@@ -19,15 +19,18 @@ import openai
 import uvicorn
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
+ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
+NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(root_path="/tmux")
+app = FastAPI(root_path=ROOT_PATH)
 
 # --- Auth ---
-AUTH_USER = "Nimo"
-AUTH_PASS = "Aa123456!"
-AUTH_SECRET = secrets.token_hex(32)  # signing key for cookie
+AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
+AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
+AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 
 
 def _make_token(username: str) -> str:
@@ -75,6 +78,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    # Skip auth entirely if no password is configured
+    if not AUTH_PASS:
+        return await call_next(request)
     path = request.url.path
     # Allow login routes without auth
     if path in ("/login", "/login/"):
@@ -83,11 +89,6 @@ async def auth_middleware(request: Request, call_next):
     if not _check_token(token):
         return HTMLResponse(LOGIN_PAGE)
     return await call_next(request)
-
-
-class LoginForm(BaseModel):
-    username: str
-    password: str
 
 
 @app.post("/login")
@@ -634,15 +635,16 @@ async def api_create_session(body: CreateSession):
             created = name
         else:
             created = sessions[-1]["name"] if sessions else "unknown"
-        # Launch claude in the new session
-        subprocess.run(
-            ["tmux", "send-keys", "-t", created, "-l", "claude"],
-            capture_output=True, text=True, timeout=5
-        )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", created, "Enter"],
-            capture_output=True, text=True, timeout=5
-        )
+        # Optionally launch a command in the new session
+        if NEW_SESSION_CMD:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "-l", NEW_SESSION_CMD],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         return JSONResponse({"ok": True, "name": created})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1362,4 +1364,4 @@ loadAll();
 """
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8501)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
