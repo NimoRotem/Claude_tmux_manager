@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Dict
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 import openai
@@ -196,6 +196,53 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return ""
 
 
+# Track auto-approve state to avoid re-triggering
+_auto_approve_sent: Dict[str, float] = {}
+
+
+def _check_auto_approve(session_name: str, visible: str):
+    """Detect Claude Code plan/permission prompts and auto-select option 2."""
+    # Don't re-trigger within 10 seconds
+    last = _auto_approve_sent.get(session_name, 0)
+    if time.time() - last < 10:
+        return
+
+    lines = visible.split("\n")
+    # Look for the option list pattern in the visible pane
+    option2_line = -1
+    selected_line = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Find the "2. Yes, and bypass" option
+        if re.search(r'2\.\s+Yes.*bypass', stripped):
+            option2_line = i
+        # Find where the selector ❯ currently is
+        if stripped.startswith('❯') or stripped.startswith('>'):
+            selected_line = i
+
+    if option2_line < 0 or selected_line < 0:
+        return
+
+    # Calculate how many Down presses needed
+    downs = option2_line - selected_line
+    if downs < 0:
+        return  # Already past option 2, don't act
+
+    try:
+        for _ in range(downs):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Down"],
+                capture_output=True, text=True, timeout=3
+            )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True, text=True, timeout=3
+        )
+        _auto_approve_sent[session_name] = time.time()
+    except Exception:
+        pass
+
+
 def detect_activity(session_name: str) -> dict:
     """Detect if session is busy or idle, and what command is running."""
     info = {"status": "unknown", "command": "", "detail": ""}
@@ -223,6 +270,9 @@ def detect_activity(session_name: str) -> dict:
             visible = vis.stdout if vis.returncode == 0 else ""
         except Exception:
             visible = ""
+
+        # Auto-approve plan/permission prompts
+        _check_auto_approve(session_name, visible)
 
         all_lines = visible.split("\n")
         # Strip trailing empty lines to find the real bottom
@@ -671,6 +721,56 @@ async def api_delete_session(session_name: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def get_session_cwd(session_name: str) -> str:
+    """Get the current working directory of a tmux session's active pane."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+@app.post("/api/sessions/{session_name}/upload")
+async def api_upload_file(session_name: str, file: UploadFile = File(...)):
+    """Upload a file to the session's current working directory."""
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    cwd = get_session_cwd(session_name)
+    if not cwd:
+        return JSONResponse({"error": "Could not determine session working directory"}, status_code=500)
+
+    # Sanitize filename — keep only the basename
+    filename = os.path.basename(file.filename or "upload")
+    if not filename or filename.startswith("."):
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+
+    dest = os.path.join(cwd, filename)
+    try:
+        content = await file.read()
+        with open(dest, "wb") as f:
+            f.write(content)
+        # Record in chat history
+        size_kb = len(content) / 1024
+        note = f"Uploaded {filename} ({size_kb:.1f} KB) to {cwd}"
+        now = time.time()
+        entry = cache.setdefault(session_name, {})
+        if "messages" not in entry:
+            entry["messages"] = _load_session_messages(session_name)
+        entry["messages"].append({"role": "user", "text": note, "ts": now})
+        _save_messages()
+        return JSONResponse({"ok": True, "path": dest, "size": len(content)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 class SendCommand(BaseModel):
     command: str
 
@@ -712,6 +812,7 @@ HTML_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>tmux Dashboard</title>
+<link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%236e7681'/></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
@@ -792,6 +893,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:none;min-height:44px;max-height:160px;line-height:1.4;overflow-y:auto}
 .cmd-input::placeholder{color:#484f58}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end}
+.cmd-upload{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-upload:hover{color:#58a6ff}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -875,7 +978,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
   <span class="nav-spacer"></span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <button class="nav-refresh-btn" onclick="refreshAllRealtime()">Refresh All</button>
 </nav>
 <div class="main" id="main"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
@@ -895,6 +997,35 @@ const rawCache={};
 const lastStatus={};
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
+// Preserve textarea drafts across re-renders
+const draftText={};
+
+function saveDrafts(){
+  ['chat','raw'].forEach(tab=>{
+    sessions.forEach(s=>{
+      const el=document.getElementById('cmd-'+tab+'-'+s.name);
+      if(el&&el.value)draftText[tab+'-'+s.name]=el.value;
+      else delete draftText[tab+'-'+s.name];
+    });
+  });
+}
+function restoreDrafts(){
+  ['chat','raw'].forEach(tab=>{
+    sessions.forEach(s=>{
+      const key=tab+'-'+s.name;
+      const el=document.getElementById('cmd-'+tab+'-'+s.name);
+      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
+    });
+  });
+}
+
+function updateFavicon(status){
+  const colors={busy:'%23f85149',idle:'%233fb950',unknown:'%236e7681'};
+  const c=colors[status]||colors.unknown;
+  const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
+  const link=document.getElementById('favicon');
+  if(link)link.href=svg;
+}
 
 function timeAgo(ts){
   if(!ts)return'never';
@@ -952,11 +1083,14 @@ function renderChatBubbles(name){
 }
 
 function renderDetail(){
+  saveDrafts();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   const tab=activeTabs[s.name]||'chat';
   // Sync server messages into local store
   if(s.messages && s.messages.length) chatMessages[s.name]=s.messages;
+  // Update favicon to match selected session
+  updateFavicon(s.activity_status);
 
   mainEl.innerHTML=`
     <div class="detail-header">
@@ -994,6 +1128,8 @@ function renderDetail(){
             oninput="autoGrow(this)"
             autocomplete="off" spellcheck="false"></textarea>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="cmd-upload" onclick="document.getElementById('upload-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
+          <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
       </div>
     </div>
@@ -1037,6 +1173,8 @@ function renderDetail(){
       </div>
     </div>`;
 
+  // Restore draft text in textareas
+  restoreDrafts();
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
@@ -1131,6 +1269,26 @@ async function sendChat(name){
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
+}
+
+async function uploadFile(name,input){
+  if(!input.files||!input.files.length)return;
+  for(const file of input.files){
+    const fd=new FormData();
+    fd.append('file',file);
+    const sizeKb=(file.size/1024).toFixed(1);
+    appendChatBubble(name,'user',`Uploading ${file.name} (${sizeKb} KB)...`,Date.now()/1000);
+    try{
+      const resp=await fetch(BASE+'/api/sessions/'+name+'/upload',{method:'POST',body:fd});
+      const data=await resp.json();
+      if(!resp.ok){
+        appendChatBubble(name,'assistant','Upload failed: '+(data.error||'Unknown error'),Date.now()/1000);
+      }
+    }catch(e){
+      appendChatBubble(name,'assistant','Upload failed: network error',Date.now()/1000);
+    }
+  }
+  input.value='';
 }
 
 async function sendCmd(name,source){
@@ -1295,6 +1453,7 @@ async function pollStatus(){
         lastStatus[st.name]=st.activity_status;
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
+      if(st.name===selectedSession)updateFavicon(st.activity_status);
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
