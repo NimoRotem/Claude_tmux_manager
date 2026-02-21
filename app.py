@@ -4,254 +4,345 @@ import asyncio
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi import FastAPI, Request, Response, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from pydantic import BaseModel
 import openai
 import uvicorn
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
-ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
-NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
+PORT = int(os.environ.get("VIBE_PORT", "8501"))
+NEW_SESSION_CMD = os.environ.get("VIBE_NEW_SESSION_CMD", "claude --dangerously-skip-permissions")
+AUTH_SECRET = os.environ.get("VIBE_SECRET", secrets.token_hex(32))
+USERS_BASE = os.environ.get("VIBE_USERS_DIR", "/var/vibe-coder/users")
+DATA_DIR = os.environ.get("VIBE_DATA_DIR", "/var/vibe-coder/data")
+DOMAIN = os.environ.get("VIBE_DOMAIN", "dianao.tech")
+
+# Ensure directories exist
+Path(USERS_BASE).mkdir(parents=True, exist_ok=True)
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(root_path=ROOT_PATH)
+app = FastAPI()
 
-# --- Auth ---
-AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
-AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
-AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
+# ---------------------------------------------------------------------------
+# Database — SQLite for user accounts
+# ---------------------------------------------------------------------------
+DB_PATH = os.path.join(DATA_DIR, "vibe-coder.db")
 
 
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = _get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ---------------------------------------------------------------------------
+# Password hashing (PBKDF2 — stdlib, no extra deps)
+# ---------------------------------------------------------------------------
+def _hash_password(password: str, salt: str = "") -> tuple[str, str]:
+    if not salt:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+    return dk.hex(), salt
+
+
+def _verify_password(password: str, stored_hash: str, salt: str) -> bool:
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+    return hmac.compare_digest(dk.hex(), stored_hash)
+
+
+# ---------------------------------------------------------------------------
+# Token auth (cookie-based HMAC)
+# ---------------------------------------------------------------------------
 def _make_token(username: str) -> str:
     sig = hmac.new(AUTH_SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()[:24]
     return f"{username}:{sig}"
 
 
-def _check_token(token: str) -> bool:
+def _check_token(token: str) -> Optional[str]:
+    """Return username if valid, else None."""
     if not token or ":" not in token:
-        return False
+        return None
     username, sig = token.split(":", 1)
     expected = hmac.new(AUTH_SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()[:24]
-    return hmac.compare_digest(sig, expected)
+    if hmac.compare_digest(sig, expected):
+        return username
+    return None
 
 
-LOGIN_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>tmux Dashboard — Login</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px}
-.login-box h2{color:#f0f6fc;margin-bottom:8px;font-size:1.2rem}
-.login-box p{color:#8b949e;font-size:.85rem;margin-bottom:20px}
-.field{margin-bottom:14px}
-.field label{display:block;font-size:.8rem;color:#8b949e;margin-bottom:4px}
-.field input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:10px 12px;font-size:.95rem;outline:none}
-.field input:focus{border-color:#58a6ff}
-.err{color:#f85149;font-size:.8rem;margin-bottom:10px;display:none}
-.login-btn{width:100%;background:#1f6feb;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;font-size:.95rem;font-weight:500}
-.login-btn:hover{background:#388bfd}
-</style></head><body>
-<form class="login-box" method="POST" action="login">
-  <h2>tmux Dashboard</h2>
-  <p>Enter credentials to continue.</p>
-  <div class="err" id="err">Invalid username or password.</div>
-  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
-  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
-  <button class="login-btn" type="submit">Log in</button>
-</form>
-<script>if(location.search.includes('err=1'))document.getElementById('err').style.display='block'</script>
-</body></html>"""
+def get_current_user(request: Request) -> Optional[str]:
+    token = request.cookies.get("vibe_auth")
+    return _check_token(token)
+
+
+# ---------------------------------------------------------------------------
+# User management
+# ---------------------------------------------------------------------------
+def create_user(username: str, password: str) -> bool:
+    """Create a new user. Returns True on success, False if username taken."""
+    pw_hash, salt = _hash_password(password)
+    try:
+        conn = _get_db()
+        conn.execute(
+            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+            (username, pw_hash, salt, time.time()),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.IntegrityError:
+        return False
+
+    # Create user directory
+    user_dir = os.path.join(USERS_BASE, username)
+    Path(user_dir).mkdir(parents=True, exist_ok=True)
+
+    # Write a CLAUDE.md so Claude Code knows the context
+    claude_md = os.path.join(user_dir, "CLAUDE.md")
+    if not os.path.exists(claude_md):
+        Path(claude_md).write_text(
+            f"# Vibe Coder Workspace\n\n"
+            f"You are building a project for user '{username}'.\n"
+            f"Everything in this directory is served publicly at: https://{DOMAIN}/{username}/\n\n"
+            f"## Rules\n"
+            f"- Put your web-facing files (HTML, CSS, JS, images) in this directory\n"
+            f"- An index.html in this directory will be the homepage at https://{DOMAIN}/{username}/\n"
+            f"- You can create subdirectories for organization\n"
+            f"- Do NOT access files outside this directory\n"
+            f"- Do NOT run commands that affect the server (no sudo, no systemctl, etc.)\n"
+            f"- Focus on building the user's project\n"
+        )
+    return True
+
+
+def authenticate_user(username: str, password: str) -> bool:
+    conn = _get_db()
+    row = conn.execute("SELECT password_hash, salt FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return _verify_password(password, row["password_hash"], row["salt"])
+
+
+def user_exists(username: str) -> bool:
+    conn = _get_db()
+    row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_user_dir(username: str) -> str:
+    return os.path.join(USERS_BASE, username)
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware — protect /app and /api routes
+# ---------------------------------------------------------------------------
+PUBLIC_PATHS = frozenset({"/", "/login", "/signup", "/health"})
+PUBLIC_PREFIXES = ("/static/",)
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    # Skip auth entirely if no password is configured
-    if not AUTH_PASS:
-        return await call_next(request)
     path = request.url.path
-    # Allow login routes without auth
-    if path in ("/login", "/login/"):
+
+    # Public routes
+    if path in PUBLIC_PATHS:
         return await call_next(request)
-    token = request.cookies.get("tmux_auth")
-    if not _check_token(token):
-        return HTMLResponse(LOGIN_PAGE)
+    for prefix in PUBLIC_PREFIXES:
+        if path.startswith(prefix):
+            return await call_next(request)
+    # Login/signup POST
+    if path in ("/login", "/signup"):
+        return await call_next(request)
+
+    # Protected routes: /app, /api/*
+    if path.startswith("/app") or path.startswith("/api/"):
+        user = get_current_user(request)
+        if not user:
+            return RedirectResponse(url="/login", status_code=303)
+        request.state.username = user
+        return await call_next(request)
+
+    # Everything else: user public files (/<username>/...)
     return await call_next(request)
 
 
-@app.post("/login")
-async def do_login(request: Request):
-    form = await request.form()
-    username = form.get("username", "")
-    password = form.get("password", "")
-    if username == AUTH_USER and password == AUTH_PASS:
-        token = _make_token(username)
-        resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
-        resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax")
-        return resp
-    return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+# ---------------------------------------------------------------------------
+# Tmux session management — one session per user
+# ---------------------------------------------------------------------------
+SESSION_PREFIX = "vc-"
 
 
-# Three-tier cache per session
-cache: Dict[str, dict] = {}
-
-# Persistent message storage
-MESSAGES_DIR = Path.home() / ".tmux-dashboard"
-MESSAGES_FILE = MESSAGES_DIR / "messages.json"
+def _session_name(username: str) -> str:
+    return f"{SESSION_PREFIX}{username}"
 
 
-def _load_messages() -> Dict[str, list]:
-    """Load all session messages from disk."""
-    try:
-        if MESSAGES_FILE.exists():
-            return json.loads(MESSAGES_FILE.read_text())
-    except Exception:
-        pass
-    return {}
-
-
-def _save_messages():
-    """Persist all session messages to disk (merge with existing)."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        # Load existing to avoid dropping sessions not yet in cache
-        existing = _load_messages()
-        # Update with current cache data
-        for name, entry in cache.items():
-            msgs = entry.get("messages")
-            if msgs:
-                existing[name] = msgs
-        MESSAGES_FILE.write_text(json.dumps(existing))
-    except Exception:
-        pass
-
-
-def _load_session_messages(session_name: str) -> list:
-    """Get persisted messages for a specific session."""
-    all_msgs = _load_messages()
-    return all_msgs.get(session_name, [])
-
-
-DESCRIPTION_TTL = 0    # never auto-expire
-PROGRESS_TTL = 600     # 10 minutes
-REALTIME_TTL = 60      # 1 minute
-
-
-def get_tmux_sessions() -> list[dict]:
+def session_exists(username: str) -> bool:
+    name = _session_name(username)
     try:
         result = subprocess.run(
-            ["tmux", "list-sessions", "-F",
-             "#{session_name}:#{session_windows}:#{session_created}:#{session_attached}"],
-            capture_output=True, text=True, timeout=5
+            ["tmux", "has-session", "-t", name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def create_user_session(username: str) -> bool:
+    name = _session_name(username)
+    user_dir = get_user_dir(username)
+    Path(user_dir).mkdir(parents=True, exist_ok=True)
+
+    if session_exists(username):
+        return True
+
+    try:
+        result = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", name, "-c", user_dir],
+            capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            return []
-        sessions = []
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split(":")
-            sessions.append({
-                "name": parts[0],
-                "windows": parts[1] if len(parts) > 1 else "?",
-                "created": parts[2] if len(parts) > 2 else "",
-                "attached": parts[3] == "1" if len(parts) > 3 else False,
-            })
-        return sessions
+            return False
+
+        # Launch the configured command (e.g. claude)
+        if NEW_SESSION_CMD:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", name, "-l", NEW_SESSION_CMD],
+                capture_output=True, text=True, timeout=5,
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", name, "Enter"],
+                capture_output=True, text=True, timeout=5,
+            )
+        return True
     except Exception:
-        return []
+        return False
 
 
-def capture_pane_full(session_name: str) -> str:
+def capture_pane_full(username: str) -> str:
+    name = _session_name(username)
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-"],
-            capture_output=True, text=True, timeout=10
+            ["tmux", "capture-pane", "-t", name, "-p", "-S", "-"],
+            capture_output=True, text=True, timeout=10,
         )
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
 
 
-def capture_pane_recent(session_name: str, lines: int = 80) -> str:
+def capture_pane_recent(username: str, lines: int = 80) -> str:
+    name = _session_name(username)
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
-            capture_output=True, text=True, timeout=5
+            ["tmux", "capture-pane", "-t", name, "-p", "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=5,
         )
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
 
 
-# Track auto-approve state to avoid re-triggering
+def get_session_cwd(username: str) -> str:
+    name = _session_name(username)
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", name, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return get_user_dir(username)
+
+
+# ---------------------------------------------------------------------------
+# Activity detection
+# ---------------------------------------------------------------------------
 _auto_approve_sent: Dict[str, float] = {}
 
 
-def _check_auto_approve(session_name: str, visible: str):
-    """Detect Claude Code plan/permission prompts and auto-select option 2."""
-    # Don't re-trigger within 10 seconds
-    last = _auto_approve_sent.get(session_name, 0)
+def _check_auto_approve(username: str, visible: str):
+    name = _session_name(username)
+    last = _auto_approve_sent.get(name, 0)
     if time.time() - last < 10:
         return
 
     lines = visible.split("\n")
-    # Look for the option list pattern in the visible pane
     option2_line = -1
     selected_line = -1
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # Find the "2. Yes, and bypass" option
         if re.search(r'2\.\s+Yes.*bypass', stripped):
             option2_line = i
-        # Find where the selector ❯ currently is
-        if stripped.startswith('❯') or stripped.startswith('>'):
+        if stripped.startswith('\u276f') or stripped.startswith('>'):
             selected_line = i
 
     if option2_line < 0 or selected_line < 0:
         return
 
-    # Calculate how many Down presses needed
     downs = option2_line - selected_line
     if downs < 0:
-        return  # Already past option 2, don't act
+        return
 
     try:
         for _ in range(downs):
             subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Down"],
-                capture_output=True, text=True, timeout=3
+                ["tmux", "send-keys", "-t", name, "Down"],
+                capture_output=True, text=True, timeout=3,
             )
         subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=3
+            ["tmux", "send-keys", "-t", name, "Enter"],
+            capture_output=True, text=True, timeout=3,
         )
-        _auto_approve_sent[session_name] = time.time()
+        _auto_approve_sent[name] = time.time()
     except Exception:
         pass
 
 
-def detect_activity(session_name: str) -> dict:
-    """Detect if session is busy or idle, and what command is running."""
+def detect_activity(username: str) -> dict:
+    name = _session_name(username)
     info = {"status": "unknown", "command": "", "detail": ""}
     try:
-        # Get the foreground command and pane pid
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p",
+            ["tmux", "display-message", "-t", name, "-p",
              "#{pane_current_command}:#{pane_pid}"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             return info
@@ -260,86 +351,59 @@ def detect_activity(session_name: str) -> dict:
         cmd = parts[0] if parts else ""
         info["command"] = cmd
 
-        # Capture the very bottom of the visible pane — this is the ground truth.
-        # tmux capture-pane without -S captures just the visible area.
         try:
             vis = subprocess.run(
-                ["tmux", "capture-pane", "-t", session_name, "-p"],
-                capture_output=True, text=True, timeout=5
+                ["tmux", "capture-pane", "-t", name, "-p"],
+                capture_output=True, text=True, timeout=5,
             )
             visible = vis.stdout if vis.returncode == 0 else ""
         except Exception:
             visible = ""
 
-        # Auto-approve plan/permission prompts
-        _check_auto_approve(session_name, visible)
+        _check_auto_approve(username, visible)
 
         all_lines = visible.split("\n")
-        # Strip trailing empty lines to find the real bottom
         while all_lines and not all_lines[-1].strip():
             all_lines.pop()
 
-        # Look at the bottom 6 lines to catch prompt + status bar + separators
         bottom = all_lines[-6:] if len(all_lines) >= 6 else all_lines
         bottom_text = "\n".join(bottom)
+        window = all_lines[-20:] if len(all_lines) >= 20 else all_lines
 
-        # --- Step 1: Check "esc to interrupt" — strongest busy signal ---
-        # This appears in Claude Code's status bar when a task is actively running.
         has_esc_to_interrupt = "esc to interrupt" in bottom_text
 
-        # --- Step 2: Check for idle prompt indicators in bottom area ---
-        idle_prompt_patterns = [
-            r'^[❯➜]\s*$',                         # bare prompt character alone on line
-            r'Tip:.*claude',                       # claude code tip = just finished
-            r'Saut[ée]ed for',                     # "Sautéed for Xs" = just finished
-            r'Whisked for',
-            r'Warped for',
-            r'Worked for',
-        ]
-        has_idle_prompt = False
-        for pattern in idle_prompt_patterns:
-            for line in bottom:
-                if re.search(pattern, line.strip()):
-                    has_idle_prompt = True
-                    break
-            if has_idle_prompt:
+        spinner_found = False
+        spinner_label = ""
+        for line in window:
+            stripped = line.strip()
+            m = re.match(r'^[✶✽\*☆◆●]\s+(\w+ing)[…\.]+', stripped)
+            if m:
+                if "Done" in stripped:
+                    continue
+                spinner_found = True
+                verb = m.group(1)
+                verb_labels = {
+                    "Generating": "Generating",
+                    "Processing": "Processing",
+                    "Running": "Running",
+                }
+                spinner_label = verb_labels.get(verb, "Thinking")
+                break
+            if re.match(r'^[✶✽\*]\s+.*\d+s\s*·\s*↓', stripped):
+                spinner_found = True
+                spinner_label = "Processing"
                 break
 
-        # If idle prompt present but NO "esc to interrupt" → truly idle
-        if has_idle_prompt and not has_esc_to_interrupt:
-            info["status"] = "idle"
-            info["detail"] = "Waiting for input"
+        if spinner_found:
+            info["status"] = "busy"
+            info["detail"] = spinner_label
             return info
 
-        # --- Step 3: Check for active spinners/progress on bottom lines ---
-        busy_patterns = [
-            (r'Generating[….]',                     "Generating"),
-            (r'Reticulating[….]',                   "Thinking"),
-            (r'Whisking[….]',                       "Thinking"),
-            (r'Warping[….]',                        "Thinking"),
-            (r'Saut[ée]ing[….]',                    "Thinking"),
-            (r'Running[….]',                        "Running"),
-            (r'thought for \d+s\)',                  "Thinking"),
-            (r'thinking\)',                          "Thinking"),
-            (r'\d+m \d+s · ↓',                      "Processing"),
-            (r'Installing',                         "Installing"),
-            (r'Building',                           "Building"),
-            (r'Compiling',                          "Compiling"),
-            (r'Downloading',                        "Downloading"),
-        ]
-        for pattern, label in busy_patterns:
-            if re.search(pattern, bottom_text):
-                info["status"] = "busy"
-                info["detail"] = label
-                return info
-
-        # "esc to interrupt" without a spinner = background tasks running
         if has_esc_to_interrupt:
             info["status"] = "busy"
-            info["detail"] = "Background tasks"
+            info["detail"] = "Working"
             return info
 
-        # --- Step 4: Shell prompt check ---
         last_line = bottom[-1].strip() if bottom else ""
         shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
         if cmd.lower() in shell_cmds:
@@ -350,7 +414,6 @@ def detect_activity(session_name: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = cmd
         elif cmd.lower() in ("claude", "node"):
-            # Claude Code with no spinner + no "esc to interrupt" = idle
             info["status"] = "idle"
             info["detail"] = "Waiting for input"
         else:
@@ -359,6 +422,41 @@ def detect_activity(session_name: str) -> dict:
     except Exception:
         pass
     return info
+
+
+# ---------------------------------------------------------------------------
+# LLM summaries (three-tier cache)
+# ---------------------------------------------------------------------------
+cache: Dict[str, dict] = {}
+
+MESSAGES_DIR = Path(DATA_DIR) / "messages"
+MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _messages_file(username: str) -> Path:
+    return MESSAGES_DIR / f"{username}.json"
+
+
+def _load_user_messages(username: str) -> list:
+    fp = _messages_file(username)
+    try:
+        if fp.exists():
+            return json.loads(fp.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _save_user_messages(username: str, messages: list):
+    try:
+        _messages_file(username).write_text(json.dumps(messages))
+    except Exception:
+        pass
+
+
+DESCRIPTION_TTL = 0
+PROGRESS_TTL = 600
+REALTIME_TTL = 60
 
 
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
@@ -377,49 +475,31 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200)
         return f"(error: {e})"
 
 
-async def get_title_and_description(session_name: str, full_output: str) -> tuple:
-    """Return (title, description) for a session."""
+async def get_title_and_description(username: str, full_output: str) -> tuple:
     lines = full_output.split("\n")
     early = "\n".join(lines[:150])
     mid_start = len(lines) // 3
     middle = "\n".join(lines[mid_start:mid_start + 80])
-    context = f"=== EARLIEST OUTPUT (first 150 lines) ===\n{early}\n\n=== MIDDLE SECTION ===\n{middle}"
+    context = f"=== EARLIEST OUTPUT ===\n{early}\n\n=== MIDDLE ===\n{middle}"
     truncated = context[:4000]
 
     title_coro = llm_call(
-        system_prompt=(
-            "Given terminal output from a tmux session, produce a SHORT title (3-6 words) "
-            "naming the project or task. Use the actual project name or directory if visible. "
-            "Examples: 'monitor-app LLM re-match', 'tmux-dashboard project', "
-            "'Next.js frontend build'. "
-            "Return ONLY the title, no quotes, no punctuation at the end."
-        ),
-        user_content=f"tmux session '{session_name}':\n\n{truncated}",
+        "Given terminal output, produce a SHORT title (3-6 words) naming the project. "
+        "Return ONLY the title, no quotes.",
+        f"workspace '{username}':\n\n{truncated}",
         max_tokens=30,
     )
     desc_coro = llm_call(
-        system_prompt=(
-            "You summarize what a terminal session is for. Write ONE short plain sentence. "
-            "Be informative and specific — mention the tool, the actual project name, and "
-            "what it does or where it runs if you can tell. "
-            "Write like a human would casually describe it to a colleague.\n"
-            "GOOD examples:\n"
-            "- 'Claude Code working on the product monitoring app at monitor.grabo.cc'\n"
-            "- 'Building and testing the tmux-dashboard FastAPI service'\n"
-            "- 'Running a data migration script for the user database'\n"
-            "BAD examples (too verbose/robotic):\n"
-            "- 'This tmux session is for the Claude Code AI assistant working on...'\n"
-            "- 'The session involves running and debugging an LLM-based...'\n"
-            "Keep it under 20 words. No filler phrases. No 'This session is for...'."
-        ),
-        user_content=f"tmux session '{session_name}':\n\n{truncated}",
+        "Summarize what this workspace is building. ONE short sentence. Be specific. "
+        "Under 20 words. No filler.",
+        f"workspace '{username}':\n\n{truncated}",
         max_tokens=60,
     )
     title, description = await asyncio.gather(title_coro, desc_coro)
     return title, description
 
 
-async def get_progress(session_name: str, full_output: str) -> str:
+async def get_progress(username: str, full_output: str) -> str:
     lines = full_output.split("\n")
     total = len(lines)
     slices = [("BEGINNING", "\n".join(lines[:60]))]
@@ -429,83 +509,71 @@ async def get_progress(session_name: str, full_output: str) -> str:
     if total > 300:
         mid = total // 2
         slices.append(("MIDDLE", "\n".join(lines[mid:mid + 50])))
-    if total > 400:
-        q3 = (total * 3) // 4
-        slices.append(("THREE-QUARTER", "\n".join(lines[q3:q3 + 50])))
     slices.append(("RECENT", "\n".join(lines[-60:])))
     context = "\n\n".join(f"=== {label} ===\n{text}" for label, text in slices)
     return await llm_call(
-        system_prompt=(
-            "Summarize what was accomplished in this terminal session so far. "
-            "Write 1-3 short plain sentences listing concrete things that were built, "
-            "fixed, or completed. Use casual first-person plural ('we') and past tense. "
-            "Focus on WHAT was done, not HOW (don't mention commands, bash, git, etc.).\n"
-            "GOOD example: 'Built a price parser module and multi-tier classifier. "
-            "Improved scraper extraction and finished the analytics dashboard.'\n"
-            "BAD example: 'Several key tasks were completed including building modules "
-            "and running scripts. Files such as matching.py were referenced.'\n"
-            "Be condensed. Under 40 words. No filler."
-        ),
-        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:5000]}",
+        "Summarize what was accomplished so far. 1-3 short sentences. "
+        "Use 'we' and past tense. Under 40 words. No filler.",
+        f"workspace '{username}' history:\n\n{context[:5000]}",
         max_tokens=100,
     )
 
 
-async def get_realtime(session_name: str) -> str:
-    recent = capture_pane_recent(session_name, 80)
-    activity = detect_activity(session_name)
-    status_hint = f"[Session is currently {activity['status'].upper()}"
+async def get_realtime(username: str) -> str:
+    recent = capture_pane_recent(username, 80)
+    activity = detect_activity(username)
+    hint = f"[Session is {activity['status'].upper()}"
     if activity["detail"]:
-        status_hint += f" — {activity['detail']}"
-    status_hint += "]"
+        hint += f" - {activity['detail']}"
+    hint += "]"
     return await llm_call(
-        system_prompt=(
-            "You summarize the CURRENT STEP in a terminal session. Write 1-2 short sentences.\n\n"
-            "Write as a collaborative team update using 'we' — like a coworker reporting progress.\n\n"
-            "RULES:\n"
-            "- Use first-person plural: 'We updated...', 'We're running...', 'We fixed...'.\n"
-            "- NEVER start with 'User asked' or 'User requested'.\n"
-            "- If BUSY: describe what's actively happening. Include progress % if visible.\n"
-            "- If IDLE: describe what was accomplished. Use past tense.\n"
-            "- Focus on the INTENT and RESULT — not shell commands or file paths.\n"
-            "- Don't mention bash, curl, sleep, grep, cat, git commands — describe the goal.\n"
-            "- Under 30 words.\n\n"
-            "GOOD examples (busy):\n"
-            "- 'Re-matching all URLs with the LLM pipeline — 64% done.'\n"
-            "- 'We're adding dark mode support, currently editing the CSS theme variables.'\n"
-            "GOOD examples (idle):\n"
-            "- 'We fixed the auth token validation and restarted the server.'\n"
-            "- 'Added a delete button with confirmation dialog and wired up the API endpoint.'\n"
-            "BAD examples:\n"
-            "- 'User asked to fix the login bug.' (don't say 'user asked')\n"
-            "- 'Idle, waiting for input.' (too vague — what was just done?)\n"
-            "- 'A bash process is executing a curl request...' (mechanics, not intent)"
-        ),
-        user_content=f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}",
+        "Summarize the CURRENT STEP. 1-2 sentences. Use 'we'. "
+        "If BUSY: describe what's happening. If IDLE: what was accomplished. "
+        "Under 30 words.",
+        f"{hint}\n\nworkspace '{username}' latest:\n\n{recent[-3000:]}",
         max_tokens=100,
     )
 
 
-async def get_session_data(session_name: str, force_all: bool = False) -> dict:
+def _msg_similarity(a: str, b: str) -> float:
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / max(len(wa), len(wb))
+
+
+def _append_assistant_msg(username: str, entry: dict, text: str, ts: float):
+    msgs = entry.setdefault("messages", [])
+    for m in reversed(msgs):
+        if m["role"] == "assistant":
+            if m["text"] == text or _msg_similarity(m["text"], text) > 0.7:
+                return
+            break
+    msgs.append({"role": "assistant", "text": text, "ts": ts})
+    _save_user_messages(username, msgs)
+
+
+async def get_session_data(username: str, force_all: bool = False) -> dict:
     now = time.time()
-    entry = cache.get(session_name, {})
+    entry = cache.get(username, {})
     if "messages" not in entry:
-        entry["messages"] = _load_session_messages(session_name)
+        entry["messages"] = _load_user_messages(username)
 
     need_description = force_all or "description" not in entry
     need_progress = force_all or "progress" not in entry or (now - entry.get("progress_at", 0)) >= PROGRESS_TTL
 
     full_output = None
     if need_description or need_progress:
-        full_output = capture_pane_full(session_name)
+        full_output = capture_pane_full(username)
 
     tasks = {}
-    if need_description:
-        tasks["title_desc"] = get_title_and_description(session_name, full_output)
-    if need_progress:
-        tasks["progress"] = get_progress(session_name, full_output)
+    if need_description and full_output:
+        tasks["title_desc"] = get_title_and_description(username, full_output)
+    if need_progress and full_output:
+        tasks["progress"] = get_progress(username, full_output)
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
-        tasks["realtime"] = get_realtime(session_name)
+        tasks["realtime"] = get_realtime(username)
 
     if tasks:
         results = await asyncio.gather(*tasks.values())
@@ -521,43 +589,15 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         if "realtime" in result_map:
             entry["realtime"] = result_map["realtime"]
             entry["realtime_at"] = now
-            _append_assistant_msg(entry, result_map["realtime"], now)
+            _append_assistant_msg(username, entry, result_map["realtime"], now)
 
-    cache[session_name] = entry
-    if entry.get("messages"):
-        _save_messages()
+    cache[username] = entry
     return entry
 
 
-def _msg_similarity(a: str, b: str) -> float:
-    """Quick word-overlap similarity between two strings."""
-    wa = set(a.lower().split())
-    wb = set(b.lower().split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def _append_assistant_msg(entry: dict, text: str, ts: float):
-    """Append an assistant message, skipping if too similar to the last one."""
-    msgs = entry.setdefault("messages", [])
-    # Find last assistant message
-    for m in reversed(msgs):
-        if m["role"] == "assistant":
-            # Skip if identical or very similar (>70% word overlap)
-            if m["text"] == text or _msg_similarity(m["text"], text) > 0.7:
-                return
-            break
-    msgs.append({"role": "assistant", "text": text, "ts": ts})
-    _save_messages()
-
-
-def build_session_response(sess: dict, data: dict) -> dict:
-    activity = detect_activity(sess["name"])
+def build_session_response(username: str, data: dict) -> dict:
+    activity = detect_activity(username)
     return {
-        "name": sess["name"],
-        "windows": sess["windows"],
-        "attached": sess["attached"],
         "title": data.get("title", ""),
         "description": data.get("description", ""),
         "description_at": data.get("description_at", 0),
@@ -569,86 +609,149 @@ def build_session_response(sess: dict, data: dict) -> dict:
         "activity_status": activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
+        "public_url": f"https://{DOMAIN}/{username}/",
     }
 
 
-# --- Routes ---
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
+async def landing_page():
+    return LANDING_HTML
 
 
-@app.get("/api/sessions")
-async def api_sessions():
-    sessions = get_tmux_sessions()
-    results = await asyncio.gather(
-        *[get_session_data(s["name"]) for s in sessions]
-    )
-    return JSONResponse([
-        build_session_response(sess, data)
-        for sess, data in zip(sessions, results)
-    ])
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return LOGIN_HTML
 
 
-@app.post("/api/sessions/{session_name}/refresh")
-async def api_refresh_session(session_name: str):
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    now = time.time()
-    entry = cache.get(session_name, {})
-    if "messages" not in entry:
-        entry["messages"] = _load_session_messages(session_name)
-    entry["realtime"] = await get_realtime(session_name)
-    entry["realtime_at"] = now
-    _append_assistant_msg(entry, entry["realtime"], now)
-    cache[session_name] = entry
-
-    sess = next(s for s in sessions if s["name"] == session_name)
-    return JSONResponse(build_session_response(sess, entry))
+@app.post("/login")
+async def do_login(request: Request):
+    form = await request.form()
+    username = (form.get("username", "") or "").strip().lower()
+    password = form.get("password", "") or ""
+    if not username or not password:
+        return RedirectResponse(url="/login?err=missing", status_code=303)
+    if not authenticate_user(username, password):
+        return RedirectResponse(url="/login?err=invalid", status_code=303)
+    # Ensure tmux session exists
+    create_user_session(username)
+    token = _make_token(username)
+    resp = RedirectResponse(url="/app", status_code=303)
+    resp.set_cookie("vibe_auth", token, max_age=86400 * 30, httponly=True, samesite="lax")
+    return resp
 
 
-@app.post("/api/sessions/{session_name}/refresh-all")
-async def api_refresh_all_tiers(session_name: str):
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
+@app.get("/signup", response_class=HTMLResponse)
+async def signup_page():
+    return SIGNUP_HTML
 
-    entry = await get_session_data(session_name, force_all=True)
-    sess = next(s for s in sessions if s["name"] == session_name)
-    return JSONResponse(build_session_response(sess, entry))
+
+@app.post("/signup")
+async def do_signup(request: Request):
+    form = await request.form()
+    username = (form.get("username", "") or "").strip().lower()
+    password = form.get("password", "") or ""
+
+    if not username or not password:
+        return RedirectResponse(url="/signup?err=missing", status_code=303)
+    if len(username) < 3 or len(username) > 24:
+        return RedirectResponse(url="/signup?err=length", status_code=303)
+    if not re.match(r'^[a-z0-9_-]+$', username):
+        return RedirectResponse(url="/signup?err=format", status_code=303)
+    if len(password) < 6:
+        return RedirectResponse(url="/signup?err=weakpw", status_code=303)
+    # Reserve system paths
+    reserved = {"app", "api", "login", "signup", "logout", "health", "static", "admin", "www", "assets"}
+    if username in reserved:
+        return RedirectResponse(url="/signup?err=reserved", status_code=303)
+
+    if not create_user(username, password):
+        return RedirectResponse(url="/signup?err=taken", status_code=303)
+
+    # Auto-login
+    create_user_session(username)
+    token = _make_token(username)
+    resp = RedirectResponse(url="/app", status_code=303)
+    resp.set_cookie("vibe_auth", token, max_age=86400 * 30, httponly=True, samesite="lax")
+    return resp
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.delete_cookie("vibe_auth")
+    return resp
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# App route (main dashboard — auth required)
+# ---------------------------------------------------------------------------
+@app.get("/app", response_class=HTMLResponse)
+async def app_page(request: Request):
+    username = request.state.username
+    # Ensure session exists
+    create_user_session(username)
+    return APP_HTML.replace("__USERNAME__", username).replace("__DOMAIN__", DOMAIN)
+
+
+# ---------------------------------------------------------------------------
+# API routes (all scoped to authenticated user)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/session")
+async def api_session(request: Request):
+    username = request.state.username
+    if not session_exists(username):
+        create_user_session(username)
+    data = await get_session_data(username)
+    return JSONResponse(build_session_response(username, data))
 
 
 @app.get("/api/status")
-async def api_status():
-    """Lightweight: return only activity status per session, no LLM calls."""
-    sessions = get_tmux_sessions()
-    out = []
-    for sess in sessions:
-        activity = detect_activity(sess["name"])
-        out.append({
-            "name": sess["name"],
-            "activity_status": activity["status"],
-            "activity_detail": activity["detail"],
-        })
-    return JSONResponse(out)
-
-
-@app.get("/api/sessions/{session_name}/raw")
-async def api_raw_output(session_name: str):
-    """Return raw scrollback content for a session."""
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    raw = capture_pane_full(session_name)
-    activity = detect_activity(session_name)
+async def api_status(request: Request):
+    username = request.state.username
+    activity = detect_activity(username)
     return JSONResponse({
-        "name": session_name,
+        "activity_status": activity["status"],
+        "activity_detail": activity["detail"],
+    })
+
+
+@app.post("/api/session/refresh")
+async def api_refresh(request: Request):
+    username = request.state.username
+    now = time.time()
+    entry = cache.get(username, {})
+    if "messages" not in entry:
+        entry["messages"] = _load_user_messages(username)
+    entry["realtime"] = await get_realtime(username)
+    entry["realtime_at"] = now
+    _append_assistant_msg(username, entry, entry["realtime"], now)
+    cache[username] = entry
+    return JSONResponse(build_session_response(username, entry))
+
+
+@app.post("/api/session/refresh-all")
+async def api_refresh_all(request: Request):
+    username = request.state.username
+    entry = await get_session_data(username, force_all=True)
+    return JSONResponse(build_session_response(username, entry))
+
+
+@app.get("/api/session/raw")
+async def api_raw(request: Request):
+    username = request.state.username
+    raw = capture_pane_full(username)
+    activity = detect_activity(username)
+    return JSONResponse({
         "raw": raw,
         "lines": len(raw.split("\n")),
         "activity_status": activity["status"],
@@ -657,97 +760,43 @@ async def api_raw_output(session_name: str):
     })
 
 
-class CreateSession(BaseModel):
-    name: str = ""
+class SendCommand(BaseModel):
+    command: str
 
 
-@app.post("/api/sessions/create")
-async def api_create_session(body: CreateSession):
-    """Create a new tmux session."""
-    name = body.name.strip()
-    if name:
-        # Validate name: alphanumeric, dash, underscore only
-        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-            return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
-        existing = [s["name"] for s in get_tmux_sessions()]
-        if name in existing:
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+@app.post("/api/session/send")
+async def api_send(request: Request, body: SendCommand):
+    username = request.state.username
+    name = _session_name(username)
     try:
-        cmd = ["tmux", "new-session", "-d"]
-        if name:
-            cmd += ["-s", name]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
-        # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
-        # Optionally launch a command in the new session
-        if NEW_SESSION_CMD:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l", NEW_SESSION_CMD],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        return JSONResponse({"ok": True, "name": created})
+        subprocess.run(
+            ["tmux", "send-keys", "-t", name, "-l", body.command],
+            capture_output=True, text=True, timeout=5,
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", name, "Enter"],
+            capture_output=True, text=True, timeout=5,
+        )
+        now = time.time()
+        entry = cache.setdefault(username, {})
+        if "messages" not in entry:
+            entry["messages"] = _load_user_messages(username)
+        entry["messages"].append({"role": "user", "text": body.command, "ts": now})
+        _save_user_messages(username, entry["messages"])
+        return JSONResponse({"ok": True, "sent": body.command})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.delete("/api/sessions/{session_name}")
-async def api_delete_session(session_name: str):
-    """Kill a tmux session."""
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        result = subprocess.run(
-            ["tmux", "kill-session", "-t", session_name],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
-        # Clean up cache
-        cache.pop(session_name, None)
-        return JSONResponse({"ok": True, "killed": session_name})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+@app.post("/api/session/upload")
+async def api_upload(request: Request, file: UploadFile = File(...)):
+    username = request.state.username
+    cwd = get_session_cwd(username)
+    # Security: ensure cwd is within user dir
+    user_dir = get_user_dir(username)
+    if not os.path.realpath(cwd).startswith(os.path.realpath(user_dir)):
+        cwd = user_dir
 
-
-def get_session_cwd(session_name: str) -> str:
-    """Get the current working directory of a tmux session's active pane."""
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return ""
-
-
-@app.post("/api/sessions/{session_name}/upload")
-async def api_upload_file(session_name: str, file: UploadFile = File(...)):
-    """Upload a file to the session's current working directory."""
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    cwd = get_session_cwd(session_name)
-    if not cwd:
-        return JSONResponse({"error": "Could not determine session working directory"}, status_code=500)
-
-    # Sanitize filename — keep only the basename
     filename = os.path.basename(file.filename or "upload")
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
@@ -757,274 +806,504 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
         content = await file.read()
         with open(dest, "wb") as f:
             f.write(content)
-        # Record in chat history
         size_kb = len(content) / 1024
         note = f"Uploaded {filename} ({size_kb:.1f} KB) to {cwd}"
         now = time.time()
-        entry = cache.setdefault(session_name, {})
+        entry = cache.setdefault(username, {})
         if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
+            entry["messages"] = _load_user_messages(username)
         entry["messages"].append({"role": "user", "text": note, "ts": now})
-        _save_messages()
+        _save_user_messages(username, entry["messages"])
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-class SendCommand(BaseModel):
-    command: str
+# ---------------------------------------------------------------------------
+# Public file serving — dianao.tech/<username>/<path>
+# ---------------------------------------------------------------------------
+BLOCKED_PATTERNS = {".env", ".git", ".claude", "node_modules", "__pycache__", ".ssh", ".bash_history", "CLAUDE.md"}
 
 
-@app.post("/api/sessions/{session_name}/send")
-async def api_send_command(session_name: str, body: SendCommand):
-    """Send keystrokes to a tmux session, as if typed at the terminal."""
-    sessions = get_tmux_sessions()
-    names = [s["name"] for s in sessions]
-    if session_name not in names:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        # -l sends text literally (no key-name interpretation)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "-l", body.command],
-            capture_output=True, text=True, timeout=5
-        )
-        # Then press Enter as a separate key event
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5
-        )
-        # Record user message in chat history
-        now = time.time()
-        entry = cache.setdefault(session_name, {})
-        if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
-        entry["messages"].append({
-            "role": "user", "text": body.command, "ts": now
-        })
-        _save_messages()
-        return JSONResponse({"ok": True, "sent": body.command})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+def _is_blocked_path(path_parts: list[str]) -> bool:
+    for part in path_parts:
+        if part.startswith("."):
+            return True
+        if part in BLOCKED_PATTERNS:
+            return True
+    return False
 
 
+@app.get("/{username}/{file_path:path}")
+async def serve_user_file(username: str, file_path: str = ""):
+    # Check user exists
+    if not user_exists(username):
+        return HTMLResponse("<h1>404 - User not found</h1>", status_code=404)
 
-HTML_PAGE = r"""<!doctype html>
+    user_dir = get_user_dir(username)
+    if not file_path or file_path == "/":
+        file_path = "index.html"
+
+    # Security: block sensitive paths
+    parts = file_path.split("/")
+    if _is_blocked_path(parts):
+        return HTMLResponse("<h1>403 - Forbidden</h1>", status_code=403)
+
+    full_path = os.path.join(user_dir, file_path)
+    real_path = os.path.realpath(full_path)
+
+    # Security: prevent path traversal
+    if not real_path.startswith(os.path.realpath(user_dir)):
+        return HTMLResponse("<h1>403 - Forbidden</h1>", status_code=403)
+
+    # If it's a directory, look for index.html
+    if os.path.isdir(real_path):
+        index_path = os.path.join(real_path, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+        return HTMLResponse("<h1>404 - Not found</h1>", status_code=404)
+
+    if os.path.isfile(real_path):
+        return FileResponse(real_path)
+
+    return HTMLResponse("<h1>404 - Not found</h1>", status_code=404)
+
+
+# Also handle the bare username path (no trailing slash)
+@app.get("/{username}")
+async def serve_user_root(username: str):
+    # Don't intercept known routes
+    if username in {"favicon.ico", "robots.txt"}:
+        return HTMLResponse("", status_code=404)
+    return await serve_user_file(username, "")
+
+
+# ---------------------------------------------------------------------------
+# HTML Pages
+# ---------------------------------------------------------------------------
+
+LANDING_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>tmux Dashboard</title>
-<link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%236e7681'/></svg>">
+<title>Vibe Coder — Build apps with AI, instantly live</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e1e4e8;min-height:100vh}
+.hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at center,rgba(99,102,241,.08) 0%,transparent 70%);animation:glow 8s ease-in-out infinite alternate}
+@keyframes glow{0%{transform:translate(0,0)}100%{transform:translate(5%,3%)}}
+.logo{font-size:3.5rem;font-weight:800;background:linear-gradient(135deg,#818cf8,#c084fc,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:16px;position:relative;z-index:1}
+.tagline{font-size:1.4rem;color:#9ca3af;max-width:600px;line-height:1.6;margin-bottom:48px;position:relative;z-index:1}
+.tagline em{color:#c084fc;font-style:normal;font-weight:600}
+.cta-group{display:flex;gap:16px;position:relative;z-index:1;flex-wrap:wrap;justify-content:center}
+.cta{display:inline-flex;align-items:center;gap:8px;padding:14px 32px;border-radius:12px;font-size:1rem;font-weight:600;text-decoration:none;transition:all .2s}
+.cta-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none}
+.cta-primary:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(99,102,241,.4)}
+.cta-secondary{background:transparent;color:#c084fc;border:1px solid #c084fc44}
+.cta-secondary:hover{background:#c084fc11;transform:translateY(-2px)}
+.features{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;max-width:900px;margin:60px auto 0;padding:0 20px;position:relative;z-index:1}
+.feature{background:#12121a;border:1px solid #1e1e2e;border-radius:16px;padding:28px;text-align:left}
+.feature-icon{font-size:1.5rem;margin-bottom:12px}
+.feature h3{color:#f0f6fc;font-size:1rem;margin-bottom:8px}
+.feature p{color:#6b7280;font-size:.9rem;line-height:1.5}
+.how{max-width:700px;margin:80px auto 0;text-align:center;position:relative;z-index:1;padding:0 20px}
+.how h2{font-size:1.8rem;color:#f0f6fc;margin-bottom:32px}
+.steps{display:flex;flex-direction:column;gap:20px;text-align:left}
+.step{display:flex;gap:16px;align-items:flex-start}
+.step-num{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem;flex-shrink:0}
+.step-text h4{color:#e5e7eb;margin-bottom:4px}
+.step-text p{color:#6b7280;font-size:.9rem}
+.footer{text-align:center;padding:40px 20px;color:#4b5563;font-size:.8rem;position:relative;z-index:1}
+@media(max-width:640px){.logo{font-size:2.5rem}.tagline{font-size:1.1rem}}
+</style></head>
+<body>
+<div class="hero">
+  <div class="logo">vibe coder</div>
+  <p class="tagline">Describe what you want. <em>AI builds it.</em> Your app goes live instantly at its own URL. No setup, no servers, no code needed.</p>
+  <div class="cta-group">
+    <a href="/signup" class="cta cta-primary">Start Building</a>
+    <a href="/login" class="cta cta-secondary">Log In</a>
+  </div>
 
-/* Nav bar */
-.top-nav{background:#161b22;border-bottom:1px solid #30363d;padding:0 24px;display:flex;align-items:center;gap:0;overflow-x:auto;flex-shrink:0}
-.top-nav::-webkit-scrollbar{height:0}
-.nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
-.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
-.nav-item:hover{background:#1c2128}
-.nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
-.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
-.nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
-.nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
-.nav-indicators{display:flex;align-items:center;gap:5px}
-.nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.nav-dot.busy{background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite}
-.nav-dot.idle{background:#3fb950}
-.nav-dot.unknown{background:#d2a8ff}
-.nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
-.nav-attached.yes{background:#238636;color:#fff}
-.nav-attached.no{background:#6e768155;color:#8b949e}
-.nav-spacer{flex:1}
-.nav-status-text{font-size:.75rem;color:#6e7681;white-space:nowrap;padding-right:12px}
-.nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
-.nav-refresh-btn:hover{background:#388bfd}
-.nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
-.nav-new-btn:hover{background:#2ea043}
+  <div class="features">
+    <div class="feature">
+      <div class="feature-icon">💬</div>
+      <h3>Chat to build</h3>
+      <p>Describe your app in plain English. Claude Code writes, runs, and deploys it for you in real time.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">🌐</div>
+      <h3>Instantly live</h3>
+      <p>Everything you build gets a public URL immediately. Share your creation with anyone, anywhere.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">🔒</div>
+      <h3>Your own sandbox</h3>
+      <p>Each user gets an isolated workspace. Build freely without worrying about breaking anything.</p>
+    </div>
+  </div>
 
-/* Main */
-.main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
+  <div class="how">
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-text">
+          <h4>Sign up in seconds</h4>
+          <p>Pick a username and password. That's it — your workspace is ready.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-text">
+          <h4>Tell Claude what to build</h4>
+          <p>Type a message like "Build me a portfolio site with a dark theme" and watch it happen.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-text">
+          <h4>See it live</h4>
+          <p>Your project is immediately available at dianao.tech/your-username — share it with the world.</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
-/* Detail header */
-.detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px}
-.detail-header-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
-.detail-title-text{font-size:1.3rem;font-weight:600;color:#f0f6fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-.detail-badges{display:flex;gap:8px;align-items:center;flex-shrink:0}
-.status-pill{font-size:.75rem;padding:3px 12px;border-radius:12px;font-weight:600;display:flex;align-items:center;gap:5px}
-.status-pill.busy{background:#f8514922;color:#f85149;border:1px solid #f8514944}
-.status-pill.idle{background:#3fb95022;color:#3fb950;border:1px solid #3fb95044}
-.status-pill.unknown{background:#d2a8ff22;color:#d2a8ff;border:1px solid #d2a8ff44}
-.status-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
-.status-pill.busy .status-dot{background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite}
-.status-pill.idle .status-dot{background:#3fb950}
-.status-pill.unknown .status-dot{background:#d2a8ff}
-.badge{font-size:.7rem;padding:2px 8px;border-radius:12px;font-weight:500}
-.badge.attached{background:#238636;color:#fff}
-.badge.detached{background:#6e7681;color:#fff}
-.btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
-.btn-danger:hover{background:#3d1214}
+  <div class="footer">
+    <p>Powered by Claude Code &middot; Built with vibes</p>
+  </div>
+</div>
+</body></html>"""
+
+LOGIN_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Log In — Vibe Coder</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e1e4e8;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#12121a;border:1px solid #1e1e2e;border-radius:16px;padding:36px;width:380px;max-width:calc(100vw - 32px)}
+.brand{font-size:1.4rem;font-weight:700;background:linear-gradient(135deg,#818cf8,#c084fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px}
+.subtitle{color:#6b7280;font-size:.85rem;margin-bottom:24px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:.8rem;color:#9ca3af;margin-bottom:6px;font-weight:500}
+.field input{width:100%;background:#0a0a0f;border:1px solid #2d2d3d;border-radius:8px;color:#e6edf3;padding:11px 14px;font-size:.95rem;outline:none;transition:border-color .15s}
+.field input:focus{border-color:#6366f1}
+.err{color:#f87171;font-size:.8rem;margin-bottom:12px;display:none;padding:8px 12px;background:#f8717111;border-radius:8px}
+.err.show{display:block}
+.submit{width:100%;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;cursor:pointer;font-size:.95rem;font-weight:600;transition:transform .15s,box-shadow .15s}
+.submit:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(99,102,241,.3)}
+.links{margin-top:20px;text-align:center;font-size:.85rem;color:#6b7280}
+.links a{color:#818cf8;text-decoration:none}
+.links a:hover{text-decoration:underline}
+</style></head>
+<body>
+<form class="card" method="POST" action="/login">
+  <div class="brand">vibe coder</div>
+  <p class="subtitle">Welcome back. Log in to your workspace.</p>
+  <div class="err" id="err"></div>
+  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
+  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+  <button class="submit" type="submit">Log In</button>
+  <div class="links">Don't have an account? <a href="/signup">Sign up</a></div>
+</form>
+<script>
+const p=new URLSearchParams(location.search);
+const msgs={invalid:'Invalid username or password.',missing:'Please fill in all fields.'};
+const e=p.get('err');
+if(e&&msgs[e]){const el=document.getElementById('err');el.textContent=msgs[e];el.classList.add('show')}
+</script>
+</body></html>"""
+
+SIGNUP_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sign Up — Vibe Coder</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e1e4e8;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#12121a;border:1px solid #1e1e2e;border-radius:16px;padding:36px;width:380px;max-width:calc(100vw - 32px)}
+.brand{font-size:1.4rem;font-weight:700;background:linear-gradient(135deg,#818cf8,#c084fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px}
+.subtitle{color:#6b7280;font-size:.85rem;margin-bottom:24px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:.8rem;color:#9ca3af;margin-bottom:6px;font-weight:500}
+.field input{width:100%;background:#0a0a0f;border:1px solid #2d2d3d;border-radius:8px;color:#e6edf3;padding:11px 14px;font-size:.95rem;outline:none;transition:border-color .15s}
+.field input:focus{border-color:#6366f1}
+.hint{font-size:.75rem;color:#4b5563;margin-top:4px}
+.err{color:#f87171;font-size:.8rem;margin-bottom:12px;display:none;padding:8px 12px;background:#f8717111;border-radius:8px}
+.err.show{display:block}
+.submit{width:100%;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;padding:12px;border-radius:8px;cursor:pointer;font-size:.95rem;font-weight:600;transition:transform .15s,box-shadow .15s}
+.submit:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(99,102,241,.3)}
+.url-preview{margin-top:12px;background:#0a0a0f;border:1px solid #2d2d3d;border-radius:8px;padding:10px 14px;font-size:.85rem;color:#6b7280;font-family:'SF Mono',monospace}
+.url-preview span{color:#c084fc}
+.links{margin-top:20px;text-align:center;font-size:.85rem;color:#6b7280}
+.links a{color:#818cf8;text-decoration:none}
+.links a:hover{text-decoration:underline}
+</style></head>
+<body>
+<form class="card" method="POST" action="/signup">
+  <div class="brand">vibe coder</div>
+  <p class="subtitle">Pick a username — it becomes your URL.</p>
+  <div class="err" id="err"></div>
+  <div class="field">
+    <label>Username</label>
+    <input name="username" id="username" autocomplete="username" autofocus
+      placeholder="your-name" oninput="updatePreview()">
+    <div class="hint">3-24 characters. Letters, numbers, dashes, underscores.</div>
+  </div>
+  <div class="url-preview">Your site: dianao.tech/<span id="preview">___</span></div>
+  <div class="field" style="margin-top:16px">
+    <label>Password</label>
+    <input name="password" type="password" autocomplete="new-password" placeholder="6+ characters">
+  </div>
+  <button class="submit" type="submit">Create Account</button>
+  <div class="links">Already have an account? <a href="/login">Log in</a></div>
+</form>
+<script>
+function updatePreview(){
+  const v=document.getElementById('username').value.toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  document.getElementById('preview').textContent=v||'___';
+}
+const p=new URLSearchParams(location.search);
+const msgs={
+  taken:'Username already taken. Try another.',
+  missing:'Please fill in all fields.',
+  length:'Username must be 3-24 characters.',
+  format:'Username can only contain letters, numbers, dashes, underscores.',
+  weakpw:'Password must be at least 6 characters.',
+  reserved:'That username is reserved. Try another.'
+};
+const e=p.get('err');
+if(e&&msgs[e]){const el=document.getElementById('err');el.textContent=msgs[e];el.classList.add('show')}
+</script>
+</body></html>"""
+
+APP_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Vibe Coder — Workspace</title>
+<link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
+
+/* Top bar */
+.top-bar{background:#12121a;border-bottom:1px solid #1e1e2e;padding:0 20px;display:flex;align-items:center;height:52px;flex-shrink:0}
+.top-brand{font-size:.95rem;font-weight:700;background:linear-gradient(135deg,#818cf8,#c084fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-right:16px}
+.top-url{font-size:.8rem;color:#6b7280;font-family:'SF Mono','Fira Code',monospace;background:#0a0a0f;padding:5px 12px;border-radius:6px;border:1px solid #1e1e2e;display:flex;align-items:center;gap:8px}
+.top-url a{color:#818cf8;text-decoration:none}
+.top-url a:hover{text-decoration:underline}
+.copy-btn{background:none;border:none;color:#6b7280;cursor:pointer;font-size:.75rem;padding:2px 6px;border-radius:4px;transition:color .15s}
+.copy-btn:hover{color:#c084fc}
+.top-spacer{flex:1}
+.top-status{display:flex;align-items:center;gap:8px;font-size:.8rem;color:#6b7280;margin-right:16px}
+.status-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.status-dot.busy{background:#f87171;animation:pulse 1.5s ease-in-out infinite}
+.status-dot.idle{background:#34d399}
+.status-dot.unknown{background:#a78bfa}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.top-user{font-size:.8rem;color:#9ca3af;margin-right:12px}
+.top-logout{background:#1e1e2e;color:#9ca3af;border:1px solid #2d2d3d;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;text-decoration:none;transition:color .15s}
+.top-logout:hover{color:#f87171;border-color:#f8717144}
+
+/* Main layout */
+.workspace{flex:1;display:flex;flex-direction:column;max-width:1000px;width:100%;margin:0 auto;padding:16px 20px}
+
+/* Project header */
+.project-header{margin-bottom:12px}
+.project-title{font-size:1.3rem;font-weight:600;color:#f0f6fc}
+.project-desc{color:#6b7280;font-size:.9rem;margin-top:4px}
 
 /* Tabs */
-.tab-bar{display:flex;border-bottom:1px solid #21262d}
-.tab{padding:10px 20px;font-size:.85rem;font-weight:500;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;user-select:none}
+.tab-bar{display:flex;border-bottom:1px solid #1e1e2e;margin-bottom:0}
+.tab{padding:10px 20px;font-size:.85rem;font-weight:500;color:#6b7280;cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;user-select:none}
 .tab:hover{color:#c9d1d9}
-.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
-.tab-content{display:none}
-.tab-content.active{display:flex;flex-direction:column;flex:1;min-height:0}
+.tab.active{color:#818cf8;border-bottom-color:#818cf8}
+.tab-content{display:none;flex-direction:column;flex:1;min-height:0}
+.tab-content.active{display:flex}
 
-/* Chat tab */
+/* Chat */
 .chat-wrap{display:flex;flex-direction:column;flex:1;min-height:0}
-.chat-messages{flex:1;overflow-y:auto;padding:16px 0;display:flex;flex-direction:column;gap:12px;min-height:120px;max-height:calc(100vh - 300px)}
+.chat-messages{flex:1;overflow-y:auto;padding:16px 0;display:flex;flex-direction:column;gap:12px;min-height:120px;max-height:calc(100vh - 260px)}
 .chat-messages::-webkit-scrollbar{width:6px}
 .chat-messages::-webkit-scrollbar-track{background:transparent}
-.chat-messages::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
-.chat-msg{max-width:85%;padding:12px 16px;border-radius:12px;font-size:1.05rem;line-height:1.6;position:relative}
-.chat-msg.user{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
-.chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
-.chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
+.chat-messages::-webkit-scrollbar-thumb{background:#2d2d3d;border-radius:3px}
+.chat-msg{max-width:85%;padding:12px 16px;border-radius:14px;font-size:1.02rem;line-height:1.6;position:relative;word-wrap:break-word}
+.chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,#4f46e5,#6d28d9);color:#fff;border-bottom-right-radius:4px}
+.chat-msg.assistant{align-self:flex-start;background:#12121a;border:1px solid #1e1e2e;color:#c9d1d9;border-bottom-left-radius:4px}
+.chat-meta{font-size:.7rem;color:#4b5563;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
-.chat-typing{align-self:flex-start;padding:10px 14px;background:#161b22;border:1px solid #30363d;border-radius:12px;border-bottom-left-radius:4px;color:#8b949e;font-size:.85rem;font-style:italic}
-.chat-typing .dots{display:inline-block;animation:typing 1.4s infinite}
-@keyframes typing{0%,80%,100%{opacity:.3}40%{opacity:1}}
+.chat-typing{align-self:flex-start;padding:10px 14px;background:#12121a;border:1px solid #1e1e2e;border-radius:14px;border-bottom-left-radius:4px;color:#6b7280;font-size:.85rem;font-style:italic}
 
-/* Command bar */
-.cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:hidden;flex-shrink:0}
-.cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:none;min-height:44px;max-height:160px;line-height:1.4;overflow-y:auto}
-.cmd-input::placeholder{color:#484f58}
-.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end}
-.cmd-upload{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
-.cmd-upload:hover{color:#58a6ff}
+/* Cmd bar */
+.cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:10px;overflow:hidden;flex-shrink:0}
+.cmd-prompt{padding:12px 0 12px 14px;color:#818cf8;font-family:'SF Mono','Fira Code',monospace;font-size:1rem;font-weight:600;user-select:none}
+.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',monospace;font-size:1rem;padding:12px;resize:none;min-height:44px;max-height:160px;line-height:1.4;overflow-y:auto}
+.cmd-input::placeholder{color:#3d3d4d}
+.cmd-send{border:none;border-left:1px solid #1e1e2e;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#12121a;color:#818cf8;cursor:pointer;font-weight:600;transition:background .15s}
+.cmd-send:hover{background:#1e1e2e}
+.cmd-upload{border:none;border-left:1px solid #1e1e2e;border-radius:0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#12121a;color:#6b7280;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-upload:hover{color:#818cf8}
 
-/* Raw tab */
-.tab-raw{padding-top:16px}
+/* Raw */
+.raw-wrap{padding-top:12px;display:flex;flex-direction:column;flex:1}
 .raw-controls{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.raw-info{color:#6e7681;font-size:.75rem}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:300px;overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
-.raw-output::-webkit-scrollbar{width:6px;height:6px}
-.raw-output::-webkit-scrollbar-track{background:#0d1117}
-.raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+.raw-info{color:#4b5563;font-size:.75rem}
+.raw-output{background:#0a0a0f;border:1px solid #1e1e2e;border-radius:10px;padding:12px;font-family:'SF Mono','Fira Code',monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:300px;overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
+.raw-cmd-bar{margin-top:8px}
 
-/* Info tab */
-.tab-info{padding-top:20px}
-.tier{margin-bottom:18px}
-.tier:last-of-type{margin-bottom:0}
-.tier-label{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;display:flex;align-items:center;gap:6px}
-.tier-label .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
-.tier-description .tier-label{color:#8b949e}
-.tier-description .dot{background:#8b949e}
-.tier-description .tier-text{color:#c9d1d9;font-weight:500}
-.tier-progress .tier-label{color:#d2a8ff}
-.tier-progress .dot{background:#d2a8ff}
-.tier-text{color:#b1bac4;line-height:1.6;font-size:1.05rem}
-.tier-text.loading{color:#6e7681;font-style:italic}
-
-/* Footer */
-.detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
+/* Info */
+.info-wrap{padding-top:16px}
+.tier{margin-bottom:16px}
+.tier-label{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+.tier-label .dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:#6b7280}
+.tier-progress .tier-label{color:#c084fc}
+.tier-progress .dot{background:#c084fc}
+.tier-text{color:#b1bac4;line-height:1.6;font-size:1rem}
+.info-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #1e1e2e;padding-top:12px;margin-top:12px}
 .timestamps{display:flex;gap:16px;flex-wrap:wrap}
-.ts{color:#484f58;font-size:.75rem}
-.ts span{color:#6e7681}
+.ts{color:#3d3d4d;font-size:.75rem}
+.ts span{color:#6b7280}
 .btn-group{display:flex;gap:8px}
-.btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;transition:background .15s}
-.btn:hover{background:#30363d}
+.btn{background:#12121a;color:#c9d1d9;border:1px solid #1e1e2e;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:.8rem;transition:background .15s}
+.btn:hover{background:#1e1e2e}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.btn-full{background:#1c2333;border-color:#388bfd44;color:#58a6ff}
-.btn-full:hover{background:#253049}
-
-/* Modal */
-.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
-.modal-overlay.active{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;min-width:340px;max-width:440px}
-.modal h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem}
-.modal p{color:#8b949e;font-size:.9rem;margin-bottom:16px;line-height:1.5}
-.modal-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 12px;font-size:.9rem;margin-bottom:16px;outline:none}
-.modal-input:focus{border-color:#58a6ff}
-.modal-input::placeholder{color:#484f58}
-.modal-actions{display:flex;gap:8px;justify-content:flex-end}
-.modal-cancel{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.85rem}
-.modal-cancel:hover{background:#30363d}
-.modal-confirm-create{background:#238636;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:500}
-.modal-confirm-create:hover{background:#2ea043}
-.modal-confirm-delete{background:#da3633;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:500}
-.modal-confirm-delete:hover{background:#f85149}
-
-.spinner{display:inline-block;width:12px;height:12px;border:2px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin .8s linear infinite;margin-right:4px;vertical-align:middle}
+.btn-full{background:#1a1a2e;border-color:#6366f144;color:#818cf8}
+.btn-full:hover{background:#252540}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid #1e1e2e;border-top-color:#818cf8;border-radius:50%;animation:spin .8s linear infinite;margin-right:4px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
-.empty{text-align:center;color:#8b949e;padding:60px 20px;font-size:1.1rem}
-@keyframes pulse-glow{0%,100%{opacity:1}50%{opacity:.5}}
+.empty{text-align:center;color:#6b7280;padding:60px 20px;font-size:1rem}
+
+/* Welcome overlay */
+.welcome{background:#12121a;border:1px solid #1e1e2e;border-radius:14px;padding:24px;margin-bottom:16px}
+.welcome h3{color:#f0f6fc;margin-bottom:8px;font-size:1rem}
+.welcome p{color:#6b7280;font-size:.9rem;line-height:1.5}
+.welcome code{background:#0a0a0f;padding:2px 6px;border-radius:4px;font-size:.85rem;color:#c084fc}
 
 /* Mobile */
-@media(max-width:768px){
-  .top-nav{padding:0 8px}
-  .nav-brand{padding:10px 8px 10px 0;margin-right:2px;font-size:.75rem}
-  .nav-item{padding:8px 10px;gap:5px}
-  .nav-title{display:none}
-  .nav-attached{display:none}
-  .nav-status-text{display:none}
-  .nav-refresh-btn{padding:5px 10px;font-size:.75rem}
-  .nav-new-btn{width:28px;height:28px;font-size:1rem;margin-right:4px}
-  .main{padding:12px}
-  .detail-header{flex-direction:column;align-items:flex-start;gap:8px}
-  .detail-title-text{font-size:1.1rem}
-  .detail-badges{flex-wrap:wrap}
+@media(max-width:640px){
+  .top-bar{padding:0 12px;gap:8px}
+  .top-url{display:none}
+  .workspace{padding:12px}
   .chat-msg{max-width:92%}
-  .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
-  .modal{min-width:280px;margin:0 16px}
+  .chat-messages{max-height:calc(100vh - 280px)}
 }
 </style></head>
 <body>
-<nav class="top-nav" id="top-nav">
-  <span class="nav-brand">tmux</span>
-  <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
-  <span class="nav-spacer"></span>
-  <span class="nav-status-text" id="status-info">Watching for changes...</span>
-</nav>
-<div class="main" id="main"></div>
-<div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
-  <div class="modal" id="modal-content"></div>
+<div class="top-bar">
+  <span class="top-brand">vibe coder</span>
+  <div class="top-url">
+    <a href="https://__DOMAIN__/__USERNAME__/" target="_blank">__DOMAIN__/__USERNAME__</a>
+    <button class="copy-btn" onclick="copyUrl()" title="Copy URL">copy</button>
+  </div>
+  <span class="top-spacer"></span>
+  <div class="top-status" id="top-status">
+    <span class="status-dot unknown" id="top-dot"></span>
+    <span id="status-text">connecting...</span>
+  </div>
+  <span class="top-user" id="top-user">__USERNAME__</span>
+  <a href="/logout" class="top-logout">Log out</a>
+</div>
+
+<div class="workspace">
+  <div class="project-header">
+    <div class="project-title" id="project-title">Your Workspace</div>
+    <div class="project-desc" id="project-desc">Loading...</div>
+  </div>
+
+  <div class="tab-bar" id="tab-bar">
+    <div class="tab active" onclick="switchTab('chat')">Chat</div>
+    <div class="tab" onclick="switchTab('raw')">Terminal</div>
+    <div class="tab" onclick="switchTab('info')">Info</div>
+  </div>
+
+  <div class="tab-content active" id="tab-chat">
+    <div class="chat-wrap">
+      <div class="chat-messages" id="chat-messages">
+        <div class="welcome" id="welcome">
+          <h3>Welcome to your workspace!</h3>
+          <p>Claude Code is ready. Tell it what to build — for example:<br>
+          <code>Build me a portfolio website with a dark theme</code><br>
+          Your project will be live at <a href="https://__DOMAIN__/__USERNAME__/" target="_blank" style="color:#818cf8">__DOMAIN__/__USERNAME__</a></p>
+        </div>
+      </div>
+      <div class="cmd-bar">
+        <span class="cmd-prompt">&gt;</span>
+        <textarea class="cmd-input" id="cmd-chat" rows="1"
+          placeholder="Tell Claude what to build..."
+          onkeydown="handleKey(event,'chat')"
+          oninput="autoGrow(this)"
+          autocomplete="off" spellcheck="false"></textarea>
+        <button class="cmd-send" onclick="sendChat()">Send</button>
+        <button class="cmd-upload" onclick="document.getElementById('upload-input').click()" title="Upload file">&#x1F4CE;</button>
+        <input type="file" id="upload-input" style="display:none" onchange="uploadFile(this)" multiple>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-raw">
+    <div class="raw-wrap">
+      <div class="raw-controls">
+        <span class="raw-info" id="raw-info">Click to load</span>
+        <button class="btn" onclick="loadRaw()">Reload</button>
+      </div>
+      <div class="raw-output" id="raw-output">Loading terminal output...</div>
+      <div class="cmd-bar raw-cmd-bar">
+        <span class="cmd-prompt">$</span>
+        <textarea class="cmd-input" id="cmd-raw" rows="1"
+          placeholder="Type a command..."
+          onkeydown="handleKey(event,'raw')"
+          oninput="autoGrow(this)"
+          autocomplete="off" spellcheck="false"></textarea>
+        <button class="cmd-send" onclick="sendRaw()">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-info">
+    <div class="info-wrap">
+      <div class="tier">
+        <div class="tier-label"><span class="dot"></span>Project</div>
+        <div class="tier-text" id="info-desc">Loading...</div>
+      </div>
+      <div class="tier tier-progress">
+        <div class="tier-label"><span class="dot"></span>Progress</div>
+        <div class="tier-text" id="info-prog">Loading...</div>
+      </div>
+      <div class="info-footer">
+        <div class="timestamps">
+          <div class="ts">project: <span id="ts-desc">-</span></div>
+          <div class="ts">progress: <span id="ts-prog">-</span></div>
+          <div class="ts">live: <span id="ts-rt">-</span></div>
+        </div>
+        <div class="btn-group">
+          <button class="btn" id="btn-refresh" onclick="refreshSession()">Update</button>
+          <button class="btn btn-full" id="btn-full" onclick="refreshFull()">Full</button>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
-const navEl=document.getElementById('top-nav');
-const mainEl=document.getElementById('main');
-const statusInfoEl=document.getElementById('status-info');
-const BASE='/tmux';
-let sessions=[];
-let selectedSession=null;
+const USERNAME='__USERNAME__';
+const DOMAIN='__DOMAIN__';
+const BASE='';
+let chatMessages=[];
+let currentTab='chat';
+let lastStatus='';
 let pollTimer=null;
-const activeTabs={};
-const rawCache={};
-const lastStatus={};
-// Local chat messages mirror (kept in sync with server)
-const chatMessages={};
-// Preserve textarea drafts across re-renders
-const draftText={};
+let rawLoaded=false;
 
-function saveDrafts(){
-  ['chat','raw'].forEach(tab=>{
-    sessions.forEach(s=>{
-      const el=document.getElementById('cmd-'+tab+'-'+s.name);
-      if(el&&el.value)draftText[tab+'-'+s.name]=el.value;
-      else delete draftText[tab+'-'+s.name];
-    });
-  });
-}
-function restoreDrafts(){
-  ['chat','raw'].forEach(tab=>{
-    sessions.forEach(s=>{
-      const key=tab+'-'+s.name;
-      const el=document.getElementById('cmd-'+tab+'-'+s.name);
-      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
-    });
-  });
-}
-
-function updateFavicon(status){
-  const colors={busy:'%23f85149',idle:'%233fb950',unknown:'%236e7681'};
-  const c=colors[status]||colors.unknown;
-  const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
-  const link=document.getElementById('favicon');
-  if(link)link.href=svg;
+function copyUrl(){
+  navigator.clipboard.writeText('https://'+DOMAIN+'/'+USERNAME+'/');
+  const btn=document.querySelector('.copy-btn');
+  btn.textContent='copied!';
+  setTimeout(()=>btn.textContent='copy',1500);
 }
 
 function timeAgo(ts){
@@ -1037,8 +1316,7 @@ function timeAgo(ts){
 }
 function fmtTime(ts){
   if(!ts)return'';
-  const d=new Date(ts*1000);
-  return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  return new Date(ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 }
 function esc(str){
   if(!str)return'';
@@ -1046,481 +1324,276 @@ function esc(str){
   d.textContent=str;
   return d.innerHTML;
 }
-function statusLabel(s){
-  if(s==='busy')return'Busy';
-  if(s==='idle')return'Idle';
-  return'...';
+
+function updateFavicon(status){
+  const colors={busy:'%23f87171',idle:'%2334d399',unknown:'%23a78bfa'};
+  const c=colors[status]||colors.unknown;
+  document.getElementById('favicon').href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
 }
 
-function renderNav(){
-  navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
-  const brand=navEl.querySelector('.nav-brand');
-  sessions.forEach(s=>{
-    const item=document.createElement('div');
-    item.className='nav-item'+(s.name===selectedSession?' active':'');
-    item.id='nav-'+s.name;
-    item.onclick=()=>selectSession(s.name);
-    item.innerHTML=`
-      <span class="nav-session-id">${esc(s.name)}</span>
-      <span class="nav-title" id="nav-title-${s.name}">${esc(s.title)||'Loading...'}</span>
-      <span class="nav-indicators">
-        <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
-        <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
-      </span>`;
-    brand.after(item);
-  });
-  const items=Array.from(navEl.querySelectorAll('.nav-item'));
-  items.reverse().forEach(item=>brand.after(item));
+function updateStatus(status,detail){
+  const dot=document.getElementById('top-dot');
+  const text=document.getElementById('status-text');
+  dot.className='status-dot '+(status||'unknown');
+  if(status==='busy')text.textContent=detail||'Working...';
+  else if(status==='idle')text.textContent=detail||'Ready';
+  else text.textContent='...';
+  updateFavicon(status);
 }
 
-function renderChatBubbles(name){
-  const msgs=chatMessages[name]||[];
-  return msgs.map(m=>`
-    <div class="chat-msg ${m.role}">
-      ${esc(m.text)}
-      <div class="chat-meta">${fmtTime(m.ts)}</div>
-    </div>`).join('');
-}
-
-function renderDetail(){
-  saveDrafts();
-  const s=sessions.find(x=>x.name===selectedSession);
-  if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
-  const tab=activeTabs[s.name]||'chat';
-  // Sync server messages into local store
-  if(s.messages && s.messages.length) chatMessages[s.name]=s.messages;
-  // Update favicon to match selected session
-  updateFavicon(s.activity_status);
-
-  mainEl.innerHTML=`
-    <div class="detail-header">
-      <div class="detail-header-left">
-        <span class="detail-title-text" id="title-${s.name}">${esc(s.title)||'Session '+esc(s.name)}</span>
-      </div>
-      <div class="detail-badges">
-        <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
-          <span class="status-dot"></span>
-          <span class="status-label">${statusLabel(s.activity_status)}</span>
-          ${s.activity_detail?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
-        </span>
-        <span class="badge ${s.attached?'attached':'detached'}">${s.attached?'attached':'detached'}</span>
-        <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
-      </div>
-    </div>
-
-    <div class="tab-bar">
-      <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
-      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Raw Output</div>
-      <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
-    </div>
-
-    <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
-      <div class="chat-wrap">
-        <div class="chat-messages" id="chat-${s.name}">
-          ${renderChatBubbles(s.name)}
-          ${s.activity_status==='busy'?'<div class="chat-typing"><span class="dots">...</span> Working</div>':''}
-        </div>
-        <div class="cmd-bar">
-          <span class="cmd-prompt">&gt;</span>
-          <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
-            placeholder="Send a message..."
-            onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this)"
-            autocomplete="off" spellcheck="false"></textarea>
-          <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
-          <button class="cmd-upload" onclick="document.getElementById('upload-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
-          <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
-        </div>
-      </div>
-    </div>
-
-    <div class="tab-content tab-raw ${tab==='raw'?'active':''}" id="tab-raw-${s.name}">
-      <div class="raw-controls">
-        <span class="raw-info" id="raw-info-${s.name}">Click to load raw output</span>
-        <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
-      </div>
-      <div class="raw-output" id="raw-${s.name}">Click "Raw Output" tab or "Reload" to fetch...</div>
-      <div class="cmd-bar">
-        <span class="cmd-prompt">$</span>
-        <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a command and press Enter..."
-          onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this)"
-          autocomplete="off" spellcheck="false"></textarea>
-        <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
-      </div>
-    </div>
-
-    <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
-      <div class="tier tier-description">
-        <div class="tier-label"><span class="dot"></span>Project</div>
-        <div class="tier-text" id="desc-${s.name}">${esc(s.description)||'Loading...'}</div>
-      </div>
-      <div class="tier tier-progress">
-        <div class="tier-label"><span class="dot"></span>Progress</div>
-        <div class="tier-text" id="prog-${s.name}">${esc(s.progress)||'Loading...'}</div>
-      </div>
-      <div class="detail-footer" style="margin-top:24px">
-        <div class="timestamps">
-          <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
-          <div class="ts">progress: <span id="ts-prog-${s.name}">${timeAgo(s.progress_at)}</span></div>
-          <div class="ts">live: <span id="ts-rt-${s.name}">${timeAgo(s.realtime_at)}</span></div>
-        </div>
-        <div class="btn-group">
-          <button class="btn" id="btn-${s.name}" onclick="refreshOne('${esc(s.name)}')">Update</button>
-          <button class="btn btn-full" id="btn-full-${s.name}" onclick="refreshFull('${esc(s.name)}')">Full</button>
-        </div>
-      </div>
-    </div>`;
-
-  // Restore draft text in textareas
-  restoreDrafts();
-  // Scroll chat to bottom
-  const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
-  // Auto-load raw
-  if(tab==='raw'&&!rawCache[s.name])loadRaw(s.name);
-}
-
-function selectSession(name){
-  selectedSession=name;
-  navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
-  const navItem=document.getElementById('nav-'+name);
-  if(navItem)navItem.classList.add('active');
-  renderDetail();
-}
-
-function switchTab(name,tab){
-  activeTabs[name]=tab;
-  const allTabs=mainEl.querySelectorAll('.tab-content');
-  allTabs.forEach(t=>t.classList.remove('active'));
-  const tabBar=mainEl.querySelector('.tab-bar');
-  if(tabBar)tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+function switchTab(name){
+  currentTab=name;
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  const tabs=document.querySelectorAll('.tab');
   const tabNames=['chat','raw','info'];
-  const idx=tabNames.indexOf(tab);
-  if(tabBar&&idx>=0){
-    const tabs=tabBar.querySelectorAll('.tab');
-    if(tabs[idx])tabs[idx].classList.add('active');
-  }
-  const target=document.getElementById('tab-'+tab+'-'+name);
-  if(target)target.classList.add('active');
-  if(tab==='raw'&&!rawCache[name])loadRaw(name);
-  if(tab==='chat'){
-    const chatEl=document.getElementById('chat-'+name);
-    if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+  const idx=tabNames.indexOf(name);
+  if(tabs[idx])tabs[idx].classList.add('active');
+  if(name==='raw'&&!rawLoaded)loadRaw();
+  if(name==='chat'){
+    const el=document.getElementById('chat-messages');
+    el.scrollTop=el.scrollHeight;
   }
 }
 
-function appendChatBubble(name,role,text,ts){
-  if(!chatMessages[name])chatMessages[name]=[];
-  // Avoid duplicate assistant messages
+function renderChatBubbles(){
+  const el=document.getElementById('chat-messages');
+  let html='';
+  if(chatMessages.length===0){
+    html=document.getElementById('welcome')?document.getElementById('welcome').outerHTML:'';
+  }
+  chatMessages.forEach(m=>{
+    html+='<div class="chat-msg '+m.role+'">'
+      +esc(m.text)
+      +'<div class="chat-meta">'+fmtTime(m.ts)+'</div>'
+      +'</div>';
+  });
+  el.innerHTML=html;
+  el.scrollTop=el.scrollHeight;
+}
+
+function appendBubble(role,text,ts){
   if(role==='assistant'){
-    const msgs=chatMessages[name];
-    for(let i=msgs.length-1;i>=0;i--){
-      if(msgs[i].role==='assistant'){
-        if(msgs[i].text===text)return;
+    for(let i=chatMessages.length-1;i>=0;i--){
+      if(chatMessages[i].role==='assistant'){
+        if(chatMessages[i].text===text)return;
         break;
       }
     }
   }
-  chatMessages[name].push({role,text,ts});
-  // If this session's chat is visible, append to DOM
-  if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
-    const chatEl=document.getElementById('chat-'+name);
-    if(chatEl){
-      // Remove typing indicator if present
-      const typing=chatEl.querySelector('.chat-typing');
-      if(typing)typing.remove();
-      const bubble=document.createElement('div');
-      bubble.className='chat-msg '+role;
-      bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
-      chatEl.appendChild(bubble);
-      chatEl.scrollTop=chatEl.scrollHeight;
-    }
+  chatMessages.push({role,text,ts});
+  const w=document.getElementById('welcome');
+  if(w)w.remove();
+  const el=document.getElementById('chat-messages');
+  const bubble=document.createElement('div');
+  bubble.className='chat-msg '+role;
+  bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+  const typing=el.querySelector('.chat-typing');
+  if(typing)typing.remove();
+  el.appendChild(bubble);
+  el.scrollTop=el.scrollHeight;
+}
+
+function showTyping(){
+  const el=document.getElementById('chat-messages');
+  if(!el.querySelector('.chat-typing')){
+    const d=document.createElement('div');
+    d.className='chat-typing';
+    d.textContent='Working...';
+    el.appendChild(d);
+    el.scrollTop=el.scrollHeight;
   }
+}
+function hideTyping(){
+  const el=document.getElementById('chat-messages');
+  const t=el.querySelector('.chat-typing');
+  if(t)t.remove();
 }
 
 function autoGrow(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,160)+'px';
 }
-function handleChatKey(e,name){
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
-}
-function handleRawKey(e,name){
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd(name,'raw')}
+function handleKey(e,src){
+  if(e.key==='Enter'&&!e.shiftKey){
+    e.preventDefault();
+    if(src==='chat')sendChat();
+    else sendRaw();
+  }
 }
 
-async function sendChat(name){
-  const input=document.getElementById('cmd-chat-'+name);
-  if(!input)return;
+async function sendChat(){
+  const input=document.getElementById('cmd-chat');
   const cmd=input.value.trim();
   if(!cmd)return;
   input.disabled=true;
-  // Show user bubble immediately
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
+  appendBubble('user',cmd,Date.now()/1000);
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    await fetch(BASE+'/api/session/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
-  }catch(e){alert('Failed to send.')}
+  }catch(e){alert('Failed to send')}
   input.disabled=false;
   input.focus();
 }
 
-async function uploadFile(name,input){
+async function sendRaw(){
+  const input=document.getElementById('cmd-raw');
+  const cmd=input.value.trim();
+  if(!cmd)return;
+  input.disabled=true;
+  appendBubble('user',cmd,Date.now()/1000);
+  try{
+    await fetch(BASE+'/api/session/send',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command:cmd})
+    });
+    input.value='';input.style.height='auto';
+    setTimeout(loadRaw,500);
+  }catch(e){alert('Failed to send')}
+  input.disabled=false;
+  input.focus();
+}
+
+async function uploadFile(input){
   if(!input.files||!input.files.length)return;
   for(const file of input.files){
     const fd=new FormData();
     fd.append('file',file);
     const sizeKb=(file.size/1024).toFixed(1);
-    appendChatBubble(name,'user',`Uploading ${file.name} (${sizeKb} KB)...`,Date.now()/1000);
+    appendBubble('user','Uploading '+file.name+' ('+sizeKb+' KB)...',Date.now()/1000);
     try{
-      const resp=await fetch(BASE+'/api/sessions/'+name+'/upload',{method:'POST',body:fd});
+      const resp=await fetch(BASE+'/api/session/upload',{method:'POST',body:fd});
       const data=await resp.json();
-      if(!resp.ok){
-        appendChatBubble(name,'assistant','Upload failed: '+(data.error||'Unknown error'),Date.now()/1000);
-      }
-    }catch(e){
-      appendChatBubble(name,'assistant','Upload failed: network error',Date.now()/1000);
-    }
+      if(!resp.ok)appendBubble('assistant','Upload failed: '+(data.error||'error'),Date.now()/1000);
+    }catch(e){appendBubble('assistant','Upload failed: network error',Date.now()/1000)}
   }
   input.value='';
 }
 
-async function sendCmd(name,source){
-  const inputId='cmd-'+source+'-'+name;
-  const input=document.getElementById(inputId);
-  if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
-  input.disabled=true;
-  // Also record in chat
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
+async function loadRaw(){
+  const el=document.getElementById('raw-output');
+  const info=document.getElementById('raw-info');
+  el.textContent='Loading...';
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({command:cmd})
-    });
-    input.value='';input.style.height='auto';
-    if(source==='raw')setTimeout(()=>loadRaw(name),500);
-  }catch(e){alert('Failed to send.')}
-  input.disabled=false;
-  input.focus();
-}
-
-async function loadRaw(name){
-  const rawEl=document.getElementById('raw-'+name);
-  const infoEl=document.getElementById('raw-info-'+name);
-  if(rawEl)rawEl.textContent='Loading...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw');
+    const resp=await fetch(BASE+'/api/session/raw');
     const data=await resp.json();
-    rawCache[name]=true;
-    if(rawEl){rawEl.textContent=data.raw||'(empty)';rawEl.scrollTop=rawEl.scrollHeight}
-    if(infoEl)infoEl.textContent=data.lines+' lines';
-    updateStatusPill(name,data.activity_status,data.activity_detail);
-  }catch(e){if(rawEl)rawEl.textContent='Error loading.'}
+    rawLoaded=true;
+    el.textContent=data.raw||'(empty)';
+    el.scrollTop=el.scrollHeight;
+    info.textContent=data.lines+' lines';
+    updateStatus(data.activity_status,data.activity_detail);
+  }catch(e){el.textContent='Error loading'}
 }
 
-function updateStatusPill(name,status,detail){
-  const pill=document.getElementById('status-'+name);
-  if(pill){
-    pill.className='status-pill '+(status||'unknown');
-    pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
-      +(detail?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
-  }
-  const navDot=document.getElementById('nav-dot-'+name);
-  if(navDot)navDot.className='nav-dot '+(status||'unknown');
-}
-
-function updateCard(s){
-  const navTitle=document.getElementById('nav-title-'+s.name);
-  if(navTitle&&s.title)navTitle.textContent=s.title;
-
-  // Sync messages from server response
-  if(s.messages&&s.messages.length){
-    const local=chatMessages[s.name]||[];
-    // Find new assistant messages from server not in local
-    s.messages.forEach(m=>{
-      if(m.role==='assistant'){
-        const exists=local.some(l=>l.role==='assistant'&&l.text===m.text);
-        if(!exists)appendChatBubble(s.name,'assistant',m.text,m.ts);
-      }
-    });
-  }
-
-  if(s.name!==selectedSession)return;
-  const titleEl=document.getElementById('title-'+s.name);
-  if(titleEl&&s.title)titleEl.textContent=s.title;
-  const desc=document.getElementById('desc-'+s.name);
-  const prog=document.getElementById('prog-'+s.name);
-  if(desc)desc.textContent=s.description||'';
-  if(prog)prog.textContent=s.progress||'';
-  const tsDesc=document.getElementById('ts-desc-'+s.name);
-  const tsProg=document.getElementById('ts-prog-'+s.name);
-  const tsRt=document.getElementById('ts-rt-'+s.name);
-  if(tsDesc)tsDesc.textContent=timeAgo(s.description_at);
-  if(tsProg)tsProg.textContent=timeAgo(s.progress_at);
-  if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
-  updateStatusPill(s.name,s.activity_status,s.activity_detail);
-
-  // Update typing indicator
-  const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl){
-    const existing=chatEl.querySelector('.chat-typing');
-    if(s.activity_status==='busy'&&!existing){
-      const typing=document.createElement('div');
-      typing.className='chat-typing';
-      typing.innerHTML='<span class="dots">...</span> Working';
-      chatEl.appendChild(typing);
-      chatEl.scrollTop=chatEl.scrollHeight;
-    }else if(s.activity_status!=='busy'&&existing){
-      existing.remove();
+async function loadSession(){
+  try{
+    const resp=await fetch(BASE+'/api/session');
+    const s=await resp.json();
+    if(s.title){
+      document.getElementById('project-title').textContent=s.title;
+      document.title='Vibe Coder \u2014 '+s.title;
     }
-  }
-}
-
-async function loadAll(){
-  try{
-    const resp=await fetch(BASE+'/api/sessions');
-    sessions=await resp.json();
-    sessions.forEach(s=>{
-      lastStatus[s.name]=s.activity_status;
-      if(s.messages&&s.messages.length)chatMessages[s.name]=s.messages;
-    });
-    if(!selectedSession&&sessions.length>0)selectedSession=sessions[0].name;
-    renderNav();
-    renderDetail();
-  }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
-  startStatusPolling();
-}
-
-async function refreshAllRealtime(){
-  for(const s of sessions){refreshOne(s.name)}
-}
-
-async function refreshOne(name){
-  const btn=document.getElementById('btn-'+name);
-  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>'}
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh',{method:'POST'});
-    const data=await resp.json();
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
-  }catch(e){}
-  if(btn){btn.disabled=false;btn.textContent='Update'}
-}
-
-async function refreshFull(name){
-  const btn=document.getElementById('btn-full-'+name);
-  const desc=document.getElementById('desc-'+name);
-  const prog=document.getElementById('prog-'+name);
-  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Full'}
-  [desc,prog].forEach(el=>{if(el)el.classList.add('loading')});
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh-all',{method:'POST'});
-    const data=await resp.json();
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
-  }catch(e){}
-  [desc,prog].forEach(el=>{if(el)el.classList.remove('loading')});
-  if(btn){btn.disabled=false;btn.textContent='Full'}
-}
-
-function startStatusPolling(){
-  if(pollTimer)clearInterval(pollTimer);
-  pollTimer=setInterval(pollStatus,10000);
+    if(s.description)document.getElementById('project-desc').textContent=s.description;
+    updateStatus(s.activity_status,s.activity_detail);
+    if(s.messages&&s.messages.length){
+      chatMessages=s.messages;
+      if(currentTab==='chat')renderChatBubbles();
+    }
+    document.getElementById('info-desc').textContent=s.description||'Loading...';
+    document.getElementById('info-prog').textContent=s.progress||'Loading...';
+    document.getElementById('ts-desc').textContent=timeAgo(s.description_at);
+    document.getElementById('ts-prog').textContent=timeAgo(s.progress_at);
+    document.getElementById('ts-rt').textContent=timeAgo(s.realtime_at);
+  }catch(e){console.error('Load failed',e)}
+  startPolling();
 }
 
 async function pollStatus(){
   try{
     const resp=await fetch(BASE+'/api/status');
-    const statuses=await resp.json();
-    let changed=false;
-    for(const st of statuses){
-      const prev=lastStatus[st.name];
-      if(prev&&prev!==st.activity_status){
-        changed=true;
-        lastStatus[st.name]=st.activity_status;
-        statusInfoEl.textContent='Session '+st.name+' changed...';
-        refreshOne(st.name);
-      }else{
-        lastStatus[st.name]=st.activity_status;
-      }
-      updateStatusPill(st.name,st.activity_status,st.activity_detail);
-      if(st.name===selectedSession)updateFavicon(st.activity_status);
+    const st=await resp.json();
+    const prev=lastStatus;
+    lastStatus=st.activity_status;
+    updateStatus(st.activity_status,st.activity_detail);
+    if(st.activity_status==='busy')showTyping();
+    else hideTyping();
+    if(prev&&prev!==st.activity_status){
+      refreshSession();
     }
-    if(!changed)statusInfoEl.textContent='Watching for changes...';
-  }catch(e){statusInfoEl.textContent='Status poll failed'}
+  }catch(e){}
 }
 
-function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
-
-function showCreateModal(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`
-    <h3>New tmux session</h3>
-    <p>Leave blank for an auto-assigned name, or enter a custom name.</p>
-    <input type="text" class="modal-input" id="new-session-name"
-      placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
-      onkeydown="if(event.key==='Enter')createSession()">
-    <div class="modal-actions">
-      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="createSession()">Create</button>
-    </div>`;
-  document.getElementById('modal-overlay').classList.add('active');
-  setTimeout(()=>document.getElementById('new-session-name').focus(),50);
+function startPolling(){
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(pollStatus,10000);
 }
 
-async function createSession(){
-  const input=document.getElementById('new-session-name');
-  const name=input?input.value.trim():'';
-  closeModal();
+async function refreshSession(){
+  const btn=document.getElementById('btn-refresh');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>'}
   try{
-    const resp=await fetch(BASE+'/api/sessions/create',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
-    });
-    const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed');return}
-    selectedSession=data.name;
-    await loadAll();
-  }catch(e){alert('Failed to create session.')}
+    const resp=await fetch(BASE+'/api/session/refresh',{method:'POST'});
+    const s=await resp.json();
+    if(s.title)document.getElementById('project-title').textContent=s.title;
+    if(s.description)document.getElementById('project-desc').textContent=s.description;
+    updateStatus(s.activity_status,s.activity_detail);
+    if(s.messages){
+      s.messages.forEach(m=>{
+        if(m.role==='assistant'){
+          const exists=chatMessages.some(l=>l.role==='assistant'&&l.text===m.text);
+          if(!exists)appendBubble('assistant',m.text,m.ts);
+        }
+      });
+    }
+    document.getElementById('info-desc').textContent=s.description||'';
+    document.getElementById('info-prog').textContent=s.progress||'';
+    document.getElementById('ts-desc').textContent=timeAgo(s.description_at);
+    document.getElementById('ts-prog').textContent=timeAgo(s.progress_at);
+    document.getElementById('ts-rt').textContent=timeAgo(s.realtime_at);
+  }catch(e){}
+  if(btn){btn.disabled=false;btn.textContent='Update'}
 }
 
-function showDeleteModal(name){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`
-    <h3>Kill session ${esc(name)}?</h3>
-    <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
-    <div class="modal-actions">
-      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-delete" onclick="deleteSession('${esc(name)}')">Kill Session</button>
-    </div>`;
-  document.getElementById('modal-overlay').classList.add('active');
-}
-
-async function deleteSession(name){
-  closeModal();
+async function refreshFull(){
+  const btn=document.getElementById('btn-full');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Full'}
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name,{method:'DELETE'});
-    const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed');return}
-    if(selectedSession===name)selectedSession=null;
-    delete chatMessages[name];
-    await loadAll();
-  }catch(e){alert('Failed to kill session.')}
+    const resp=await fetch(BASE+'/api/session/refresh-all',{method:'POST'});
+    const s=await resp.json();
+    if(s.title)document.getElementById('project-title').textContent=s.title;
+    if(s.description){
+      document.getElementById('project-desc').textContent=s.description;
+      document.getElementById('info-desc').textContent=s.description;
+    }
+    if(s.progress)document.getElementById('info-prog').textContent=s.progress;
+    updateStatus(s.activity_status,s.activity_detail);
+    if(s.messages){
+      s.messages.forEach(m=>{
+        if(m.role==='assistant'){
+          const exists=chatMessages.some(l=>l.role==='assistant'&&l.text===m.text);
+          if(!exists)appendBubble('assistant',m.text,m.ts);
+        }
+      });
+    }
+    document.getElementById('ts-desc').textContent=timeAgo(s.description_at);
+    document.getElementById('ts-prog').textContent=timeAgo(s.progress_at);
+    document.getElementById('ts-rt').textContent=timeAgo(s.realtime_at);
+  }catch(e){}
+  if(btn){btn.disabled=false;btn.textContent='Full'}
 }
 
-loadAll();
+loadSession();
 </script>
-</body></html>
-"""
+</body></html>"""
 
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
