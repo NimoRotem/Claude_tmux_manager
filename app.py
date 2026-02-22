@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict
+import glob as globmod
 
 from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -24,6 +25,45 @@ ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# --- Claude Code API key storage ---
+MESSAGES_DIR = Path.home() / ".tmux-dashboard"
+ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
+_stored_anthropic_key: str = ""
+
+
+def _load_anthropic_key() -> str:
+    global _stored_anthropic_key
+    try:
+        if ANTHROPIC_API_KEY_FILE.exists():
+            _stored_anthropic_key = ANTHROPIC_API_KEY_FILE.read_text().strip()
+    except Exception:
+        pass
+    return _stored_anthropic_key
+
+
+def _save_anthropic_key(key: str):
+    global _stored_anthropic_key
+    _stored_anthropic_key = key
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ANTHROPIC_API_KEY_FILE.write_text(key)
+        ANTHROPIC_API_KEY_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _clear_anthropic_key():
+    global _stored_anthropic_key
+    _stored_anthropic_key = ""
+    try:
+        if ANTHROPIC_API_KEY_FILE.exists():
+            ANTHROPIC_API_KEY_FILE.unlink()
+    except Exception:
+        pass
+
+
+_load_anthropic_key()
 
 app = FastAPI(root_path=ROOT_PATH)
 
@@ -305,33 +345,43 @@ def detect_activity(session_name: str) -> dict:
             if has_idle_prompt:
                 break
 
-        # If idle prompt present but NO "esc to interrupt" → truly idle
+        # --- Step 3: Check for active spinners/progress ---
+        # Scan a wider window (bottom 25 lines) because Claude Code's
+        # spinners and task indicators appear in the content area
+        # *above* the bottom chrome.  This MUST run before we return
+        # idle — the ❯ prompt is always visible even while Claude is
+        # executing tools / thinking / streaming.
+        window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
+        window_text = "\n".join(window)
+
+        # All checks are LINE-BY-LINE with start-of-line anchoring to
+        # avoid false positives from these same patterns appearing in
+        # conversation output text (e.g. Claude explaining its own UI).
+        SPINNER_ICONS = r'[✶✽✻·\*☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'
+        for line in window:
+            stripped = line.strip()
+            # ◼ at start of line (with optional ⎿ tree prefix) = running task
+            if re.match(r'^[⎿\s]*◼', stripped):
+                info["status"] = "busy"
+                info["detail"] = "Running task"
+                return info
+            # Spinner icon + verb… — generic catch-all for Claude spinners
+            if re.match(SPINNER_ICONS + r'\s+\w+…', stripped):
+                info["status"] = "busy"
+                # Extract detail from the spinner line itself
+                if '(thinking)' in stripped:
+                    info["detail"] = "Thinking"
+                elif 'thought for' in stripped:
+                    info["detail"] = "Thinking"
+                else:
+                    info["detail"] = "Working"
+                return info
+
+        # --- Step 4: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
             info["detail"] = "Waiting for input"
             return info
-
-        # --- Step 3: Check for active spinners/progress on bottom lines ---
-        busy_patterns = [
-            (r'Generating[….]',                     "Generating"),
-            (r'Reticulating[….]',                   "Thinking"),
-            (r'Whisking[….]',                       "Thinking"),
-            (r'Warping[….]',                        "Thinking"),
-            (r'Saut[ée]ing[….]',                    "Thinking"),
-            (r'Running[….]',                        "Running"),
-            (r'thought for \d+s\)',                  "Thinking"),
-            (r'thinking\)',                          "Thinking"),
-            (r'\d+m \d+s · ↓',                      "Processing"),
-            (r'Installing',                         "Installing"),
-            (r'Building',                           "Building"),
-            (r'Compiling',                          "Compiling"),
-            (r'Downloading',                        "Downloading"),
-        ]
-        for pattern, label in busy_patterns:
-            if re.search(pattern, bottom_text):
-                info["status"] = "busy"
-                info["detail"] = label
-                return info
 
         # "esc to interrupt" without a spinner = background tasks running
         if has_esc_to_interrupt:
@@ -685,6 +735,17 @@ async def api_create_session(body: CreateSession):
             created = name
         else:
             created = sessions[-1]["name"] if sessions else "unknown"
+        # Inject stored API key so Claude Code can authenticate
+        if _stored_anthropic_key:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "-l",
+                 f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         # Optionally launch a command in the new session
         if NEW_SESSION_CMD:
             subprocess.run(
@@ -771,6 +832,129 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# --- Claude Code auth management ---
+
+@app.get("/api/auth/claude-status")
+async def api_claude_auth_status():
+    result_data: dict = {"loggedIn": False, "hasApiKey": bool(_stored_anthropic_key)}
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            auth_info = json.loads(result.stdout.strip())
+            auth_info["hasApiKey"] = bool(_stored_anthropic_key)
+            return JSONResponse(auth_info)
+    except Exception as e:
+        result_data["error"] = str(e)
+    return JSONResponse(result_data)
+
+
+class SetApiKey(BaseModel):
+    apiKey: str
+
+
+@app.post("/api/auth/api-key")
+async def api_set_claude_key(body: SetApiKey):
+    key = body.apiKey.strip()
+    if key:
+        if not key.startswith(("sk-ant-", "sk-")):
+            return JSONResponse(
+                {"error": "Invalid API key format. Expected key starting with sk-ant- or sk-."},
+                status_code=400,
+            )
+        _save_anthropic_key(key)
+        return JSONResponse({"ok": True, "message": "API key stored."})
+    else:
+        _clear_anthropic_key()
+        return JSONResponse({"ok": True, "message": "API key cleared."})
+
+
+@app.post("/api/auth/logout")
+async def api_claude_auth_logout():
+    errors = []
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "logout"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            errors.append(result.stderr.strip() or "OAuth logout failed")
+    except Exception as e:
+        errors.append(str(e))
+    _clear_anthropic_key()
+    if errors:
+        return JSONResponse({"ok": True, "warnings": errors})
+    return JSONResponse({"ok": True})
+
+
+_usage_cache: dict = {"ts": 0, "data": {}}
+
+@app.get("/api/auth/usage")
+async def api_claude_usage():
+    """Token usage for today, parsed from Claude Code session JSONL files."""
+    now = time.time()
+    if now - _usage_cache["ts"] < 60:
+        return JSONResponse(_usage_cache["data"])
+
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    home = str(Path.home())
+    patterns = [
+        f"{home}/.claude/projects/*/*.jsonl",
+        f"{home}/.claude/projects/*/subagents/*.jsonl",
+        f"{home}/.claude/projects/*/*/subagents/*.jsonl",
+    ]
+    files: set = set()
+    for p in patterns:
+        files.update(globmod.glob(p))
+
+    input_tok = 0
+    output_tok = 0
+    cache_read = 0
+    cache_create = 0
+    msg_count = 0
+
+    for fpath in files:
+        try:
+            mtime = os.path.getmtime(fpath)
+            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
+                continue
+            with open(fpath) as f:
+                for line in f:
+                    d = json.loads(line)
+                    if d.get("type") != "assistant":
+                        continue
+                    ts = d.get("timestamp", "")
+                    if not ts.startswith(today):
+                        continue
+                    msg = d if "usage" in d else d.get("message", {})
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    input_tok += usage.get("input_tokens", 0)
+                    output_tok += usage.get("output_tokens", 0)
+                    cache_read += usage.get("cache_read_input_tokens", 0)
+                    cache_create += usage.get("cache_creation_input_tokens", 0)
+                    msg_count += 1
+        except Exception:
+            pass
+
+    data = {
+        "date": today,
+        "messages": msg_count,
+        "inputTokens": input_tok,
+        "outputTokens": output_tok,
+        "cacheReadTokens": cache_read,
+        "cacheCreateTokens": cache_create,
+        "totalTokens": input_tok + output_tok + cache_read + cache_create,
+    }
+    _usage_cache["ts"] = now
+    _usage_cache["data"] = data
+    return JSONResponse(data)
+
+
 class SendCommand(BaseModel):
     command: str
 
@@ -817,9 +1001,13 @@ HTML_PAGE = r"""<!doctype html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
 
-/* Nav bar */
-.top-nav{background:#161b22;border-bottom:1px solid #30363d;padding:0 24px;display:flex;align-items:center;gap:0;overflow-x:auto;flex-shrink:0}
+/* Nav wrapper — keeps right-side items pinned while tabs scroll */
+.nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0}
+/* Nav bar — scrollable session tabs area */
+.top-nav{padding:0 0 0 24px;display:flex;align-items:center;gap:0;overflow-x:auto;flex:1;min-width:0}
 .top-nav::-webkit-scrollbar{height:0}
+/* Pinned right section */
+.nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
 .nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
@@ -953,14 +1141,49 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .empty{text-align:center;color:#8b949e;padding:60px 20px;font-size:1.1rem}
 @keyframes pulse-glow{0%,100%{opacity:1}50%{opacity:.5}}
 
+/* Claude auth indicator */
+.claude-auth{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;border-radius:6px;transition:background .15s;user-select:none;flex-shrink:0;margin-right:4px}
+.claude-auth:hover{background:#1c2128}
+.claude-auth-label{font-size:.75rem;color:#c9d1d9;white-space:nowrap}
+.claude-auth .status-dot.idle{background:#3fb950}
+.claude-auth .status-dot.busy{background:#f85149}
+.claude-auth .status-dot.unknown{background:#6e7681}
+
+/* Auth dropdown */
+.auth-dropdown{display:none;position:fixed;top:46px;right:24px;z-index:100;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;min-width:310px;max-width:420px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.auth-dropdown.active{display:block}
+.auth-title{font-size:.9rem;font-weight:600;color:#f0f6fc;margin-bottom:10px}
+.auth-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;font-size:.8rem}
+.auth-row-label{color:#8b949e}
+.auth-row-value{color:#c9d1d9;font-weight:500}
+.auth-divider{border:none;border-top:1px solid #21262d;margin:10px 0}
+.auth-btn{padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;border:none;text-align:center;transition:all .15s;width:100%}
+.auth-btn-danger{background:#f8514922;color:#f85149;border:1px solid #f8514944}
+.auth-btn-danger:hover{background:#3d1214}
+.auth-btn-primary{background:#1f6feb;color:#fff}
+.auth-btn-primary:hover{background:#388bfd}
+.auth-api-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.8rem;font-family:'SF Mono','Fira Code',Consolas,monospace;outline:none;margin-top:4px}
+.auth-api-input:focus{border-color:#58a6ff}
+.auth-api-input::placeholder{color:#484f58}
+.auth-hint{font-size:.75rem;color:#6e7681;line-height:1.5;margin-top:4px}
+.auth-plan-badge{display:inline-block;font-size:.65rem;font-weight:600;padding:2px 8px;border-radius:10px;text-transform:uppercase;letter-spacing:.04em}
+.auth-plan-badge.max{background:#d2a8ff22;color:#d2a8ff;border:1px solid #d2a8ff44}
+.auth-plan-badge.pro{background:#3fb95022;color:#3fb950;border:1px solid #3fb95044}
+.auth-plan-badge.free{background:#6e768122;color:#8b949e;border:1px solid #6e768144}
+
 /* Mobile */
 @media(max-width:768px){
-  .top-nav{padding:0 8px}
+  .top-nav{padding:0 0 0 8px}
+  .nav-right{padding-right:8px}
   .nav-brand{padding:10px 8px 10px 0;margin-right:2px;font-size:.75rem}
   .nav-item{padding:8px 10px;gap:5px}
   .nav-title{display:none}
   .nav-attached{display:none}
   .nav-status-text{display:none}
+  .claude-auth-label{display:none}
+  .claude-auth{padding:8px 10px}
+  .claude-auth .status-dot{width:10px;height:10px}
+  .auth-dropdown{right:8px;min-width:270px;max-width:calc(100vw - 16px)}
   .nav-refresh-btn{padding:5px 10px;font-size:.75rem}
   .nav-new-btn{width:28px;height:28px;font-size:1rem;margin-right:4px}
   .main{padding:12px}
@@ -973,12 +1196,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 }
 </style></head>
 <body>
+<div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">tmux</span>
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
   <span class="nav-spacer"></span>
-  <span class="nav-status-text" id="status-info">Watching for changes...</span>
 </nav>
+<div class="nav-right">
+  <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
+    <span class="status-dot unknown" id="claude-auth-dot"></span>
+    <span class="claude-auth-label" id="claude-auth-label">...</span>
+  </div>
+</div>
+</div>
+<div class="auth-dropdown" id="auth-dropdown">
+  <div id="auth-dropdown-content"></div>
+</div>
 <div class="main" id="main"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal-content"></div>
@@ -1457,6 +1691,8 @@ async function pollStatus(){
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
+  _authPollCount++;
+  if(_authPollCount%5===0)checkClaudeAuth();
 }
 
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
@@ -1517,7 +1753,171 @@ async function deleteSession(name){
   }catch(e){alert('Failed to kill session.')}
 }
 
+// ── Claude Auth ──
+let _authCache=null;
+let _usageCache=null;
+let _authPollCount=0;
+
+async function checkClaudeAuth(){
+  try{
+    const [authResp,usageResp]=await Promise.all([
+      fetch(BASE+'/api/auth/claude-status'),
+      fetch(BASE+'/api/auth/usage')
+    ]);
+    _authCache=await authResp.json();
+    _usageCache=await usageResp.json();
+  }catch(e){_authCache={loggedIn:false,error:true};_usageCache=null}
+  renderAuthIndicator();
+}
+
+function renderAuthIndicator(){
+  const dot=document.getElementById('claude-auth-dot');
+  const label=document.getElementById('claude-auth-label');
+  if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
+  if(_authCache.hasApiKey&&!_authCache.loggedIn){
+    dot.className='status-dot';dot.style.background='#d2a8ff';
+    label.textContent='API Key';return;
+  }
+  if(_authCache.loggedIn){
+    dot.className='status-dot idle';dot.style.background='';
+    const email=_authCache.email||'';
+    const plan=_authCache.subscriptionType||'';
+    label.textContent=email+(plan?' · '+plan.charAt(0).toUpperCase()+plan.slice(1):'');
+  }else{
+    dot.className='status-dot busy';dot.style.background='';
+    label.textContent='Not connected';
+  }
+}
+
+function toggleAuthPanel(event){
+  event.stopPropagation();
+  const dd=document.getElementById('auth-dropdown');
+  dd.classList.toggle('active');
+  if(dd.classList.contains('active'))renderAuthPanel();
+}
+
+function fmtTokens(n){
+  if(n>=1e9)return (n/1e9).toFixed(1)+'B';
+  if(n>=1e6)return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+
+function renderUsageHtml(){
+  if(!_usageCache||!_usageCache.totalTokens)return '';
+  const u=_usageCache;
+  const total=u.totalTokens;
+  const outPct=total?Math.round(u.outputTokens/total*100):0;
+  const inPct=total?Math.round(u.inputTokens/total*100):0;
+  const crPct=total?Math.round(u.cacheCreateTokens/total*100):0;
+  const rdPct=total?Math.round(u.cacheReadTokens/total*100):0;
+  // Bar segments
+  const barH='<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;background:#21262d;margin:8px 0 4px">'
+    +'<div style="width:'+outPct+'%;background:#f85149" title="Output '+outPct+'%"></div>'
+    +'<div style="width:'+crPct+'%;background:#d2a8ff" title="Cache write '+crPct+'%"></div>'
+    +'<div style="width:'+inPct+'%;background:#58a6ff" title="Input '+inPct+'%"></div>'
+    +'<div style="width:'+rdPct+'%;background:#21262d" title="Cache read '+rdPct+'%"></div>'
+    +'</div>';
+  return '<hr class="auth-divider">'
+    +'<div class="auth-title" style="margin-bottom:4px">Today\'s Usage</div>'
+    +'<div class="auth-row"><span class="auth-row-label">Messages</span><span class="auth-row-value">'+u.messages+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Total tokens</span><span class="auth-row-value">'+fmtTokens(total)+'</span></div>'
+    +barH
+    +'<div style="display:flex;flex-wrap:wrap;gap:2px 12px;font-size:.7rem;color:#8b949e;margin-bottom:2px">'
+    +'<span><span style="color:#f85149">●</span> Output '+fmtTokens(u.outputTokens)+'</span>'
+    +'<span><span style="color:#58a6ff">●</span> Input '+fmtTokens(u.inputTokens)+'</span>'
+    +'<span><span style="color:#d2a8ff">●</span> Cache write '+fmtTokens(u.cacheCreateTokens)+'</span>'
+    +'<span style="color:#484f58">Cache read '+fmtTokens(u.cacheReadTokens)+'</span>'
+    +'</div>'
+    +'<p class="auth-hint" style="margin-top:6px">Usage resets on a 5-hour rolling window.</p>';
+}
+
+function renderAuthPanel(){
+  const el=document.getElementById('auth-dropdown-content');
+  if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
+  const usageHtml=renderUsageHtml();
+  if(_authCache.loggedIn){
+    const plan=(_authCache.subscriptionType||'free').toLowerCase();
+    const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
+    el.innerHTML=`
+      <div class="auth-title">Claude Code Connected</div>
+      <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
+      <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
+      <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMethod||'—')}</span></div>
+      ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">API Key</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
+      ${usageHtml}
+      <hr class="auth-divider">
+      ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
+      <button class="auth-btn auth-btn-danger" onclick="claudeLogout()">Sign out of Claude</button>
+    `;
+  }else{
+    el.innerHTML=`
+      <div class="auth-title">Claude Code — Not Connected</div>
+      <p class="auth-hint">Set an Anthropic API key to authenticate Claude Code for new sessions:</p>
+      <input type="password" class="auth-api-input" id="auth-api-key-input"
+        placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false"
+        value="${_authCache.hasApiKey?'••••••••••••••••':''}">
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
+        ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="flex:1" onclick="clearApiKey()">Clear</button>':''}
+      </div>
+      ${usageHtml}
+      <hr class="auth-divider">
+      <p class="auth-hint">Or authenticate via OAuth by running <code style="color:#79c0ff">claude auth login</code> in a terminal session.</p>
+    `;
+  }
+}
+
+async function saveApiKey(){
+  const input=document.getElementById('auth-api-key-input');
+  if(!input)return;
+  const key=input.value.trim();
+  if(!key){alert('Please enter an API key.');return}
+  try{
+    const resp=await fetch(BASE+'/api/auth/api-key',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({apiKey:key})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.detail||'Failed to save');return}
+    await checkClaudeAuth();
+    renderAuthPanel();
+  }catch(e){alert('Failed to save API key.')}
+}
+
+async function clearApiKey(){
+  try{
+    const resp=await fetch(BASE+'/api/auth/api-key',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({apiKey:''})
+    });
+    await resp.json();
+    await checkClaudeAuth();
+    renderAuthPanel();
+  }catch(e){alert('Failed to clear API key.')}
+}
+
+async function claudeLogout(){
+  if(!confirm('Sign out of Claude Code?'))return;
+  try{
+    const resp=await fetch(BASE+'/api/auth/logout',{method:'POST'});
+    await resp.json();
+    await checkClaudeAuth();
+    renderAuthPanel();
+  }catch(e){alert('Failed to sign out.')}
+}
+
+// Close auth dropdown on outside click
+document.addEventListener('click',function(e){
+  const dd=document.getElementById('auth-dropdown');
+  const trigger=document.getElementById('claude-auth');
+  if(dd.classList.contains('active')&&!dd.contains(e.target)&&!trigger.contains(e.target)){
+    dd.classList.remove('active');
+  }
+});
+
 loadAll();
+checkClaudeAuth();
 </script>
 </body></html>
 """
