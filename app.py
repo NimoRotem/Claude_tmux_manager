@@ -7,7 +7,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict
@@ -150,6 +152,36 @@ cache: Dict[str, dict] = {}
 # Persistent message storage
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
+NOTES_FILE = MESSAGES_DIR / "notes.json"
+
+
+def _load_all_notes() -> Dict[str, str]:
+    """Load all session notes from disk."""
+    try:
+        if NOTES_FILE.exists():
+            return json.loads(NOTES_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_notes():
+    """Persist all session notes to disk."""
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        existing = _load_all_notes()
+        for name, entry in cache.items():
+            notes = entry.get("notes")
+            if notes:
+                existing[name] = notes
+        NOTES_FILE.write_text(json.dumps(existing))
+    except Exception:
+        pass
+
+
+def _load_session_notes(session_name: str) -> str:
+    """Get persisted notes for a specific session."""
+    return _load_all_notes().get(session_name, "")
 
 
 def _load_messages() -> Dict[str, list]:
@@ -187,6 +219,7 @@ def _load_session_messages(session_name: str) -> list:
 DESCRIPTION_TTL = 0    # never auto-expire
 PROGRESS_TTL = 600     # 10 minutes
 REALTIME_TTL = 60      # 1 minute
+NOTES_TTL = 600        # 10 minutes
 
 
 def get_tmux_sessions() -> list[dict]:
@@ -234,6 +267,24 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def get_pane_position(session_name: str) -> dict:
+    """Get current pane line-count metadata (cheap, no content capture)."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p",
+             "#{history_size}:#{cursor_y}"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(":")
+            history_size = int(parts[0])
+            cursor_y = int(parts[1])
+            return {"total_lines": history_size + cursor_y + 1}
+    except Exception:
+        pass
+    return {"total_lines": 0}
 
 
 # Track auto-approve state to avoid re-triggering
@@ -331,10 +382,9 @@ def detect_activity(session_name: str) -> dict:
         idle_prompt_patterns = [
             r'^[❯➜]\s*$',                         # bare prompt character alone on line
             r'Tip:.*claude',                       # claude code tip = just finished
-            r'Saut[ée]ed for',                     # "Sautéed for Xs" = just finished
-            r'Whisked for',
-            r'Warped for',
-            r'Worked for',
+            # Claude Code completion messages: "<verb> for <duration>"
+            # Use a broad pattern to catch all verb variations (Churned, Sautéed, etc.)
+            r'[A-Z][a-zé]+ for \d+[ms]',
         ]
         has_idle_prompt = False
         for pattern in idle_prompt_patterns:
@@ -354,27 +404,45 @@ def detect_activity(session_name: str) -> dict:
         window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
         window_text = "\n".join(window)
 
-        # All checks are LINE-BY-LINE with start-of-line anchoring to
-        # avoid false positives from these same patterns appearing in
-        # conversation output text (e.g. Claude explaining its own UI).
-        SPINNER_ICONS = r'[✶✽✻·\*☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'
+        # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
+        # where possible to avoid false positives from these patterns
+        # appearing in conversation output text.
+        SPINNER_ICONS = r'[✶✽✻·\*☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
+        # Completion markers: "● Done" or "● Completed" = finished, NOT busy.
+        # Must check these BEFORE spinner detection since ● is a spinner icon.
+        COMPLETION_RE = re.compile(r'^●\s+(Done|Completed)\b')
         for line in window:
             stripped = line.strip()
+            # Skip completion markers — these look like spinners but mean "finished"
+            if COMPLETION_RE.match(stripped):
+                continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
             if re.match(r'^[⎿\s]*◼', stripped):
                 info["status"] = "busy"
                 info["detail"] = "Running task"
                 return info
-            # Spinner icon + verb… — generic catch-all for Claude spinners
-            if re.match(SPINNER_ICONS + r'\s+\w+…', stripped):
+            # Spinner icon + verb… at START of line
+            # Use … (ellipsis) or 2+ dots to avoid matching "Done." or other punctuation
+            if re.match(SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})', stripped):
                 info["status"] = "busy"
-                # Extract detail from the spinner line itself
-                if '(thinking)' in stripped:
-                    info["detail"] = "Thinking"
-                elif 'thought for' in stripped:
+                if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
                 else:
                     info["detail"] = "Working"
+                return info
+            # Spinner icon + verb… anywhere in line (catches inline spinners
+            # after streamed text, e.g. "...Let me create it. ✢ Ebbing… (thought for 8s)")
+            if re.search(SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$', stripped):
+                info["status"] = "busy"
+                if '(thinking)' in stripped or 'thought for' in stripped:
+                    info["detail"] = "Thinking"
+                else:
+                    info["detail"] = "Working"
+                return info
+            # "(thought for Xs)" or "(thinking)" near end of line — strong busy signal
+            if re.search(r'\(thought for \d+', stripped) or stripped.endswith('(thinking)'):
+                info["status"] = "busy"
+                info["detail"] = "Thinking"
                 return info
 
         # --- Step 4: If idle prompt + no busy signals → truly idle ---
@@ -501,6 +569,56 @@ async def get_progress(session_name: str, full_output: str) -> str:
     )
 
 
+async def get_notes(session_name: str, full_output: str, existing_notes: str = "", messages: list = None) -> str:
+    """Extract key reference info from terminal output and chat history."""
+    lines = full_output.split("\n")
+    total = len(lines)
+    slices = [("BEGINNING", "\n".join(lines[:80]))]
+    if total > 200:
+        q1 = total // 4
+        slices.append(("QUARTER", "\n".join(lines[q1:q1 + 60])))
+    if total > 300:
+        mid = total // 2
+        slices.append(("MIDDLE", "\n".join(lines[mid:mid + 60])))
+    slices.append(("RECENT", "\n".join(lines[-80:])))
+    context = "\n\n".join(f"=== {label} ===\n{text}" for label, text in slices)
+
+    # Include chat messages (captures uploaded files, user commands, etc.)
+    chat_section = ""
+    if messages:
+        recent_msgs = messages[-30:]  # last 30 messages
+        chat_lines = [f"[{m['role']}] {m['text']}" for m in recent_msgs]
+        chat_section = f"\n\n=== CHAT HISTORY (user commands & uploads) ===\n" + "\n".join(chat_lines)
+
+    prev_section = ""
+    if existing_notes and existing_notes.strip():
+        prev_section = f"\n\n=== PREVIOUS NOTES (merge new findings into these) ===\n{existing_notes}"
+
+    return await llm_call(
+        system_prompt=(
+            "Extract key reference info from this terminal session. "
+            "Organize into these sections:\n\n"
+            "CREDENTIALS — usernames, passwords, API keys, tokens, secrets\n"
+            "URLS — public URLs, domains, endpoints where this project is served or accessible\n"
+            "STACK — languages, frameworks, libraries, dependencies, tools, package managers\n"
+            "SERVICES — databases, ports, process managers (PM2/supervisor/systemd), background services\n"
+            "STRUCTURE — project root, key files, directories, config file paths\n"
+            "UPLOADS — paths to any files that were uploaded to this session\n"
+            "NOTES — important dev decisions, gotchas, deployment steps, things to remember\n\n"
+            "Rules:\n"
+            "- Only include info actually visible in the terminal output or chat history\n"
+            "- Keep each item on one line, be specific (include actual values, paths, ports)\n"
+            "- If a section has nothing, omit it entirely\n"
+            "- If previous notes exist, merge new findings into them — keep old data, "
+            "remove duplicates, update changed values\n"
+            "- Redact nothing — this is the developer's own reference\n"
+            "- No intro/outro text, just the section headers and their items"
+        ),
+        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:5000]}{chat_section[:1500]}{prev_section}",
+        max_tokens=500,
+    )
+
+
 async def get_realtime(session_name: str) -> str:
     recent = capture_pane_recent(session_name, 80)
     activity = detect_activity(session_name)
@@ -541,12 +659,15 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     entry = cache.get(session_name, {})
     if "messages" not in entry:
         entry["messages"] = _load_session_messages(session_name)
+    if "notes" not in entry:
+        entry["notes"] = _load_session_notes(session_name)
 
     need_description = force_all or "description" not in entry
     need_progress = force_all or "progress" not in entry or (now - entry.get("progress_at", 0)) >= PROGRESS_TTL
+    need_notes = force_all or "notes" not in entry or (now - entry.get("notes_at", 0)) >= NOTES_TTL
 
     full_output = None
-    if need_description or need_progress:
+    if need_description or need_progress or need_notes:
         full_output = capture_pane_full(session_name)
 
     tasks = {}
@@ -554,6 +675,8 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         tasks["title_desc"] = get_title_and_description(session_name, full_output)
     if need_progress:
         tasks["progress"] = get_progress(session_name, full_output)
+    if need_notes:
+        tasks["notes"] = get_notes(session_name, full_output, entry.get("notes", ""), entry.get("messages", []))
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
         tasks["realtime"] = get_realtime(session_name)
 
@@ -568,6 +691,9 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         if "progress" in result_map:
             entry["progress"] = result_map["progress"]
             entry["progress_at"] = now
+        if "notes" in result_map:
+            entry["notes"] = result_map["notes"]
+            entry["notes_at"] = now
         if "realtime" in result_map:
             entry["realtime"] = result_map["realtime"]
             entry["realtime_at"] = now
@@ -576,6 +702,8 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     cache[session_name] = entry
     if entry.get("messages"):
         _save_messages()
+    if entry.get("notes"):
+        _save_notes()
     return entry
 
 
@@ -613,6 +741,8 @@ def build_session_response(sess: dict, data: dict) -> dict:
         "description_at": data.get("description_at", 0),
         "progress": data.get("progress", ""),
         "progress_at": data.get("progress_at", 0),
+        "notes": data.get("notes", ""),
+        "notes_at": data.get("notes_at", 0),
         "realtime": data.get("realtime", ""),
         "realtime_at": data.get("realtime_at", 0),
         "messages": data.get("messages", []),
@@ -707,6 +837,48 @@ async def api_raw_output(session_name: str):
     })
 
 
+@app.get("/api/sessions/{session_name}/raw-tail")
+async def api_raw_tail(session_name: str, known_lines: int = 0):
+    """Return delta output since the client's last known line count."""
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    pos = get_pane_position(session_name)
+    current_total = pos["total_lines"]
+
+    # First load or session reset → full capture
+    if known_lines <= 0 or known_lines > current_total:
+        raw = capture_pane_full(session_name)
+        return JSONResponse({
+            "mode": "full",
+            "raw": raw,
+            "total_lines": len(raw.split("\n")),
+            "pane_total": current_total,
+        })
+
+    # No new content
+    if current_total <= known_lines:
+        return JSONResponse({
+            "mode": "none",
+            "total_lines": known_lines,
+            "pane_total": current_total,
+        })
+
+    # Delta: capture only the new lines + small overlap for dedup
+    overlap = 5
+    lines_from_end = (current_total - known_lines) + overlap
+    raw = capture_pane_recent(session_name, lines_from_end)
+    return JSONResponse({
+        "mode": "delta",
+        "raw": raw,
+        "total_lines": current_total,
+        "pane_total": current_total,
+        "overlap": overlap,
+    })
+
+
 class CreateSession(BaseModel):
     name: str = ""
 
@@ -763,12 +935,52 @@ async def api_create_session(body: CreateSession):
 
 @app.delete("/api/sessions/{session_name}")
 async def api_delete_session(session_name: str):
-    """Kill a tmux session."""
+    """Kill a tmux session and all its child processes."""
     sessions = get_tmux_sessions()
     names = [s["name"] for s in sessions]
     if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
+        # First, find and kill all processes in the session's panes.
+        # This ensures Claude Code (node) processes are terminated cleanly
+        # before the tmux session is destroyed.
+        try:
+            # Get all pane PIDs in this session
+            pane_result = subprocess.run(
+                ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if pane_result.returncode == 0:
+                for pid_str in pane_result.stdout.strip().split("\n"):
+                    pid_str = pid_str.strip()
+                    if not pid_str:
+                        continue
+                    # Kill the entire process group rooted at this pane's shell
+                    # This catches Claude Code (node), any background tasks, etc.
+                    try:
+                        subprocess.run(
+                            ["pkill", "-TERM", "-P", pid_str],
+                            capture_output=True, text=True, timeout=3
+                        )
+                    except Exception:
+                        pass
+                # Brief pause to let processes handle SIGTERM
+                await asyncio.sleep(0.5)
+                # Force-kill any remaining children
+                for pid_str in pane_result.stdout.strip().split("\n"):
+                    pid_str = pid_str.strip()
+                    if not pid_str:
+                        continue
+                    try:
+                        subprocess.run(
+                            ["pkill", "-KILL", "-P", pid_str],
+                            capture_output=True, text=True, timeout=3
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Non-fatal — tmux kill-session will still clean up
+
         result = subprocess.run(
             ["tmux", "kill-session", "-t", session_name],
             capture_output=True, text=True, timeout=5
@@ -830,6 +1042,138 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# --- CLAUDE.md viewer/editor ---
+
+@app.get("/api/sessions/{session_name}/claude-md")
+async def api_get_claude_md(session_name: str):
+    """Read CLAUDE.md from the session's working directory and home dir."""
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    cwd = get_session_cwd(session_name)
+    results = []
+    # Check session CWD
+    if cwd:
+        md_path = os.path.join(cwd, "CLAUDE.md")
+        content = ""
+        if os.path.exists(md_path):
+            try:
+                with open(md_path) as f:
+                    content = f.read()
+            except Exception:
+                pass
+        results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
+    # Check home dir
+    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
+    home_content = ""
+    if os.path.exists(home_md):
+        try:
+            with open(home_md) as f:
+                home_content = f.read()
+        except Exception:
+            pass
+    results.append({"path": home_md, "content": home_content, "exists": os.path.exists(home_md), "label": "Global"})
+    return JSONResponse({"files": results, "cwd": cwd or ""})
+
+
+class SaveClaudeMd(BaseModel):
+    path: str
+    content: str
+
+
+@app.post("/api/sessions/{session_name}/claude-md")
+async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
+    """Save CLAUDE.md to the specified path."""
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    # Safety: only allow writing CLAUDE.md files
+    if not body.path.endswith("CLAUDE.md"):
+        return JSONResponse({"error": "Can only write CLAUDE.md files"}, status_code=400)
+    try:
+        os.makedirs(os.path.dirname(body.path), exist_ok=True)
+        with open(body.path, "w") as f:
+            f.write(body.content)
+        return JSONResponse({"ok": True, "path": body.path})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# --- System stats ---
+
+@app.get("/api/stats")
+async def api_stats():
+    """System stats: CPU, disk, memory, tmux sessions, Claude processes."""
+    stats = {}
+    # CPU load
+    try:
+        with open('/proc/loadavg') as f:
+            parts = f.read().split()
+            stats["cpu_load"] = {"1m": parts[0], "5m": parts[1], "15m": parts[2]}
+    except Exception:
+        stats["cpu_load"] = {}
+    # Memory
+    try:
+        result = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+        lines = result.stdout.strip().split("\n")
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            stats["memory"] = {
+                "total_mb": int(parts[1]),
+                "used_mb": int(parts[2]),
+                "available_mb": int(parts[6]) if len(parts) > 6 else int(parts[3]),
+            }
+    except Exception:
+        stats["memory"] = {}
+    # Disk
+    try:
+        usage = shutil.disk_usage("/")
+        stats["disk"] = {
+            "total_gb": round(usage.total / (1024**3), 1),
+            "used_gb": round(usage.used / (1024**3), 1),
+            "free_gb": round(usage.free / (1024**3), 1),
+            "pct": round(usage.used / usage.total * 100, 1),
+        }
+    except Exception:
+        stats["disk"] = {}
+    # tmux sessions
+    stats["tmux_sessions"] = get_tmux_sessions()
+    # Claude processes
+    try:
+        result = subprocess.run(
+            ["pgrep", "-a", "claude"],
+            capture_output=True, text=True, timeout=5
+        )
+        stats["claude_processes"] = [
+            l.strip() for l in result.stdout.strip().split("\n") if l.strip()
+        ]
+    except Exception:
+        stats["claude_processes"] = []
+    # Node processes (Claude Code runs as node)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-a", "-f", "claude"],
+            capture_output=True, text=True, timeout=5
+        )
+        stats["claude_related"] = len([
+            l for l in result.stdout.strip().split("\n") if l.strip()
+        ])
+    except Exception:
+        stats["claude_related"] = 0
+    # Uptime
+    try:
+        with open('/proc/uptime') as f:
+            uptime_secs = float(f.read().split()[0])
+            days = int(uptime_secs // 86400)
+            hours = int((uptime_secs % 86400) // 3600)
+            stats["uptime"] = f"{days}d {hours}h"
+    except Exception:
+        stats["uptime"] = "unknown"
+    return JSONResponse(stats)
 
 
 # --- Claude Code auth management ---
@@ -967,11 +1311,30 @@ async def api_send_command(session_name: str, body: SendCommand):
     if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
-        # -l sends text literally (no key-name interpretation)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "-l", body.command],
-            capture_output=True, text=True, timeout=5
-        )
+        cmd_text = body.command
+        if len(cmd_text) > 200:
+            # For long messages, use tmux load-buffer + paste-buffer
+            # This avoids command-line length limits and ensures reliable delivery
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+                tmp.write(cmd_text)
+                tmp_path = tmp.name
+            try:
+                subprocess.run(
+                    ["tmux", "load-buffer", tmp_path],
+                    capture_output=True, text=True, timeout=5
+                )
+                subprocess.run(
+                    ["tmux", "paste-buffer", "-t", session_name],
+                    capture_output=True, text=True, timeout=5
+                )
+            finally:
+                os.unlink(tmp_path)
+        else:
+            # Short messages: send-keys -l is fine
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
+                capture_output=True, text=True, timeout=5
+            )
         # Then press Enter as a separate key event
         subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -990,6 +1353,23 @@ async def api_send_command(session_name: str, body: SendCommand):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
+
+@app.post("/api/sessions/{session_name}/interrupt")
+async def api_interrupt_session(session_name: str):
+    """Send Escape key to interrupt a running Claude Code session."""
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Escape"],
+            capture_output=True, text=True, timeout=5
+        )
+        return JSONResponse({"ok": True, "action": "interrupt"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -1016,8 +1396,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
 .nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
 .nav-indicators{display:flex;align-items:center;gap:5px}
-.nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.nav-dot.busy{background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite}
+.nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
+.nav-dot.busy{width:10px;height:10px;background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #f8514988}
 .nav-dot.idle{background:#3fb950}
 .nav-dot.unknown{background:#d2a8ff}
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
@@ -1033,13 +1413,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
 
-/* Detail header */
-.detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px}
-.detail-header-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
-.detail-title-text{font-size:1.3rem;font-weight:600;color:#f0f6fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-.detail-badges{display:flex;gap:8px;align-items:center;flex-shrink:0}
-.status-pill{font-size:.75rem;padding:3px 12px;border-radius:12px;font-weight:600;display:flex;align-items:center;gap:5px}
-.status-pill.busy{background:#f8514922;color:#f85149;border:1px solid #f8514944}
+/* Detail badges (inline in tab bar) */
+.detail-badges{display:flex;gap:8px;align-items:center;flex-shrink:0;margin-left:auto;padding-right:4px}
+.status-pill{font-size:.75rem;padding:3px 12px;border-radius:12px;font-weight:600;display:flex;align-items:center;gap:5px;transition:all .3s ease}
+.status-pill.busy{background:#f8514930;color:#f85149;border:2px solid #f8514966;font-size:.85rem;padding:5px 16px;animation:pulse-glow 1.5s ease-in-out infinite}
 .status-pill.idle{background:#3fb95022;color:#3fb950;border:1px solid #3fb95044}
 .status-pill.unknown{background:#d2a8ff22;color:#d2a8ff;border:1px solid #d2a8ff44}
 .status-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
@@ -1071,24 +1448,46 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
-.chat-typing{align-self:flex-start;padding:10px 14px;background:#161b22;border:1px solid #30363d;border-radius:12px;border-bottom-left-radius:4px;color:#8b949e;font-size:.85rem;font-style:italic}
-.chat-typing .dots{display:inline-block;animation:typing 1.4s infinite}
-@keyframes typing{0%,80%,100%{opacity:.3}40%{opacity:1}}
+.chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
+.chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
+.chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
+.chat-typing .typing-dot:nth-child(2){animation-delay:.2s}
+.chat-typing .typing-dot:nth-child(3){animation-delay:.4s}
+@keyframes typing-bounce{0%,80%,100%{opacity:.3;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
+@keyframes pulse-busy{0%,100%{opacity:1;border-color:#f8514955}50%{opacity:.85;border-color:#f8514988}}
 
 /* Command bar */
-.cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:hidden;flex-shrink:0}
+.cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:visible;flex-shrink:0}
 .cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:none;min-height:44px;max-height:160px;line-height:1.4;overflow-y:auto}
+.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
+.cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
-.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end}
-.cmd-upload{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
+.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
+.cmd-send:hover{background:#30363d}
+.cmd-upload{border:none;border-left:1px solid #30363d;border-radius:0 6px 6px 0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
 .cmd-upload:hover{color:#58a6ff}
+.cmd-expand{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 10px;font-size:.85rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-expand:hover{color:#58a6ff}
+.cmd-slash{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 12px;font-size:.85rem;cursor:pointer;background:#21262d;color:#d2a8ff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.cmd-slash:hover{background:#1c2128;color:#f0f6fc}
+.cmd-interrupt{display:none;border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:.8rem;cursor:pointer;background:#da3633;color:#fff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;letter-spacing:.03em;white-space:nowrap}
+.cmd-interrupt:hover{background:#f85149}
+.cmd-interrupt.visible{display:block}
+/* Slash commands dropdown */
+.slash-dropdown{display:none;position:absolute;bottom:100%;right:0;z-index:50;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:6px 0;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-bottom:4px}
+.slash-dropdown.active{display:block}
+.slash-item{display:flex;align-items:center;gap:10px;padding:8px 14px;cursor:pointer;transition:background .1s;font-size:.85rem;color:#c9d1d9}
+.slash-item:hover{background:#1c2128}
+.slash-item-cmd{color:#d2a8ff;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:600;min-width:80px}
+.slash-item-desc{color:#8b949e;font-size:.75rem}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
-.raw-controls{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.raw-info{color:#6e7681;font-size:.75rem}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:300px;overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
+.raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
+.raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
 .raw-output::-webkit-scrollbar{width:6px;height:6px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
@@ -1104,6 +1503,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tier-description .tier-text{color:#c9d1d9;font-weight:500}
 .tier-progress .tier-label{color:#d2a8ff}
 .tier-progress .dot{background:#d2a8ff}
+.tier-notes .tier-label{color:#e3b341}
+.tier-notes .dot{background:#e3b341}
+.tier-notes .tier-text{white-space:pre-wrap;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;max-height:300px;overflow-y:auto}
 .tier-text{color:#b1bac4;line-height:1.6;font-size:1.05rem}
 .tier-text.loading{color:#6e7681;font-style:italic}
 
@@ -1171,6 +1573,40 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .auth-plan-badge.pro{background:#3fb95022;color:#3fb950;border:1px solid #3fb95044}
 .auth-plan-badge.free{background:#6e768122;color:#8b949e;border:1px solid #6e768144}
 
+/* Nav icon buttons */
+.nav-icon-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:6px 8px;border-radius:6px;font-size:.85rem;transition:all .15s;flex-shrink:0;display:flex;align-items:center;gap:4px}
+.nav-icon-btn:hover{background:#1c2128;color:#c9d1d9}
+.nav-icon-btn .icon{font-size:1rem}
+
+/* Stats modal */
+.stats-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
+.stats-overlay.active{display:flex}
+.stats-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:560px;max-width:calc(100vw - 32px);max-height:calc(100vh - 120px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.stats-panel h3{color:#f0f6fc;margin-bottom:16px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
+.stats-section{margin-bottom:16px}
+.stats-section-title{font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:8px}
+.stats-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:.85rem}
+.stats-row-label{color:#8b949e}
+.stats-row-value{color:#c9d1d9;font-weight:500;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.8rem}
+.stats-bar{height:6px;border-radius:3px;background:#21262d;overflow:hidden;margin:4px 0}
+.stats-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.stats-close{background:none;border:none;color:#8b949e;cursor:pointer;font-size:1.2rem;padding:0 4px}
+.stats-close:hover{color:#f0f6fc}
+
+/* CLAUDE.md editor modal */
+.claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
+.claudemd-overlay.active{display:flex}
+.claudemd-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.claudemd-panel h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
+.claudemd-tabs{display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:12px}
+.claudemd-tab{padding:8px 16px;font-size:.8rem;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+.claudemd-tab:hover{color:#c9d1d9}
+.claudemd-tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.claudemd-editor{width:100%;min-height:350px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
+.claudemd-editor:focus{border-color:#58a6ff}
+.claudemd-path{font-size:.7rem;color:#6e7681;margin-bottom:8px;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.claudemd-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+
 /* Mobile */
 @media(max-width:768px){
   .top-nav{padding:0 0 0 8px}
@@ -1204,6 +1640,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </nav>
 <div class="nav-right">
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
+  <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
     <span class="status-dot unknown" id="claude-auth-dot"></span>
     <span class="claude-auth-label" id="claude-auth-label">...</span>
@@ -1217,6 +1655,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal-content"></div>
 </div>
+<!-- Stats overlay -->
+<div class="stats-overlay" id="stats-overlay" onclick="if(event.target===this)closeStats()">
+  <div class="stats-panel" id="stats-panel">
+    <h3>System Stats <button class="stats-close" onclick="closeStats()">&times;</button></h3>
+    <div id="stats-content">Loading...</div>
+  </div>
+</div>
+<!-- CLAUDE.md editor overlay -->
+<div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
+  <div class="claudemd-panel" id="claudemd-panel">
+    <h3>CLAUDE.md <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
+    <div class="claudemd-tabs" id="claudemd-tabs"></div>
+    <div class="claudemd-path" id="claudemd-path"></div>
+    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false"></textarea>
+    <div class="claudemd-actions">
+      <button class="btn" onclick="closeClaudeMd()">Cancel</button>
+      <button class="btn btn-full" onclick="saveClaudeMd()">Save</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const navEl=document.getElementById('top-nav');
@@ -1227,7 +1685,8 @@ let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
-const rawCache={};
+const rawState={};
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0};return rawState[n]}
 const lastStatus={};
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
@@ -1281,7 +1740,7 @@ function esc(str){
   return d.innerHTML;
 }
 function statusLabel(s){
-  if(s==='busy')return'Busy';
+  if(s==='busy')return'Working...';
   if(s==='idle')return'Idle';
   return'...';
 }
@@ -1321,16 +1780,17 @@ function renderDetail(){
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   const tab=activeTabs[s.name]||'chat';
-  // Sync server messages into local store
-  if(s.messages && s.messages.length) chatMessages[s.name]=s.messages;
+  // Sync server messages into local store (merge, don't replace — preserves
+  // messages added locally from raw tab that server hasn't echoed back yet)
+  if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
   // Update favicon to match selected session
   updateFavicon(s.activity_status);
 
   mainEl.innerHTML=`
-    <div class="detail-header">
-      <div class="detail-header-left">
-        <span class="detail-title-text" id="title-${s.name}">${esc(s.title)||'Session '+esc(s.name)}</span>
-      </div>
+    <div class="tab-bar">
+      <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
+      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Raw Output</div>
+      <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
       <div class="detail-badges">
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
           <span class="status-dot"></span>
@@ -1342,19 +1802,13 @@ function renderDetail(){
       </div>
     </div>
 
-    <div class="tab-bar">
-      <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
-      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Raw Output</div>
-      <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
-    </div>
-
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
-          ${s.activity_status==='busy'?'<div class="chat-typing"><span class="dots">...</span> Working</div>':''}
+          ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
-        <div class="cmd-bar">
+        <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
@@ -1362,8 +1816,12 @@ function renderDetail(){
             oninput="autoGrow(this)"
             autocomplete="off" spellcheck="false"></textarea>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+          <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-chat-${s.name}')" title="Slash commands">/</button>
+          <button class="cmd-expand" onclick="toggleExpand('cmd-chat-${s.name}')" title="Expand/collapse">&#x2195;</button>
           <button class="cmd-upload" onclick="document.getElementById('upload-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+          <div class="slash-dropdown" id="slash-chat-${s.name}"></div>
         </div>
       </div>
     </div>
@@ -1371,10 +1829,11 @@ function renderDetail(){
     <div class="tab-content tab-raw ${tab==='raw'?'active':''}" id="tab-raw-${s.name}">
       <div class="raw-controls">
         <span class="raw-info" id="raw-info-${s.name}">Click to load raw output</span>
+        <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
       <div class="raw-output" id="raw-${s.name}">Click "Raw Output" tab or "Reload" to fetch...</div>
-      <div class="cmd-bar">
+      <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
           placeholder="Type a command and press Enter..."
@@ -1382,6 +1841,12 @@ function renderDetail(){
           oninput="autoGrow(this)"
           autocomplete="off" spellcheck="false"></textarea>
         <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
+        <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-raw-${s.name}')" title="Slash commands">/</button>
+        <button class="cmd-expand" onclick="toggleExpand('cmd-raw-${s.name}')" title="Expand/collapse">&#x2195;</button>
+        <button class="cmd-upload" onclick="document.getElementById('upload-raw-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
+        <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+        <div class="slash-dropdown" id="slash-raw-${s.name}"></div>
       </div>
     </div>
 
@@ -1394,10 +1859,15 @@ function renderDetail(){
         <div class="tier-label"><span class="dot"></span>Progress</div>
         <div class="tier-text" id="prog-${s.name}">${esc(s.progress)||'Loading...'}</div>
       </div>
+      <div class="tier tier-notes">
+        <div class="tier-label"><span class="dot"></span>Key Info</div>
+        <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
+      </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
           <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
           <div class="ts">progress: <span id="ts-prog-${s.name}">${timeAgo(s.progress_at)}</span></div>
+          <div class="ts">notes: <span id="ts-notes-${s.name}">${timeAgo(s.notes_at)}</span></div>
           <div class="ts">live: <span id="ts-rt-${s.name}">${timeAgo(s.realtime_at)}</span></div>
         </div>
         <div class="btn-group">
@@ -1412,11 +1882,13 @@ function renderDetail(){
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
-  // Auto-load raw
-  if(tab==='raw'&&!rawCache[s.name])loadRaw(s.name);
+  // Start/stop raw polling based on active tab
+  stopAllRawPolling();
+  if(tab==='raw')startRawPolling(s.name);
 }
 
 function selectSession(name){
+  stopAllRawPolling();
   selectedSession=name;
   navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const navItem=document.getElementById('nav-'+name);
@@ -1438,11 +1910,47 @@ function switchTab(name,tab){
   }
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
-  if(tab==='raw'&&!rawCache[name])loadRaw(name);
+  stopAllRawPolling();
+  if(tab==='raw')startRawPolling(name);
   if(tab==='chat'){
+    // Re-render chat bubbles to pick up messages added while on other tabs
     const chatEl=document.getElementById('chat-'+name);
-    if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+    if(chatEl){
+      chatEl.innerHTML=renderChatBubbles(name);
+      // Re-add typing indicator if busy
+      const s=sessions.find(x=>x.name===name);
+      if(s&&s.activity_status==='busy'){
+        const typing=document.createElement('div');
+        typing.className='chat-typing';
+        typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
+        chatEl.appendChild(typing);
+      }
+      chatEl.scrollTop=chatEl.scrollHeight;
+    }
   }
+}
+
+function mergeChatMessages(name, serverMsgs){
+  // Merge server messages with local messages, preserving any locally-added
+  // messages (e.g. from raw tab) that the server hasn't echoed back yet.
+  const local=chatMessages[name]||[];
+  if(!local.length){chatMessages[name]=[...serverMsgs];return}
+  // Build a set of server message signatures for dedup
+  const serverSet=new Set(serverMsgs.map(m=>m.role+':'+m.text+':'+Math.floor(m.ts)));
+  // Find local-only messages (user messages added via appendChatBubble that
+  // the server already recorded but with slightly different timestamp)
+  const localOnly=[];
+  for(const m of local){
+    const sig=m.role+':'+m.text+':'+Math.floor(m.ts);
+    if(!serverSet.has(sig)){
+      // Check if server has same role+text with close timestamp (within 5s)
+      const dup=serverMsgs.some(s=>s.role===m.role&&s.text===m.text&&Math.abs(s.ts-m.ts)<5);
+      if(!dup)localOnly.push(m);
+    }
+  }
+  // Merge: server messages + any local-only messages, sorted by timestamp
+  const merged=[...serverMsgs,...localOnly].sort((a,b)=>a.ts-b.ts);
+  chatMessages[name]=merged;
 }
 
 function appendChatBubble(name,role,text,ts){
@@ -1475,8 +1983,21 @@ function appendChatBubble(name,role,text,ts){
 }
 
 function autoGrow(el){
+  if(el.classList.contains('expanded'))return;
   el.style.height='auto';
-  el.style.height=Math.min(el.scrollHeight,160)+'px';
+  el.style.height=Math.min(el.scrollHeight,400)+'px';
+}
+function toggleExpand(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  if(el.classList.contains('expanded')){
+    el.classList.remove('expanded');
+    el.style.height='auto';
+    el.style.height=Math.min(el.scrollHeight,400)+'px';
+  }else{
+    el.classList.add('expanded');
+    el.style.height='300px';
+  }
 }
 function handleChatKey(e,name){
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
@@ -1493,6 +2014,8 @@ async function sendChat(name){
   input.disabled=true;
   // Show user bubble immediately
   appendChatBubble(name,'user',cmd,Date.now()/1000);
+  // Immediately show busy state — user just sent a message so it must be working
+  setOptimisticBusy(name);
   try{
     await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
@@ -1503,6 +2026,77 @@ async function sendChat(name){
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
+  // After a delay, verify the busy state from the actual terminal
+  scheduleBusyVerification(name);
+}
+
+function setOptimisticBusy(name){
+  // Update local session state
+  const idx=sessions.findIndex(s=>s.name===name);
+  if(idx>=0){sessions[idx].activity_status='busy';sessions[idx].activity_detail='Processing...'}
+  lastStatus[name]='busy';
+  // Update status pill and nav dot
+  updateStatusPill(name,'busy','Processing...');
+  if(name===selectedSession)updateFavicon('busy');
+  // Show typing indicator in chat
+  const chatEl=document.getElementById('chat-'+name);
+  if(chatEl){
+    const existing=chatEl.querySelector('.chat-typing');
+    if(!existing){
+      const typing=document.createElement('div');
+      typing.className='chat-typing';
+      typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
+      chatEl.appendChild(typing);
+      chatEl.scrollTop=chatEl.scrollHeight;
+    }
+  }
+}
+
+function scheduleBusyVerification(name){
+  // First check after 5 seconds
+  setTimeout(async()=>{
+    try{
+      const resp=await fetch(BASE+'/api/status');
+      const statuses=await resp.json();
+      const st=statuses.find(s=>s.name===name);
+      if(!st)return;
+      if(st.activity_status==='busy'){
+        // Confirmed busy — update detail from server
+        updateStatusPill(name,st.activity_status,st.activity_detail);
+        lastStatus[name]=st.activity_status;
+        return;
+      }
+      // Server says idle — but might be a brief gap.  Check once more after 3s.
+      setTimeout(async()=>{
+        try{
+          const resp2=await fetch(BASE+'/api/status');
+          const statuses2=await resp2.json();
+          const st2=statuses2.find(s=>s.name===name);
+          if(!st2)return;
+          // Now accept whatever the server says
+          lastStatus[name]=st2.activity_status;
+          updateStatusPill(name,st2.activity_status,st2.activity_detail);
+          if(name===selectedSession)updateFavicon(st2.activity_status);
+          // Update typing indicator
+          const chatEl=document.getElementById('chat-'+name);
+          if(chatEl){
+            const existing=chatEl.querySelector('.chat-typing');
+            if(st2.activity_status==='busy'&&!existing){
+              const typing=document.createElement('div');
+              typing.className='chat-typing';
+              typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
+              chatEl.appendChild(typing);
+              chatEl.scrollTop=chatEl.scrollHeight;
+            }else if(st2.activity_status!=='busy'&&existing){
+              existing.remove();
+            }
+          }
+          // Also trigger a full data refresh if status changed
+          if(st2.activity_status!=='busy')refreshOne(name);
+        }catch(e){}
+      },3000);
+    }catch(e){}
+  },5000);
 }
 
 async function uploadFile(name,input){
@@ -1534,6 +2128,8 @@ async function sendCmd(name,source){
   input.disabled=true;
   // Also record in chat
   appendChatBubble(name,'user',cmd,Date.now()/1000);
+  // Immediately show busy state
+  setOptimisticBusy(name);
   try{
     await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
@@ -1541,24 +2137,73 @@ async function sendCmd(name,source){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
-    if(source==='raw')setTimeout(()=>loadRaw(name),500);
+    if(source==='raw')setTimeout(()=>pollRawDelta(name),500);
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
+  scheduleBusyVerification(name);
+}
+
+// ── Raw Output Streaming ──
+function startRawPolling(name){
+  const st=getRawState(name);
+  if(st.polling)return;
+  st.polling=true;
+  pollRawDelta(name);
+  st.timer=setInterval(()=>pollRawDelta(name),2000);
+}
+function stopRawPolling(name){
+  const st=getRawState(name);
+  st.polling=false;
+  if(st.timer){clearInterval(st.timer);st.timer=null}
+}
+function stopAllRawPolling(){
+  for(const n in rawState)stopRawPolling(n);
+}
+
+async function pollRawDelta(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  const infoEl=document.getElementById('raw-info-'+name);
+  if(!rawEl)return;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines='+st.knownLines);
+    const data=await resp.json();
+    if(data.mode==='full'){
+      rawEl.textContent=data.raw||'(empty)';
+      st.knownLines=data.pane_total;
+      rawEl.scrollTop=rawEl.scrollHeight;
+      if(infoEl)infoEl.textContent=data.total_lines+' lines';
+    }else if(data.mode==='delta'&&data.raw){
+      const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
+      const newLines=data.raw.split('\n');
+      const curText=rawEl.textContent;
+      const existingLines=curText.split('\n');
+      // Deduplicate using overlap
+      let appendFrom=0;
+      if(data.overlap&&existingLines.length>=data.overlap){
+        const tail=existingLines.slice(-data.overlap).join('\n');
+        const head=newLines.slice(0,data.overlap).join('\n');
+        if(tail===head)appendFrom=data.overlap;
+      }
+      const toAppend=newLines.slice(appendFrom).join('\n');
+      if(toAppend){
+        rawEl.textContent=curText+'\n'+toAppend;
+      }
+      st.knownLines=data.pane_total;
+      if(infoEl)infoEl.textContent=data.total_lines+' lines';
+      if(wasAtBottom)rawEl.scrollTop=rawEl.scrollHeight;
+    }
+    // mode==='none': nothing to do
+  }catch(e){}
 }
 
 async function loadRaw(name){
+  const st=getRawState(name);
+  st.knownLines=0;
   const rawEl=document.getElementById('raw-'+name);
-  const infoEl=document.getElementById('raw-info-'+name);
   if(rawEl)rawEl.textContent='Loading...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw');
-    const data=await resp.json();
-    rawCache[name]=true;
-    if(rawEl){rawEl.textContent=data.raw||'(empty)';rawEl.scrollTop=rawEl.scrollHeight}
-    if(infoEl)infoEl.textContent=data.lines+' lines';
-    updateStatusPill(name,data.activity_status,data.activity_detail);
-  }catch(e){if(rawEl)rawEl.textContent='Error loading.'}
+  await pollRawDelta(name);
 }
 
 function updateStatusPill(name,status,detail){
@@ -1568,6 +2213,7 @@ function updateStatusPill(name,status,detail){
     pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
       +(detail?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
+  toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
   if(navDot)navDot.className='nav-dot '+(status||'unknown');
 }
@@ -1589,17 +2235,21 @@ function updateCard(s){
   }
 
   if(s.name!==selectedSession)return;
-  const titleEl=document.getElementById('title-'+s.name);
-  if(titleEl&&s.title)titleEl.textContent=s.title;
+  const rawTitle=document.getElementById('raw-title-'+s.name);
+  if(rawTitle&&s.title)rawTitle.textContent=s.title;
   const desc=document.getElementById('desc-'+s.name);
   const prog=document.getElementById('prog-'+s.name);
+  const notesEl=document.getElementById('notes-'+s.name);
   if(desc)desc.textContent=s.description||'';
   if(prog)prog.textContent=s.progress||'';
+  if(notesEl&&s.notes)notesEl.textContent=s.notes;
   const tsDesc=document.getElementById('ts-desc-'+s.name);
   const tsProg=document.getElementById('ts-prog-'+s.name);
+  const tsNotes=document.getElementById('ts-notes-'+s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
   if(tsDesc)tsDesc.textContent=timeAgo(s.description_at);
   if(tsProg)tsProg.textContent=timeAgo(s.progress_at);
+  if(tsNotes)tsNotes.textContent=timeAgo(s.notes_at);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
   updateStatusPill(s.name,s.activity_status,s.activity_detail);
 
@@ -1610,7 +2260,7 @@ function updateCard(s){
     if(s.activity_status==='busy'&&!existing){
       const typing=document.createElement('div');
       typing.className='chat-typing';
-      typing.innerHTML='<span class="dots">...</span> Working';
+      typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
       chatEl.appendChild(typing);
       chatEl.scrollTop=chatEl.scrollHeight;
     }else if(s.activity_status!=='busy'&&existing){
@@ -1625,7 +2275,7 @@ async function loadAll(){
     sessions=await resp.json();
     sessions.forEach(s=>{
       lastStatus[s.name]=s.activity_status;
-      if(s.messages&&s.messages.length)chatMessages[s.name]=s.messages;
+      if(s.messages&&s.messages.length)mergeChatMessages(s.name, s.messages);
     });
     if(!selectedSession&&sessions.length>0)selectedSession=sessions[0].name;
     renderNav();
@@ -1654,15 +2304,16 @@ async function refreshFull(name){
   const btn=document.getElementById('btn-full-'+name);
   const desc=document.getElementById('desc-'+name);
   const prog=document.getElementById('prog-'+name);
+  const notesEl=document.getElementById('notes-'+name);
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Full'}
-  [desc,prog].forEach(el=>{if(el)el.classList.add('loading')});
+  [desc,prog,notesEl].forEach(el=>{if(el)el.classList.add('loading')});
   try{
     const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh-all',{method:'POST'});
     const data=await resp.json();
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
   }catch(e){}
-  [desc,prog].forEach(el=>{if(el)el.classList.remove('loading')});
+  [desc,prog,notesEl].forEach(el=>{if(el)el.classList.remove('loading')});
   if(btn){btn.disabled=false;btn.textContent='Full'}
 }
 
@@ -1759,14 +2410,24 @@ let _usageCache=null;
 let _authPollCount=0;
 
 async function checkClaudeAuth(){
+  // Fetch auth and usage independently so one failure doesn't break the other
   try{
-    const [authResp,usageResp]=await Promise.all([
-      fetch(BASE+'/api/auth/claude-status'),
-      fetch(BASE+'/api/auth/usage')
-    ]);
-    _authCache=await authResp.json();
-    _usageCache=await usageResp.json();
-  }catch(e){_authCache={loggedIn:false,error:true};_usageCache=null}
+    const authResp=await fetch(BASE+'/api/auth/claude-status');
+    if(authResp.ok){
+      const data=await authResp.json();
+      _authCache=data;
+    }
+    // If fetch succeeded but returned bad data, keep previous cache
+  }catch(e){
+    // Keep last known good auth state instead of resetting to disconnected
+    if(!_authCache)_authCache={loggedIn:false,error:true};
+  }
+  try{
+    const usageResp=await fetch(BASE+'/api/auth/usage');
+    if(usageResp.ok) _usageCache=await usageResp.json();
+  }catch(e){
+    // Keep last known usage data
+  }
   renderAuthIndicator();
 }
 
@@ -1914,7 +2575,224 @@ document.addEventListener('click',function(e){
   if(dd.classList.contains('active')&&!dd.contains(e.target)&&!trigger.contains(e.target)){
     dd.classList.remove('active');
   }
+  // Close any open slash dropdowns
+  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
+    if(!sd.contains(e.target)&&!e.target.classList.contains('cmd-slash')){
+      sd.classList.remove('active');
+    }
+  });
 });
+
+// ── Interrupt Session ──
+async function interruptSession(name){
+  try{
+    await fetch(BASE+'/api/sessions/'+name+'/interrupt',{method:'POST'});
+    appendChatBubble(name,'user','[interrupted]',Date.now()/1000);
+    // Clear busy state
+    const idx=sessions.findIndex(s=>s.name===name);
+    if(idx>=0){sessions[idx].activity_status='idle';sessions[idx].activity_detail=''}
+    lastStatus[name]='idle';
+    updateStatusPill(name,'idle','');
+    toggleInterruptButtons(name,false);
+    if(name===selectedSession)updateFavicon('idle');
+    // Remove typing indicator
+    const chatEl=document.getElementById('chat-'+name);
+    if(chatEl){const t=chatEl.querySelector('.chat-typing');if(t)t.remove()}
+  }catch(e){alert('Failed to interrupt session.')}
+  // Verify state after a moment
+  setTimeout(()=>refreshOne(name),2000);
+}
+function toggleInterruptButtons(name,show){
+  ['interrupt-chat-'+name,'interrupt-raw-'+name].forEach(id=>{
+    const btn=document.getElementById(id);
+    if(btn){if(show)btn.classList.add('visible');else btn.classList.remove('visible')}
+  });
+}
+
+// ── Slash Commands ──
+const SLASH_COMMANDS=[
+  {cmd:'/clear',desc:'Wipe conversation, start fresh'},
+  {cmd:'/compact',desc:'Summarize older context to save tokens'},
+  {cmd:'/context',desc:'Show context window usage'},
+  {cmd:'/cost',desc:'Show current session cost'},
+  {cmd:'/usage',desc:'Check rate limit status'},
+  {cmd:'/model sonnet',desc:'Switch to Sonnet (faster)'},
+  {cmd:'/model opus',desc:'Switch to Opus (stronger)'},
+  {cmd:'/plan',desc:'Toggle plan mode for complex tasks'},
+];
+
+function toggleSlashMenu(event,dropdownId){
+  event.stopPropagation();
+  // Close all other slash dropdowns
+  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
+    if(sd.id!==dropdownId)sd.classList.remove('active');
+  });
+  const dd=document.getElementById(dropdownId);
+  if(!dd)return;
+  if(!dd.innerHTML){
+    dd.innerHTML=SLASH_COMMANDS.map(c=>
+      `<div class="slash-item" data-cmd="${esc(c.cmd)}">
+        <span class="slash-item-cmd">${esc(c.cmd)}</span>
+        <span class="slash-item-desc">${esc(c.desc)}</span>
+      </div>`
+    ).join('');
+    dd.querySelectorAll('.slash-item').forEach(item=>{
+      item.addEventListener('click',function(){
+        const cmd=this.dataset.cmd;
+        // Find which session this belongs to
+        const name=selectedSession;
+        if(!name)return;
+        dd.classList.remove('active');
+        // Send the slash command
+        sendSlashCommand(name,cmd);
+      });
+    });
+  }
+  dd.classList.toggle('active');
+}
+
+async function sendSlashCommand(name,cmd){
+  appendChatBubble(name,'user',cmd,Date.now()/1000);
+  setOptimisticBusy(name);
+  try{
+    await fetch(BASE+'/api/sessions/'+name+'/send',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command:cmd})
+    });
+  }catch(e){alert('Failed to send command.')}
+  scheduleBusyVerification(name);
+}
+
+// ── CLAUDE.md Editor ──
+let _claudeMdFiles=[];
+let _claudeMdActiveIdx=0;
+
+async function openClaudeMd(){
+  if(!selectedSession){alert('Select a session first.');return}
+  const overlay=document.getElementById('claudemd-overlay');
+  overlay.classList.add('active');
+  document.getElementById('claudemd-editor').value='Loading...';
+  document.getElementById('claudemd-path').textContent='';
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+selectedSession+'/claude-md');
+    const data=await resp.json();
+    _claudeMdFiles=data.files||[];
+    _claudeMdActiveIdx=0;
+    renderClaudeMdTabs();
+    showClaudeMdFile(0);
+  }catch(e){
+    document.getElementById('claudemd-editor').value='Error loading CLAUDE.md';
+  }
+}
+
+function renderClaudeMdTabs(){
+  const tabsEl=document.getElementById('claudemd-tabs');
+  tabsEl.innerHTML=_claudeMdFiles.map((f,i)=>
+    `<div class="claudemd-tab ${i===_claudeMdActiveIdx?'active':''}" onclick="showClaudeMdFile(${i})">${esc(f.label)}${f.exists?'':' (new)'}</div>`
+  ).join('');
+}
+
+function showClaudeMdFile(idx){
+  _claudeMdActiveIdx=idx;
+  const f=_claudeMdFiles[idx];
+  if(!f)return;
+  document.getElementById('claudemd-editor').value=f.content||'';
+  document.getElementById('claudemd-path').textContent=f.path;
+  renderClaudeMdTabs();
+}
+
+async function saveClaudeMd(){
+  const f=_claudeMdFiles[_claudeMdActiveIdx];
+  if(!f)return;
+  const content=document.getElementById('claudemd-editor').value;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+selectedSession+'/claude-md',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:f.path,content})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to save');return}
+    f.content=content;
+    f.exists=true;
+    renderClaudeMdTabs();
+    closeClaudeMd();
+  }catch(e){alert('Failed to save CLAUDE.md')}
+}
+
+function closeClaudeMd(){
+  document.getElementById('claudemd-overlay').classList.remove('active');
+}
+
+// ── Stats Window ──
+async function openStats(){
+  const overlay=document.getElementById('stats-overlay');
+  overlay.classList.add('active');
+  document.getElementById('stats-content').innerHTML='<div style="text-align:center;color:#8b949e;padding:20px"><span class="spinner"></span> Loading stats...</div>';
+  try{
+    const resp=await fetch(BASE+'/api/stats');
+    const s=await resp.json();
+    renderStats(s);
+  }catch(e){
+    document.getElementById('stats-content').innerHTML='<div style="color:#f85149">Failed to load stats.</div>';
+  }
+}
+
+function renderStats(s){
+  let html='';
+  // Server
+  html+='<div class="stats-section"><div class="stats-section-title">Server</div>';
+  html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
+  if(s.cpu_load&&s.cpu_load['1m']){
+    html+='<div class="stats-row"><span class="stats-row-label">CPU Load</span><span class="stats-row-value">'+esc(s.cpu_load['1m'])+' / '+esc(s.cpu_load['5m'])+' / '+esc(s.cpu_load['15m'])+'</span></div>';
+  }
+  html+='</div>';
+  // Memory
+  if(s.memory&&s.memory.total_mb){
+    const memPct=Math.round(s.memory.used_mb/s.memory.total_mb*100);
+    const memColor=memPct>80?'#f85149':memPct>60?'#d29922':'#3fb950';
+    html+='<div class="stats-section"><div class="stats-section-title">Memory</div>';
+    html+='<div class="stats-row"><span class="stats-row-label">Used / Total</span><span class="stats-row-value">'+Math.round(s.memory.used_mb/1024*10)/10+'G / '+Math.round(s.memory.total_mb/1024*10)/10+'G ('+memPct+'%)</span></div>';
+    html+='<div class="stats-bar"><div class="stats-bar-fill" style="width:'+memPct+'%;background:'+memColor+'"></div></div>';
+    html+='</div>';
+  }
+  // Disk
+  if(s.disk&&s.disk.total_gb){
+    const diskColor=s.disk.pct>85?'#f85149':s.disk.pct>70?'#d29922':'#3fb950';
+    html+='<div class="stats-section"><div class="stats-section-title">Disk</div>';
+    html+='<div class="stats-row"><span class="stats-row-label">Used / Total</span><span class="stats-row-value">'+s.disk.used_gb+'G / '+s.disk.total_gb+'G ('+s.disk.pct+'%)</span></div>';
+    html+='<div class="stats-bar"><div class="stats-bar-fill" style="width:'+s.disk.pct+'%;background:'+diskColor+'"></div></div>';
+    html+='</div>';
+  }
+  // tmux Sessions
+  if(s.tmux_sessions&&s.tmux_sessions.length){
+    html+='<div class="stats-section"><div class="stats-section-title">tmux Sessions ('+s.tmux_sessions.length+')</div>';
+    s.tmux_sessions.forEach(t=>{
+      const att=t.attached?'<span style="color:#3fb950">attached</span>':'<span style="color:#8b949e">detached</span>';
+      html+='<div class="stats-row"><span class="stats-row-label">'+esc(t.name)+'</span><span class="stats-row-value">'+t.windows+' win &middot; '+att+'</span></div>';
+    });
+    html+='</div>';
+  }
+  // Claude Processes
+  html+='<div class="stats-section"><div class="stats-section-title">Claude Processes</div>';
+  if(s.claude_processes&&s.claude_processes.length){
+    s.claude_processes.forEach(p=>{
+      const short=p.length>80?p.substring(0,80)+'...':p;
+      html+='<div class="stats-row" style="word-break:break-all"><span class="stats-row-value" style="font-size:.7rem">'+esc(short)+'</span></div>';
+    });
+  }else{
+    html+='<div class="stats-row"><span class="stats-row-label">No Claude processes found</span></div>';
+  }
+  if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
+  html+='</div>';
+
+  document.getElementById('stats-content').innerHTML=html;
+}
+
+function closeStats(){
+  document.getElementById('stats-overlay').classList.remove('active');
+}
 
 loadAll();
 checkClaudeAuth();
