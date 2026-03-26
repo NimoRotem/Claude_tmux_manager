@@ -290,6 +290,10 @@ def get_pane_position(session_name: str) -> dict:
 # Track auto-approve state to avoid re-triggering
 _auto_approve_sent: Dict[str, float] = {}
 
+# Content stability tracking for idle detection
+# Stores (hash, first_seen_time, consecutive_count) per session
+_pane_stability: Dict[str, tuple] = {}
+
 
 def _check_auto_approve(session_name: str, visible: str):
     """Detect Claude Code permission prompts and numbered question prompts,
@@ -497,10 +501,13 @@ def detect_activity(session_name: str) -> dict:
         # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
         # where possible to avoid false positives from these patterns
         # appearing in conversation output text.
-        SPINNER_ICONS = r'[✶✽✻·\*☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
-        # Completion markers: "● Done" or "● Completed" = finished, NOT busy.
-        # Must check these BEFORE spinner detection since ● is a spinner icon.
-        COMPLETION_RE = re.compile(r'^●\s+(Done|Completed)\b')
+        SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
+        # Completion markers — these look like spinners but mean "finished":
+        # "● Done", "● Completed", "✻ Sautéed for 4m 47s", "✶ Churned for 2m", etc.
+        COMPLETION_RE = re.compile(
+            r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
+            r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
+        )
         for line in window:
             stripped = line.strip()
             # Skip completion markers — these look like spinners but mean "finished"
@@ -541,7 +548,26 @@ def detect_activity(session_name: str) -> dict:
                 info["detail"] = "Agents running"
                 return info
 
-        # --- Step 4: If idle prompt + no busy signals → truly idle ---
+        # --- Step 4: Content stability check ---
+        # If the terminal content hasn't changed for 20+ seconds and there's no
+        # "esc to interrupt", the session is idle — real work produces output,
+        # real spinners animate.  This catches cases text patterns miss.
+        content_hash = hashlib.md5(visible.encode()).hexdigest()
+        now = time.time()
+        prev = _pane_stability.get(session_name)
+        if prev and prev[0] == content_hash:
+            # Content unchanged since last check
+            stable_since = prev[1]
+            stable_seconds = now - stable_since
+            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
+        else:
+            # Content changed — reset
+            stable_seconds = 0
+            _pane_stability[session_name] = (content_hash, now, 1)
+
+        content_is_static = stable_seconds >= 20
+
+        # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
             info["detail"] = "Waiting for input"
@@ -553,7 +579,16 @@ def detect_activity(session_name: str) -> dict:
             info["detail"] = "Background tasks"
             return info
 
-        # --- Step 4: Shell prompt check ---
+        # --- Step 6: Static content override ---
+        # If the terminal hasn't changed in 20+ seconds and the foreground
+        # command is claude/node, it's almost certainly idle — the text-based
+        # checks above may have missed it or the output just looks ambiguous.
+        if content_is_static and cmd.lower() in ("claude", "node"):
+            info["status"] = "idle"
+            info["detail"] = "Waiting for input"
+            return info
+
+        # --- Step 7: Shell prompt check ---
         last_line = bottom[-1].strip() if bottom else ""
         shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
         if cmd.lower() in shell_cmds:
