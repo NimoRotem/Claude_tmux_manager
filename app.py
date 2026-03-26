@@ -292,33 +292,111 @@ _auto_approve_sent: Dict[str, float] = {}
 
 
 def _check_auto_approve(session_name: str, visible: str):
-    """Detect Claude Code plan/permission prompts and auto-select option 2."""
+    """Detect Claude Code permission prompts and numbered question prompts,
+    then auto-select the most autonomous / 'just do it' option."""
     # Don't re-trigger within 10 seconds
     last = _auto_approve_sent.get(session_name, 0)
     if time.time() - last < 10:
         return
 
     lines = visible.split("\n")
-    # Look for the option list pattern in the visible pane
+
+    # --- Strategy 1: Permission prompt with "Yes, and bypass" ---
     option2_line = -1
     selected_line = -1
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # Find the "2. Yes, and bypass" option
         if re.search(r'2\.\s+Yes.*bypass', stripped):
             option2_line = i
-        # Find where the selector ❯ currently is
         if stripped.startswith('❯') or stripped.startswith('>'):
             selected_line = i
 
-    if option2_line < 0 or selected_line < 0:
-        return
+    if option2_line >= 0 and selected_line >= 0:
+        downs = option2_line - selected_line
+        if downs >= 0:
+            _send_option(session_name, downs)
+            return
 
-    # Calculate how many Down presses needed
-    downs = option2_line - selected_line
-    if downs < 0:
-        return  # Already past option 2, don't act
+    # --- Strategy 2: Numbered question prompt (1. / 2. / 3. style) ---
+    # Claude sometimes asks the user to pick from numbered options after planning.
+    # We look for a list of numbered options and pick the most autonomous one.
+    numbered_options = {}  # line_index -> (number, text)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        m = re.match(r'^(\d+)[.\-\)]\s+(.+)', stripped)
+        if m:
+            numbered_options[i] = (int(m.group(1)), m.group(2))
 
+    if len(numbered_options) >= 2:
+        # Find the option that means "do it all, don't ask again"
+        autonomous_keywords = [
+            "don't ask", "without asking", "bypass", "skip permission",
+            "autonomous", "all permissions", "proceed without",
+            "do everything", "yes to all", "approve all",
+            "don't confirm", "without confirm", "skip confirm",
+            "no further", "without further",
+        ]
+        best_line = None
+        best_score = -1
+        for line_idx, (num, text) in numbered_options.items():
+            lower = text.lower()
+            score = sum(1 for kw in autonomous_keywords if kw in lower)
+            # Also favor option 1 as tiebreaker (usually the most autonomous)
+            if score > best_score or (score == best_score and best_line is not None
+                                      and num < numbered_options.get(best_line, (999, ""))[0]):
+                best_score = score
+                best_line = line_idx
+
+        # Only act if we found a clear autonomous option (keyword match)
+        # or if there are exactly 2-3 options and option 1 mentions doing/proceeding
+        if best_score > 0 and best_line is not None:
+            target_num = numbered_options[best_line][0]
+            # Type the number and press Enter
+            try:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "-l", str(target_num)],
+                    capture_output=True, text=True, timeout=3
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    capture_output=True, text=True, timeout=3
+                )
+                _auto_approve_sent[session_name] = time.time()
+            except Exception:
+                pass
+            return
+
+    # --- Strategy 3: AskUserQuestion with labeled options (cursor-based) ---
+    # Claude Code sometimes presents options where ❯ is the selector and
+    # options contain labels. Pick the one with autonomous keywords.
+    if selected_line >= 0:
+        option_lines = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Options in a cursor-based list start with ❯, >, or spaces (unselected)
+            if re.match(r'^[❯>\s]\s+\S', stripped):
+                option_lines.append((i, stripped.lstrip('❯> ')))
+        if len(option_lines) >= 2:
+            autonomous_target = None
+            for idx, (line_i, text) in enumerate(option_lines):
+                lower = text.lower()
+                for kw in ["bypass", "don't ask", "autonomous", "skip permission",
+                           "all permissions", "yes to all", "approve all",
+                           "without asking", "proceed without"]:
+                    if kw in lower:
+                        autonomous_target = line_i
+                        break
+                if autonomous_target is not None:
+                    break
+            if autonomous_target is not None:
+                downs = autonomous_target - selected_line
+                if downs >= 0:
+                    _send_option(session_name, downs)
+                    return
+
+
+def _send_option(session_name: str, downs: int):
+    """Send Down arrow keys + Enter to select an option in a tmux pane."""
     try:
         for _ in range(downs):
             subprocess.run(
@@ -386,10 +464,22 @@ def detect_activity(session_name: str) -> dict:
             # Use a broad pattern to catch all verb variations (Churned, Sautéed, etc.)
             r'[A-Z][a-zé]+ for \d+[ms]',
         ]
+        # Lines containing these phrases override idle — session is still working
+        busy_overrides = [
+            "still running",
+            "agents running",
+            "waiting for completion",
+            "in progress",
+        ]
         has_idle_prompt = False
         for pattern in idle_prompt_patterns:
             for line in bottom:
-                if re.search(pattern, line.strip()):
+                stripped = line.strip()
+                if re.search(pattern, stripped):
+                    # Check if the same line has a busy override
+                    lower = stripped.lower()
+                    if any(phrase in lower for phrase in busy_overrides):
+                        continue  # not truly idle
                     has_idle_prompt = True
                     break
             if has_idle_prompt:
@@ -443,6 +533,12 @@ def detect_activity(session_name: str) -> dict:
             if re.search(r'\(thought for \d+', stripped) or stripped.endswith('(thinking)'):
                 info["status"] = "busy"
                 info["detail"] = "Thinking"
+                return info
+            # "N local agents still running" or "Waiting for completion" = busy
+            lower = stripped.lower()
+            if "still running" in lower or "waiting for completion" in lower:
+                info["status"] = "busy"
+                info["detail"] = "Agents running"
                 return info
 
         # --- Step 4: If idle prompt + no busy signals → truly idle ---
