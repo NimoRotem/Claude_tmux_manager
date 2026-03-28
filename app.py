@@ -294,6 +294,13 @@ _auto_approve_sent: Dict[str, float] = {}
 # Stores (hash, first_seen_time, consecutive_count) per session
 _pane_stability: Dict[str, tuple] = {}
 
+# Hysteresis for activity detection — prevents rapid busy/idle flickering.
+# Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
+_activity_state: Dict[str, dict] = {}
+# Require N consecutive idle readings before switching from busy → idle.
+# At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
+IDLE_CONFIRM_COUNT = 3
+
 
 def _check_auto_approve(session_name: str, visible: str):
     """Detect Claude Code permission prompts and numbered question prompts,
@@ -416,8 +423,8 @@ def _send_option(session_name: str, downs: int):
         pass
 
 
-def detect_activity(session_name: str) -> dict:
-    """Detect if session is busy or idle, and what command is running."""
+def _detect_activity_raw(session_name: str) -> dict:
+    """Raw single-snapshot activity detection (no debounce)."""
     info = {"status": "unknown", "command": "", "detail": ""}
     try:
         # Get the foreground command and pane pid
@@ -608,6 +615,81 @@ def detect_activity(session_name: str) -> dict:
     except Exception:
         pass
     return info
+
+
+def detect_activity(session_name: str) -> dict:
+    """Debounced activity detection with asymmetric hysteresis.
+
+    - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
+    - idle → busy: immediate (1 reading)
+
+    This prevents flickering when Claude Code briefly shows no spinner
+    between tool calls or streaming chunks.
+    """
+    raw = _detect_activity_raw(session_name)
+    now = time.time()
+    prev = _activity_state.get(session_name)
+
+    if prev is None:
+        # First reading — accept as-is
+        _activity_state[session_name] = {
+            "status": raw["status"],
+            "since": now,
+            "consecutive_idle": 1 if raw["status"] == "idle" else 0,
+            "raw": raw,
+        }
+        return raw
+
+    if raw["status"] == "busy":
+        # Busy is always accepted immediately — reset idle counter
+        _activity_state[session_name] = {
+            "status": "busy",
+            "since": now if prev["status"] != "busy" else prev["since"],
+            "consecutive_idle": 0,
+            "raw": raw,
+        }
+        return raw
+
+    if raw["status"] in ("idle", "unknown"):
+        if prev["status"] == "busy":
+            # Trying to transition busy → idle: increment counter but hold busy
+            idle_count = prev["consecutive_idle"] + 1
+            if idle_count >= IDLE_CONFIRM_COUNT:
+                # Enough consecutive idle readings — confirm transition
+                _activity_state[session_name] = {
+                    "status": raw["status"],
+                    "since": now,
+                    "consecutive_idle": idle_count,
+                    "raw": raw,
+                }
+                return raw
+            else:
+                # Not enough yet — stay busy but record the idle reading
+                _activity_state[session_name] = {
+                    "status": "busy",
+                    "since": prev["since"],
+                    "consecutive_idle": idle_count,
+                    "raw": prev["raw"],  # keep last busy details
+                }
+                return prev["raw"]
+        else:
+            # Already idle/unknown — stay idle, keep counting
+            _activity_state[session_name] = {
+                "status": raw["status"],
+                "since": prev["since"],
+                "consecutive_idle": prev["consecutive_idle"] + 1,
+                "raw": raw,
+            }
+            return raw
+
+    # Fallback
+    _activity_state[session_name] = {
+        "status": raw["status"],
+        "since": now,
+        "consecutive_idle": 0,
+        "raw": raw,
+    }
+    return raw
 
 
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
