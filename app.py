@@ -67,6 +67,9 @@ def _clear_anthropic_key():
 
 _load_anthropic_key()
 
+# Track auth mode per session: "subscription" or "api"
+_session_auth_mode: Dict[str, str] = {}
+
 app = FastAPI(root_path=ROOT_PATH)
 
 # --- Auth ---
@@ -839,31 +842,48 @@ async def get_realtime(session_name: str) -> str:
     if activity["detail"]:
         status_hint += f" — {activity['detail']}"
     status_hint += "]"
+
+    # Include recent chat messages for context to avoid repetition
+    entry = cache.get(session_name, {})
+    messages = entry.get("messages", [])
+    msg_context = ""
+    if messages:
+        recent_msgs = messages[-10:]
+        msg_lines = []
+        for m in recent_msgs:
+            prefix = "USER" if m["role"] == "user" else "ASSISTANT"
+            msg_lines.append(f"[{prefix}] {m['text']}")
+        msg_context = "\n\n=== RECENT CHAT MESSAGES ===\n" + "\n".join(msg_lines)
+
     return await llm_call(
         system_prompt=(
-            "You summarize the CURRENT STEP in a terminal session. Write 1-2 short sentences.\n\n"
-            "Write as a collaborative team update using 'we' — like a coworker reporting progress.\n\n"
+            "You summarize what happened in a terminal session SINCE the last user message. "
+            "Write 2-3 short sentences as a collaborative team update using 'we'.\n\n"
             "RULES:\n"
             "- Use first-person plural: 'We updated...', 'We're running...', 'We fixed...'.\n"
             "- NEVER start with 'User asked' or 'User requested'.\n"
+            "- Focus on CONCRETE DETAILS: URLs, IPs, file paths modified, error messages, "
+            "credentials created, ports used, specific actions taken.\n"
             "- If BUSY: describe what's actively happening. Include progress % if visible.\n"
-            "- If IDLE: describe what was accomplished. Use past tense.\n"
-            "- Focus on the INTENT and RESULT — not shell commands or file paths.\n"
-            "- Don't mention bash, curl, sleep, grep, cat, git commands — describe the goal.\n"
-            "- Under 30 words.\n\n"
-            "GOOD examples (busy):\n"
-            "- 'Re-matching all URLs with the LLM pipeline — 64% done.'\n"
-            "- 'We're adding dark mode support, currently editing the CSS theme variables.'\n"
-            "GOOD examples (idle):\n"
-            "- 'We fixed the auth token validation and restarted the server.'\n"
-            "- 'Added a delete button with confirmation dialog and wired up the API endpoint.'\n"
+            "- If IDLE: describe what was accomplished since the last user message.\n"
+            "- Include any errors or warnings that appeared.\n"
+            "- Do NOT repeat information already in previous ASSISTANT messages.\n"
+            "- Refer to the RECENT CHAT MESSAGES to understand context and avoid repetition.\n"
+            "- Under 60 words.\n\n"
+            "GOOD examples:\n"
+            "- 'We added the /api/users endpoint and deployed to rotem.cc:8510. "
+            "The migration created 3 new tables. Server restarted successfully.'\n"
+            "- 'We're running the scraper pipeline — 64% done. Found 2 rate-limit errors.'\n"
             "BAD examples:\n"
+            "- 'We're working on the project.' (too vague)\n"
             "- 'User asked to fix the login bug.' (don't say 'user asked')\n"
-            "- 'Idle, waiting for input.' (too vague — what was just done?)\n"
-            "- 'A bash process is executing a curl request...' (mechanics, not intent)"
+            "- 'Idle, waiting for input.' (what was just done?)"
         ),
-        user_content=f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}",
-        max_tokens=100,
+        user_content=(
+            f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}"
+            f"{msg_context[:1500]}"
+        ),
+        max_tokens=200,
     )
 
 
@@ -962,6 +982,7 @@ def build_session_response(sess: dict, data: dict) -> dict:
         "activity_status": activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
+        "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
     }
 
 
@@ -982,6 +1003,41 @@ async def api_sessions():
         build_session_response(sess, data)
         for sess, data in zip(sessions, results)
     ])
+
+
+@app.get("/api/sessions-fast")
+async def api_sessions_fast():
+    """Return session list with cached data only — no LLM calls. Fast startup."""
+    sessions = get_tmux_sessions()
+    out = []
+    for sess in sessions:
+        activity = detect_activity(sess["name"])
+        entry = cache.get(sess["name"], {})
+        if "messages" not in entry:
+            entry["messages"] = _load_session_messages(sess["name"])
+        if "notes" not in entry:
+            entry["notes"] = _load_session_notes(sess["name"])
+        cache[sess["name"]] = entry
+        out.append({
+            "name": sess["name"],
+            "windows": sess["windows"],
+            "attached": sess["attached"],
+            "title": entry.get("title", ""),
+            "description": entry.get("description", ""),
+            "description_at": entry.get("description_at", 0),
+            "progress": entry.get("progress", ""),
+            "progress_at": entry.get("progress_at", 0),
+            "notes": entry.get("notes", ""),
+            "notes_at": entry.get("notes_at", 0),
+            "realtime": entry.get("realtime", ""),
+            "realtime_at": entry.get("realtime_at", 0),
+            "messages": entry.get("messages", []),
+            "activity_status": activity["status"],
+            "activity_command": activity.get("command", ""),
+            "activity_detail": activity.get("detail", ""),
+            "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
+        })
+    return JSONResponse(out)
 
 
 @app.post("/api/sessions/{session_name}/refresh")
@@ -1131,6 +1187,9 @@ async def api_create_session(body: CreateSession):
                 ["tmux", "send-keys", "-t", created, "Enter"],
                 capture_output=True, text=True, timeout=5
             )
+            _session_auth_mode[created] = "api"
+        else:
+            _session_auth_mode[created] = "subscription"
         # Optionally launch a command in the new session
         if NEW_SESSION_CMD:
             subprocess.run(
@@ -1515,6 +1574,12 @@ async def api_claude_usage():
 class SendCommand(BaseModel):
     command: str
 
+class SendKeys(BaseModel):
+    keys: list  # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"]
+
+class AuthModeBody(BaseModel):
+    mode: str  # "api" or "subscription"
+
 
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(session_name: str, body: SendCommand):
@@ -1581,6 +1646,96 @@ async def api_interrupt_session(session_name: str):
             capture_output=True, text=True, timeout=5
         )
         return JSONResponse({"ok": True, "action": "interrupt"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# Allowed tmux key names to prevent injection
+ALLOWED_TMUX_KEYS = {
+    "Escape", "Enter", "Space", "Tab", "BSpace",
+    "Up", "Down", "Left", "Right",
+    "C-c", "C-d", "C-z", "C-l", "C-a", "C-e",
+    "PageUp", "PageDown", "Home", "End",
+}
+
+@app.post("/api/sessions/{session_name}/send-keys")
+async def api_send_keys(session_name: str, body: SendKeys):
+    """Send raw key sequences to a tmux session (Escape, C-c, Enter, q, etc.).
+
+    Unlike /send, this does NOT wrap text in -l (literal) mode and does NOT
+    auto-append Enter. Use this for terminal control keys.
+    """
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        for key in body.keys:
+            # Allow single printable characters (q, y, n, etc.) and known tmux key names
+            if key in ALLOWED_TMUX_KEYS or (len(key) == 1 and key.isprintable()):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, key],
+                    capture_output=True, text=True, timeout=5
+                )
+            else:
+                return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
+        return JSONResponse({"ok": True, "keys_sent": body.keys})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/sessions/{session_name}/set-auth-mode")
+async def api_set_auth_mode(session_name: str, body: AuthModeBody):
+    """Toggle between API key and subscription auth for a specific session."""
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        if body.mode == "api":
+            key = _stored_anthropic_key
+            if not key:
+                # Fallback: try to extract from ~/CLAUDE.md
+                try:
+                    claude_md = (Path.home() / "CLAUDE.md").read_text()
+                    for line in claude_md.splitlines():
+                        line = line.strip()
+                        if line.startswith("sk-ant-"):
+                            key = line.split()[0].rstrip(",;")
+                            break
+                        elif "sk-ant-" in line:
+                            import re
+                            m = re.search(r'(sk-ant-\S+)', line)
+                            if m:
+                                key = m.group(1).rstrip(",;")
+                                break
+                except Exception:
+                    pass
+            if not key:
+                return JSONResponse({"error": "No API key found"}, status_code=400)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 f"export ANTHROPIC_API_KEY={key}"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
+        elif body.mode == "subscription":
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 "unset ANTHROPIC_API_KEY"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
+        else:
+            return JSONResponse({"error": "Invalid mode"}, status_code=400)
+        _session_auth_mode[session_name] = body.mode
+        return JSONResponse({"ok": True, "mode": body.mode, "session": session_name})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1682,28 +1837,43 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .cmd-upload:hover{color:#58a6ff}
 .cmd-expand{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 10px;font-size:.85rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
 .cmd-expand:hover{color:#58a6ff}
-.cmd-slash{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 12px;font-size:.85rem;cursor:pointer;background:#21262d;color:#d2a8ff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;font-family:'SF Mono','Fira Code',Consolas,monospace}
-.cmd-slash:hover{background:#1c2128;color:#f0f6fc}
 .cmd-interrupt{display:none;border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:.8rem;cursor:pointer;background:#da3633;color:#fff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;letter-spacing:.03em;white-space:nowrap}
 .cmd-interrupt:hover{background:#f85149}
 .cmd-interrupt.visible{display:block}
-/* Slash commands dropdown */
-.slash-dropdown{display:none;position:absolute;bottom:100%;right:0;z-index:50;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:6px 0;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-bottom:4px}
-.slash-dropdown.active{display:block}
-.slash-item{display:flex;align-items:center;gap:10px;padding:8px 14px;cursor:pointer;transition:background .1s;font-size:.85rem;color:#c9d1d9}
-.slash-item:hover{background:#1c2128}
-.slash-item-cmd{color:#d2a8ff;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:600;min-width:80px}
-.slash-item-desc{color:#8b949e;font-size:.75rem}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
 .raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
 .raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
+.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto;scroll-behavior:smooth}
 .raw-output::-webkit-scrollbar{width:6px;height:6px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+.raw-resize-handle{width:100%;height:8px;cursor:ns-resize;background:transparent;display:flex;align-items:center;justify-content:center;user-select:none;flex-shrink:0}
+.raw-resize-handle:hover{background:#21262d}
+.raw-resize-handle::after{content:'';width:40px;height:3px;border-radius:2px;background:#30363d}
+.raw-resize-handle:hover::after{background:#484f58}
+
+/* Terminal key bar */
+.key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
+.key-bar.expanded{display:flex}
+.key-bar-toggle{display:flex;align-items:center;justify-content:center;gap:4px;margin-top:6px;padding:4px 10px;font-size:.68rem;color:#8b949e;background:#161b22;border:1px solid #21262d;border-radius:6px;cursor:pointer;user-select:none;transition:all .15s;width:100%}
+.key-bar-toggle:hover{background:#1c2128;color:#c9d1d9;border-color:#30363d}
+.key-bar-toggle.open{border-radius:6px 6px 0 0;border-bottom:none}
+.key-bar-toggle .chevron{transition:transform .2s;display:inline-block;font-size:.6rem}
+.key-bar-toggle.open .chevron{transform:rotate(180deg)}
+.key-bar-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;margin-right:4px;user-select:none;white-space:nowrap}
+.key-btn{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:500;color:#c9d1d9;background:#21262d;border:1px solid #30363d;border-radius:4px;cursor:pointer;transition:all .15s;user-select:none;white-space:nowrap;line-height:1.3}
+.key-btn:hover{background:#30363d;color:#f0f6fc;border-color:#484f58}
+.key-btn:active{background:#484f58;transform:scale(.95)}
+.key-btn.key-esc{color:#f0883e;border-color:#f0883e55}
+.key-btn.key-esc:hover{background:#f0883e22;color:#ffb366}
+.key-btn.key-ctrlc{color:#f85149;border-color:#f8514955}
+.key-btn.key-ctrlc:hover{background:#f8514922;color:#ff7b73}
+.key-btn.key-slash{color:#d2a8ff;border-color:#d2a8ff44;font-size:.68rem}
+.key-btn.key-slash:hover{background:#d2a8ff22;color:#f0f6fc;border-color:#d2a8ff88}
+.key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -1968,7 +2138,6 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
-      <span class="nav-title" id="nav-title-${s.name}">${esc(s.title)||'Loading...'}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
@@ -1992,7 +2161,7 @@ function renderDetail(){
   saveDrafts();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
-  const tab=activeTabs[s.name]||'chat';
+  const tab=activeTabs[s.name]||'raw';
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -2001,8 +2170,8 @@ function renderDetail(){
 
   mainEl.innerHTML=`
     <div class="tab-bar">
+      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
       <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
-      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Raw Output</div>
       <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
       <div class="detail-badges">
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
@@ -2030,22 +2199,22 @@ function renderDetail(){
             autocomplete="off" spellcheck="false"></textarea>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
           <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-          <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-chat-${s.name}')" title="Slash commands">/</button>
           <button class="cmd-expand" onclick="toggleExpand('cmd-chat-${s.name}')" title="Expand/collapse">&#x2195;</button>
           <button class="cmd-upload" onclick="document.getElementById('upload-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
-          <div class="slash-dropdown" id="slash-chat-${s.name}"></div>
         </div>
+        ${buildKeyBar(s.name,'chat')}
       </div>
     </div>
 
     <div class="tab-content tab-raw ${tab==='raw'?'active':''}" id="tab-raw-${s.name}">
       <div class="raw-controls">
-        <span class="raw-info" id="raw-info-${s.name}">Click to load raw output</span>
+        <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}">Click "Raw Output" tab or "Reload" to fetch...</div>
+      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
+      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
@@ -2055,12 +2224,11 @@ function renderDetail(){
           autocomplete="off" spellcheck="false"></textarea>
         <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
         <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-        <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-raw-${s.name}')" title="Slash commands">/</button>
         <button class="cmd-expand" onclick="toggleExpand('cmd-raw-${s.name}')" title="Expand/collapse">&#x2195;</button>
         <button class="cmd-upload" onclick="document.getElementById('upload-raw-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
-        <div class="slash-dropdown" id="slash-raw-${s.name}"></div>
       </div>
+      ${buildKeyBar(s.name,'raw')}
     </div>
 
     <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
@@ -2075,6 +2243,24 @@ function renderDetail(){
       <div class="tier tier-notes">
         <div class="tier-label"><span class="dot"></span>Key Info</div>
         <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
+      </div>
+      <div class="tier" style="margin-top:12px">
+        <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
+            <input type="radio" name="auth-mode-${s.name}" value="subscription"
+              onchange="setAuthMode('${s.name}','subscription')"
+              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
+            Subscription
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
+            <input type="radio" name="auth-mode-${s.name}" value="api"
+              onchange="setAuthMode('${s.name}','api')"
+              ${s.auth_mode==='api'?'checked':''}>
+            API Key
+          </label>
+          <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
+        </div>
       </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
@@ -2097,7 +2283,11 @@ function renderDetail(){
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
   // Start/stop raw polling based on active tab
   stopAllRawPolling();
-  if(tab==='raw')startRawPolling(s.name);
+  if(tab==='raw'){
+    const rawEl=document.getElementById('raw-'+s.name);
+    if(rawEl&&rawEl.textContent.startsWith('Loading'))loadRaw(s.name);
+    startRawPolling(s.name);
+  }
 }
 
 function selectSession(name){
@@ -2115,7 +2305,7 @@ function switchTab(name,tab){
   allTabs.forEach(t=>t.classList.remove('active'));
   const tabBar=mainEl.querySelector('.tab-bar');
   if(tabBar)tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  const tabNames=['chat','raw','info'];
+  const tabNames=['raw','chat','info'];
   const idx=tabNames.indexOf(tab);
   if(tabBar&&idx>=0){
     const tabs=tabBar.querySelectorAll('.tab');
@@ -2363,7 +2553,7 @@ function startRawPolling(name){
   if(st.polling)return;
   st.polling=true;
   pollRawDelta(name);
-  st.timer=setInterval(()=>pollRawDelta(name),2000);
+  st.timer=setInterval(()=>pollRawDelta(name),1000);
 }
 function stopRawPolling(name){
   const st=getRawState(name);
@@ -2385,7 +2575,9 @@ async function pollRawDelta(name){
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
+      rawEl.style.scrollBehavior='auto';
       rawEl.scrollTop=rawEl.scrollHeight;
+      rawEl.style.scrollBehavior='';
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
       const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
@@ -2432,9 +2624,6 @@ function updateStatusPill(name,status,detail){
 }
 
 function updateCard(s){
-  const navTitle=document.getElementById('nav-title-'+s.name);
-  if(navTitle&&s.title)navTitle.textContent=s.title;
-
   // Sync messages from server response
   if(s.messages&&s.messages.length){
     const local=chatMessages[s.name]||[];
@@ -2484,7 +2673,8 @@ function updateCard(s){
 
 async function loadAll(){
   try{
-    const resp=await fetch(BASE+'/api/sessions');
+    // Phase 1: Fast load — cached data + activity status, no LLM calls
+    const resp=await fetch(BASE+'/api/sessions-fast');
     sessions=await resp.json();
     sessions.forEach(s=>{
       lastStatus[s.name]=s.activity_status;
@@ -2495,6 +2685,19 @@ async function loadAll(){
     renderDetail();
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
+  // Phase 2: Background LLM refresh for each session
+  lazyRefreshAll();
+}
+
+async function lazyRefreshAll(){
+  for(const s of sessions){
+    try{
+      const resp=await fetch(BASE+'/api/sessions/'+s.name+'/refresh',{method:'POST'});
+      const data=await resp.json();
+      const idx=sessions.findIndex(x=>x.name===s.name);
+      if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
+    }catch(e){}
+  }
 }
 
 async function refreshAllRealtime(){
@@ -2788,12 +2991,6 @@ document.addEventListener('click',function(e){
   if(dd.classList.contains('active')&&!dd.contains(e.target)&&!trigger.contains(e.target)){
     dd.classList.remove('active');
   }
-  // Close any open slash dropdowns
-  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
-    if(!sd.contains(e.target)&&!e.target.classList.contains('cmd-slash')){
-      sd.classList.remove('active');
-    }
-  });
 });
 
 // ── Interrupt Session ──
@@ -2822,46 +3019,123 @@ function toggleInterruptButtons(name,show){
   });
 }
 
-// ── Slash Commands ──
-const SLASH_COMMANDS=[
-  {cmd:'/clear',desc:'Wipe conversation, start fresh'},
-  {cmd:'/compact',desc:'Summarize older context to save tokens'},
-  {cmd:'/context',desc:'Show context window usage'},
-  {cmd:'/cost',desc:'Show current session cost'},
-  {cmd:'/usage',desc:'Check rate limit status'},
-  {cmd:'/model sonnet',desc:'Switch to Sonnet (faster)'},
-  {cmd:'/model opus',desc:'Switch to Opus (stronger)'},
-  {cmd:'/plan',desc:'Toggle plan mode for complex tasks'},
-];
+// ── Terminal Resize ──
+let _resizing=null;
+function getTerminalHeight(){
+  const saved=localStorage.getItem('terminalHeight');
+  return saved?'max-height:'+saved+'px':'';
+}
+function startResize(e,name){
+  e.preventDefault();
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  _resizing={el:rawEl,startY:e.clientY,startH:rawEl.offsetHeight};
+  document.addEventListener('mousemove',doResize);
+  document.addEventListener('mouseup',stopResize);
+  document.body.style.cursor='ns-resize';
+  document.body.style.userSelect='none';
+}
+function doResize(e){
+  if(!_resizing)return;
+  const delta=e.clientY-_resizing.startY;
+  const newH=Math.max(120,Math.min(window.innerHeight-200,_resizing.startH+delta));
+  _resizing.el.style.maxHeight=newH+'px';
+}
+function stopResize(){
+  if(!_resizing)return;
+  const finalH=parseInt(_resizing.el.style.maxHeight);
+  if(finalH)localStorage.setItem('terminalHeight',String(finalH));
+  _resizing=null;
+  document.removeEventListener('mousemove',doResize);
+  document.removeEventListener('mouseup',stopResize);
+  document.body.style.cursor='';
+  document.body.style.userSelect='';
+}
 
-function toggleSlashMenu(event,dropdownId){
-  event.stopPropagation();
-  // Close all other slash dropdowns
-  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
-    if(sd.id!==dropdownId)sd.classList.remove('active');
-  });
-  const dd=document.getElementById(dropdownId);
-  if(!dd)return;
-  if(!dd.innerHTML){
-    dd.innerHTML=SLASH_COMMANDS.map(c=>
-      `<div class="slash-item" data-cmd="${esc(c.cmd)}">
-        <span class="slash-item-cmd">${esc(c.cmd)}</span>
-        <span class="slash-item-desc">${esc(c.desc)}</span>
-      </div>`
-    ).join('');
-    dd.querySelectorAll('.slash-item').forEach(item=>{
-      item.addEventListener('click',function(){
-        const cmd=this.dataset.cmd;
-        // Find which session this belongs to
-        const name=selectedSession;
-        if(!name)return;
-        dd.classList.remove('active');
-        // Send the slash command
-        sendSlashCommand(name,cmd);
-      });
+// ── Send Raw Keys ──
+async function sendRawKeys(name,keys){
+  try{
+    await fetch(BASE+'/api/sessions/'+name+'/send-keys',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({keys:keys})
     });
+    setTimeout(()=>pollRawDelta(name),400);
+  }catch(e){console.error('Failed to send keys:',e)}
+}
+
+// ── Auth Mode Toggle ──
+async function setAuthMode(name,mode){
+  const statusEl=document.getElementById('auth-mode-status-'+name);
+  if(statusEl)statusEl.textContent='Switching...';
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/set-auth-mode',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:mode})
+    });
+    const data=await resp.json();
+    if(resp.ok){
+      const idx=sessions.findIndex(s=>s.name===name);
+      if(idx>=0)sessions[idx].auth_mode=mode;
+      if(statusEl)statusEl.textContent=mode==='api'?'API key exported':'API key unset';
+    }else{
+      if(statusEl)statusEl.textContent=data.error||'Failed';
+    }
+  }catch(e){
+    if(statusEl)statusEl.textContent='Error';
   }
-  dd.classList.toggle('active');
+}
+
+// ── Key Bar + Slash Commands ──
+function buildKeyBar(name,tab){
+  const id='keybar-'+tab+'-'+name;
+  const isOpen=localStorage.getItem('keyBarOpen')==='true';
+  return `<div class="key-bar-toggle${isOpen?' open':''}" onclick="toggleKeyBar('${id}',this)">
+    <span class="chevron">&#x25BC;</span> Keys &amp; Commands
+  </div>
+  <div class="key-bar${isOpen?' expanded':''}" id="${id}">
+    <span class="key-bar-label">Keys:</span>
+    <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
+    <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
+    <span class="key-bar-sep"></span>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['q'])" title="q — quit pager">q</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['n'])" title="n — no">n</button>
+    <span class="key-bar-sep"></span>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['Tab'])" title="Tab">Tab</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
+    <span class="key-bar-sep"></span>
+    <span class="key-bar-label">Cmds:</span>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
+  </div>`;
+}
+
+function toggleKeyBar(barId,toggleEl){
+  const bar=document.getElementById(barId);
+  if(!bar)return;
+  const isOpen=bar.classList.contains('expanded');
+  if(isOpen){
+    bar.classList.remove('expanded');
+    toggleEl.classList.remove('open');
+    localStorage.setItem('keyBarOpen','false');
+  }else{
+    bar.classList.add('expanded');
+    toggleEl.classList.add('open');
+    localStorage.setItem('keyBarOpen','true');
+  }
 }
 
 async function sendSlashCommand(name,cmd){
