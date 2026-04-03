@@ -1,0 +1,7 @@
+# Pinned 2026-04-03.
+fastapi==0.128.8          # updated 2026-04-03 (was 0.115.6); enables starlette upgrade
+uvicorn==0.39.0           # updated 2026-04-03 (was 0.34.0)
+openai==1.58.1            # latest: 2.30.0 (MAJOR — breaking API changes; skip until manual review)
+python-multipart==0.0.20  # GHSA-wp53-j4wj-2cfg partial mitigation; full fix at 0.0.22 not yet on PyPI
+starlette==0.49.3         # updated 2026-04-03 (was 0.41.3); fixes GHSA-2c2j-9gv5-cj73 + GHSA-7f5h-v6xp-fcq8
+pydantic==2.12.5          # updated 2026-04-03 (was 2.10.3)

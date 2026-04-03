@@ -1,0 +1,20 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP", "I", "B"]
+ignore = [
+    "E501",   # line too long — single-file app with embedded HTML/JS strings
+    "F401",   # unused imports — sometimes needed for side-effects
+    "E402",   # module-level import not at top — intentional: logging init before imports
+    "B008",   # FastAPI File(...) in default args — correct FastAPI pattern, not a bug
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["F811"]  # redefinition in test files is fine
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["."]
+python_files = ["test_*.py"]
