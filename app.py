@@ -2495,29 +2495,9 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
                     logger.debug("Failed to scan credentials file for API key", exc_info=True)
             if not key:
                 return JSONResponse({"error": "No API key found"}, status_code=400)
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 f"export ANTHROPIC_API_KEY={shlex.quote(key)}"],
-                capture_output=True, text=True, timeout=5
-            )
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            await _tmux_type_and_enter(session_name, f"export ANTHROPIC_API_KEY={shlex.quote(key)}")
         elif body.mode == "subscription":
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 "unset ANTHROPIC_API_KEY"],
-                capture_output=True, text=True, timeout=5
-            )
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            await _tmux_type_and_enter(session_name, "unset ANTHROPIC_API_KEY")
         else:
             return JSONResponse({"error": "Invalid mode"}, status_code=400)
         _session_auth_mode[session_name] = body.mode
@@ -4065,6 +4045,16 @@ button,a,input,textarea,select{touch-action:manipulation}
 .nav-total-cost span{color:#3fb950;font-weight:600}
 .nav-item.long-idle .nav-session-id{color:#484f58}
 .nav-item.long-idle .nav-dot.idle{background:#484f58;animation:none}
+/* Drag-to-reorder */
+.nav-item.dragging{opacity:.4;background:#1c2128}
+.nav-item.drag-over{border-top:2px solid #58a6ff !important}
+/* Focus mode */
+body.focus-mode .top-nav{display:none}
+body.focus-mode .nav-right{display:none}
+body.focus-mode .rate-alarm{display:none}
+body.focus-mode .main{max-width:none;padding:8px 16px}
+.focus-mode-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
+.focus-mode-btn:hover{border-color:#58a6ff;color:#58a6ff}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -4606,12 +4596,23 @@ function statusLabel(s){
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   const pinnedSet=getPinnedSessions();
-  const pinned=sessions.filter(s=>pinnedSet.has(s.name));
-  const unpinned=sessions.filter(s=>!pinnedSet.has(s.name));
-  [...pinned,...unpinned].forEach(s=>{
+  // Apply custom drag order if present
+  const customOrder=_getSessionOrder();
+  const sorted=[...sessions].sort((a,b)=>{
+    const ap=pinnedSet.has(a.name)?-1000:0,bp=pinnedSet.has(b.name)?-1000:0;
+    const ai=customOrder.indexOf(a.name),bi=customOrder.indexOf(b.name);
+    const ar=ai<0?999:ai,br=bi<0?999:bi;
+    return (ap+ar)-(bp+br);
+  });
+  sorted.forEach(s=>{
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'');
     item.id='nav-'+s.name;
+    item.draggable=true;
+    item.addEventListener('dragstart',e=>onNavDragStart(e,s.name));
+    item.addEventListener('dragover',onNavDragOver);
+    item.addEventListener('drop',e=>onNavDrop(e,s.name));
+    item.addEventListener('dragend',onNavDragEnd);
     item.onclick=()=>selectSession(s.name);
     // Session age tooltip
     const created=parseInt(s.created)||0;
@@ -4689,6 +4690,7 @@ function renderDetail(){
           <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
           <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
           <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
+          <button class="focus-mode-btn" onclick="toggleFocusMode()" title="Toggle focus mode (F)">&#x26F6; Focus</button>
         </div>
         <div class="chat-search-bar">
           <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
@@ -5029,7 +5031,12 @@ function _histNav(e,name,tab){
 }
 function handleChatKey(e,name){
   if(_histNav(e,name,'chat'))return;
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name);return;}
+  // Escape: interrupt if Claude is busy, otherwise let global handler run
+  if(e.key==='Escape'){
+    const sess=sessions.find(s=>s.name===name);
+    if(sess&&sess.activity_status==='busy'){e.preventDefault();interruptSession(name);}
+  }
 }
 function handleRawKey(e,name){
   if(_histNav(e,name,'raw'))return;
@@ -5932,6 +5939,48 @@ function cycleSessionColor(name,tagEl){
   localStorage.setItem('tmux-clr-'+name,next);
   if(tagEl){tagEl.className='nav-color-tag '+next;}
 }
+
+// ── Focus mode ──
+function toggleFocusMode(){
+  document.body.classList.toggle('focus-mode');
+}
+
+// ── Drag-to-reorder sessions ──
+let _dragSrc=null;
+function onNavDragStart(e,name){
+  _dragSrc=name;
+  e.dataTransfer.effectAllowed='move';
+  e.dataTransfer.setData('text/plain',name);
+  setTimeout(()=>{const el=document.getElementById('nav-'+name);if(el)el.classList.add('dragging');},0);
+}
+function onNavDragOver(e){
+  e.preventDefault();
+  e.dataTransfer.dropEffect='move';
+  const item=e.target.closest('.nav-item');
+  navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('drag-over'));
+  if(item&&item.id!=='nav-'+_dragSrc)item.classList.add('drag-over');
+}
+function onNavDrop(e,name){
+  e.preventDefault();
+  navEl.querySelectorAll('.nav-item').forEach(el=>{el.classList.remove('drag-over');el.classList.remove('dragging');});
+  if(!_dragSrc||_dragSrc===name)return;
+  const order=_getSessionOrder();
+  const from=order.indexOf(_dragSrc),to=order.indexOf(name);
+  if(from>=0&&to>=0){order.splice(from,1);order.splice(to,0,_dragSrc);}
+  else if(from>=0){order.splice(from,1);order.push(_dragSrc);}
+  localStorage.setItem('tmux-session-order',JSON.stringify(order));
+  renderNav();
+  _dragSrc=null;
+}
+function onNavDragEnd(){
+  navEl.querySelectorAll('.nav-item').forEach(el=>{el.classList.remove('drag-over');el.classList.remove('dragging');});
+  _dragSrc=null;
+}
+function _getSessionOrder(){
+  try{const o=JSON.parse(localStorage.getItem('tmux-session-order')||'[]');if(Array.isArray(o))return o;}catch(e){}
+  return sessions.map(s=>s.name);
+}
+
 async function toggleAwayMode(name,enabled){
   const statusEl=document.getElementById('away-status-'+name);
   if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
@@ -6550,6 +6599,12 @@ document.addEventListener('keydown',function(e){
     const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
     if(!isInput){toggleBusyFilter();return;}
   }
+  // F → toggle focus mode (when not in input)
+  if(e.key==='f'||e.key==='F'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput){toggleFocusMode();return;}
+  }
   // ? → show keyboard shortcut help (when not in input)
   if(e.key==='?'){
     const focused=document.activeElement;
@@ -6574,10 +6629,11 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+]</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Next session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+[</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Previous session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">B</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle busy-only filter</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle focus mode (hide nav)</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Send message / command</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Close palette / modal</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy) / close modal</td></tr>
     </table>
     <div style="margin-top:16px;text-align:right">
       <button class="btn btn-full" onclick="closeModal()">Got it</button>
