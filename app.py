@@ -2269,6 +2269,11 @@ def _parse_session_stats(session_name: str) -> dict:
         "lastInputTokens": last_input,
         "contextPct": context_pct,
         "ctxWindowSize": ctx_window,
+        # Activity timeline: per-minute output token counts for last 60 min
+        "activityTimeline": [
+            buckets.get(int(now_epoch // 60) * 60 - (i * 60), {}).get("output", 0)
+            for i in range(59, -1, -1)  # index 0 = 59 min ago, index 59 = current minute
+        ],
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -4194,6 +4199,10 @@ button,a,input,textarea,select{touch-action:manipulation}
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
 .key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
 .key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
+.key-btn.key-custom{color:#79c0ff;border-color:#79c0ff44;font-size:.68rem}
+.key-btn.key-custom:hover{background:#79c0ff22;color:#f0f6fc;border-color:#79c0ff88}
+.key-btn.key-add-custom{color:#3fb950;border-color:#3fb95044;font-size:.75rem;padding:3px 7px}
+.key-btn.key-add-custom:hover{background:#3fb95022;border-color:#3fb95088}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -4537,7 +4546,7 @@ function renderChatBubbles(name){
     return`<div class="chat-msg ${m.role}">
       <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
       ${body}
-      <div class="chat-meta">${fmtTime(m.ts)}</div>
+      <div class="chat-meta" title="${m.ts?new Date(m.ts*1000).toLocaleString():''}">${fmtTime(m.ts)}</div>
     </div>`;
   }).join('');
 }
@@ -4816,7 +4825,7 @@ function appendChatBubble(name,role,text,ts){
       const bodyHtml=mdEnabled(name)&&role==='assistant'
         ?renderMarkdown(text)
         :'<div class="chat-body">'+esc(text)+'</div>';
-      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+bodyHtml+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+bodyHtml+'<div class="chat-meta" title="'+(ts?new Date(ts*1000).toLocaleString():'')+'" >'+fmtTime(ts)+'</div>';
       chatEl.appendChild(bubble);
       chatEl.scrollTop=chatEl.scrollHeight;
     }
@@ -5605,6 +5614,22 @@ async function loadSessionStats(name){
         <div class="rate-bar-track"><div class="rate-bar-fill" style="width:${Math.min(100,st.contextPct)}%;background:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#3fb950'}"></div></div>
         <span class="rate-label">${st.contextPct}%</span>
       </div>`:''}
+      ${(()=>{
+        const tl=st.activityTimeline;
+        if(!tl||!tl.length)return'';
+        const maxOut=Math.max(...tl,1);
+        const W=280,H=36,bw=W/tl.length;
+        const bars=tl.map((v,i)=>{
+          const h=Math.max(v>0?2:1,Math.round(v/maxOut*H));
+          const x=i*bw,y=H-h;
+          const fill=v>maxOut*0.5?'#3fb950':v>0?'#238636':'#21262d';
+          return\`<rect x="\${x.toFixed(1)}" y="\${y}" width="\${Math.max(0.5,bw-0.5).toFixed(1)}" height="\${h}" fill="\${fill}"/>\`;
+        }).join('');
+        return\`<div style="margin-top:12px">
+          <div style="font-size:.7rem;color:#6e7681;margin-bottom:4px">Activity — last 60 min</div>
+          <svg width="\${W}" height="\${H}" style="display:block;border-radius:4px;background:#0d1117" title="Output tokens/min over the last hour">\${bars}</svg>
+        </div>\`;
+      })()}
       `;
   }catch(e){
     panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
@@ -5783,6 +5808,10 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
+    <span class="key-bar-sep"></span>
+    <span class="key-bar-label">Custom:</span>
+    ${buildCustomCmdBtns(name)}
+    <button class="key-btn key-add-custom" onclick="openAddCustomCmd('${name}')" title="Add custom command">+</button>
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Opts:</span>
     <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
@@ -6364,6 +6393,103 @@ function renderMarkdown(raw){
 function escMd(str){
   // Minimal HTML escape for markdown content (not using esc() to avoid the DOM roundtrip)
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ==================== Feature 9: Custom Commands ====================
+function getCustomCmds(){
+  try{return JSON.parse(localStorage.getItem('tmux-custom-cmds')||'[]');}catch{return[];}
+}
+function saveCustomCmds(cmds){
+  localStorage.setItem('tmux-custom-cmds',JSON.stringify(cmds));
+}
+function buildCustomCmdBtns(name){
+  const cmds=getCustomCmds();
+  if(!cmds.length)return'';
+  return cmds.map((cmd,idx)=>`
+    <button class="key-btn key-custom" onclick="sendSlashCommand('${esc(name)}','${esc(cmd.cmd)}')" title="${esc(cmd.cmd)}" oncontextmenu="event.preventDefault();removeCustomCmd(${idx})">${esc(cmd.label||cmd.cmd)}</button>`
+  ).join('');
+}
+function openAddCustomCmd(name){
+  const modal=document.getElementById('modal-overlay');
+  const body=document.getElementById('modal-body');
+  if(!modal||!body)return;
+  const cmds=getCustomCmds();
+  body.innerHTML=`
+    <div style="font-size:1rem;font-weight:600;color:#e6edf3;margin-bottom:12px">Custom Commands</div>
+    <div style="font-size:.8rem;color:#8b949e;margin-bottom:12px">Right-click a custom button to remove it.</div>
+    <div id="custom-cmd-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
+      ${cmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
+        <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
+        <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
+        <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
+      </div>`).join('')}
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input id="new-cmd-input" type="text" placeholder="Command (e.g. /plan)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 9px;border-radius:4px;font-size:.8rem;font-family:monospace;outline:none" autocomplete="off" spellcheck="false">
+      <input id="new-cmd-label" type="text" placeholder="Label (optional)" style="width:120px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 9px;border-radius:4px;font-size:.8rem;outline:none" autocomplete="off" spellcheck="false">
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+      <button class="btn" onclick="closeModal()">Done</button>
+      <button class="btn btn-full" onclick="addCustomCmd()">Add Command</button>
+    </div>`;
+  modal.classList.add('active');
+  document.getElementById('new-cmd-input').focus();
+}
+function addCustomCmd(){
+  const input=document.getElementById('new-cmd-input');
+  const labelInput=document.getElementById('new-cmd-label');
+  if(!input)return;
+  const cmd=input.value.trim();
+  if(!cmd)return;
+  const label=labelInput?labelInput.value.trim():'';
+  const cmds=getCustomCmds();
+  cmds.push({cmd,label});
+  saveCustomCmds(cmds);
+  input.value='';
+  if(labelInput)labelInput.value='';
+  // Refresh list in modal
+  const listEl=document.getElementById('custom-cmd-list');
+  if(listEl){
+    const newCmds=getCustomCmds();
+    listEl.innerHTML=newCmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
+      <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
+      <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
+      <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
+    </div>`).join('');
+  }
+  // Refresh all visible key bars
+  refreshKeyBars();
+}
+function removeCustomCmd(idx){
+  const cmds=getCustomCmds();
+  cmds.splice(idx,1);
+  saveCustomCmds(cmds);
+  // Refresh list in modal if open
+  const listEl=document.getElementById('custom-cmd-list');
+  if(listEl){
+    const newCmds=getCustomCmds();
+    listEl.innerHTML=newCmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
+      <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
+      <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
+      <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
+    </div>`).join('');
+  }
+  refreshKeyBars();
+}
+function refreshKeyBars(){
+  // Re-render only the custom cmd section in visible key bars
+  if(selectedSession){
+    const s=sessions.find(x=>x.name===selectedSession);
+    if(!s)return;
+    const tab=activeTabs[selectedSession]||'raw';
+    const barId='keybar-'+tab+'-'+selectedSession;
+    const bar=document.getElementById(barId);
+    if(bar){
+      // Find the custom section placeholder and replace it
+      // Easiest: re-render the whole detail
+      renderDetail();
+    }
+  }
 }
 
 loadAll();
