@@ -122,78 +122,6 @@ def _load_autonomous_state() -> Dict[str, dict]:
         logger.debug("Failed to load autonomous mode state", exc_info=True)
     return {}
 
-
-def _is_claude_running(session_name: str) -> bool:
-    """Check if Claude Code process is running in the session (not just a bare shell).
-
-    When Claude Code OOMs or crashes, the tmux pane falls back to the parent
-    shell (bash/zsh). This function distinguishes that from Claude Code running.
-    Returns True if Claude (node) is the foreground process, False if bare shell.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p",
-             "#{pane_current_command}"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return False
-        cmd = result.stdout.strip().lower()
-        # Claude Code runs as 'node' or sometimes 'claude'. A bare shell is bash/zsh/sh/fish.
-        shell_commands = {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
-        if cmd in shell_commands:
-            return False
-        # If it's node, claude, or anything else non-shell, Claude is likely running
-        return True
-    except Exception:
-        return False
-
-
-async def _async_is_claude_running(session_name: str) -> bool:
-    """Non-blocking version of _is_claude_running."""
-    return await asyncio.to_thread(_is_claude_running, session_name)
-
-
-async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None) -> bool:
-    """Check if Claude Code is running; if not, restart it. Returns True if Claude is running after check.
-
-    This handles OOM crashes where Claude dies and the pane falls back to bash.
-    """
-    alog = logging.getLogger("autonomous")
-    if await _async_is_claude_running(session_name):
-        return True
-
-    msg = f"Claude Code not running in '{session_name}' — restarting it"
-    alog.warning(msg)
-    if log_fn and state:
-        log_fn(state, msg)
-
-    try:
-        # Send claude command to the bare shell
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "claude --dangerously-skip-permissions", "Enter"],
-            capture_output=True, text=True, timeout=5)
-
-        # Wait for Claude Code to start (up to 30s)
-        for _ in range(15):
-            await asyncio.sleep(2)
-            if await _async_is_claude_running(session_name):
-                alog.info(f"Claude Code restarted successfully in '{session_name}'")
-                if log_fn and state:
-                    log_fn(state, "Claude Code restarted successfully")
-                # Give it a moment to fully initialize
-                await asyncio.sleep(5)
-                return True
-
-        alog.error(f"Failed to restart Claude Code in '{session_name}' after 30s")
-        if log_fn and state:
-            log_fn(state, "Failed to restart Claude Code after 30s")
-        return False
-    except Exception as e:
-        alog.error(f"Error restarting Claude Code in '{session_name}': {e}")
-        return False
-
-
 app = FastAPI(root_path=ROOT_PATH)
 
 # --- Auth ---
@@ -2449,14 +2377,6 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
         if not state.get("enabled"):
             return
 
-        # Ensure Claude Code is actually running (handles OOM/crash during server downtime)
-        claude_ok = await _ensure_claude_running(session_name, log_fn, state)
-        if not claude_ok:
-            log_fn(state, "Could not restart Claude Code during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
         # Send the appropriate unstick/resume prompt
         skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
         unstick_prompt = (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
@@ -2562,14 +2482,6 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
     # Terminal has been identical for >10 minutes. Check if there's a good reason.
     log_fn = _away_log if mode == "away" else _go_nuts_log
 
-    # Check if Claude Code has crashed (OOM, etc) — if so, restart immediately
-    if not await _async_is_claude_running(session_name):
-        wlog.warning(f"Claude Code not running in '{session_name}' — OOM/crash detected, restarting")
-        log_fn(state, "Watchdog: Claude Code crashed (OOM?) — restarting")
-        _watchdog_snapshots.pop(session_name, None)
-        await _watchdog_restart_mode(session_name, state, mode, wlog)
-        return
-
     # First stall detection — use LLM to check if it's a legitimate long operation
     if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
         wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
@@ -2610,14 +2522,6 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
         snap["last_nudge"] = now
         log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
         wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
-
-        # Ensure Claude Code is running before nudging
-        if not await _async_is_claude_running(session_name):
-            wlog.warning(f"Claude Code not running in '{session_name}' during nudge — restarting mode")
-            log_fn(state, "Watchdog: Claude Code not running during nudge — restarting")
-            _watchdog_snapshots.pop(session_name, None)
-            await _watchdog_restart_mode(session_name, state, mode, wlog)
-            return
 
         # If session appears to be waiting for input or truly idle, just send the nudge
         try:
@@ -2665,14 +2569,6 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
     except Exception:
         pass
 
-    # 2b. Ensure Claude Code is actually running (handles OOM/crash recovery)
-    claude_ok = await _ensure_claude_running(session_name, log_fn, state)
-    if not claude_ok:
-        log_fn(state, "Watchdog: could not restart Claude Code — aborting restart")
-        state["enabled"] = False
-        _save_autonomous_state()
-        return
-
     # 3. Preserve the log history, reset state for fresh loop
     old_log = state.get("log", [])
     old_started = state.get("started_at", time.time())
@@ -2691,7 +2587,6 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
         "log": old_log,  # Keep full log history
         "task": None,
     })
-    _save_autonomous_state()
 
     # 5. Send an unstick prompt directly instead of re-running initial phases
     skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
@@ -2742,14 +2637,6 @@ async def _away_mode_continuous_loop(session_name: str):
                 if not state.get("enabled"):
                     return
 
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _away_log, state)
-                if not claude_ok:
-                    _away_log(state, "Claude Code dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
                 state["step"] = cycle
                 state["step_name"] = f"Ping cycle {cycle}"
                 _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
@@ -2757,7 +2644,6 @@ async def _away_mode_continuous_loop(session_name: str):
                                            f"Task ping cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -2780,7 +2666,6 @@ async def _away_mode_continuous_loop(session_name: str):
     except Exception as e:
         _away_log(state, f"Away mode (restarted) error: {e}")
         log.error(f"Away mode restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
         state["task"] = None
@@ -2816,14 +2701,6 @@ async def _go_nuts_continuous_loop(session_name: str):
                 if not state.get("enabled"):
                     return
 
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _go_nuts_log, state)
-                if not claude_ok:
-                    _go_nuts_log(state, "Claude Code dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
                 state["step"] = cycle
                 state["step_name"] = f"Build cycle {cycle}"
                 _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
@@ -2831,7 +2708,6 @@ async def _go_nuts_continuous_loop(session_name: str):
                                               f"Build cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -2854,7 +2730,6 @@ async def _go_nuts_continuous_loop(session_name: str):
     except Exception as e:
         _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
         log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
         state["task"] = None
@@ -3325,14 +3200,6 @@ async def _away_mode_worker(session_name: str):
                 if not state.get("enabled"):
                     return
 
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _away_log, state)
-                if not claude_ok:
-                    _away_log(state, "Claude Code dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
                 # Session has been idle for 90s — send ping prompt
                 state["step"] = cycle
                 state["step_name"] = f"Ping cycle {cycle}"
@@ -3341,7 +3208,6 @@ async def _away_mode_worker(session_name: str):
                                            f"Task ping cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -3366,7 +3232,6 @@ async def _away_mode_worker(session_name: str):
     except Exception as e:
         _away_log(state, f"Away mode fatal error: {e}")
         log.error(f"Away mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
         state["task"] = None
@@ -3700,14 +3565,6 @@ async def _go_nuts_mode_worker(session_name: str):
                 if not state.get("enabled"):
                     return
 
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _go_nuts_log, state)
-                if not claude_ok:
-                    _go_nuts_log(state, "Claude Code dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
                 state["step"] = cycle
                 state["step_name"] = f"Build cycle {cycle}"
                 _go_nuts_log(state, f"Session idle for 90s — sending build ping (cycle {cycle})")
@@ -3715,7 +3572,6 @@ async def _go_nuts_mode_worker(session_name: str):
                                               f"Build cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -3740,7 +3596,6 @@ async def _go_nuts_mode_worker(session_name: str):
     except Exception as e:
         _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
         log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
         state["task"] = None
@@ -4280,7 +4135,7 @@ function renderDetail(){
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
           <span class="status-dot"></span>
           <span class="status-label">${statusLabel(s.activity_status)}</span>
-          ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
+          ${s.activity_detail?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         <span class="badge ${s.attached?'attached':'detached'}">${s.attached?'attached':'detached'}</span>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
@@ -4755,7 +4610,7 @@ function updateStatusPill(name,status,detail){
   if(pill){
     pill.className='status-pill '+(status||'unknown');
     pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
-      +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
+      +(detail?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
