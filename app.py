@@ -4066,6 +4066,10 @@ button,a,input,textarea,select{touch-action:manipulation}
 .nav-attached.no{background:#6e768155;color:#8b949e}
 .nav-spacer{flex:1}
 .nav-status-text{font-size:.75rem;color:#6e7681;white-space:nowrap;padding-right:12px}
+.nav-total-cost{font-size:.7rem;color:#6e7681;white-space:nowrap;padding:0 10px 0 0;cursor:default}
+.nav-total-cost span{color:#3fb950;font-weight:600}
+.nav-item.long-idle .nav-session-id{color:#484f58}
+.nav-item.long-idle .nav-dot.idle{background:#484f58;animation:none}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -4471,6 +4475,7 @@ button,a,input,textarea,select{touch-action:manipulation}
 </nav>
 <div class="nav-right">
   <input class="nav-search" id="nav-search" type="text" placeholder="&#x1F50D; filter sessions..." oninput="filterSessionsNav(this.value)" title="Filter sessions (Ctrl+F)">
+  <span class="nav-total-cost" id="nav-total-cost" title="Total estimated API cost across all sessions"></span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
   <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
   <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
@@ -5755,6 +5760,8 @@ async function setAuthMode(name,mode){
 
 // ── Session Stats ──
 let _statsTimers={};
+const _sessionCosts={};  // name → estimatedCost (updated by loadSessionStats)
+const _sessionIdle={};   // name → secsSinceLastActivity
 function fmtRate(n){
   if(n>=1000)return (n/1000).toFixed(1)+'k/min';
   return n+'/min';
@@ -5787,6 +5794,15 @@ async function loadSessionStats(name){
       if(rateCls!=='normal')tips.push('Rate: '+rateLabel);
       if(st.contextPct>0)tips.push('Context: '+st.contextPct+'%');
       navHealthEl.title='Health: '+healthCls+(tips.length?' ('+tips.join(', ')+')':'');
+    }
+    // Accumulate cost + idle data for global summary
+    _sessionCosts[name]=st.estimatedCost;
+    _sessionIdle[name]=st.secsSinceLastActivity;
+    updateNavTotalCost();
+    // Dim nav item if idle >1 hour
+    const navItem=document.getElementById('nav-'+name);
+    if(navItem){
+      navItem.classList.toggle('long-idle',st.secsSinceLastActivity>3600&&st.secsSinceLastActivity>=0);
     }
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
@@ -5847,6 +5863,11 @@ async function loadSessionStats(name){
   }
 }
 
+function updateNavTotalCost(){
+  const total=Object.values(_sessionCosts).reduce((a,b)=>a+b,0);
+  const el=document.getElementById('nav-total-cost');
+  if(el&&total>0)el.innerHTML='Total: <span>$'+total.toFixed(2)+'</span>';
+}
 function startStatsPolling(name){
   stopStatsPolling();
   loadSessionStats(name);
@@ -6217,6 +6238,21 @@ function renderStats(s){
   }
   if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
   html+='</div>';
+
+  // Per-session cost leaderboard
+  const costEntries=Object.entries(_sessionCosts).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+  if(costEntries.length){
+    const totalAll=costEntries.reduce((sum,[,v])=>sum+v,0);
+    html+='<div class="stats-section"><div class="stats-section-title">Session Cost Leaderboard</div>';
+    costEntries.forEach(([name,cost])=>{
+      const pct=Math.round(cost/totalAll*100);
+      const barW=Math.max(2,pct);
+      html+='<div class="stats-row"><span class="stats-row-label">'+esc(name)+'</span><span class="stats-row-value" style="color:#3fb950">$'+cost.toFixed(2)+' <span style="color:#6e7681;font-size:.7rem">('+pct+'%)</span></span></div>';
+      html+='<div class="stats-bar"><div class="stats-bar-fill" style="width:'+barW+'%;background:#238636"></div></div>';
+    });
+    html+='<div class="stats-row" style="margin-top:6px"><span class="stats-row-label" style="font-weight:600">Total</span><span class="stats-row-value" style="color:#3fb950;font-weight:600">$'+totalAll.toFixed(2)+'</span></div>';
+    html+='</div>';
+  }
 
   document.getElementById('stats-content').innerHTML=html;
 }
