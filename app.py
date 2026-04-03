@@ -4125,6 +4125,9 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .chat-bmark-btn:hover{color:#e3b341}
 .chat-bmark-btn.bookmarked{color:#e3b341;opacity:1}
 .chat-msg.bookmarked{border-left:2px solid #e3b34166}
+/* Chat font size classes (applied to html element) */
+html.chat-font-sm .chat-body{font-size:.75rem!important;line-height:1.4!important}
+html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!important}
 /* Nav cost + health badges */
 .nav-cost{font-size:.61rem;color:#6e7681;padding:0 2px;letter-spacing:-.01em;min-width:0}
 .nav-health{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0;margin-left:1px;transition:background .3s}
@@ -4502,7 +4505,8 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
   <input class="nav-search" id="nav-search" type="text" placeholder="&#x1F50D; filter sessions..." oninput="filterSessionsNav(this.value)" title="Filter sessions (Ctrl+F)">
   <span class="nav-total-cost" id="nav-total-cost" title="Total estimated API cost across all sessions"></span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
+  <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable browser notifications">&#x1F514;</button>
+  <button class="nav-icon-btn" id="sound-btn" onclick="toggleSound()" title="Toggle sound notifications (beep when session goes idle)">&#x1F507;</button>
   <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
   <button class="nav-icon-btn nav-busy-filter" id="busy-filter-btn" onclick="toggleBusyFilter()" title="Show only busy sessions (B)">&#x26AB;</button>
   <button class="nav-icon-btn" id="sort-mode-btn" onclick="cycleSortMode()" title="Sort: custom" style="font-size:.65rem;padding:3px 7px">&#x21C5;Sort</button>
@@ -4925,6 +4929,7 @@ function renderDetail(){
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
           <button class="chat-export-btn" onclick="clearChatView('${s.name}')" title="Clear messages from view (local only, does not delete anything)">&#x1F5D1; Clear</button>
+          <button class="chat-export-btn" id="chat-font-btn-${s.name}" onclick="cycleChatFont()" title="Toggle chat font size">A</button>
           <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
           <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
           <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
@@ -5569,6 +5574,10 @@ async function loadRaw(name){
 }
 
 function updateStatusPill(name,status,detail){
+  // Sound notification: beep when session transitions from busy → idle
+  const prev=_prevActivityStatus[name];
+  _prevActivityStatus[name]=status;
+  if(prev==='busy'&&status!=='busy'&&status!==undefined){_playBeep(660,0.2,0.22);}
   const pill=document.getElementById('status-'+name);
   if(pill){
     pill.className='status-pill '+(status||'unknown');
@@ -7026,6 +7035,22 @@ document.addEventListener('keydown',function(e){
     const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
     if(!isInput&&selectedSession){snoozeSession(selectedSession,15);return;}
   }
+  // N → new session (when not in input)
+  if(e.key==='n'||e.key==='N'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput){showCreateModal();return;}
+  }
+  // R → rename current session (when not in input)
+  if(e.key==='r'||e.key==='R'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      const spanEl=document.querySelector('#nav-'+CSS.escape(selectedSession)+' .nav-session-id');
+      if(spanEl)startRename(selectedSession,spanEl);
+      return;
+    }
+  }
   // ? → show keyboard shortcut help (when not in input)
   if(e.key==='?'){
     const focused=document.activeElement;
@@ -7061,6 +7086,8 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">E</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Export current session conversation</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">S</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus chat send input</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">X</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Snooze current session for 15 min</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">R</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Rename current session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy) / close modal</td></tr>
     </table>
@@ -7196,6 +7223,59 @@ function clearChatView(name){
   const chatEl=document.getElementById('chat-'+name);
   if(chatEl)chatEl.innerHTML='<div style="text-align:center;padding:32px;color:#484f58;font-size:.85rem">View cleared — switch sessions or reload to restore</div>';
   showToast('Chat view cleared','success',2000);
+}
+
+// ==================== Chat Font Size ====================
+const _CHAT_FONT_SIZES=['default','sm','lg'];
+let _chatFontIdx=0;
+(function(){
+  const saved=localStorage.getItem('tmux-chat-font');
+  const idx=_CHAT_FONT_SIZES.indexOf(saved);
+  _chatFontIdx=idx>=0?idx:0;
+  _applyChatFont(false);
+})();
+function getChatFontLabel(){return['A-','A','A+'][_chatFontIdx]||'A';}
+function _applyChatFont(toast){
+  document.documentElement.classList.remove('chat-font-sm','chat-font-lg');
+  const mode=_CHAT_FONT_SIZES[_chatFontIdx];
+  if(mode!=='default')document.documentElement.classList.add('chat-font-'+mode);
+  localStorage.setItem('tmux-chat-font',mode);
+  document.querySelectorAll('[id^="chat-font-btn-"]').forEach(function(btn){btn.textContent=getChatFontLabel();});
+  if(toast)showToast(['Default font','Small font','Large font'][_chatFontIdx],'success',1500);
+}
+function cycleChatFont(){_chatFontIdx=(_chatFontIdx+1)%_CHAT_FONT_SIZES.length;_applyChatFont(true);}
+
+// ==================== Sound Notifications ====================
+let _soundEnabled=localStorage.getItem('tmux-sound')==='true';
+const _prevActivityStatus={};
+function initSoundBtn(){
+  const btn=document.getElementById('sound-btn');
+  if(btn){
+    btn.textContent=_soundEnabled?'\uD83D\uDD14':'\uD83D\uDD07';
+    btn.title=_soundEnabled?'Sound: ON (click to mute)':'Sound: OFF (click to enable)';
+  }
+}
+function toggleSound(){
+  _soundEnabled=!_soundEnabled;
+  localStorage.setItem('tmux-sound',String(_soundEnabled));
+  initSoundBtn();
+  showToast(_soundEnabled?'Sound notifications ON':'Sound notifications OFF','success',1500);
+}
+function _playBeep(freq,dur,vol){
+  freq=freq||660;dur=dur||0.18;vol=vol||0.22;
+  try{
+    const ACtx=window.AudioContext||window.webkitAudioContext;
+    if(!ACtx)return;
+    const ctx=new ACtx();
+    const osc=ctx.createOscillator();
+    const gain=ctx.createGain();
+    osc.connect(gain);gain.connect(ctx.destination);
+    osc.type='sine';osc.frequency.value=freq;
+    gain.gain.setValueAtTime(vol,ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+dur);
+    osc.start();osc.stop(ctx.currentTime+dur);
+    setTimeout(function(){try{ctx.close();}catch(e){}},600);
+  }catch(e){}
 }
 
 // ==================== Feature 10: Token budget — handled via backend API ====================
@@ -7517,6 +7597,7 @@ function jumpToBottom(name){
 
 loadAll();
 checkClaudeAuth();
+initSoundBtn();
 </script>
 </body></html>
 """
