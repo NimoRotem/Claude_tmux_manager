@@ -4185,7 +4185,10 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
 /* Markdown rendered content */
 .chat-body{white-space:pre-wrap}
+.chat-body.collapsed{max-height:200px;overflow:hidden;mask-image:linear-gradient(to bottom,#000 60%,transparent)}
 .chat-body.md-rendered{white-space:normal}
+.chat-expand-btn{display:block;font-size:.72rem;color:#58a6ff;background:none;border:none;padding:4px 0;cursor:pointer;text-align:left;font-family:inherit;margin-top:2px}
+.chat-expand-btn:hover{text-decoration:underline}
 .chat-body.md-rendered pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;overflow-x:auto;margin:8px 0;font-size:.82rem}
 .chat-body.md-rendered code{background:#21262d;padding:1px 5px;border-radius:3px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
 .chat-body.md-rendered pre code{background:none;padding:0;font-size:.82rem}
@@ -4643,16 +4646,34 @@ function renderNav(){
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   const usesMd=mdEnabled(name);
-  return msgs.map(m=>{
-    const body=usesMd&&m.role==='assistant'
-      ?renderMarkdown(m.text)
-      :`<div class="chat-body">${esc(m.text)}</div>`;
+  const COLLAPSE_LEN=1200;
+  return msgs.map((m,idx)=>{
+    const isLong=m.text&&m.text.length>COLLAPSE_LEN&&m.role==='assistant';
+    const bodyId=`chat-body-${name}-${idx}`;
+    let body;
+    if(usesMd&&m.role==='assistant'){
+      const rendered=renderMarkdown(m.text);
+      // renderMarkdown returns a div.chat-body wrapper — inject id and collapse if long
+      if(isLong)body=rendered.replace('<div class="chat-body','<div id="'+bodyId+'" class="chat-body collapsed');
+      else body=rendered;
+    }else{
+      body=`<div id="${bodyId}" class="chat-body${isLong?' collapsed':''}">${esc(m.text)}</div>`;
+    }
+    const expandBtn=isLong?`<button class="chat-expand-btn" id="exp-${bodyId}" onclick="expandChatMsg('${bodyId}','exp-${bodyId}')">Show more ▼</button>`:'';
     return`<div class="chat-msg ${m.role}">
       <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
       ${body}
+      ${expandBtn}
       <div class="chat-meta" title="${m.ts?new Date(m.ts*1000).toLocaleString():''}">${fmtTime(m.ts)}</div>
     </div>`;
   }).join('');
+}
+function expandChatMsg(bodyId,btnId){
+  const body=document.getElementById(bodyId);
+  const btn=document.getElementById(btnId);
+  if(!body)return;
+  const collapsed=body.classList.toggle('collapsed');
+  if(btn)btn.textContent=collapsed?'Show more ▼':'Show less ▲';
 }
 
 function renderDetail(){
@@ -6467,6 +6488,9 @@ const _paletteActions=[
   {icon:'&#x1F4DD;',label:'Open CLAUDE.md editor',hint:'Editor',fn:()=>openClaudeMd()},
   {icon:'&#x2795;',label:'New tmux session',hint:'Create',fn:()=>showCreateModal()},
   {icon:'&#x1F514;',label:'Enable notifications',hint:'Notif',fn:()=>requestNotifPermission()},
+  {icon:'&#x26F6;',label:'Toggle focus mode',hint:'F',fn:()=>toggleFocusMode()},
+  {icon:'&#x26AB;',label:'Toggle busy-only filter',hint:'B',fn:()=>toggleBusyFilter()},
+  {icon:'&#x1F4E1;',label:'Broadcast to sessions',hint:'Send',fn:()=>openBroadcast()},
 ];
 function openPalette(){
   const overlay=document.getElementById('palette-overlay');
@@ -6500,6 +6524,33 @@ function renderPalette(query){
       </div>`;
     });
   }
+  // Session actions for current session — stored in a global so onclick can call by index
+  if(selectedSession){
+    const sess=sessions.find(s=>s.name===selectedSession);
+    const sn=selectedSession;
+    window._pal_sess_fns=[];
+    const sessActions=[
+      {icon:'&#x270F;',label:'Rename session',hint:sn,fn:()=>{const el=document.querySelector('#nav-'+sn+' .nav-session-id');if(el)startRename(sn,el);}},
+      {icon:'&#x21E9;',label:'Export conversation',hint:'MD',fn:()=>exportConversation(sn)},
+      {icon:'&#x1F527;',label:'Toggle markdown',hint:'MD',fn:()=>toggleMarkdown(sn)},
+      {icon:'&#x25B6;',label:(sess&&sess.away_mode?'Stop':'Start')+' Away Mode',hint:'Away',fn:()=>quickToggleAway(sn)},
+      {icon:'&#x1F914;',label:(sess&&sess.go_nuts_mode?'Stop':'Start')+' Go Nuts',hint:'GN',fn:()=>quickToggleGoNuts(sn)},
+    ];
+    if(sess&&sess.activity_status==='busy')sessActions.unshift({icon:'&#x23F9;',label:'Interrupt Claude',hint:'Esc',fn:()=>interruptSession(sn)});
+    const matchSessAct=sessActions.filter(a=>!q||a.label.toLowerCase().includes(q)||a.hint.toLowerCase().includes(q));
+    if(matchSessAct.length){
+      html+='<div class="palette-section">Session: '+esc(sn)+'</div>';
+      matchSessAct.forEach(a=>{
+        const idx=window._pal_sess_fns.length;
+        window._pal_sess_fns.push(a.fn);
+        html+=`<div class="palette-item" onclick="closePalette();window._pal_sess_fns[${idx}]&&window._pal_sess_fns[${idx}]()">
+          <span class="palette-item-icon">${a.icon}</span>
+          <span class="palette-item-label">${esc(a.label)}</span>
+          <span class="palette-item-hint">${esc(a.hint)}</span>
+        </div>`;
+      });
+    }
+  }
   // Actions section
   const matchActions=_paletteActions.filter(a=>!q||a.label.toLowerCase().includes(q));
   if(matchActions.length){
@@ -6513,7 +6564,7 @@ function renderPalette(query){
       </div>`;
     });
   }
-  if(!matchSessions.length&&!matchActions.length){
+  if(!html){
     html='<div class="palette-no-results">No results for "'+esc(q)+'"</div>';
   }
   el.innerHTML=html;
