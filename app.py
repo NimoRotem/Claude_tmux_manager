@@ -4222,6 +4222,7 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .cmd-char-count.long{color:#e3b341}
 .cmd-char-count.very-long{color:#f85149}
 .nav-msg-count{font-size:.6rem;color:#484f58;padding:0 1px}
+.chat-meta-rt{color:#484f58;font-size:.6rem;margin-left:6px}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
@@ -4536,6 +4537,8 @@ const chatMessages={};
 const draftText={};
 // Unread message tracking: name → last seen assistant message count
 const unreadCounts={};
+// Response time tracking: name → timestamp when user sent last message
+const _responseWaiting={};
 
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
@@ -4624,10 +4627,14 @@ function renderNav(){
     const ageStr=ageH>0?`${ageH}h ${ageM}m`:`${ageM}m`;
     const createdStr=created?new Date(created*1000).toLocaleString():'unknown';
     const ageTip=created?`Created: ${createdStr} • Running: ${ageStr} • `:'';
+    // Last message preview
+    const msgs=chatMessages[s.name]||[];
+    const lastMsg=msgs.length?msgs[msgs.length-1]:null;
+    const lastTip=lastMsg?`Last: ${lastMsg.text.slice(0,80).replace(/\n/g,' ')}${lastMsg.text.length>80?'…':''} • `:'';
     const clrCls=getSessionColor(s.name);
     item.innerHTML=`
       <span class="nav-color-tag ${clrCls}" onclick="event.stopPropagation();cycleSessionColor('${esc(s.name)}',this)" title="Click to set session color"></span>
-      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="${ageTip}Double-click to rename">${esc(s.name)}</span>
+      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="${lastTip}${ageTip}Double-click to rename">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
@@ -4664,7 +4671,7 @@ function renderChatBubbles(name){
       <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
       ${body}
       ${expandBtn}
-      <div class="chat-meta" title="${m.ts?new Date(m.ts*1000).toLocaleString():''}">${fmtTime(m.ts)}</div>
+      <div class="chat-meta" title="${m.ts?new Date(m.ts*1000).toLocaleString():''}">${fmtTime(m.ts)}${m.rt?`<span class="chat-meta-rt" title="Response time">${m.rt}s</span>`:''}</div>
     </div>`;
   }).join('');
 }
@@ -4966,7 +4973,15 @@ function appendChatBubble(name,role,text,ts){
       }
     }
   }
-  chatMessages[name].push({role,text,ts});
+  // Track response time
+  let rt=null;
+  if(role==='user'){
+    _responseWaiting[name]=Date.now();
+  }else if(role==='assistant'&&_responseWaiting[name]){
+    rt=((Date.now()-_responseWaiting[name])/1000).toFixed(1);
+    delete _responseWaiting[name];
+  }
+  chatMessages[name].push({role,text,ts,rt});
   // Track unread assistant messages for non-active sessions
   if(role==='assistant'&&name!==selectedSession){
     unreadCounts[name]=(unreadCounts[name]||0)+1;
@@ -5863,6 +5878,7 @@ async function loadSessionStats(name){
         <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
         <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
         <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
+        <div class="stat-item"><span class="stat-label">Output efficiency</span><span class="stat-value" title="Output tokens / input tokens — higher = more output per token spent">${st.totalInput>0?Math.round(st.totalOutput/st.totalInput*100)+'%':'—'}</span></div>
       </div>
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
         <span style="font-size:.75rem;color:#8b949e">Rate</span>
