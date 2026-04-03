@@ -4679,6 +4679,24 @@ function loadSessionNote(name){
   el.value=getSessionNote(name);
   autoResizeNote(el);
 }
+// ── Session snooze (hide from nav for N minutes) ──
+const _snoozed={};  // name → expiry timestamp (ms)
+function snoozeSession(name,minutes){
+  _snoozed[name]=Date.now()+minutes*60000;
+  showToast(name+' snoozed for '+minutes+'m','info',2500);
+  // Jump to next visible session
+  const visible=sessions.filter(s=>!isSnoozed(s.name)&&s.name!==name);
+  if(visible.length)selectSession(visible[0].name);
+  filterSessionsNav(document.getElementById('nav-search')?.value||'');
+}
+function isSnoozed(name){return _snoozed[name]&&Date.now()<_snoozed[name];}
+function unsnoozeSession(name){delete _snoozed[name];filterSessionsNav(document.getElementById('nav-search')?.value||'');}
+// Periodically check snooze expiry
+setInterval(()=>{
+  let changed=false;
+  for(const name of Object.keys(_snoozed)){if(Date.now()>=_snoozed[name]){delete _snoozed[name];changed=true;showToast(name+' unsnooze','info',2000);}}
+  if(changed)filterSessionsNav(document.getElementById('nav-search')?.value||'');
+},30000);
 // ── Session duplication ──
 async function duplicateSession(name){
   try{
@@ -6592,10 +6610,11 @@ function filterSessionsNav(query){
     const sess=sessions.find(s=>s.name===rawName);
     const textHide=q&&!name.includes(q);
     const busyHide=_busyOnly&&(!sess||sess.activity_status!=='busy');
-    item.classList.toggle('nav-hidden',textHide||busyHide);
+    const snoozeHide=isSnoozed(rawName);
+    item.classList.toggle('nav-hidden',textHide||busyHide||snoozeHide);
   });
   // If current selected session got hidden, select first visible
-  if(q||_busyOnly){
+  if(q||_busyOnly||Object.keys(_snoozed).length){
     const active=navEl.querySelector('.nav-item.active:not(.nav-hidden)');
     if(!active){
       const first=navEl.querySelector('.nav-item:not(.nav-hidden)');
@@ -6763,6 +6782,7 @@ function renderPalette(query){
       {icon:'&#x25B6;',label:(sess&&sess.away_mode?'Stop':'Start')+' Away Mode',hint:'Away',fn:()=>quickToggleAway(sn)},
       {icon:'&#x1F914;',label:(sess&&sess.go_nuts_mode?'Stop':'Start')+' Go Nuts',hint:'GN',fn:()=>quickToggleGoNuts(sn)},
       {icon:'&#x2398;',label:'Duplicate session',hint:'Clone',fn:()=>duplicateSession(sn)},
+      {icon:'&#x1F634;',label:'Snooze session 15min',hint:'X',fn:()=>snoozeSession(sn,15)},
     ];
     if(sess&&sess.activity_status==='busy')sessActions.unshift({icon:'&#x23F9;',label:'Interrupt Claude',hint:'Esc',fn:()=>interruptSession(sn)});
     const matchSessAct=sessActions.filter(a=>!q||a.label.toLowerCase().includes(q)||a.hint.toLowerCase().includes(q));
@@ -6926,6 +6946,38 @@ document.addEventListener('keydown',function(e){
       return;
     }
   }
+  // I → interrupt current session (when not in input)
+  if(e.key==='i'||e.key==='I'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      const sess=sessions.find(s=>s.name===selectedSession);
+      if(sess&&sess.activity_status==='busy'){interruptSession(selectedSession);return;}
+    }
+  }
+  // E → export current session conversation (when not in input)
+  if(e.key==='e'||e.key==='E'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){exportConversation(selectedSession);return;}
+  }
+  // S → focus chat send input for current session (when not in input, switch to chat)
+  if(e.key==='s'||e.key==='S'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      if((activeTabs[selectedSession]||'raw')!=='chat')switchTab(selectedSession,'chat');
+      const inp=document.getElementById('cmd-chat-'+selectedSession);
+      if(inp){setTimeout(()=>inp.focus(),50);}
+      return;
+    }
+  }
+  // X → snooze current session for 15 min (hide from nav, when not in input)
+  if(e.key==='x'||e.key==='X'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){snoozeSession(selectedSession,15);return;}
+  }
   // ? → show keyboard shortcut help (when not in input)
   if(e.key==='?'){
     const focused=document.activeElement;
@@ -6957,6 +7009,10 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle focus mode (hide nav)</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Send message / command</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">I</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy)</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">E</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Export current session conversation</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">S</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus chat send input</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">X</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Snooze current session for 15 min</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy) / close modal</td></tr>
     </table>
