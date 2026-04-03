@@ -4230,6 +4230,8 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .session-note-input{width:100%;box-sizing:border-box;background:none;border:none;color:#6e7681;font-size:.72rem;font-family:inherit;resize:none;outline:none;line-height:1.45;max-height:80px;overflow-y:auto;padding:2px 0}
 .session-note-input::placeholder{color:#30363d}
 .session-note-input:focus{color:#c9d1d9}
+.nav-sparkline{display:flex;align-items:flex-end;gap:1px;height:10px;margin-left:4px;opacity:.6}
+.nav-spark-bar{width:3px;border-radius:1px 1px 0 0;min-height:2px}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
@@ -4561,6 +4563,24 @@ const draftText={};
 const unreadCounts={};
 // Response time tracking: name → timestamp when user sent last message
 const _responseWaiting={};
+const _activityHistory={};  // name → [{s:'busy'|'idle'|'unknown', t:timestamp}, ...]
+const SPARK_MAX=20;  // keep last N data points for sparkline
+function trackActivity(name,status){
+  if(!_activityHistory[name])_activityHistory[name]=[];
+  const h=_activityHistory[name];
+  h.push({s:status,t:Date.now()});
+  if(h.length>SPARK_MAX)h.splice(0,h.length-SPARK_MAX);
+}
+function renderSparkline(name){
+  const h=_activityHistory[name];
+  if(!h||h.length<2)return'';
+  const bars=h.map(p=>{
+    const col=p.s==='busy'?'#3fb950':p.s==='idle'?'#484f58':'#30363d';
+    const ht=p.s==='busy'?10:p.s==='idle'?5:2;
+    return`<div class="nav-spark-bar" style="height:${ht}px;background:${col}"></div>`;
+  }).join('');
+  return`<div class="nav-sparkline" title="Activity history (last ${h.length} checks)">${bars}</div>`;
+}
 
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
@@ -4768,6 +4788,7 @@ function renderNav(){
         ${(chatMessages[s.name]||[]).length>0?`<span class="nav-msg-count" title="${(chatMessages[s.name]||[]).length} messages">${(chatMessages[s.name]||[]).length}</span>`:''}
         <span class="nav-cost" id="nav-cost-${s.name}"></span>
         <span class="nav-health good" id="nav-health-${s.name}" title="Session health"></span>
+        <span id="spark-${s.name}">${renderSparkline(s.name)}</span>
         <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
     navEl.appendChild(item);
@@ -5445,6 +5466,10 @@ function updateStatusPill(name,status,detail){
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
   if(navDot)navDot.className='nav-dot '+(status||'unknown');
+  // Track activity history and update sparkline
+  trackActivity(name,status);
+  const sparkEl=document.getElementById('spark-'+name);
+  if(sparkEl)sparkEl.innerHTML=renderSparkline(name);
 }
 
 function updateCard(s){
@@ -6802,6 +6827,18 @@ document.addEventListener('keydown',function(e){
     const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
     if(!isInput){toggleFocusMode();return;}
   }
+  // T → cycle tabs for current session (when not in input)
+  if(e.key==='t'||e.key==='T'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      const tabOrder=['raw','chat','info'];
+      const cur=activeTabs[selectedSession]||'raw';
+      const next=tabOrder[(tabOrder.indexOf(cur)+1)%tabOrder.length];
+      switchTab(selectedSession,next);
+      return;
+    }
+  }
   // ? → show keyboard shortcut help (when not in input)
   if(e.key==='?'){
     const focused=document.activeElement;
@@ -6825,6 +6862,7 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Alt+1-9</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Switch to session 1–9</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+]</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Next session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+[</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Previous session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">T</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Cycle tabs (Terminal → Chat → Info)</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">B</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle busy-only filter</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle focus mode (hide nav)</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
