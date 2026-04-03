@@ -4244,6 +4244,10 @@ button,a,input,textarea,select{touch-action:manipulation}
 .rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
 .rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
 .rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
+.rate-alarm{display:none;align-items:center;gap:8px;padding:6px 16px;font-size:.78rem;font-weight:600;border-bottom:1px solid;animation:pulse-busy 2s ease-in-out infinite}
+.rate-alarm.visible{display:flex}
+.rate-alarm.limited{background:rgba(210,153,34,.08);border-bottom-color:#d29922;color:#d29922}
+.rate-alarm.severely_limited{background:rgba(248,81,73,.1);border-bottom-color:#f85149;color:#f85149}
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
@@ -4418,6 +4422,7 @@ button,a,input,textarea,select{touch-action:manipulation}
 <div class="auth-dropdown" id="auth-dropdown">
   <div id="auth-dropdown-content"></div>
 </div>
+<div class="rate-alarm" id="rate-alarm"></div>
 <div class="main" id="main"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal-content" role="dialog" aria-modal="true"></div>
@@ -4656,6 +4661,18 @@ function renderDetail(){
       <div class="tier tier-notes">
         <div class="tier-label"><span class="dot"></span>Key Info</div>
         <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
+      </div>
+      <div class="tier" style="margin-top:12px">
+        <div class="tier-label"><span class="dot" style="background:#e3b341"></span>Quick Note
+          <span style="font-size:.65rem;color:#6e7681;font-weight:400;margin-left:4px">saved locally</span>
+        </div>
+        <textarea id="qnote-${s.name}" rows="3"
+          placeholder="Jot a quick note about this session..."
+          style="width:100%;margin-top:6px;background:#0d1117;border:1px solid #21262d;color:#c9d1d9;padding:8px 10px;border-radius:6px;font-size:.82rem;font-family:inherit;resize:vertical;outline:none;transition:border-color .15s"
+          onfocus="this.style.borderColor='#58a6ff'"
+          onblur="this.style.borderColor='#21262d';saveQuickNote('${s.name}',this.value)"
+          oninput="saveQuickNote('${s.name}',this.value)"
+        >${esc(getQuickNote(s.name))}</textarea>
       </div>
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
@@ -5656,6 +5673,8 @@ async function loadSessionStats(name){
     }
     const rateCls=st.rateStatus;
     const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    // Rate alarm: show/hide a warning banner at top of tab area
+    updateRateAlarm(name,rateCls);
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
     panel.innerHTML=`
@@ -6620,6 +6639,36 @@ async function executeBroadcast(){
     }catch{fail++;}
   }));
   if(fail)alert(\`Broadcast: \${ok} sent, \${fail} failed.\`);
+}
+
+// ==================== Rate Limit Alarm Banner ====================
+const _rateAlarmState={};
+function updateRateAlarm(name,rateStatus){
+  // Only show alarm for the currently selected session
+  if(name!==selectedSession)return;
+  _rateAlarmState[name]=rateStatus;
+  const banner=document.getElementById('rate-alarm');
+  if(!banner)return;
+  if(rateStatus==='severely_limited'){
+    banner.className='rate-alarm severely_limited visible';
+    banner.innerHTML='&#x26A0; <strong>Rate Limit: Severely Throttled</strong> — Claude is responding much slower than peak. Consider waiting or switching to a different session.&nbsp;&nbsp;<button onclick="this.closest(\'.rate-alarm\').classList.remove(\'visible\')" style="background:none;border:1px solid #f85149;color:#f85149;border-radius:3px;padding:1px 8px;cursor:pointer;font-size:.7rem;margin-left:auto">Dismiss</button>';
+  }else if(rateStatus==='limited'){
+    banner.className='rate-alarm limited visible';
+    banner.innerHTML='&#x26A0; <strong>Rate Limited</strong> — Claude response speed is reduced.&nbsp;&nbsp;<button onclick="this.closest(\'.rate-alarm\').classList.remove(\'visible\')" style="background:none;border:1px solid #d29922;color:#d29922;border-radius:3px;padding:1px 8px;cursor:pointer;font-size:.7rem;margin-left:auto">Dismiss</button>';
+  }else{
+    banner.classList.remove('visible');
+  }
+}
+
+// ==================== Quick Notes ====================
+function getQuickNote(name){
+  try{return localStorage.getItem('tmux-qnote-'+name)||'';}catch{return'';}
+}
+function saveQuickNote(name,val){
+  try{
+    if(val)localStorage.setItem('tmux-qnote-'+name,val);
+    else localStorage.removeItem('tmux-qnote-'+name);
+  }catch{}
 }
 
 // ==================== Jump to Bottom + Command History ====================
