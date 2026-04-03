@@ -1555,6 +1555,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
 
 class CreateSession(BaseModel):
     name: str = Field("", max_length=128)  # tmux session names have a practical limit
+    launch_claude: bool = False  # if true, run "claude" in the new session immediately
 
 
 @app.post("/api/sessions/create")
@@ -1597,11 +1598,12 @@ async def api_create_session(body: CreateSession):
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
-        # Optionally launch a command in the new session
-        if NEW_SESSION_CMD:
+        # Optionally launch a command in the new session (env var or per-request flag)
+        launch_cmd = NEW_SESSION_CMD or ("claude" if body.launch_claude else "")
+        if launch_cmd:
             await asyncio.to_thread(
                 subprocess.run,
-                ["tmux", "send-keys", "-t", created, "-l", NEW_SESSION_CMD],
+                ["tmux", "send-keys", "-t", created, "-l", launch_cmd],
                 capture_output=True, text=True, timeout=5
             )
             await asyncio.to_thread(
@@ -4010,7 +4012,8 @@ button,a,input,textarea,select{touch-action:manipulation}
 /* Pinned right section */
 .nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
 .nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
-.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
+.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none;position:relative}
+.nav-unread{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;background:#1f6feb;color:#fff;font-size:.6rem;font-weight:700;border-radius:8px;line-height:1}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
 .nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
@@ -4400,6 +4403,7 @@ button,a,input,textarea,select{touch-action:manipulation}
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
   <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
   <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
+  <button class="nav-icon-btn" onclick="openBroadcast()" title="Broadcast to multiple sessions">&#x1F4E1;</button>
   <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
   <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
@@ -4460,6 +4464,8 @@ const lastStatus={};
 const chatMessages={};
 // Preserve textarea drafts across re-renders
 const draftText={};
+// Unread message tracking: name → last seen assistant message count
+const unreadCounts={};
 
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
@@ -4530,6 +4536,7 @@ function renderNav(){
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
+        ${(unreadCounts[s.name]||0)>0&&s.name!==selectedSession?`<span class="nav-unread">${unreadCounts[s.name]}</span>`:''}
         <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
     navEl.appendChild(item);
@@ -4726,9 +4733,15 @@ function renderDetail(){
 function selectSession(name){
   stopAllRawPolling();
   selectedSession=name;
+  // Clear unread badge for this session
+  unreadCounts[name]=0;
   navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const navItem=document.getElementById('nav-'+name);
-  if(navItem)navItem.classList.add('active');
+  if(navItem){
+    navItem.classList.add('active');
+    const badge=navItem.querySelector('.nav-unread');
+    if(badge)badge.remove();
+  }
   renderDetail();
 }
 
@@ -4813,6 +4826,22 @@ function appendChatBubble(name,role,text,ts){
     }
   }
   chatMessages[name].push({role,text,ts});
+  // Track unread assistant messages for non-active sessions
+  if(role==='assistant'&&name!==selectedSession){
+    unreadCounts[name]=(unreadCounts[name]||0)+1;
+    // Update badge on nav item without full re-render
+    const navItem=document.getElementById('nav-'+name);
+    if(navItem){
+      let badge=navItem.querySelector('.nav-unread');
+      if(!badge){
+        badge=document.createElement('span');
+        badge.className='nav-unread';
+        const indicators=navItem.querySelector('.nav-indicators');
+        if(indicators)indicators.insertBefore(badge,indicators.querySelector('.nav-pin-btn'));
+      }
+      badge.textContent=unreadCounts[name];
+    }
+  }
   // If this session's chat is visible, append to DOM
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
     const chatEl=document.getElementById('chat-'+name);
@@ -5224,6 +5253,10 @@ function showCreateModal(){
     <input type="text" class="modal-input" id="new-session-name"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:.82rem;color:#c9d1d9;cursor:pointer;user-select:none">
+      <input type="checkbox" id="new-session-launch-claude" checked style="width:14px;height:14px;cursor:pointer">
+      Auto-launch <code style="font-size:.8em;background:#21262d;padding:1px 5px;border-radius:3px">claude</code> in new session
+    </label>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" onclick="createSession()">Create</button>
@@ -5235,11 +5268,13 @@ function showCreateModal(){
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
+  const launchCb=document.getElementById('new-session-launch-claude');
+  const launch_claude=launchCb?launchCb.checked:true;
   closeModal();
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
+      body:JSON.stringify({name,launch_claude})
     });
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed');return}
@@ -6490,6 +6525,57 @@ function refreshKeyBars(){
       renderDetail();
     }
   }
+}
+
+// ==================== Broadcast (Bulk Send) ====================
+function openBroadcast(){
+  const modal=document.getElementById('modal-overlay');
+  const body=document.getElementById('modal-body');
+  if(!modal||!body)return;
+  body.innerHTML=`
+    <div style="font-size:1rem;font-weight:600;color:#e6edf3;margin-bottom:8px">&#x1F4E1; Broadcast to Sessions</div>
+    <div style="font-size:.8rem;color:#8b949e;margin-bottom:12px">Send the same message or command to multiple sessions at once.</div>
+    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:12px;max-height:180px;overflow-y:auto">
+      ${sessions.map(s=>`
+        <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#161b22;border:1px solid #30363d;border-radius:4px;cursor:pointer;font-size:.82rem;color:#c9d1d9">
+          <input type="checkbox" class="bc-session-chk" value="${esc(s.name)}" ${s.name===selectedSession?'checked':''} style="cursor:pointer">
+          <span class="nav-dot ${esc(s.activity_status)}" style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${s.activity_status==='busy'?'#f85149':s.activity_status==='idle'?'#3fb950':'#d2a8ff'}"></span>
+          ${esc(s.name)}
+        </label>`).join('')}
+    </div>
+    <textarea id="bc-message" rows="3" placeholder="Type a message or command..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:.85rem;font-family:inherit;resize:vertical;outline:none" spellcheck="false"></textarea>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:.78rem;color:#8b949e;cursor:pointer">
+        <input type="checkbox" id="bc-select-all" onchange="document.querySelectorAll('.bc-session-chk').forEach(c=>c.checked=this.checked)">
+        Select all
+      </label>
+      <div style="display:flex;gap:8px">
+        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-full" onclick="executeBroadcast()">Send</button>
+      </div>
+    </div>`;
+  modal.classList.add('active');
+  document.getElementById('bc-message').focus();
+}
+async function executeBroadcast(){
+  const msg=document.getElementById('bc-message');
+  if(!msg||!msg.value.trim()){alert('Enter a message first.');return;}
+  const text=msg.value.trim();
+  const checked=[...document.querySelectorAll('.bc-session-chk:checked')].map(c=>c.value);
+  if(!checked.length){alert('Select at least one session.');return;}
+  closeModal();
+  let ok=0,fail=0;
+  await Promise.all(checked.map(async name=>{
+    try{
+      appendChatBubble(name,'user',text,Date.now()/1000);
+      const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({command:text})
+      });
+      if(resp.ok)ok++;else fail++;
+    }catch{fail++;}
+  }));
+  if(fail)alert(\`Broadcast: \${ok} sent, \${fail} failed.\`);
 }
 
 loadAll();
