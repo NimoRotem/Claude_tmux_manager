@@ -1570,6 +1570,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
 class CreateSession(BaseModel):
     name: str = Field("", max_length=128)  # tmux session names have a practical limit
     launch_claude: bool = False  # if true, run "claude" in the new session immediately
+    cwd: str = Field("", max_length=500)  # optional starting directory
 
 
 @app.post("/api/sessions/create")
@@ -1587,6 +1588,8 @@ async def api_create_session(body: CreateSession):
         cmd = ["tmux", "new-session", "-d"]
         if name:
             cmd += ["-s", name]
+        if body.cwd and os.path.isdir(body.cwd):
+            cmd += ["-c", body.cwd]
         result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
@@ -4223,6 +4226,10 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .cmd-char-count.very-long{color:#f85149}
 .nav-msg-count{font-size:.6rem;color:#484f58;padding:0 1px}
 .chat-meta-rt{color:#484f58;font-size:.6rem;margin-left:6px}
+.session-note-wrap{padding:4px 10px 2px;border-top:1px solid #21262d}
+.session-note-input{width:100%;box-sizing:border-box;background:none;border:none;color:#6e7681;font-size:.72rem;font-family:inherit;resize:none;outline:none;line-height:1.45;max-height:80px;overflow-y:auto;padding:2px 0}
+.session-note-input::placeholder{color:#30363d}
+.session-note-input:focus{color:#c9d1d9}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
@@ -4486,6 +4493,7 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
   <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
   <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
   <button class="nav-icon-btn nav-busy-filter" id="busy-filter-btn" onclick="toggleBusyFilter()" title="Show only busy sessions (B)">&#x26AB;</button>
+  <button class="nav-icon-btn" id="sort-mode-btn" onclick="cycleSortMode()" title="Sort: custom" style="font-size:.65rem;padding:3px 7px">&#x21C5;Sort</button>
   <button class="nav-icon-btn" onclick="openBroadcast()" title="Broadcast to multiple sessions">&#x1F4E1;</button>
   <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
   <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
@@ -4640,17 +4648,91 @@ function statusLabel(s){
   if(s==='idle')return'Idle';
   return'...';
 }
+// ── Session sticky notes ──
+function getSessionNote(name){return localStorage.getItem('tmux-note-'+name)||'';}
+function saveSessionNote(name,text){if(text)localStorage.setItem('tmux-note-'+name,text);else localStorage.removeItem('tmux-note-'+name);}
+function autoResizeNote(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,80)+'px';}
+function loadSessionNote(name){
+  const el=document.getElementById('note-'+name);
+  if(!el)return;
+  el.value=getSessionNote(name);
+  autoResizeNote(el);
+}
+// ── Session duplication ──
+async function duplicateSession(name){
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/files');
+    const data=await resp.json();
+    showDuplicateModal(name,data.cwd||'');
+  }catch(e){showDuplicateModal(name,'');}
+}
+function showDuplicateModal(origName,cwd){
+  const modal=document.getElementById('modal-content');
+  const sugName='copy-'+origName.replace(/^copy-/,'');
+  modal.innerHTML=`
+    <h3 id="modal-title">Duplicate session ${esc(origName)}</h3>
+    ${cwd?`<p style="font-size:.78rem;color:#6e7681;margin:4px 0 8px">Dir: ${esc(cwd)}</p>`:''}
+    <input type="text" class="modal-input" id="dup-name" value="${esc(sugName)}"
+      onkeydown="if(event.key===\\'Enter\\')confirmDuplicate(\\'${esc(origName)}\\',\\'${esc(cwd)}\\')">
+    <label style="display:flex;align-items:center;gap:8px;font-size:.8rem;color:#8b949e;margin-top:10px">
+      <input type="checkbox" id="dup-launch-claude" checked style="width:14px;height:14px;cursor:pointer">
+      Launch Claude in new session
+    </label>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-confirm-create" onclick="confirmDuplicate(\\'${esc(origName)}\\',\\'${esc(cwd)}\\')">Duplicate</button>
+    </div>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  setTimeout(()=>{const i=document.getElementById('dup-name');if(i){i.focus();i.select();}},50);
+}
+async function confirmDuplicate(origName,cwd){
+  const input=document.getElementById('dup-name');
+  const name=input?input.value.trim():'';
+  const lc=document.getElementById('dup-launch-claude');
+  const launch_claude=lc?lc.checked:true;
+  closeModal();
+  try{
+    const resp=await fetch(BASE+'/api/sessions/create',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,launch_claude,cwd})
+    });
+    const data=await resp.json();
+    if(!resp.ok){showToast(data.error||'Failed','error',3000);return;}
+    selectedSession=data.name;
+    await loadAll();
+    showToast('Duplicated as '+data.name,'success',2500);
+  }catch(e){showToast('Failed to duplicate session','error',3000);}
+}
+// ── Nav sort modes ──
+const _sortModes=['custom','cost','name','activity'];
+let _sortModeIdx=0;
+function cycleSortMode(){
+  _sortModeIdx=(_sortModeIdx+1)%_sortModes.length;
+  const btn=document.getElementById('sort-mode-btn');
+  const labels=['&#x21C5;Sort','&#x21C5;Cost','&#x21C5;A-Z','&#x21C5;Live'];
+  if(btn){btn.innerHTML=labels[_sortModeIdx];btn.title='Sort: '+_sortModes[_sortModeIdx];}
+  renderNav();
+}
 
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   const pinnedSet=getPinnedSessions();
-  // Apply custom drag order if present
   const customOrder=_getSessionOrder();
+  const sortMode=_sortModes[_sortModeIdx]||'custom';
   const sorted=[...sessions].sort((a,b)=>{
     const ap=pinnedSet.has(a.name)?-1000:0,bp=pinnedSet.has(b.name)?-1000:0;
-    const ai=customOrder.indexOf(a.name),bi=customOrder.indexOf(b.name);
-    const ar=ai<0?999:ai,br=bi<0?999:bi;
-    return (ap+ar)-(bp+br);
+    let delta=0;
+    if(sortMode==='cost'){delta=(_sessionCosts[b.name]||0)-(_sessionCosts[a.name]||0);}
+    else if(sortMode==='name'){delta=a.name.localeCompare(b.name);}
+    else if(sortMode==='activity'){
+      const order={busy:0,idle:1,unknown:2};
+      delta=(order[a.activity_status]||2)-(order[b.activity_status]||2);
+    }else{
+      const ai=customOrder.indexOf(a.name),bi=customOrder.indexOf(b.name);
+      const ar=ai<0?999:ai,br=bi<0?999:bi;
+      delta=ar-br;
+    }
+    return (ap-bp)||delta;
   });
   sorted.forEach(s=>{
     const item=document.createElement('div');
@@ -4786,6 +4868,9 @@ function renderDetail(){
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
+        <div class="session-note-wrap">
+          <textarea class="session-note-input" id="note-${s.name}" rows="1" placeholder="&#x1F4DD; session note..." oninput="saveSessionNote('${s.name}',this.value);autoResizeNote(this)" onfocus="autoResizeNote(this)"></textarea>
+        </div>
       </div>
     </div>
 
@@ -4928,8 +5013,9 @@ function selectSession(name){
     if(badge)badge.remove();
   }
   renderDetail();
-  // Auto-focus chat input after render
+  // Load sticky note and auto-focus chat input after render
   requestAnimationFrame(()=>{
+    loadSessionNote(name);
     const input=document.getElementById('cmd-chat-'+name);
     if(input&&!input.disabled&&document.activeElement!==input)input.focus();
   });
@@ -6594,6 +6680,7 @@ function renderPalette(query){
       {icon:'&#x1F527;',label:'Toggle markdown',hint:'MD',fn:()=>toggleMarkdown(sn)},
       {icon:'&#x25B6;',label:(sess&&sess.away_mode?'Stop':'Start')+' Away Mode',hint:'Away',fn:()=>quickToggleAway(sn)},
       {icon:'&#x1F914;',label:(sess&&sess.go_nuts_mode?'Stop':'Start')+' Go Nuts',hint:'GN',fn:()=>quickToggleGoNuts(sn)},
+      {icon:'&#x2398;',label:'Duplicate session',hint:'Clone',fn:()=>duplicateSession(sn)},
     ];
     if(sess&&sess.activity_status==='busy')sessActions.unshift({icon:'&#x23F9;',label:'Interrupt Claude',hint:'Esc',fn:()=>interruptSession(sn)});
     const matchSessAct=sessActions.filter(a=>!q||a.label.toLowerCase().includes(q)||a.hint.toLowerCase().includes(q));
