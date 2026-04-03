@@ -1618,6 +1618,43 @@ async def api_create_session(body: CreateSession):
         return JSONResponse({"error": "Failed to create session"}, status_code=500)
 
 
+class RenameSession(BaseModel):
+    new_name: str = Field(..., min_length=1, max_length=128)
+
+@app.post("/api/sessions/{session_name}/rename")
+async def api_rename_session(session_name: str, body: RenameSession):
+    """Rename a tmux session."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return _resp_session_not_found()
+    new_name = body.new_name.strip()
+    if not re.match(r'^[a-zA-Z0-9_-]+$', new_name):
+        return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
+    if new_name == session_name:
+        return JSONResponse({"ok": True, "name": new_name})
+    existing = [s["name"] for s in get_tmux_sessions()]
+    if new_name in existing:
+        return JSONResponse({"error": f"Session '{new_name}' already exists."}, status_code=409)
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "rename-session", "-t", session_name, new_name],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return JSONResponse({"error": result.stderr.strip() or "Rename failed"}, status_code=500)
+        # Transfer cached data to new name
+        for store in [_session_data_cache, _session_auth_mode, _session_stats_cache,
+                      _away_mode_state, _go_nuts_state]:
+            if session_name in store:
+                store[new_name] = store.pop(session_name)
+        logger.info("Session renamed: '%s' → '%s'", session_name, new_name)
+        return JSONResponse({"ok": True, "name": new_name})
+    except Exception:
+        logger.exception("Failed to rename session '%s'", session_name)
+        return JSONResponse({"error": "Failed to rename session"}, status_code=500)
+
+
 @app.delete("/api/sessions/{session_name}")
 async def api_delete_session(session_name: str):
     """Kill a tmux session and all its child processes."""
@@ -4500,6 +4537,13 @@ function updateFavicon(status){
   const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
   const link=document.getElementById('favicon');
   if(link)link.href=svg;
+  // Also update page title with activity summary
+  const busyCount=sessions.filter(s=>s.activity_status==='busy').length;
+  const totalUnread=Object.values(unreadCounts).reduce((a,b)=>a+b,0);
+  const parts=['tmux Dashboard'];
+  if(busyCount>0)parts.unshift('('+busyCount+' working)');
+  if(totalUnread>0)parts.unshift('['+totalUnread+']');
+  document.title=parts.join(' ');
 }
 
 function timeAgo(ts){
@@ -4538,7 +4582,7 @@ function renderNav(){
     item.id='nav-'+s.name;
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
-      <span class="nav-session-id">${esc(s.name)}</span>
+      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="Double-click to rename">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
@@ -6639,6 +6683,43 @@ async function executeBroadcast(){
     }catch{fail++;}
   }));
   if(fail)alert(\`Broadcast: \${ok} sent, \${fail} failed.\`);
+}
+
+// ==================== Session Rename ====================
+function startRename(name,spanEl){
+  const current=spanEl.textContent;
+  const input=document.createElement('input');
+  input.value=current;
+  input.style.cssText='width:'+(Math.max(60,current.length*8))+'px;background:#0d1117;border:1px solid #58a6ff;color:#58a6ff;border-radius:3px;padding:1px 5px;font-size:.75rem;font-weight:700;font-family:inherit;outline:none;max-width:140px';
+  spanEl.replaceWith(input);
+  input.select();
+  const finish=async(save)=>{
+    const newName=input.value.trim();
+    // Restore span
+    const newSpan=document.createElement('span');
+    newSpan.className='nav-session-id';
+    newSpan.title='Double-click to rename';
+    newSpan.ondblclick=(e)=>{e.stopPropagation();startRename(save&&newName?newName:name,newSpan)};
+    newSpan.textContent=save&&newName&&newName!==name?newName:name;
+    input.replaceWith(newSpan);
+    if(!save||!newName||newName===name)return;
+    try{
+      const resp=await fetch(BASE+'/api/sessions/'+name+'/rename',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({new_name:newName})
+      });
+      const data=await resp.json();
+      if(!resp.ok){alert(data.error||'Rename failed');renderNav();return;}
+      if(selectedSession===name)selectedSession=data.name;
+      await loadAll();
+    }catch{alert('Rename failed');}
+  };
+  input.onkeydown=(e)=>{
+    if(e.key==='Enter'){e.preventDefault();finish(true);}
+    else if(e.key==='Escape')finish(false);
+  };
+  input.onblur=()=>finish(true);
+  input.onclick=(e)=>e.stopPropagation();
 }
 
 // ==================== Rate Limit Alarm Banner ====================
