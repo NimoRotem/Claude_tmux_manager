@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import json
-import logging
 import os
 import re
 import secrets
@@ -14,14 +12,10 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Dict
 import glob as globmod
 
-logger = logging.getLogger("tmux-dashboard")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, Response, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 import openai
@@ -46,7 +40,7 @@ def _load_anthropic_key() -> str:
         if ANTHROPIC_API_KEY_FILE.exists():
             _stored_anthropic_key = ANTHROPIC_API_KEY_FILE.read_text().strip()
     except Exception:
-        logger.debug("Failed to load Anthropic API key from %s", ANTHROPIC_API_KEY_FILE, exc_info=True)
+        pass
     return _stored_anthropic_key
 
 
@@ -58,7 +52,7 @@ def _save_anthropic_key(key: str):
         ANTHROPIC_API_KEY_FILE.write_text(key)
         ANTHROPIC_API_KEY_FILE.chmod(0o600)
     except Exception:
-        logger.debug("Failed to save Anthropic API key", exc_info=True)
+        pass
 
 
 def _clear_anthropic_key():
@@ -68,59 +62,10 @@ def _clear_anthropic_key():
         if ANTHROPIC_API_KEY_FILE.exists():
             ANTHROPIC_API_KEY_FILE.unlink()
     except Exception:
-        logger.debug("Failed to clear Anthropic API key", exc_info=True)
+        pass
 
 
 _load_anthropic_key()
-
-# Track auth mode per session: "subscription" or "api"
-_session_auth_mode: Dict[str, str] = {}
-
-# Away mode state per session
-_away_mode_state: Dict[str, dict] = {}
-# Per-session structure when active:
-# {
-#   "enabled": bool,
-#   "phase": int (1-5),
-#   "phase_name": str,
-#   "step": int,
-#   "step_name": str,
-#   "started_at": float,
-#   "log": [{"ts": float, "phase": int, "step": int, "action": str}],
-#   "report": str,
-#   "task": asyncio.Task | None,
-# }
-
-# Go Nuts mode state per session (same structure as away mode)
-_go_nuts_state: Dict[str, dict] = {}
-
-# --- Persistent autonomous mode state ---
-# Survives restarts: stores which sessions had away/go-nuts mode enabled.
-AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
-
-def _save_autonomous_state():
-    """Persist which sessions have away/go-nuts mode enabled to disk."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        state = {}
-        for name, s in _away_mode_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["away_mode"] = True
-        for name, s in _go_nuts_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["go_nuts_mode"] = True
-        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
-    except Exception:
-        logger.debug("Failed to save autonomous mode state", exc_info=True)
-
-def _load_autonomous_state() -> Dict[str, dict]:
-    """Load persisted autonomous mode state from disk."""
-    try:
-        if AUTONOMOUS_STATE_FILE.exists():
-            return json.loads(AUTONOMOUS_STATE_FILE.read_text())
-    except Exception:
-        logger.debug("Failed to load autonomous mode state", exc_info=True)
-    return {}
 
 app = FastAPI(root_path=ROOT_PATH)
 
@@ -174,21 +119,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 
 @app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    """Add security headers to all responses and log slow requests."""
-    start = time.time()
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    duration = time.time() - start
-    if duration > 2.0:
-        logger.warning("Slow request: %s %s took %.1fs", request.method, request.url.path, duration)
-    return response
-
-
-@app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     # Skip auth entirely if no password is configured
     if not AUTH_PASS:
@@ -208,11 +138,10 @@ async def do_login(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
-    if hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(password, AUTH_PASS):
+    if username == AUTH_USER and password == AUTH_PASS:
         token = _make_token(username)
         resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
-        is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-        resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+        resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax")
         return resp
     return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
 
@@ -221,6 +150,7 @@ async def do_login(request: Request):
 cache: Dict[str, dict] = {}
 
 # Persistent message storage
+MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
 
@@ -231,7 +161,7 @@ def _load_all_notes() -> Dict[str, str]:
         if NOTES_FILE.exists():
             return json.loads(NOTES_FILE.read_text())
     except Exception:
-        logger.debug("Failed to load notes from %s", NOTES_FILE, exc_info=True)
+        pass
     return {}
 
 
@@ -246,7 +176,7 @@ def _save_notes():
                 existing[name] = notes
         NOTES_FILE.write_text(json.dumps(existing))
     except Exception:
-        logger.debug("Failed to save notes to %s", NOTES_FILE, exc_info=True)
+        pass
 
 
 def _load_session_notes(session_name: str) -> str:
@@ -260,7 +190,7 @@ def _load_messages() -> Dict[str, list]:
         if MESSAGES_FILE.exists():
             return json.loads(MESSAGES_FILE.read_text())
     except Exception:
-        logger.debug("Failed to load messages from %s", MESSAGES_FILE, exc_info=True)
+        pass
     return {}
 
 
@@ -277,7 +207,7 @@ def _save_messages():
                 existing[name] = msgs
         MESSAGES_FILE.write_text(json.dumps(existing))
     except Exception:
-        logger.debug("Failed to save messages to %s", MESSAGES_FILE, exc_info=True)
+        pass
 
 
 def _load_session_messages(session_name: str) -> list:
@@ -317,18 +247,6 @@ def get_tmux_sessions() -> list[dict]:
         return []
 
 
-def _find_session(session_name: str) -> tuple:
-    """Look up a tmux session by name.
-
-    Returns (sessions_list, session_dict) if found, or (sessions_list, None) if not.
-    """
-    sessions = get_tmux_sessions()
-    for s in sessions:
-        if s["name"] == session_name:
-            return sessions, s
-    return sessions, None
-
-
 def capture_pane_full(session_name: str) -> str:
     try:
         result = subprocess.run(
@@ -352,26 +270,20 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
 
 
 def get_pane_position(session_name: str) -> dict:
-    """Get current pane line-count metadata (cheap, no content capture).
-
-    Uses history_size + pane_height (not cursor_y) so the count only changes
-    when new content actually scrolls up, not when the cursor moves within
-    the visible area (status bar updates, etc.).  This prevents false deltas
-    that cause duplicate lines in the terminal view.
-    """
+    """Get current pane line-count metadata (cheap, no content capture)."""
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-t", session_name, "-p",
-             "#{history_size}:#{pane_height}"],
+             "#{history_size}:#{cursor_y}"],
             capture_output=True, text=True, timeout=3
         )
         if result.returncode == 0:
             parts = result.stdout.strip().split(":")
             history_size = int(parts[0])
-            pane_height = int(parts[1])
-            return {"total_lines": history_size + pane_height}
+            cursor_y = int(parts[1])
+            return {"total_lines": history_size + cursor_y + 1}
     except Exception:
-        logger.debug("Failed to get pane position for '%s'", session_name, exc_info=True)
+        pass
     return {"total_lines": 0}
 
 
@@ -388,30 +300,6 @@ _activity_state: Dict[str, dict] = {}
 # Require N consecutive idle readings before switching from busy → idle.
 # At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
 IDLE_CONFIRM_COUNT = 3
-
-# Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
-_SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
-_RE_COMPLETION = re.compile(
-    r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
-    r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
-)
-_RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
-_RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
-_RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
-_RE_THOUGHT = re.compile(r'\(thought for \d+')
-_RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
-_RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
-_RE_TIP_CLAUDE = re.compile(r'Tip:.*claude')
-_RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
-
-
-_AUTONOMOUS_KEYWORDS = [
-    "don't ask", "without asking", "bypass", "skip permission",
-    "autonomous", "all permissions", "proceed without",
-    "do everything", "yes to all", "approve all",
-    "don't confirm", "without confirm", "skip confirm",
-    "no further", "without further",
-]
 
 
 def _check_auto_approve(session_name: str, visible: str):
@@ -452,11 +340,18 @@ def _check_auto_approve(session_name: str, visible: str):
 
     if len(numbered_options) >= 2:
         # Find the option that means "do it all, don't ask again"
+        autonomous_keywords = [
+            "don't ask", "without asking", "bypass", "skip permission",
+            "autonomous", "all permissions", "proceed without",
+            "do everything", "yes to all", "approve all",
+            "don't confirm", "without confirm", "skip confirm",
+            "no further", "without further",
+        ]
         best_line = None
         best_score = -1
         for line_idx, (num, text) in numbered_options.items():
             lower = text.lower()
-            score = sum(1 for kw in _AUTONOMOUS_KEYWORDS if kw in lower)
+            score = sum(1 for kw in autonomous_keywords if kw in lower)
             # Also favor option 1 as tiebreaker (usually the most autonomous)
             if score > best_score or (score == best_score and best_line is not None
                                       and num < numbered_options.get(best_line, (999, ""))[0]):
@@ -479,7 +374,7 @@ def _check_auto_approve(session_name: str, visible: str):
                 )
                 _auto_approve_sent[session_name] = time.time()
             except Exception:
-                logger.debug("Auto-approve send failed for '%s'", session_name, exc_info=True)
+                pass
             return
 
     # --- Strategy 3: AskUserQuestion with labeled options (cursor-based) ---
@@ -496,7 +391,9 @@ def _check_auto_approve(session_name: str, visible: str):
             autonomous_target = None
             for idx, (line_i, text) in enumerate(option_lines):
                 lower = text.lower()
-                for kw in _AUTONOMOUS_KEYWORDS:
+                for kw in ["bypass", "don't ask", "autonomous", "skip permission",
+                           "all permissions", "yes to all", "approve all",
+                           "without asking", "proceed without"]:
                     if kw in lower:
                         autonomous_target = line_i
                         break
@@ -523,7 +420,7 @@ def _send_option(session_name: str, downs: int):
         )
         _auto_approve_sent[session_name] = time.time()
     except Exception:
-        logger.debug("Failed to send option keys to '%s'", session_name, exc_info=True)
+        pass
 
 
 def _detect_activity_raw(session_name: str) -> dict:
@@ -571,7 +468,13 @@ def _detect_activity_raw(session_name: str) -> dict:
         has_esc_to_interrupt = "esc to interrupt" in bottom_text
 
         # --- Step 2: Check for idle prompt indicators in bottom area ---
-        idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
+        idle_prompt_patterns = [
+            r'^[❯➜]\s*$',                         # bare prompt character alone on line
+            r'Tip:.*claude',                       # claude code tip = just finished
+            # Claude Code completion messages: "<verb> for <duration>"
+            # Use a broad pattern to catch all verb variations (Churned, Sautéed, etc.)
+            r'[A-Z][a-zé]+ for \d+[ms]',
+        ]
         # Lines containing these phrases override idle — session is still working
         busy_overrides = [
             "still running",
@@ -583,7 +486,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         for pattern in idle_prompt_patterns:
             for line in bottom:
                 stripped = line.strip()
-                if pattern.search(stripped):
+                if re.search(pattern, stripped):
                     # Check if the same line has a busy override
                     lower = stripped.lower()
                     if any(phrase in lower for phrase in busy_overrides):
@@ -600,31 +503,40 @@ def _detect_activity_raw(session_name: str) -> dict:
         # idle — the ❯ prompt is always visible even while Claude is
         # executing tools / thinking / streaming.
         window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
+        window_text = "\n".join(window)
 
         # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
         # where possible to avoid false positives from these patterns
         # appearing in conversation output text.
-        # (Regexes are pre-compiled at module level: _RE_COMPLETION, etc.)
+        SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
+        # Completion markers — these look like spinners but mean "finished":
+        # "● Done", "● Completed", "✻ Sautéed for 4m 47s", "✶ Churned for 2m", etc.
+        COMPLETION_RE = re.compile(
+            r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
+            r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
+        )
         for line in window:
             stripped = line.strip()
             # Skip completion markers — these look like spinners but mean "finished"
-            if _RE_COMPLETION.match(stripped):
+            if COMPLETION_RE.match(stripped):
                 continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
-            if _RE_RUNNING_TASK.match(stripped):
+            if re.match(r'^[⎿\s]*◼', stripped):
                 info["status"] = "busy"
                 info["detail"] = "Running task"
                 return info
             # Spinner icon + verb… at START of line
-            if _RE_SPINNER_START.match(stripped):
+            # Use … (ellipsis) or 2+ dots to avoid matching "Done." or other punctuation
+            if re.match(SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})', stripped):
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
                 else:
                     info["detail"] = "Working"
                 return info
-            # Spinner icon + verb… anywhere in line (catches inline spinners)
-            if _RE_SPINNER_INLINE.search(stripped):
+            # Spinner icon + verb… anywhere in line (catches inline spinners
+            # after streamed text, e.g. "...Let me create it. ✢ Ebbing… (thought for 8s)")
+            if re.search(SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$', stripped):
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
@@ -632,7 +544,7 @@ def _detect_activity_raw(session_name: str) -> dict:
                     info["detail"] = "Working"
                 return info
             # "(thought for Xs)" or "(thinking)" near end of line — strong busy signal
-            if _RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)'):
+            if re.search(r'\(thought for \d+', stripped) or stripped.endswith('(thinking)'):
                 info["status"] = "busy"
                 info["detail"] = "Thinking"
                 return info
@@ -665,7 +577,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
-            info["detail"] = ""
+            info["detail"] = "Waiting for input"
             return info
 
         # "esc to interrupt" without a spinner = background tasks running
@@ -680,14 +592,14 @@ def _detect_activity_raw(session_name: str) -> dict:
         # checks above may have missed it or the output just looks ambiguous.
         if content_is_static and cmd.lower() in ("claude", "node"):
             info["status"] = "idle"
-            info["detail"] = ""
+            info["detail"] = "Waiting for input"
             return info
 
         # --- Step 7: Shell prompt check ---
         last_line = bottom[-1].strip() if bottom else ""
         shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
         if cmd.lower() in shell_cmds:
-            if _RE_SHELL_PROMPT.search(last_line) or not last_line:
+            if re.search(r'[\$#%>]\s*$', last_line) or not last_line:
                 info["status"] = "idle"
                 info["detail"] = "Shell prompt"
             else:
@@ -696,12 +608,12 @@ def _detect_activity_raw(session_name: str) -> dict:
         elif cmd.lower() in ("claude", "node"):
             # Claude Code with no spinner + no "esc to interrupt" = idle
             info["status"] = "idle"
-            info["detail"] = ""
+            info["detail"] = "Waiting for input"
         else:
             info["status"] = "busy"
             info["detail"] = cmd
     except Exception:
-        logger.debug("Activity detection failed for session '%s'", session_name, exc_info=True)
+        pass
     return info
 
 
@@ -780,13 +692,7 @@ def detect_activity(session_name: str) -> dict:
     return raw
 
 
-async def async_detect_activity(session_name: str) -> dict:
-    """Non-blocking detect_activity — runs in thread pool to avoid blocking the event loop."""
-    return await asyncio.to_thread(detect_activity, session_name)
-
-
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
-    start = time.time()
     try:
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
@@ -797,13 +703,8 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200)
             max_tokens=max_tokens,
             temperature=0.3,
         )
-        duration = time.time() - start
-        tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
-        logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        duration = time.time() - start
-        logger.error("LLM call failed after %.1fs: %s", duration, e)
         return f"(error: {e})"
 
 
@@ -900,7 +801,7 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
     if messages:
         recent_msgs = messages[-30:]  # last 30 messages
         chat_lines = [f"[{m['role']}] {m['text']}" for m in recent_msgs]
-        chat_section = "\n\n=== CHAT HISTORY (user commands & uploads) ===\n" + "\n".join(chat_lines)
+        chat_section = f"\n\n=== CHAT HISTORY (user commands & uploads) ===\n" + "\n".join(chat_lines)
 
     prev_section = ""
     if existing_notes and existing_notes.strip():
@@ -932,54 +833,37 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
 
 
 async def get_realtime(session_name: str) -> str:
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 80)
-    activity = await async_detect_activity(session_name)
+    recent = capture_pane_recent(session_name, 80)
+    activity = detect_activity(session_name)
     status_hint = f"[Session is currently {activity['status'].upper()}"
     if activity["detail"]:
         status_hint += f" — {activity['detail']}"
     status_hint += "]"
-
-    # Include recent chat messages for context to avoid repetition
-    entry = cache.get(session_name, {})
-    messages = entry.get("messages", [])
-    msg_context = ""
-    if messages:
-        recent_msgs = messages[-10:]
-        msg_lines = []
-        for m in recent_msgs:
-            prefix = "USER" if m["role"] == "user" else "ASSISTANT"
-            msg_lines.append(f"[{prefix}] {m['text']}")
-        msg_context = "\n\n=== RECENT CHAT MESSAGES ===\n" + "\n".join(msg_lines)
-
     return await llm_call(
         system_prompt=(
-            "You summarize what happened in a terminal session SINCE the last user message. "
-            "Write 2-3 short sentences as a collaborative team update using 'we'.\n\n"
+            "You summarize the CURRENT STEP in a terminal session. Write 1-2 short sentences.\n\n"
+            "Write as a collaborative team update using 'we' — like a coworker reporting progress.\n\n"
             "RULES:\n"
             "- Use first-person plural: 'We updated...', 'We're running...', 'We fixed...'.\n"
             "- NEVER start with 'User asked' or 'User requested'.\n"
-            "- Focus on CONCRETE DETAILS: URLs, IPs, file paths modified, error messages, "
-            "credentials created, ports used, specific actions taken.\n"
             "- If BUSY: describe what's actively happening. Include progress % if visible.\n"
-            "- If IDLE: describe what was accomplished since the last user message.\n"
-            "- Include any errors or warnings that appeared.\n"
-            "- Do NOT repeat information already in previous ASSISTANT messages.\n"
-            "- Refer to the RECENT CHAT MESSAGES to understand context and avoid repetition.\n"
-            "- Under 60 words.\n\n"
-            "GOOD examples:\n"
-            "- 'We added the /api/users endpoint and deployed to rotem.cc:8510. "
-            "The migration created 3 new tables. Server restarted successfully.'\n"
-            "- 'We're running the scraper pipeline — 64% done. Found 2 rate-limit errors.'\n"
+            "- If IDLE: describe what was accomplished. Use past tense.\n"
+            "- Focus on the INTENT and RESULT — not shell commands or file paths.\n"
+            "- Don't mention bash, curl, sleep, grep, cat, git commands — describe the goal.\n"
+            "- Under 30 words.\n\n"
+            "GOOD examples (busy):\n"
+            "- 'Re-matching all URLs with the LLM pipeline — 64% done.'\n"
+            "- 'We're adding dark mode support, currently editing the CSS theme variables.'\n"
+            "GOOD examples (idle):\n"
+            "- 'We fixed the auth token validation and restarted the server.'\n"
+            "- 'Added a delete button with confirmation dialog and wired up the API endpoint.'\n"
             "BAD examples:\n"
-            "- 'We're working on the project.' (too vague)\n"
             "- 'User asked to fix the login bug.' (don't say 'user asked')\n"
-            "- 'Idle, waiting for input.' (what was just done?)"
+            "- 'Idle, waiting for input.' (too vague — what was just done?)\n"
+            "- 'A bash process is executing a curl request...' (mechanics, not intent)"
         ),
-        user_content=(
-            f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}"
-            f"{msg_context[:1500]}"
-        ),
-        max_tokens=200,
+        user_content=f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}",
+        max_tokens=100,
     )
 
 
@@ -1059,9 +943,8 @@ def _append_assistant_msg(entry: dict, text: str, ts: float):
     _save_messages()
 
 
-def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
-    if activity is None:
-        activity = detect_activity(sess["name"])
+def build_session_response(sess: dict, data: dict) -> dict:
+    activity = detect_activity(sess["name"])
     return {
         "name": sess["name"],
         "windows": sess["windows"],
@@ -1079,9 +962,6 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "activity_status": activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
-        "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-        "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-        "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
     }
 
 
@@ -1095,93 +975,58 @@ async def index():
 @app.get("/api/sessions")
 async def api_sessions():
     sessions = get_tmux_sessions()
-    results, activities = await asyncio.gather(
-        asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
-        asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
+    results = await asyncio.gather(
+        *[get_session_data(s["name"]) for s in sessions]
     )
     return JSONResponse([
-        build_session_response(sess, data, activity=act)
-        for sess, data, act in zip(sessions, results, activities)
+        build_session_response(sess, data)
+        for sess, data in zip(sessions, results)
     ])
-
-
-@app.get("/api/sessions-fast")
-async def api_sessions_fast():
-    """Return session list with cached data only — no LLM calls. Fast startup."""
-    sessions = get_tmux_sessions()
-    # Run activity detection for all sessions in parallel threads
-    activities = await asyncio.gather(
-        *(async_detect_activity(sess["name"]) for sess in sessions)
-    )
-    out = []
-    for sess, activity in zip(sessions, activities):
-        entry = cache.get(sess["name"], {})
-        if "messages" not in entry:
-            entry["messages"] = _load_session_messages(sess["name"])
-        if "notes" not in entry:
-            entry["notes"] = _load_session_notes(sess["name"])
-        cache[sess["name"]] = entry
-        out.append({
-            "name": sess["name"],
-            "windows": sess["windows"],
-            "attached": sess["attached"],
-            "title": entry.get("title", ""),
-            "description": entry.get("description", ""),
-            "description_at": entry.get("description_at", 0),
-            "progress": entry.get("progress", ""),
-            "progress_at": entry.get("progress_at", 0),
-            "notes": entry.get("notes", ""),
-            "notes_at": entry.get("notes_at", 0),
-            "realtime": entry.get("realtime", ""),
-            "realtime_at": entry.get("realtime_at", 0),
-            "messages": entry.get("messages", []),
-            "activity_status": activity["status"],
-            "activity_command": activity.get("command", ""),
-            "activity_detail": activity.get("detail", ""),
-            "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-            "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-            "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
-        })
-    return JSONResponse(out)
 
 
 @app.post("/api/sessions/{session_name}/refresh")
 async def api_refresh_session(session_name: str):
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
-    entry = await get_session_data(session_name)
-    activity = await async_detect_activity(session_name)
-    return JSONResponse(build_session_response(sess, entry, activity=activity))
+    now = time.time()
+    entry = cache.get(session_name, {})
+    if "messages" not in entry:
+        entry["messages"] = _load_session_messages(session_name)
+    entry["realtime"] = await get_realtime(session_name)
+    entry["realtime_at"] = now
+    _append_assistant_msg(entry, entry["realtime"], now)
+    cache[session_name] = entry
+
+    sess = next(s for s in sessions if s["name"] == session_name)
+    return JSONResponse(build_session_response(sess, entry))
 
 
 @app.post("/api/sessions/{session_name}/refresh-all")
 async def api_refresh_all_tiers(session_name: str):
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     entry = await get_session_data(session_name, force_all=True)
-    activity = await async_detect_activity(session_name)
-    return JSONResponse(build_session_response(sess, entry, activity=activity))
+    sess = next(s for s in sessions if s["name"] == session_name)
+    return JSONResponse(build_session_response(sess, entry))
 
 
 @app.get("/api/status")
 async def api_status():
     """Lightweight: return only activity status per session, no LLM calls."""
     sessions = get_tmux_sessions()
-    activities = await asyncio.gather(
-        *(async_detect_activity(sess["name"]) for sess in sessions)
-    )
     out = []
-    for sess, activity in zip(sessions, activities):
+    for sess in sessions:
+        activity = detect_activity(sess["name"])
         out.append({
             "name": sess["name"],
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
-            "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-            "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         })
     return JSONResponse(out)
 
@@ -1189,11 +1034,12 @@ async def api_status():
 @app.get("/api/sessions/{session_name}/raw")
 async def api_raw_output(session_name: str):
     """Return raw scrollback content for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    raw = await asyncio.to_thread(capture_pane_full, session_name)
-    activity = await async_detect_activity(session_name)
+    raw = capture_pane_full(session_name)
+    activity = detect_activity(session_name)
     return JSONResponse({
         "name": session_name,
         "raw": raw,
@@ -1207,16 +1053,17 @@ async def api_raw_output(session_name: str):
 @app.get("/api/sessions/{session_name}/raw-tail")
 async def api_raw_tail(session_name: str, known_lines: int = 0):
     """Return delta output since the client's last known line count."""
-    _, found = _find_session(session_name)
-    if not found:
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
-    pos = await asyncio.to_thread(get_pane_position, session_name)
+    pos = get_pane_position(session_name)
     current_total = pos["total_lines"]
 
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
-        raw = await asyncio.to_thread(capture_pane_full, session_name)
+        raw = capture_pane_full(session_name)
         return JSONResponse({
             "mode": "full",
             "raw": raw,
@@ -1235,7 +1082,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
     # Delta: capture only the new lines + small overlap for dedup
     overlap = 5
     lines_from_end = (current_total - known_lines) + overlap
-    raw = await asyncio.to_thread(capture_pane_recent, session_name, lines_from_end)
+    raw = capture_pane_recent(session_name, lines_from_end)
     return JSONResponse({
         "mode": "delta",
         "raw": raw,
@@ -1284,9 +1131,6 @@ async def api_create_session(body: CreateSession):
                 ["tmux", "send-keys", "-t", created, "Enter"],
                 capture_output=True, text=True, timeout=5
             )
-            _session_auth_mode[created] = "api"
-        else:
-            _session_auth_mode[created] = "subscription"
         # Optionally launch a command in the new session
         if NEW_SESSION_CMD:
             subprocess.run(
@@ -1297,18 +1141,17 @@ async def api_create_session(body: CreateSession):
                 ["tmux", "send-keys", "-t", created, "Enter"],
                 capture_output=True, text=True, timeout=5
             )
-        logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
     except Exception as e:
-        logger.error("Failed to create session '%s': %s", name, e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.delete("/api/sessions/{session_name}")
 async def api_delete_session(session_name: str):
     """Kill a tmux session and all its child processes."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         # First, find and kill all processes in the session's panes.
@@ -1333,7 +1176,7 @@ async def api_delete_session(session_name: str):
                             capture_output=True, text=True, timeout=3
                         )
                     except Exception:
-                        logger.debug("pkill -TERM failed for pid %s", pid_str, exc_info=True)
+                        pass
                 # Brief pause to let processes handle SIGTERM
                 await asyncio.sleep(0.5)
                 # Force-kill any remaining children
@@ -1347,9 +1190,9 @@ async def api_delete_session(session_name: str):
                             capture_output=True, text=True, timeout=3
                         )
                     except Exception:
-                        logger.debug("pkill -KILL failed for pid %s", pid_str, exc_info=True)
+                        pass
         except Exception:
-            logger.debug("Process cleanup failed for session '%s' — kill-session will still clean up", session_name, exc_info=True)
+            pass  # Non-fatal — tmux kill-session will still clean up
 
         result = subprocess.run(
             ["tmux", "kill-session", "-t", session_name],
@@ -1357,21 +1200,8 @@ async def api_delete_session(session_name: str):
         )
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
-        # Clean up all per-session state from global dicts
+        # Clean up cache
         cache.pop(session_name, None)
-        _auto_approve_sent.pop(session_name, None)
-        _pane_stability.pop(session_name, None)
-        _activity_state.pop(session_name, None)
-        _session_stats_cache.pop(session_name, None)
-        _auto_respond_cooldown.pop(session_name, None)
-        _session_auth_mode.pop(session_name, None)
-        _away_mode_state.pop(session_name, None)
-        # Cancel go-nuts worker if running
-        gn_state = _go_nuts_state.get(session_name, {})
-        if gn_state.get("task") and not gn_state["task"].done():
-            gn_state["task"].cancel()
-        _go_nuts_state.pop(session_name, None)
-        logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1387,15 +1217,16 @@ def get_session_cwd(session_name: str) -> str:
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except Exception:
-        logger.debug("Failed to get CWD for session '%s'", session_name, exc_info=True)
+        pass
     return ""
 
 
 @app.post("/api/sessions/{session_name}/upload")
 async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     """Upload a file to the session's current working directory."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     cwd = get_session_cwd(session_name)
@@ -1410,9 +1241,6 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     dest = os.path.join(cwd, filename)
     try:
         content = await file.read()
-        max_size = 50 * 1024 * 1024  # 50 MB
-        if len(content) > max_size:
-            return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
         with open(dest, "wb") as f:
             f.write(content)
         # Record in chat history
@@ -1434,8 +1262,9 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
 @app.get("/api/sessions/{session_name}/claude-md")
 async def api_get_claude_md(session_name: str):
     """Read CLAUDE.md from the session's working directory and home dir."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     cwd = get_session_cwd(session_name)
     results = []
@@ -1448,7 +1277,7 @@ async def api_get_claude_md(session_name: str):
                 with open(md_path) as f:
                     content = f.read()
             except Exception:
-                logger.debug("Failed to read CLAUDE.md at %s", md_path, exc_info=True)
+                pass
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
     # Check home dir
     home_md = os.path.join(str(Path.home()), "CLAUDE.md")
@@ -1458,7 +1287,7 @@ async def api_get_claude_md(session_name: str):
             with open(home_md) as f:
                 home_content = f.read()
         except Exception:
-            logger.debug("Failed to read global CLAUDE.md at %s", home_md, exc_info=True)
+            pass
     results.append({"path": home_md, "content": home_content, "exists": os.path.exists(home_md), "label": "Global"})
     return JSONResponse({"files": results, "cwd": cwd or ""})
 
@@ -1471,23 +1300,18 @@ class SaveClaudeMd(BaseModel):
 @app.post("/api/sessions/{session_name}/claude-md")
 async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
     """Save CLAUDE.md to the specified path."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    # Safety: only allow writing CLAUDE.md files within home directory
+    # Safety: only allow writing CLAUDE.md files
     if not body.path.endswith("CLAUDE.md"):
         return JSONResponse({"error": "Can only write CLAUDE.md files"}, status_code=400)
-    real_path = os.path.realpath(body.path)
-    home_dir = str(Path.home())
-    if not real_path.startswith(home_dir + "/") and real_path != home_dir:
-        return JSONResponse({"error": "Path must be within home directory"}, status_code=403)
-    if not real_path.endswith("/CLAUDE.md"):
-        return JSONResponse({"error": "Invalid path after resolution"}, status_code=400)
     try:
-        os.makedirs(os.path.dirname(real_path), exist_ok=True)
-        with open(real_path, "w") as f:
+        os.makedirs(os.path.dirname(body.path), exist_ok=True)
+        with open(body.path, "w") as f:
             f.write(body.content)
-        return JSONResponse({"ok": True, "path": real_path})
+        return JSONResponse({"ok": True, "path": body.path})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1565,30 +1389,13 @@ async def api_stats():
     return JSONResponse(stats)
 
 
-@app.get("/api/health")
-async def api_health():
-    """Lightweight health check — verifies tmux is accessible."""
-    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_API_KEY)}
-    try:
-        result = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=3
-        )
-        checks["tmux"] = result.returncode == 0 or "no server running" in result.stderr
-    except Exception:
-        checks["tmux"] = False
-    if not checks["tmux"]:
-        checks["status"] = "degraded"
-    return JSONResponse(checks)
-
-
 # --- Claude Code auth management ---
 
 @app.get("/api/auth/claude-status")
 async def api_claude_auth_status():
     result_data: dict = {"loggedIn": False, "hasApiKey": bool(_stored_anthropic_key)}
     try:
-        result = await asyncio.to_thread(subprocess.run,
+        result = subprocess.run(
             ["claude", "auth", "status", "--json"],
             capture_output=True, text=True, timeout=10,
         )
@@ -1648,6 +1455,7 @@ async def api_claude_usage():
     if now - _usage_cache["ts"] < 60:
         return JSONResponse(_usage_cache["data"])
 
+    from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     home = str(Path.home())
     patterns = [
@@ -1688,7 +1496,7 @@ async def api_claude_usage():
                     cache_create += usage.get("cache_creation_input_tokens", 0)
                     msg_count += 1
         except Exception:
-            logger.debug("Failed to parse usage JSONL for '%s'", fpath, exc_info=True)
+            pass
 
     data = {
         "date": today,
@@ -1704,240 +1512,16 @@ async def api_claude_usage():
     return JSONResponse(data)
 
 
-# --- Per-session token stats & rate tracking ---
-
-_session_stats_cache: Dict[str, dict] = {}
-
-
-def _find_session_jsonl_files(session_name: str) -> list:
-    """Find Claude Code JSONL files for a tmux session based on its working directory."""
-    cwd = get_session_cwd(session_name)
-    if not cwd:
-        return []
-    # Claude Code sanitizes paths: replaces all non-alphanumeric chars with hyphens
-    sanitized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-    projects_base = Path.home() / ".claude" / "projects"
-    # Try exact match first, then fallback to glob match
-    project_dir = str(projects_base / sanitized)
-    if not os.path.isdir(project_dir):
-        # Try with leading dash (common pattern)
-        alt = str(projects_base / ("-" + sanitized.lstrip("-")))
-        if os.path.isdir(alt):
-            project_dir = alt
-        else:
-            # Glob fallback: match any dir containing the last path component
-            last_part = cwd.rstrip("/").rsplit("/", 1)[-1]
-            candidates = globmod.glob(str(projects_base / f"*{last_part}*"))
-            if candidates:
-                project_dir = candidates[0]
-            else:
-                return []
-    files = globmod.glob(os.path.join(project_dir, "*.jsonl"))
-    files += globmod.glob(os.path.join(project_dir, "subagents", "*.jsonl"))
-    return files
-
-
-def _parse_session_stats(session_name: str) -> dict:
-    """Parse JSONL files and compute per-session token stats with rate tracking."""
-    now = time.time()
-    cached = _session_stats_cache.get(session_name)
-    if cached and now - cached.get("_ts", 0) < 15:
-        return cached
-
-    files = _find_session_jsonl_files(session_name)
-    if not files:
-        result = {"available": False, "_ts": now}
-        _session_stats_cache[session_name] = result
-        return result
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    now_epoch = now
-
-    # Collect all assistant messages with usage from today
-    entries = []  # (epoch_seconds, input_tok, output_tok, cache_read, cache_create, model)
-    total_input = 0
-    total_output = 0
-    total_cache_read = 0
-    total_cache_create = 0
-    msg_count = 0
-    models_seen = {}
-
-    for fpath in files:
-        try:
-            mtime = os.path.getmtime(fpath)
-            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
-                continue
-            with open(fpath) as f:
-                for line in f:
-                    d = json.loads(line)
-                    if d.get("type") != "assistant":
-                        continue
-                    ts_str = d.get("timestamp", "")
-                    if not ts_str.startswith(today):
-                        continue
-                    msg = d if "usage" in d else d.get("message", {})
-                    usage = msg.get("usage")
-                    if not usage:
-                        continue
-                    inp = usage.get("input_tokens", 0)
-                    out = usage.get("output_tokens", 0)
-                    cr = usage.get("cache_read_input_tokens", 0)
-                    cc = usage.get("cache_creation_input_tokens", 0)
-                    model = msg.get("model", d.get("message", {}).get("model", "unknown"))
-
-                    total_input += inp
-                    total_output += out
-                    total_cache_read += cr
-                    total_cache_create += cc
-                    msg_count += 1
-                    models_seen[model] = models_seen.get(model, 0) + 1
-
-                    # Parse timestamp to epoch for rate calc
-                    try:
-                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        epoch = dt.timestamp()
-                        entries.append((epoch, inp, out, cr, cc))
-                    except Exception:
-                        logger.debug("Failed to parse timestamp in stats JSONL entry", exc_info=True)
-        except Exception:
-            logger.debug("Failed to read stats JSONL for '%s'", session_name, exc_info=True)
-
-    if not entries:
-        result = {"available": False, "_ts": now}
-        _session_stats_cache[session_name] = result
-        return result
-
-    # Sort by timestamp
-    entries.sort(key=lambda e: e[0])
-
-    # Cost estimation (per 1M tokens)
-    # Detect primary model
-    primary_model = max(models_seen, key=models_seen.get) if models_seen else "unknown"
-    if "opus" in primary_model:
-        cost_input, cost_output = 15.0, 75.0
-        cost_cache_read, cost_cache_create = 1.5, 18.75
-    elif "haiku" in primary_model:
-        cost_input, cost_output = 1.0, 5.0
-        cost_cache_read, cost_cache_create = 0.1, 1.25
-    else:  # sonnet or unknown
-        cost_input, cost_output = 3.0, 15.0
-        cost_cache_read, cost_cache_create = 0.3, 3.75
-
-    estimated_cost = (
-        total_input * cost_input / 1_000_000
-        + total_output * cost_output / 1_000_000
-        + total_cache_read * cost_cache_read / 1_000_000
-        + total_cache_create * cost_cache_create / 1_000_000
-    )
-
-    # Rate calculation: bucket into 1-minute windows
-    # Only consider windows with meaningful output (> 10 output tokens = actually streaming)
-    buckets = {}  # minute_epoch -> {input, output, total}
-    for epoch, inp, out, cr, cc in entries:
-        minute = int(epoch // 60) * 60
-        b = buckets.setdefault(minute, {"input": 0, "output": 0, "total": 0})
-        b["input"] += inp
-        b["output"] += out
-        b["total"] += inp + out + cr + cc
-
-    # Active minutes: only windows with meaningful output (streaming, not just tool calls)
-    active_minutes = [m for m, b in buckets.items() if b["output"] > 10]
-    active_minutes.sort()
-
-    # Peak rate: median of top 5 windows (avoid outlier spikes)
-    output_rates = sorted([b["output"] for b in buckets.values() if b["output"] > 10], reverse=True)
-    peak_output_rate = 0
-    if output_rates:
-        top = output_rates[:5]
-        peak_output_rate = top[len(top) // 2]  # median of top 5
-
-    # Recent rate: last 3 active minutes within the past 10 minutes
-    recent_output_rate = 0
-    cutoff = now_epoch - 600  # 10 minutes ago
-    recent_active = [m for m in active_minutes if m >= cutoff]
-    if recent_active:
-        recent_mins = recent_active[-3:]
-        recent_output_rate = int(sum(buckets[m]["output"] for m in recent_mins) / len(recent_mins))
-
-    # Rate limit detection: only meaningful when session is currently busy
-    # and has recent activity (within last 5 minutes)
-    rate_status = "normal"
-    rate_pct = 100
-    activity = detect_activity(session_name)
-    is_busy = activity["status"] == "busy"
-    has_recent = recent_active and (now_epoch - recent_active[-1]) < 300
-
-    if peak_output_rate > 100 and recent_output_rate > 0 and has_recent:
-        rate_pct = min(100, int(recent_output_rate / peak_output_rate * 100))
-        if is_busy and rate_pct < 30:
-            rate_status = "severely_limited"
-        elif is_busy and rate_pct < 60:
-            rate_status = "limited"
-    elif not has_recent:
-        rate_pct = 0  # no recent data
-
-    # Time since last activity
-    last_active = entries[-1][0] if entries else 0
-    secs_since_last = int(now_epoch - last_active) if last_active else -1
-
-    # Session duration (first to last entry)
-    session_start = entries[0][0]
-    session_duration_min = int((entries[-1][0] - session_start) / 60) if len(entries) > 1 else 0
-
-    result = {
-        "available": True,
-        "model": primary_model,
-        "messageCount": msg_count,
-        "totalInput": total_input,
-        "totalOutput": total_output,
-        "cacheRead": total_cache_read,
-        "cacheCreate": total_cache_create,
-        "totalTokens": total_input + total_output + total_cache_read + total_cache_create,
-        "estimatedCost": round(estimated_cost, 4),
-        "peakOutputRate": peak_output_rate,  # tokens/min
-        "peakTotalRate": peak_output_rate,
-        "recentOutputRate": recent_output_rate,
-        "recentTotalRate": recent_output_rate,
-        "rateStatus": rate_status,  # normal | limited | severely_limited
-        "ratePct": rate_pct,
-        "activeMinutes": len(active_minutes),
-        "sessionDurationMin": session_duration_min,
-        "secsSinceLastActivity": secs_since_last,
-        "modelsUsed": models_seen,
-        "_ts": now,
-    }
-    _session_stats_cache[session_name] = result
-    return result
-
-
-@app.get("/api/sessions/{session_name}/stats")
-async def api_session_stats(session_name: str):
-    """Per-session token usage, cost, and rate limit detection."""
-    stats = await asyncio.to_thread(_parse_session_stats, session_name)
-    return JSONResponse(stats)
-
-
 class SendCommand(BaseModel):
     command: str
-
-class SendKeys(BaseModel):
-    keys: list  # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"]
-
-class AuthModeBody(BaseModel):
-    mode: str  # "api" or "subscription"
-
-class AwayModeBody(BaseModel):
-    enabled: bool
-
-class GoNutsModeBody(BaseModel):
-    enabled: bool
 
 
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions = get_tmux_sessions()
+    names = [s["name"] for s in sessions]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         cmd_text = body.command
@@ -1948,11 +1532,11 @@ async def api_send_command(session_name: str, body: SendCommand):
                 tmp.write(cmd_text)
                 tmp_path = tmp.name
             try:
-                await asyncio.to_thread(subprocess.run,
+                subprocess.run(
                     ["tmux", "load-buffer", tmp_path],
                     capture_output=True, text=True, timeout=5
                 )
-                await asyncio.to_thread(subprocess.run,
+                subprocess.run(
                     ["tmux", "paste-buffer", "-t", session_name],
                     capture_output=True, text=True, timeout=5
                 )
@@ -1960,12 +1544,12 @@ async def api_send_command(session_name: str, body: SendCommand):
                 os.unlink(tmp_path)
         else:
             # Short messages: send-keys -l is fine
-            await asyncio.to_thread(subprocess.run,
+            subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
         # Then press Enter as a separate key event
-        await asyncio.to_thread(subprocess.run,
+        subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5
         )
@@ -1987,1669 +1571,18 @@ async def api_send_command(session_name: str, body: SendCommand):
 @app.post("/api/sessions/{session_name}/interrupt")
 async def api_interrupt_session(session_name: str):
     """Send Escape key to interrupt a running Claude Code session."""
-    _, sess = _find_session(session_name)
-    if not sess:
+    sessions_list = get_tmux_sessions()
+    names = [s["name"] for s in sessions_list]
+    if session_name not in names:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
-        await asyncio.to_thread(subprocess.run,
+        subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "Escape"],
             capture_output=True, text=True, timeout=5
         )
         return JSONResponse({"ok": True, "action": "interrupt"})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# Allowed tmux key names to prevent injection
-ALLOWED_TMUX_KEYS = {
-    "Escape", "Enter", "Space", "Tab", "BSpace",
-    "Up", "Down", "Left", "Right",
-    "C-c", "C-d", "C-z", "C-l", "C-a", "C-e",
-    "PageUp", "PageDown", "Home", "End",
-}
-
-@app.post("/api/sessions/{session_name}/send-keys")
-async def api_send_keys(session_name: str, body: SendKeys):
-    """Send raw key sequences to a tmux session (Escape, C-c, Enter, q, etc.).
-
-    Unlike /send, this does NOT wrap text in -l (literal) mode and does NOT
-    auto-append Enter. Use this for terminal control keys.
-    """
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        for key in body.keys:
-            # Allow single printable characters (q, y, n, etc.) and known tmux key names
-            if key in ALLOWED_TMUX_KEYS or (len(key) == 1 and key.isprintable()):
-                await asyncio.to_thread(subprocess.run,
-                    ["tmux", "send-keys", "-t", session_name, key],
-                    capture_output=True, text=True, timeout=5
-                )
-            else:
-                return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
-        return JSONResponse({"ok": True, "keys_sent": body.keys})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-class BracketedPasteBody(BaseModel):
-    enabled: bool
-
-@app.post("/api/sessions/{session_name}/bracketed-paste")
-async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody):
-    """Toggle bracketed paste mode for a tmux session.
-    Sends the ANSI escape sequence to enable/disable bracketed paste in the terminal.
-    """
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        if body.enabled:
-            # \e[?2004h — enable bracketed paste
-            hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "68"]
-        else:
-            # \e[?2004l — disable bracketed paste
-            hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "6c"]
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H"] + hex_seq,
-            capture_output=True, text=True, timeout=5,
-        )
-        return JSONResponse({"ok": True, "bracketed_paste": body.enabled})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.post("/api/sessions/{session_name}/set-auth-mode")
-async def api_set_auth_mode(session_name: str, body: AuthModeBody):
-    """Toggle between API key and subscription auth for a specific session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        if body.mode == "api":
-            key = _stored_anthropic_key
-            if not key:
-                # Fallback: try to extract from ~/CLAUDE.md
-                try:
-                    claude_md = (Path.home() / "CLAUDE.md").read_text()
-                    for line in claude_md.splitlines():
-                        line = line.strip()
-                        if line.startswith("sk-ant-"):
-                            key = line.split()[0].rstrip(",;")
-                            break
-                        elif "sk-ant-" in line:
-                            m = re.search(r'(sk-ant-\S+)', line)
-                            if m:
-                                key = m.group(1).rstrip(",;")
-                                break
-                except Exception:
-                    logger.debug("Failed to scan credentials file for API key", exc_info=True)
-            if not key:
-                return JSONResponse({"error": "No API key found"}, status_code=400)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 f"export ANTHROPIC_API_KEY={key}"],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        elif body.mode == "subscription":
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 "unset ANTHROPIC_API_KEY"],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        else:
-            return JSONResponse({"error": "Invalid mode"}, status_code=400)
-        _session_auth_mode[session_name] = body.mode
-        return JSONResponse({"ok": True, "mode": body.mode, "session": session_name})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# --- Auto-responder for Claude Code interactive prompts ---
-# Automatically detects when Claude Code is waiting for user input
-# (plan approval, questions, permission prompts) and sends Enter
-# to select the default/first option — keeps sessions unblocked.
-
-_auto_respond_cooldown: Dict[str, float] = {}
-_AUTO_RESPOND_INTERVAL = 3      # seconds between checks
-_AUTO_RESPOND_COOLDOWN = 10     # min seconds between auto-responds per session
-_auto_respond_log: list = []    # recent auto-respond events (for debugging)
-
-
-def _detect_interactive_prompt(visible_text: str) -> str | None:
-    """Check if visible terminal shows a Claude Code interactive prompt.
-
-    Returns a description of the detected prompt, or None.
-    """
-    lines = visible_text.strip().split("\n")
-    last_25 = lines[-25:]
-    text = "\n".join(last_25)
-
-    # Must have the ❯ selection cursor
-    if "\u276f" not in text and "❯" not in text:
-        return None
-
-    # Count lines that look like numbered options: "  1. text" or "❯ 1. text"
-    numbered = 0
-    has_selector_on_option = False
-    for line in last_25:
-        stripped = line.strip()
-        if re.match(r"^[❯\u276f\s]*\d+\.\s", stripped):
-            numbered += 1
-        if re.match(r"^❯\s*\d+\.", stripped) or re.match(r"^\u276f\s*\d+\.", stripped):
-            has_selector_on_option = True
-
-    # Strong signal: specific Claude Code prompt keywords
-    strong_keywords = [
-        "bypass permissions",
-        "manually approve edits",
-        "shift+tab to approve",
-        "Would you like to proceed",
-        "Tell Claude what to change",
-        "approve with this feedback",
-    ]
-    has_strong = any(kw in text for kw in strong_keywords)
-
-    # Plan approval or known prompt pattern
-    if has_strong and numbered >= 2:
-        return "plan_approval"
-
-    # Generic Claude Code selection prompt: ❯ on a numbered option + 2+ options
-    if has_selector_on_option and numbered >= 2:
-        return "selection_prompt"
-
-    return None
-
-
-async def _auto_responder_loop():
-    """Background loop that auto-responds to Claude Code interactive prompts."""
-    log = logging.getLogger("auto-responder")
-    await asyncio.sleep(5)  # initial delay after startup
-    while True:
-        try:
-            await asyncio.sleep(_AUTO_RESPOND_INTERVAL)
-            sessions_list = get_tmux_sessions()
-            now = time.time()
-            for sess in sessions_list:
-                name = sess["name"]
-                # Check cooldown
-                last = _auto_respond_cooldown.get(name, 0)
-                if now - last < _AUTO_RESPOND_COOLDOWN:
-                    continue
-                # Capture visible pane (not history — just what's on screen)
-                try:
-                    result = await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "capture-pane", "-t", name, "-p"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    if result.returncode != 0 or not result.stdout.strip():
-                        continue
-                except Exception:
-                    continue
-
-                prompt_type = _detect_interactive_prompt(result.stdout)
-                if prompt_type:
-                    # Send Enter to accept the highlighted (first) option
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "send-keys", "-t", name, "Enter"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    _auto_respond_cooldown[name] = now
-                    event = {"session": name, "type": prompt_type, "ts": now}
-                    _auto_respond_log.append(event)
-                    # Keep log bounded
-                    if len(_auto_respond_log) > 50:
-                        _auto_respond_log.pop(0)
-                    log.info(f"Auto-responded to {prompt_type} in session '{name}'")
-        except Exception:
-            logger.debug("Auto-responder loop iteration failed", exc_info=True)
-
-
-_background_tasks: list = []
-
-
-@app.on_event("startup")
-async def _start_auto_responder():
-    # Increase thread pool for asyncio.to_thread() — prevents blocking when
-    # multiple background tasks + API requests run subprocess calls concurrently.
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=20))
-    logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
-                PORT, ROOT_PATH,
-                "enabled" if AUTH_PASS else "disabled",
-                "configured" if OPENAI_API_KEY else "missing")
-    if not AUTH_PASS:
-        logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
-                       "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
-    if not os.environ.get("TMUX_DASH_SECRET"):
-        logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
-                       "Set a persistent secret for stable sessions.")
-    sessions = get_tmux_sessions()
-    logger.info("Found %d existing tmux sessions", len(sessions))
-    task = asyncio.create_task(_auto_responder_loop())
-    _background_tasks.append(task)
-    logger.info("Auto-responder background task started")
-    watchdog_task = asyncio.create_task(_watchdog_loop())
-    _background_tasks.append(watchdog_task)
-    logger.info("Autonomous mode watchdog started")
-
-    # Restore persistent autonomous mode state from disk
-    saved = _load_autonomous_state()
-    if saved:
-        session_names = {s["name"] for s in sessions}
-        for name, modes in saved.items():
-            if name not in session_names:
-                logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
-                continue
-            if modes.get("away_mode"):
-                logger.info("Restoring Away Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _away_mode_state[name] = state
-                _away_log(state, "Away mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "away"))
-                state["task"] = t
-            elif modes.get("go_nuts_mode"):
-                logger.info("Restoring Go Nuts Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous Build (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _go_nuts_state[name] = state
-                _go_nuts_log(state, "Go Nuts mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
-                state["task"] = t
-
-
-@app.on_event("shutdown")
-async def _shutdown():
-    logger.info("tmux Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
-    # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
-    _save_autonomous_state()
-    logger.info("Autonomous mode state saved to disk for restore on next startup")
-    for task in _background_tasks:
-        if not task.done():
-            task.cancel()
-    # Cancel any running away-mode workers
-    for name, state in _away_mode_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled away-mode worker for '%s'", name)
-    # Cancel any running go-nuts-mode workers
-    for name, state in _go_nuts_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled go-nuts-mode worker for '%s'", name)
-    logger.info("Shutdown complete")
-
-
-@app.get("/api/auto-respond-log")
-async def api_auto_respond_log():
-    """Recent auto-respond events for debugging."""
-    return JSONResponse(_auto_respond_log[-20:])
-
-
-# --- Autonomous Mode Watchdog ---
-# Monitors all active away-mode and go-nuts-mode sessions.
-# Detects stalls (no terminal change for too long) and unsticks them.
-
-_watchdog_snapshots: Dict[str, dict] = {}
-# Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
-
-_WATCHDOG_INTERVAL = 30         # Check every 30 seconds
-_STALL_THRESHOLD = 600          # 10 minutes of identical terminal = stalled
-_NUDGE_COOLDOWN = 180           # Wait 3 minutes between nudge attempts
-_MAX_NUDGES_BEFORE_RESTART = 3  # After 3 failed nudges, hard-restart the mode
-
-_NUDGE_PROMPT = """You appear to be idle or stuck. The user is not present — you are in autonomous mode.
-
-If you just finished a task: pick the next one and start working. Check your skill files and backlog.
-If you're waiting for something: cancel the wait (Ctrl+C if needed) and move to a different task.
-If you encountered an error: log it, revert if needed, and continue with the next item.
-
-Do NOT say "standing by" or ask for instructions. Take action NOW."""
-
-_UNSTICK_PROMPT_AWAY = """You are in Away Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Check git log to see what you've already done
-2. Check /tmp/away-mode-*.md for your previous notes and audit findings
-3. Pick the next most valuable skill to execute
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Take action immediately."""
-
-_UNSTICK_PROMPT_GONUTS = """You are in Go Nuts Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Check git log to see what you've already built
-2. Check /tmp/go-nuts-*.md for your product profile and feature backlog
-3. Pick the next feature to build or generate new ideas
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Build something NOW."""
-
-
-async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
-    """Restore an autonomous mode after server restart: wait for session, send prompt, launch loop."""
-    rlog = logging.getLogger("restore")
-    rlog.info(f"Restoring {mode} mode for '{session_name}' — waiting 15s for tmux to stabilize")
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    try:
-        # Give tmux and Claude Code a moment to settle after server restart
-        await asyncio.sleep(15)
-
-        if not state.get("enabled"):
-            return
-
-        # Check the session still exists
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            log_fn(state, "Session not found during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
-        # Wait for session to be idle before sending prompt (max 10 min)
-        if activity.get("status") == "busy":
-            log_fn(state, "Session is busy — waiting for it to finish current task")
-            await _away_wait_for_idle(session_name, timeout=600)
-
-        if not state.get("enabled"):
-            return
-
-        # Send the appropriate unstick/resume prompt
-        skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-        unstick_prompt = (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-        log_fn(state, "Sending resume prompt to session")
-        await _away_send_prompt(session_name, unstick_prompt)
-        await asyncio.sleep(2)
-
-        # Now enter the continuous monitoring loop
-        if mode == "away":
-            await _away_mode_continuous_loop(session_name)
-        else:
-            await _go_nuts_continuous_loop(session_name)
-
-    except asyncio.CancelledError:
-        log_fn(state, f"{mode} restore cancelled")
-        state["enabled"] = False
-        _save_autonomous_state()
-        raise
-    except Exception as e:
-        log_fn(state, f"{mode} restore error: {e}")
-        rlog.error(f"Restore {mode} for '{session_name}' failed: {e}")
-        # Don't set enabled=False — watchdog zombie detection will restart us
-    finally:
-        state["task"] = None
-
-
-async def _watchdog_loop():
-    """Background watchdog: detects stalled autonomous sessions and unsticks them."""
-    wlog = logging.getLogger("watchdog")
-    wlog.info("Autonomous mode watchdog started")
-    while True:
-        try:
-            await asyncio.sleep(_WATCHDOG_INTERVAL)
-            # Collect all active autonomous sessions
-            active_sessions: list[tuple[str, dict, str]] = []  # (name, state, mode)
-            for name, state in _away_mode_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "away"))
-            for name, state in _go_nuts_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "gonuts"))
-
-            if not active_sessions:
-                if _watchdog_snapshots:
-                    _watchdog_snapshots.clear()
-                continue
-
-            for session_name, state, mode in active_sessions:
-                try:
-                    await _watchdog_check_session(session_name, state, mode, wlog)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
-
-            # Also check for zombie states: enabled=True but task is dead
-            for name, state in list(_away_mode_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Away mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "away", wlog)
-            for name, state in list(_go_nuts_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Go Nuts mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "gonuts", wlog)
-
-        except asyncio.CancelledError:
-            wlog.info("Watchdog cancelled")
-            raise
-        except Exception as e:
-            wlog.error(f"Watchdog loop error: {e}")
-            await asyncio.sleep(60)
-
-
-async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
-    """Check a single session for stalls."""
-    import hashlib
-    now = time.time()
-
-    # Capture recent terminal content (non-blocking)
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
-    if not recent.strip():
-        return  # Empty pane, can't assess
-
-    content_hash = hashlib.md5(recent.encode()).hexdigest()
-    snap = _watchdog_snapshots.get(session_name)
-
-    if snap is None or snap["content_hash"] != content_hash:
-        # Terminal content changed — session is making progress
-        _watchdog_snapshots[session_name] = {
-            "content_hash": content_hash,
-            "first_seen": now,
-            "nudge_count": 0,
-            "last_nudge": 0,
-        }
-        return
-
-    # Terminal content is UNCHANGED since last check
-    stall_duration = now - snap["first_seen"]
-
-    if stall_duration < _STALL_THRESHOLD:
-        return  # Not stalled yet — could be processing
-
-    # Terminal has been identical for >10 minutes. Check if there's a good reason.
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # First stall detection — use LLM to check if it's a legitimate long operation
-    if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
-        wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
-        try:
-            assessment = await llm_call(
-                system_prompt=(
-                    "You are monitoring an autonomous AI coding session. The terminal output has not changed "
-                    "for over 10 minutes. Assess whether this is:\n"
-                    "1. LEGITIMATE: downloading large files, compiling a big project, running extensive tests, "
-                    "waiting for a deployment, or any operation that genuinely takes >10 minutes\n"
-                    "2. STUCK: the agent said 'standing by', asked a question, hit an error and stopped, "
-                    "is waiting for user input, or simply finished and didn't continue\n\n"
-                    "Reply with ONLY one word: LEGITIMATE or STUCK"
-                ),
-                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
-                max_tokens=10,
-            )
-            assessment = assessment.strip().upper()
-        except Exception:
-            assessment = "STUCK"  # If we can't assess, assume stuck
-
-        if "LEGITIMATE" in assessment:
-            wlog.info(f"Session '{session_name}' stall assessed as LEGITIMATE — skipping for now")
-            log_fn(state, f"Watchdog: stall detected ({stall_duration:.0f}s) but appears legitimate — waiting")
-            # Push out the first_seen so we re-check in another 10 minutes
-            snap["first_seen"] = now - _STALL_THRESHOLD + 300  # Re-check in 5 min
-            return
-
-        wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
-
-    # Session is stuck. Try nudging.
-    if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
-        return  # Wait for cooldown between nudges
-
-    if snap["nudge_count"] < _MAX_NUDGES_BEFORE_RESTART:
-        # Gentle nudge: send continuation prompt
-        snap["nudge_count"] += 1
-        snap["last_nudge"] = now
-        log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
-        wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
-
-        # If session appears to be waiting for input or truly idle, just send the nudge
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            activity = {"status": "unknown"}
-
-        if activity["status"] == "busy":
-            # Session claims busy but terminal hasn't changed — might be truly stuck
-            # Send Ctrl+C first to break out of whatever it's doing
-            log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(5)
-
-        await _away_send_prompt(session_name, _NUDGE_PROMPT)
-        return
-
-    # Nudges exhausted — hard restart
-    log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
-    wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
-    await _watchdog_restart_mode(session_name, state, mode, wlog)
-    # Reset snapshot
-    _watchdog_snapshots.pop(session_name, None)
-
-
-async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
-    """Gracefully restart an autonomous mode session, preserving history."""
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # 1. Cancel existing task
-    old_task = state.get("task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-
-    # 2. Send Ctrl+C to break any stuck process in the terminal
-    try:
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(3)
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-    # 3. Preserve the log history, reset state for fresh loop
-    old_log = state.get("log", [])
-    old_started = state.get("started_at", time.time())
-    old_step = state.get("step", 0)
-
-    log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
-
-    # 4. Re-initialize state
-    state.update({
-        "enabled": True,
-        "phase": 4,
-        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
-        "step": old_step,
-        "step_name": "Watchdog restart",
-        "started_at": old_started,  # Keep original start time
-        "log": old_log,  # Keep full log history
-        "task": None,
-    })
-
-    # 5. Send an unstick prompt directly instead of re-running initial phases
-    skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-    unstick_prompt = (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-
-    await _away_send_prompt(session_name, unstick_prompt)
-    await asyncio.sleep(2)
-
-    # 6. Launch fresh worker that skips to continuous loop
-    if mode == "away":
-        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
-        state["task"] = task
-    else:
-        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
-        state["task"] = task
-
-    wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
-
-
-async def _away_mode_continuous_loop(session_name: str):
-    """Standalone continuous loop for away mode (used by watchdog restart)."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    try:
-        # Wait for the unstick prompt to be processed
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        _away_log(state, "Away mode (restarted) cancelled")
-        state["enabled"] = False
-        _save_autonomous_state()
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode (restarted) error: {e}")
-        log.error(f"Away mode restarted loop error for '{session_name}': {e}")
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-async def _go_nuts_continuous_loop(session_name: str):
-    """Standalone continuous loop for go-nuts mode (used by watchdog restart)."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    try:
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
-        state["enabled"] = False
-        _save_autonomous_state()
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
-        log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-# --- Away Mode ---
-# Autonomous mode: sends structured prompts to a Claude Code session,
-# waits for idle, captures output, summarizes, advances to next phase.
-
-def _away_log(state: dict, action: str):
-    """Append a log entry to the away-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > 200:
-        state["log"] = state["log"][-200:]
-
-
-def _away_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of away-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _away_send_prompt(session_name: str, prompt: str):
-    """Send a long prompt to a Claude Code session via tmux paste-buffer.
-
-    Two-phase approach to defeat the bracketed paste "[Pasted text +N lines]" hang:
-    Phase 1: Write prompt to a temp file, then send a short shell-pipe command that
-             reads the file and feeds it to the Claude Code prompt via xdotool-style
-             keyboard simulation. This avoids bracketed paste entirely.
-    Phase 2 (fallback): If Phase 1 fails or Claude Code is truly at its ❯ prompt
-             (not a shell), use paste-buffer with aggressive Enter retries.
-    """
-    log = logging.getLogger("away-mode")
-    prompt_text = prompt.rstrip("\n\r ")  # Strip trailing whitespace/newlines
-    prompt_file = None
-    try:
-        fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
-        os.close(fd)
-        Path(prompt_file).write_text(prompt_text)
-
-        # Capture terminal state before paste to detect changes later
-        pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-
-        # --- Strategy: Disable bracketed paste, then paste raw ---
-        # Send \e[?2004l escape sequence directly to the terminal to disable
-        # bracketed paste mode. tmux send-keys -H sends raw hex bytes.
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H",
-             "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.sleep(0.2)
-
-        # Load file into tmux buffer and paste
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "load-buffer", prompt_file],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "paste-buffer", "-t", session_name],
-            capture_output=True, text=True, timeout=10,
-        )
-
-        # Scale wait time with prompt size
-        wait_secs = max(2.0, min(8.0, len(prompt_text) / 1500))
-        await asyncio.sleep(wait_secs)
-
-        # Send Enter to submit
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
-        log.info(f"Sent prompt to '{session_name}' ({len(prompt_text)} chars, waited {wait_secs:.1f}s)")
-
-        # Note: we do NOT re-enable bracketed paste (\e[?2004h) here.
-        # Bracketed paste causes "[Pasted text +N lines]" previews that hang.
-        # Users can toggle it back on from the Keys bar if they want it.
-
-        # --- Verify submission with retries ---
-        for attempt in range(3):
-            await asyncio.sleep(3)
-            try:
-                activity = await async_detect_activity(session_name)
-            except Exception:
-                activity = {"status": "unknown"}
-
-            if activity["status"] == "busy":
-                log.info(f"Session '{session_name}' is busy — prompt accepted")
-                return  # Success — session started processing
-
-            # Check if terminal output changed (even if still "idle" per detection)
-            post_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-            if post_snapshot != pre_snapshot:
-                log.info(f"Session '{session_name}' terminal changed — prompt likely accepted")
-                return  # Terminal content changed, prompt was received
-
-            # Still showing the same content — try Enter again
-            log.warning(f"Session '{session_name}' still idle after paste (attempt {attempt+1}/3) — retrying Enter")
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5,
-            )
-
-        # All Enter retries failed. Check if there's a bracketed paste preview stuck.
-        recent = await asyncio.to_thread(capture_pane_recent, session_name, 10)
-        if "Pasted text" in recent or "pasted" in recent.lower():
-            # Bracketed paste preview is stuck — Escape to cancel it, then re-send
-            log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
-            await asyncio.sleep(0.5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(1)
-            # Re-send the prompt, this time relying on bracketed paste disabled earlier
-            await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "paste-buffer", "-t", session_name], capture_output=True, text=True, timeout=10)
-            await asyncio.sleep(wait_secs)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Enter"], capture_output=True, text=True, timeout=5)
-            log.info(f"Re-sent prompt to '{session_name}' after clearing stuck paste")
-
-    except Exception as e:
-        log.error(f"Failed to send prompt to '{session_name}': {e}")
-    finally:
-        if prompt_file:
-            try:
-                os.unlink(prompt_file)
-            except (OSError, UnboundLocalError):
-                pass
-
-
-async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
-    """Wait for a session to become busy then return to idle. Returns True on success."""
-    log = logging.getLogger("away-mode")
-
-    # Phase A: wait for session to become busy (max 30s)
-    start = time.time()
-    became_busy = False
-    while time.time() - start < 30:
-        await asyncio.sleep(2)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "busy":
-            became_busy = True
-            break
-
-    if not became_busy:
-        log.warning(f"Session '{session_name}' never became busy, proceeding anyway")
-
-    # Phase B: wait for session to return to idle (up to timeout)
-    idle_count = 0
-    while time.time() - start < timeout:
-        await asyncio.sleep(5)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "idle":
-            idle_count += 1
-            if idle_count >= 2:  # 2 consecutive idle readings = confirmed idle
-                return True
-        else:
-            idle_count = 0
-
-    log.warning(f"Session '{session_name}' timed out after {timeout}s")
-    return False
-
-
-async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
-                               step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _away_log(state, f"Sending: {step_name}")
-
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _away_log(state, f"Timeout on: {step_name}")
-        # Send Ctrl+C to unstick if needed
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    # Capture output and summarize
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: files created/modified, tests run, errors, "
-                "branches created, findings. Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Away mode step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _away_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Phase implementations ---
-# Skills are installed at ~/.claude/away-mode-skills/XX-name/SKILL.md
-_SKILLS_DIR = str(Path.home() / ".claude" / "away-mode-skills")
-
-_PHASE1_PROMPT = f"""I'm putting you in Away Mode. You are autonomous — the user is not present. Every action must be safe, verifiable, and revertible. You cannot ask questions — make decisions and document reasoning.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Study the Project
-
-1. Read the project root directory structure
-2. Examine root config files (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, docker-compose.yml, .env.example, etc.)
-3. Examine source directories (src/, app/, lib/, components/, routes/, api/)
-4. Check test directories (test/, tests/, __tests__/, spec/, e2e/)
-5. Check git history: recent commits, active areas of development
-6. Create a project profile at /tmp/away-mode-profile.md covering:
-   - Project name, type, primary languages, frameworks
-   - Architecture: frontend, backend, database, external services
-   - Current state: can it build? tests? linting?
-   - Development patterns, known issues from TODOs
-7. Establish baseline:
-   - Record git status and recent commits
-   - Create safety branch: git checkout -b away-mode/session-$(date +%Y%m%d-%H%M%S)
-   - Run existing tests if available, record results
-   - Run linter if configured, record results
-
-CRITICAL: Never commit to main/master. Work on the away-mode branch.
-CRITICAL: If tests fail at baseline, note which tests fail — do NOT introduce NEW failures.
-
-When done with this phase, immediately continue to the next task without waiting."""
-
-_PHASE2_PROMPT = f"""PHASE 2: Select Applicable Skills
-
-Review the project profile you created. The following skills are available on disk. For each, read its SKILL.md to understand its scope, then decide if it applies to THIS project.
-
-Available skills (read the SKILL.md inside each directory):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing (ALWAYS applicable)
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage (ALWAYS applicable)
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring (ALWAYS applicable)
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
- 8. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
- 9. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing (if web app)
-10. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed (if web app/API)
-11. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
-12. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards (if public web pages)
-13. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility (if UI exists)
-14. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish (if UI)
-15. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-16. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-17. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements (if UI)
-18. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-
-For each skill, read the SKILL.md, then decide: applicable? priority? risk level?
-
-Write selection to /tmp/away-mode-skills-selected.md with selected skills in priority order.
-
-When done, immediately continue to executing skills — do not wait."""
-
-_PHASE3_ROUND1_PROMPT = f"""PHASE 3, ROUND 1: Observe and Audit (NO code changes)
-
-Read these skill files and execute their AUDIT tasks. Do NOT modify code — observe and report only.
-
-1. Read {_SKILLS_DIR}/05-security/SKILL.md — execute all security scan tasks
-2. Read {_SKILLS_DIR}/06-content-integrity/SKILL.md — execute content integrity checks
-3. Read {_SKILLS_DIR}/21-codebase-audit/SKILL.md — execute codebase audit tasks
-
-For EVERY finding, log it in /tmp/away-mode-audit.md with:
-- Category | Severity (critical/high/medium/low) | Description | File:Line
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND2_PROMPT = f"""PHASE 3, ROUND 2: Safe Mechanical Fixes
-
-Read these skill files and execute their FIX tasks — only safe, deterministic changes:
-
-1. Read {_SKILLS_DIR}/07-dependencies/SKILL.md — apply patch updates (semver-safe only)
-2. Read {_SKILLS_DIR}/22-config-hardening/SKILL.md — tighten configs, fix .gitignore
-3. Read {_SKILLS_DIR}/23-git-hygiene/SKILL.md — clean up git state
-
-EXECUTION WRAPPER for every change:
-1. Record current git SHA
-2. Make ONE logical change
-3. Run full test suite + build
-4. ALL GREEN → commit: [away-mode][category] description
-5. ANY RED → git checkout . to fully revert
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND3_PROMPT = f"""PHASE 3, ROUND 3: Test-Gated Improvements
-
-Read these skill files and execute their tasks:
-
-1. Read {_SKILLS_DIR}/08-testing/SKILL.md — generate tests for untested code (HIGHEST PRIORITY)
-2. Read {_SKILLS_DIR}/09-code-quality/SKILL.md — refactor, remove dead code, simplify
-3. Read {_SKILLS_DIR}/10-error-handling/SKILL.md — fix empty catches, add error handlers
-
-EXECUTION WRAPPER: one commit per change, test after each, revert on failure.
-
-When done, immediately continue to the next task."""
-
-async def _away_phase_study(session_name: str, state: dict):
-    """Phase 1: Study the project."""
-    state["phase"] = 1
-    state["phase_name"] = "Study Project"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 1: Study the Project")
-    await _away_send_and_wait(session_name, _PHASE1_PROMPT, state,
-                               "Study project structure & establish baseline", timeout=600)
-
-
-async def _away_phase_select(session_name: str, state: dict):
-    """Phase 2: Select applicable skills."""
-    state["phase"] = 2
-    state["phase_name"] = "Select Skills"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 2: Select Applicable Skills")
-    await _away_send_and_wait(session_name, _PHASE2_PROMPT, state,
-                               "Evaluate and select skills", timeout=300)
-
-
-async def _away_phase_execute(session_name: str, state: dict):
-    """Phase 3: Execute skills in rounds."""
-    state["phase"] = 3
-    state["phase_name"] = "Execute Skills"
-    state["step"] = 1
-
-    rounds = [
-        ("Round 1: Audit (read-only)", _PHASE3_ROUND1_PROMPT, 600),
-        ("Round 2: Safe fixes", _PHASE3_ROUND2_PROMPT, 900),
-        ("Round 3: Test-gated improvements", _PHASE3_ROUND3_PROMPT, 900),
-    ]
-
-    for round_name, prompt, timeout in rounds:
-        if not state.get("enabled"):
-            return
-        _away_log(state, f"Starting {round_name}")
-        await _away_send_and_wait(session_name, prompt, state, round_name, timeout=timeout)
-        # Brief pause between rounds
-        await asyncio.sleep(5)
-
-
-_AWAY_PING_PROMPT = f"""You are in Away Mode. The user is not present. You are autonomous.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do. Choose a skill you haven't fully completed yet, or revisit one that could be improved.
-
-STEP 1: Pick a skill from the list below.
-STEP 2: Read the SKILL.md file for that skill — it contains detailed tasks and instructions.
-STEP 3: Execute the tasks described in the SKILL.md.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing & Hardening
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed
- 8. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
- 9. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
-10. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
-11. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish
-12. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-13. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-14. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements
-15. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-16. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing
-17. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards
-18. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-21. {_SKILLS_DIR}/24-cost-optimization/SKILL.md — Cost Optimization
-22. {_SKILLS_DIR}/25-migration-readiness/SKILL.md — Migration Readiness
-23. {_SKILLS_DIR}/26-email-notifications/SKILL.md — Email & Notifications
-24. {_SKILLS_DIR}/27-mobile-pwa/SKILL.md — Mobile & PWA
-25. {_SKILLS_DIR}/28-asset-pipeline/SKILL.md — Asset Pipeline
-26. {_SKILLS_DIR}/29-developer-tooling/SKILL.md — Developer Tooling
-27. {_SKILLS_DIR}/30-disaster-recovery/SKILL.md — Disaster Recovery
-
-Rules:
-- Work on the away-mode branch (create one if not already on it)
-- Never commit to main/master
-- One logical change per commit: [away-mode][category] description
-- Run tests after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Take concrete action — don't just plan or summarize
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _away_mode_worker(session_name: str):
-    """Main away-mode coroutine. Runs initial phases then loops forever, pinging when idle."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    log.info(f"Away mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _away_phase_study(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Away mode phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_select(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Away mode phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_execute(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Away mode phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                # Wait for confirmed idle: 90 seconds of consecutive idle readings
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break  # Confirmed idle for 90s
-                    else:
-                        idle_since = None  # Reset — session is busy
-
-                if not state.get("enabled"):
-                    return
-
-                # Session has been idle for 90s — send ping prompt
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle for 90s — sending task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _away_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        _away_log(state, "Away mode cancelled by user")
-        log.info(f"Away mode cancelled for '{session_name}'")
-        state["enabled"] = False
-        _save_autonomous_state()
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode fatal error: {e}")
-        log.error(f"Away mode fatal error for '{session_name}': {e}")
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Away mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
-    """Toggle away mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Check if already running for this session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
-
-        # Initialize and launch
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _away_mode_state[session_name] = state
-        _away_log(state, "Away mode enabled")
-        task = asyncio.create_task(_away_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-    else:
-        # Disable
-        state = _away_mode_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _away_log(state, "Away mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_status(session_name: str):
-    """Get current away-mode state for a session."""
-    state = _away_mode_state.get(session_name, {})
-    return JSONResponse(_away_state_summary(state))
-
-
-# --- Go Nuts Mode ---
-# Autonomous feature-building mode: discovers the project, generates a feature backlog,
-# then continuously builds features, tests, and improves the project in a loop.
-
-_GO_NUTS_SKILLS_DIR = str(Path.home() / ".claude" / "go-nuts-mode-skills")
-
-def _go_nuts_log(state: dict, action: str):
-    """Append a log entry to the go-nuts-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > 200:
-        state["log"] = state["log"][-200:]
-
-
-def _go_nuts_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of go-nuts-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
-                                  step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _go_nuts_log(state, f"Sending: {step_name}")
-
-    # Reuse the same send/wait infrastructure as away mode
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _go_nuts_log(state, f"Timeout on: {step_name}")
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: features built, files created/modified, tests run, errors. "
-                "Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Go Nuts step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _go_nuts_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Go Nuts Phase Prompts ---
-
-_GN_PHASE1_PROMPT = f"""I'm putting you in Go Nuts Mode. You are autonomous — the user is not present. Your job is to BUILD FEATURES and IMPROVE this project as aggressively as possible.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_GO_NUTS_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Discover the Project
-
-Read {_GO_NUTS_SKILLS_DIR}/01-project-discovery/SKILL.md and execute ALL tasks described in it.
-
-Key objectives:
-1. Map every route, endpoint, model, dependency, and feature
-2. Understand the product vision — who uses this, what does "done" look like?
-3. Assess maturity level (skeleton/prototype/MVP/early product/established)
-4. Map constraints — what can and can't we build?
-5. Write the product profile to /tmp/go-nuts-product-profile.md
-
-Then immediately read {_GO_NUTS_SKILLS_DIR}/02-product-gap-analysis/SKILL.md and execute it:
-1. Compare what exists vs what users of this product type expect
-2. Identify every missing feature and gap
-3. Write the gap analysis to /tmp/go-nuts-gap-analysis.md
-
-CRITICAL: Create a working branch: git checkout -b go-nuts/session-$(date +%Y%m%d-%H%M%S)
-CRITICAL: Never commit to main/master. All work on the go-nuts branch.
-CRITICAL: After EVERY feature you build, run tests + build to verify nothing broke.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE2_PROMPT = f"""PHASE 2: Generate Feature Backlog
-
-Read {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md and execute ALL tasks:
-1. Use the brainstorming frameworks (What If, Adjacent Feature, Delight, Productization)
-2. Research competitors if possible (use web search)
-3. Score each feature on Impact/Feasibility/Independence/Novelty
-4. Write the prioritized backlog to /tmp/go-nuts-feature-backlog.md
-
-Then pick the TOP 3 highest-priority features from the backlog and start building them.
-
-For EACH feature:
-1. Create a git checkpoint (read {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md)
-2. Build the complete feature — not a stub, not a placeholder, the REAL thing
-3. Match existing code style, design language, and patterns
-4. Handle all states: loading, empty, error, populated
-5. Run tests + build after completion
-6. If tests pass → commit: [go-nuts][feature] description
-7. If tests fail → revert and move to next feature
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE3_PROMPT = f"""PHASE 3: Build Features (Batch)
-
-Continue building features from the backlog at /tmp/go-nuts-feature-backlog.md.
-
-For each feature, use the relevant skill file:
-- UI/pages → Read {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md
-- API/backend → Read {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md
-- Auth/users → Read {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md
-- Navigation → Read {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md
-- Data/state → Read {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md
-- Search → Read {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md
-- Notifications → Read {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md
-- Settings → Read {_GO_NUTS_SKILLS_DIR}/11-settings-preferences/SKILL.md
-- Content pages → Read {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md
-- Dashboard → Read {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md
-- Import/Export → Read {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md
-
-EXECUTION WRAPPER for every feature:
-1. Checkpoint (git stash or note SHA)
-2. Build the COMPLETE feature
-3. Run tests + build
-4. ALL GREEN → commit: [go-nuts][feature] description
-5. ANY RED → full revert, log why it failed, move on
-
-Build as many features as you can. Prioritize high-impact, high-feasibility items.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PING_PROMPT = f"""You are in Go Nuts Mode. The user is not present. You are autonomous. Your mission: BUILD FEATURES and IMPROVE the project.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do.
-
-STEP 1: Check your backlog at /tmp/go-nuts-feature-backlog.md — any features left to build?
-STEP 2: If backlog is empty or low, generate new ideas using {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md
-STEP 3: Pick a skill and execute it.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md — Build UI Pages & Components
- 2. {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md — Build API & Backend Features
- 3. {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md — Auth & User System
- 4. {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md — Navigation & Routing
- 5. {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md — Data & State Management
- 6. {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md — Search & Filtering
- 7. {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md — Notifications & Realtime
- 8. {_GO_NUTS_SKILLS_DIR}/11-settings-preferences/SKILL.md — Settings & Preferences
- 9. {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md — Content Pages
-10. {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md — Dashboard & Analytics
-11. {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md — Import & Export
-12. {_GO_NUTS_SKILLS_DIR}/15-social-collaboration/SKILL.md — Social & Collaboration
-13. {_GO_NUTS_SKILLS_DIR}/16-onboarding-empty-states/SKILL.md — Onboarding & Empty States
-14. {_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md — QA & Stability Audit
-15. {_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md — Security Sweep
-16. {_GO_NUTS_SKILLS_DIR}/19-web-research/SKILL.md — Web Research & Inspiration
-17. {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md — Feature Ideation & Brainstorming
-18. {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md — Backup & Checkpoint Manager
-
-Rules:
-- Work on the go-nuts branch (create one if not already on it)
-- Never commit to main/master
-- One feature per commit: [go-nuts][feature] description
-- Run tests + build after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Build COMPLETE features, not stubs or placeholders
-- Every 5th cycle, run QA audit ({_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md) and security sweep ({_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md)
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _go_nuts_phase_discover(session_name: str, state: dict):
-    """Phase 1: Discover the project and analyze gaps."""
-    state["phase"] = 1
-    state["phase_name"] = "Discover Project"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 1: Project Discovery & Gap Analysis")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE1_PROMPT, state,
-                                  "Discover project & analyze gaps", timeout=600)
-
-
-async def _go_nuts_phase_backlog(session_name: str, state: dict):
-    """Phase 2: Generate feature backlog and start building."""
-    state["phase"] = 2
-    state["phase_name"] = "Feature Backlog"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 2: Generate Feature Backlog & Build Top Features")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE2_PROMPT, state,
-                                  "Generate backlog & build top features", timeout=900)
-
-
-async def _go_nuts_phase_build(session_name: str, state: dict):
-    """Phase 3: Build features from backlog."""
-    state["phase"] = 3
-    state["phase_name"] = "Build Features"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 3: Build Features Batch")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE3_PROMPT, state,
-                                  "Build features from backlog", timeout=900)
-
-
-async def _go_nuts_mode_worker(session_name: str):
-    """Main go-nuts-mode coroutine. Runs discovery phases then loops forever, building features."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    log.info(f"Go Nuts mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _go_nuts_phase_discover(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Go Nuts phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_backlog(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Go Nuts phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_build(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Go Nuts phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next feature task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous Build"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle for 90s — sending build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _go_nuts_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        _go_nuts_log(state, "Go Nuts mode cancelled by user")
-        log.info(f"Go Nuts mode cancelled for '{session_name}'")
-        state["enabled"] = False
-        _save_autonomous_state()
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
-        log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Go Nuts mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
-    """Toggle go-nuts mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Don't allow both away mode and go-nuts mode at the same time on same session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Away Mode is active on this session. Disable it first."}, status_code=409)
-
-        if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_go_nuts_state_summary(_go_nuts_state[session_name]))
-
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _go_nuts_state[session_name] = state
-        _go_nuts_log(state, "Go Nuts mode enabled")
-        task = asyncio.create_task(_go_nuts_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-    else:
-        state = _go_nuts_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _go_nuts_log(state, "Go Nuts mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_status(session_name: str):
-    """Get current go-nuts-mode state for a session."""
-    state = _go_nuts_state.get(session_name, {})
-    return JSONResponse(_go_nuts_state_summary(state))
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -3745,46 +1678,32 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
+.cmd-upload{border:none;border-left:1px solid #30363d;border-radius:0 6px 6px 0;padding:12px 14px;font-size:1.1rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-upload:hover{color:#58a6ff}
+.cmd-expand{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 10px;font-size:.85rem;cursor:pointer;background:#21262d;color:#8b949e;align-self:flex-end;line-height:1;transition:color .15s}
+.cmd-expand:hover{color:#58a6ff}
+.cmd-slash{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 12px;font-size:.85rem;cursor:pointer;background:#21262d;color:#d2a8ff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.cmd-slash:hover{background:#1c2128;color:#f0f6fc}
+.cmd-interrupt{display:none;border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;font-size:.8rem;cursor:pointer;background:#da3633;color:#fff;align-self:flex-end;line-height:1;transition:all .15s;font-weight:600;letter-spacing:.03em;white-space:nowrap}
+.cmd-interrupt:hover{background:#f85149}
+.cmd-interrupt.visible{display:block}
+/* Slash commands dropdown */
+.slash-dropdown{display:none;position:absolute;bottom:100%;right:0;z-index:50;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:6px 0;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,.5);margin-bottom:4px}
+.slash-dropdown.active{display:block}
+.slash-item{display:flex;align-items:center;gap:10px;padding:8px 14px;cursor:pointer;transition:background .1s;font-size:.85rem;color:#c9d1d9}
+.slash-item:hover{background:#1c2128}
+.slash-item-cmd{color:#d2a8ff;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:600;min-width:80px}
+.slash-item-desc{color:#8b949e;font-size:.75rem}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
-.btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
-.btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
-.btn-stop.visible{display:inline-block}
-.chat-controls{display:flex;justify-content:flex-end;margin-bottom:4px;min-height:0}
 .raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
 .raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto;scroll-behavior:smooth}
+.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
 .raw-output::-webkit-scrollbar{width:6px;height:6px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
-.raw-resize-handle{width:100%;height:8px;cursor:ns-resize;background:transparent;display:flex;align-items:center;justify-content:center;user-select:none;flex-shrink:0}
-.raw-resize-handle:hover{background:#21262d}
-.raw-resize-handle::after{content:'';width:40px;height:3px;border-radius:2px;background:#30363d}
-.raw-resize-handle:hover::after{background:#484f58}
-
-/* Terminal key bar */
-.key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
-.key-bar.expanded{display:flex}
-.key-bar-toggle{display:flex;align-items:center;justify-content:center;gap:4px;margin-top:6px;padding:4px 10px;font-size:.68rem;color:#8b949e;background:#161b22;border:1px solid #21262d;border-radius:6px;cursor:pointer;user-select:none;transition:all .15s;width:100%}
-.key-bar-toggle:hover{background:#1c2128;color:#c9d1d9;border-color:#30363d}
-.key-bar-toggle.open{border-radius:6px 6px 0 0;border-bottom:none}
-.key-bar-toggle .chevron{transition:transform .2s;display:inline-block;font-size:.6rem}
-.key-bar-toggle.open .chevron{transform:rotate(180deg)}
-.key-bar-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;margin-right:4px;user-select:none;white-space:nowrap}
-.key-btn{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:500;color:#c9d1d9;background:#21262d;border:1px solid #30363d;border-radius:4px;cursor:pointer;transition:all .15s;user-select:none;white-space:nowrap;line-height:1.3}
-.key-btn:hover{background:#30363d;color:#f0f6fc;border-color:#484f58}
-.key-btn:active{background:#484f58;transform:scale(.95)}
-.key-btn.key-esc{color:#f0883e;border-color:#f0883e55}
-.key-btn.key-esc:hover{background:#f0883e22;color:#ffb366}
-.key-btn.key-ctrlc{color:#f85149;border-color:#f8514955}
-.key-btn.key-ctrlc:hover{background:#f8514922;color:#ff7b73}
-.key-btn.key-slash{color:#d2a8ff;border-color:#d2a8ff44;font-size:.68rem}
-.key-btn.key-slash:hover{background:#d2a8ff22;color:#f0f6fc;border-color:#d2a8ff88}
-.key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
-.key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
-.key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -3802,50 +1721,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tier-notes .tier-text{white-space:pre-wrap;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;max-height:300px;overflow-y:auto}
 .tier-text{color:#b1bac4;line-height:1.6;font-size:1.05rem}
 .tier-text.loading{color:#6e7681;font-style:italic}
-
-/* Stats panel */
-.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;margin-top:8px}
-.stat-item{display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:.85rem}
-.stat-label{color:#8b949e}
-.stat-value{color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-weight:500}
-.stat-value.cost{color:#3fb950}
-.rate-bar{display:flex;align-items:center;gap:8px;margin-top:8px}
-.rate-bar-track{flex:1;height:6px;background:#21262d;border-radius:3px;overflow:hidden}
-.rate-bar-fill{height:100%;border-radius:3px;transition:width .5s ease}
-.rate-bar-fill.normal{background:#3fb950}
-.rate-bar-fill.limited{background:#d29922}
-.rate-bar-fill.severely_limited{background:#f85149}
-.rate-label{font-size:.75rem;color:#8b949e;min-width:60px;text-align:right}
-.rate-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
-.rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
-.rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
-.rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
-.stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
-.stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
-
-/* Away mode toggle */
-.away-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.away-toggle input{opacity:0;width:0;height:0}
-.away-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.away-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.away-toggle input:checked+.away-toggle-slider{background:#238636}
-.away-toggle input:checked+.away-toggle-slider:before{transform:translateX(20px);background:#fff}
-.away-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
-.away-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.away-log-entry .away-ts{color:#58a6ff}
-.nav-away{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#3d1f6d;color:#d2a8ff}
-
-/* Go Nuts mode toggle */
-.gonuts-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.gonuts-toggle input{opacity:0;width:0;height:0}
-.gonuts-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.gonuts-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.gonuts-toggle input:checked+.gonuts-toggle-slider{background:#da3633}
-.gonuts-toggle input:checked+.gonuts-toggle-slider:before{transform:translateX(20px);background:#fff}
-.gonuts-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
-.gonuts-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.gonuts-log-entry .gonuts-ts{color:#f0883e}
-.nav-gonuts{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#6e2a0a;color:#f0883e}
 
 /* Footer */
 .detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
@@ -3966,7 +1841,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   .detail-badges{flex-wrap:wrap}
   .chat-msg{max-width:92%}
   .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
-  .raw-output{max-height:50vh}
   .modal{min-width:280px;margin:0 16px}
 }
 </style></head>
@@ -4094,11 +1968,10 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
+      <span class="nav-title" id="nav-title-${s.name}">${esc(s.title)||'Loading...'}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
-        ${s.away_mode?'<span class="nav-away">AW</span>':''}
-        ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
     brand.after(item);
   });
@@ -4119,7 +1992,7 @@ function renderDetail(){
   saveDrafts();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
-  const tab=activeTabs[s.name]||'raw';
+  const tab=activeTabs[s.name]||'chat';
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -4128,8 +2001,8 @@ function renderDetail(){
 
   mainEl.innerHTML=`
     <div class="tab-bar">
-      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
       <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
+      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Raw Output</div>
       <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
       <div class="detail-badges">
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
@@ -4144,9 +2017,6 @@ function renderDetail(){
 
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
-        <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-        </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
@@ -4159,21 +2029,23 @@ function renderDetail(){
             oninput="autoGrow(this)"
             autocomplete="off" spellcheck="false"></textarea>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+          <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-chat-${s.name}')" title="Slash commands">/</button>
+          <button class="cmd-expand" onclick="toggleExpand('cmd-chat-${s.name}')" title="Expand/collapse">&#x2195;</button>
+          <button class="cmd-upload" onclick="document.getElementById('upload-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+          <div class="slash-dropdown" id="slash-chat-${s.name}"></div>
         </div>
-        ${buildKeyBar(s.name,'chat')}
       </div>
     </div>
 
     <div class="tab-content tab-raw ${tab==='raw'?'active':''}" id="tab-raw-${s.name}">
       <div class="raw-controls">
-        <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
+        <span class="raw-info" id="raw-info-${s.name}">Click to load raw output</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
-      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
+      <div class="raw-output" id="raw-${s.name}">Click "Raw Output" tab or "Reload" to fetch...</div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
@@ -4182,9 +2054,13 @@ function renderDetail(){
           oninput="autoGrow(this)"
           autocomplete="off" spellcheck="false"></textarea>
         <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
+        <button class="cmd-interrupt ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="cmd-slash" onclick="toggleSlashMenu(event,'slash-raw-${s.name}')" title="Slash commands">/</button>
+        <button class="cmd-expand" onclick="toggleExpand('cmd-raw-${s.name}')" title="Expand/collapse">&#x2195;</button>
+        <button class="cmd-upload" onclick="document.getElementById('upload-raw-${s.name}').click()" title="Upload file">&#x1F4CE;</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+        <div class="slash-dropdown" id="slash-raw-${s.name}"></div>
       </div>
-      ${buildKeyBar(s.name,'raw')}
     </div>
 
     <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
@@ -4199,54 +2075,6 @@ function renderDetail(){
       <div class="tier tier-notes">
         <div class="tier-label"><span class="dot"></span>Key Info</div>
         <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
-      </div>
-      <div class="tier" style="margin-top:12px">
-        <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="subscription"
-              onchange="setAuthMode('${s.name}','subscription')"
-              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
-            Subscription
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="api"
-              onchange="setAuthMode('${s.name}','api')"
-              ${s.auth_mode==='api'?'checked':''}>
-            API Key
-          </label>
-          <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
-        </div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
-        <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="away-toggle">
-            <input type="checkbox" id="away-toggle-${s.name}"
-              onchange="toggleAwayMode('${esc(s.name)}',this.checked)"
-              ${s.away_mode?'checked':''}>
-            <span class="away-toggle-slider"></span>
-          </label>
-          <span id="away-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.away_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="away-log" id="away-log-${s.name}"></div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="gonuts-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Go Nuts Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="gonuts-toggle">
-            <input type="checkbox" id="gonuts-toggle-${s.name}"
-              onchange="toggleGoNutsMode('${esc(s.name)}',this.checked)"
-              ${s.go_nuts_mode?'checked':''}>
-            <span class="gonuts-toggle-slider"></span>
-          </label>
-          <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
       </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
@@ -4269,13 +2097,7 @@ function renderDetail(){
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
   // Start/stop raw polling based on active tab
   stopAllRawPolling();
-  stopStatsPolling();
-  if(tab==='raw'){
-    const rawEl=document.getElementById('raw-'+s.name);
-    if(rawEl&&rawEl.textContent.startsWith('Loading'))loadRaw(s.name);
-    startRawPolling(s.name);
-  }
-  if(tab==='info')startStatsPolling(s.name);
+  if(tab==='raw')startRawPolling(s.name);
 }
 
 function selectSession(name){
@@ -4293,7 +2115,7 @@ function switchTab(name,tab){
   allTabs.forEach(t=>t.classList.remove('active'));
   const tabBar=mainEl.querySelector('.tab-bar');
   if(tabBar)tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  const tabNames=['raw','chat','info'];
+  const tabNames=['chat','raw','info'];
   const idx=tabNames.indexOf(tab);
   if(tabBar&&idx>=0){
     const tabs=tabBar.querySelectorAll('.tab');
@@ -4302,18 +2124,7 @@ function switchTab(name,tab){
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
   stopAllRawPolling();
-  stopStatsPolling();
-  stopAllAwayPolling();
-  stopAllGoNutsPolling();
   if(tab==='raw')startRawPolling(name);
-  if(tab==='info'){
-    startStatsPolling(name);
-    const s=sessions.find(x=>x.name===name);
-    if(s&&s.away_mode)startAwayPolling(name);
-    else loadAwayStatus(name);
-    if(s&&s.go_nuts_mode)startGoNutsPolling(name);
-    else loadGoNutsStatus(name);
-  }
   if(tab==='chat'){
     // Re-render chat bubbles to pick up messages added while on other tabs
     const chatEl=document.getElementById('chat-'+name);
@@ -4388,6 +2199,18 @@ function autoGrow(el){
   if(el.classList.contains('expanded'))return;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,400)+'px';
+}
+function toggleExpand(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  if(el.classList.contains('expanded')){
+    el.classList.remove('expanded');
+    el.style.height='auto';
+    el.style.height=Math.min(el.scrollHeight,400)+'px';
+  }else{
+    el.classList.add('expanded');
+    el.style.height='300px';
+  }
 }
 function handleChatKey(e,name){
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
@@ -4540,7 +2363,7 @@ function startRawPolling(name){
   if(st.polling)return;
   st.polling=true;
   pollRawDelta(name);
-  st.timer=setInterval(()=>pollRawDelta(name),1000);
+  st.timer=setInterval(()=>pollRawDelta(name),2000);
 }
 function stopRawPolling(name){
   const st=getRawState(name);
@@ -4562,32 +2385,23 @@ async function pollRawDelta(name){
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      rawEl.style.scrollBehavior='auto';
       rawEl.scrollTop=rawEl.scrollHeight;
-      rawEl.style.scrollBehavior='';
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
       const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
       const newLines=data.raw.split('\n');
       const curText=rawEl.textContent;
       const existingLines=curText.split('\n');
-      // Deduplicate using overlap — compare last N existing lines with first N new lines
+      // Deduplicate using overlap
       let appendFrom=0;
-      let overlapMatched=false;
       if(data.overlap&&existingLines.length>=data.overlap){
         const tail=existingLines.slice(-data.overlap).join('\n');
         const head=newLines.slice(0,data.overlap).join('\n');
-        if(tail===head){appendFrom=data.overlap;overlapMatched=true}
+        if(tail===head)appendFrom=data.overlap;
       }
-      if(overlapMatched){
-        // Overlap matched — safe to append only new content
-        const toAppend=newLines.slice(appendFrom).join('\n');
-        if(toAppend){
-          rawEl.textContent=curText+'\n'+toAppend;
-        }
-      }else{
-        // Overlap did NOT match — content diverged, do a full replace to avoid duplication
-        rawEl.textContent=data.raw;
+      const toAppend=newLines.slice(appendFrom).join('\n');
+      if(toAppend){
+        rawEl.textContent=curText+'\n'+toAppend;
       }
       st.knownLines=data.pane_total;
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
@@ -4618,6 +2432,9 @@ function updateStatusPill(name,status,detail){
 }
 
 function updateCard(s){
+  const navTitle=document.getElementById('nav-title-'+s.name);
+  if(navTitle&&s.title)navTitle.textContent=s.title;
+
   // Sync messages from server response
   if(s.messages&&s.messages.length){
     const local=chatMessages[s.name]||[];
@@ -4667,8 +2484,7 @@ function updateCard(s){
 
 async function loadAll(){
   try{
-    // Phase 1: Fast load — cached data + activity status, no LLM calls
-    const resp=await fetch(BASE+'/api/sessions-fast');
+    const resp=await fetch(BASE+'/api/sessions');
     sessions=await resp.json();
     sessions.forEach(s=>{
       lastStatus[s.name]=s.activity_status;
@@ -4679,19 +2495,10 @@ async function loadAll(){
     renderDetail();
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
-  // Phase 2: Background LLM refresh for each session
-  lazyRefreshAll();
 }
 
-async function lazyRefreshAll(){
-  await Promise.all(sessions.map(async s=>{
-    try{
-      const resp=await fetch(BASE+'/api/sessions/'+s.name+'/refresh',{method:'POST'});
-      const data=await resp.json();
-      const idx=sessions.findIndex(x=>x.name===s.name);
-      if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
-    }catch(e){}
-  }));
+async function refreshAllRealtime(){
+  for(const s of sessions){refreshOne(s.name)}
 }
 
 async function refreshOne(name){
@@ -4745,14 +2552,6 @@ async function pollStatus(){
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update away_mode and go_nuts_mode badges in nav
-      const si=sessions.findIndex(s=>s.name===st.name);
-      if(si>=0){
-        let navChanged=false;
-        if(sessions[si].away_mode!==st.away_mode){sessions[si].away_mode=st.away_mode;navChanged=true;}
-        if(sessions[si].go_nuts_mode!==st.go_nuts_mode){sessions[si].go_nuts_mode=st.go_nuts_mode;navChanged=true;}
-        if(navChanged)renderNav();
-      }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
@@ -4989,6 +2788,12 @@ document.addEventListener('click',function(e){
   if(dd.classList.contains('active')&&!dd.contains(e.target)&&!trigger.contains(e.target)){
     dd.classList.remove('active');
   }
+  // Close any open slash dropdowns
+  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
+    if(!sd.contains(e.target)&&!e.target.classList.contains('cmd-slash')){
+      sd.classList.remove('active');
+    }
+  });
 });
 
 // ── Interrupt Session ──
@@ -5017,336 +2822,46 @@ function toggleInterruptButtons(name,show){
   });
 }
 
-// ── Terminal Resize ──
-let _resizing=null;
-function getTerminalHeight(){
-  const saved=localStorage.getItem('terminalHeight');
-  return saved?'max-height:'+saved+'px':'';
-}
-function startResize(e,name){
-  e.preventDefault();
-  const rawEl=document.getElementById('raw-'+name);
-  if(!rawEl)return;
-  _resizing={el:rawEl,startY:e.clientY,startH:rawEl.offsetHeight};
-  document.addEventListener('mousemove',doResize);
-  document.addEventListener('mouseup',stopResize);
-  document.body.style.cursor='ns-resize';
-  document.body.style.userSelect='none';
-}
-function doResize(e){
-  if(!_resizing)return;
-  const delta=e.clientY-_resizing.startY;
-  const newH=Math.max(120,Math.min(window.innerHeight-200,_resizing.startH+delta));
-  _resizing.el.style.maxHeight=newH+'px';
-}
-function stopResize(){
-  if(!_resizing)return;
-  const finalH=parseInt(_resizing.el.style.maxHeight);
-  if(finalH)localStorage.setItem('terminalHeight',String(finalH));
-  _resizing=null;
-  document.removeEventListener('mousemove',doResize);
-  document.removeEventListener('mouseup',stopResize);
-  document.body.style.cursor='';
-  document.body.style.userSelect='';
-}
+// ── Slash Commands ──
+const SLASH_COMMANDS=[
+  {cmd:'/clear',desc:'Wipe conversation, start fresh'},
+  {cmd:'/compact',desc:'Summarize older context to save tokens'},
+  {cmd:'/context',desc:'Show context window usage'},
+  {cmd:'/cost',desc:'Show current session cost'},
+  {cmd:'/usage',desc:'Check rate limit status'},
+  {cmd:'/model sonnet',desc:'Switch to Sonnet (faster)'},
+  {cmd:'/model opus',desc:'Switch to Opus (stronger)'},
+  {cmd:'/plan',desc:'Toggle plan mode for complex tasks'},
+];
 
-// ── Send Raw Keys ──
-async function sendRawKeys(name,keys){
-  try{
-    await fetch(BASE+'/api/sessions/'+name+'/send-keys',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({keys:keys})
+function toggleSlashMenu(event,dropdownId){
+  event.stopPropagation();
+  // Close all other slash dropdowns
+  document.querySelectorAll('.slash-dropdown.active').forEach(sd=>{
+    if(sd.id!==dropdownId)sd.classList.remove('active');
+  });
+  const dd=document.getElementById(dropdownId);
+  if(!dd)return;
+  if(!dd.innerHTML){
+    dd.innerHTML=SLASH_COMMANDS.map(c=>
+      `<div class="slash-item" data-cmd="${esc(c.cmd)}">
+        <span class="slash-item-cmd">${esc(c.cmd)}</span>
+        <span class="slash-item-desc">${esc(c.desc)}</span>
+      </div>`
+    ).join('');
+    dd.querySelectorAll('.slash-item').forEach(item=>{
+      item.addEventListener('click',function(){
+        const cmd=this.dataset.cmd;
+        // Find which session this belongs to
+        const name=selectedSession;
+        if(!name)return;
+        dd.classList.remove('active');
+        // Send the slash command
+        sendSlashCommand(name,cmd);
+      });
     });
-    setTimeout(()=>pollRawDelta(name),400);
-  }catch(e){console.error('Failed to send keys:',e)}
-}
-
-// ── Bracketed Paste Toggle ──
-// Tracks per-session state. Default is ON (true). Click toggles.
-let _bracketedPaste={};
-async function toggleBracketedPaste(name,btn){
-  if(!(name in _bracketedPaste))_bracketedPaste[name]=true;
-  _bracketedPaste[name]=!_bracketedPaste[name];
-  const enabled=_bracketedPaste[name];
-  try{
-    await fetch(BASE+'/api/sessions/'+name+'/bracketed-paste',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-  }catch(e){console.error('Bracketed paste toggle failed:',e)}
-  if(btn){
-    btn.textContent='Paste Mode: '+(enabled?'ON':'OFF');
-    btn.classList.toggle('off',!enabled);
   }
-}
-
-// ── Auth Mode Toggle ──
-async function setAuthMode(name,mode){
-  const statusEl=document.getElementById('auth-mode-status-'+name);
-  if(statusEl)statusEl.textContent='Switching...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/set-auth-mode',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({mode:mode})
-    });
-    const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].auth_mode=mode;
-      if(statusEl)statusEl.textContent=mode==='api'?'API key exported':'API key unset';
-    }else{
-      if(statusEl)statusEl.textContent=data.error||'Failed';
-    }
-  }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-  }
-}
-
-// ── Session Stats ──
-let _statsTimers={};
-function fmtRate(n){
-  if(n>=1000)return (n/1000).toFixed(1)+'k/min';
-  return n+'/min';
-}
-
-async function loadSessionStats(name){
-  const panel=document.getElementById('stats-panel-'+name);
-  if(!panel)return;
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/stats');
-    const st=await resp.json();
-    if(!st.available){
-      panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Claude Code activity.</span>';
-      return;
-    }
-    const rateCls=st.rateStatus;
-    const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
-    const barPct=Math.min(100,Math.max(2,st.ratePct));
-    const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
-    panel.innerHTML=`
-      <div class="stats-grid">
-        <div class="stat-item"><span class="stat-label">Model</span><span class="stat-value"><span class="model-tag">${esc(st.model)}</span></span></div>
-        <div class="stat-item"><span class="stat-label">Messages</span><span class="stat-value">${st.messageCount}</span></div>
-        <div class="stat-item"><span class="stat-label">Input tokens</span><span class="stat-value">${fmtTokens(st.totalInput)}</span></div>
-        <div class="stat-item"><span class="stat-label">Output tokens</span><span class="stat-value">${fmtTokens(st.totalOutput)}</span></div>
-        <div class="stat-item"><span class="stat-label">Cache read</span><span class="stat-value">${fmtTokens(st.cacheRead)}</span></div>
-        <div class="stat-item"><span class="stat-label">Cache write</span><span class="stat-value">${fmtTokens(st.cacheCreate)}</span></div>
-        <div class="stats-divider"></div>
-        <div class="stat-item"><span class="stat-label">API equiv.</span><span class="stat-value cost">$${st.estimatedCost.toFixed(2)}</span></div>
-        <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
-        <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
-        <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
-      </div>
-      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
-        <span style="font-size:.75rem;color:#8b949e">Rate</span>
-        <span class="rate-badge ${rateCls}">${rateLabel}</span>
-        <span style="font-size:.75rem;color:#6e7681">${fmtRate(st.recentOutputRate)} output</span>
-        <span style="font-size:.65rem;color:#484f58">peak ${fmtRate(st.peakOutputRate)}</span>
-      </div>
-      <div class="rate-bar">
-        <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
-        <span class="rate-label">${st.ratePct}%</span>
-      </div>`;
-  }catch(e){
-    panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
-  }
-}
-
-function startStatsPolling(name){
-  stopStatsPolling();
-  loadSessionStats(name);
-  _statsTimers[name]=setInterval(()=>loadSessionStats(name),15000);
-}
-function stopStatsPolling(){
-  Object.values(_statsTimers).forEach(t=>clearInterval(t));
-  _statsTimers={};
-}
-
-// ── Away Mode ──
-let _awayTimers={};
-async function toggleAwayMode(name,enabled){
-  const statusEl=document.getElementById('away-status-'+name);
-  if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/away-mode',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-    const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].away_mode=data.enabled;
-      if(statusEl)statusEl.textContent=data.enabled?'Running \u2014 Phase '+(data.phase||0)+': '+(data.phase_name||''):'Off';
-      if(data.enabled)startAwayPolling(name);
-      else stopAwayPolling(name);
-      renderNav();
-    }else{
-      if(statusEl)statusEl.textContent=data.error||'Failed';
-      const tog=document.getElementById('away-toggle-'+name);
-      if(tog)tog.checked=!enabled;
-    }
-  }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-    const tog=document.getElementById('away-toggle-'+name);
-    if(tog)tog.checked=!enabled;
-  }
-}
-function startAwayPolling(name){
-  stopAwayPolling(name);
-  loadAwayStatus(name);
-  _awayTimers[name]=setInterval(()=>loadAwayStatus(name),10000);
-}
-function stopAwayPolling(name){
-  if(_awayTimers[name]){clearInterval(_awayTimers[name]);delete _awayTimers[name];}
-}
-function stopAllAwayPolling(){
-  Object.keys(_awayTimers).forEach(n=>stopAwayPolling(n));
-}
-async function loadAwayStatus(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/away-mode');
-    const data=await resp.json();
-    const statusEl=document.getElementById('away-status-'+name);
-    const logEl=document.getElementById('away-log-'+name);
-    const tog=document.getElementById('away-toggle-'+name);
-    if(statusEl){
-      if(data.enabled)statusEl.textContent='Phase '+data.phase+': '+(data.phase_name||'');
-      else statusEl.textContent=data.log&&data.log.length?'Finished':'Off';
-    }
-    if(tog)tog.checked=!!data.enabled;
-    if(logEl&&data.log&&data.log.length){
-      logEl.innerHTML=data.log.slice(-15).map(e=>
-        '<div class="away-log-entry"><span class="away-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-      ).join('');
-      logEl.scrollTop=logEl.scrollHeight;
-    }
-    // Update nav badge
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].away_mode=data.enabled;
-    if(!data.enabled&&_awayTimers[name])stopAwayPolling(name);
-  }catch(e){}
-}
-
-// ── Go Nuts Mode ──
-let _goNutsTimers={};
-async function toggleGoNutsMode(name,enabled){
-  const statusEl=document.getElementById('gonuts-status-'+name);
-  if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/go-nuts-mode',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-    const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].go_nuts_mode=data.enabled;
-      if(statusEl)statusEl.textContent=data.enabled?'Running \u2014 Phase '+(data.phase||0)+': '+(data.phase_name||''):'Off';
-      if(data.enabled)startGoNutsPolling(name);
-      else stopGoNutsPolling(name);
-      renderNav();
-    }else{
-      if(statusEl)statusEl.textContent=data.error||'Failed';
-      const tog=document.getElementById('gonuts-toggle-'+name);
-      if(tog)tog.checked=!enabled;
-    }
-  }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-    const tog=document.getElementById('gonuts-toggle-'+name);
-    if(tog)tog.checked=!enabled;
-  }
-}
-function startGoNutsPolling(name){
-  stopGoNutsPolling(name);
-  loadGoNutsStatus(name);
-  _goNutsTimers[name]=setInterval(()=>loadGoNutsStatus(name),10000);
-}
-function stopGoNutsPolling(name){
-  if(_goNutsTimers[name]){clearInterval(_goNutsTimers[name]);delete _goNutsTimers[name];}
-}
-function stopAllGoNutsPolling(){
-  Object.keys(_goNutsTimers).forEach(n=>stopGoNutsPolling(n));
-}
-async function loadGoNutsStatus(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/go-nuts-mode');
-    const data=await resp.json();
-    const statusEl=document.getElementById('gonuts-status-'+name);
-    const logEl=document.getElementById('gonuts-log-'+name);
-    const tog=document.getElementById('gonuts-toggle-'+name);
-    if(statusEl){
-      if(data.enabled)statusEl.textContent='Phase '+data.phase+': '+(data.phase_name||'');
-      else statusEl.textContent=data.log&&data.log.length?'Finished':'Off';
-    }
-    if(tog)tog.checked=!!data.enabled;
-    if(logEl&&data.log&&data.log.length){
-      logEl.innerHTML=data.log.slice(-15).map(e=>
-        '<div class="gonuts-log-entry"><span class="gonuts-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-      ).join('');
-      logEl.scrollTop=logEl.scrollHeight;
-    }
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].go_nuts_mode=data.enabled;
-    if(!data.enabled&&_goNutsTimers[name])stopGoNutsPolling(name);
-  }catch(e){}
-}
-
-// ── Key Bar + Slash Commands ──
-function buildKeyBar(name,tab){
-  const id='keybar-'+tab+'-'+name;
-  const isOpen=localStorage.getItem('keyBarOpen')==='true';
-  return `<div class="key-bar-toggle${isOpen?' open':''}" onclick="toggleKeyBar('${id}',this)">
-    <span class="chevron">&#x25BC;</span> Keys &amp; Commands
-  </div>
-  <div class="key-bar${isOpen?' expanded':''}" id="${id}">
-    <span class="key-bar-label">Keys:</span>
-    <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
-    <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
-    <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['q'])" title="q — quit pager">q</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['n'])" title="n — no">n</button>
-    <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Tab'])" title="Tab">Tab</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
-    <span class="key-bar-sep"></span>
-    <span class="key-bar-label">Cmds:</span>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
-    <span class="key-bar-sep"></span>
-    <span class="key-bar-label">Opts:</span>
-    <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
-    <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
-  </div>`;
-}
-
-function toggleKeyBar(barId,toggleEl){
-  const bar=document.getElementById(barId);
-  if(!bar)return;
-  const isOpen=bar.classList.contains('expanded');
-  if(isOpen){
-    bar.classList.remove('expanded');
-    toggleEl.classList.remove('open');
-    localStorage.setItem('keyBarOpen','false');
-  }else{
-    bar.classList.add('expanded');
-    toggleEl.classList.add('open');
-    localStorage.setItem('keyBarOpen','true');
-  }
+  dd.classList.toggle('active');
 }
 
 async function sendSlashCommand(name,cmd){
