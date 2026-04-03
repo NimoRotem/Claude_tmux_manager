@@ -652,6 +652,20 @@ async def _send_ctrl_c(session_name: str) -> None:
     )
 
 
+async def _tmux_type_and_enter(session_name: str, text: str, timeout: int = 5) -> None:
+    """Type text into a tmux session then send Enter — used to run shell commands."""
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "-l", text],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
 def get_pane_position(session_name: str) -> dict:
     """Get current pane line-count metadata (cheap, no content capture).
 
@@ -1584,33 +1598,14 @@ async def api_create_session(body: CreateSession):
             created = sessions[-1]["name"] if sessions else "unknown"
         # Inject stored API key so Claude Code can authenticate
         if _stored_anthropic_key:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", created, "-l",
-                 f"export ANTHROPIC_API_KEY={shlex.quote(_stored_anthropic_key)}"],
-                capture_output=True, text=True, timeout=5
-            )
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            await _tmux_type_and_enter(created, f"export ANTHROPIC_API_KEY={shlex.quote(_stored_anthropic_key)}")
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
         # Optionally launch a command in the new session (env var or per-request flag)
         launch_cmd = NEW_SESSION_CMD or ("claude" if body.launch_claude else "")
         if launch_cmd:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", created, "-l", launch_cmd],
-                capture_output=True, text=True, timeout=5
-            )
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            await _tmux_type_and_enter(created, launch_cmd)
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
     except Exception:
@@ -4230,6 +4225,10 @@ button,a,input,textarea,select{touch-action:manipulation}
 .cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
+.cmd-char-count{position:absolute;bottom:6px;right:70px;font-size:.62rem;color:#484f58;pointer-events:none;transition:color .15s}
+.cmd-char-count.long{color:#e3b341}
+.cmd-char-count.very-long{color:#f85149}
+.nav-msg-count{font-size:.6rem;color:#484f58;padding:0 1px}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
@@ -4631,6 +4630,7 @@ function renderNav(){
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
         ${(unreadCounts[s.name]||0)>0&&s.name!==selectedSession?`<span class="nav-unread">${unreadCounts[s.name]}</span>`:''}
+        ${(chatMessages[s.name]||[]).length>0?`<span class="nav-msg-count" title="${(chatMessages[s.name]||[]).length} messages">${(chatMessages[s.name]||[]).length}</span>`:''}
         <span class="nav-cost" id="nav-cost-${s.name}"></span>
         <span class="nav-health good" id="nav-health-${s.name}" title="Session health"></span>
         <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
@@ -4707,8 +4707,9 @@ function renderDetail(){
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this)"
+            oninput="autoGrow(this);updateCmdCharCount(this,'chat-cc-${s.name}')"
             autocomplete="off" spellcheck="false"></textarea>
+          <span class="cmd-char-count" id="chat-cc-${s.name}"></span>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
@@ -4855,6 +4856,11 @@ function selectSession(name){
     if(badge)badge.remove();
   }
   renderDetail();
+  // Auto-focus chat input after render
+  requestAnimationFrame(()=>{
+    const input=document.getElementById('cmd-chat-'+name);
+    if(input&&!input.disabled&&document.activeElement!==input)input.focus();
+  });
 }
 
 function switchTab(name,tab){
@@ -4978,6 +4984,14 @@ function autoGrow(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,400)+'px';
 }
+function updateCmdCharCount(el,countId){
+  const n=el.value.length;
+  const countEl=document.getElementById(countId);
+  if(!countEl)return;
+  if(n===0){countEl.textContent='';countEl.className='cmd-char-count';return;}
+  countEl.textContent=n;
+  countEl.className='cmd-char-count'+(n>500?' very-long':n>200?' long':'');
+}
 // Command history per session per tab: {name+tab: {cmds:[], idx:-1}}
 const _cmdHistory={};
 function _getCmdHist(name,tab){const k=name+'_'+tab;if(!_cmdHistory[k])_cmdHistory[k]={cmds:[],idx:-1};return _cmdHistory[k]}
@@ -5040,6 +5054,8 @@ async function sendChat(name){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
+    const cc=document.getElementById('chat-cc-'+name);
+    if(cc){cc.textContent='';cc.className='cmd-char-count';}
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
