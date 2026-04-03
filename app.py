@@ -4140,6 +4140,21 @@ button,a,input,textarea,select{touch-action:manipulation}
 .chat-away-btn.running{border-color:#3fb950;color:#3fb950;background:#0d2818}
 /* Busy-only filter toggle */
 .nav-busy-filter.active{color:#3fb950 !important;border-color:#3fb950 !important;background:#0d2818 !important}
+/* Connection status */
+.nav-status-text.disconnected{color:#f85149 !important}
+/* Go Nuts quick-launch */
+.chat-gonuts-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
+.chat-gonuts-btn:hover{border-color:#f0883e;color:#f0883e;background:#1c2128}
+.chat-gonuts-btn.running{border-color:#da3633;color:#da3633;background:#1a0c0c}
+/* Session color labels */
+.nav-color-tag{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;cursor:pointer;transition:transform .1s;margin-right:1px}
+.nav-color-tag:hover{transform:scale(1.3)}
+.nav-color-tag.c0{background:#21262d;border:1px solid #30363d}
+.nav-color-tag.c1{background:#1f6feb}
+.nav-color-tag.c2{background:#238636}
+.nav-color-tag.c3{background:#9a6700}
+.nav-color-tag.c4{background:#8250df}
+.nav-color-tag.c5{background:#cf222e}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -4601,7 +4616,9 @@ function renderNav(){
     const ageStr=ageH>0?`${ageH}h ${ageM}m`:`${ageM}m`;
     const createdStr=created?new Date(created*1000).toLocaleString():'unknown';
     const ageTip=created?`Created: ${createdStr} • Running: ${ageStr} • `:'';
+    const clrCls=getSessionColor(s.name);
     item.innerHTML=`
+      <span class="nav-color-tag ${clrCls}" onclick="event.stopPropagation();cycleSessionColor('${esc(s.name)}',this)" title="Click to set session color"></span>
       <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="${ageTip}Double-click to rename">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
@@ -4666,6 +4683,7 @@ function renderDetail(){
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
           <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
           <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
+          <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
         </div>
         <div class="chat-search-bar">
           <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
@@ -5379,7 +5397,8 @@ async function pollStatus(){
       }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
-  }catch(e){statusInfoEl.textContent='Status poll failed'}
+    statusInfoEl.classList.remove('disconnected');
+  }catch(e){statusInfoEl.textContent='⚠ Connection lost';statusInfoEl.classList.add('disconnected');}
   _authPollCount++;
   if(_authPollCount%5===0)checkClaudeAuth();
 }
@@ -5844,7 +5863,6 @@ async function quickToggleAway(name){
   const sess=sessions.find(s=>s.name===name);
   const isOn=!!(sess&&sess.away_mode);
   await toggleAwayMode(name,!isOn);
-  // Sync the quick button state (renderNav handles nav; update chat controls button)
   const btn=document.getElementById('away-quick-'+name);
   if(btn){
     const nowOn=!isOn;
@@ -5852,6 +5870,30 @@ async function quickToggleAway(name){
     btn.title=nowOn?'Stop Away Mode':'Start Away Mode';
     btn.innerHTML=nowOn?'&#x23F9; Away':'&#x25B6; Away';
   }
+}
+async function quickToggleGoNuts(name){
+  const sess=sessions.find(s=>s.name===name);
+  const isOn=!!(sess&&sess.go_nuts_mode);
+  await toggleGoNutsMode(name,!isOn);
+  const btn=document.getElementById('gonuts-quick-'+name);
+  if(btn){
+    const nowOn=!isOn;
+    btn.className='chat-gonuts-btn'+(nowOn?' running':'');
+    btn.title=nowOn?'Stop Go Nuts Mode':'Start Go Nuts Mode';
+    btn.innerHTML=nowOn?'&#x23F9; Nuts':'&#x1F914; Nuts';
+  }
+}
+// Session color labels (stored in localStorage, cycle on click)
+const _SESSION_COLORS=['c0','c1','c2','c3','c4','c5'];
+function getSessionColor(name){
+  return localStorage.getItem('tmux-clr-'+name)||'c0';
+}
+function cycleSessionColor(name,tagEl){
+  const cur=getSessionColor(name);
+  const idx=_SESSION_COLORS.indexOf(cur);
+  const next=_SESSION_COLORS[(idx+1)%_SESSION_COLORS.length];
+  localStorage.setItem('tmux-clr-'+name,next);
+  if(tagEl){tagEl.className='nav-color-tag '+next;}
 }
 async function toggleAwayMode(name,enabled){
   const statusEl=document.getElementById('away-status-'+name);
