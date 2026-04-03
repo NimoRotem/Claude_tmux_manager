@@ -2241,6 +2241,11 @@ def _parse_session_stats(session_name: str) -> dict:
     session_start = entries[0][0]
     session_duration_min = int((entries[-1][0] - session_start) / 60) if len(entries) > 1 else 0
 
+    # Context window usage: most recent input tokens = current context size
+    last_input = entries[-1][1] if entries else 0  # (epoch, inp, out, cr, cc)
+    ctx_window = 200_000  # All modern Claude models (Opus/Sonnet/Haiku 3.x and 4.x)
+    context_pct = round(last_input / ctx_window * 100, 1) if last_input else 0
+
     result = {
         "available": True,
         "model": primary_model,
@@ -2261,6 +2266,9 @@ def _parse_session_stats(session_name: str) -> dict:
         "sessionDurationMin": session_duration_min,
         "secsSinceLastActivity": secs_since_last,
         "modelsUsed": models_seen,
+        "lastInputTokens": last_input,
+        "contextPct": context_pct,
+        "ctxWindowSize": ctx_window,
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -4114,6 +4122,21 @@ button,a,input,textarea,select{touch-action:manipulation}
 .chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
+/* Markdown rendered content */
+.chat-body{white-space:pre-wrap}
+.chat-body.md-rendered{white-space:normal}
+.chat-body.md-rendered pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;overflow-x:auto;margin:8px 0;font-size:.82rem}
+.chat-body.md-rendered code{background:#21262d;padding:1px 5px;border-radius:3px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
+.chat-body.md-rendered pre code{background:none;padding:0;font-size:.82rem}
+.chat-body.md-rendered h1,.chat-body.md-rendered h2,.chat-body.md-rendered h3{margin:12px 0 4px;color:#e6edf3;font-weight:600}
+.chat-body.md-rendered h1{font-size:1.1em}.chat-body.md-rendered h2{font-size:1.0em}.chat-body.md-rendered h3{font-size:.95em}
+.chat-body.md-rendered ul,.chat-body.md-rendered ol{margin:6px 0;padding-left:20px}
+.chat-body.md-rendered li{margin:2px 0}
+.chat-body.md-rendered blockquote{border-left:3px solid #58a6ff;margin:8px 0;padding:4px 12px;color:#8b949e;background:#161b22}
+.chat-body.md-rendered p{margin:4px 0}
+.chat-body.md-rendered a{color:#58a6ff;text-decoration:none}.chat-body.md-rendered a:hover{text-decoration:underline}
+.chat-body.md-rendered hr{border:none;border-top:1px solid #30363d;margin:12px 0}
+.chat-body.md-rendered strong{color:#e6edf3}.chat-body.md-rendered em{opacity:.85}
 .chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
 .chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
@@ -4506,12 +4529,17 @@ function renderNav(){
 
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
-  return msgs.map(m=>`
-    <div class="chat-msg ${m.role}">
+  const usesMd=mdEnabled(name);
+  return msgs.map(m=>{
+    const body=usesMd&&m.role==='assistant'
+      ?renderMarkdown(m.text)
+      :`<div class="chat-body">${esc(m.text)}</div>`;
+    return`<div class="chat-msg ${m.role}">
       <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
-      ${esc(m.text)}
+      ${body}
       <div class="chat-meta">${fmtTime(m.ts)}</div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 function renderDetail(){
@@ -4546,6 +4574,7 @@ function renderDetail(){
         <div class="chat-controls">
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
+          <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
         </div>
         <div class="chat-search-bar">
           <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
@@ -4784,7 +4813,10 @@ function appendChatBubble(name,role,text,ts){
       if(typing)typing.remove();
       const bubble=document.createElement('div');
       bubble.className='chat-msg '+role;
-      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+      const bodyHtml=mdEnabled(name)&&role==='assistant'
+        ?renderMarkdown(text)
+        :'<div class="chat-body">'+esc(text)+'</div>';
+      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+bodyHtml+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
       chatEl.appendChild(bubble);
       chatEl.scrollTop=chatEl.scrollHeight;
     }
@@ -5561,7 +5593,19 @@ async function loadSessionStats(name){
       <div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
-      </div>`;
+      </div>
+      ${st.contextPct>0?`
+      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+        <span style="font-size:.75rem;color:#8b949e">Context</span>
+        <span style="font-size:.75rem;color:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#6e7681'}">${st.contextPct}% used</span>
+        <span style="font-size:.65rem;color:#484f58">${fmtTokens(st.lastInputTokens)} / ${fmtTokens(st.ctxWindowSize)}</span>
+        ${st.contextPct>=75?'<span style="font-size:.65rem;color:#e3b341">consider /compact</span>':''}
+      </div>
+      <div class="rate-bar">
+        <div class="rate-bar-track"><div class="rate-bar-fill" style="width:${Math.min(100,st.contextPct)}%;background:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#3fb950'}"></div></div>
+        <span class="rate-label">${st.contextPct}%</span>
+      </div>`:''}
+      `;
   }catch(e){
     panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
   }
@@ -6233,6 +6277,93 @@ function toggleScrollLock(name){
     scrollLocked.add(name);
     if(btn){btn.textContent='Auto-scroll: OFF';btn.classList.add('locked');}
   }
+}
+
+// ==================== Feature 10: Token budget — handled via backend API ====================
+
+// ==================== Feature 13: Markdown Rendering ====================
+const _mdDisabled=new Set(); // sessions where MD is turned OFF (default ON)
+
+function mdEnabled(name){return!_mdDisabled.has(name);}
+
+function toggleMarkdown(name){
+  const btn=document.getElementById('md-toggle-'+name);
+  if(_mdDisabled.has(name)){
+    _mdDisabled.delete(name);
+    if(btn)btn.textContent='MD: ON';
+  }else{
+    _mdDisabled.add(name);
+    if(btn)btn.textContent='MD: OFF';
+  }
+  // Re-render all chat bubbles
+  const chatEl=document.getElementById('chat-'+name);
+  if(chatEl){
+    const typing=chatEl.querySelector('.chat-typing');
+    chatEl.innerHTML=renderChatBubbles(name);
+    if(typing)chatEl.appendChild(typing);
+  }
+}
+
+function renderMarkdown(raw){
+  if(!raw)return'';
+  // Step 1: Extract fenced code blocks to placeholders (protect from further processing)
+  const blocks=[];
+  let s=raw.replace(/```([\w.-]*)\n?([\s\S]*?)```/g,(_, lang, code)=>{
+    const idx=blocks.length;
+    const langAttr=lang?lang.toLowerCase():'';
+    blocks.push(`<pre><code class="code-block${langAttr?' lang-'+langAttr:''}">${escMd(code.replace(/\n$/,''))}</code></pre>`);
+    return'\x00B'+idx+'\x00';
+  });
+  // Step 2: Escape remaining HTML
+  s=escMd(s);
+  // Step 3: Inline code (after HTML escaping)
+  s=s.replace(/`([^`\n]+?)`/g,'<code>$1</code>');
+  // Step 4: Headers
+  s=s.replace(/^(#{1,3}) (.+)$/gm,(_, h, txt)=>{
+    const lvl=h.length;
+    return`<h${lvl}>${txt}</h${lvl}>`;
+  });
+  // Step 5: Bold and italic (order matters: bold first)
+  s=s.replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>');
+  s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/\*([^*\n]+?)\*/g,'<em>$1</em>');
+  s=s.replace(/__(.+?)__/g,'<strong>$1</strong>');
+  s=s.replace(/_([^_\n]+?)_/g,'<em>$1</em>');
+  // Step 6: Blockquotes
+  s=s.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
+  // Step 7: Horizontal rules
+  s=s.replace(/^(---|===|\*\*\*)$/gm,'<hr>');
+  // Step 8: Lists — collect consecutive list lines
+  // Unordered (-, *, +)
+  s=s.replace(/((?:^[-*+] .+\n?)+)/gm,match=>{
+    const items=match.trim().split('\n').map(l=>'<li>'+l.replace(/^[-*+] /,'')+' </li>').join('');
+    return'<ul>'+items+'</ul>';
+  });
+  // Ordered (1. 2. etc.)
+  s=s.replace(/((?:^\d+\. .+\n?)+)/gm,match=>{
+    const items=match.trim().split('\n').map(l=>'<li>'+l.replace(/^\d+\. /,'')+' </li>').join('');
+    return'<ol>'+items+'</ol>';
+  });
+  // Step 9: Links
+  s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Step 10: Paragraphs — double newlines become paragraph breaks
+  s=s.replace(/\n\n+/g,'</p><p>');
+  // Single newlines in non-special contexts become <br>
+  s=s.replace(/\n/g,'<br>');
+  // Step 11: Restore code blocks
+  blocks.forEach((block,idx)=>{
+    s=s.replace('\x00B'+idx+'\x00',block);
+  });
+  // Wrap in paragraph
+  s='<p>'+s+'</p>';
+  // Clean up empty paragraphs
+  s=s.replace(/<p><\/p>/g,'').replace(/<p>(<[hH][1-6]|<ul|<ol|<hr|<blockquote|<pre)/g,'$1').replace(/(<\/h[1-6]>|<\/ul>|<\/ol>|<hr>|<\/blockquote>|<\/pre>)<\/p>/g,'$1');
+  return'<div class="chat-body md-rendered">'+s+'</div>';
+}
+
+function escMd(str){
+  // Minimal HTML escape for markdown content (not using esc() to avoid the DOM roundtrip)
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 loadAll();
