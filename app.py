@@ -2742,15 +2742,14 @@ async def _watchdog_loop():
             if not active_sessions:
                 if _watchdog_snapshots:
                     _watchdog_snapshots.clear()
-                continue
-
-            for session_name, state, mode in active_sessions:
-                try:
-                    await _watchdog_check_session(session_name, state, mode, wlog)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
+            else:
+                for session_name, state, mode in active_sessions:
+                    try:
+                        await _watchdog_check_session(session_name, state, mode, wlog)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        wlog.error(f"Watchdog error checking '{session_name}': {e}")
 
             # Also check for zombie states: enabled=True but task is dead
             for name, state in list(_away_mode_state.items()):
@@ -4238,6 +4237,8 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
+.raw-search-bar.active{display:flex!important}
+.raw-line-match{background:#1c2333;outline:1px solid #58a6ff44;border-radius:2px}
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
@@ -4864,6 +4865,7 @@ function renderDetail(){
           <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
           <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
           <button class="focus-mode-btn" onclick="toggleFocusMode()" title="Toggle focus mode (F)">&#x26F6; Focus</button>
+          ${s.activity_status!=='busy'?`<button class="chat-export-btn" onclick="sendChatCmd('${s.name}','claude')" title="Launch Claude in this session" style="color:#3fb950;border-color:#238636">&#x25B6; Claude</button>`:''}
         </div>
         <div class="chat-search-bar">
           <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
@@ -4902,6 +4904,12 @@ function renderDetail(){
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
         <button class="scroll-lock-btn" id="scroll-lock-${s.name}" onclick="toggleScrollLock('${s.name}')" title="Toggle auto-scroll">Auto-scroll: ON</button>
+      </div>
+      <div class="raw-search-bar" id="raw-search-bar-${s.name}" style="display:none;padding:4px 8px;border-bottom:1px solid #21262d;align-items:center;gap:6px">
+        <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
+        <input id="raw-srch-${s.name}" type="text" placeholder="Search terminal..." oninput="searchRawTerminal('${s.name}',this.value)" autocomplete="off" spellcheck="false" style="flex:1;background:none;border:none;color:#c9d1d9;font-size:.78rem;outline:none;font-family:inherit">
+        <span class="chat-search-count" id="raw-srch-count-${s.name}"></span>
+        <button class="chat-search-clear" onclick="searchRawTerminal('${s.name}','');var i=document.getElementById('raw-srch-${s.name}');if(i){i.value='';}closeRawSearch('${s.name}')" title="Close">&#x00D7;</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
@@ -5226,6 +5234,44 @@ function handleChatKey(e,name){
 function handleRawKey(e,name){
   if(_histNav(e,name,'raw'))return;
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd(name,'raw')}
+  if((e.ctrlKey||e.metaKey)&&e.key==='f'){
+    e.preventDefault();
+    openRawSearch(name);
+  }
+}
+function openRawSearch(name){
+  const bar=document.getElementById('raw-search-bar-'+name);
+  if(!bar)return;
+  bar.style.display='flex';
+  const inp=document.getElementById('raw-srch-'+name);
+  if(inp){inp.focus();inp.select();}
+}
+function closeRawSearch(name){
+  const bar=document.getElementById('raw-search-bar-'+name);
+  if(bar)bar.style.display='none';
+  // Clear highlights
+  const rawEl=document.getElementById('raw-'+name);
+  if(rawEl){const plain=rawEl.innerText||rawEl.textContent;rawEl.textContent=plain;}
+  const countEl=document.getElementById('raw-srch-count-'+name);
+  if(countEl)countEl.textContent='';
+}
+function searchRawTerminal(name,query){
+  const rawEl=document.getElementById('raw-'+name);
+  const countEl=document.getElementById('raw-srch-count-'+name);
+  if(!rawEl)return;
+  const text=rawEl.innerText||rawEl.textContent;
+  if(!query){rawEl.textContent=text;if(countEl)countEl.textContent='';return;}
+  const lq=query.toLowerCase();
+  const lines=text.split('\n');
+  let matches=0;
+  const html=lines.map(line=>{
+    const esc=line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    if(line.toLowerCase().includes(lq)){matches++;return'<span class="raw-line-match">'+esc+'</span>';}
+    return esc;
+  }).join('\n');
+  rawEl.innerHTML=html;
+  if(countEl)countEl.textContent=matches+' match'+(matches!==1?'es':'');
+  if(matches){const first=rawEl.querySelector('.raw-line-match');if(first)first.scrollIntoView({block:'center'});}
 }
 
 async function sendChat(name){
@@ -6786,8 +6832,14 @@ document.addEventListener('keydown',function(e){
   }
   // Ctrl+F → focus session search
   if((e.ctrlKey||e.metaKey)&&e.key==='f'){
-    const srch=document.getElementById('nav-search');
-    if(srch&&document.activeElement!==srch){e.preventDefault();srch.focus();srch.select();}
+    // If on raw terminal tab, open raw search; otherwise focus session nav search
+    if(selectedSession&&(activeTabs[selectedSession]||'raw')==='raw'){
+      e.preventDefault();
+      openRawSearch(selectedSession);
+    }else{
+      const srch=document.getElementById('nav-search');
+      if(srch&&document.activeElement!==srch){e.preventDefault();srch.focus();srch.select();}
+    }
     return;
   }
   // Ctrl+N → new session
