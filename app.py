@@ -4057,6 +4057,25 @@ button,a,input,textarea,select{touch-action:manipulation}
 .notif-btn:hover{color:#c9d1d9;background:#1c2128}
 .notif-btn.granted{color:#3fb950}
 
+/* Chat message search */
+.chat-search-bar{display:flex;align-items:center;gap:6px;padding:5px 10px;background:#161b22;border:1px solid #21262d;border-radius:6px;margin-bottom:8px}
+.chat-search-bar input{flex:1;background:none;border:none;color:#c9d1d9;font-size:.78rem;outline:none;font-family:inherit}
+.chat-search-bar input::placeholder{color:#484f58}
+.chat-search-clear{background:none;border:none;color:#6e7681;cursor:pointer;font-size:.85rem;padding:0 2px;line-height:1}
+.chat-search-clear:hover{color:#c9d1d9}
+.chat-search-count{font-size:.7rem;color:#6e7681;white-space:nowrap;min-width:60px;text-align:right}
+.chat-msg.search-dim{opacity:.2;transition:opacity .1s}
+.chat-msg.search-match{background:#1c2333;outline:1px solid #58a6ff44;border-radius:4px}
+/* Session pinning */
+.nav-pin-btn{background:none;border:none;color:#21262d;cursor:pointer;font-size:.75rem;padding:0 1px;line-height:1;transition:color .15s;flex-shrink:0;margin-left:2px}
+.nav-item:hover .nav-pin-btn{color:#8b949e}
+.nav-item.pinned .nav-pin-btn{color:#e3b341}
+.nav-item.pinned{border-bottom-color:#e3b341 !important}
+/* Auto-scroll lock */
+.scroll-lock-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;transition:all .15s;font-family:inherit;margin-left:4px}
+.scroll-lock-btn:hover{border-color:#8b949e;color:#c9d1d9}
+.scroll-lock-btn.locked{border-color:#f85149;color:#f85149}
+
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
 
@@ -4464,10 +4483,12 @@ function statusLabel(s){
 
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
-  const brand=navEl.querySelector('.nav-brand');
-  sessions.forEach(s=>{
+  const pinnedSet=getPinnedSessions();
+  const pinned=sessions.filter(s=>pinnedSet.has(s.name));
+  const unpinned=sessions.filter(s=>!pinnedSet.has(s.name));
+  [...pinned,...unpinned].forEach(s=>{
     const item=document.createElement('div');
-    item.className='nav-item'+(s.name===selectedSession?' active':'');
+    item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'');
     item.id='nav-'+s.name;
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
@@ -4477,11 +4498,10 @@ function renderNav(){
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
+        <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
-    brand.after(item);
+    navEl.appendChild(item);
   });
-  const items=Array.from(navEl.querySelectorAll('.nav-item'));
-  items.reverse().forEach(item=>brand.after(item));
 }
 
 function renderChatBubbles(name){
@@ -4527,6 +4547,12 @@ function renderDetail(){
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
         </div>
+        <div class="chat-search-bar">
+          <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
+          <input id="chat-srch-${s.name}" type="text" placeholder="Search messages..." oninput="searchChatMessages('${s.name}',this.value)" autocomplete="off" spellcheck="false">
+          <span class="chat-search-count" id="chat-srch-count-${s.name}"></span>
+          <button class="chat-search-clear" onclick="searchChatMessages('${s.name}','');var i=document.getElementById('chat-srch-${s.name}');if(i){i.value='';i.focus()}" title="Clear">&#x00D7;</button>
+        </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
@@ -4551,6 +4577,7 @@ function renderDetail(){
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
+        <button class="scroll-lock-btn" id="scroll-lock-${s.name}" onclick="toggleScrollLock('${s.name}')" title="Toggle auto-scroll">Auto-scroll: ON</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
@@ -4942,12 +4969,14 @@ async function pollRawDelta(name){
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      rawEl.style.scrollBehavior='auto';
-      rawEl.scrollTop=rawEl.scrollHeight;
-      rawEl.style.scrollBehavior='';
+      if(!scrollLocked.has(name)){
+        rawEl.style.scrollBehavior='auto';
+        rawEl.scrollTop=rawEl.scrollHeight;
+        rawEl.style.scrollBehavior='';
+      }
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
-      const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
+      const wasAtBottom=!scrollLocked.has(name)&&(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
       const newLines=data.raw.split('\n');
       const curText=rawEl.textContent;
       const existingLines=curText.split('\n');
@@ -6145,6 +6174,65 @@ function showKeyboardHelp(){
       <button class="btn btn-full" onclick="closeModal()">Got it</button>
     </div>`;
   document.getElementById('modal-overlay').classList.add('active');
+}
+
+// ==================== Feature 7: Chat Message Search ====================
+function searchChatMessages(name,query){
+  const chatEl=document.getElementById('chat-'+name);
+  if(!chatEl)return;
+  const msgs=chatEl.querySelectorAll('.chat-msg');
+  const countEl=document.getElementById('chat-srch-count-'+name);
+  if(!query){
+    msgs.forEach(el=>{el.classList.remove('search-dim','search-match')});
+    if(countEl)countEl.textContent='';
+    return;
+  }
+  const lq=query.toLowerCase();
+  let matches=0;
+  let firstMatch=null;
+  msgs.forEach(el=>{
+    // Extract text without copy-btn / meta content
+    const clone=el.cloneNode(true);
+    clone.querySelectorAll('.chat-meta,.chat-copy-btn').forEach(x=>x.remove());
+    const text=clone.textContent.toLowerCase();
+    if(text.includes(lq)){
+      el.classList.add('search-match');
+      el.classList.remove('search-dim');
+      matches++;
+      if(!firstMatch)firstMatch=el;
+    }else{
+      el.classList.add('search-dim');
+      el.classList.remove('search-match');
+    }
+  });
+  if(countEl)countEl.textContent=matches+' match'+(matches!==1?'es':'');
+  if(firstMatch)firstMatch.scrollIntoView({block:'nearest',behavior:'smooth'});
+}
+
+// ==================== Feature 8: Session Pinning ====================
+function getPinnedSessions(){
+  try{return new Set(JSON.parse(localStorage.getItem('tmux-pinned')||'[]'));}catch{return new Set();}
+}
+function togglePin(name){
+  const pinned=getPinnedSessions();
+  if(pinned.has(name))pinned.delete(name);else pinned.add(name);
+  localStorage.setItem('tmux-pinned',JSON.stringify([...pinned]));
+  renderNav();
+  const activeEl=navEl.querySelector('.nav-item.active');
+  if(activeEl)activeEl.scrollIntoView({block:'nearest',inline:'nearest',behavior:'smooth'});
+}
+
+// ==================== Feature 12: Auto-scroll lock ====================
+const scrollLocked=new Set();
+function toggleScrollLock(name){
+  const btn=document.getElementById('scroll-lock-'+name);
+  if(scrollLocked.has(name)){
+    scrollLocked.delete(name);
+    if(btn){btn.textContent='Auto-scroll: ON';btn.classList.remove('locked');}
+  }else{
+    scrollLocked.add(name);
+    if(btn){btn.textContent='Auto-scroll: OFF';btn.classList.add('locked');}
+  }
 }
 
 loadAll();
