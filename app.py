@@ -4119,6 +4119,12 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .scroll-lock-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;transition:all .15s;font-family:inherit;margin-left:4px}
 .scroll-lock-btn:hover{border-color:#8b949e;color:#c9d1d9}
 .scroll-lock-btn.locked{border-color:#f85149;color:#f85149}
+/* Message bookmark button */
+.chat-bmark-btn{position:absolute;top:6px;right:56px;background:none;border:none;color:#484f58;padding:2px 4px;font-size:.8rem;cursor:pointer;opacity:0;transition:opacity .15s,color .15s;z-index:1;font-family:inherit;line-height:1}
+.chat-msg:hover .chat-bmark-btn{opacity:1}
+.chat-bmark-btn:hover{color:#e3b341}
+.chat-bmark-btn.bookmarked{color:#e3b341;opacity:1}
+.chat-msg.bookmarked{border-left:2px solid #e3b34166}
 /* Nav cost + health badges */
 .nav-cost{font-size:.61rem;color:#6e7681;padding:0 2px;letter-spacing:-.01em;min-width:0}
 .nav-health{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0;margin-left:1px;transition:background .3s}
@@ -4854,6 +4860,7 @@ function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   const usesMd=mdEnabled(name);
   const COLLAPSE_LEN=1200;
+  _loadBookmarks(name);
   return msgs.map((m,idx)=>{
     const isLong=m.text&&m.text.length>COLLAPSE_LEN&&m.role==='assistant';
     const bodyId=`chat-body-${name}-${idx}`;
@@ -4867,7 +4874,9 @@ function renderChatBubbles(name){
       body=`<div id="${bodyId}" class="chat-body${isLong?' collapsed':''}">${esc(m.text)}</div>`;
     }
     const expandBtn=isLong?`<button class="chat-expand-btn" id="exp-${bodyId}" onclick="expandChatMsg('${bodyId}','exp-${bodyId}')">Show more ▼</button>`:'';
-    return`<div class="chat-msg ${m.role}">
+    const bmarked=isBookmarked(name,idx);
+    return`<div class="chat-msg ${m.role}${bmarked?' bookmarked':''}" data-session="${esc(name)}" data-msg-idx="${idx}">
+      <button class="chat-bmark-btn${bmarked?' bookmarked':''}" onclick="toggleBookmark(this)" title="${bmarked?'Remove bookmark':'Bookmark message'}">&#x2605;</button>
       <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
       ${body}
       ${expandBtn}
@@ -4915,6 +4924,7 @@ function renderDetail(){
         <div class="chat-controls">
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
+          <button class="chat-export-btn" onclick="clearChatView('${s.name}')" title="Clear messages from view (local only, does not delete anything)">&#x1F5D1; Clear</button>
           <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
           <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
           <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
@@ -4958,6 +4968,7 @@ function renderDetail(){
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
+        <button class="btn" onclick="copyRawTerminal('${s.name}')" title="Copy all terminal text to clipboard">Copy All</button>
         <button class="scroll-lock-btn" id="scroll-lock-${s.name}" onclick="toggleScrollLock('${s.name}')" title="Toggle auto-scroll">Auto-scroll: ON</button>
       </div>
       <div class="raw-search-bar" id="raw-search-bar-${s.name}" style="display:none;padding:4px 8px;border-bottom:1px solid #21262d;align-items:center;gap:6px">
@@ -6670,7 +6681,7 @@ function copyMsg(btn){
   const bubble=btn.closest('.chat-msg');
   if(!bubble)return;
   const clone=bubble.cloneNode(true);
-  clone.querySelectorAll('.chat-meta,.chat-copy-btn').forEach(el=>el.remove());
+  clone.querySelectorAll('.chat-meta,.chat-copy-btn,.chat-bmark-btn').forEach(el=>el.remove());
   const text=clone.textContent.trim();
   if(navigator.clipboard&&window.isSecureContext){
     navigator.clipboard.writeText(text).then(()=>{
@@ -7076,7 +7087,7 @@ function searchChatMessages(name,query){
   msgs.forEach(el=>{
     // Extract text without copy-btn / meta content
     const clone=el.cloneNode(true);
-    clone.querySelectorAll('.chat-meta,.chat-copy-btn').forEach(x=>x.remove());
+    clone.querySelectorAll('.chat-meta,.chat-copy-btn,.chat-bmark-btn').forEach(x=>x.remove());
     const text=clone.textContent.toLowerCase();
     if(text.includes(lq)){
       el.classList.add('search-match');
@@ -7116,6 +7127,75 @@ function toggleScrollLock(name){
     scrollLocked.add(name);
     if(btn){btn.textContent='Auto-scroll: OFF';btn.classList.add('locked');}
   }
+}
+
+// ==================== Copy raw terminal ====================
+function copyRawTerminal(name){
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  const text=rawEl.innerText||rawEl.textContent;
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(()=>{
+      showToast('Terminal copied to clipboard','success',2000);
+    }).catch(()=>_rawCopyFallback(text));
+  }else{_rawCopyFallback(text);}
+}
+function _rawCopyFallback(text){
+  const ta=document.createElement('textarea');
+  ta.value=text;ta.style.position='fixed';ta.style.top='-9999px';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy');showToast('Terminal copied','success',2000);}
+  catch(e){showToast('Copy failed','warn',2000);}
+  document.body.removeChild(ta);
+}
+
+// ==================== Message Bookmarks ====================
+const _bookmarks={};
+function _loadBookmarks(name){
+  if(_bookmarks[name])return;
+  try{
+    const raw=localStorage.getItem('tmux-bmarks-'+name);
+    _bookmarks[name]=raw?new Set(JSON.parse(raw)):new Set();
+  }catch(e){_bookmarks[name]=new Set();}
+}
+function _saveBookmarks(name){
+  try{localStorage.setItem('tmux-bmarks-'+name,JSON.stringify([..._bookmarks[name]]));}
+  catch(e){}
+}
+function isBookmarked(name,idx){
+  _loadBookmarks(name);
+  return _bookmarks[name].has(idx);
+}
+function toggleBookmark(btn){
+  const msgEl=btn.closest('.chat-msg');
+  if(!msgEl)return;
+  const name=msgEl.dataset.session;
+  const idx=parseInt(msgEl.dataset.msgIdx,10);
+  if(isNaN(idx)||!name)return;
+  _loadBookmarks(name);
+  if(_bookmarks[name].has(idx)){
+    _bookmarks[name].delete(idx);
+    btn.classList.remove('bookmarked');
+    msgEl.classList.remove('bookmarked');
+    btn.title='Bookmark message';
+    showToast('Bookmark removed','success',1500);
+  }else{
+    _bookmarks[name].add(idx);
+    btn.classList.add('bookmarked');
+    msgEl.classList.add('bookmarked');
+    btn.title='Remove bookmark';
+    showToast('Message bookmarked','success',1500);
+  }
+  _saveBookmarks(name);
+}
+
+// ==================== Clear chat view ====================
+function clearChatView(name){
+  if(!confirm('Clear messages from view? (Does not delete anything — reload to restore)'))return;
+  chatMessages[name]=[];
+  const chatEl=document.getElementById('chat-'+name);
+  if(chatEl)chatEl.innerHTML='<div style="text-align:center;padding:32px;color:#484f58;font-size:.85rem">View cleared — switch sessions or reload to restore</div>';
+  showToast('Chat view cleared','success',2000);
 }
 
 // ==================== Feature 10: Token budget — handled via backend API ====================
