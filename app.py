@@ -5979,6 +5979,7 @@ function fmtRate(n){
   return n+'/min';
 }
 
+const _ctxWarnShown={};  // name → last warned pct threshold (75 or 90)
 async function loadSessionStats(name){
   const panel=document.getElementById('stats-panel-'+name);
   if(!panel)return;
@@ -6011,6 +6012,16 @@ async function loadSessionStats(name){
     _sessionCosts[name]=st.estimatedCost;
     _sessionIdle[name]=st.secsSinceLastActivity;
     updateNavTotalCost();
+    // Context threshold warnings (show once per threshold crossed)
+    if(st.contextPct>=90&&_ctxWarnShown[name]!==90){
+      _ctxWarnShown[name]=90;
+      showToast(name+': Context at '+st.contextPct+'% — consider /compact','warn',5000);
+    }else if(st.contextPct>=75&&_ctxWarnShown[name]!==75&&_ctxWarnShown[name]!==90){
+      _ctxWarnShown[name]=75;
+      showToast(name+': Context at '+st.contextPct+'% used','warn',4000);
+    }else if(st.contextPct<70){
+      delete _ctxWarnShown[name];  // reset so we warn again if it climbs back up
+    }
     // Dim nav item if idle >1 hour
     const navItem=document.getElementById('nav-'+name);
     if(navItem){
@@ -6827,6 +6838,30 @@ document.addEventListener('keydown',function(e){
     const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
     if(!isInput){toggleFocusMode();return;}
   }
+  // / → focus chat search (when not in input, switches to chat tab)
+  if(e.key==='/'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      e.preventDefault();
+      if((activeTabs[selectedSession]||'raw')!=='chat')switchTab(selectedSession,'chat');
+      const srch=document.getElementById('chat-srch-'+selectedSession);
+      if(srch){setTimeout(()=>{srch.focus();srch.select();},50);}
+      return;
+    }
+  }
+  // G → jump to last message; Shift+G → jump to first message (when not in input)
+  if(e.key==='g'||e.key==='G'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){
+      const chatEl=document.getElementById('chat-'+selectedSession);
+      if(chatEl){
+        if(e.shiftKey){chatEl.scrollTop=0;}else{chatEl.scrollTop=chatEl.scrollHeight;}
+      }
+      return;
+    }
+  }
   // T → cycle tabs for current session (when not in input)
   if(e.key==='t'||e.key==='T'){
     const focused=document.activeElement;
@@ -6862,6 +6897,9 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Alt+1-9</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Switch to session 1–9</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+]</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Next session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+[</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Previous session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">/</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus chat message search</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">G</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Jump to latest message in chat</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+G</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Jump to first message in chat</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">T</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Cycle tabs (Terminal → Chat → Info)</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">B</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle busy-only filter</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle focus mode (hide nav)</td></tr>
