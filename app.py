@@ -4138,6 +4138,8 @@ button,a,input,textarea,select{touch-action:manipulation}
 .chat-away-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
 .chat-away-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2128}
 .chat-away-btn.running{border-color:#3fb950;color:#3fb950;background:#0d2818}
+/* Busy-only filter toggle */
+.nav-busy-filter.active{color:#3fb950 !important;border-color:#3fb950 !important;background:#0d2818 !important}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -4457,6 +4459,7 @@ button,a,input,textarea,select{touch-action:manipulation}
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
   <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
   <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
+  <button class="nav-icon-btn nav-busy-filter" id="busy-filter-btn" onclick="toggleBusyFilter()" title="Show only busy sessions (B)">&#x26AB;</button>
   <button class="nav-icon-btn" onclick="openBroadcast()" title="Broadcast to multiple sessions">&#x1F4E1;</button>
   <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
   <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
@@ -4591,8 +4594,15 @@ function renderNav(){
     item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'');
     item.id='nav-'+s.name;
     item.onclick=()=>selectSession(s.name);
+    // Session age tooltip
+    const created=parseInt(s.created)||0;
+    const ageMs=created?Date.now()-created*1000:0;
+    const ageH=Math.floor(ageMs/3600000),ageM=Math.floor((ageMs%3600000)/60000);
+    const ageStr=ageH>0?`${ageH}h ${ageM}m`:`${ageM}m`;
+    const createdStr=created?new Date(created*1000).toLocaleString():'unknown';
+    const ageTip=created?`Created: ${createdStr} • Running: ${ageStr} • `:'';
     item.innerHTML=`
-      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="Double-click to rename">${esc(s.name)}</span>
+      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="${ageTip}Double-click to rename">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
@@ -5011,6 +5021,19 @@ async function sendChat(name){
   input.disabled=false;
   input.focus();
   // After a delay, verify the busy state from the actual terminal
+  scheduleBusyVerification(name);
+}
+
+async function sendChatCmd(name,cmd){
+  /* Send a command directly to a session's chat without touching the input element. */
+  appendChatBubble(name,'user',cmd,Date.now()/1000);
+  setOptimisticBusy(name);
+  try{
+    await fetch(BASE+'/api/sessions/'+name+'/send',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command:cmd})
+    });
+  }catch(e){console.error('sendChatCmd failed:',e)}
   scheduleBusyVerification(name);
 }
 
@@ -5777,7 +5800,7 @@ async function loadSessionStats(name){
         <span style="font-size:.75rem;color:#8b949e">Context</span>
         <span style="font-size:.75rem;color:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#6e7681'}">${st.contextPct}% used</span>
         <span style="font-size:.65rem;color:#484f58">${fmtTokens(st.lastInputTokens)} / ${fmtTokens(st.ctxWindowSize)}</span>
-        ${st.contextPct>=75?'<span style="font-size:.65rem;color:#e3b341">consider /compact</span>':''}
+        ${st.contextPct>=75?`<button onclick="sendChatCmd('${name}','/compact')" style="font-size:.65rem;padding:2px 8px;border-radius:4px;border:1px solid #e3b341;background:transparent;color:#e3b341;cursor:pointer;font-family:inherit" title="Send /compact to free up context window">/compact</button>`:''}
       </div>
       <div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill" style="width:${Math.min(100,st.contextPct)}%;background:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#3fb950'}"></div></div>
@@ -6163,16 +6186,26 @@ function closeStats(){
 // ============================================================
 // FEATURE: Session search / filter bar
 // ============================================================
+let _busyOnly=false;
+function toggleBusyFilter(){
+  _busyOnly=!_busyOnly;
+  const btn=document.getElementById('busy-filter-btn');
+  if(btn)btn.classList.toggle('active',_busyOnly);
+  filterSessionsNav(document.getElementById('nav-search')?.value||'');
+}
 function filterSessionsNav(query){
   const q=(query||'').toLowerCase().trim();
   navEl.querySelectorAll('.nav-item').forEach(item=>{
     const id=item.querySelector('.nav-session-id');
-    const name=id?id.textContent.toLowerCase():'';
-    const hidden=q&&!name.includes(q);
-    item.classList.toggle('nav-hidden',hidden);
+    const rawName=id?id.textContent:'';
+    const name=rawName.toLowerCase();
+    const sess=sessions.find(s=>s.name===rawName);
+    const textHide=q&&!name.includes(q);
+    const busyHide=_busyOnly&&(!sess||sess.activity_status!=='busy');
+    item.classList.toggle('nav-hidden',textHide||busyHide);
   });
   // If current selected session got hidden, select first visible
-  if(q){
+  if(q||_busyOnly){
     const active=navEl.querySelector('.nav-item.active:not(.nav-hidden)');
     if(!active){
       const first=navEl.querySelector('.nav-item:not(.nav-hidden)');
@@ -6399,6 +6432,30 @@ document.addEventListener('keydown',function(e){
     if(visible[idx])selectSession(visible[idx].name);
     return;
   }
+  // Ctrl+] or Ctrl+ArrowRight → next session; Ctrl+[ or Ctrl+ArrowLeft → prev session
+  const isNavJump=(e.ctrlKey||e.metaKey)&&(e.key===']'||e.key==='['||e.key==='ArrowRight'||e.key==='ArrowLeft');
+  if(isNavJump){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA');
+    if(!isInput){
+      e.preventDefault();
+      const isNext=e.key===']'||e.key==='ArrowRight';
+      const visible=sessions.filter(s=>{
+        const item=document.getElementById('nav-'+s.name);
+        return item&&!item.classList.contains('nav-hidden');
+      });
+      const cur=visible.findIndex(s=>s.name===selectedSession);
+      const next=isNext?Math.min(visible.length-1,cur+1):Math.max(0,cur-1);
+      if(visible[next]&&visible[next].name!==selectedSession)selectSession(visible[next].name);
+      return;
+    }
+  }
+  // B → toggle busy-only filter (when not in input)
+  if(e.key==='b'||e.key==='B'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput){toggleBusyFilter();return;}
+  }
   // ? → show keyboard shortcut help (when not in input)
   if(e.key==='?'){
     const focused=document.activeElement;
@@ -6420,6 +6477,9 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus session search</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Alt+1-9</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Switch to session 1–9</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+]</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Next session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+[</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Previous session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">B</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle busy-only filter</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Send message / command</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
