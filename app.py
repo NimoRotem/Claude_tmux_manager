@@ -4234,6 +4234,13 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .cmd-char-count.very-long{color:#f85149}
 .nav-msg-count{font-size:.6rem;color:#484f58;padding:0 1px}
 .chat-meta-rt{color:#484f58;font-size:.6rem;margin-left:6px}
+/* Quick reply templates */
+.quick-replies{display:flex;align-items:center;gap:4px;flex-wrap:wrap;padding:4px 8px;margin-top:4px;opacity:.7;transition:opacity .15s}
+.quick-replies:hover{opacity:1}
+.qr-label{font-size:.62rem;color:#484f58;margin-right:2px;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em;flex-shrink:0}
+.quick-reply-btn{background:#161b22;border:1px solid #21262d;color:#8b949e;border-radius:10px;padding:2px 9px;font-size:.68rem;cursor:pointer;transition:all .12s;font-family:inherit;white-space:nowrap}
+.quick-reply-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2333}
+.quick-reply-btn:active{background:#1f6feb;border-color:#1f6feb;color:#fff}
 .session-note-wrap{padding:4px 10px 2px;border-top:1px solid #21262d}
 .session-note-input{width:100%;box-sizing:border-box;background:none;border:none;color:#6e7681;font-size:.72rem;font-family:inherit;resize:none;outline:none;line-height:1.45;max-height:80px;overflow-y:auto;padding:2px 0}
 .session-note-input::placeholder{color:#30363d}
@@ -4723,6 +4730,15 @@ function toggleSessionDone(name){
   showToast(name+(isDone?' marked active':' marked done'),isDone?'info':'success',2000);
 }
 // ── Send to all sessions ──
+// ==================== Quick Reply Templates ====================
+function sendQuickReply(name,text){
+  const input=document.getElementById('cmd-chat-'+name);
+  if(!input)return;
+  input.value=text;
+  input.focus();
+  setTimeout(function(){sendChat(name);},80);
+}
+
 async function sendToAll(fromName){
   const input=document.getElementById('cmd-chat-'+fromName);
   if(!input)return;
@@ -4948,6 +4964,17 @@ function renderDetail(){
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
         <button class="chat-jump-btn" id="jump-btn-${s.name}" onclick="jumpToBottom('${s.name}')">&#x21E9; Latest</button>
+        <div class="quick-replies">
+          <span class="qr-label">Quick:</span>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Continue')">Continue</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Yes')">Yes</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','No')">No</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Summarize what you did')">Summarize</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Explain in more detail')">Explain more</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Show me the code')">Show code</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','What is the next step?')">Next step</button>
+          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Done, thanks')">Done</button>
+        </div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
@@ -6658,6 +6685,13 @@ function toggleBusyFilter(){
   if(btn)btn.classList.toggle('active',_busyOnly);
   filterSessionsNav(document.getElementById('nav-search')?.value||'');
 }
+let _hideDone=localStorage.getItem('tmux-hide-done')==='true';
+function toggleHideDone(){
+  _hideDone=!_hideDone;
+  localStorage.setItem('tmux-hide-done',String(_hideDone));
+  filterSessionsNav(document.getElementById('nav-search')?document.getElementById('nav-search').value:'');
+  showToast(_hideDone?'Done sessions hidden':'Done sessions visible','success',1500);
+}
 function filterSessionsNav(query){
   const q=(query||'').toLowerCase().trim();
   navEl.querySelectorAll('.nav-item').forEach(item=>{
@@ -6668,10 +6702,11 @@ function filterSessionsNav(query){
     const textHide=q&&!name.includes(q);
     const busyHide=_busyOnly&&(!sess||sess.activity_status!=='busy');
     const snoozeHide=isSnoozed(rawName);
-    item.classList.toggle('nav-hidden',textHide||busyHide||snoozeHide);
+    const doneHide=_hideDone&&isSessionDone(rawName);
+    item.classList.toggle('nav-hidden',textHide||busyHide||snoozeHide||doneHide);
   });
   // If current selected session got hidden, select first visible
-  if(q||_busyOnly||Object.keys(_snoozed).length){
+  if(q||_busyOnly||Object.keys(_snoozed).length||_hideDone){
     const active=navEl.querySelector('.nav-item.active:not(.nav-hidden)');
     if(!active){
       const first=navEl.querySelector('.nav-item:not(.nav-hidden)');
@@ -7035,6 +7070,24 @@ document.addEventListener('keydown',function(e){
     const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
     if(!isInput&&selectedSession){snoozeSession(selectedSession,15);return;}
   }
+  // P → pin/unpin current session (when not in input)
+  if(e.key==='p'||e.key==='P'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){togglePin(selectedSession);return;}
+  }
+  // H → toggle hide done sessions in nav (when not in input)
+  if(e.key==='h'||e.key==='H'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput){toggleHideDone();return;}
+  }
+  // W → toggle Away mode for current session (when not in input)
+  if(e.key==='w'||e.key==='W'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput&&selectedSession){quickToggleAway(selectedSession);return;}
+  }
   // N → new session (when not in input)
   if(e.key==='n'||e.key==='N'){
     const focused=document.activeElement;
@@ -7088,6 +7141,9 @@ function showKeyboardHelp(){
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">X</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Snooze current session for 15 min</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">R</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Rename current session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">P</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Pin / unpin current session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">H</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Hide / show done sessions in nav</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">W</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle Away mode for current session</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy) / close modal</td></tr>
     </table>
