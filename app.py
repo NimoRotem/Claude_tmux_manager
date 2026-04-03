@@ -4018,6 +4018,45 @@ button,a,input,textarea,select{touch-action:manipulation}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
 
+/* Session filter search */
+.nav-search{background:#0d1117;border:1px solid #30363d;color:#e1e4e8;padding:4px 10px;border-radius:6px;font-size:.75rem;outline:none;width:130px;transition:width .2s,border-color .2s;flex-shrink:0;margin-right:8px}
+.nav-search:focus{border-color:#58a6ff;width:190px}
+.nav-search::placeholder{color:#6e7681}
+.nav-item.nav-hidden{display:none}
+
+/* Copy button on chat messages */
+.chat-copy-btn{position:absolute;top:6px;right:8px;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:2px 7px;font-size:.63rem;cursor:pointer;opacity:0;transition:opacity .15s;z-index:1;font-family:inherit}
+.chat-msg:hover .chat-copy-btn{opacity:1}
+.chat-copy-btn:hover{background:#30363d;color:#c9d1d9}
+.chat-copy-btn.copied{color:#3fb950;border-color:#3fb950}
+
+/* Export conversation button */
+.chat-export-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:3px 10px;font-size:.72rem;cursor:pointer;transition:all .15s;font-family:inherit}
+.chat-export-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2333}
+
+/* Command palette (Ctrl+K) */
+.palette-overlay{position:fixed;inset:0;background:rgba(1,4,9,.75);z-index:300;display:flex;align-items:flex-start;justify-content:center;padding-top:100px;backdrop-filter:blur(2px)}
+.palette-overlay:not(.active){display:none}
+.palette-box{background:#161b22;border:1px solid #30363d;border-radius:12px;width:540px;max-width:92vw;box-shadow:0 24px 64px #00000099;overflow:hidden}
+.palette-input{width:100%;background:transparent;border:none;border-bottom:1px solid #30363d;color:#e1e4e8;padding:14px 20px;font-size:1rem;outline:none;font-family:inherit}
+.palette-input::placeholder{color:#6e7681}
+.palette-results{max-height:340px;overflow-y:auto}
+.palette-section{font-size:.65rem;color:#6e7681;padding:8px 20px 4px;text-transform:uppercase;letter-spacing:.08em;background:#0d1117;border-top:1px solid #21262d}
+.palette-item{display:flex;align-items:center;gap:10px;padding:10px 20px;cursor:pointer;transition:background .1s}
+.palette-item:hover,.palette-item.pal-selected{background:#1c2128}
+.palette-item-icon{font-size:.9rem;flex-shrink:0;width:18px;text-align:center}
+.palette-item-label{font-size:.88rem;color:#c9d1d9;flex:1}
+.palette-item-hint{font-size:.72rem;color:#6e7681;white-space:nowrap}
+.palette-item-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.palette-no-results{padding:24px;text-align:center;color:#6e7681;font-size:.85rem}
+.palette-footer{padding:8px 20px;border-top:1px solid #21262d;display:flex;gap:16px;font-size:.68rem;color:#6e7681}
+.palette-footer kbd{background:#21262d;border:1px solid #30363d;padding:1px 5px;border-radius:3px;color:#8b949e}
+
+/* Notification permission hint */
+.notif-btn{background:none;border:none;color:#6e7681;cursor:pointer;font-size:.7rem;padding:2px 6px;border-radius:4px;transition:all .15s;flex-shrink:0}
+.notif-btn:hover{color:#c9d1d9;background:#1c2128}
+.notif-btn.granted{color:#3fb950}
+
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
 
@@ -4302,11 +4341,14 @@ button,a,input,textarea,select{touch-action:manipulation}
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">tmux</span>
-  <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
+  <button class="nav-new-btn" onclick="showCreateModal()" title="New session (Ctrl+N)">+</button>
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
+  <input class="nav-search" id="nav-search" type="text" placeholder="&#x1F50D; filter sessions..." oninput="filterSessionsNav(this.value)" title="Filter sessions (Ctrl+F)">
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable notifications">&#x1F514;</button>
+  <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
   <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
   <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
@@ -4327,6 +4369,14 @@ button,a,input,textarea,select{touch-action:manipulation}
   <div class="stats-panel" id="stats-panel" role="dialog" aria-modal="true" aria-label="System Stats">
     <h3>System Stats <button class="stats-close" onclick="closeStats()" aria-label="Close">&times;</button></h3>
     <div id="stats-content">Loading...</div>
+  </div>
+</div>
+<!-- Command palette overlay (Ctrl+K) -->
+<div class="palette-overlay" id="palette-overlay" onclick="if(event.target===this)closePalette()">
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input class="palette-input" id="palette-input" type="text" placeholder="Search sessions or actions..." oninput="renderPalette(this.value)" onkeydown="handlePaletteKey(event)" autocomplete="off" spellcheck="false">
+    <div class="palette-results" id="palette-results"></div>
+    <div class="palette-footer"><span><kbd>&#x2191;</kbd><kbd>&#x2193;</kbd> navigate</span><span><kbd>Enter</kbd> select</span><span><kbd>Esc</kbd> close</span><span><kbd>Ctrl+K</kbd> anywhere</span></div>
   </div>
 </div>
 <!-- CLAUDE.md editor overlay -->
@@ -4438,6 +4488,7 @@ function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   return msgs.map(m=>`
     <div class="chat-msg ${m.role}">
+      <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
       ${esc(m.text)}
       <div class="chat-meta">${fmtTime(m.ts)}</div>
     </div>`).join('');
@@ -4474,6 +4525,7 @@ function renderDetail(){
       <div class="chat-wrap">
         <div class="chat-controls">
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+          <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
         </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
@@ -4705,7 +4757,7 @@ function appendChatBubble(name,role,text,ts){
       if(typing)typing.remove();
       const bubble=document.createElement('div');
       bubble.className='chat-msg '+role;
-      bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
       chatEl.appendChild(bubble);
       chatEl.scrollTop=chatEl.scrollHeight;
     }
@@ -5067,6 +5119,10 @@ async function pollStatus(){
         changed=true;
         lastStatus[st.name]=st.activity_status;
         statusInfoEl.textContent='Session '+st.name+' changed...';
+        // Browser notification when session goes idle
+        if(prev==='busy'&&st.activity_status==='idle'){
+          maybeNotify(st.name,st.away_mode,st.go_nuts_mode);
+        }
         refreshOne(st.name);
       }else{
         lastStatus[st.name]=st.activity_status;
@@ -5818,6 +5874,277 @@ function renderStats(s){
 
 function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
+}
+
+// ============================================================
+// FEATURE: Session search / filter bar
+// ============================================================
+function filterSessionsNav(query){
+  const q=(query||'').toLowerCase().trim();
+  navEl.querySelectorAll('.nav-item').forEach(item=>{
+    const id=item.querySelector('.nav-session-id');
+    const name=id?id.textContent.toLowerCase():'';
+    const hidden=q&&!name.includes(q);
+    item.classList.toggle('nav-hidden',hidden);
+  });
+  // If current selected session got hidden, select first visible
+  if(q){
+    const active=navEl.querySelector('.nav-item.active:not(.nav-hidden)');
+    if(!active){
+      const first=navEl.querySelector('.nav-item:not(.nav-hidden)');
+      if(first){
+        const name=first.id.replace('nav-','');
+        selectSession(name);
+      }
+    }
+  }
+}
+
+// ============================================================
+// FEATURE: Copy-to-clipboard on chat messages
+// ============================================================
+function copyMsg(btn){
+  const bubble=btn.closest('.chat-msg');
+  if(!bubble)return;
+  const clone=bubble.cloneNode(true);
+  clone.querySelectorAll('.chat-meta,.chat-copy-btn').forEach(el=>el.remove());
+  const text=clone.textContent.trim();
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(()=>{
+      btn.textContent='copied!';btn.classList.add('copied');
+      setTimeout(()=>{btn.textContent='copy';btn.classList.remove('copied')},1500);
+    }).catch(()=>fallbackCopy(btn,text));
+  }else{
+    fallbackCopy(btn,text);
+  }
+}
+function fallbackCopy(btn,text){
+  const ta=document.createElement('textarea');
+  ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy');btn.textContent='copied!';btn.classList.add('copied');}
+  catch(e){btn.textContent='err';}
+  document.body.removeChild(ta);
+  setTimeout(()=>{btn.textContent='copy';btn.classList.remove('copied')},1500);
+}
+
+// ============================================================
+// FEATURE: Export conversation as Markdown
+// ============================================================
+function exportConversation(name){
+  const msgs=chatMessages[name]||[];
+  if(!msgs.length){alert('No messages to export.');return}
+  const s=sessions.find(x=>x.name===name);
+  const title=s&&s.title?s.title:name;
+  const now=new Date().toISOString().slice(0,16).replace('T',' ');
+  let md=`# Conversation: ${title}\n\n`;
+  md+=`**Session**: \`${name}\`  \n**Exported**: ${now}\n\n---\n\n`;
+  msgs.forEach(m=>{
+    const ts=m.ts?new Date(m.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+    const role=m.role==='user'?'**You**':'**Claude**';
+    md+=`### ${role} ${ts?'<sup>'+ts+'</sup>':''}\n\n${m.text}\n\n---\n\n`;
+  });
+  const blob=new Blob([md],{type:'text/markdown;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;a.download=`${name}-conversation.md`;
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);document.body.removeChild(a)},500);
+}
+
+// ============================================================
+// FEATURE: Browser notifications for idle sessions
+// ============================================================
+let _notifGranted=false;
+function requestNotifPermission(){
+  if(!('Notification' in window)){return;}
+  if(Notification.permission==='granted'){
+    _notifGranted=true;
+    const btn=document.getElementById('notif-btn');
+    if(btn){btn.classList.add('granted');btn.title='Notifications enabled';}
+    return;
+  }
+  Notification.requestPermission().then(perm=>{
+    _notifGranted=perm==='granted';
+    const btn=document.getElementById('notif-btn');
+    if(btn){
+      btn.classList.toggle('granted',_notifGranted);
+      btn.title=_notifGranted?'Notifications enabled':'Notifications blocked';
+    }
+  });
+}
+function maybeNotify(sessionName,awayMode,goNutsMode){
+  if(!_notifGranted)return;
+  if(document.visibilityState==='visible')return; // Only notify if tab not focused
+  let title='Session idle: '+sessionName;
+  let body='Claude has finished working.';
+  if(awayMode){title='Away Mode complete: '+sessionName;body='Away Mode finished. Check the results!';}
+  else if(goNutsMode){title='Go Nuts complete: '+sessionName;body='Go Nuts Mode finished building features!';}
+  try{
+    const n=new Notification(title,{body,icon:"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%233fb950'/></svg>"});
+    n.onclick=()=>{window.focus();n.close();selectSession(sessionName)};
+    setTimeout(()=>n.close(),8000);
+  }catch(e){}
+}
+// Auto-check notification permission on load
+(function initNotifBtn(){
+  if('Notification' in window&&Notification.permission==='granted'){
+    _notifGranted=true;
+    // Set button state after DOM ready
+    setTimeout(()=>{
+      const btn=document.getElementById('notif-btn');
+      if(btn){btn.classList.add('granted');btn.title='Notifications enabled';}
+    },100);
+  }
+})();
+
+// ============================================================
+// FEATURE: Command palette (Ctrl+K)
+// ============================================================
+let _paletteSel=0;
+const _paletteActions=[
+  {icon:'&#x1F4CA;',label:'Open System Stats',hint:'Stats',fn:()=>openStats()},
+  {icon:'&#x1F4DD;',label:'Open CLAUDE.md editor',hint:'Editor',fn:()=>openClaudeMd()},
+  {icon:'&#x2795;',label:'New tmux session',hint:'Create',fn:()=>showCreateModal()},
+  {icon:'&#x1F514;',label:'Enable notifications',hint:'Notif',fn:()=>requestNotifPermission()},
+];
+function openPalette(){
+  const overlay=document.getElementById('palette-overlay');
+  if(!overlay)return;
+  overlay.classList.add('active');
+  const inp=document.getElementById('palette-input');
+  if(inp){inp.value='';inp.focus();}
+  _paletteSel=0;
+  renderPalette('');
+}
+function closePalette(){
+  const overlay=document.getElementById('palette-overlay');
+  if(overlay)overlay.classList.remove('active');
+}
+function renderPalette(query){
+  const el=document.getElementById('palette-results');
+  if(!el)return;
+  const q=(query||'').toLowerCase().trim();
+  let html='';
+  // Sessions section
+  const matchSessions=sessions.filter(s=>!q||s.name.toLowerCase().includes(q)||(s.title||'').toLowerCase().includes(q));
+  if(matchSessions.length){
+    html+='<div class="palette-section">Sessions</div>';
+    matchSessions.forEach((s,i)=>{
+      const dotCol=s.activity_status==='busy'?'#f85149':s.activity_status==='idle'?'#3fb950':'#d2a8ff';
+      const hint=s.activity_status+(s.away_mode?' · AW':'')+(s.go_nuts_mode?' · GN':'');
+      html+=`<div class="palette-item${i===0&&!q?' pal-selected':''}" onclick="closePalette();selectSession('${esc(s.name)}')">
+        <span class="palette-item-dot" style="background:${dotCol}"></span>
+        <span class="palette-item-label">${esc(s.name)}${s.title?'<span style="color:#6e7681;font-size:.78rem;margin-left:8px">'+esc(s.title)+'</span>':''}</span>
+        <span class="palette-item-hint">${esc(hint)}</span>
+      </div>`;
+    });
+  }
+  // Actions section
+  const matchActions=_paletteActions.filter(a=>!q||a.label.toLowerCase().includes(q));
+  if(matchActions.length){
+    html+='<div class="palette-section">Actions</div>';
+    const offset=matchSessions.length;
+    matchActions.forEach((a,i)=>{
+      html+=`<div class="palette-item" onclick="closePalette();(_paletteActions.find(x=>x.label===\`${a.label.replace(/`/g,'\\`')}\`)||{fn:()=>{}}).fn()" data-pal-idx="${offset+i}">
+        <span class="palette-item-icon">${a.icon}</span>
+        <span class="palette-item-label">${esc(a.label)}</span>
+        <span class="palette-item-hint">${esc(a.hint)}</span>
+      </div>`;
+    });
+  }
+  if(!matchSessions.length&&!matchActions.length){
+    html='<div class="palette-no-results">No results for "'+esc(q)+'"</div>';
+  }
+  el.innerHTML=html;
+  _paletteSel=0;
+  updatePaletteSel();
+}
+function updatePaletteSel(){
+  const items=document.querySelectorAll('#palette-results .palette-item');
+  items.forEach((item,i)=>item.classList.toggle('pal-selected',i===_paletteSel));
+  const sel=items[_paletteSel];
+  if(sel)sel.scrollIntoView({block:'nearest'});
+}
+function handlePaletteKey(e){
+  const items=document.querySelectorAll('#palette-results .palette-item');
+  if(e.key==='ArrowDown'){e.preventDefault();_paletteSel=(_paletteSel+1)%Math.max(1,items.length);updatePaletteSel();}
+  else if(e.key==='ArrowUp'){e.preventDefault();_paletteSel=(_paletteSel-1+items.length)%Math.max(1,items.length);updatePaletteSel();}
+  else if(e.key==='Enter'){e.preventDefault();const sel=items[_paletteSel];if(sel)sel.click();}
+  else if(e.key==='Escape'){closePalette();}
+}
+
+// ============================================================
+// FEATURE: Global keyboard shortcuts
+// ============================================================
+document.addEventListener('keydown',function(e){
+  // Ctrl+K or Cmd+K → command palette
+  if((e.ctrlKey||e.metaKey)&&e.key==='k'){
+    e.preventDefault();
+    const pal=document.getElementById('palette-overlay');
+    if(pal&&pal.classList.contains('active'))closePalette();
+    else openPalette();
+    return;
+  }
+  // Escape → close palette if open
+  if(e.key==='Escape'){
+    const pal=document.getElementById('palette-overlay');
+    if(pal&&pal.classList.contains('active')){closePalette();return;}
+  }
+  // Ctrl+F → focus session search
+  if((e.ctrlKey||e.metaKey)&&e.key==='f'){
+    const srch=document.getElementById('nav-search');
+    if(srch&&document.activeElement!==srch){e.preventDefault();srch.focus();srch.select();}
+    return;
+  }
+  // Ctrl+N → new session
+  if((e.ctrlKey||e.metaKey)&&e.key==='n'&&!e.shiftKey){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA');
+    if(!isInput){e.preventDefault();showCreateModal();}
+    return;
+  }
+  // Alt+1-9 → switch to nth session
+  if(e.altKey&&e.key>='1'&&e.key<='9'){
+    e.preventDefault();
+    const idx=parseInt(e.key)-1;
+    const visible=sessions.filter(s=>{
+      const item=document.getElementById('nav-'+s.name);
+      return item&&!item.classList.contains('nav-hidden');
+    });
+    if(visible[idx])selectSession(visible[idx].name);
+    return;
+  }
+  // ? → show keyboard shortcut help (when not in input)
+  if(e.key==='?'){
+    const focused=document.activeElement;
+    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
+    if(!isInput){showKeyboardHelp();return;}
+  }
+});
+
+// ============================================================
+// FEATURE: Keyboard shortcut help modal (press ?)
+// ============================================================
+function showKeyboardHelp(){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`
+    <h3>Keyboard Shortcuts</h3>
+    <table style="width:100%;border-collapse:collapse;font-size:.85rem;margin-top:12px">
+      <tr style="color:#6e7681;font-size:.72rem"><th style="text-align:left;padding:4px 8px">Key</th><th style="text-align:left;padding:4px 8px">Action</th></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+K</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Open command palette</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus session search</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Alt+1-9</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Switch to session 1–9</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Send message / command</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
+      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Close palette / modal</td></tr>
+    </table>
+    <div style="margin-top:16px;text-align:right">
+      <button class="btn btn-full" onclick="closeModal()">Got it</button>
+    </div>`;
+  document.getElementById('modal-overlay').classList.add('active');
 }
 
 loadAll();
