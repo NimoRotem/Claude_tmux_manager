@@ -1644,7 +1644,7 @@ async def api_rename_session(session_name: str, body: RenameSession):
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Rename failed"}, status_code=500)
         # Transfer cached data to new name
-        for store in [_session_data_cache, _session_auth_mode, _session_stats_cache,
+        for store in [cache, _session_auth_mode, _session_stats_cache,
                       _away_mode_state, _go_nuts_state]:
             if session_name in store:
                 store[new_name] = store.pop(session_name)
@@ -4128,6 +4128,16 @@ button,a,input,textarea,select{touch-action:manipulation}
 .scroll-lock-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;transition:all .15s;font-family:inherit;margin-left:4px}
 .scroll-lock-btn:hover{border-color:#8b949e;color:#c9d1d9}
 .scroll-lock-btn.locked{border-color:#f85149;color:#f85149}
+/* Nav cost + health badges */
+.nav-cost{font-size:.61rem;color:#6e7681;padding:0 2px;letter-spacing:-.01em;min-width:0}
+.nav-health{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0;margin-left:1px;transition:background .3s}
+.nav-health.good{background:#3fb950}
+.nav-health.warn{background:#e3b341}
+.nav-health.bad{background:#f85149}
+/* Away quick-launch button in chat controls */
+.chat-away-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
+.chat-away-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2128}
+.chat-away-btn.running{border-color:#3fb950;color:#3fb950;background:#0d2818}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -4589,6 +4599,8 @@ function renderNav(){
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
         ${(unreadCounts[s.name]||0)>0&&s.name!==selectedSession?`<span class="nav-unread">${unreadCounts[s.name]}</span>`:''}
+        <span class="nav-cost" id="nav-cost-${s.name}"></span>
+        <span class="nav-health good" id="nav-health-${s.name}" title="Session health"></span>
         <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
     navEl.appendChild(item);
@@ -4643,6 +4655,7 @@ function renderDetail(){
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
           <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
           <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
+          <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
         </div>
         <div class="chat-search-bar">
           <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
@@ -5719,6 +5732,20 @@ async function loadSessionStats(name){
     const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
     // Rate alarm: show/hide a warning banner at top of tab area
     updateRateAlarm(name,rateCls);
+    // Update nav cost badge
+    const navCostEl=document.getElementById('nav-cost-'+name);
+    if(navCostEl)navCostEl.textContent='$'+st.estimatedCost.toFixed(2);
+    // Update session health badge
+    const healthCls=rateCls==='severely_limited'||st.contextPct>=90?'bad':
+      rateCls==='limited'||st.contextPct>=75?'warn':'good';
+    const navHealthEl=document.getElementById('nav-health-'+name);
+    if(navHealthEl){
+      navHealthEl.className='nav-health '+healthCls;
+      const tips=[];
+      if(rateCls!=='normal')tips.push('Rate: '+rateLabel);
+      if(st.contextPct>0)tips.push('Context: '+st.contextPct+'%');
+      navHealthEl.title='Health: '+healthCls+(tips.length?' ('+tips.join(', ')+')':'');
+    }
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
     panel.innerHTML=`
@@ -5790,6 +5817,19 @@ function stopStatsPolling(){
 
 // ── Away Mode ──
 let _awayTimers={};
+async function quickToggleAway(name){
+  const sess=sessions.find(s=>s.name===name);
+  const isOn=!!(sess&&sess.away_mode);
+  await toggleAwayMode(name,!isOn);
+  // Sync the quick button state (renderNav handles nav; update chat controls button)
+  const btn=document.getElementById('away-quick-'+name);
+  if(btn){
+    const nowOn=!isOn;
+    btn.className='chat-away-btn'+(nowOn?' running':'');
+    btn.title=nowOn?'Stop Away Mode':'Start Away Mode';
+    btn.innerHTML=nowOn?'&#x23F9; Away':'&#x25B6; Away';
+  }
+}
 async function toggleAwayMode(name,enabled){
   const statusEl=document.getElementById('away-status-'+name);
   if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
