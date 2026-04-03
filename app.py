@@ -4145,6 +4145,9 @@ button,a,input,textarea,select{touch-action:manipulation}
 .chat-body.md-rendered a{color:#58a6ff;text-decoration:none}.chat-body.md-rendered a:hover{text-decoration:underline}
 .chat-body.md-rendered hr{border:none;border-top:1px solid #30363d;margin:12px 0}
 .chat-body.md-rendered strong{color:#e6edf3}.chat-body.md-rendered em{opacity:.85}
+.chat-jump-btn{position:absolute;bottom:56px;right:16px;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:20px;padding:4px 12px;font-size:.72rem;cursor:pointer;transition:all .15s;z-index:5;display:none}
+.chat-jump-btn.visible{display:block}
+.chat-jump-btn:hover{background:#30363d;color:#c9d1d9;border-color:#484f58}
 .chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
 .chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
@@ -4598,10 +4601,12 @@ function renderDetail(){
           <span class="chat-search-count" id="chat-srch-count-${s.name}"></span>
           <button class="chat-search-clear" onclick="searchChatMessages('${s.name}','');var i=document.getElementById('chat-srch-${s.name}');if(i){i.value='';i.focus()}" title="Clear">&#x00D7;</button>
         </div>
-        <div class="chat-messages" id="chat-${s.name}">
+        <div class="chat-messages" id="chat-${s.name}"
+          onscroll="updateJumpBtn('${s.name}',this)">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
+        <button class="chat-jump-btn" id="jump-btn-${s.name}" onclick="jumpToBottom('${s.name}')">&#x21E9; Latest</button>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
@@ -4866,10 +4871,47 @@ function autoGrow(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,400)+'px';
 }
+// Command history per session per tab: {name+tab: {cmds:[], idx:-1}}
+const _cmdHistory={};
+function _getCmdHist(name,tab){const k=name+'_'+tab;if(!_cmdHistory[k])_cmdHistory[k]={cmds:[],idx:-1};return _cmdHistory[k]}
+function _histPush(name,tab,cmd){
+  const h=_getCmdHist(name,tab);
+  if(cmd&&(h.cmds[0]!==cmd))h.cmds.unshift(cmd);
+  if(h.cmds.length>50)h.cmds.length=50;
+  h.idx=-1;
+}
+function _histNav(e,name,tab){
+  const h=_getCmdHist(name,tab);
+  if(!h.cmds.length)return false;
+  const input=document.getElementById('cmd-'+tab+'-'+name);
+  if(!input)return false;
+  // Only navigate history when cursor is at start/end of single-line input
+  const single=input.value.indexOf('\n')<0;
+  if(!single)return false;
+  if(e.key==='ArrowUp'){
+    e.preventDefault();
+    h.idx=Math.min(h.idx+1,h.cmds.length-1);
+    input.value=h.cmds[h.idx]||'';
+    input.selectionStart=input.selectionEnd=input.value.length;
+    autoGrow(input);
+    return true;
+  }
+  if(e.key==='ArrowDown'){
+    e.preventDefault();
+    h.idx=Math.max(h.idx-1,-1);
+    input.value=h.idx<0?'':h.cmds[h.idx];
+    input.selectionStart=input.selectionEnd=input.value.length;
+    autoGrow(input);
+    return true;
+  }
+  return false;
+}
 function handleChatKey(e,name){
+  if(_histNav(e,name,'chat'))return;
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
 }
 function handleRawKey(e,name){
+  if(_histNav(e,name,'raw'))return;
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd(name,'raw')}
 }
 
@@ -4878,6 +4920,7 @@ async function sendChat(name){
   if(!input)return;
   const cmd=input.value.trim();
   if(!cmd)return;
+  _histPush(name,'chat',cmd);
   input.disabled=true;
   // Show user bubble immediately
   appendChatBubble(name,'user',cmd,Date.now()/1000);
@@ -4992,6 +5035,7 @@ async function sendCmd(name,source){
   if(!input)return;
   const cmd=input.value.trim();
   if(!cmd)return;
+  _histPush(name,source,cmd);
   input.disabled=true;
   // Also record in chat
   appendChatBubble(name,'user',cmd,Date.now()/1000);
@@ -6576,6 +6620,21 @@ async function executeBroadcast(){
     }catch{fail++;}
   }));
   if(fail)alert(\`Broadcast: \${ok} sent, \${fail} failed.\`);
+}
+
+// ==================== Jump to Bottom + Command History ====================
+function updateJumpBtn(name,chatEl){
+  const btn=document.getElementById('jump-btn-'+name);
+  if(!btn)return;
+  const distFromBottom=chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight;
+  if(distFromBottom>120)btn.classList.add('visible');
+  else btn.classList.remove('visible');
+}
+function jumpToBottom(name){
+  const chatEl=document.getElementById('chat-'+name);
+  if(chatEl){chatEl.scrollTop=chatEl.scrollHeight;}
+  const btn=document.getElementById('jump-btn-'+name);
+  if(btn)btn.classList.remove('visible');
 }
 
 loadAll();
