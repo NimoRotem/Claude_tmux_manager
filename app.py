@@ -4234,6 +4234,9 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
+.nav-item.done .nav-session-id{text-decoration:line-through;color:#484f58}
+.nav-done-btn{background:none;border:none;color:#484f58;cursor:pointer;font-size:.8rem;padding:0 2px;line-height:1;flex-shrink:0}
+.nav-done-btn.done{color:#3fb950}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -4697,6 +4700,38 @@ setInterval(()=>{
   for(const name of Object.keys(_snoozed)){if(Date.now()>=_snoozed[name]){delete _snoozed[name];changed=true;showToast(name+' unsnooze','info',2000);}}
   if(changed)filterSessionsNav(document.getElementById('nav-search')?.value||'');
 },30000);
+// ── Session mark-as-done ──
+function isSessionDone(name){return localStorage.getItem('tmux-done-'+name)==='1';}
+function toggleSessionDone(name){
+  const isDone=isSessionDone(name);
+  if(isDone)localStorage.removeItem('tmux-done-'+name);
+  else localStorage.setItem('tmux-done-'+name,'1');
+  const item=document.getElementById('nav-'+name);
+  if(item)item.classList.toggle('done',!isDone);
+  const btn=item&&item.querySelector('.nav-done-btn');
+  if(btn)btn.classList.toggle('done',!isDone);
+  showToast(name+(isDone?' marked active':' marked done'),isDone?'info':'success',2000);
+}
+// ── Send to all sessions ──
+async function sendToAll(fromName){
+  const input=document.getElementById('cmd-chat-'+fromName);
+  if(!input)return;
+  const cmd=input.value.trim();
+  if(!cmd)return;
+  const targets=sessions.filter(s=>s.name!==fromName);
+  if(!targets.length){showToast('No other sessions to send to','warn',2500);return;}
+  let ok=0,fail=0;
+  await Promise.all(targets.map(async s=>{
+    try{
+      await fetch(BASE+'/api/sessions/'+s.name+'/send',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({command:cmd})
+      });
+      ok++;
+    }catch{fail++;}
+  }));
+  showToast('Sent to '+ok+' session'+(ok!==1?'s':'')+(fail?' ('+fail+' failed)':''),'success',3000);
+}
 // ── Session duplication ──
 async function duplicateSession(name){
   try{
@@ -4775,7 +4810,7 @@ function renderNav(){
   });
   sorted.forEach(s=>{
     const item=document.createElement('div');
-    item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'');
+    item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'')+(isSessionDone(s.name)?' done':'');
     item.id='nav-'+s.name;
     item.draggable=true;
     item.addEventListener('dragstart',e=>onNavDragStart(e,s.name));
@@ -4808,6 +4843,7 @@ function renderNav(){
         <span class="nav-cost" id="nav-cost-${s.name}"></span>
         <span class="nav-health good" id="nav-health-${s.name}" title="Session health"></span>
         <span id="spark-${s.name}">${renderSparkline(s.name)}</span>
+        <button class="nav-done-btn ${isSessionDone(s.name)?'done':''}" onclick="event.stopPropagation();toggleSessionDone('${esc(s.name)}')" title="Mark as done">&#x2713;</button>
         <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
     navEl.appendChild(item);
@@ -4906,6 +4942,7 @@ function renderDetail(){
             autocomplete="off" spellcheck="false"></textarea>
           <span class="cmd-char-count" id="chat-cc-${s.name}"></span>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="btn cmd-send" onclick="sendToAll('${s.name}')" title="Send to all sessions" style="background:#161b22;font-size:.7rem;padding:12px 10px;border-left:1px solid #21262d">All</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
