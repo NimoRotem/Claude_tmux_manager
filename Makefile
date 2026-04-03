@@ -1,11 +1,14 @@
-.PHONY: test lint lint-fix run run-dev backup backup-data restore-check install help
+.PHONY: test test-fast coverage check lint lint-fix run run-dev backup backup-data restore-check install help
 
 PORT ?= 8501
 
 help:
 	@echo "tmux Dashboard — common development commands"
 	@echo ""
-	@echo "  make test          Run full test suite"
+	@echo "  make test          Run full test suite (verbose)"
+	@echo "  make test-fast     Run tests without coverage (faster)"
+	@echo "  make coverage      Run tests and open HTML coverage report"
+	@echo "  make check         Run lint then full test suite"
 	@echo "  make lint          Check code with ruff"
 	@echo "  make lint-fix      Auto-fix ruff violations"
 	@echo "  make run           Start server (requires TMUX_DASH_PASS)"
@@ -23,6 +26,15 @@ help:
 
 test:
 	python3 -m pytest test_app.py test_api.py -v
+
+test-fast:
+	python3 -m pytest test_app.py test_api.py -q
+
+coverage:
+	python3 -m pytest test_app.py test_api.py --cov=app --cov-report=term-missing --cov-report=html -q
+	@echo "HTML report written to htmlcov/index.html"
+
+check: lint test
 
 lint:
 	python3 -m ruff check app.py test_app.py test_api.py

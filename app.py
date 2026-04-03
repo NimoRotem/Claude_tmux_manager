@@ -4419,6 +4419,19 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
 .stats-bar-fill{height:100%;border-radius:3px;transition:width .3s}
 .stats-close{background:none;border:none;color:#8b949e;cursor:pointer;font-size:1.2rem;padding:0 4px}
 .stats-close:hover{color:#f0f6fc}
+/* Toast notifications */
+#toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:.82rem;color:#c9d1d9;max-width:320px;pointer-events:auto;animation:toast-in .25s ease;display:flex;align-items:center;gap:8px;box-shadow:0 4px 16px #00000066}
+.toast.success{border-color:#238636;background:#0d2818}
+.toast.warn{border-color:#d29922;background:#271d05}
+.toast.error{border-color:#da3633;background:#2d0b0b}
+@keyframes toast-in{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+@keyframes toast-out{from{opacity:1}to{opacity:0}}
+/* Code block copy buttons in markdown */
+.code-block-wrap{position:relative}
+.code-copy-btn{position:absolute;top:6px;right:6px;font-size:.65rem;padding:2px 8px;border-radius:3px;border:1px solid #30363d;background:#21262d;color:#6e7681;cursor:pointer;transition:all .15s;font-family:inherit;opacity:0}
+.code-block-wrap:hover .code-copy-btn{opacity:1}
+.code-copy-btn:hover{border-color:#58a6ff;color:#58a6ff}
 
 /* CLAUDE.md editor modal */
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
@@ -4486,9 +4499,10 @@ body.focus-mode .main{max-width:none;padding:8px 16px}
   <div id="auth-dropdown-content"></div>
 </div>
 <div class="rate-alarm" id="rate-alarm"></div>
+<div id="toast-container"></div>
 <div class="main" id="main"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
-  <div class="modal" id="modal-content" role="dialog" aria-modal="true"></div>
+  <div class="modal" id="modal-content" role="dialog" aria-modal="true" aria-labelledby="modal-title"></div>
 </div>
 <!-- Stats overlay -->
 <div class="stats-overlay" id="stats-overlay" onclick="if(event.target===this)closeStats()">
@@ -4586,6 +4600,34 @@ function fmtTime(ts){
   if(!ts)return'';
   const d=new Date(ts*1000);
   return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+function showToast(msg,type='info',duration=3000){
+  const container=document.getElementById('toast-container');
+  if(!container)return;
+  const el=document.createElement('div');
+  el.className='toast'+(type!=='info'?' '+type:'');
+  el.textContent=msg;
+  container.appendChild(el);
+  setTimeout(()=>{
+    el.style.animation='toast-out .3s ease forwards';
+    setTimeout(()=>el.remove(),300);
+  },duration);
+}
+function copyCodeBlock(btn){
+  const code=btn.parentElement.querySelector('code');
+  if(!code)return;
+  const text=code.innerText||code.textContent;
+  navigator.clipboard.writeText(text).then(()=>{
+    btn.textContent='copied!';
+    showToast('Code copied','success',1800);
+    setTimeout(()=>{btn.textContent='copy';},1500);
+  }).catch(()=>{
+    const ta=document.createElement('textarea');
+    ta.value=text;document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy');btn.textContent='copied!';}catch(e){}
+    document.body.removeChild(ta);
+    setTimeout(()=>{btn.textContent='copy';},1500);
+  });
 }
 function esc(str){
   if(!str)return'';
@@ -5472,7 +5514,7 @@ function closeModal(){document.getElementById('modal-overlay').classList.remove(
 function showCreateModal(){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>New tmux session</h3>
+    <h3 id="modal-title">New tmux session</h3>
     <p>Leave blank for an auto-assigned name, or enter a custom name.</p>
     <input type="text" class="modal-input" id="new-session-name"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
@@ -5510,7 +5552,7 @@ async function createSession(){
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>Kill session ${esc(name)}?</h3>
+    <h3 id="modal-title">Kill session ${esc(name)}?</h3>
     <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
@@ -6409,6 +6451,7 @@ function copyMsg(btn){
   if(navigator.clipboard&&window.isSecureContext){
     navigator.clipboard.writeText(text).then(()=>{
       btn.textContent='copied!';btn.classList.add('copied');
+      showToast('Copied to clipboard','success',1800);
       setTimeout(()=>{btn.textContent='copy';btn.classList.remove('copied')},1500);
     }).catch(()=>fallbackCopy(btn,text));
   }else{
@@ -6686,7 +6729,7 @@ document.addEventListener('keydown',function(e){
 function showKeyboardHelp(){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>Keyboard Shortcuts</h3>
+    <h3 id="modal-title">Keyboard Shortcuts</h3>
     <table style="width:100%;border-collapse:collapse;font-size:.85rem;margin-top:12px">
       <tr style="color:#6e7681;font-size:.72rem"><th style="text-align:left;padding:4px 8px">Key</th><th style="text-align:left;padding:4px 8px">Action</th></tr>
       <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+K</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Open command palette</td></tr>
@@ -6799,7 +6842,7 @@ function renderMarkdown(raw){
   let s=raw.replace(/```([\w.-]*)\n?([\s\S]*?)```/g,(_, lang, code)=>{
     const idx=blocks.length;
     const langAttr=lang?lang.toLowerCase():'';
-    blocks.push(`<pre><code class="code-block${langAttr?' lang-'+langAttr:''}">${escMd(code.replace(/\n$/,''))}</code></pre>`);
+    blocks.push(`<div class="code-block-wrap"><button class="code-copy-btn" onclick="copyCodeBlock(this)">copy</button><pre><code class="code-block${langAttr?' lang-'+langAttr:''}">${escMd(code.replace(/\n$/,''))}</code></pre></div>`);
     return'\x00B'+idx+'\x00';
   });
   // Step 2: Escape remaining HTML
@@ -6880,7 +6923,7 @@ function openAddCustomCmd(name){
       ${cmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
         <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
         <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
-        <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
+        <button onclick="removeCustomCmd(${i})" title="Remove command" aria-label="Remove command" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
       </div>`).join('')}
     </div>
     <div style="display:flex;gap:8px;margin-bottom:8px">

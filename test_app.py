@@ -649,6 +649,19 @@ class TestDetectActivityHysteresis:
         assert result["status"] == "busy"
         assert _activity_state["test-sess"]["consecutive_idle"] == 0
 
+    @patch("app._detect_activity_raw")
+    def test_fallback_for_unexpected_status(self, mock_raw):
+        """Covers lines 1075-1081: fallback when raw status is not busy/idle/unknown."""
+        # Pre-populate state so prev is not None
+        _activity_state["test-sess"] = {
+            "status": "idle", "since": 0, "consecutive_idle": 1, "raw": {}
+        }
+        # Return a status that doesn't match any of the handled cases
+        mock_raw.return_value = {"status": "custom_status", "command": "custom", "detail": ""}
+        result = detect_activity("test-sess")
+        assert result["status"] == "custom_status"
+        assert _activity_state["test-sess"]["consecutive_idle"] == 0
+
 
 # ─── build_session_response Tests ───
 
