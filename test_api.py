@@ -3479,7 +3479,9 @@ class TestAwayWaitForIdle:
         act_idx = [0]
 
         async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]; act_idx[0] += 1; return v
+            v = activity_vals[act_idx[0]]
+            act_idx[0] += 1
+            return v
 
         async def noop_sleep(_secs):
             pass
@@ -3504,7 +3506,9 @@ class TestAwayWaitForIdle:
         act_idx = [0]
 
         async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]; act_idx[0] += 1; return v
+            v = activity_vals[act_idx[0]]
+            act_idx[0] += 1
+            return v
 
         async def noop_sleep(_secs):
             pass
@@ -3531,7 +3535,9 @@ class TestAwayWaitForIdle:
         act_idx = [0]
 
         async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]; act_idx[0] += 1; return v
+            v = activity_vals[act_idx[0]]
+            act_idx[0] += 1
+            return v
 
         async def noop_sleep(_secs):
             pass
@@ -3556,7 +3562,6 @@ class TestRestoreAutonomousMode:
         """Normal restore: session exists, idle, sends prompt, enters continuous loop."""
         import app as _app
 
-        log_entries = []
         loop_called = []
 
         async def noop_sleep(_secs):
@@ -3667,6 +3672,7 @@ class TestWatchdogLoop:
     async def test_no_active_sessions_clears_snapshots(self):
         """Lines 2742-2745: when no active sessions, snapshots are cleared then loop runs once."""
         import asyncio as _asyncio
+
         import app as _app
 
         sleep_count = 0
@@ -3700,6 +3706,7 @@ class TestWatchdogLoop:
         live session and a zombie session.
         """
         import asyncio as _asyncio
+
         import app as _app
 
         sleep_count = 0
@@ -3741,3 +3748,1261 @@ class TestWatchdogLoop:
 
         assert any(name == "zombie-sess" and mode == "away"
                    for name, mode in restart_calls)
+
+
+# ─── api_create_session with cwd ───
+
+
+class TestCreateSessionCwd:
+    """Cover line 1592: api_create_session appends -c when cwd is a valid directory."""
+
+    @patch("app.get_tmux_sessions", return_value=[])
+    @patch("app.asyncio.to_thread", new_callable=AsyncMock)
+    def test_create_session_with_valid_cwd_adds_c_flag(
+        self, mock_to_thread, mock_sessions, authed_client, tmp_path
+    ):
+        """Line 1592: -c flag is appended to the tmux command when cwd is a real directory."""
+        import app as _app
+
+        mock_to_thread.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        mock_sessions.side_effect = [
+            [],  # initial duplicate check
+            [{"name": "cwd-sess", "windows": "1", "created": "0", "attached": False}],  # after create
+        ]
+        resp = authed_client.post(
+            "/api/sessions/create",
+            json={"name": "cwd-sess", "cwd": str(tmp_path)},
+        )
+        assert resp.status_code == 200
+        # Verify -c appeared in the tmux command args
+        call_args = mock_to_thread.call_args_list[0]
+        cmd = call_args[0][1]  # positional arg 1 is the command list
+        assert "-c" in cmd
+        assert str(tmp_path) in cmd
+
+
+# ─── _away_send_prompt ───
+
+
+class TestAwaySendPrompt:
+    """Cover lines 3107-3201: _away_send_prompt."""
+
+    @pytest.mark.asyncio
+    async def test_busy_detected_returns_early(self):
+        """Lines 3160-3162: if session is busy after paste, returns immediately."""
+        import app as _app
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app.capture_pane_recent:
+                return "snapshot"
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def mock_activity(session_name):
+            return {"status": "busy"}
+
+        async def noop_sleep(_secs):
+            pass
+
+        with patch("app.asyncio.to_thread", mock_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            await _app._away_send_prompt("test-sess", "hello prompt")
+        # If we reach here without exception, the function returned successfully
+
+    @pytest.mark.asyncio
+    async def test_terminal_changed_detected(self):
+        """Lines 3165-3168: if pre/post snapshot differs, returns without retry."""
+        import app as _app
+
+        snapshot_count = [0]
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app.capture_pane_recent:
+                snapshot_count[0] += 1
+                # pre-snapshot returns "before", post-snapshot returns "after"
+                return "before" if snapshot_count[0] == 1 else "after"
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}  # Not busy — will check snapshot diff
+
+        async def noop_sleep(_secs):
+            pass
+
+        with patch("app.asyncio.to_thread", mock_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            await _app._away_send_prompt("test-sess", "hello prompt")
+        # Terminal content changed → function returned early (line 3168)
+
+    @pytest.mark.asyncio
+    async def test_all_retries_fail_logs_and_returns(self):
+        """Lines 3170-3175: all 3 Enter retries fail (same content), function returns."""
+        import app as _app
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app.capture_pane_recent:
+                return "same content"  # Never changes
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}  # Always idle
+
+        async def noop_sleep(_secs):
+            pass
+
+        with patch("app.asyncio.to_thread", mock_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            await _app._away_send_prompt("test-sess", "hello " * 200)
+        # All retries failed, "Pasted text" not detected, function returns normally
+
+    @pytest.mark.asyncio
+    async def test_stuck_paste_preview_cleared(self):
+        """Lines 3179-3191: 'Pasted text' in recent output triggers Escape + resend."""
+        import app as _app
+
+        call_count = [0]
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app.capture_pane_recent:
+                call_count[0] += 1
+                # Pre-snapshot (call 1) and post-snapshot (calls 2,3,4) and recent check (call 5)
+                if call_count[0] == 5:
+                    return "Pasted text +10 lines in buffer"  # Stuck paste!
+                return "same"
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        ctrl_c_calls = []
+
+        async def mock_ctrl_c(session_name):
+            ctrl_c_calls.append(session_name)
+
+        async def noop_sleep(_secs):
+            pass
+
+        with patch("app.asyncio.to_thread", mock_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app._send_ctrl_c", mock_ctrl_c), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            await _app._away_send_prompt("test-sess", "hello prompt")
+        assert ctrl_c_calls == ["test-sess"]  # _send_ctrl_c was called during paste recovery
+
+    @pytest.mark.asyncio
+    async def test_activity_exception_treated_as_unknown(self):
+        """Lines 3157-3158: when async_detect_activity raises, activity = unknown."""
+        import app as _app
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app.capture_pane_recent:
+                return "snapshot"
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def failing_activity(session_name):
+            raise RuntimeError("tmux connection lost")
+
+        async def noop_sleep(_secs):
+            pass
+
+        # If unknown status → not busy → snapshot check → same → retry loop × 3
+        # Function should return without error despite activity failure
+        with patch("app.asyncio.to_thread", mock_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", failing_activity), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            await _app._away_send_prompt("test-sess", "hello prompt")
+        # Function completes normally (3 retries attempted, no crash)
+
+    @pytest.mark.asyncio
+    async def test_exception_during_paste_logged(self):
+        """Lines 3193-3200: exception during send is caught and logged, finally cleans up."""
+        import app as _app
+
+        async def failing_to_thread(fn, *args, **kwargs):
+            raise OSError("tmux not found")
+
+        async def noop_sleep(_secs):
+            pass
+
+        with patch("app.asyncio.to_thread", failing_to_thread), \
+             patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
+             patch("app.os.close"), \
+             patch("app.os.unlink"):
+            # Should not raise — exception caught internally
+            await _app._away_send_prompt("test-sess", "hello prompt")
+
+
+# ─── _restore_autonomous_mode additional paths ───
+
+
+class TestRestoreAutonomousModeExtra:
+    """Cover lines 2686-2698, 2713-2720: busy-wait path and claude-dead path in restore."""
+
+    @pytest.mark.asyncio
+    async def test_restore_waits_when_busy(self):
+        """Lines 2686-2687: if session is busy on restore, wait for idle before sending."""
+        import app as _app
+
+        wait_called = []
+
+        async def noop_sleep(_secs):
+            pass
+
+        async def mock_activity(session_name):
+            return {"status": "busy"}  # Session is busy when restoring
+
+        async def mock_wait_idle(session_name, timeout=900):
+            wait_called.append(session_name)
+
+        async def mock_ensure_claude(session_name, log_fn=None, state=None):
+            return True
+
+        async def mock_send_prompt(session_name, prompt):
+            pass
+
+        async def mock_loop(session_name):
+            pass
+
+        state = {"enabled": True, "phase": 4, "step": 0, "log": []}
+        with patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app._away_wait_for_idle", mock_wait_idle), \
+             patch("app._ensure_claude_running", mock_ensure_claude), \
+             patch("app._away_send_prompt", mock_send_prompt), \
+             patch("app._away_mode_continuous_loop", mock_loop):
+            await _app._restore_autonomous_mode("busy-sess", state, "away")
+        assert wait_called == ["busy-sess"]  # _away_wait_for_idle was called
+
+    @pytest.mark.asyncio
+    async def test_restore_stops_when_claude_dead(self):
+        """Lines 2694-2698: if Claude Code can't be restarted, restore stops."""
+        import app as _app
+
+        loop_called = []
+
+        async def noop_sleep(_secs):
+            pass
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def mock_ensure_dead(session_name, log_fn=None, state=None):
+            return False  # Claude couldn't restart
+
+        async def mock_loop(session_name):
+            loop_called.append(session_name)
+
+        state = {"enabled": True, "phase": 4, "step": 0, "log": []}
+        with patch("app.asyncio.sleep", noop_sleep), \
+             patch("app.async_detect_activity", mock_activity), \
+             patch("app._ensure_claude_running", mock_ensure_dead), \
+             patch("app._away_mode_continuous_loop", mock_loop), \
+             patch("app._save_autonomous_state"):
+            await _app._restore_autonomous_mode("dead-sess", state, "away")
+        assert loop_called == []  # Loop NOT entered
+        assert state["enabled"] is False  # Disabled
+
+
+# ─── Watchdog go-nuts zombie detection ───
+
+
+class TestWatchdogGoNutsZombie:
+    """Cover lines 2760-2762: zombie go-nuts mode detection in _watchdog_loop."""
+
+    @pytest.mark.asyncio
+    async def test_zombie_go_nuts_detected_and_restarted(self):
+        """Lines 2760-2762: zombie go-nuts (enabled but task done) triggers restart."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        sleep_count = 0
+        restart_calls = []
+
+        async def counting_sleep(secs):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count >= 2:
+                raise _asyncio.CancelledError()
+
+        async def mock_restart(name, state, mode, wlog):
+            restart_calls.append((name, mode))
+
+        async def mock_check_session(session_name, state, mode, wlog):
+            pass
+
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        dead_task = MagicMock()
+        dead_task.done.return_value = True
+
+        live_state = {"enabled": True, "phase": 1, "step": 0, "log": [], "task": live_task}
+        zombie_gn_state = {"enabled": True, "phase": 2, "step": 0, "log": [], "task": dead_task}
+
+        _app._away_mode_state["live-sess-gn"] = live_state
+        _app._go_nuts_state["zombie-gn"] = zombie_gn_state
+        try:
+            with patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app._watchdog_restart_mode", mock_restart), \
+                 patch("app._watchdog_check_session", mock_check_session):
+                try:
+                    await _app._watchdog_loop()
+                except _asyncio.CancelledError:
+                    pass
+        finally:
+            _app._away_mode_state.pop("live-sess-gn", None)
+            _app._go_nuts_state.pop("zombie-gn", None)
+
+        assert any(name == "zombie-gn" and mode == "gonuts"
+                   for name, mode in restart_calls)
+
+
+# ─── _away_mode_worker paths ───
+
+
+class TestAwayModeWorkerPaths:
+    """Cover lines 3499-3610: _away_mode_worker exception, disabled, and cancel paths."""
+
+    @pytest.mark.asyncio
+    async def test_phase1_exception_is_skipped(self):
+        """Lines 3505-3507: exception in phase 1 is caught and logged, phase 2 continues."""
+        import app as _app
+
+        phase2_called = []
+
+        async def failing_phase1(session_name, state):
+            raise RuntimeError("Phase 1 broke!")
+
+        async def success_phase2(session_name, state):
+            phase2_called.append(True)
+
+        async def instant_execute(session_name, state):
+            pass  # Phase 3 does nothing
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["worker-test"] = state
+        try:
+            with patch("app._away_phase_study", failing_phase1), \
+                 patch("app._away_phase_select", success_phase2), \
+                 patch("app._away_phase_execute", instant_execute), \
+                 patch("app._away_mode_continuous_loop", None):
+                # Disable after phase 2 so worker exits before continuous loop
+                async def execute_and_disable(session_name, state):
+                    state["enabled"] = False
+
+                with patch("app._away_phase_execute", execute_and_disable):
+                    await _app._away_mode_worker("worker-test")
+        finally:
+            _app._away_mode_state.pop("worker-test", None)
+
+        assert phase2_called  # Phase 2 ran despite phase 1 error
+        assert state["task"] is None  # Cleaned up in finally
+
+    @pytest.mark.asyncio
+    async def test_disabled_after_phase1_exits_early(self):
+        """Lines 3509-3510: if disabled after phase 1, worker exits before phase 2."""
+        import app as _app
+
+        phase2_called = []
+
+        async def phase1_that_disables(session_name, state):
+            state["enabled"] = False  # Simulate user disabling during phase 1
+
+        async def phase2(session_name, state):
+            phase2_called.append(True)
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["worker-test2"] = state
+        try:
+            with patch("app._away_phase_study", phase1_that_disables), \
+                 patch("app._away_phase_select", phase2):
+                await _app._away_mode_worker("worker-test2")
+        finally:
+            _app._away_mode_state.pop("worker-test2", None)
+
+        assert not phase2_called  # Phase 2 was NOT reached
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_sets_disabled_and_reraises(self):
+        """Lines 3594-3598: CancelledError from phase sets enabled=False and re-raises."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        async def cancelling_phase1(session_name, state):
+            raise _asyncio.CancelledError()
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["worker-cancel"] = state
+        try:
+            with patch("app._away_phase_study", cancelling_phase1), \
+                 patch("app._save_autonomous_state"):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._away_mode_worker("worker-cancel")
+        finally:
+            _app._away_mode_state.pop("worker-cancel", None)
+
+        assert state["enabled"] is False  # Set to False on cancel
+        assert state["task"] is None      # Cleared in finally
+
+# ---------------------------------------------------------------------------
+# Phase 23 — High-coverage tests for remaining uncovered async paths
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResponderLoop:
+    """Tests for _auto_responder_loop (lines 2571-2612)."""
+
+    @pytest.mark.asyncio
+    async def test_detects_prompt_and_responds_with_enter(self):
+        """Full path: session found, not in cooldown, prompt detected, Enter sent."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        sleep_count = [0]
+
+        async def counting_sleep(secs):
+            sleep_count[0] += 1
+            # Exit after the initial delay + one interval sleep
+            if sleep_count[0] >= 2:
+                raise _asyncio.CancelledError()
+
+        mock_capture = MagicMock(returncode=0, stdout="❯ 1. Yes\n2. No\nWould you like to proceed")
+        mock_enter = MagicMock(returncode=0, stdout="")
+
+        call_seq = [0]
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            call_seq[0] += 1
+            # First call = capture-pane, second = send-keys Enter
+            if call_seq[0] == 1:
+                return mock_capture
+            return mock_enter
+
+        _app._auto_respond_cooldown.clear()
+        _app._auto_respond_log.clear()
+        try:
+            with patch("app.get_tmux_sessions", return_value=[{"name": "ar-sess"}]), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.asyncio.to_thread", mock_to_thread), \
+                 patch("app._detect_interactive_prompt", return_value="plan_approval"), \
+                 patch("app.time.time", return_value=1000.0):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._auto_responder_loop()
+        finally:
+            _app._auto_respond_cooldown.clear()
+            _app._auto_respond_log.clear()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_skips_session(self):
+        """Lines 2582-2583: session within cooldown window is skipped."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        sleep_count = [0]
+
+        async def counting_sleep(secs):
+            sleep_count[0] += 1
+            if sleep_count[0] >= 2:
+                raise _asyncio.CancelledError()
+
+        to_thread_called = [False]
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            to_thread_called[0] = True
+            return MagicMock(returncode=0, stdout="")
+
+        _app._auto_respond_cooldown["cd-sess"] = 995.0  # recent → within 10s cooldown
+        try:
+            with patch("app.get_tmux_sessions", return_value=[{"name": "cd-sess"}]), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.asyncio.to_thread", mock_to_thread), \
+                 patch("app.time.time", return_value=1000.0):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._auto_responder_loop()
+        finally:
+            _app._auto_respond_cooldown.pop("cd-sess", None)
+
+        assert not to_thread_called[0]
+
+    @pytest.mark.asyncio
+    async def test_tmux_capture_exception_is_silently_skipped(self):
+        """Lines 2590-2591: exception from to_thread capture continues."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        sleep_count = [0]
+
+        async def counting_sleep(secs):
+            sleep_count[0] += 1
+            if sleep_count[0] >= 2:
+                raise _asyncio.CancelledError()
+
+        async def failing_to_thread(fn, *args, **kwargs):
+            raise OSError("tmux not available")
+
+        _app._auto_respond_cooldown.clear()
+        try:
+            with patch("app.get_tmux_sessions", return_value=[{"name": "ex-sess"}]), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.asyncio.to_thread", failing_to_thread), \
+                 patch("app.time.time", return_value=1000.0):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._auto_responder_loop()
+        finally:
+            _app._auto_respond_cooldown.pop("ex-sess", None)
+
+    @pytest.mark.asyncio
+    async def test_outer_exception_continues_loop(self):
+        """Lines 2608-2609: outer except Exception keeps the loop running."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        sleep_count = [0]
+
+        async def counting_sleep(secs):
+            sleep_count[0] += 1
+            if sleep_count[0] == 1:
+                return  # initial delay passes
+            if sleep_count[0] == 2:
+                return  # first interval passes (exception will be raised after)
+            raise _asyncio.CancelledError()
+
+        call_count = [0]
+
+        async def mock_to_thread(fn, *args, **kwargs):
+            call_count[0] += 1
+            raise RuntimeError("unexpected failure")
+
+        _app._auto_respond_cooldown.clear()
+        try:
+            with patch("app.get_tmux_sessions", side_effect=[RuntimeError("boom"), []]), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.asyncio.to_thread", mock_to_thread), \
+                 patch("app.time.time", return_value=1000.0):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._auto_responder_loop()
+        finally:
+            _app._auto_respond_cooldown.clear()
+
+
+class TestGoNutsModeWorkerPaths:
+    """Tests for _go_nuts_mode_worker top-level paths (lines 3849-3870)."""
+
+    @pytest.mark.asyncio
+    async def test_phase1_exception_skipped_phase2_runs(self):
+        """Lines 3857-3862: phase 1 exception is caught and skipped."""
+        import app as _app
+
+        async def failing_phase1(session_name, state):
+            raise RuntimeError("Phase 1 boom")
+
+        phase2_called = [False]
+
+        async def noop_phase2(session_name, state):
+            phase2_called[0] = True
+
+        async def noop_phase(session_name, state):
+            pass
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._go_nuts_state["gn-test1"] = state
+
+        try:
+            with patch("app._go_nuts_phase_discover", failing_phase1), \
+                 patch("app._go_nuts_phase_backlog", noop_phase2), \
+                 patch("app._go_nuts_phase_build", noop_phase), \
+                 patch("app._save_autonomous_state"), \
+                 patch("app.asyncio.sleep", side_effect=RuntimeError("break")), \
+                 patch("app.async_detect_activity", return_value={"status": "idle"}):
+                try:
+                    await _app._go_nuts_mode_worker("gn-test1")
+                except RuntimeError:
+                    pass
+        finally:
+            _app._go_nuts_state.pop("gn-test1", None)
+
+        assert phase2_called[0]
+
+    @pytest.mark.asyncio
+    async def test_disabled_after_phase1_exits_early(self):
+        """Lines 3863-3864: worker exits early if disabled after phase 1."""
+        import app as _app
+
+        phase2_called = [False]
+
+        async def disabling_phase1(session_name, state):
+            state["enabled"] = False
+
+        async def noop_phase2(session_name, state):
+            phase2_called[0] = True
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._go_nuts_state["gn-test2"] = state
+
+        try:
+            with patch("app._go_nuts_phase_discover", disabling_phase1), \
+                 patch("app._go_nuts_phase_backlog", noop_phase2), \
+                 patch("app._save_autonomous_state"):
+                await _app._go_nuts_mode_worker("gn-test2")
+        finally:
+            _app._go_nuts_state.pop("gn-test2", None)
+
+        assert not phase2_called[0]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_sets_disabled_and_reraises(self):
+        """Lines 3945-3950: CancelledError propagates with enabled=False."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        async def cancelling_phase1(session_name, state):
+            raise _asyncio.CancelledError()
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._go_nuts_state["gn-cancel"] = state
+
+        try:
+            with patch("app._go_nuts_phase_discover", cancelling_phase1), \
+                 patch("app._save_autonomous_state"):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._go_nuts_mode_worker("gn-cancel")
+        finally:
+            _app._go_nuts_state.pop("gn-cancel", None)
+
+        assert state["enabled"] is False
+        assert state["task"] is None
+
+
+class TestAwayModeWorkerContinuousLoop:
+    """Tests for the phase 4+ continuous loop in _away_mode_worker (lines 3538-3594)."""
+
+    @pytest.mark.asyncio
+    async def test_one_cycle_then_disabled(self):
+        """Lines 3538-3594: runs one full ping cycle then exits when disabled."""
+        import app as _app
+
+        sleep_count = [0]
+        time_values = [0.0, 91.0, 91.0]
+        time_idx = [0]
+
+        async def counting_sleep(secs):
+            sleep_count[0] += 1
+            if secs == 5:  # sleep after successful cycle → disable
+                state["enabled"] = False
+
+        def mock_time():
+            val = time_values[min(time_idx[0], len(time_values) - 1)]
+            time_idx[0] += 1
+            return val
+
+        send_calls = [0]
+
+        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
+            send_calls[0] += 1
+
+        async def noop_ensure(session_name, log_fn=None, state=None):
+            return True
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def noop_phase(session_name, state):
+            pass
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["cont-away"] = state
+
+        try:
+            with patch("app._away_phase_study", noop_phase), \
+                 patch("app._away_phase_select", noop_phase), \
+                 patch("app._away_phase_execute", noop_phase), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", noop_ensure), \
+                 patch("app._away_send_and_wait", mock_send_wait), \
+                 patch("app._save_autonomous_state"):
+                await _app._away_mode_worker("cont-away")
+        finally:
+            _app._away_mode_state.pop("cont-away", None)
+
+        assert send_calls[0] == 1
+        assert state["step"] == 1
+        assert state["phase"] == 4
+        assert state["task"] is None
+
+    @pytest.mark.asyncio
+    async def test_claude_dead_stops_loop(self):
+        """Lines 3554-3559: Claude dead and can't restart → stop."""
+        import app as _app
+
+        async def counting_sleep(secs):
+            pass  # all sleeps are instant
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        time_idx = [0]
+        time_vals = [0.0, 91.0]
+
+        def mock_time():
+            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
+            time_idx[0] += 1
+            return val
+
+        async def dead_ensure(session_name, log_fn=None, state=None):
+            return False  # Claude dead, can't restart
+
+        async def noop_phase(session_name, state):
+            pass
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["dead-away"] = state
+
+        try:
+            with patch("app._away_phase_study", noop_phase), \
+                 patch("app._away_phase_select", noop_phase), \
+                 patch("app._away_phase_execute", noop_phase), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._save_autonomous_state"):
+                await _app._away_mode_worker("dead-away")
+        finally:
+            _app._away_mode_state.pop("dead-away", None)
+
+        assert state["enabled"] is False
+        assert state["task"] is None
+
+
+class TestGoNutsModeWorkerContinuousLoop:
+    """Tests for the phase 4+ continuous loop in _go_nuts_mode_worker (lines 3883-3958)."""
+
+    @pytest.mark.asyncio
+    async def test_one_cycle_then_disabled(self):
+        """Lines 3883-3958: go-nuts runs one full build cycle then exits."""
+        import app as _app
+
+        time_values = [0.0, 91.0, 91.0]
+        time_idx = [0]
+
+        async def counting_sleep(secs):
+            if secs == 5:
+                state["enabled"] = False
+
+        def mock_time():
+            val = time_values[min(time_idx[0], len(time_values) - 1)]
+            time_idx[0] += 1
+            return val
+
+        send_calls = [0]
+
+        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
+            send_calls[0] += 1
+
+        async def noop_ensure(session_name, log_fn=None, state=None):
+            return True
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def noop_phase(session_name, state):
+            pass
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._go_nuts_state["cont-gn"] = state
+
+        try:
+            with patch("app._go_nuts_phase_discover", noop_phase), \
+                 patch("app._go_nuts_phase_backlog", noop_phase), \
+                 patch("app._go_nuts_phase_build", noop_phase), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", noop_ensure), \
+                 patch("app._go_nuts_send_and_wait", mock_send_wait), \
+                 patch("app._save_autonomous_state"):
+                await _app._go_nuts_mode_worker("cont-gn")
+        finally:
+            _app._go_nuts_state.pop("cont-gn", None)
+
+        assert send_calls[0] == 1
+        assert state["step"] == 1
+        assert state["phase"] == 4
+        assert state["task"] is None
+
+    @pytest.mark.asyncio
+    async def test_claude_dead_stops_loop(self):
+        """Go-nuts: Claude dead → stops loop."""
+        import app as _app
+
+        async def counting_sleep(secs):
+            pass
+
+        time_idx = [0]
+        time_vals = [0.0, 91.0]
+
+        def mock_time():
+            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
+            time_idx[0] += 1
+            return val
+
+        async def dead_ensure(session_name, log_fn=None, state=None):
+            return False
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def noop_phase(session_name, state):
+            pass
+
+        state = {
+            "enabled": True, "phase": 0, "phase_name": "Init",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._go_nuts_state["dead-gn"] = state
+
+        try:
+            with patch("app._go_nuts_phase_discover", noop_phase), \
+                 patch("app._go_nuts_phase_backlog", noop_phase), \
+                 patch("app._go_nuts_phase_build", noop_phase), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._save_autonomous_state"):
+                await _app._go_nuts_mode_worker("dead-gn")
+        finally:
+            _app._go_nuts_state.pop("dead-gn", None)
+
+        assert state["enabled"] is False
+
+
+class TestAutonomousContinuousLoop:
+    """Tests for _autonomous_continuous_loop (lines 2969-3037, watchdog restart path)."""
+
+    @pytest.mark.asyncio
+    async def test_one_cycle_then_disabled(self):
+        """Full path: idles, sends ping, completes cycle, exits when disabled."""
+        import app as _app
+
+        time_values = [0.0, 91.0, 91.0]
+        time_idx = [0]
+
+        async def counting_sleep(secs):
+            if secs == 5:
+                state["enabled"] = False
+
+        def mock_time():
+            val = time_values[min(time_idx[0], len(time_values) - 1)]
+            time_idx[0] += 1
+            return val
+
+        send_calls = [0]
+
+        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
+            send_calls[0] += 1
+
+        async def noop_ensure(session_name, log_fn=None, state=None):
+            return True
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def noop_wait_idle(session_name, timeout=900):
+            return True
+
+        state = {
+            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["acl-test"] = state
+
+        try:
+            with patch("app._away_wait_for_idle", noop_wait_idle), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", noop_ensure), \
+                 patch("app._save_autonomous_state"):
+                await _app._autonomous_continuous_loop(
+                    "acl-test",
+                    state=state,
+                    log_fn=_app._away_log,
+                    logger=__import__("logging").getLogger("test"),
+                    mode_name="Away mode",
+                    cycle_label="Ping cycle",
+                    ping_label="task ping",
+                    send_and_wait_fn=mock_send_wait,
+                    ping_prompt="ping!",
+                )
+        finally:
+            _app._away_mode_state.pop("acl-test", None)
+
+        assert send_calls[0] == 1
+        assert state["task"] is None
+
+    @pytest.mark.asyncio
+    async def test_claude_dead_stops_loop(self):
+        """Lines 2996-3001: Claude dead → loop stops."""
+        import app as _app
+
+        async def counting_sleep(secs):
+            pass
+
+        time_idx = [0]
+        time_vals = [0.0, 91.0]
+
+        def mock_time():
+            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
+            time_idx[0] += 1
+            return val
+
+        async def dead_ensure(session_name, log_fn=None, state=None):
+            return False
+
+        async def mock_activity(session_name):
+            return {"status": "idle"}
+
+        async def noop_wait_idle(session_name, timeout=900):
+            return True
+
+        state = {
+            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["acl-dead"] = state
+
+        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
+            pass
+
+        try:
+            with patch("app._away_wait_for_idle", noop_wait_idle), \
+                 patch("app.asyncio.sleep", counting_sleep), \
+                 patch("app.async_detect_activity", mock_activity), \
+                 patch("app.time.time", mock_time), \
+                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._save_autonomous_state"):
+                await _app._autonomous_continuous_loop(
+                    "acl-dead",
+                    state=state,
+                    log_fn=_app._away_log,
+                    logger=__import__("logging").getLogger("test"),
+                    mode_name="Away mode",
+                    cycle_label="Ping cycle",
+                    ping_label="task ping",
+                    send_and_wait_fn=mock_send_wait,
+                    ping_prompt="ping!",
+                )
+        finally:
+            _app._away_mode_state.pop("acl-dead", None)
+
+        assert state["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_sets_disabled_and_reraises(self):
+        """Lines 3025-3030: CancelledError from inner loop propagates correctly."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        async def cancelling_wait_idle(session_name, timeout=900):
+            raise _asyncio.CancelledError()
+
+        state = {
+            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
+            "step": 0, "step_name": "", "started_at": 0.0,
+            "log": [], "report": "", "task": None,
+        }
+        _app._away_mode_state["acl-cancel"] = state
+
+        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
+            pass
+
+        try:
+            with patch("app._away_wait_for_idle", cancelling_wait_idle), \
+                 patch("app._save_autonomous_state"):
+                with pytest.raises(_asyncio.CancelledError):
+                    await _app._autonomous_continuous_loop(
+                        "acl-cancel",
+                        state=state,
+                        log_fn=_app._away_log,
+                        logger=__import__("logging").getLogger("test"),
+                        mode_name="Away mode",
+                        cycle_label="Ping cycle",
+                        ping_label="task ping",
+                        send_and_wait_fn=mock_send_wait,
+                        ping_prompt="ping!",
+                    )
+        finally:
+            _app._away_mode_state.pop("acl-cancel", None)
+
+        assert state["enabled"] is False
+        assert state["task"] is None
+
+
+class TestWatchdogCheckSession:
+    """Tests for _watchdog_check_session (lines 2774-2882)."""
+
+    @pytest.mark.asyncio
+    async def test_empty_pane_returns_early(self):
+        """Lines 2775-2779: empty pane → return immediately."""
+        import app as _app
+
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+        state = {"enabled": True, "log": []}
+
+        with patch("app.asyncio.to_thread", return_value="   "):
+            await _app._watchdog_check_session("empty-sess", state, "away", wlog)
+        # No assertion needed — function returned without error
+
+    @pytest.mark.asyncio
+    async def test_new_content_resets_snapshot(self):
+        """Lines 2781-2790: new content hash → reset snapshot, return."""
+        import app as _app
+
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+        state = {"enabled": True, "log": []}
+
+        _app._watchdog_snapshots.pop("snap-sess", None)
+        try:
+            with patch("app.asyncio.to_thread", return_value="new terminal content here"), \
+                 patch("app.time.time", return_value=1000.0):
+                await _app._watchdog_check_session("snap-sess", state, "away", wlog)
+        finally:
+            _app._watchdog_snapshots.pop("snap-sess", None)
+
+        # Snapshot was created — now call again with SAME content → stall detected but < threshold
+        snap = _app._watchdog_snapshots.get("snap-sess")
+        assert snap is not None
+        assert snap["nudge_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stall_below_threshold_returns_early(self):
+        """Lines 2793-2795: stall detected but < _STALL_THRESHOLD → return."""
+        import app as _app
+
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+        state = {"enabled": True, "log": []}
+
+        # Pre-seed a snapshot with same content hash
+        import hashlib
+
+        content = "unchanged terminal output"
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        _app._watchdog_snapshots["thresh-sess"] = {
+            "content_hash": content_hash,
+            "first_seen": 900.0,  # 100s ago at now=1000
+            "nudge_count": 0,
+            "last_nudge": 0,
+        }
+        try:
+            with patch("app.asyncio.to_thread", return_value=content), \
+                 patch("app.time.time", return_value=1000.0), \
+                 patch("app._STALL_THRESHOLD", 600):  # threshold = 600s, stall = 100s < 600
+                await _app._watchdog_check_session("thresh-sess", state, "away", wlog)
+        finally:
+            _app._watchdog_snapshots.pop("thresh-sess", None)
+
+    @pytest.mark.asyncio
+    async def test_stall_llm_says_stuck_triggers_nudge(self):
+        """Lines 2801-2879: LLM says STUCK → nudge sent."""
+        import app as _app
+
+        import hashlib
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+        state = {"enabled": True, "log": []}
+
+        content = "stuck terminal output"
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        _app._watchdog_snapshots["nudge-sess"] = {
+            "content_hash": content_hash,
+            "first_seen": 0.0,  # 1000s ago
+            "nudge_count": 0,
+            "last_nudge": 0.0,
+        }
+
+        nudge_called = [False]
+
+        async def mock_send_prompt(session_name, prompt):
+            nudge_called[0] = True
+
+        try:
+            with patch("app.asyncio.to_thread", return_value=content), \
+                 patch("app.time.time", return_value=1000.0), \
+                 patch("app._STALL_THRESHOLD", 10), \
+                 patch("app._async_is_claude_running", return_value=True), \
+                 patch("app.llm_call", return_value="STUCK"), \
+                 patch("app.async_detect_activity",
+                       return_value={"status": "idle"}), \
+                 patch("app._away_send_prompt", mock_send_prompt), \
+                 patch("app._NUDGE_COOLDOWN", 0), \
+                 patch("app._MAX_NUDGES_BEFORE_RESTART", 3):
+                await _app._watchdog_check_session("nudge-sess", state, "away", wlog)
+        finally:
+            _app._watchdog_snapshots.pop("nudge-sess", None)
+
+        assert nudge_called[0]
+
+
+class TestWatchdogRestartMode:
+    """Tests for _watchdog_restart_mode (lines 2887-2950)."""
+
+    @pytest.mark.asyncio
+    async def test_away_mode_restart_launches_continuous_loop(self):
+        """Lines 2887-2950: restart cancels old task, sends unstick, creates new task."""
+        import asyncio as _asyncio
+
+        import app as _app
+
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+
+        old_task = MagicMock()
+        old_task.done.return_value = False
+        old_task.cancel = MagicMock()
+
+        state = {
+            "enabled": True, "log": ["existing log"],
+            "started_at": 100.0, "step": 3,
+            "phase": 2, "phase_name": "Phase 2",
+            "task": old_task,
+        }
+        _app._away_mode_state["restart-test"] = state
+
+        send_calls = [0]
+
+        async def mock_send_prompt(session_name, prompt):
+            send_calls[0] += 1
+
+        async def mock_ctrl_c(session_name):
+            pass
+
+        async def mock_ensure(session_name, log_fn=None, state=None):
+            return True
+
+        async def instant_continuous(session_name):
+            pass
+
+        try:
+            with patch("app._send_ctrl_c", mock_ctrl_c), \
+                 patch("app.asyncio.sleep", return_value=None), \
+                 patch("app._ensure_claude_running", mock_ensure), \
+                 patch("app._away_send_prompt", mock_send_prompt), \
+                 patch("app._away_mode_continuous_loop", instant_continuous), \
+                 patch("app._save_autonomous_state"), \
+                 patch("app.asyncio.wait_for", side_effect=_asyncio.TimeoutError()):
+                await _app._watchdog_restart_mode("restart-test", state, "away", wlog)
+        finally:
+            _app._away_mode_state.pop("restart-test", None)
+
+        assert send_calls[0] == 1
+        assert state["phase"] == 4
+        assert state["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_restart_claude_dead_sets_disabled(self):
+        """Lines 2921-2924: if Claude can't be restarted, enabled=False."""
+        import app as _app
+
+        import logging
+
+        wlog = logging.getLogger("watchdog-test")
+
+        state = {
+            "enabled": True, "log": [],
+            "started_at": 0.0, "step": 0,
+            "task": None,
+        }
+        _app._away_mode_state["restart-dead"] = state
+
+        async def mock_ctrl_c(session_name):
+            pass
+
+        async def dead_ensure(session_name, log_fn=None, state=None):
+            return False
+
+        try:
+            with patch("app._send_ctrl_c", mock_ctrl_c), \
+                 patch("app.asyncio.sleep", return_value=None), \
+                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._save_autonomous_state"):
+                await _app._watchdog_restart_mode("restart-dead", state, "away", wlog)
+        finally:
+            _app._away_mode_state.pop("restart-dead", None)
+
+        assert state["enabled"] is False
+

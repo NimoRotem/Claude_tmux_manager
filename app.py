@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import glob as globmod
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
@@ -9,30 +10,27 @@ import logging
 import os
 import re
 import secrets
-import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Dict
+import glob as globmod
 
 logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
 import openai
 import uvicorn
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-PORT = int(os.environ.get("PORT", os.environ.get("TMUX_DASH_PORT", "8501")))  # PORT preferred; TMUX_DASH_PORT kept for compatibility
-ROOT_PATH = os.environ.get("TMUX_DASH_ROOT", os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux"))  # TMUX_DASH_ROOT preferred; TMUX_DASH_ROOT_PATH kept for compatibility
+PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
+ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -44,7 +42,6 @@ _stored_anthropic_key: str = ""
 
 
 def _load_anthropic_key() -> str:
-    """Load the stored Anthropic API key from disk into the module-level cache."""
     global _stored_anthropic_key
     try:
         if ANTHROPIC_API_KEY_FILE.exists():
@@ -55,21 +52,17 @@ def _load_anthropic_key() -> str:
 
 
 def _save_anthropic_key(key: str):
-    """Persist an Anthropic API key to disk (atomic write, chmod 600) and update in-memory cache."""
     global _stored_anthropic_key
     _stored_anthropic_key = key
     try:
-        _ensure_data_dir()
-        tmp = ANTHROPIC_API_KEY_FILE.with_suffix(".tmp")
-        tmp.write_text(key)
-        tmp.chmod(0o600)
-        tmp.rename(ANTHROPIC_API_KEY_FILE)
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ANTHROPIC_API_KEY_FILE.write_text(key)
+        ANTHROPIC_API_KEY_FILE.chmod(0o600)
     except Exception:
         logger.debug("Failed to save Anthropic API key", exc_info=True)
 
 
 def _clear_anthropic_key():
-    """Remove the stored Anthropic API key from disk and clear the in-memory cache."""
     global _stored_anthropic_key
     _stored_anthropic_key = ""
     try:
@@ -82,10 +75,10 @@ def _clear_anthropic_key():
 _load_anthropic_key()
 
 # Track auth mode per session: "subscription" or "api"
-_session_auth_mode: dict[str, str] = {}
+_session_auth_mode: Dict[str, str] = {}
 
 # Away mode state per session
-_away_mode_state: dict[str, dict] = {}
+_away_mode_state: Dict[str, dict] = {}
 # Per-session structure when active:
 # {
 #   "enabled": bool,
@@ -100,35 +93,20 @@ _away_mode_state: dict[str, dict] = {}
 # }
 
 # Go Nuts mode state per session (same structure as away mode)
-_go_nuts_state: dict[str, dict] = {}
+_go_nuts_state: Dict[str, dict] = {}
+
+# Flag to prevent CancelledError handlers from wiping persisted state during shutdown.
+# When True, worker cancel handlers skip setting enabled=False and re-saving to disk.
+_shutting_down = False
 
 # --- Persistent autonomous mode state ---
 # Survives restarts: stores which sessions had away/go-nuts mode enabled.
 AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
 
-def _ensure_data_dir() -> None:
-    """Create ~/.tmux-dashboard/ with restricted permissions (700) if it doesn't exist."""
-    MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-    MESSAGES_DIR.chmod(0o700)
-
-
-def _atomic_write_json(path: Path, data) -> None:
-    """Write *data* as JSON to *path* atomically (write tmp → rename).
-
-    Uses a sibling .tmp file on the same filesystem so the rename is atomic
-    on Linux/POSIX.  Prevents corrupt JSON if the process is killed mid-write.
-    Sets file permissions to 0o600 (user read/write only).
-    """
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.chmod(0o600)
-    tmp.rename(path)
-
-
 def _save_autonomous_state():
     """Persist which sessions have away/go-nuts mode enabled to disk."""
     try:
-        _ensure_data_dir()
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
         state = {}
         for name, s in _away_mode_state.items():
             if s.get("enabled"):
@@ -136,11 +114,11 @@ def _save_autonomous_state():
         for name, s in _go_nuts_state.items():
             if s.get("enabled"):
                 state.setdefault(name, {})["go_nuts_mode"] = True
-        _atomic_write_json(AUTONOMOUS_STATE_FILE, state)
+        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
     except Exception:
         logger.debug("Failed to save autonomous mode state", exc_info=True)
 
-def _load_autonomous_state() -> dict[str, dict]:
+def _load_autonomous_state() -> Dict[str, dict]:
     """Load persisted autonomous mode state from disk."""
     try:
         if AUTONOMOUS_STATE_FILE.exists():
@@ -230,11 +208,10 @@ async def lifespan(_app: FastAPI):
     # --- Startup ---
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=20))
-    logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s, python=%s",
+    logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
                 PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "configured" if OPENAI_API_KEY else "missing",
-                sys.version.split()[0])
+                "configured" if OPENAI_API_KEY else "missing")
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
@@ -283,43 +260,32 @@ async def lifespan(_app: FastAPI):
                 t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
                 state["task"] = t
 
+    # Clean up orphaned entries (sessions that no longer exist were skipped above
+    # but file still has their old state). Re-save now based on in-memory dicts only.
+    _save_autonomous_state()
+
     yield  # Application is running
 
     # --- Shutdown ---
+    global _shutting_down
+    _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
     logger.info("tmux Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
     # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
     _save_autonomous_state()
     logger.info("Autonomous mode state saved to disk for restore on next startup")
-
-    # Collect running tasks, cancel them, then await cleanup
-    _shutdown_tasks = []
     for t in _background_tasks:
         if not t.done():
-            _shutdown_tasks.append(t)
             t.cancel()
+    # Cancel any running away-mode workers
     for name, state in _away_mode_state.items():
-        t = state.get("task")
-        if t and not t.done():
-            _shutdown_tasks.append(t)
-            t.cancel()
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
             logger.info("Cancelled away-mode worker for '%s'", name)
+    # Cancel any running go-nuts-mode workers
     for name, state in _go_nuts_state.items():
-        t = state.get("task")
-        if t and not t.done():
-            _shutdown_tasks.append(t)
-            t.cancel()
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
             logger.info("Cancelled go-nuts-mode worker for '%s'", name)
-
-    # Wait up to 5s for all tasks to finish their cancellation handlers
-    if _shutdown_tasks:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*_shutdown_tasks, return_exceptions=True),
-                timeout=5,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Graceful shutdown: %d task(s) did not stop within 5s",
-                           len(_shutdown_tasks))
     logger.info("Shutdown complete")
 
 
@@ -332,13 +298,11 @@ AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 
 
 def _make_token(username: str) -> str:
-    """Create an HMAC-signed session token for the given username."""
     sig = hmac.new(AUTH_SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()[:24]
     return f"{username}:{sig}"
 
 
 def _check_token(token: str) -> bool:
-    """Validate a session token via HMAC. Token format: '<username>:<hex_signature>'."""
     if not token or ":" not in token:
         return False
     username, sig = token.split(":", 1)
@@ -376,20 +340,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </body></html>"""
 
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Normalize Pydantic validation errors to consistent {error: ...} format."""
-    msgs = [f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in exc.errors()]
-    return JSONResponse({"error": "; ".join(msgs)}, status_code=422)
-
-
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     """Add security headers to all responses and log slow requests."""
     start = time.time()
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -401,12 +358,9 @@ async def security_headers_middleware(request: Request, call_next):
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "font-src 'self' data:; "
-        "frame-ancestors 'none'"
+        "frame-ancestors 'self'"
     )
-    if request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https":
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     duration = time.time() - start
-    logger.debug("%s %s → %d (%.0fms)", request.method, request.url.path, response.status_code, duration * 1000)
     if duration > 2.0:
         logger.warning("Slow request: %s %s took %.1fs", request.method, request.url.path, duration)
     return response
@@ -414,7 +368,6 @@ async def security_headers_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Enforce HMAC cookie auth on all routes except /login. Skipped if TMUX_DASH_PASS is unset."""
     # Skip auth entirely if no password is configured
     if not AUTH_PASS:
         return await call_next(request)
@@ -428,15 +381,8 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Auth cookie lifetime
-_AUTH_COOKIE_MAX_AGE = 86400 * 30   # 30 days in seconds
-
-# Autonomous mode log limits
-_LOG_CAP = 200   # max log entries kept in away/go-nuts state dicts
-_LOG_TAIL = 30   # max log entries returned in API status responses
-
 # Simple in-memory login rate limiter: (ip, window_start_minute) -> attempt_count
-_login_attempts: dict[str, int] = {}
+_login_attempts: Dict[str, int] = {}
 _LOGIN_MAX_ATTEMPTS = 10  # per IP per minute
 _LOGIN_WINDOW = 60        # seconds
 
@@ -458,7 +404,6 @@ def _check_login_rate_limit(ip: str) -> bool:
 
 @app.post("/login")
 async def do_login(request: Request):
-    """Handle POST login form: validate credentials, set auth cookie, redirect."""
     ip = request.client.host if request.client else "unknown"
     if not _check_login_rate_limit(ip):
         logger.warning("Login rate limit exceeded for IP %s", ip)
@@ -470,20 +415,20 @@ async def do_login(request: Request):
         token = _make_token(username)
         resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
         is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-        resp.set_cookie("tmux_auth", token, max_age=_AUTH_COOKIE_MAX_AGE, httponly=True, samesite="lax", secure=is_https)
+        resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
         return resp
     return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
 
 
 # Three-tier cache per session
-cache: dict[str, dict] = {}
+cache: Dict[str, dict] = {}
 
 # Persistent message storage
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
 
 
-def _load_all_notes() -> dict[str, str]:
+def _load_all_notes() -> Dict[str, str]:
     """Load all session notes from disk."""
     try:
         if NOTES_FILE.exists():
@@ -496,13 +441,13 @@ def _load_all_notes() -> dict[str, str]:
 def _save_notes():
     """Persist all session notes to disk."""
     try:
-        _ensure_data_dir()
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
         existing = _load_all_notes()
         for name, entry in cache.items():
             notes = entry.get("notes")
             if notes:
                 existing[name] = notes
-        _atomic_write_json(NOTES_FILE, existing)
+        NOTES_FILE.write_text(json.dumps(existing))
     except Exception:
         logger.debug("Failed to save notes to %s", NOTES_FILE, exc_info=True)
 
@@ -512,7 +457,7 @@ def _load_session_notes(session_name: str) -> str:
     return _load_all_notes().get(session_name, "")
 
 
-def _load_messages() -> dict[str, list]:
+def _load_messages() -> Dict[str, list]:
     """Load all session messages from disk."""
     try:
         if MESSAGES_FILE.exists():
@@ -525,7 +470,7 @@ def _load_messages() -> dict[str, list]:
 def _save_messages():
     """Persist all session messages to disk (merge with existing)."""
     try:
-        _ensure_data_dir()
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
         # Load existing to avoid dropping sessions not yet in cache
         existing = _load_messages()
         # Update with current cache data
@@ -533,7 +478,7 @@ def _save_messages():
             msgs = entry.get("messages")
             if msgs:
                 existing[name] = msgs
-        _atomic_write_json(MESSAGES_FILE, existing)
+        MESSAGES_FILE.write_text(json.dumps(existing))
     except Exception:
         logger.debug("Failed to save messages to %s", MESSAGES_FILE, exc_info=True)
 
@@ -549,23 +494,8 @@ PROGRESS_TTL = 600     # 10 minutes
 REALTIME_TTL = 60      # 1 minute
 NOTES_TTL = 600        # 10 minutes
 
-# LLM context window and token budget constants
-_LLM_CTX_DESCRIPTION = 4000   # chars of terminal history sent for title/description
-_LLM_CTX_PROGRESS = 5000      # chars sent for progress summaries
-_LLM_CTX_NOTES_CHAT = 1500    # chars of recent chat messages included with notes
-_LLM_CTX_REALTIME_OUTPUT = 3000   # chars of recent terminal output for realtime summary
-_LLM_CTX_REALTIME_CHAT = 1500     # chars of chat messages for realtime context
-_LLM_CTX_AWAY_OUTPUT = 4000   # chars of terminal output for away/go-nuts mode analysis
-_LLM_TOKENS_TITLE = 30        # max tokens for session title generation
-_LLM_TOKENS_DESCRIPTION = 60  # max tokens for session description
-_LLM_TOKENS_PROGRESS = 100    # max tokens for progress summary
-_LLM_TOKENS_NOTES = 500       # max tokens for notes extraction
-_LLM_TOKENS_REALTIME = 200    # max tokens for realtime status summary
-_LLM_TOKENS_AWAY = 200        # max tokens for away/go-nuts mode step analysis
-
 
 def get_tmux_sessions() -> list[dict]:
-    """Return a list of all active tmux sessions with name, window count, created time, and attached status."""
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F",
@@ -587,31 +517,14 @@ def get_tmux_sessions() -> list[dict]:
             })
         return sessions
     except Exception:
-        logger.debug("get_tmux_sessions() failed — tmux may not be running", exc_info=True)
         return []
-
-
-_SESSION_NAME_RE = re.compile(r'^[a-zA-Z0-9_.\-]+$')
-
-
-def _is_valid_session_name(name: str) -> bool:
-    """Validate a session name for safe use as a tmux target.
-
-    Tmux session names can technically contain most characters, but we restrict
-    to alphanumeric, underscore, hyphen, and dot to prevent target-selector
-    injection (e.g. ``session:window.pane`` syntax) from API inputs.
-    """
-    return bool(name and len(name) <= 128 and _SESSION_NAME_RE.match(name))
 
 
 def _find_session(session_name: str) -> tuple:
     """Look up a tmux session by name.
 
     Returns (sessions_list, session_dict) if found, or (sessions_list, None) if not.
-    Rejects names that fail validation to prevent tmux target-selector injection.
     """
-    if not _is_valid_session_name(session_name):
-        return [], None
     sessions = get_tmux_sessions()
     for s in sessions:
         if s["name"] == session_name:
@@ -620,7 +533,6 @@ def _find_session(session_name: str) -> tuple:
 
 
 def capture_pane_full(session_name: str) -> str:
-    """Capture the full scrollback history of a tmux pane as a string. Returns '' on failure."""
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-"],
@@ -632,7 +544,6 @@ def capture_pane_full(session_name: str) -> str:
 
 
 def capture_pane_recent(session_name: str, lines: int = 80) -> str:
-    """Capture the most recent *lines* lines of a tmux pane. Returns '' on failure."""
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
@@ -641,29 +552,6 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
-
-
-async def _send_ctrl_c(session_name: str) -> None:
-    """Send Ctrl+C to a tmux session to interrupt a stuck process."""
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "C-c"],
-        capture_output=True, timeout=3,
-    )
-
-
-async def _tmux_type_and_enter(session_name: str, text: str, timeout: int = 5) -> None:
-    """Type text into a tmux session then send Enter — used to run shell commands."""
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", text],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    await asyncio.to_thread(
-        subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
-        capture_output=True, text=True, timeout=timeout,
-    )
 
 
 def get_pane_position(session_name: str) -> dict:
@@ -691,15 +579,15 @@ def get_pane_position(session_name: str) -> dict:
 
 
 # Track auto-approve state to avoid re-triggering
-_auto_approve_sent: dict[str, float] = {}
+_auto_approve_sent: Dict[str, float] = {}
 
 # Content stability tracking for idle detection
 # Stores (hash, first_seen_time, consecutive_count) per session
-_pane_stability: dict[str, tuple] = {}
+_pane_stability: Dict[str, tuple] = {}
 
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
 # Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
-_activity_state: dict[str, dict] = {}
+_activity_state: Dict[str, dict] = {}
 # Require N consecutive idle readings before switching from busy → idle.
 # At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
 IDLE_CONFIRM_COUNT = 3
@@ -809,7 +697,7 @@ def _check_auto_approve(session_name: str, visible: str):
                 option_lines.append((i, stripped.lstrip('❯> ')))
         if len(option_lines) >= 2:
             autonomous_target = None
-            for _idx, (line_i, text) in enumerate(option_lines):
+            for idx, (line_i, text) in enumerate(option_lines):
                 lower = text.lower()
                 for kw in _AUTONOMOUS_KEYWORDS:
                     if kw in lower:
@@ -1100,33 +988,22 @@ async def async_detect_activity(session_name: str) -> dict:
     return await asyncio.to_thread(detect_activity, session_name)
 
 
-_LLM_TIMEOUT = 30  # seconds before aborting a hung OpenAI request
-
-
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
-    """Call the OpenAI Chat Completions API (gpt-4o-mini) and return the response text."""
     start = time.time()
     try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=max_tokens,
-                temperature=0.3,
-            ),
-            timeout=_LLM_TIMEOUT,
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.3,
         )
         duration = time.time() - start
         tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
         logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
         return resp.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        duration = time.time() - start
-        logger.warning("LLM call timed out after %.1fs", duration)
-        return "(error: LLM request timed out)"
     except Exception as e:
         duration = time.time() - start
         logger.error("LLM call failed after %.1fs: %s", duration, e)
@@ -1140,7 +1017,7 @@ async def get_title_and_description(session_name: str, full_output: str) -> tupl
     mid_start = len(lines) // 3
     middle = "\n".join(lines[mid_start:mid_start + 80])
     context = f"=== EARLIEST OUTPUT (first 150 lines) ===\n{early}\n\n=== MIDDLE SECTION ===\n{middle}"
-    truncated = context[:_LLM_CTX_DESCRIPTION]
+    truncated = context[:4000]
 
     title_coro = llm_call(
         system_prompt=(
@@ -1151,7 +1028,7 @@ async def get_title_and_description(session_name: str, full_output: str) -> tupl
             "Return ONLY the title, no quotes, no punctuation at the end."
         ),
         user_content=f"tmux session '{session_name}':\n\n{truncated}",
-        max_tokens=_LLM_TOKENS_TITLE,
+        max_tokens=30,
     )
     desc_coro = llm_call(
         system_prompt=(
@@ -1169,14 +1046,13 @@ async def get_title_and_description(session_name: str, full_output: str) -> tupl
             "Keep it under 20 words. No filler phrases. No 'This session is for...'."
         ),
         user_content=f"tmux session '{session_name}':\n\n{truncated}",
-        max_tokens=_LLM_TOKENS_DESCRIPTION,
+        max_tokens=60,
     )
     title, description = await asyncio.gather(title_coro, desc_coro)
     return title, description
 
 
 async def get_progress(session_name: str, full_output: str) -> str:
-    """Generate a concise progress summary from terminal output using gpt-4o-mini."""
     lines = full_output.split("\n")
     total = len(lines)
     slices = [("BEGINNING", "\n".join(lines[:60]))]
@@ -1203,8 +1079,8 @@ async def get_progress(session_name: str, full_output: str) -> str:
             "and running scripts. Files such as matching.py were referenced.'\n"
             "Be condensed. Under 40 words. No filler."
         ),
-        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:_LLM_CTX_PROGRESS]}",
-        max_tokens=_LLM_TOKENS_PROGRESS,
+        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:5000]}",
+        max_tokens=100,
     )
 
 
@@ -1253,13 +1129,12 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
             "- Redact nothing — this is the developer's own reference\n"
             "- No intro/outro text, just the section headers and their items"
         ),
-        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:_LLM_CTX_PROGRESS]}{chat_section[:_LLM_CTX_NOTES_CHAT]}{prev_section}",
-        max_tokens=_LLM_TOKENS_NOTES,
+        user_content=f"tmux session '{session_name}' sampled history:\n\n{context[:5000]}{chat_section[:1500]}{prev_section}",
+        max_tokens=500,
     )
 
 
 async def get_realtime(session_name: str) -> str:
-    """Capture recent terminal output and annotate it with current activity status."""
     recent = await asyncio.to_thread(capture_pane_recent, session_name, 80)
     activity = await async_detect_activity(session_name)
     status_hint = f"[Session is currently {activity['status'].upper()}"
@@ -1304,20 +1179,20 @@ async def get_realtime(session_name: str) -> str:
             "- 'Idle, waiting for input.' (what was just done?)"
         ),
         user_content=(
-            f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-_LLM_CTX_REALTIME_OUTPUT:]}"
-            f"{msg_context[:_LLM_CTX_REALTIME_CHAT]}"
+            f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}"
+            f"{msg_context[:1500]}"
         ),
-        max_tokens=_LLM_TOKENS_REALTIME,
+        max_tokens=200,
     )
 
 
 async def get_session_data(session_name: str, force_all: bool = False) -> dict:
-    """Fetch and cache all LLM-generated session data (title, description, progress, realtime).
-
-    Results are cached in memory with per-field TTLs. Pass force_all=True to bypass all TTLs.
-    """
     now = time.time()
-    entry = cache.get(session_name, {})
+    # IMPORTANT: use setdefault so `entry` is the SAME object as cache[session_name].
+    # This prevents a race with api_send_command where a concurrent /send could
+    # add a user message to a different cache entry, then get clobbered when this
+    # function reassigns cache[session_name] below after awaiting LLM calls.
+    entry = cache.setdefault(session_name, {})
     if "messages" not in entry:
         entry["messages"] = _load_session_messages(session_name)
     if "notes" not in entry:
@@ -1392,7 +1267,6 @@ def _append_assistant_msg(entry: dict, text: str, ts: float):
 
 
 def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
-    """Build a complete session API response dict from raw tmux session, cached data, and activity state."""
     if activity is None:
         activity = detect_activity(sess["name"])
     return {
@@ -1415,25 +1289,19 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
         "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
         "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+        "model": _get_session_model(sess["name"]),
     }
-
-
-def _resp_session_not_found() -> JSONResponse:
-    """Return a standardised 404 JSON response for missing sessions."""
-    return JSONResponse({"error": "Session not found"}, status_code=404)
 
 
 # --- Routes ---
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Serve the single-page dashboard application."""
     return HTML_PAGE
 
 
 @app.get("/api/sessions")
 async def api_sessions():
-    """Full session list with LLM-generated titles and descriptions. Not called by the UI (use /api/sessions-fast instead)."""
     sessions = get_tmux_sessions()
     results, activities = await asyncio.gather(
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
@@ -1461,16 +1329,36 @@ async def api_sessions_fast():
         if "notes" not in entry:
             entry["notes"] = _load_session_notes(sess["name"])
         cache[sess["name"]] = entry
-        out.append(build_session_response(sess, entry, activity=activity))
+        out.append({
+            "name": sess["name"],
+            "windows": sess["windows"],
+            "attached": sess["attached"],
+            "title": entry.get("title", ""),
+            "description": entry.get("description", ""),
+            "description_at": entry.get("description_at", 0),
+            "progress": entry.get("progress", ""),
+            "progress_at": entry.get("progress_at", 0),
+            "notes": entry.get("notes", ""),
+            "notes_at": entry.get("notes_at", 0),
+            "realtime": entry.get("realtime", ""),
+            "realtime_at": entry.get("realtime_at", 0),
+            "messages": entry.get("messages", []),
+            "activity_status": activity["status"],
+            "activity_command": activity.get("command", ""),
+            "activity_detail": activity.get("detail", ""),
+            "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
+            "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
+            "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+            "model": _get_session_model(sess["name"]),
+        })
     return JSONResponse(out)
 
 
 @app.post("/api/sessions/{session_name}/refresh")
 async def api_refresh_session(session_name: str):
-    """Refresh a single session's data (LLM title/description + activity). Triggers on-demand LLM calls."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
     entry = await get_session_data(session_name)
     activity = await async_detect_activity(session_name)
@@ -1479,10 +1367,9 @@ async def api_refresh_session(session_name: str):
 
 @app.post("/api/sessions/{session_name}/refresh-all")
 async def api_refresh_all_tiers(session_name: str):
-    """Force a full refresh of all data tiers for a session, bypassing cache TTLs."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
     entry = await get_session_data(session_name, force_all=True)
     activity = await async_detect_activity(session_name)
@@ -1504,6 +1391,7 @@ async def api_status():
             "activity_detail": activity["detail"],
             "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
             "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+            "model": _get_session_model(sess["name"]),
         })
     return JSONResponse(out)
 
@@ -1513,7 +1401,7 @@ async def api_raw_output(session_name: str):
     """Return raw scrollback content for a session."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     raw = await asyncio.to_thread(capture_pane_full, session_name)
     activity = await async_detect_activity(session_name)
     return JSONResponse({
@@ -1531,7 +1419,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
     """Return delta output since the client's last known line count."""
     _, found = _find_session(session_name)
     if not found:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
     pos = await asyncio.to_thread(get_pane_position, session_name)
     current_total = pos["total_lines"]
@@ -1568,9 +1456,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
 
 
 class CreateSession(BaseModel):
-    name: str = Field("", max_length=128)  # tmux session names have a practical limit
-    launch_claude: bool = False  # if true, run "claude" in the new session immediately
-    cwd: str = Field("", max_length=500)  # optional starting directory
+    name: str = ""
 
 
 @app.post("/api/sessions/create")
@@ -1588,9 +1474,7 @@ async def api_create_session(body: CreateSession):
         cmd = ["tmux", "new-session", "-d"]
         if name:
             cmd += ["-s", name]
-        if body.cwd and os.path.isdir(body.cwd):
-            cmd += ["-c", body.cwd]
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
         # Find the new session name (if auto-named)
@@ -1601,56 +1485,33 @@ async def api_create_session(body: CreateSession):
             created = sessions[-1]["name"] if sessions else "unknown"
         # Inject stored API key so Claude Code can authenticate
         if _stored_anthropic_key:
-            await _tmux_type_and_enter(created, f"export ANTHROPIC_API_KEY={shlex.quote(_stored_anthropic_key)}")
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "-l",
+                 f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
-        # Optionally launch a command in the new session (env var or per-request flag)
-        launch_cmd = NEW_SESSION_CMD or ("claude" if body.launch_claude else "")
-        if launch_cmd:
-            await _tmux_type_and_enter(created, launch_cmd)
+        # Optionally launch a command in the new session
+        if NEW_SESSION_CMD:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "-l", NEW_SESSION_CMD],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", created, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
-    except Exception:
-        logger.exception("Failed to create session '%s'", name)
-        return JSONResponse({"error": "Failed to create session"}, status_code=500)
-
-
-class RenameSession(BaseModel):
-    new_name: str = Field(..., min_length=1, max_length=128)
-
-@app.post("/api/sessions/{session_name}/rename")
-async def api_rename_session(session_name: str, body: RenameSession):
-    """Rename a tmux session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return _resp_session_not_found()
-    new_name = body.new_name.strip()
-    if not re.match(r'^[a-zA-Z0-9_-]+$', new_name):
-        return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
-    if new_name == session_name:
-        return JSONResponse({"ok": True, "name": new_name})
-    existing = [s["name"] for s in get_tmux_sessions()]
-    if new_name in existing:
-        return JSONResponse({"error": f"Session '{new_name}' already exists."}, status_code=409)
-    try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "rename-session", "-t", session_name, new_name],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Rename failed"}, status_code=500)
-        # Transfer cached data to new name
-        for store in [cache, _session_auth_mode, _session_stats_cache,
-                      _away_mode_state, _go_nuts_state]:
-            if session_name in store:
-                store[new_name] = store.pop(session_name)
-        logger.info("Session renamed: '%s' → '%s'", session_name, new_name)
-        return JSONResponse({"ok": True, "name": new_name})
-    except Exception:
-        logger.exception("Failed to rename session '%s'", session_name)
-        return JSONResponse({"error": "Failed to rename session"}, status_code=500)
+    except Exception as e:
+        logger.error("Failed to create session '%s': %s", name, e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.delete("/api/sessions/{session_name}")
@@ -1658,15 +1519,14 @@ async def api_delete_session(session_name: str):
     """Kill a tmux session and all its child processes."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         # First, find and kill all processes in the session's panes.
         # This ensures Claude Code (node) processes are terminated cleanly
         # before the tmux session is destroyed.
         try:
             # Get all pane PIDs in this session
-            pane_result = await asyncio.to_thread(
-                subprocess.run,
+            pane_result = subprocess.run(
                 ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5
             )
@@ -1678,8 +1538,7 @@ async def api_delete_session(session_name: str):
                     # Kill the entire process group rooted at this pane's shell
                     # This catches Claude Code (node), any background tasks, etc.
                     try:
-                        await asyncio.to_thread(
-                            subprocess.run,
+                        subprocess.run(
                             ["pkill", "-TERM", "-P", pid_str],
                             capture_output=True, text=True, timeout=3
                         )
@@ -1693,8 +1552,7 @@ async def api_delete_session(session_name: str):
                     if not pid_str:
                         continue
                     try:
-                        await asyncio.to_thread(
-                            subprocess.run,
+                        subprocess.run(
                             ["pkill", "-KILL", "-P", pid_str],
                             capture_output=True, text=True, timeout=3
                         )
@@ -1703,8 +1561,7 @@ async def api_delete_session(session_name: str):
         except Exception:
             logger.debug("Process cleanup failed for session '%s' — kill-session will still clean up", session_name, exc_info=True)
 
-        result = await asyncio.to_thread(
-            subprocess.run,
+        result = subprocess.run(
             ["tmux", "kill-session", "-t", session_name],
             capture_output=True, text=True, timeout=5
         )
@@ -1726,9 +1583,8 @@ async def api_delete_session(session_name: str):
         _go_nuts_state.pop(session_name, None)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
-    except Exception:
-        logger.exception("Failed to delete session '%s'", session_name)
-        return JSONResponse({"error": "Failed to delete session"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 def get_session_cwd(session_name: str) -> str:
@@ -1745,26 +1601,14 @@ def get_session_cwd(session_name: str) -> str:
     return ""
 
 
-_UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-
-
 @app.post("/api/sessions/{session_name}/upload")
-async def api_upload_file(request: Request, session_name: str, file: UploadFile = File(...)):
+async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     """Upload a file to the session's current working directory."""
-    # Reject oversized uploads before reading body into RAM
-    cl = request.headers.get("content-length", "")
-    if cl:
-        try:
-            if int(cl) > _UPLOAD_MAX_BYTES:
-                return JSONResponse({"error": "File too large. Max is 50 MB."}, status_code=413)
-        except ValueError:
-            pass  # malformed Content-Length; fall through to post-read check
-
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
-    cwd = await asyncio.to_thread(get_session_cwd, session_name)
+    cwd = get_session_cwd(session_name)
     if not cwd:
         return JSONResponse({"error": "Could not determine session working directory"}, status_code=500)
 
@@ -1776,9 +1620,11 @@ async def api_upload_file(request: Request, session_name: str, file: UploadFile 
     dest = os.path.join(cwd, filename)
     try:
         content = await file.read()
-        if len(content) > _UPLOAD_MAX_BYTES:
+        max_size = 50 * 1024 * 1024  # 50 MB
+        if len(content) > max_size:
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
-        await asyncio.to_thread(Path(dest).write_bytes, content)
+        with open(dest, "wb") as f:
+            f.write(content)
         # Record in chat history
         size_kb = len(content) / 1024
         note = f"Uploaded {filename} ({size_kb:.1f} KB) to {cwd}"
@@ -1789,9 +1635,8 @@ async def api_upload_file(request: Request, session_name: str, file: UploadFile 
         entry["messages"].append({"role": "user", "text": note, "ts": now})
         _save_messages()
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
-    except Exception:
-        logger.exception("File upload failed for session '%s'", session_name)
-        return JSONResponse({"error": "File upload failed"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # --- CLAUDE.md viewer/editor ---
@@ -1801,8 +1646,8 @@ async def api_get_claude_md(session_name: str):
     """Read CLAUDE.md from the session's working directory and home dir."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
-    cwd = await asyncio.to_thread(get_session_cwd, session_name)
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    cwd = get_session_cwd(session_name)
     results = []
     # Check session CWD
     if cwd:
@@ -1810,7 +1655,8 @@ async def api_get_claude_md(session_name: str):
         content = ""
         if os.path.exists(md_path):
             try:
-                content = await asyncio.to_thread(Path(md_path).read_text)
+                with open(md_path) as f:
+                    content = f.read()
             except Exception:
                 logger.debug("Failed to read CLAUDE.md at %s", md_path, exc_info=True)
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
@@ -1819,7 +1665,8 @@ async def api_get_claude_md(session_name: str):
     home_content = ""
     if os.path.exists(home_md):
         try:
-            home_content = await asyncio.to_thread(Path(home_md).read_text)
+            with open(home_md) as f:
+                home_content = f.read()
         except Exception:
             logger.debug("Failed to read global CLAUDE.md at %s", home_md, exc_info=True)
     results.append({"path": home_md, "content": home_content, "exists": os.path.exists(home_md), "label": "Global"})
@@ -1827,8 +1674,8 @@ async def api_get_claude_md(session_name: str):
 
 
 class SaveClaudeMd(BaseModel):
-    path: str = Field(..., max_length=4096)
-    content: str = Field(..., max_length=1_000_000)  # 1 MB cap for CLAUDE.md
+    path: str
+    content: str
 
 
 @app.post("/api/sessions/{session_name}/claude-md")
@@ -1836,7 +1683,7 @@ async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
     """Save CLAUDE.md to the specified path."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     # Safety: only allow writing CLAUDE.md files within home directory
     if not body.path.endswith("CLAUDE.md"):
         return JSONResponse({"error": "Can only write CLAUDE.md files"}, status_code=400)
@@ -1847,12 +1694,205 @@ async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
     if not real_path.endswith("/CLAUDE.md"):
         return JSONResponse({"error": "Invalid path after resolution"}, status_code=400)
     try:
-        await asyncio.to_thread(os.makedirs, os.path.dirname(real_path), exist_ok=True)
-        await asyncio.to_thread(Path(real_path).write_text, body.content)
+        os.makedirs(os.path.dirname(real_path), exist_ok=True)
+        with open(real_path, "w") as f:
+            f.write(body.content)
+        return JSONResponse({"ok": True, "path": real_path})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# --- Global CLAUDE.md (header button — no session needed) ---
+
+@app.get("/api/claude-md-global")
+async def api_get_claude_md_global():
+    """Read global CLAUDE.md from home dir."""
+    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
+    content = ""
+    exists = os.path.exists(home_md)
+    if exists:
+        try:
+            with open(home_md) as f:
+                content = f.read()
+        except Exception:
+            logger.debug("Failed to read global CLAUDE.md", exc_info=True)
+    return JSONResponse({"path": home_md, "content": content, "exists": exists})
+
+
+@app.post("/api/claude-md-global")
+async def api_save_claude_md_global(body: SaveClaudeMd):
+    """Save global CLAUDE.md."""
+    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
+    real_path = os.path.realpath(body.path)
+    if real_path != os.path.realpath(home_md):
+        return JSONResponse({"error": "Can only save to global CLAUDE.md"}, status_code=400)
+    try:
+        with open(real_path, "w") as f:
+            f.write(body.content)
         return JSONResponse({"ok": True, "path": real_path})
     except Exception:
-        logger.exception("CLAUDE.md save failed at '%s'", real_path)
-        return JSONResponse({"error": "Failed to save CLAUDE.md"}, status_code=500)
+        logger.exception("Failed to save global CLAUDE.md")
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+# --- Skills file management ---
+
+SKILLS_DIR = MESSAGES_DIR / "skills"
+SKILL_LIBRARY_DIR = MESSAGES_DIR / "skill-library"
+
+_SKILL_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_-]+\.md$")
+
+
+def _sanitize_skill_filename(name: str) -> str:
+    """Sanitize and validate a skill filename."""
+    name = os.path.basename(name)
+    if not name.endswith(".md"):
+        name += ".md"
+    if not _SKILL_FILENAME_RE.match(name):
+        return ""
+    return name
+
+
+def _skill_dir_for_session(session_name: str) -> Path:
+    d = SKILLS_DIR / session_name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class SkillFileBody(BaseModel):
+    name: str
+    content: str
+
+
+class SkillLibraryBody(BaseModel):
+    name: str
+    session_name: str
+
+
+@app.get("/api/sessions/{session_name}/skills")
+async def api_list_skills(session_name: str):
+    """List .md skill files for a session."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    d = _skill_dir_for_session(session_name)
+    files = []
+    for p in sorted(d.iterdir()):
+        if p.suffix == ".md" and p.is_file():
+            try:
+                content = p.read_text()
+                stat = p.stat()
+                files.append({
+                    "name": p.name,
+                    "content": content,
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+            except Exception:
+                logger.debug("Failed to read skill file %s", p, exc_info=True)
+    return JSONResponse({"files": files, "path": str(d)})
+
+
+@app.post("/api/sessions/{session_name}/skills")
+async def api_save_skill(session_name: str, body: SkillFileBody):
+    """Create or update a skill .md file."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    fname = _sanitize_skill_filename(body.name)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename. Use alphanumeric, hyphens, underscores with .md extension."}, status_code=400)
+    d = _skill_dir_for_session(session_name)
+    fpath = d / fname
+    # Resolve to prevent traversal
+    if not str(fpath.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        fpath.write_text(body.content)
+        return JSONResponse({"ok": True, "name": fname, "path": str(fpath)})
+    except Exception:
+        logger.exception("Failed to save skill file")
+        return JSONResponse({"error": "Failed to save skill file"}, status_code=500)
+
+
+@app.delete("/api/sessions/{session_name}/skills/{filename}")
+async def api_delete_skill(session_name: str, filename: str):
+    """Delete a skill .md file."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    fname = _sanitize_skill_filename(filename)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    d = _skill_dir_for_session(session_name)
+    fpath = d / fname
+    if not str(fpath.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not fpath.exists():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    try:
+        fpath.unlink()
+        return JSONResponse({"ok": True})
+    except Exception:
+        logger.exception("Failed to delete skill file")
+        return JSONResponse({"error": "Failed to delete skill file"}, status_code=500)
+
+
+@app.get("/api/skill-library")
+async def api_list_skill_library():
+    """List all saved skill sets in the library."""
+    SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    sets = []
+    for d in sorted(SKILL_LIBRARY_DIR.iterdir()):
+        if d.is_dir():
+            files = [f.name for f in sorted(d.iterdir()) if f.suffix == ".md" and f.is_file()]
+            try:
+                created = d.stat().st_ctime
+            except Exception:
+                created = 0
+            sets.append({"name": d.name, "files": files, "created": created})
+    return JSONResponse({"sets": sets})
+
+
+@app.post("/api/skill-library/save")
+async def api_save_to_library(body: SkillLibraryBody):
+    """Copy a session's skill files to the library under a given set name."""
+    _, sess = _find_session(body.session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    set_name = re.sub(r"[^a-zA-Z0-9_-]", "", body.name)
+    if not set_name:
+        return JSONResponse({"error": "Invalid set name"}, status_code=400)
+    src = _skill_dir_for_session(body.session_name)
+    dest = SKILL_LIBRARY_DIR / set_name
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for p in src.iterdir():
+        if p.suffix == ".md" and p.is_file():
+            shutil.copy2(str(p), str(dest / p.name))
+            copied.append(p.name)
+    return JSONResponse({"ok": True, "name": set_name, "files": copied})
+
+
+@app.post("/api/skill-library/load")
+async def api_load_from_library(body: SkillLibraryBody):
+    """Load a skill set from the library into a session's skills dir (merge/overwrite)."""
+    _, sess = _find_session(body.session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    set_name = re.sub(r"[^a-zA-Z0-9_-]", "", body.name)
+    if not set_name:
+        return JSONResponse({"error": "Invalid set name"}, status_code=400)
+    src = SKILL_LIBRARY_DIR / set_name
+    if not src.is_dir():
+        return JSONResponse({"error": "Library set not found"}, status_code=404)
+    dest = _skill_dir_for_session(body.session_name)
+    loaded = []
+    for p in src.iterdir():
+        if p.suffix == ".md" and p.is_file():
+            shutil.copy2(str(p), str(dest / p.name))
+            loaded.append(p.name)
+    return JSONResponse({"ok": True, "name": set_name, "files": loaded})
 
 
 # --- System stats ---
@@ -1866,11 +1906,25 @@ async def api_stats():
         with open('/proc/loadavg') as f:
             parts = f.read().split()
             stats["cpu_load"] = {"1m": parts[0], "5m": parts[1], "15m": parts[2]}
+            # Running threads from field 4 (e.g. "2/150")
+            if len(parts) > 3 and '/' in parts[3]:
+                running, total = parts[3].split('/')
+                stats["threads_running"] = int(running)
+                stats["threads_total"] = int(total)
     except Exception:
         stats["cpu_load"] = {}
+    # CPU count and approximate usage percent
+    try:
+        cpu_count = os.cpu_count() or 1
+        stats["cpu_count"] = cpu_count
+        load_1m = float(stats.get("cpu_load", {}).get("1m", 0))
+        stats["cpu_percent"] = min(round(load_1m / cpu_count * 100, 1), 100.0)
+    except Exception:
+        stats["cpu_count"] = 1
+        stats["cpu_percent"] = 0
     # Memory
     try:
-        result = await asyncio.to_thread(subprocess.run, ["free", "-m"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
         lines = result.stdout.strip().split("\n")
         if len(lines) >= 2:
             parts = lines[1].split()
@@ -1896,25 +1950,23 @@ async def api_stats():
     stats["tmux_sessions"] = get_tmux_sessions()
     # Claude processes
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        result = subprocess.run(
             ["pgrep", "-a", "claude"],
             capture_output=True, text=True, timeout=5
         )
         stats["claude_processes"] = [
-            line.strip() for line in result.stdout.strip().split("\n") if line.strip()
+            l.strip() for l in result.stdout.strip().split("\n") if l.strip()
         ]
     except Exception:
         stats["claude_processes"] = []
     # Node processes (Claude Code runs as node)
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        result = subprocess.run(
             ["pgrep", "-a", "-f", "claude"],
             capture_output=True, text=True, timeout=5
         )
         stats["claude_related"] = len([
-            line for line in result.stdout.strip().split("\n") if line.strip()
+            l for l in result.stdout.strip().split("\n") if l.strip()
         ])
     except Exception:
         stats["claude_related"] = 0
@@ -1932,56 +1984,74 @@ async def api_stats():
 
 @app.get("/api/health")
 async def api_health():
-    """Lightweight health check — verifies tmux is accessible and data dir is writable."""
-    checks: dict = {
-        "status": "ok",
-        "tmux": False,
-        "openai": bool(OPENAI_API_KEY),
-        "data_dir": False,
-    }
+    """Lightweight health check — verifies tmux is accessible."""
+    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_API_KEY)}
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
             capture_output=True, text=True, timeout=3
         )
         checks["tmux"] = result.returncode == 0 or "no server running" in result.stderr
     except Exception:
         checks["tmux"] = False
-    checks["data_dir"] = MESSAGES_DIR.is_dir() and os.access(MESSAGES_DIR, os.R_OK | os.W_OK)
-    if not checks["tmux"] or not checks["data_dir"]:
+    if not checks["tmux"]:
         checks["status"] = "degraded"
     return JSONResponse(checks)
 
 
 # --- Claude Code auth management ---
 
+_claude_auth_cache: dict = {"ts": 0, "data": {}}
+
 @app.get("/api/auth/claude-status")
 async def api_claude_auth_status():
-    """Return Claude Code OAuth login status and whether an Anthropic API key is stored."""
+    now = time.time()
+    if now - _claude_auth_cache["ts"] < 60 and _claude_auth_cache["data"]:
+        cached = dict(_claude_auth_cache["data"])
+        cached["hasApiKey"] = bool(_stored_anthropic_key)
+        return JSONResponse(cached)
+
     result_data: dict = {"loggedIn": False, "hasApiKey": bool(_stored_anthropic_key)}
+
+    # Try reading credentials file directly (instant vs ~25s subprocess)
+    creds_file = Path.home() / ".claude" / ".credentials.json"
+    try:
+        creds = json.loads(creds_file.read_text())
+        oauth = creds.get("claudeAiOauth", {})
+        if oauth and oauth.get("expiresAt", 0) > now * 1000:  # expiresAt is millis
+            result_data["loggedIn"] = True
+            result_data["subscriptionType"] = oauth.get("subscriptionType", "")
+            result_data["email"] = "Claude Code"
+            _claude_auth_cache["ts"] = now
+            _claude_auth_cache["data"] = result_data
+            return JSONResponse(result_data)
+    except Exception:
+        logger.debug("Could not read credentials file, falling back to subprocess")
+
+    # Fallback: subprocess with generous timeout
     try:
         result = await asyncio.to_thread(subprocess.run,
             ["claude", "auth", "status", "--json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
             auth_info = json.loads(result.stdout.strip())
             auth_info["hasApiKey"] = bool(_stored_anthropic_key)
+            _claude_auth_cache["ts"] = now
+            _claude_auth_cache["data"] = auth_info
             return JSONResponse(auth_info)
     except Exception:
-        logger.exception("claude auth status check failed")
-        result_data["error"] = "Claude status check failed"
+        logger.debug("Claude auth subprocess fallback also failed", exc_info=True)
+
     return JSONResponse(result_data)
 
 
 class SetApiKey(BaseModel):
-    apiKey: str = Field(..., max_length=500)
+    apiKey: str
 
 
 @app.post("/api/auth/api-key")
 async def api_set_claude_key(body: SetApiKey):
-    """Store or clear the Anthropic API key used for Claude Code sessions in API-key auth mode."""
     key = body.apiKey.strip()
     if key:
         if not key.startswith(("sk-ant-", "sk-")):
@@ -1998,19 +2068,16 @@ async def api_set_claude_key(body: SetApiKey):
 
 @app.post("/api/auth/logout")
 async def api_claude_auth_logout():
-    """Revoke Claude Code OAuth session and clear any stored Anthropic API key."""
     errors = []
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
+        result = subprocess.run(
             ["claude", "auth", "logout"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
             errors.append(result.stderr.strip() or "OAuth logout failed")
-    except Exception:
-        logger.exception("claude auth logout subprocess failed")
-        errors.append("Logout process failed")
+    except Exception as e:
+        errors.append(str(e))
     _clear_anthropic_key()
     if errors:
         return JSONResponse({"ok": True, "warnings": errors})
@@ -2018,36 +2085,6 @@ async def api_claude_auth_logout():
 
 
 _usage_cache: dict = {"ts": 0, "data": {}}
-
-
-def _parse_usage_file(fpath: str, today: str) -> tuple[int, int, int, int, int]:
-    """Parse a single Claude JSONL file for today's token usage. Returns (input, output, cache_read, cache_create, msg_count)."""
-    input_tok = output_tok = cache_read = cache_create = msg_count = 0
-    try:
-        mtime = os.path.getmtime(fpath)
-        if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
-            return 0, 0, 0, 0, 0
-        with open(fpath) as f:
-            for line in f:
-                d = json.loads(line)
-                if d.get("type") != "assistant":
-                    continue
-                ts = d.get("timestamp", "")
-                if not ts.startswith(today):
-                    continue
-                msg = d if "usage" in d else d.get("message", {})
-                usage = msg.get("usage")
-                if not usage:
-                    continue
-                input_tok += usage.get("input_tokens", 0)
-                output_tok += usage.get("output_tokens", 0)
-                cache_read += usage.get("cache_read_input_tokens", 0)
-                cache_create += usage.get("cache_creation_input_tokens", 0)
-                msg_count += 1
-    except Exception:
-        logger.debug("Failed to parse usage JSONL for '%s'", fpath, exc_info=True)
-    return input_tok, output_tok, cache_read, cache_create, msg_count
-
 
 @app.get("/api/auth/usage")
 async def api_claude_usage():
@@ -2067,17 +2104,36 @@ async def api_claude_usage():
     for p in patterns:
         files.update(globmod.glob(p))
 
-    results = await asyncio.gather(
-        *(asyncio.to_thread(_parse_usage_file, fpath, today) for fpath in files)
-    )
+    input_tok = 0
+    output_tok = 0
+    cache_read = 0
+    cache_create = 0
+    msg_count = 0
 
-    input_tok = output_tok = cache_read = cache_create = msg_count = 0
-    for it, ot, cr, cc, mc in results:
-        input_tok += it
-        output_tok += ot
-        cache_read += cr
-        cache_create += cc
-        msg_count += mc
+    for fpath in files:
+        try:
+            mtime = os.path.getmtime(fpath)
+            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
+                continue
+            with open(fpath) as f:
+                for line in f:
+                    d = json.loads(line)
+                    if d.get("type") != "assistant":
+                        continue
+                    ts = d.get("timestamp", "")
+                    if not ts.startswith(today):
+                        continue
+                    msg = d if "usage" in d else d.get("message", {})
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    input_tok += usage.get("input_tokens", 0)
+                    output_tok += usage.get("output_tokens", 0)
+                    cache_read += usage.get("cache_read_input_tokens", 0)
+                    cache_create += usage.get("cache_creation_input_tokens", 0)
+                    msg_count += 1
+        except Exception:
+            logger.debug("Failed to parse usage JSONL for '%s'", fpath, exc_info=True)
 
     data = {
         "date": today,
@@ -2093,9 +2149,216 @@ async def api_claude_usage():
     return JSONResponse(data)
 
 
+_stats_usage_cache: dict = {"ts": 0, "data": {}}
+
+def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
+    """Estimate cost in USD from token counts and model name."""
+    if "opus" in model:
+        ci, co, ccr, ccc = 15.0, 75.0, 1.5, 18.75
+    elif "haiku" in model:
+        ci, co, ccr, ccc = 1.0, 5.0, 0.1, 1.25
+    else:  # sonnet or unknown
+        ci, co, ccr, ccc = 3.0, 15.0, 0.3, 3.75
+    return inp * ci / 1e6 + out * co / 1e6 + cr * ccr / 1e6 + cc * ccc / 1e6
+
+
+@app.get("/api/stats/usage")
+async def api_stats_usage():
+    """Aggregated token usage across all sessions: 5h window + this week."""
+    now = time.time()
+    if now - _stats_usage_cache["ts"] < 120 and _stats_usage_cache["data"]:
+        return JSONResponse(_stats_usage_cache["data"])
+
+    now_dt = datetime.now(timezone.utc)
+    cutoff_5h = (now_dt - timedelta(hours=5)).isoformat()
+    # Monday 00:00 UTC of current week
+    week_start = (now_dt - timedelta(days=now_dt.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    home = str(Path.home())
+    patterns = [
+        f"{home}/.claude/projects/*/*.jsonl",
+        f"{home}/.claude/projects/*/subagents/*.jsonl",
+        f"{home}/.claude/projects/*/*/subagents/*.jsonl",
+    ]
+    all_files: set = set()
+    for p in patterns:
+        all_files.update(globmod.glob(p))
+
+    # Build mapping: project_dir -> list of (timestamp, inp, out, cr, cc, model)
+    dir_entries: dict = {}  # project_dir -> entries list
+    week_start_date = week_start[:10]
+
+    for fpath in all_files:
+        try:
+            mtime = os.path.getmtime(fpath)
+            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < week_start_date:
+                continue
+            # Derive project dir (strip subagents/ if present)
+            pdir = os.path.dirname(fpath)
+            if os.path.basename(pdir) == "subagents":
+                pdir = os.path.dirname(pdir)
+            if pdir not in dir_entries:
+                dir_entries[pdir] = []
+            with open(fpath) as f:
+                for line in f:
+                    d = json.loads(line)
+                    if d.get("type") != "assistant":
+                        continue
+                    ts = d.get("timestamp", "")
+                    if ts < week_start:
+                        continue
+                    msg = d if "usage" in d else d.get("message", {})
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    inp = usage.get("input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    cr = usage.get("cache_read_input_tokens", 0)
+                    cc = usage.get("cache_creation_input_tokens", 0)
+                    model = msg.get("model", d.get("message", {}).get("model", "unknown"))
+                    dir_entries[pdir].append((ts, inp, out, cr, cc, model))
+        except Exception:
+            logger.debug("Failed to parse stats usage JSONL '%s'", fpath, exc_info=True)
+
+    # Map tmux sessions to project dirs
+    tmux_sessions = get_tmux_sessions()
+    session_dirs: dict = {}  # project_dir -> session_name
+    for s in tmux_sessions:
+        cwd = get_session_cwd(s["name"])
+        if not cwd:
+            continue
+        sanitized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        projects_base = str(Path.home() / ".claude" / "projects")
+        for candidate in [
+            os.path.join(projects_base, sanitized),
+            os.path.join(projects_base, "-" + sanitized.lstrip("-")),
+        ]:
+            if candidate in dir_entries:
+                session_dirs[candidate] = s["name"]
+                break
+        else:
+            last_part = cwd.rstrip("/").rsplit("/", 1)[-1]
+            for pdir in dir_entries:
+                if last_part in os.path.basename(pdir):
+                    session_dirs[pdir] = s["name"]
+                    break
+
+    # Aggregate per project dir
+    g5h = {"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreateTokens": 0, "totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
+    gweek = {"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreateTokens": 0, "totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
+    session_list = []
+
+    for pdir, entries in dir_entries.items():
+        if not entries:
+            continue
+        sname = session_dirs.get(pdir, os.path.basename(pdir).split("-")[-1] or os.path.basename(pdir))
+        s5h = {"totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
+        sweek = {"totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
+        latest_ts = ""
+        latest_model = "unknown"
+
+        for ts, inp, out, cr, cc, model in entries:
+            total = inp + out + cr + cc
+            # This week
+            sweek["totalTokens"] += total
+            sweek["messages"] += 1
+            sweek["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+            gweek["inputTokens"] += inp
+            gweek["outputTokens"] += out
+            gweek["cacheReadTokens"] += cr
+            gweek["cacheCreateTokens"] += cc
+            gweek["totalTokens"] += total
+            gweek["messages"] += 1
+            gweek["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+            if ts > latest_ts:
+                latest_ts = ts
+                latest_model = model
+            # 5h window
+            if ts >= cutoff_5h:
+                s5h["totalTokens"] += total
+                s5h["messages"] += 1
+                s5h["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+                g5h["inputTokens"] += inp
+                g5h["outputTokens"] += out
+                g5h["cacheReadTokens"] += cr
+                g5h["cacheCreateTokens"] += cc
+                g5h["totalTokens"] += total
+                g5h["messages"] += 1
+                g5h["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+
+        # Round costs
+        s5h["estimatedCost"] = round(s5h["estimatedCost"], 2)
+        sweek["estimatedCost"] = round(sweek["estimatedCost"], 2)
+
+        session_list.append({
+            "name": sname,
+            "model": latest_model,
+            "window5h": s5h,
+            "thisWeek": sweek,
+            "lastActive": latest_ts,
+        })
+
+    # Sort by most recently active
+    session_list.sort(key=lambda x: x["lastActive"], reverse=True)
+    g5h["estimatedCost"] = round(g5h["estimatedCost"], 2)
+    gweek["estimatedCost"] = round(gweek["estimatedCost"], 2)
+
+    data = {
+        "window5h": g5h,
+        "thisWeek": gweek,
+        "sessions": session_list,
+    }
+    _stats_usage_cache["ts"] = now
+    _stats_usage_cache["data"] = data
+    return JSONResponse(data)
+
+
 # --- Per-session token stats & rate tracking ---
 
-_session_stats_cache: dict[str, dict] = {}
+_session_stats_cache: Dict[str, dict] = {}
+_session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+
+
+def _get_session_model(session_name: str) -> str:
+    """Detect the current model for a session by reading the latest JSONL entries."""
+    now = time.time()
+    cached = _session_model_cache.get(session_name)
+    if cached and now - cached.get("ts", 0) < 30:
+        return cached.get("model", "")
+    files = _find_session_jsonl_files(session_name)
+    if not files:
+        _session_model_cache[session_name] = {"model": "", "ts": now}
+        return ""
+    # Find newest file by mtime
+    newest = max(files, key=lambda f: os.path.getmtime(f), default=None)
+    if not newest:
+        _session_model_cache[session_name] = {"model": "", "ts": now}
+        return ""
+    model = ""
+    try:
+        with open(newest, "rb") as f:
+            # Read last ~32KB to find recent model entries
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 32768))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.strip().split("\n")):
+            try:
+                d = json.loads(line)
+                if d.get("type") == "assistant":
+                    msg = d if "model" in d else d.get("message", {})
+                    m = msg.get("model", "")
+                    if m:
+                        model = m
+                        break
+            except (json.JSONDecodeError, KeyError):
+                continue
+    except Exception:
+        logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
+    _session_model_cache[session_name] = {"model": model, "ts": now}
+    return model
 
 
 def _find_session_jsonl_files(session_name: str) -> list:
@@ -2278,11 +2541,6 @@ def _parse_session_stats(session_name: str) -> dict:
     session_start = entries[0][0]
     session_duration_min = int((entries[-1][0] - session_start) / 60) if len(entries) > 1 else 0
 
-    # Context window usage: most recent input tokens = current context size
-    last_input = entries[-1][1] if entries else 0  # (epoch, inp, out, cr, cc)
-    ctx_window = 200_000  # All modern Claude models (Opus/Sonnet/Haiku 3.x and 4.x)
-    context_pct = round(last_input / ctx_window * 100, 1) if last_input else 0
-
     result = {
         "available": True,
         "model": primary_model,
@@ -2303,14 +2561,6 @@ def _parse_session_stats(session_name: str) -> dict:
         "sessionDurationMin": session_duration_min,
         "secsSinceLastActivity": secs_since_last,
         "modelsUsed": models_seen,
-        "lastInputTokens": last_input,
-        "contextPct": context_pct,
-        "ctxWindowSize": ctx_window,
-        # Activity timeline: per-minute output token counts for last 60 min
-        "activityTimeline": [
-            buckets.get(int(now_epoch // 60) * 60 - (i * 60), {}).get("output", 0)
-            for i in range(59, -1, -1)  # index 0 = 59 min ago, index 59 = current minute
-        ],
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -2325,10 +2575,10 @@ async def api_session_stats(session_name: str):
 
 
 class SendCommand(BaseModel):
-    command: str = Field(..., max_length=100_000)  # 100 KB cap
+    command: str
 
 class SendKeys(BaseModel):
-    keys: list = Field(..., max_length=50)  # max 50 keys; e.g. ["Escape"], ["C-c"], ["q", "Enter"]
+    keys: list  # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"]
 
 class AuthModeBody(BaseModel):
     mode: str  # "api" or "subscription"
@@ -2345,12 +2595,23 @@ async def api_send_command(session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         cmd_text = body.command
         if len(cmd_text) > 200:
-            # For long messages, use tmux load-buffer + paste-buffer
-            # This avoids command-line length limits and ensures reliable delivery
+            # For long messages, use tmux load-buffer + paste-buffer.
+            # Claude Code's bracketed paste mode shows "[Pasted text +N lines]"
+            # as a preview and often swallows the Enter that follows, leaving
+            # the paste stuck until the user sends a second message. We defeat
+            # this by sending the \e[?2004l escape sequence first (disables
+            # bracketed paste), then pasting, then waiting long enough for
+            # the terminal to render before pressing Enter.
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "-H",
+                 "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
+                capture_output=True, text=True, timeout=5
+            )
+            await asyncio.sleep(0.15)
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
                 tmp.write(cmd_text)
                 tmp_path = tmp.name
@@ -2365,17 +2626,41 @@ async def api_send_command(session_name: str, body: SendCommand):
                 )
             finally:
                 os.unlink(tmp_path)
+            # Wait long enough for Claude Code to render the pasted content
+            # before pressing Enter. Scale with length; cap at 5s.
+            wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
+            await asyncio.sleep(wait_secs)
+            # Press Enter to submit
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
+            # Belt-and-braces: if a bracketed paste preview is still showing
+            # (because the escape sequence arrived too late, or bracketed paste
+            # was re-enabled mid-flight), a second Enter usually dismisses the
+            # preview and submits. Check the pane, only re-press Enter if we
+            # still see paste preview markers.
+            await asyncio.sleep(0.4)
+            try:
+                tail = await asyncio.to_thread(capture_pane_recent, session_name, 6)
+                if "Pasted text" in tail or "[Pasted" in tail:
+                    await asyncio.to_thread(subprocess.run,
+                        ["tmux", "send-keys", "-t", session_name, "Enter"],
+                        capture_output=True, text=True, timeout=5
+                    )
+            except Exception:
+                logger.debug("Post-paste verification failed", exc_info=True)
         else:
             # Short messages: send-keys -l is fine
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
-        # Then press Enter as a separate key event
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5
-        )
+            # Press Enter as a separate key event
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         # Record user message in chat history
         now = time.time()
         entry = cache.setdefault(session_name, {})
@@ -2386,9 +2671,8 @@ async def api_send_command(session_name: str, body: SendCommand):
         })
         _save_messages()
         return JSONResponse({"ok": True, "sent": body.command})
-    except Exception:
-        logger.exception("Failed to send command to session '%s'", session_name)
-        return JSONResponse({"error": "Failed to send command"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 
@@ -2397,23 +2681,22 @@ async def api_interrupt_session(session_name: str):
     """Send Escape key to interrupt a running Claude Code session."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         await asyncio.to_thread(subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "Escape"],
             capture_output=True, text=True, timeout=5
         )
         return JSONResponse({"ok": True, "action": "interrupt"})
-    except Exception:
-        logger.exception("Failed to interrupt session '%s'", session_name)
-        return JSONResponse({"error": "Failed to interrupt session"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # Allowed tmux key names to prevent injection
 ALLOWED_TMUX_KEYS = {
     "Escape", "Enter", "Space", "Tab", "BSpace",
     "Up", "Down", "Left", "Right",
-    "C-c", "C-d", "C-z", "C-l", "C-a", "C-e",
+    "C-c", "C-d", "C-z", "C-l", "C-a", "C-e", "C-u", "C-k", "C-w",
     "PageUp", "PageDown", "Home", "End",
 }
 
@@ -2426,7 +2709,7 @@ async def api_send_keys(session_name: str, body: SendKeys):
     """
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         for key in body.keys:
             # Allow single printable characters (q, y, n, etc.) and known tmux key names
@@ -2438,9 +2721,8 @@ async def api_send_keys(session_name: str, body: SendKeys):
             else:
                 return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
         return JSONResponse({"ok": True, "keys_sent": body.keys})
-    except Exception:
-        logger.exception("Failed to send keys to session '%s'", session_name)
-        return JSONResponse({"error": "Failed to send keys"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 class BracketedPasteBody(BaseModel):
@@ -2453,7 +2735,7 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
     """
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         if body.enabled:
             # \e[?2004h — enable bracketed paste
@@ -2466,9 +2748,8 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
             capture_output=True, text=True, timeout=5,
         )
         return JSONResponse({"ok": True, "bracketed_paste": body.enabled})
-    except Exception:
-        logger.exception("Failed to toggle bracketed paste for session '%s'", session_name)
-        return JSONResponse({"error": "Failed to toggle bracketed paste"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/api/sessions/{session_name}/set-auth-mode")
@@ -2476,14 +2757,14 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
     """Toggle between API key and subscription auth for a specific session."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         if body.mode == "api":
             key = _stored_anthropic_key
             if not key:
                 # Fallback: try to extract from ~/CLAUDE.md
                 try:
-                    claude_md = await asyncio.to_thread((Path.home() / "CLAUDE.md").read_text)
+                    claude_md = (Path.home() / "CLAUDE.md").read_text()
                     for line in claude_md.splitlines():
                         line = line.strip()
                         if line.startswith("sk-ant-"):
@@ -2498,16 +2779,31 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
                     logger.debug("Failed to scan credentials file for API key", exc_info=True)
             if not key:
                 return JSONResponse({"error": "No API key found"}, status_code=400)
-            await _tmux_type_and_enter(session_name, f"export ANTHROPIC_API_KEY={shlex.quote(key)}")
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 f"export ANTHROPIC_API_KEY={key}"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         elif body.mode == "subscription":
-            await _tmux_type_and_enter(session_name, "unset ANTHROPIC_API_KEY")
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 "unset ANTHROPIC_API_KEY"],
+                capture_output=True, text=True, timeout=5
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
         else:
             return JSONResponse({"error": "Invalid mode"}, status_code=400)
         _session_auth_mode[session_name] = body.mode
         return JSONResponse({"ok": True, "mode": body.mode, "session": session_name})
-    except Exception:
-        logger.exception("Failed to set auth mode for session '%s'", session_name)
-        return JSONResponse({"error": "Failed to set auth mode"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # --- Auto-responder for Claude Code interactive prompts ---
@@ -2515,7 +2811,7 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
 # (plan approval, questions, permission prompts) and sends Enter
 # to select the default/first option — keeps sessions unblocked.
 
-_auto_respond_cooldown: dict[str, float] = {}
+_auto_respond_cooldown: Dict[str, float] = {}
 _AUTO_RESPOND_INTERVAL = 3      # seconds between checks
 _AUTO_RESPOND_COOLDOWN = 10     # min seconds between auto-responds per session
 _auto_respond_log: list = []    # recent auto-respond events (for debugging)
@@ -2622,7 +2918,7 @@ async def api_auto_respond_log():
 # Monitors all active away-mode and go-nuts-mode sessions.
 # Detects stalls (no terminal change for too long) and unsticks them.
 
-_watchdog_snapshots: dict[str, dict] = {}
+_watchdog_snapshots: Dict[str, dict] = {}
 # Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
 
 _WATCHDOG_INTERVAL = 30         # Check every 30 seconds
@@ -2641,9 +2937,12 @@ Do NOT say "standing by" or ask for instructions. Take action NOW."""
 _UNSTICK_PROMPT_AWAY = """You are in Away Mode. The system detected you were stuck and restarted your task loop.
 
 Your previous work is preserved on the current branch. Pick up where you left off:
-1. Check git log to see what you've already done
-2. Check /tmp/away-mode-*.md for your previous notes and audit findings
-3. Pick the next most valuable skill to execute
+1. Run `pwd` to confirm you are in the correct project directory
+2. Check git log to see what you've already done
+3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
+4. Pick the next most valuable skill to execute
+
+IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
 
 Available skills are at: {skills_dir}/
 Read a SKILL.md file and execute its tasks. Take action immediately."""
@@ -2651,9 +2950,12 @@ Read a SKILL.md file and execute its tasks. Take action immediately."""
 _UNSTICK_PROMPT_GONUTS = """You are in Go Nuts Mode. The system detected you were stuck and restarted your task loop.
 
 Your previous work is preserved on the current branch. Pick up where you left off:
-1. Check git log to see what you've already built
-2. Check /tmp/go-nuts-*.md for your product profile and feature backlog
-3. Pick the next feature to build or generate new ideas
+1. Run `pwd` to confirm you are in the correct project directory
+2. Check git log to see what you've already built
+3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
+4. Pick the next feature to build or generate new ideas
+
+IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
 
 Available skills are at: {skills_dir}/
 Read a SKILL.md file and execute its tasks. Build something NOW."""
@@ -2697,9 +2999,9 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
             _save_autonomous_state()
             return
 
-        # Send the appropriate unstick/resume prompt
+        # Send the appropriate unstick/resume prompt (with project isolation)
         skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-        unstick_prompt = (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
+        unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
         log_fn(state, "Sending resume prompt to session")
         await _away_send_prompt(session_name, unstick_prompt)
         await asyncio.sleep(2)
@@ -2711,9 +3013,12 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
             await _go_nuts_continuous_loop(session_name)
 
     except asyncio.CancelledError:
-        log_fn(state, f"{mode} restore cancelled")
-        state["enabled"] = False
-        _save_autonomous_state()
+        if _shutting_down:
+            log_fn(state, f"{mode} restore cancelled (server shutdown — will restore)")
+        else:
+            log_fn(state, f"{mode} restore cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
         raise
     except Exception as e:
         log_fn(state, f"{mode} restore error: {e}")
@@ -2742,14 +3047,15 @@ async def _watchdog_loop():
             if not active_sessions:
                 if _watchdog_snapshots:
                     _watchdog_snapshots.clear()
-            else:
-                for session_name, state, mode in active_sessions:
-                    try:
-                        await _watchdog_check_session(session_name, state, mode, wlog)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        wlog.error(f"Watchdog error checking '{session_name}': {e}")
+                continue
+
+            for session_name, state, mode in active_sessions:
+                try:
+                    await _watchdog_check_session(session_name, state, mode, wlog)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
 
             # Also check for zombie states: enabled=True but task is dead
             for name, state in list(_away_mode_state.items()):
@@ -2823,7 +3129,7 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
                     "is waiting for user input, or simply finished and didn't continue\n\n"
                     "Reply with ONLY one word: LEGITIMATE or STUCK"
                 ),
-                user_content=f"Terminal output (last 50 lines):\n{recent[-_LLM_CTX_REALTIME_OUTPUT:]}",
+                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
                 max_tokens=10,
             )
             assessment = assessment.strip().upper()
@@ -2868,10 +3174,10 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
             # Session claims busy but terminal hasn't changed — might be truly stuck
             # Send Ctrl+C first to break out of whatever it's doing
             log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await _send_ctrl_c(session_name)
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
             await asyncio.sleep(5)
 
-        await _away_send_prompt(session_name, _NUDGE_PROMPT)
+        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
         return
 
     # Nudges exhausted — hard restart
@@ -2897,9 +3203,9 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
 
     # 2. Send Ctrl+C to break any stuck process in the terminal
     try:
-        await _send_ctrl_c(session_name)
+        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
         await asyncio.sleep(3)
-        await _send_ctrl_c(session_name)
+        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
         await asyncio.sleep(2)
     except Exception:
         pass
@@ -2932,9 +3238,9 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
     })
     _save_autonomous_state()
 
-    # 5. Send an unstick prompt directly instead of re-running initial phases
+    # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
     skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-    unstick_prompt = (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
+    unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
 
     await _away_send_prompt(session_name, unstick_prompt)
     await asyncio.sleep(2)
@@ -2950,31 +3256,19 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
     wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
 
 
-async def _autonomous_continuous_loop(
-    session_name: str,
-    state: dict,
-    log_fn,
-    logger,
-    mode_name: str,
-    cycle_label: str,
-    ping_label: str,
-    send_and_wait_fn,
-    ping_prompt: str,
-) -> None:
-    """Shared continuous-loop body for away mode and go-nuts mode (watchdog restart path).
-
-    Waits for the session to become idle, then sends a ping prompt, repeating until
-    the mode is disabled or the task is cancelled.
-    """
+async def _away_mode_continuous_loop(session_name: str):
+    """Standalone continuous loop for away mode (used by watchdog restart)."""
+    log = logging.getLogger("away-mode")
+    state = _away_mode_state[session_name]
     try:
-        # Wait for any in-progress prompt to be processed before starting
+        # Wait for the unstick prompt to be processed
         await _away_wait_for_idle(session_name, timeout=600)
 
         cycle = state.get("step", 0) + 1
         consecutive_errors = 0
         while state.get("enabled"):
             try:
-                log_fn(state, f"Monitoring for idle (cycle {cycle})...")
+                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
                 idle_since = None
                 while state.get("enabled"):
                     await asyncio.sleep(10)
@@ -2994,18 +3288,18 @@ async def _autonomous_continuous_loop(
                     return
 
                 # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, log_fn, state)
+                claude_ok = await _ensure_claude_running(session_name, _away_log, state)
                 if not claude_ok:
-                    log_fn(state, f"Claude Code dead and couldn't restart — stopping {mode_name.lower()}")
+                    _away_log(state, "Claude Code dead and couldn't restart — stopping away mode")
                     state["enabled"] = False
                     _save_autonomous_state()
                     return
 
                 state["step"] = cycle
-                state["step_name"] = f"{cycle_label} {cycle}"
-                log_fn(state, f"Session idle 90s — {ping_label} (cycle {cycle})")
-                await send_and_wait_fn(session_name, ping_prompt, state,
-                                       f"{cycle_label} {cycle}", timeout=900)
+                state["step_name"] = f"Ping cycle {cycle}"
+                _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
+                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
+                                           f"Task ping cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
                 _save_autonomous_state()  # Periodic save after each successful cycle
@@ -3015,8 +3309,8 @@ async def _autonomous_continuous_loop(
                 raise
             except Exception as e:
                 consecutive_errors += 1
-                log_fn(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                logger.error(f"{mode_name} cycle error for '{session_name}': {e}")
+                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Away mode cycle error for '{session_name}': {e}")
                 if consecutive_errors >= 5:
                     await asyncio.sleep(300)
                     consecutive_errors = 0
@@ -3024,47 +3318,97 @@ async def _autonomous_continuous_loop(
                     await asyncio.sleep(30)
 
     except asyncio.CancelledError:
-        log_fn(state, f"{mode_name} (restarted) cancelled")
-        state["enabled"] = False
-        _save_autonomous_state()
+        if _shutting_down:
+            _away_log(state, "Away mode (restarted) cancelled (server shutdown — will restore)")
+        else:
+            _away_log(state, "Away mode (restarted) cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
         raise
     except Exception as e:
-        log_fn(state, f"{mode_name} (restarted) error: {e}")
-        logger.error(f"{mode_name} restarted loop error for '{session_name}': {e}")
+        _away_log(state, f"Away mode (restarted) error: {e}")
+        log.error(f"Away mode restarted loop error for '{session_name}': {e}")
         _save_autonomous_state()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
         state["task"] = None
 
 
-async def _away_mode_continuous_loop(session_name: str):
-    """Standalone continuous loop for away mode (used by watchdog restart)."""
-    await _autonomous_continuous_loop(
-        session_name,
-        state=_away_mode_state[session_name],
-        log_fn=_away_log,
-        logger=logging.getLogger("away-mode"),
-        mode_name="Away mode",
-        cycle_label="Ping cycle",
-        ping_label="task ping",
-        send_and_wait_fn=_away_send_and_wait,
-        ping_prompt=_AWAY_PING_PROMPT,
-    )
-
-
 async def _go_nuts_continuous_loop(session_name: str):
     """Standalone continuous loop for go-nuts mode (used by watchdog restart)."""
-    await _autonomous_continuous_loop(
-        session_name,
-        state=_go_nuts_state[session_name],
-        log_fn=_go_nuts_log,
-        logger=logging.getLogger("go-nuts-mode"),
-        mode_name="Go Nuts mode",
-        cycle_label="Build cycle",
-        ping_label="build ping",
-        send_and_wait_fn=_go_nuts_send_and_wait,
-        ping_prompt=_GN_PING_PROMPT,
-    )
+    log = logging.getLogger("go-nuts-mode")
+    state = _go_nuts_state[session_name]
+    try:
+        await _away_wait_for_idle(session_name, timeout=600)
+
+        cycle = state.get("step", 0) + 1
+        consecutive_errors = 0
+        while state.get("enabled"):
+            try:
+                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
+                idle_since = None
+                while state.get("enabled"):
+                    await asyncio.sleep(10)
+                    try:
+                        activity = await async_detect_activity(session_name)
+                    except Exception:
+                        activity = {"status": "unknown"}
+                    if activity["status"] == "idle":
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 90:
+                            break
+                    else:
+                        idle_since = None
+
+                if not state.get("enabled"):
+                    return
+
+                # Ensure Claude Code is running before sending prompt (OOM recovery)
+                claude_ok = await _ensure_claude_running(session_name, _go_nuts_log, state)
+                if not claude_ok:
+                    _go_nuts_log(state, "Claude Code dead and couldn't restart — stopping go nuts mode")
+                    state["enabled"] = False
+                    _save_autonomous_state()
+                    return
+
+                state["step"] = cycle
+                state["step_name"] = f"Build cycle {cycle}"
+                _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
+                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
+                                              f"Build cycle {cycle}", timeout=900)
+                cycle += 1
+                consecutive_errors = 0
+                _save_autonomous_state()  # Periodic save after each successful cycle
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Go Nuts cycle error for '{session_name}': {e}")
+                if consecutive_errors >= 5:
+                    await asyncio.sleep(300)
+                    consecutive_errors = 0
+                else:
+                    await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled (server shutdown — will restore)")
+        else:
+            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
+        raise
+    except Exception as e:
+        _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
+        log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
+        _save_autonomous_state()  # Save state so watchdog can recover
+        # Don't set enabled=False — let watchdog zombie detection restart us
+    finally:
+        state["task"] = None
 
 
 # --- Away Mode ---
@@ -3075,8 +3419,8 @@ def _away_log(state: dict, action: str):
     """Append a log entry to the away-mode state."""
     entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
     state.setdefault("log", []).append(entry)
-    if len(state["log"]) > _LOG_CAP:
-        state["log"] = state["log"][-_LOG_CAP:]
+    if len(state["log"]) > 200:
+        state["log"] = state["log"][-200:]
 
 
 def _away_state_summary(state: dict) -> dict:
@@ -3088,7 +3432,7 @@ def _away_state_summary(state: dict) -> dict:
         "step": state.get("step", 0),
         "step_name": state.get("step_name", ""),
         "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-_LOG_TAIL:],
+        "log": state.get("log", [])[-30:],
         "report": state.get("report", ""),
     }
 
@@ -3109,7 +3453,7 @@ async def _away_send_prompt(session_name: str, prompt: str):
     try:
         fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
         os.close(fd)
-        await asyncio.to_thread(Path(prompt_file).write_text, prompt_text)
+        Path(prompt_file).write_text(prompt_text)
 
         # Capture terminal state before paste to detect changes later
         pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
@@ -3181,7 +3525,7 @@ async def _away_send_prompt(session_name: str, prompt: str):
             log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
             await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
             await asyncio.sleep(0.5)
-            await _send_ctrl_c(session_name)
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
             await asyncio.sleep(1)
             # Re-send the prompt, this time relying on bracketed paste disabled earlier
             await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
@@ -3233,68 +3577,60 @@ async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
     return False
 
 
-_AWAY_SUMMARY_PROMPT = (
-    "Summarize what the agent accomplished in this terminal output. "
-    "Focus on concrete actions: files created/modified, tests run, errors, "
-    "branches created, findings. Be specific and concise. Under 80 words."
-)
+def _build_project_isolation_preamble(session_name: str) -> str:
+    """Build a preamble that anchors the autonomous mode to the correct project."""
+    cwd = get_session_cwd(session_name)
+    return f"""PROJECT ISOLATION — READ THIS FIRST:
+You are working in tmux session "{session_name}".
+Your project directory is: {cwd or '(unknown — run pwd to confirm)'}
 
-_GN_SUMMARY_PROMPT = (
-    "Summarize what the agent accomplished in this terminal output. "
-    "Focus on concrete actions: features built, files created/modified, tests run, errors. "
-    "Be specific and concise. Under 80 words."
-)
+STRICT RULES:
+- ONLY modify files inside your project directory ({cwd or 'current working directory'}).
+- NEVER cd into, read from, or write to other project directories on this server.
+- NEVER modify files under /var/www/, /opt/, or ~/  that belong to other projects.
+- Write all reports and temp files to /tmp/ using your session name as prefix: /tmp/{session_name}-*.md
+- Do NOT write to generic paths like /tmp/away-mode-*.md or /tmp/go-nuts-*.md — always include the session name.
+- If you need to check infrastructure context, read ~/.claude/vm_projects_dir.md (read-only, never modify during autonomous mode).
+- If a skill or task does not apply to THIS project, skip it entirely.
+- Do NOT restart, modify configs for, or interact with services belonging to other projects.
+
+"""
 
 
-async def _autonomous_send_and_wait(
-    session_name: str,
-    prompt: str,
-    state: dict,
-    step_name: str,
-    timeout: int,
-    log_fn,
-    mode_label: str,
-    summary_prompt: str,
-) -> str:
-    """Send prompt to session, wait for idle, capture output and LLM-summarize.
-
-    Shared implementation for away mode and go-nuts mode.
-    """
+async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
+                               step_name: str, timeout: int = 900) -> str:
+    """Send prompt, wait for completion, capture and summarize output."""
     state["step_name"] = step_name
-    log_fn(state, f"Sending: {step_name}")
+    _away_log(state, f"Sending: {step_name}")
 
+    prompt = _build_project_isolation_preamble(session_name) + prompt
     await _away_send_prompt(session_name, prompt)
     completed = await _away_wait_for_idle(session_name, timeout=timeout)
 
     if not completed:
-        log_fn(state, f"Timeout on: {step_name}")
+        _away_log(state, f"Timeout on: {step_name}")
         # Send Ctrl+C to unstick if needed
-        await _send_ctrl_c(session_name)
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
         await asyncio.sleep(2)
 
     # Capture output and summarize
     output = capture_pane_full(session_name)
     try:
         summary = await llm_call(
-            system_prompt=summary_prompt,
-            user_content=f"{mode_label} step: {step_name}\n\nTerminal output:\n{output[-_LLM_CTX_AWAY_OUTPUT:]}",
-            max_tokens=_LLM_TOKENS_AWAY,
+            system_prompt=(
+                "Summarize what the agent accomplished in this terminal output. "
+                "Focus on concrete actions: files created/modified, tests run, errors, "
+                "branches created, findings. Be specific and concise. Under 80 words."
+            ),
+            user_content=f"Away mode step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
+            max_tokens=200,
         )
     except Exception:
         summary = "(summary unavailable)"
 
-    log_fn(state, f"Done: {summary[:200]}")
+    _away_log(state, f"Done: {summary[:200]}")
     state["step"] += 1
     return summary
-
-
-async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
-                               step_name: str, timeout: int = 900) -> str:
-    """Send prompt in away mode, wait for completion, capture and summarize output."""
-    return await _autonomous_send_and_wait(
-        session_name, prompt, state, step_name, timeout,
-        log_fn=_away_log, mode_label="Away mode", summary_prompt=_AWAY_SUMMARY_PROMPT,
-    )
 
 
 # --- Phase implementations ---
@@ -3314,7 +3650,7 @@ PHASE 1: Study the Project
 3. Examine source directories (src/, app/, lib/, components/, routes/, api/)
 4. Check test directories (test/, tests/, __tests__/, spec/, e2e/)
 5. Check git history: recent commits, active areas of development
-6. Create a project profile at /tmp/away-mode-profile.md covering:
+6. Create a project profile at /tmp/<SESSION_NAME>-away-mode-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above) covering:
    - Project name, type, primary languages, frameworks
    - Architecture: frontend, backend, database, external services
    - Current state: can it build? tests? linting?
@@ -3358,7 +3694,7 @@ Available skills (read the SKILL.md inside each directory):
 
 For each skill, read the SKILL.md, then decide: applicable? priority? risk level?
 
-Write selection to /tmp/away-mode-skills-selected.md with selected skills in priority order.
+Write selection to /tmp/<SESSION_NAME>-away-mode-skills-selected.md (use your session name) with selected skills in priority order.
 
 When done, immediately continue to executing skills — do not wait."""
 
@@ -3370,7 +3706,7 @@ Read these skill files and execute their AUDIT tasks. Do NOT modify code — obs
 2. Read {_SKILLS_DIR}/06-content-integrity/SKILL.md — execute content integrity checks
 3. Read {_SKILLS_DIR}/21-codebase-audit/SKILL.md — execute codebase audit tasks
 
-For EVERY finding, log it in /tmp/away-mode-audit.md with:
+For EVERY finding, log it in /tmp/<SESSION_NAME>-away-mode-audit.md (use your session name) with:
 - Category | Severity (critical/high/medium/low) | Description | File:Line
 
 When done, immediately continue to the next round."""
@@ -3594,10 +3930,13 @@ async def _away_mode_worker(session_name: str):
                     await asyncio.sleep(30)
 
     except asyncio.CancelledError:
-        _away_log(state, "Away mode cancelled by user")
+        if _shutting_down:
+            _away_log(state, "Away mode cancelled (server shutdown — will restore)")
+        else:
+            _away_log(state, "Away mode cancelled by user")
+            state["enabled"] = False
+            _save_autonomous_state()
         log.info(f"Away mode cancelled for '{session_name}'")
-        state["enabled"] = False
-        _save_autonomous_state()
         raise
     except Exception as e:
         _away_log(state, f"Away mode fatal error: {e}")
@@ -3614,9 +3953,13 @@ async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
     """Toggle away mode on or off for a session."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
     if body.enabled:
+        # Don't allow both away mode and go-nuts mode at the same time on same session
+        if _go_nuts_state.get(session_name, {}).get("enabled"):
+            return JSONResponse({"error": "Go Nuts Mode is active on this session. Disable it first."}, status_code=409)
+
         # Check if already running for this session
         if _away_mode_state.get(session_name, {}).get("enabled"):
             return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
@@ -3668,8 +4011,8 @@ def _go_nuts_log(state: dict, action: str):
     """Append a log entry to the go-nuts-mode state."""
     entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
     state.setdefault("log", []).append(entry)
-    if len(state["log"]) > _LOG_CAP:
-        state["log"] = state["log"][-_LOG_CAP:]
+    if len(state["log"]) > 200:
+        state["log"] = state["log"][-200:]
 
 
 def _go_nuts_state_summary(state: dict) -> dict:
@@ -3681,18 +4024,44 @@ def _go_nuts_state_summary(state: dict) -> dict:
         "step": state.get("step", 0),
         "step_name": state.get("step_name", ""),
         "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-_LOG_TAIL:],
+        "log": state.get("log", [])[-30:],
         "report": state.get("report", ""),
     }
 
 
 async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
                                   step_name: str, timeout: int = 900) -> str:
-    """Send prompt in go-nuts mode, wait for completion, capture and summarize output."""
-    return await _autonomous_send_and_wait(
-        session_name, prompt, state, step_name, timeout,
-        log_fn=_go_nuts_log, mode_label="Go Nuts", summary_prompt=_GN_SUMMARY_PROMPT,
-    )
+    """Send prompt, wait for completion, capture and summarize output."""
+    state["step_name"] = step_name
+    _go_nuts_log(state, f"Sending: {step_name}")
+
+    prompt = _build_project_isolation_preamble(session_name) + prompt
+    # Reuse the same send/wait infrastructure as away mode
+    await _away_send_prompt(session_name, prompt)
+    completed = await _away_wait_for_idle(session_name, timeout=timeout)
+
+    if not completed:
+        _go_nuts_log(state, f"Timeout on: {step_name}")
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
+        await asyncio.sleep(2)
+
+    output = capture_pane_full(session_name)
+    try:
+        summary = await llm_call(
+            system_prompt=(
+                "Summarize what the agent accomplished in this terminal output. "
+                "Focus on concrete actions: features built, files created/modified, tests run, errors. "
+                "Be specific and concise. Under 80 words."
+            ),
+            user_content=f"Go Nuts step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
+            max_tokens=200,
+        )
+    except Exception:
+        summary = "(summary unavailable)"
+
+    _go_nuts_log(state, f"Done: {summary[:200]}")
+    state["step"] += 1
+    return summary
 
 
 # --- Go Nuts Phase Prompts ---
@@ -3712,12 +4081,12 @@ Key objectives:
 2. Understand the product vision — who uses this, what does "done" look like?
 3. Assess maturity level (skeleton/prototype/MVP/early product/established)
 4. Map constraints — what can and can't we build?
-5. Write the product profile to /tmp/go-nuts-product-profile.md
+5. Write the product profile to /tmp/<SESSION_NAME>-go-nuts-product-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above)
 
 Then immediately read {_GO_NUTS_SKILLS_DIR}/02-product-gap-analysis/SKILL.md and execute it:
 1. Compare what exists vs what users of this product type expect
 2. Identify every missing feature and gap
-3. Write the gap analysis to /tmp/go-nuts-gap-analysis.md
+3. Write the gap analysis to /tmp/<SESSION_NAME>-go-nuts-gap-analysis.md (use your session name)
 
 CRITICAL: Create a working branch: git checkout -b go-nuts/session-$(date +%Y%m%d-%H%M%S)
 CRITICAL: Never commit to main/master. All work on the go-nuts branch.
@@ -3731,7 +4100,7 @@ Read {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md and execute ALL tasks:
 1. Use the brainstorming frameworks (What If, Adjacent Feature, Delight, Productization)
 2. Research competitors if possible (use web search)
 3. Score each feature on Impact/Feasibility/Independence/Novelty
-4. Write the prioritized backlog to /tmp/go-nuts-feature-backlog.md
+4. Write the prioritized backlog to /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name)
 
 Then pick the TOP 3 highest-priority features from the backlog and start building them.
 
@@ -3748,7 +4117,7 @@ When done, immediately continue to the next task without waiting."""
 
 _GN_PHASE3_PROMPT = f"""PHASE 3: Build Features (Batch)
 
-Continue building features from the backlog at /tmp/go-nuts-feature-backlog.md.
+Continue building features from the backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name from the PROJECT ISOLATION preamble).
 
 For each feature, use the relevant skill file:
 - UI/pages → Read {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md
@@ -3778,7 +4147,7 @@ _GN_PING_PROMPT = f"""You are in Go Nuts Mode. The user is not present. You are 
 
 You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do.
 
-STEP 1: Check your backlog at /tmp/go-nuts-feature-backlog.md — any features left to build?
+STEP 1: Check your backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name) — any features left to build?
 STEP 2: If backlog is empty or low, generate new ideas using {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md
 STEP 3: Pick a skill and execute it.
 
@@ -3943,10 +4312,13 @@ async def _go_nuts_mode_worker(session_name: str):
                     await asyncio.sleep(30)
 
     except asyncio.CancelledError:
-        _go_nuts_log(state, "Go Nuts mode cancelled by user")
+        if _shutting_down:
+            _go_nuts_log(state, "Go Nuts mode cancelled (server shutdown — will restore)")
+        else:
+            _go_nuts_log(state, "Go Nuts mode cancelled by user")
+            state["enabled"] = False
+            _save_autonomous_state()
         log.info(f"Go Nuts mode cancelled for '{session_name}'")
-        state["enabled"] = False
-        _save_autonomous_state()
         raise
     except Exception as e:
         _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
@@ -3963,7 +4335,7 @@ async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
     """Toggle go-nuts mode on or off for a session."""
     _, sess = _find_session(session_name)
     if not sess:
-        return _resp_session_not_found()
+        return JSONResponse({"error": "Session not found"}, status_code=404)
 
     if body.enabled:
         # Don't allow both away mode and go-nuts mode at the same time on same session
@@ -4016,7 +4388,6 @@ HTML_PAGE = r"""<!doctype html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
-button,a,input,textarea,select{touch-action:manipulation}
 
 /* Nav wrapper — keeps right-side items pinned while tabs scroll */
 .nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0}
@@ -4026,8 +4397,7 @@ button,a,input,textarea,select{touch-action:manipulation}
 /* Pinned right section */
 .nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
 .nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
-.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none;position:relative}
-.nav-unread{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;background:#1f6feb;color:#fff;font-size:.6rem;font-weight:700;border-radius:8px;line-height:1}
+.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
 .nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
@@ -4042,119 +4412,16 @@ button,a,input,textarea,select{touch-action:manipulation}
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
 .nav-spacer{flex:1}
+.nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;padding-right:10px;display:flex;align-items:center;gap:8px;border-right:1px solid #30363d;margin-right:10px;padding:4px 10px 4px 0;transition:color .15s}
+.nav-server-stats:hover{color:#c9d1d9}
+.nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
+.nav-server-stats .stat-val.warn{color:#d29922}
+.nav-server-stats .stat-val.crit{color:#f85149}
 .nav-status-text{font-size:.75rem;color:#6e7681;white-space:nowrap;padding-right:12px}
-.nav-total-cost{font-size:.7rem;color:#6e7681;white-space:nowrap;padding:0 10px 0 0;cursor:default}
-.nav-total-cost span{color:#3fb950;font-weight:600}
-.nav-item.long-idle .nav-session-id{color:#484f58}
-.nav-item.long-idle .nav-dot.idle{background:#484f58;animation:none}
-/* Drag-to-reorder */
-.nav-item.dragging{opacity:.4;background:#1c2128}
-.nav-item.drag-over{border-top:2px solid #58a6ff !important}
-/* Focus mode */
-body.focus-mode .top-nav{display:none}
-body.focus-mode .nav-right{display:none}
-body.focus-mode .rate-alarm{display:none}
-body.focus-mode .main{max-width:none;padding:8px 16px}
-.focus-mode-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
-.focus-mode-btn:hover{border-color:#58a6ff;color:#58a6ff}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
-
-/* Session filter search */
-.nav-search{background:#0d1117;border:1px solid #30363d;color:#e1e4e8;padding:4px 10px;border-radius:6px;font-size:.75rem;outline:none;width:130px;transition:width .2s,border-color .2s;flex-shrink:0;margin-right:8px}
-.nav-search:focus{border-color:#58a6ff;width:190px}
-.nav-search::placeholder{color:#6e7681}
-.nav-item.nav-hidden{display:none}
-
-/* Copy button on chat messages */
-.chat-copy-btn{position:absolute;top:6px;right:8px;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:2px 7px;font-size:.63rem;cursor:pointer;opacity:0;transition:opacity .15s;z-index:1;font-family:inherit}
-.chat-msg:hover .chat-copy-btn{opacity:1}
-.chat-copy-btn:hover{background:#30363d;color:#c9d1d9}
-.chat-copy-btn.copied{color:#3fb950;border-color:#3fb950}
-
-/* Export conversation button */
-.chat-export-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:3px 10px;font-size:.72rem;cursor:pointer;transition:all .15s;font-family:inherit}
-.chat-export-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2333}
-
-/* Command palette (Ctrl+K) */
-.palette-overlay{position:fixed;inset:0;background:rgba(1,4,9,.75);z-index:300;display:flex;align-items:flex-start;justify-content:center;padding-top:100px;backdrop-filter:blur(2px)}
-.palette-overlay:not(.active){display:none}
-.palette-box{background:#161b22;border:1px solid #30363d;border-radius:12px;width:540px;max-width:92vw;box-shadow:0 24px 64px #00000099;overflow:hidden}
-.palette-input{width:100%;background:transparent;border:none;border-bottom:1px solid #30363d;color:#e1e4e8;padding:14px 20px;font-size:1rem;outline:none;font-family:inherit}
-.palette-input::placeholder{color:#6e7681}
-.palette-results{max-height:340px;overflow-y:auto}
-.palette-section{font-size:.65rem;color:#6e7681;padding:8px 20px 4px;text-transform:uppercase;letter-spacing:.08em;background:#0d1117;border-top:1px solid #21262d}
-.palette-item{display:flex;align-items:center;gap:10px;padding:10px 20px;cursor:pointer;transition:background .1s}
-.palette-item:hover,.palette-item.pal-selected{background:#1c2128}
-.palette-item-icon{font-size:.9rem;flex-shrink:0;width:18px;text-align:center}
-.palette-item-label{font-size:.88rem;color:#c9d1d9;flex:1}
-.palette-item-hint{font-size:.72rem;color:#6e7681;white-space:nowrap}
-.palette-item-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.palette-no-results{padding:24px;text-align:center;color:#6e7681;font-size:.85rem}
-.palette-footer{padding:8px 20px;border-top:1px solid #21262d;display:flex;gap:16px;font-size:.68rem;color:#6e7681}
-.palette-footer kbd{background:#21262d;border:1px solid #30363d;padding:1px 5px;border-radius:3px;color:#8b949e}
-
-/* Notification permission hint */
-.notif-btn{background:none;border:none;color:#6e7681;cursor:pointer;font-size:.7rem;padding:2px 6px;border-radius:4px;transition:all .15s;flex-shrink:0}
-.notif-btn:hover{color:#c9d1d9;background:#1c2128}
-.notif-btn.granted{color:#3fb950}
-
-/* Chat message search */
-.chat-search-bar{display:flex;align-items:center;gap:6px;padding:5px 10px;background:#161b22;border:1px solid #21262d;border-radius:6px;margin-bottom:8px}
-.chat-search-bar input{flex:1;background:none;border:none;color:#c9d1d9;font-size:.78rem;outline:none;font-family:inherit}
-.chat-search-bar input::placeholder{color:#484f58}
-.chat-search-clear{background:none;border:none;color:#6e7681;cursor:pointer;font-size:.85rem;padding:0 2px;line-height:1}
-.chat-search-clear:hover{color:#c9d1d9}
-.chat-search-count{font-size:.7rem;color:#6e7681;white-space:nowrap;min-width:60px;text-align:right}
-.chat-msg.search-dim{opacity:.2;transition:opacity .1s}
-.chat-msg.search-match{background:#1c2333;outline:1px solid #58a6ff44;border-radius:4px}
-/* Session pinning */
-.nav-pin-btn{background:none;border:none;color:#21262d;cursor:pointer;font-size:.75rem;padding:0 1px;line-height:1;transition:color .15s;flex-shrink:0;margin-left:2px}
-.nav-item:hover .nav-pin-btn{color:#8b949e}
-.nav-item.pinned .nav-pin-btn{color:#e3b341}
-.nav-item.pinned{border-bottom-color:#e3b341 !important}
-/* Auto-scroll lock */
-.scroll-lock-btn{background:none;border:1px solid #30363d;color:#6e7681;border-radius:4px;padding:2px 8px;font-size:.7rem;cursor:pointer;transition:all .15s;font-family:inherit;margin-left:4px}
-.scroll-lock-btn:hover{border-color:#8b949e;color:#c9d1d9}
-.scroll-lock-btn.locked{border-color:#f85149;color:#f85149}
-/* Message bookmark button */
-.chat-bmark-btn{position:absolute;top:6px;right:56px;background:none;border:none;color:#484f58;padding:2px 4px;font-size:.8rem;cursor:pointer;opacity:0;transition:opacity .15s,color .15s;z-index:1;font-family:inherit;line-height:1}
-.chat-msg:hover .chat-bmark-btn{opacity:1}
-.chat-bmark-btn:hover{color:#e3b341}
-.chat-bmark-btn.bookmarked{color:#e3b341;opacity:1}
-.chat-msg.bookmarked{border-left:2px solid #e3b34166}
-/* Chat font size classes (applied to html element) */
-html.chat-font-sm .chat-body{font-size:.75rem!important;line-height:1.4!important}
-html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!important}
-/* Nav cost + health badges */
-.nav-cost{font-size:.61rem;color:#6e7681;padding:0 2px;letter-spacing:-.01em;min-width:0}
-.nav-health{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0;margin-left:1px;transition:background .3s}
-.nav-health.good{background:#3fb950}
-.nav-health.warn{background:#e3b341}
-.nav-health.bad{background:#f85149}
-/* Away quick-launch button in chat controls */
-.chat-away-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
-.chat-away-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2128}
-.chat-away-btn.running{border-color:#3fb950;color:#3fb950;background:#0d2818}
-/* Busy-only filter toggle */
-.nav-busy-filter.active{color:#3fb950 !important;border-color:#3fb950 !important;background:#0d2818 !important}
-/* Connection status */
-.nav-status-text.disconnected{color:#f85149 !important}
-/* Go Nuts quick-launch */
-.chat-gonuts-btn{font-size:.72rem;padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;transition:all .15s;font-family:inherit}
-.chat-gonuts-btn:hover{border-color:#f0883e;color:#f0883e;background:#1c2128}
-.chat-gonuts-btn.running{border-color:#da3633;color:#da3633;background:#1a0c0c}
-/* Session color labels */
-.nav-color-tag{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;cursor:pointer;transition:transform .1s;margin-right:1px}
-.nav-color-tag:hover{transform:scale(1.3)}
-.nav-color-tag.c0{background:#21262d;border:1px solid #30363d}
-.nav-color-tag.c1{background:#1f6feb}
-.nav-color-tag.c2{background:#238636}
-.nav-color-tag.c3{background:#9a6700}
-.nav-color-tag.c4{background:#8250df}
-.nav-color-tag.c5{background:#cf222e}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -4172,6 +4439,7 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .badge{font-size:.7rem;padding:2px 8px;border-radius:12px;font-weight:500}
 .badge.attached{background:#238636;color:#fff}
 .badge.detached{background:#6e7681;color:#fff}
+.badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
 .btn-danger:hover{background:#3d1214}
 
@@ -4180,6 +4448,14 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .tab{padding:10px 20px;font-size:.85rem;font-weight:500;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;user-select:none}
 .tab:hover{color:#c9d1d9}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+/* Tab-more dropdown (Chat/Skills/Info) */
+.tab-more-wrap{position:relative}
+.tab-more-trigger{display:flex;align-items:center;gap:4px}
+.tab-more-menu{display:none;position:absolute;top:100%;left:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:120px;padding:4px 0;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.tab-more-menu.open{display:block}
+.tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
+.tab-more-item:hover{background:#1c2128;color:#c9d1d9}
+.tab-more-item.active{color:#58a6ff}
 .tab-content{display:none}
 .tab-content.active{display:flex;flex-direction:column;flex:1;min-height:0}
 
@@ -4194,27 +4470,6 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
-/* Markdown rendered content */
-.chat-body{white-space:pre-wrap}
-.chat-body.collapsed{max-height:200px;overflow:hidden;mask-image:linear-gradient(to bottom,#000 60%,transparent)}
-.chat-body.md-rendered{white-space:normal}
-.chat-expand-btn{display:block;font-size:.72rem;color:#58a6ff;background:none;border:none;padding:4px 0;cursor:pointer;text-align:left;font-family:inherit;margin-top:2px}
-.chat-expand-btn:hover{text-decoration:underline}
-.chat-body.md-rendered pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;overflow-x:auto;margin:8px 0;font-size:.82rem}
-.chat-body.md-rendered code{background:#21262d;padding:1px 5px;border-radius:3px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
-.chat-body.md-rendered pre code{background:none;padding:0;font-size:.82rem}
-.chat-body.md-rendered h1,.chat-body.md-rendered h2,.chat-body.md-rendered h3{margin:12px 0 4px;color:#e6edf3;font-weight:600}
-.chat-body.md-rendered h1{font-size:1.1em}.chat-body.md-rendered h2{font-size:1.0em}.chat-body.md-rendered h3{font-size:.95em}
-.chat-body.md-rendered ul,.chat-body.md-rendered ol{margin:6px 0;padding-left:20px}
-.chat-body.md-rendered li{margin:2px 0}
-.chat-body.md-rendered blockquote{border-left:3px solid #58a6ff;margin:8px 0;padding:4px 12px;color:#8b949e;background:#161b22}
-.chat-body.md-rendered p{margin:4px 0}
-.chat-body.md-rendered a{color:#58a6ff;text-decoration:none}.chat-body.md-rendered a:hover{text-decoration:underline}
-.chat-body.md-rendered hr{border:none;border-top:1px solid #30363d;margin:12px 0}
-.chat-body.md-rendered strong{color:#e6edf3}.chat-body.md-rendered em{opacity:.85}
-.chat-jump-btn{position:absolute;bottom:56px;right:16px;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:20px;padding:4px 12px;font-size:.72rem;cursor:pointer;transition:all .15s;z-index:5;display:none}
-.chat-jump-btn.visible{display:block}
-.chat-jump-btn:hover{background:#30363d;color:#c9d1d9;border-color:#484f58}
 .chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
 .chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
@@ -4229,35 +4484,12 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
-.cmd-char-count{position:absolute;bottom:6px;right:70px;font-size:.62rem;color:#484f58;pointer-events:none;transition:color .15s}
-.cmd-char-count.long{color:#e3b341}
-.cmd-char-count.very-long{color:#f85149}
-.nav-msg-count{font-size:.6rem;color:#484f58;padding:0 1px}
-.chat-meta-rt{color:#484f58;font-size:.6rem;margin-left:6px}
-/* Quick reply templates */
-.quick-replies{display:flex;align-items:center;gap:4px;flex-wrap:wrap;padding:4px 8px;margin-top:4px;opacity:.7;transition:opacity .15s}
-.quick-replies:hover{opacity:1}
-.qr-label{font-size:.62rem;color:#484f58;margin-right:2px;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em;flex-shrink:0}
-.quick-reply-btn{background:#161b22;border:1px solid #21262d;color:#8b949e;border-radius:10px;padding:2px 9px;font-size:.68rem;cursor:pointer;transition:all .12s;font-family:inherit;white-space:nowrap}
-.quick-reply-btn:hover{border-color:#58a6ff;color:#58a6ff;background:#1c2333}
-.quick-reply-btn:active{background:#1f6feb;border-color:#1f6feb;color:#fff}
-.session-note-wrap{padding:4px 10px 2px;border-top:1px solid #21262d}
-.session-note-input{width:100%;box-sizing:border-box;background:none;border:none;color:#6e7681;font-size:.72rem;font-family:inherit;resize:none;outline:none;line-height:1.45;max-height:80px;overflow-y:auto;padding:2px 0}
-.session-note-input::placeholder{color:#30363d}
-.session-note-input:focus{color:#c9d1d9}
-.nav-sparkline{display:flex;align-items:flex-end;gap:1px;height:10px;margin-left:4px;opacity:.6}
-.nav-spark-bar{width:3px;border-radius:1px 1px 0 0;min-height:2px}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
-.nav-item.done .nav-session-id{text-decoration:line-through;color:#484f58}
-.nav-done-btn{background:none;border:none;color:#484f58;cursor:pointer;font-size:.8rem;padding:0 2px;line-height:1;flex-shrink:0}
-.nav-done-btn.done{color:#3fb950}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
-.raw-search-bar.active{display:flex!important}
-.raw-line-match{background:#1c2333;outline:1px solid #58a6ff44;border-radius:2px}
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
@@ -4295,10 +4527,6 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
 .key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
 .key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
-.key-btn.key-custom{color:#79c0ff;border-color:#79c0ff44;font-size:.68rem}
-.key-btn.key-custom:hover{background:#79c0ff22;color:#f0f6fc;border-color:#79c0ff88}
-.key-btn.key-add-custom{color:#3fb950;border-color:#3fb95044;font-size:.75rem;padding:3px 7px}
-.key-btn.key-add-custom:hover{background:#3fb95022;border-color:#3fb95088}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -4334,10 +4562,6 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
 .rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
 .rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
-.rate-alarm{display:none;align-items:center;gap:8px;padding:6px 16px;font-size:.78rem;font-weight:600;border-bottom:1px solid;animation:pulse-busy 2s ease-in-out infinite}
-.rate-alarm.visible{display:flex}
-.rate-alarm.limited{background:rgba(210,153,34,.08);border-bottom-color:#d29922;color:#d29922}
-.rate-alarm.severely_limited{background:rgba(248,81,73,.1);border-bottom-color:#f85149;color:#f85149}
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
@@ -4433,6 +4657,13 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .nav-icon-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:6px 8px;border-radius:6px;font-size:.85rem;transition:all .15s;flex-shrink:0;display:flex;align-items:center;gap:4px}
 .nav-icon-btn:hover{background:#1c2128;color:#c9d1d9}
 .nav-icon-btn .icon{font-size:1rem}
+/* Nav tools dropdown */
+.nav-tools-wrap{position:relative;flex-shrink:0}
+.nav-tools-menu{display:none;position:absolute;top:100%;right:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:4px 0;z-index:150;box-shadow:0 8px 24px rgba(0,0,0,.4);margin-top:4px}
+.nav-tools-menu.open{display:block}
+.nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
+.nav-tools-item:hover{background:#1c2128}
+.nav-tools-item .icon{font-size:.9rem}
 
 /* Stats modal */
 .stats-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
@@ -4448,29 +4679,46 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 .stats-bar-fill{height:100%;border-radius:3px;transition:width .3s}
 .stats-close{background:none;border:none;color:#8b949e;cursor:pointer;font-size:1.2rem;padding:0 4px}
 .stats-close:hover{color:#f0f6fc}
-/* Toast notifications */
-#toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
-.toast{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:.82rem;color:#c9d1d9;max-width:320px;pointer-events:auto;animation:toast-in .25s ease;display:flex;align-items:center;gap:8px;box-shadow:0 4px 16px #00000066}
-.toast.success{border-color:#238636;background:#0d2818}
-.toast.warn{border-color:#d29922;background:#271d05}
-.toast.error{border-color:#da3633;background:#2d0b0b}
-@keyframes toast-in{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-@keyframes toast-out{from{opacity:1}to{opacity:0}}
-/* Code block copy buttons in markdown */
-.code-block-wrap{position:relative}
-.code-copy-btn{position:absolute;top:6px;right:6px;font-size:.65rem;padding:2px 8px;border-radius:3px;border:1px solid #30363d;background:#21262d;color:#6e7681;cursor:pointer;transition:all .15s;font-family:inherit;opacity:0}
-.code-block-wrap:hover .code-copy-btn{opacity:1}
-.code-copy-btn:hover{border-color:#58a6ff;color:#58a6ff}
+.stats-usage-table{width:100%;border-collapse:collapse;font-size:.75rem;margin-top:4px}
+.stats-usage-table th{color:#8b949e;font-weight:600;text-align:right;padding:3px 6px;border-bottom:1px solid #21262d;white-space:nowrap}
+.stats-usage-table th:first-child{text-align:left}
+.stats-usage-table td{padding:3px 6px;color:#c9d1d9;text-align:right;white-space:nowrap;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.stats-usage-table td:first-child{text-align:left;font-family:inherit;color:#f0f6fc}
+.stats-usage-table tr.stats-totals-row{border-top:1px solid #30363d;font-weight:600}
+.stats-usage-table tr.stats-totals-row td{color:#f0f6fc;padding-top:6px}
+.stats-usage-table .model-tag{font-size:.65rem;padding:1px 5px;background:#30363d;border-radius:3px;color:#c9d1d9;display:inline-block}
 
 /* CLAUDE.md editor modal */
+/* Skills tab */
+.skills-panel{display:flex;flex-direction:column;height:100%;gap:8px;padding:12px 0}
+.skills-toolbar{display:flex;gap:8px;padding:0 0 8px 0}
+.skills-list{flex:0 0 auto;max-height:200px;overflow-y:auto}
+.skills-file{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #21262d}
+.skills-file:hover{background:#161b22}
+.skills-file-name{color:#58a6ff;cursor:pointer;font-size:.85rem}
+.skills-file-meta{font-size:.7rem;color:#6e7681;margin-left:8px}
+.skills-file-actions{display:flex;gap:6px}
+.skills-editor-wrap{flex:1;display:flex;flex-direction:column;min-height:0}
+.skills-editor-header{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.skills-editor-header input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:6px 10px;font-size:.85rem;font-family:monospace}
+.skills-editor{flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;resize:none;min-height:200px;line-height:1.5;outline:none}
+.skills-editor:focus{border-color:#58a6ff}
+.skills-empty{color:#6e7681;font-size:.85rem;padding:16px 0;text-align:center}
+/* Skills library overlay */
+.skills-library-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
+.skills-library-overlay.active{display:flex}
+.skills-library-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:500px;max-width:calc(100vw - 32px);max-height:calc(100vh - 120px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+.skills-library-panel h3{color:#f0f6fc;margin-bottom:16px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
+.skills-library-set{padding:10px 12px;border:1px solid #21262d;border-radius:8px;margin-bottom:8px;cursor:pointer;transition:background .15s}
+.skills-library-set:hover{background:#21262d}
+.skills-library-set-name{color:#58a6ff;font-weight:500;font-size:.9rem}
+.skills-library-set-meta{font-size:.72rem;color:#6e7681;margin-top:2px}
+.skills-library-actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end}
+
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .claudemd-overlay.active{display:flex}
 .claudemd-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
 .claudemd-panel h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
-.claudemd-tabs{display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:12px}
-.claudemd-tab{padding:8px 16px;font-size:.8rem;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
-.claudemd-tab:hover{color:#c9d1d9}
-.claudemd-tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
 .claudemd-editor{width:100%;min-height:350px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
 .claudemd-editor:focus{border-color:#58a6ff}
 .claudemd-path{font-size:.7rem;color:#6e7681;margin-bottom:8px;font-family:'SF Mono','Fira Code',Consolas,monospace}
@@ -4484,6 +4732,7 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
   .nav-item{padding:8px 10px;gap:5px}
   .nav-title{display:none}
   .nav-attached{display:none}
+  .nav-server-stats{display:none}
   .nav-status-text{display:none}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
@@ -4499,27 +4748,27 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
   .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
   .raw-output{max-height:50vh}
   .modal{min-width:280px;margin:0 16px}
+  .tab{padding:8px 12px;font-size:.8rem}
+  .tab-more-menu{min-width:100px}
 }
 </style></head>
 <body>
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">tmux</span>
-  <button class="nav-new-btn" onclick="showCreateModal()" title="New session (Ctrl+N)">+</button>
+  <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
-  <input class="nav-search" id="nav-search" type="text" placeholder="&#x1F50D; filter sessions..." oninput="filterSessionsNav(this.value)" title="Filter sessions (Ctrl+F)">
-  <span class="nav-total-cost" id="nav-total-cost" title="Total estimated API cost across all sessions"></span>
+  <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <button class="notif-btn" id="notif-btn" onclick="requestNotifPermission()" title="Enable browser notifications">&#x1F514;</button>
-  <button class="nav-icon-btn" id="sound-btn" onclick="toggleSound()" title="Toggle sound notifications (beep when session goes idle)">&#x1F507;</button>
-  <button class="nav-icon-btn" onclick="openPalette()" title="Command palette (Ctrl+K)"><span class="icon">&#x2318;</span></button>
-  <button class="nav-icon-btn nav-busy-filter" id="busy-filter-btn" onclick="toggleBusyFilter()" title="Show only busy sessions (B)">&#x26AB;</button>
-  <button class="nav-icon-btn" id="sort-mode-btn" onclick="cycleSortMode()" title="Sort: custom" style="font-size:.65rem;padding:3px 7px">&#x21C5;Sort</button>
-  <button class="nav-icon-btn" onclick="openBroadcast()" title="Broadcast to multiple sessions">&#x1F4E1;</button>
-  <button class="nav-icon-btn" onclick="openStats()" title="System Stats"><span class="icon">&#x1F4CA;</span></button>
-  <button class="nav-icon-btn" onclick="openClaudeMd()" title="CLAUDE.md"><span class="icon">&#x1F4DD;</span></button>
+  <div class="nav-tools-wrap">
+    <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
+    <div class="nav-tools-menu" id="nav-tools-menu">
+      <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
+      <div class="nav-tools-item" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> CLAUDE.md</div>
+    </div>
+  </div>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
     <span class="status-dot unknown" id="claude-auth-dot"></span>
     <span class="claude-auth-label" id="claude-auth-label">...</span>
@@ -4529,37 +4778,37 @@ html.chat-font-lg .chat-body{font-size:1.05rem!important;line-height:1.65!import
 <div class="auth-dropdown" id="auth-dropdown">
   <div id="auth-dropdown-content"></div>
 </div>
-<div class="rate-alarm" id="rate-alarm"></div>
-<div id="toast-container"></div>
 <div class="main" id="main"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
-  <div class="modal" id="modal-content" role="dialog" aria-modal="true" aria-labelledby="modal-title"></div>
+  <div class="modal" id="modal-content"></div>
 </div>
 <!-- Stats overlay -->
 <div class="stats-overlay" id="stats-overlay" onclick="if(event.target===this)closeStats()">
-  <div class="stats-panel" id="stats-panel" role="dialog" aria-modal="true" aria-label="System Stats">
-    <h3>System Stats <button class="stats-close" onclick="closeStats()" aria-label="Close">&times;</button></h3>
+  <div class="stats-panel" id="stats-panel">
+    <h3>System Stats <button class="stats-close" onclick="closeStats()">&times;</button></h3>
     <div id="stats-content">Loading...</div>
-  </div>
-</div>
-<!-- Command palette overlay (Ctrl+K) -->
-<div class="palette-overlay" id="palette-overlay" onclick="if(event.target===this)closePalette()">
-  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
-    <input class="palette-input" id="palette-input" type="text" placeholder="Search sessions or actions..." oninput="renderPalette(this.value)" onkeydown="handlePaletteKey(event)" autocomplete="off" spellcheck="false">
-    <div class="palette-results" id="palette-results"></div>
-    <div class="palette-footer"><span><kbd>&#x2191;</kbd><kbd>&#x2193;</kbd> navigate</span><span><kbd>Enter</kbd> select</span><span><kbd>Esc</kbd> close</span><span><kbd>Ctrl+K</kbd> anywhere</span></div>
   </div>
 </div>
 <!-- CLAUDE.md editor overlay -->
 <div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
-  <div class="claudemd-panel" id="claudemd-panel" role="dialog" aria-modal="true" aria-label="CLAUDE.md editor">
-    <h3>CLAUDE.md <button class="stats-close" onclick="closeClaudeMd()" aria-label="Close">&times;</button></h3>
-    <div class="claudemd-tabs" id="claudemd-tabs"></div>
+  <div class="claudemd-panel" id="claudemd-panel">
+    <h3>CLAUDE.md (Global) <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
     <div class="claudemd-path" id="claudemd-path"></div>
-    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false" aria-label="CLAUDE.md file contents"></textarea>
+    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false"></textarea>
     <div class="claudemd-actions">
       <button class="btn" onclick="closeClaudeMd()">Cancel</button>
       <button class="btn btn-full" onclick="saveClaudeMd()">Save</button>
+    </div>
+  </div>
+</div>
+<!-- Skills library overlay -->
+<div class="skills-library-overlay" id="skills-library-overlay" onclick="if(event.target===this)closeSkillLibrary()">
+  <div class="skills-library-panel">
+    <h3>Skill Library <button class="stats-close" onclick="closeSkillLibrary()">&times;</button></h3>
+    <div id="skills-library-list"></div>
+    <div class="skills-library-actions">
+      <button class="btn" onclick="closeSkillLibrary()">Cancel</button>
+      <button class="btn btn-full" onclick="saveCurrentToLibrary()">Save Current Set</button>
     </div>
   </div>
 </div>
@@ -4580,28 +4829,6 @@ const lastStatus={};
 const chatMessages={};
 // Preserve textarea drafts across re-renders
 const draftText={};
-// Unread message tracking: name → last seen assistant message count
-const unreadCounts={};
-// Response time tracking: name → timestamp when user sent last message
-const _responseWaiting={};
-const _activityHistory={};  // name → [{s:'busy'|'idle'|'unknown', t:timestamp}, ...]
-const SPARK_MAX=20;  // keep last N data points for sparkline
-function trackActivity(name,status){
-  if(!_activityHistory[name])_activityHistory[name]=[];
-  const h=_activityHistory[name];
-  h.push({s:status,t:Date.now()});
-  if(h.length>SPARK_MAX)h.splice(0,h.length-SPARK_MAX);
-}
-function renderSparkline(name){
-  const h=_activityHistory[name];
-  if(!h||h.length<2)return'';
-  const bars=h.map(p=>{
-    const col=p.s==='busy'?'#3fb950':p.s==='idle'?'#484f58':'#30363d';
-    const ht=p.s==='busy'?10:p.s==='idle'?5:2;
-    return`<div class="nav-spark-bar" style="height:${ht}px;background:${col}"></div>`;
-  }).join('');
-  return`<div class="nav-sparkline" title="Activity history (last ${h.length} checks)">${bars}</div>`;
-}
 
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
@@ -4628,13 +4855,6 @@ function updateFavicon(status){
   const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
   const link=document.getElementById('favicon');
   if(link)link.href=svg;
-  // Also update page title with activity summary
-  const busyCount=sessions.filter(s=>s.activity_status==='busy').length;
-  const totalUnread=Object.values(unreadCounts).reduce((a,b)=>a+b,0);
-  const parts=['tmux Dashboard'];
-  if(busyCount>0)parts.unshift('('+busyCount+' working)');
-  if(totalUnread>0)parts.unshift('['+totalUnread+']');
-  document.title=parts.join(' ');
 }
 
 function timeAgo(ts){
@@ -4650,266 +4870,62 @@ function fmtTime(ts){
   const d=new Date(ts*1000);
   return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 }
-function showToast(msg,type='info',duration=3000){
-  const container=document.getElementById('toast-container');
-  if(!container)return;
-  const el=document.createElement('div');
-  el.className='toast'+(type!=='info'?' '+type:'');
-  el.textContent=msg;
-  container.appendChild(el);
-  setTimeout(()=>{
-    el.style.animation='toast-out .3s ease forwards';
-    setTimeout(()=>el.remove(),300);
-  },duration);
-}
-function copyCodeBlock(btn){
-  const code=btn.parentElement.querySelector('code');
-  if(!code)return;
-  const text=code.innerText||code.textContent;
-  navigator.clipboard.writeText(text).then(()=>{
-    btn.textContent='copied!';
-    showToast('Code copied','success',1800);
-    setTimeout(()=>{btn.textContent='copy';},1500);
-  }).catch(()=>{
-    const ta=document.createElement('textarea');
-    ta.value=text;document.body.appendChild(ta);ta.select();
-    try{document.execCommand('copy');btn.textContent='copied!';}catch(e){}
-    document.body.removeChild(ta);
-    setTimeout(()=>{btn.textContent='copy';},1500);
-  });
-}
 function esc(str){
   if(!str)return'';
   const d=document.createElement('div');
   d.textContent=str;
   return d.innerHTML;
 }
+function formatModelName(model){
+  if(!model)return'';
+  // Strip claude- prefix
+  let m=model.replace(/^claude-/,'');
+  // Strip date suffix like -20251001
+  m=m.replace(/-\d{8}$/,'');
+  // Extract family and version: e.g. "sonnet-4-6" -> "sonnet 4.6"
+  const parts=m.match(/^([a-z]+)-(.+)$/);
+  if(parts){
+    const family=parts[1];
+    const ver=parts[2].replace(/-/g,'.');
+    return family+' '+ver;
+  }
+  return m;
+}
 function statusLabel(s){
   if(s==='busy')return'Working...';
   if(s==='idle')return'Idle';
   return'...';
 }
-// ── Session sticky notes ──
-function getSessionNote(name){return localStorage.getItem('tmux-note-'+name)||'';}
-function saveSessionNote(name,text){if(text)localStorage.setItem('tmux-note-'+name,text);else localStorage.removeItem('tmux-note-'+name);}
-function autoResizeNote(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,80)+'px';}
-function loadSessionNote(name){
-  const el=document.getElementById('note-'+name);
-  if(!el)return;
-  el.value=getSessionNote(name);
-  autoResizeNote(el);
-}
-// ── Session snooze (hide from nav for N minutes) ──
-const _snoozed={};  // name → expiry timestamp (ms)
-function snoozeSession(name,minutes){
-  _snoozed[name]=Date.now()+minutes*60000;
-  showToast(name+' snoozed for '+minutes+'m','info',2500);
-  // Jump to next visible session
-  const visible=sessions.filter(s=>!isSnoozed(s.name)&&s.name!==name);
-  if(visible.length)selectSession(visible[0].name);
-  filterSessionsNav(document.getElementById('nav-search')?.value||'');
-}
-function isSnoozed(name){return _snoozed[name]&&Date.now()<_snoozed[name];}
-function unsnoozeSession(name){delete _snoozed[name];filterSessionsNav(document.getElementById('nav-search')?.value||'');}
-// Periodically check snooze expiry
-setInterval(()=>{
-  let changed=false;
-  for(const name of Object.keys(_snoozed)){if(Date.now()>=_snoozed[name]){delete _snoozed[name];changed=true;showToast(name+' unsnooze','info',2000);}}
-  if(changed)filterSessionsNav(document.getElementById('nav-search')?.value||'');
-},30000);
-// ── Session mark-as-done ──
-function isSessionDone(name){return localStorage.getItem('tmux-done-'+name)==='1';}
-function toggleSessionDone(name){
-  const isDone=isSessionDone(name);
-  if(isDone)localStorage.removeItem('tmux-done-'+name);
-  else localStorage.setItem('tmux-done-'+name,'1');
-  const item=document.getElementById('nav-'+name);
-  if(item)item.classList.toggle('done',!isDone);
-  const btn=item&&item.querySelector('.nav-done-btn');
-  if(btn)btn.classList.toggle('done',!isDone);
-  showToast(name+(isDone?' marked active':' marked done'),isDone?'info':'success',2000);
-}
-// ── Send to all sessions ──
-// ==================== Quick Reply Templates ====================
-function sendQuickReply(name,text){
-  const input=document.getElementById('cmd-chat-'+name);
-  if(!input)return;
-  input.value=text;
-  input.focus();
-  setTimeout(function(){sendChat(name);},80);
-}
-
-async function sendToAll(fromName){
-  const input=document.getElementById('cmd-chat-'+fromName);
-  if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
-  const targets=sessions.filter(s=>s.name!==fromName);
-  if(!targets.length){showToast('No other sessions to send to','warn',2500);return;}
-  let ok=0,fail=0;
-  await Promise.all(targets.map(async s=>{
-    try{
-      await fetch(BASE+'/api/sessions/'+s.name+'/send',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({command:cmd})
-      });
-      ok++;
-    }catch{fail++;}
-  }));
-  showToast('Sent to '+ok+' session'+(ok!==1?'s':'')+(fail?' ('+fail+' failed)':''),'success',3000);
-}
-// ── Session duplication ──
-async function duplicateSession(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/files');
-    const data=await resp.json();
-    showDuplicateModal(name,data.cwd||'');
-  }catch(e){showDuplicateModal(name,'');}
-}
-function showDuplicateModal(origName,cwd){
-  const modal=document.getElementById('modal-content');
-  const sugName='copy-'+origName.replace(/^copy-/,'');
-  modal.innerHTML=`
-    <h3 id="modal-title">Duplicate session ${esc(origName)}</h3>
-    ${cwd?`<p style="font-size:.78rem;color:#6e7681;margin:4px 0 8px">Dir: ${esc(cwd)}</p>`:''}
-    <input type="text" class="modal-input" id="dup-name" value="${esc(sugName)}"
-      onkeydown="if(event.key===\\'Enter\\')confirmDuplicate(\\'${esc(origName)}\\',\\'${esc(cwd)}\\')">
-    <label style="display:flex;align-items:center;gap:8px;font-size:.8rem;color:#8b949e;margin-top:10px">
-      <input type="checkbox" id="dup-launch-claude" checked style="width:14px;height:14px;cursor:pointer">
-      Launch Claude in new session
-    </label>
-    <div class="modal-actions">
-      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="confirmDuplicate(\\'${esc(origName)}\\',\\'${esc(cwd)}\\')">Duplicate</button>
-    </div>`;
-  document.getElementById('modal-overlay').classList.add('active');
-  setTimeout(()=>{const i=document.getElementById('dup-name');if(i){i.focus();i.select();}},50);
-}
-async function confirmDuplicate(origName,cwd){
-  const input=document.getElementById('dup-name');
-  const name=input?input.value.trim():'';
-  const lc=document.getElementById('dup-launch-claude');
-  const launch_claude=lc?lc.checked:true;
-  closeModal();
-  try{
-    const resp=await fetch(BASE+'/api/sessions/create',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name,launch_claude,cwd})
-    });
-    const data=await resp.json();
-    if(!resp.ok){showToast(data.error||'Failed','error',3000);return;}
-    selectedSession=data.name;
-    await loadAll();
-    showToast('Duplicated as '+data.name,'success',2500);
-  }catch(e){showToast('Failed to duplicate session','error',3000);}
-}
-// ── Nav sort modes ──
-const _sortModes=['custom','cost','name','activity'];
-let _sortModeIdx=0;
-function cycleSortMode(){
-  _sortModeIdx=(_sortModeIdx+1)%_sortModes.length;
-  const btn=document.getElementById('sort-mode-btn');
-  const labels=['&#x21C5;Sort','&#x21C5;Cost','&#x21C5;A-Z','&#x21C5;Live'];
-  if(btn){btn.innerHTML=labels[_sortModeIdx];btn.title='Sort: '+_sortModes[_sortModeIdx];}
-  renderNav();
-}
 
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
-  const pinnedSet=getPinnedSessions();
-  const customOrder=_getSessionOrder();
-  const sortMode=_sortModes[_sortModeIdx]||'custom';
-  const sorted=[...sessions].sort((a,b)=>{
-    const ap=pinnedSet.has(a.name)?-1000:0,bp=pinnedSet.has(b.name)?-1000:0;
-    let delta=0;
-    if(sortMode==='cost'){delta=(_sessionCosts[b.name]||0)-(_sessionCosts[a.name]||0);}
-    else if(sortMode==='name'){delta=a.name.localeCompare(b.name);}
-    else if(sortMode==='activity'){
-      const order={busy:0,idle:1,unknown:2};
-      delta=(order[a.activity_status]||2)-(order[b.activity_status]||2);
-    }else{
-      const ai=customOrder.indexOf(a.name),bi=customOrder.indexOf(b.name);
-      const ar=ai<0?999:ai,br=bi<0?999:bi;
-      delta=ar-br;
-    }
-    return (ap-bp)||delta;
-  });
-  sorted.forEach(s=>{
+  const brand=navEl.querySelector('.nav-brand');
+  sessions.forEach(s=>{
     const item=document.createElement('div');
-    item.className='nav-item'+(s.name===selectedSession?' active':'')+(pinnedSet.has(s.name)?' pinned':'')+(isSessionDone(s.name)?' done':'');
+    item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.draggable=true;
-    item.addEventListener('dragstart',e=>onNavDragStart(e,s.name));
-    item.addEventListener('dragover',onNavDragOver);
-    item.addEventListener('drop',e=>onNavDrop(e,s.name));
-    item.addEventListener('dragend',onNavDragEnd);
     item.onclick=()=>selectSession(s.name);
-    // Session age tooltip
-    const created=parseInt(s.created)||0;
-    const ageMs=created?Date.now()-created*1000:0;
-    const ageH=Math.floor(ageMs/3600000),ageM=Math.floor((ageMs%3600000)/60000);
-    const ageStr=ageH>0?`${ageH}h ${ageM}m`:`${ageM}m`;
-    const createdStr=created?new Date(created*1000).toLocaleString():'unknown';
-    const ageTip=created?`Created: ${createdStr} • Running: ${ageStr} • `:'';
-    // Last message preview
-    const msgs=chatMessages[s.name]||[];
-    const lastMsg=msgs.length?msgs[msgs.length-1]:null;
-    const lastTip=lastMsg?`Last: ${lastMsg.text.slice(0,80).replace(/\n/g,' ')}${lastMsg.text.length>80?'…':''} • `:'';
-    const clrCls=getSessionColor(s.name);
     item.innerHTML=`
-      <span class="nav-color-tag ${clrCls}" onclick="event.stopPropagation();cycleSessionColor('${esc(s.name)}',this)" title="Click to set session color"></span>
-      <span class="nav-session-id" ondblclick="event.stopPropagation();startRename('${esc(s.name)}',this)" title="${lastTip}${ageTip}Double-click to rename">${esc(s.name)}</span>
+      <span class="nav-session-id">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
-        ${(unreadCounts[s.name]||0)>0&&s.name!==selectedSession?`<span class="nav-unread">${unreadCounts[s.name]}</span>`:''}
-        ${(chatMessages[s.name]||[]).length>0?`<span class="nav-msg-count" title="${(chatMessages[s.name]||[]).length} messages">${(chatMessages[s.name]||[]).length}</span>`:''}
-        <span class="nav-cost" id="nav-cost-${s.name}"></span>
-        <span class="nav-health good" id="nav-health-${s.name}" title="Session health"></span>
-        <span id="spark-${s.name}">${renderSparkline(s.name)}</span>
-        <button class="nav-done-btn ${isSessionDone(s.name)?'done':''}" onclick="event.stopPropagation();toggleSessionDone('${esc(s.name)}')" title="Mark as done">&#x2713;</button>
-        <button class="nav-pin-btn" onclick="event.stopPropagation();togglePin('${esc(s.name)}')" title="${pinnedSet.has(s.name)?'Unpin':'Pin'} session">&#x2605;</button>
       </span>`;
-    navEl.appendChild(item);
+    brand.after(item);
   });
+  const items=Array.from(navEl.querySelectorAll('.nav-item'));
+  items.reverse().forEach(item=>brand.after(item));
 }
 
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
-  const usesMd=mdEnabled(name);
-  const COLLAPSE_LEN=1200;
-  _loadBookmarks(name);
-  return msgs.map((m,idx)=>{
-    const isLong=m.text&&m.text.length>COLLAPSE_LEN&&m.role==='assistant';
-    const bodyId=`chat-body-${name}-${idx}`;
-    let body;
-    if(usesMd&&m.role==='assistant'){
-      const rendered=renderMarkdown(m.text);
-      // renderMarkdown returns a div.chat-body wrapper — inject id and collapse if long
-      if(isLong)body=rendered.replace('<div class="chat-body','<div id="'+bodyId+'" class="chat-body collapsed');
-      else body=rendered;
-    }else{
-      body=`<div id="${bodyId}" class="chat-body${isLong?' collapsed':''}">${esc(m.text)}</div>`;
-    }
-    const expandBtn=isLong?`<button class="chat-expand-btn" id="exp-${bodyId}" onclick="expandChatMsg('${bodyId}','exp-${bodyId}')">Show more ▼</button>`:'';
-    const bmarked=isBookmarked(name,idx);
-    return`<div class="chat-msg ${m.role}${bmarked?' bookmarked':''}" data-session="${esc(name)}" data-msg-idx="${idx}">
-      <button class="chat-bmark-btn${bmarked?' bookmarked':''}" onclick="toggleBookmark(this)" title="${bmarked?'Remove bookmark':'Bookmark message'}">&#x2605;</button>
-      <button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>
-      ${body}
-      ${expandBtn}
-      <div class="chat-meta" title="${m.ts?new Date(m.ts*1000).toLocaleString():''}">${fmtTime(m.ts)}${m.rt?`<span class="chat-meta-rt" title="Response time">${m.rt}s</span>`:''}</div>
-    </div>`;
-  }).join('');
-}
-function expandChatMsg(bodyId,btnId){
-  const body=document.getElementById(bodyId);
-  const btn=document.getElementById(btnId);
-  if(!body)return;
-  const collapsed=body.classList.toggle('collapsed');
-  if(btn)btn.textContent=collapsed?'Show more ▼':'Show less ▲';
+  return msgs.map(m=>`
+    <div class="chat-msg ${m.role}">
+      ${esc(m.text)}
+      <div class="chat-meta">${fmtTime(m.ts)}</div>
+    </div>`).join('');
 }
 
 function renderDetail(){
@@ -4926,15 +4942,22 @@ function renderDetail(){
   mainEl.innerHTML=`
     <div class="tab-bar">
       <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
-      <div class="tab ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat')">Chat</div>
-      <div class="tab ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info')">Info</div>
+      <div class="tab-more-wrap">
+        <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'} &#9662;</div>
+        <div class="tab-more-menu" id="tab-more-menu">
+          <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
+          <div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>
+          <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
+        </div>
+      </div>
       <div class="detail-badges">
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
           <span class="status-dot"></span>
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        <span class="badge ${s.attached?'attached':'detached'}">${s.attached?'attached':'detached'}</span>
+        ${s.model?'<span class="badge model-badge" id="model-badge-'+s.name+'">'+formatModelName(s.model)+'</span>':''}
+        ${s.attached?'<span class="badge attached">attached</span>':''}
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
@@ -4943,54 +4966,22 @@ function renderDetail(){
       <div class="chat-wrap">
         <div class="chat-controls">
           <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-          <button class="chat-export-btn" onclick="exportConversation('${s.name}')" title="Export conversation as Markdown">&#x21E9; Export</button>
-          <button class="chat-export-btn" onclick="clearChatView('${s.name}')" title="Clear messages from view (local only, does not delete anything)">&#x1F5D1; Clear</button>
-          <button class="chat-export-btn" id="chat-font-btn-${s.name}" onclick="cycleChatFont()" title="Toggle chat font size">A</button>
-          <button class="chat-export-btn" id="md-toggle-${s.name}" onclick="toggleMarkdown('${s.name}')" title="Toggle markdown rendering">MD: ON</button>
-          <button class="chat-away-btn ${s.away_mode?'running':''}" id="away-quick-${s.name}" onclick="quickToggleAway('${esc(s.name)}')" title="${s.away_mode?'Stop Away Mode':'Start Away Mode'}">${s.away_mode?'&#x23F9; Away':'&#x25B6; Away'}</button>
-          <button class="chat-gonuts-btn ${s.go_nuts_mode?'running':''}" id="gonuts-quick-${s.name}" onclick="quickToggleGoNuts('${esc(s.name)}')" title="${s.go_nuts_mode?'Stop Go Nuts Mode':'Start Go Nuts Mode'}">${s.go_nuts_mode?'&#x23F9; Nuts':'&#x1F914; Nuts'}</button>
-          <button class="focus-mode-btn" onclick="toggleFocusMode()" title="Toggle focus mode (F)">&#x26F6; Focus</button>
-          ${s.activity_status!=='busy'?`<button class="chat-export-btn" onclick="sendChatCmd('${s.name}','claude')" title="Launch Claude in this session" style="color:#3fb950;border-color:#238636">&#x25B6; Claude</button>`:''}
         </div>
-        <div class="chat-search-bar">
-          <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
-          <input id="chat-srch-${s.name}" type="text" placeholder="Search messages..." oninput="searchChatMessages('${s.name}',this.value)" autocomplete="off" spellcheck="false">
-          <span class="chat-search-count" id="chat-srch-count-${s.name}"></span>
-          <button class="chat-search-clear" onclick="searchChatMessages('${s.name}','');var i=document.getElementById('chat-srch-${s.name}');if(i){i.value='';i.focus()}" title="Clear">&#x00D7;</button>
-        </div>
-        <div class="chat-messages" id="chat-${s.name}"
-          onscroll="updateJumpBtn('${s.name}',this)">
+        <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
-        </div>
-        <button class="chat-jump-btn" id="jump-btn-${s.name}" onclick="jumpToBottom('${s.name}')">&#x21E9; Latest</button>
-        <div class="quick-replies">
-          <span class="qr-label">Quick:</span>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Continue')">Continue</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Yes')">Yes</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','No')">No</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Summarize what you did')">Summarize</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Explain in more detail')">Explain more</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Show me the code')">Show code</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','What is the next step?')">Next step</button>
-          <button class="quick-reply-btn" onclick="sendQuickReply('${s.name}','Done, thanks')">Done</button>
         </div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this);updateCmdCharCount(this,'chat-cc-${s.name}')"
+            oninput="autoGrow(this)"
             autocomplete="off" spellcheck="false"></textarea>
-          <span class="cmd-char-count" id="chat-cc-${s.name}"></span>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
-          <button class="btn cmd-send" onclick="sendToAll('${s.name}')" title="Send to all sessions" style="background:#161b22;font-size:.7rem;padding:12px 10px;border-left:1px solid #21262d">All</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
-        <div class="session-note-wrap">
-          <textarea class="session-note-input" id="note-${s.name}" rows="1" placeholder="&#x1F4DD; session note..." oninput="saveSessionNote('${s.name}',this.value);autoResizeNote(this)" onfocus="autoResizeNote(this)"></textarea>
-        </div>
       </div>
     </div>
 
@@ -5000,14 +4991,6 @@ function renderDetail(){
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
-        <button class="btn" onclick="copyRawTerminal('${s.name}')" title="Copy all terminal text to clipboard">Copy All</button>
-        <button class="scroll-lock-btn" id="scroll-lock-${s.name}" onclick="toggleScrollLock('${s.name}')" title="Toggle auto-scroll">Auto-scroll: ON</button>
-      </div>
-      <div class="raw-search-bar" id="raw-search-bar-${s.name}" style="display:none;padding:4px 8px;border-bottom:1px solid #21262d;align-items:center;gap:6px">
-        <span style="color:#484f58;font-size:.78rem">&#x1F50D;</span>
-        <input id="raw-srch-${s.name}" type="text" placeholder="Search terminal..." oninput="searchRawTerminal('${s.name}',this.value)" autocomplete="off" spellcheck="false" style="flex:1;background:none;border:none;color:#c9d1d9;font-size:.78rem;outline:none;font-family:inherit">
-        <span class="chat-search-count" id="raw-srch-count-${s.name}"></span>
-        <button class="chat-search-clear" onclick="searchRawTerminal('${s.name}','');var i=document.getElementById('raw-srch-${s.name}');if(i){i.value='';}closeRawSearch('${s.name}')" title="Close">&#x00D7;</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
@@ -5024,6 +5007,24 @@ function renderDetail(){
       ${buildKeyBar(s.name,'raw')}
     </div>
 
+    <div class="tab-content ${tab==='skills'?'active':''}" id="tab-skills-${s.name}">
+      <div class="skills-panel">
+        <div class="skills-toolbar">
+          <button class="btn" onclick="newSkillFile('${s.name}')">+ New File</button>
+          <button class="btn" onclick="openSkillLibrary('${s.name}')">Library</button>
+        </div>
+        <div class="skills-list" id="skills-list-${s.name}"></div>
+        <div class="skills-editor-wrap" id="skills-editor-wrap-${s.name}" style="display:none">
+          <div class="skills-editor-header">
+            <input id="skills-filename-${s.name}" placeholder="filename.md">
+            <button class="btn" onclick="saveSkillFile('${s.name}')">Save</button>
+            <button class="btn" onclick="closeSkillEditor('${s.name}')">Cancel</button>
+          </div>
+          <textarea class="skills-editor" id="skills-editor-${s.name}"></textarea>
+        </div>
+      </div>
+    </div>
+
     <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
       <div class="tier tier-description">
         <div class="tier-label"><span class="dot"></span>Project</div>
@@ -5036,18 +5037,6 @@ function renderDetail(){
       <div class="tier tier-notes">
         <div class="tier-label"><span class="dot"></span>Key Info</div>
         <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
-      </div>
-      <div class="tier" style="margin-top:12px">
-        <div class="tier-label"><span class="dot" style="background:#e3b341"></span>Quick Note
-          <span style="font-size:.65rem;color:#6e7681;font-weight:400;margin-left:4px">saved locally</span>
-        </div>
-        <textarea id="qnote-${s.name}" rows="3"
-          placeholder="Jot a quick note about this session..."
-          style="width:100%;margin-top:6px;background:#0d1117;border:1px solid #21262d;color:#c9d1d9;padding:8px 10px;border-radius:6px;font-size:.82rem;font-family:inherit;resize:vertical;outline:none;transition:border-color .15s"
-          onfocus="this.style.borderColor='#58a6ff'"
-          onblur="this.style.borderColor='#21262d';saveQuickNote('${s.name}',this.value)"
-          oninput="saveQuickNote('${s.name}',this.value)"
-        >${esc(getQuickNote(s.name))}</textarea>
       </div>
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
@@ -5125,27 +5114,16 @@ function renderDetail(){
     startRawPolling(s.name);
   }
   if(tab==='info')startStatsPolling(s.name);
+  if(tab==='skills')loadSkillFiles(s.name);
 }
 
 function selectSession(name){
   stopAllRawPolling();
   selectedSession=name;
-  // Clear unread badge for this session
-  unreadCounts[name]=0;
   navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const navItem=document.getElementById('nav-'+name);
-  if(navItem){
-    navItem.classList.add('active');
-    const badge=navItem.querySelector('.nav-unread');
-    if(badge)badge.remove();
-  }
+  if(navItem)navItem.classList.add('active');
   renderDetail();
-  // Load sticky note and auto-focus chat input after render
-  requestAnimationFrame(()=>{
-    loadSessionNote(name);
-    const input=document.getElementById('cmd-chat-'+name);
-    if(input&&!input.disabled&&document.activeElement!==input)input.focus();
-  });
 }
 
 function switchTab(name,tab){
@@ -5153,12 +5131,19 @@ function switchTab(name,tab){
   const allTabs=mainEl.querySelectorAll('.tab-content');
   allTabs.forEach(t=>t.classList.remove('active'));
   const tabBar=mainEl.querySelector('.tab-bar');
-  if(tabBar)tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  const tabNames=['raw','chat','info'];
-  const idx=tabNames.indexOf(tab);
-  if(tabBar&&idx>=0){
-    const tabs=tabBar.querySelectorAll('.tab');
-    if(tabs[idx])tabs[idx].classList.add('active');
+  if(tabBar){
+    tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    if(tab==='raw'){
+      const rawTab=tabBar.querySelector('.tab');
+      if(rawTab)rawTab.classList.add('active');
+    }else{
+      const trigger=tabBar.querySelector('.tab-more-trigger');
+      if(trigger){trigger.classList.add('active');trigger.innerHTML=({'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More')+' &#9662;';}
+    }
+    tabBar.querySelectorAll('.tab-more-item').forEach(el=>el.classList.remove('active'));
+    const items=tabBar.querySelectorAll('.tab-more-item');
+    const moreIdx=['chat','skills','info'].indexOf(tab);
+    if(moreIdx>=0&&items[moreIdx])items[moreIdx].classList.add('active');
   }
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
@@ -5175,6 +5160,7 @@ function switchTab(name,tab){
     if(s&&s.go_nuts_mode)startGoNutsPolling(name);
     else loadGoNutsStatus(name);
   }
+  if(tab==='skills')loadSkillFiles(name);
   if(tab==='chat'){
     // Re-render chat bubbles to pick up messages added while on other tabs
     const chatEl=document.getElementById('chat-'+name);
@@ -5192,6 +5178,31 @@ function switchTab(name,tab){
     }
   }
 }
+
+// ── Tab-more dropdown ──
+function toggleTabMore(e){
+  e.stopPropagation();
+  const menu=document.getElementById('tab-more-menu');
+  if(menu)menu.classList.toggle('open');
+}
+function closeTabMore(){
+  const menu=document.getElementById('tab-more-menu');
+  if(menu)menu.classList.remove('open');
+}
+
+// ── Nav tools dropdown ──
+function toggleToolsMenu(e){
+  e.stopPropagation();
+  const menu=document.getElementById('nav-tools-menu');
+  if(menu)menu.classList.toggle('open');
+}
+function closeToolsMenu(){
+  const menu=document.getElementById('nav-tools-menu');
+  if(menu)menu.classList.remove('open');
+}
+
+// Close dropdowns on outside click
+document.addEventListener('click',function(){closeTabMore();closeToolsMenu()});
 
 function mergeChatMessages(name, serverMsgs){
   // Merge server messages with local messages, preserving any locally-added
@@ -5228,31 +5239,7 @@ function appendChatBubble(name,role,text,ts){
       }
     }
   }
-  // Track response time
-  let rt=null;
-  if(role==='user'){
-    _responseWaiting[name]=Date.now();
-  }else if(role==='assistant'&&_responseWaiting[name]){
-    rt=((Date.now()-_responseWaiting[name])/1000).toFixed(1);
-    delete _responseWaiting[name];
-  }
-  chatMessages[name].push({role,text,ts,rt});
-  // Track unread assistant messages for non-active sessions
-  if(role==='assistant'&&name!==selectedSession){
-    unreadCounts[name]=(unreadCounts[name]||0)+1;
-    // Update badge on nav item without full re-render
-    const navItem=document.getElementById('nav-'+name);
-    if(navItem){
-      let badge=navItem.querySelector('.nav-unread');
-      if(!badge){
-        badge=document.createElement('span');
-        badge.className='nav-unread';
-        const indicators=navItem.querySelector('.nav-indicators');
-        if(indicators)indicators.insertBefore(badge,indicators.querySelector('.nav-pin-btn'));
-      }
-      badge.textContent=unreadCounts[name];
-    }
-  }
+  chatMessages[name].push({role,text,ts});
   // If this session's chat is visible, append to DOM
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
     const chatEl=document.getElementById('chat-'+name);
@@ -5262,10 +5249,7 @@ function appendChatBubble(name,role,text,ts){
       if(typing)typing.remove();
       const bubble=document.createElement('div');
       bubble.className='chat-msg '+role;
-      const bodyHtml=mdEnabled(name)&&role==='assistant'
-        ?renderMarkdown(text)
-        :'<div class="chat-body">'+esc(text)+'</div>';
-      bubble.innerHTML='<button class="chat-copy-btn" onclick="copyMsg(this)" title="Copy to clipboard">copy</button>'+bodyHtml+'<div class="chat-meta" title="'+(ts?new Date(ts*1000).toLocaleString():'')+'" >'+fmtTime(ts)+'</div>';
+      bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
       chatEl.appendChild(bubble);
       chatEl.scrollTop=chatEl.scrollHeight;
     }
@@ -5277,99 +5261,11 @@ function autoGrow(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,400)+'px';
 }
-function updateCmdCharCount(el,countId){
-  const n=el.value.length;
-  const countEl=document.getElementById(countId);
-  if(!countEl)return;
-  if(n===0){countEl.textContent='';countEl.className='cmd-char-count';return;}
-  countEl.textContent=n;
-  countEl.className='cmd-char-count'+(n>500?' very-long':n>200?' long':'');
-}
-// Command history per session per tab: {name+tab: {cmds:[], idx:-1}}
-const _cmdHistory={};
-function _getCmdHist(name,tab){const k=name+'_'+tab;if(!_cmdHistory[k])_cmdHistory[k]={cmds:[],idx:-1};return _cmdHistory[k]}
-function _histPush(name,tab,cmd){
-  const h=_getCmdHist(name,tab);
-  if(cmd&&(h.cmds[0]!==cmd))h.cmds.unshift(cmd);
-  if(h.cmds.length>50)h.cmds.length=50;
-  h.idx=-1;
-}
-function _histNav(e,name,tab){
-  const h=_getCmdHist(name,tab);
-  if(!h.cmds.length)return false;
-  const input=document.getElementById('cmd-'+tab+'-'+name);
-  if(!input)return false;
-  // Only navigate history when cursor is at start/end of single-line input
-  const single=input.value.indexOf('\n')<0;
-  if(!single)return false;
-  if(e.key==='ArrowUp'){
-    e.preventDefault();
-    h.idx=Math.min(h.idx+1,h.cmds.length-1);
-    input.value=h.cmds[h.idx]||'';
-    input.selectionStart=input.selectionEnd=input.value.length;
-    autoGrow(input);
-    return true;
-  }
-  if(e.key==='ArrowDown'){
-    e.preventDefault();
-    h.idx=Math.max(h.idx-1,-1);
-    input.value=h.idx<0?'':h.cmds[h.idx];
-    input.selectionStart=input.selectionEnd=input.value.length;
-    autoGrow(input);
-    return true;
-  }
-  return false;
-}
 function handleChatKey(e,name){
-  if(_histNav(e,name,'chat'))return;
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name);return;}
-  // Escape: interrupt if Claude is busy, otherwise let global handler run
-  if(e.key==='Escape'){
-    const sess=sessions.find(s=>s.name===name);
-    if(sess&&sess.activity_status==='busy'){e.preventDefault();interruptSession(name);}
-  }
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
 }
 function handleRawKey(e,name){
-  if(_histNav(e,name,'raw'))return;
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd(name,'raw')}
-  if((e.ctrlKey||e.metaKey)&&e.key==='f'){
-    e.preventDefault();
-    openRawSearch(name);
-  }
-}
-function openRawSearch(name){
-  const bar=document.getElementById('raw-search-bar-'+name);
-  if(!bar)return;
-  bar.style.display='flex';
-  const inp=document.getElementById('raw-srch-'+name);
-  if(inp){inp.focus();inp.select();}
-}
-function closeRawSearch(name){
-  const bar=document.getElementById('raw-search-bar-'+name);
-  if(bar)bar.style.display='none';
-  // Clear highlights
-  const rawEl=document.getElementById('raw-'+name);
-  if(rawEl){const plain=rawEl.innerText||rawEl.textContent;rawEl.textContent=plain;}
-  const countEl=document.getElementById('raw-srch-count-'+name);
-  if(countEl)countEl.textContent='';
-}
-function searchRawTerminal(name,query){
-  const rawEl=document.getElementById('raw-'+name);
-  const countEl=document.getElementById('raw-srch-count-'+name);
-  if(!rawEl)return;
-  const text=rawEl.innerText||rawEl.textContent;
-  if(!query){rawEl.textContent=text;if(countEl)countEl.textContent='';return;}
-  const lq=query.toLowerCase();
-  const lines=text.split('\n');
-  let matches=0;
-  const html=lines.map(line=>{
-    const esc=line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    if(line.toLowerCase().includes(lq)){matches++;return'<span class="raw-line-match">'+esc+'</span>';}
-    return esc;
-  }).join('\n');
-  rawEl.innerHTML=html;
-  if(countEl)countEl.textContent=matches+' match'+(matches!==1?'es':'');
-  if(matches){const first=rawEl.querySelector('.raw-line-match');if(first)first.scrollIntoView({block:'center'});}
 }
 
 async function sendChat(name){
@@ -5377,7 +5273,6 @@ async function sendChat(name){
   if(!input)return;
   const cmd=input.value.trim();
   if(!cmd)return;
-  _histPush(name,'chat',cmd);
   input.disabled=true;
   // Show user bubble immediately
   appendChatBubble(name,'user',cmd,Date.now()/1000);
@@ -5390,25 +5285,10 @@ async function sendChat(name){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
-    const cc=document.getElementById('chat-cc-'+name);
-    if(cc){cc.textContent='';cc.className='cmd-char-count';}
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
   // After a delay, verify the busy state from the actual terminal
-  scheduleBusyVerification(name);
-}
-
-async function sendChatCmd(name,cmd){
-  /* Send a command directly to a session's chat without touching the input element. */
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  setOptimisticBusy(name);
-  try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({command:cmd})
-    });
-  }catch(e){console.error('sendChatCmd failed:',e)}
   scheduleBusyVerification(name);
 }
 
@@ -5507,7 +5387,6 @@ async function sendCmd(name,source){
   if(!input)return;
   const cmd=input.value.trim();
   if(!cmd)return;
-  _histPush(name,source,cmd);
   input.disabled=true;
   // Also record in chat
   appendChatBubble(name,'user',cmd,Date.now()/1000);
@@ -5555,14 +5434,12 @@ async function pollRawDelta(name){
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      if(!scrollLocked.has(name)){
-        rawEl.style.scrollBehavior='auto';
-        rawEl.scrollTop=rawEl.scrollHeight;
-        rawEl.style.scrollBehavior='';
-      }
+      rawEl.style.scrollBehavior='auto';
+      rawEl.scrollTop=rawEl.scrollHeight;
+      rawEl.style.scrollBehavior='';
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
-      const wasAtBottom=!scrollLocked.has(name)&&(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
+      const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
       const newLines=data.raw.split('\n');
       const curText=rawEl.textContent;
       const existingLines=curText.split('\n');
@@ -5601,10 +5478,6 @@ async function loadRaw(name){
 }
 
 function updateStatusPill(name,status,detail){
-  // Sound notification: beep when session transitions from busy → idle
-  const prev=_prevActivityStatus[name];
-  _prevActivityStatus[name]=status;
-  if(prev==='busy'&&status!=='busy'&&status!==undefined){_playBeep(660,0.2,0.22);}
   const pill=document.getElementById('status-'+name);
   if(pill){
     pill.className='status-pill '+(status||'unknown');
@@ -5614,10 +5487,6 @@ function updateStatusPill(name,status,detail){
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
   if(navDot)navDot.className='nav-dot '+(status||'unknown');
-  // Track activity history and update sparkline
-  trackActivity(name,status);
-  const sparkEl=document.getElementById('spark-'+name);
-  if(sparkEl)sparkEl.innerHTML=renderSparkline(name);
 }
 
 function updateCard(s){
@@ -5742,46 +5611,63 @@ async function pollStatus(){
         changed=true;
         lastStatus[st.name]=st.activity_status;
         statusInfoEl.textContent='Session '+st.name+' changed...';
-        // Browser notification when session goes idle
-        if(prev==='busy'&&st.activity_status==='idle'){
-          maybeNotify(st.name,st.away_mode,st.go_nuts_mode);
-        }
         refreshOne(st.name);
       }else{
         lastStatus[st.name]=st.activity_status;
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update away_mode and go_nuts_mode badges in nav
+      // Update away_mode, go_nuts_mode, and model badges in nav
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
         if(sessions[si].away_mode!==st.away_mode){sessions[si].away_mode=st.away_mode;navChanged=true;}
         if(sessions[si].go_nuts_mode!==st.go_nuts_mode){sessions[si].go_nuts_mode=st.go_nuts_mode;navChanged=true;}
+        if(st.model&&sessions[si].model!==st.model){
+          sessions[si].model=st.model;navChanged=true;
+          // Update detail model badge if visible
+          const mb=document.getElementById('model-badge-'+st.name);
+          if(mb)mb.textContent=formatModelName(st.model);
+        }
         if(navChanged)renderNav();
       }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
-    statusInfoEl.classList.remove('disconnected');
-  }catch(e){statusInfoEl.textContent='⚠ Connection lost';statusInfoEl.classList.add('disconnected');}
+  }catch(e){statusInfoEl.textContent='Status poll failed'}
   _authPollCount++;
   if(_authPollCount%5===0)checkClaudeAuth();
+  // Refresh inline server stats every 3rd poll (~30s)
+  if(_authPollCount%3===0)refreshNavStats();
 }
+
+// --- Inline server stats in nav header ---
+const navStatsEl=document.getElementById('nav-server-stats');
+async function refreshNavStats(){
+  try{
+    const resp=await fetch(BASE+'/api/stats');
+    const s=await resp.json();
+    const cpuPct=s.cpu_percent!=null?s.cpu_percent:0;
+    const threads=s.threads_running!=null?s.threads_running:'?';
+    const cpuCount=s.cpu_count||1;
+    const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
+    const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
+    const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
+    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span>'
+      +'<span>MEM <span class="stat-val '+memClass+'">'+memPct+'%</span></span>';
+  }catch(e){navStatsEl.innerHTML=''}
+}
+refreshNavStats();
 
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 
 function showCreateModal(){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3 id="modal-title">New tmux session</h3>
+    <h3>New tmux session</h3>
     <p>Leave blank for an auto-assigned name, or enter a custom name.</p>
     <input type="text" class="modal-input" id="new-session-name"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
-    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:.82rem;color:#c9d1d9;cursor:pointer;user-select:none">
-      <input type="checkbox" id="new-session-launch-claude" checked style="width:14px;height:14px;cursor:pointer">
-      Auto-launch <code style="font-size:.8em;background:#21262d;padding:1px 5px;border-radius:3px">claude</code> in new session
-    </label>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" onclick="createSession()">Create</button>
@@ -5793,13 +5679,11 @@ function showCreateModal(){
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
-  const launchCb=document.getElementById('new-session-launch-claude');
-  const launch_claude=launchCb?launchCb.checked:true;
   closeModal();
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name,launch_claude})
+      body:JSON.stringify({name})
     });
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed');return}
@@ -5811,7 +5695,7 @@ async function createSession(){
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3 id="modal-title">Kill session ${esc(name)}?</h3>
+    <h3>Kill session ${esc(name)}?</h3>
     <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
@@ -5968,7 +5852,7 @@ async function saveApiKey(){
       body:JSON.stringify({apiKey:key})
     });
     const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to save');return}
+    if(!resp.ok){alert(data.detail||'Failed to save');return}
     await checkClaudeAuth();
     renderAuthPanel();
   }catch(e){alert('Failed to save API key.')}
@@ -6120,14 +6004,11 @@ async function setAuthMode(name,mode){
 
 // ── Session Stats ──
 let _statsTimers={};
-const _sessionCosts={};  // name → estimatedCost (updated by loadSessionStats)
-const _sessionIdle={};   // name → secsSinceLastActivity
 function fmtRate(n){
   if(n>=1000)return (n/1000).toFixed(1)+'k/min';
   return n+'/min';
 }
 
-const _ctxWarnShown={};  // name → last warned pct threshold (75 or 90)
 async function loadSessionStats(name){
   const panel=document.getElementById('stats-panel-'+name);
   if(!panel)return;
@@ -6140,41 +6021,6 @@ async function loadSessionStats(name){
     }
     const rateCls=st.rateStatus;
     const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
-    // Rate alarm: show/hide a warning banner at top of tab area
-    updateRateAlarm(name,rateCls);
-    // Update nav cost badge
-    const navCostEl=document.getElementById('nav-cost-'+name);
-    if(navCostEl)navCostEl.textContent='$'+st.estimatedCost.toFixed(2);
-    // Update session health badge
-    const healthCls=rateCls==='severely_limited'||st.contextPct>=90?'bad':
-      rateCls==='limited'||st.contextPct>=75?'warn':'good';
-    const navHealthEl=document.getElementById('nav-health-'+name);
-    if(navHealthEl){
-      navHealthEl.className='nav-health '+healthCls;
-      const tips=[];
-      if(rateCls!=='normal')tips.push('Rate: '+rateLabel);
-      if(st.contextPct>0)tips.push('Context: '+st.contextPct+'%');
-      navHealthEl.title='Health: '+healthCls+(tips.length?' ('+tips.join(', ')+')':'');
-    }
-    // Accumulate cost + idle data for global summary
-    _sessionCosts[name]=st.estimatedCost;
-    _sessionIdle[name]=st.secsSinceLastActivity;
-    updateNavTotalCost();
-    // Context threshold warnings (show once per threshold crossed)
-    if(st.contextPct>=90&&_ctxWarnShown[name]!==90){
-      _ctxWarnShown[name]=90;
-      showToast(name+': Context at '+st.contextPct+'% — consider /compact','warn',5000);
-    }else if(st.contextPct>=75&&_ctxWarnShown[name]!==75&&_ctxWarnShown[name]!==90){
-      _ctxWarnShown[name]=75;
-      showToast(name+': Context at '+st.contextPct+'% used','warn',4000);
-    }else if(st.contextPct<70){
-      delete _ctxWarnShown[name];  // reset so we warn again if it climbs back up
-    }
-    // Dim nav item if idle >1 hour
-    const navItem=document.getElementById('nav-'+name);
-    if(navItem){
-      navItem.classList.toggle('long-idle',st.secsSinceLastActivity>3600&&st.secsSinceLastActivity>=0);
-    }
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
     panel.innerHTML=`
@@ -6190,7 +6036,6 @@ async function loadSessionStats(name){
         <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
         <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
         <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
-        <div class="stat-item"><span class="stat-label">Output efficiency</span><span class="stat-value" title="Output tokens / input tokens — higher = more output per token spent">${st.totalInput>0?Math.round(st.totalOutput/st.totalInput*100)+'%':'—'}</span></div>
       </div>
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
         <span style="font-size:.75rem;color:#8b949e">Rate</span>
@@ -6201,45 +6046,12 @@ async function loadSessionStats(name){
       <div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
-      </div>
-      ${st.contextPct>0?`
-      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
-        <span style="font-size:.75rem;color:#8b949e">Context</span>
-        <span style="font-size:.75rem;color:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#6e7681'}">${st.contextPct}% used</span>
-        <span style="font-size:.65rem;color:#484f58">${fmtTokens(st.lastInputTokens)} / ${fmtTokens(st.ctxWindowSize)}</span>
-        ${st.contextPct>=75?`<button onclick="sendChatCmd('${name}','/compact')" style="font-size:.65rem;padding:2px 8px;border-radius:4px;border:1px solid #e3b341;background:transparent;color:#e3b341;cursor:pointer;font-family:inherit" title="Send /compact to free up context window">/compact</button>`:''}
-      </div>
-      <div class="rate-bar">
-        <div class="rate-bar-track"><div class="rate-bar-fill" style="width:${Math.min(100,st.contextPct)}%;background:${st.contextPct>=90?'#f85149':st.contextPct>=75?'#e3b341':st.contextPct>=50?'#d29922':'#3fb950'}"></div></div>
-        <span class="rate-label">${st.contextPct}%</span>
-      </div>`:''}
-      ${(()=>{
-        const tl=st.activityTimeline;
-        if(!tl||!tl.length)return'';
-        const maxOut=Math.max(...tl,1);
-        const W=280,H=36,bw=W/tl.length;
-        const bars=tl.map((v,i)=>{
-          const h=Math.max(v>0?2:1,Math.round(v/maxOut*H));
-          const x=i*bw,y=H-h;
-          const fill=v>maxOut*0.5?'#3fb950':v>0?'#238636':'#21262d';
-          return\`<rect x="\${x.toFixed(1)}" y="\${y}" width="\${Math.max(0.5,bw-0.5).toFixed(1)}" height="\${h}" fill="\${fill}"/>\`;
-        }).join('');
-        return\`<div style="margin-top:12px">
-          <div style="font-size:.7rem;color:#6e7681;margin-bottom:4px">Activity — last 60 min</div>
-          <svg width="\${W}" height="\${H}" style="display:block;border-radius:4px;background:#0d1117" title="Output tokens/min over the last hour">\${bars}</svg>
-        </div>\`;
-      })()}
-      `;
+      </div>`;
   }catch(e){
     panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
   }
 }
 
-function updateNavTotalCost(){
-  const total=Object.values(_sessionCosts).reduce((a,b)=>a+b,0);
-  const el=document.getElementById('nav-total-cost');
-  if(el&&total>0)el.innerHTML='Total: <span>$'+total.toFixed(2)+'</span>';
-}
 function startStatsPolling(name){
   stopStatsPolling();
   loadSessionStats(name);
@@ -6252,84 +6064,6 @@ function stopStatsPolling(){
 
 // ── Away Mode ──
 let _awayTimers={};
-async function quickToggleAway(name){
-  const sess=sessions.find(s=>s.name===name);
-  const isOn=!!(sess&&sess.away_mode);
-  await toggleAwayMode(name,!isOn);
-  const btn=document.getElementById('away-quick-'+name);
-  if(btn){
-    const nowOn=!isOn;
-    btn.className='chat-away-btn'+(nowOn?' running':'');
-    btn.title=nowOn?'Stop Away Mode':'Start Away Mode';
-    btn.innerHTML=nowOn?'&#x23F9; Away':'&#x25B6; Away';
-  }
-}
-async function quickToggleGoNuts(name){
-  const sess=sessions.find(s=>s.name===name);
-  const isOn=!!(sess&&sess.go_nuts_mode);
-  await toggleGoNutsMode(name,!isOn);
-  const btn=document.getElementById('gonuts-quick-'+name);
-  if(btn){
-    const nowOn=!isOn;
-    btn.className='chat-gonuts-btn'+(nowOn?' running':'');
-    btn.title=nowOn?'Stop Go Nuts Mode':'Start Go Nuts Mode';
-    btn.innerHTML=nowOn?'&#x23F9; Nuts':'&#x1F914; Nuts';
-  }
-}
-// Session color labels (stored in localStorage, cycle on click)
-const _SESSION_COLORS=['c0','c1','c2','c3','c4','c5'];
-function getSessionColor(name){
-  return localStorage.getItem('tmux-clr-'+name)||'c0';
-}
-function cycleSessionColor(name,tagEl){
-  const cur=getSessionColor(name);
-  const idx=_SESSION_COLORS.indexOf(cur);
-  const next=_SESSION_COLORS[(idx+1)%_SESSION_COLORS.length];
-  localStorage.setItem('tmux-clr-'+name,next);
-  if(tagEl){tagEl.className='nav-color-tag '+next;}
-}
-
-// ── Focus mode ──
-function toggleFocusMode(){
-  document.body.classList.toggle('focus-mode');
-}
-
-// ── Drag-to-reorder sessions ──
-let _dragSrc=null;
-function onNavDragStart(e,name){
-  _dragSrc=name;
-  e.dataTransfer.effectAllowed='move';
-  e.dataTransfer.setData('text/plain',name);
-  setTimeout(()=>{const el=document.getElementById('nav-'+name);if(el)el.classList.add('dragging');},0);
-}
-function onNavDragOver(e){
-  e.preventDefault();
-  e.dataTransfer.dropEffect='move';
-  const item=e.target.closest('.nav-item');
-  navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('drag-over'));
-  if(item&&item.id!=='nav-'+_dragSrc)item.classList.add('drag-over');
-}
-function onNavDrop(e,name){
-  e.preventDefault();
-  navEl.querySelectorAll('.nav-item').forEach(el=>{el.classList.remove('drag-over');el.classList.remove('dragging');});
-  if(!_dragSrc||_dragSrc===name)return;
-  const order=_getSessionOrder();
-  const from=order.indexOf(_dragSrc),to=order.indexOf(name);
-  if(from>=0&&to>=0){order.splice(from,1);order.splice(to,0,_dragSrc);}
-  else if(from>=0){order.splice(from,1);order.push(_dragSrc);}
-  localStorage.setItem('tmux-session-order',JSON.stringify(order));
-  renderNav();
-  _dragSrc=null;
-}
-function onNavDragEnd(){
-  navEl.querySelectorAll('.nav-item').forEach(el=>{el.classList.remove('drag-over');el.classList.remove('dragging');});
-  _dragSrc=null;
-}
-function _getSessionOrder(){
-  try{const o=JSON.parse(localStorage.getItem('tmux-session-order')||'[]');if(Array.isArray(o))return o;}catch(e){}
-  return sessions.map(s=>s.name);
-}
-
 async function toggleAwayMode(name,enabled){
   const statusEl=document.getElementById('away-status-'+name);
   if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
@@ -6468,6 +6202,7 @@ function buildKeyBar(name,tab){
     <span class="key-bar-label">Keys:</span>
     <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Claude Code's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
@@ -6490,10 +6225,6 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
-    <span class="key-bar-sep"></span>
-    <span class="key-bar-label">Custom:</span>
-    ${buildCustomCmdBtns(name)}
-    <button class="key-btn key-add-custom" onclick="openAddCustomCmd('${name}')" title="Add custom command">+</button>
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Opts:</span>
     <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
@@ -6530,59 +6261,197 @@ async function sendSlashCommand(name,cmd){
   scheduleBusyVerification(name);
 }
 
-// ── CLAUDE.md Editor ──
-let _claudeMdFiles=[];
-let _claudeMdActiveIdx=0;
+// ── Skills Tab ──
+let _skillsLibrarySession='';
+
+async function loadSkillFiles(name){
+  const listEl=document.getElementById('skills-list-'+name);
+  if(!listEl)return;
+  listEl.innerHTML='<div class="skills-empty">Loading...</div>';
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills');
+    const data=await resp.json();
+    if(!data.files||!data.files.length){
+      listEl.innerHTML='<div class="skills-empty">No skill files yet. Click "+ New File" to create one.</div>';
+      return;
+    }
+    listEl.innerHTML=data.files.map(f=>`
+      <div class="skills-file">
+        <span>
+          <span class="skills-file-name" onclick="editSkillFile('${name}','${esc(f.name)}')">${esc(f.name)}</span>
+          <span class="skills-file-meta">${(f.size/1024).toFixed(1)} KB</span>
+        </span>
+        <span class="skills-file-actions">
+          <button class="btn" style="padding:2px 8px;font-size:.75rem" onclick="editSkillFile('${name}','${esc(f.name)}')">Edit</button>
+          <button class="btn btn-danger" style="padding:2px 8px;font-size:.75rem" onclick="deleteSkillFile('${name}','${esc(f.name)}')">Del</button>
+        </span>
+      </div>`).join('');
+  }catch(e){
+    listEl.innerHTML='<div class="skills-empty" style="color:#f85149">Failed to load skills.</div>';
+  }
+}
+
+function newSkillFile(name){
+  const wrap=document.getElementById('skills-editor-wrap-'+name);
+  const fnameEl=document.getElementById('skills-filename-'+name);
+  const editorEl=document.getElementById('skills-editor-'+name);
+  if(!wrap||!fnameEl||!editorEl)return;
+  fnameEl.value='';
+  editorEl.value='';
+  wrap.style.display='flex';
+  fnameEl.focus();
+}
+
+async function editSkillFile(name,filename){
+  const wrap=document.getElementById('skills-editor-wrap-'+name);
+  const fnameEl=document.getElementById('skills-filename-'+name);
+  const editorEl=document.getElementById('skills-editor-'+name);
+  if(!wrap||!fnameEl||!editorEl)return;
+  // Fetch content from the list we already loaded, or re-fetch
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills');
+    const data=await resp.json();
+    const file=data.files.find(f=>f.name===filename);
+    if(file){
+      fnameEl.value=file.name;
+      editorEl.value=file.content;
+    }else{
+      fnameEl.value=filename;
+      editorEl.value='';
+    }
+  }catch(e){
+    fnameEl.value=filename;
+    editorEl.value='';
+  }
+  wrap.style.display='flex';
+  editorEl.focus();
+}
+
+async function saveSkillFile(name){
+  const fnameEl=document.getElementById('skills-filename-'+name);
+  const editorEl=document.getElementById('skills-editor-'+name);
+  if(!fnameEl||!editorEl)return;
+  let fname=fnameEl.value.trim();
+  if(!fname){alert('Please enter a filename.');return}
+  if(!fname.endsWith('.md'))fname+='.md';
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:fname,content:editorEl.value})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to save');return}
+    closeSkillEditor(name);
+    loadSkillFiles(name);
+  }catch(e){alert('Failed to save skill file.')}
+}
+
+async function deleteSkillFile(name,filename){
+  if(!confirm('Delete '+filename+'?'))return;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills/'+encodeURIComponent(filename),{method:'DELETE'});
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to delete');return}
+    loadSkillFiles(name);
+  }catch(e){alert('Failed to delete skill file.')}
+}
+
+function closeSkillEditor(name){
+  const wrap=document.getElementById('skills-editor-wrap-'+name);
+  if(wrap)wrap.style.display='none';
+}
+
+async function openSkillLibrary(name){
+  _skillsLibrarySession=name;
+  const overlay=document.getElementById('skills-library-overlay');
+  overlay.classList.add('active');
+  const listEl=document.getElementById('skills-library-list');
+  listEl.innerHTML='<div style="color:#8b949e;padding:8px">Loading...</div>';
+  try{
+    const resp=await fetch(BASE+'/api/skill-library');
+    const data=await resp.json();
+    if(!data.sets||!data.sets.length){
+      listEl.innerHTML='<div style="color:#6e7681;padding:12px;text-align:center">No saved skill sets yet.</div>';
+      return;
+    }
+    listEl.innerHTML=data.sets.map(s=>`
+      <div class="skills-library-set" onclick="loadSkillSet('${_skillsLibrarySession}','${esc(s.name)}')">
+        <div class="skills-library-set-name">${esc(s.name)}</div>
+        <div class="skills-library-set-meta">${s.files.length} file${s.files.length!==1?'s':''}: ${s.files.join(', ')}</div>
+      </div>`).join('');
+  }catch(e){
+    listEl.innerHTML='<div style="color:#f85149;padding:8px">Failed to load library.</div>';
+  }
+}
+
+function closeSkillLibrary(){
+  document.getElementById('skills-library-overlay').classList.remove('active');
+}
+
+async function loadSkillSet(name,setName){
+  if(!confirm('Load skill set "'+setName+'" into session '+name+'? Existing files with the same name will be overwritten.'))return;
+  try{
+    const resp=await fetch(BASE+'/api/skill-library/load',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:setName,session_name:name})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to load');return}
+    closeSkillLibrary();
+    loadSkillFiles(name);
+  }catch(e){alert('Failed to load skill set.')}
+}
+
+async function saveCurrentToLibrary(){
+  const name=_skillsLibrarySession;
+  const setName=prompt('Enter a name for this skill set:');
+  if(!setName)return;
+  try{
+    const resp=await fetch(BASE+'/api/skill-library/save',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:setName,session_name:name})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to save');return}
+    alert('Saved '+data.files.length+' file(s) to library as "'+data.name+'"');
+    openSkillLibrary(name);
+  }catch(e){alert('Failed to save to library.')}
+}
+
+// ── CLAUDE.md Editor (global only) ──
+let _claudeMdGlobal={path:'',content:'',exists:false};
 
 async function openClaudeMd(){
-  if(!selectedSession){alert('Select a session first.');return}
   const overlay=document.getElementById('claudemd-overlay');
   overlay.classList.add('active');
   document.getElementById('claudemd-editor').value='Loading...';
   document.getElementById('claudemd-path').textContent='';
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+selectedSession+'/claude-md');
+    const resp=await fetch(BASE+'/api/claude-md-global');
     const data=await resp.json();
-    _claudeMdFiles=data.files||[];
-    _claudeMdActiveIdx=0;
-    renderClaudeMdTabs();
-    showClaudeMdFile(0);
+    _claudeMdGlobal=data;
+    document.getElementById('claudemd-editor').value=data.content||'';
+    document.getElementById('claudemd-path').textContent=data.path;
   }catch(e){
     document.getElementById('claudemd-editor').value='Error loading CLAUDE.md';
   }
 }
 
-function renderClaudeMdTabs(){
-  const tabsEl=document.getElementById('claudemd-tabs');
-  tabsEl.innerHTML=_claudeMdFiles.map((f,i)=>
-    `<div class="claudemd-tab ${i===_claudeMdActiveIdx?'active':''}" onclick="showClaudeMdFile(${i})">${esc(f.label)}${f.exists?'':' (new)'}</div>`
-  ).join('');
-}
-
-function showClaudeMdFile(idx){
-  _claudeMdActiveIdx=idx;
-  const f=_claudeMdFiles[idx];
-  if(!f)return;
-  document.getElementById('claudemd-editor').value=f.content||'';
-  document.getElementById('claudemd-path').textContent=f.path;
-  renderClaudeMdTabs();
-}
-
 async function saveClaudeMd(){
-  const f=_claudeMdFiles[_claudeMdActiveIdx];
-  if(!f)return;
   const content=document.getElementById('claudemd-editor').value;
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+selectedSession+'/claude-md',{
+    const resp=await fetch(BASE+'/api/claude-md-global',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path:f.path,content})
+      body:JSON.stringify({path:_claudeMdGlobal.path,content})
     });
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed to save');return}
-    f.content=content;
-    f.exists=true;
-    renderClaudeMdTabs();
+    _claudeMdGlobal.content=content;
+    _claudeMdGlobal.exists=true;
     closeClaudeMd();
   }catch(e){alert('Failed to save CLAUDE.md')}
 }
@@ -6597,21 +6466,29 @@ async function openStats(){
   overlay.classList.add('active');
   document.getElementById('stats-content').innerHTML='<div style="text-align:center;color:#8b949e;padding:20px"><span class="spinner"></span> Loading stats...</div>';
   try{
-    const resp=await fetch(BASE+'/api/stats');
-    const s=await resp.json();
-    renderStats(s);
+    const [statsResp,usageResp]=await Promise.all([fetch(BASE+'/api/stats'),fetch(BASE+'/api/stats/usage')]);
+    const s=await statsResp.json();
+    let usage=null;
+    if(usageResp.ok) usage=await usageResp.json();
+    renderStats(s,usage);
   }catch(e){
     document.getElementById('stats-content').innerHTML='<div style="color:#f85149">Failed to load stats.</div>';
   }
 }
 
-function renderStats(s){
+function renderStats(s,usage){
   let html='';
   // Server
   html+='<div class="stats-section"><div class="stats-section-title">Server</div>';
   html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
   if(s.cpu_load&&s.cpu_load['1m']){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Load</span><span class="stats-row-value">'+esc(s.cpu_load['1m'])+' / '+esc(s.cpu_load['5m'])+' / '+esc(s.cpu_load['15m'])+'</span></div>';
+  }
+  if(s.cpu_percent!=null){
+    html+='<div class="stats-row"><span class="stats-row-label">CPU Usage</span><span class="stats-row-value">'+s.cpu_percent+'% ('+s.cpu_count+' CPUs)</span></div>';
+  }
+  if(s.threads_running!=null){
+    html+='<div class="stats-row"><span class="stats-row-label">Threads</span><span class="stats-row-value">'+s.threads_running+' running / '+s.threads_total+' total</span></div>';
   }
   html+='</div>';
   // Memory
@@ -6653,19 +6530,23 @@ function renderStats(s){
   if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
   html+='</div>';
 
-  // Per-session cost leaderboard
-  const costEntries=Object.entries(_sessionCosts).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
-  if(costEntries.length){
-    const totalAll=costEntries.reduce((sum,[,v])=>sum+v,0);
-    html+='<div class="stats-section"><div class="stats-section-title">Session Cost Leaderboard</div>';
-    costEntries.forEach(([name,cost])=>{
-      const pct=Math.round(cost/totalAll*100);
-      const barW=Math.max(2,pct);
-      html+='<div class="stats-row"><span class="stats-row-label">'+esc(name)+'</span><span class="stats-row-value" style="color:#3fb950">$'+cost.toFixed(2)+' <span style="color:#6e7681;font-size:.7rem">('+pct+'%)</span></span></div>';
-      html+='<div class="stats-bar"><div class="stats-bar-fill" style="width:'+barW+'%;background:#238636"></div></div>';
+  // Claude Usage
+  if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
+    function fmtTok(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
+    function fmtCost(n){if(!n)return'—';return'$'+n.toFixed(2)}
+    function modelTag(m){if(!m||m==='unknown')return'';const short=m.replace('claude-','').replace(/-\d{8}$/,'');let bg='#30363d';if(short.includes('opus'))bg='#8b5cf6';else if(short.includes('haiku'))bg='#f59e0b';else if(short.includes('sonnet'))bg='#3b82f6';return'<span class="model-tag" style="background:'+bg+'">'+esc(short)+'</span>'}
+    html+='<div class="stats-section"><div class="stats-section-title">Claude Usage</div>';
+    html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Session</th><th>Model</th><th>5h Tokens</th><th>5h Cost</th><th>Week Tokens</th><th>Week Cost</th></tr></thead><tbody>';
+    usage.sessions.forEach(sess=>{
+      html+='<tr><td>'+esc(sess.name)+'</td><td>'+modelTag(sess.model)+'</td>';
+      html+='<td>'+fmtTok(sess.window5h.totalTokens)+'</td><td>'+fmtCost(sess.window5h.estimatedCost)+'</td>';
+      html+='<td>'+fmtTok(sess.thisWeek.totalTokens)+'</td><td>'+fmtCost(sess.thisWeek.estimatedCost)+'</td></tr>';
     });
-    html+='<div class="stats-row" style="margin-top:6px"><span class="stats-row-label" style="font-weight:600">Total</span><span class="stats-row-value" style="color:#3fb950;font-weight:600">$'+totalAll.toFixed(2)+'</span></div>';
-    html+='</div>';
+    // Totals row
+    html+='<tr class="stats-totals-row"><td>Total</td><td></td>';
+    html+='<td>'+fmtTok(usage.window5h.totalTokens)+'</td><td>'+fmtCost(usage.window5h.estimatedCost)+'</td>';
+    html+='<td>'+fmtTok(usage.thisWeek.totalTokens)+'</td><td>'+fmtCost(usage.thisWeek.estimatedCost)+'</td></tr>';
+    html+='</tbody></table></div>';
   }
 
   document.getElementById('stats-content').innerHTML=html;
@@ -6675,985 +6556,8 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
-// ============================================================
-// FEATURE: Session search / filter bar
-// ============================================================
-let _busyOnly=false;
-function toggleBusyFilter(){
-  _busyOnly=!_busyOnly;
-  const btn=document.getElementById('busy-filter-btn');
-  if(btn)btn.classList.toggle('active',_busyOnly);
-  filterSessionsNav(document.getElementById('nav-search')?.value||'');
-}
-let _hideDone=localStorage.getItem('tmux-hide-done')==='true';
-function toggleHideDone(){
-  _hideDone=!_hideDone;
-  localStorage.setItem('tmux-hide-done',String(_hideDone));
-  filterSessionsNav(document.getElementById('nav-search')?document.getElementById('nav-search').value:'');
-  showToast(_hideDone?'Done sessions hidden':'Done sessions visible','success',1500);
-}
-function filterSessionsNav(query){
-  const q=(query||'').toLowerCase().trim();
-  navEl.querySelectorAll('.nav-item').forEach(item=>{
-    const id=item.querySelector('.nav-session-id');
-    const rawName=id?id.textContent:'';
-    const name=rawName.toLowerCase();
-    const sess=sessions.find(s=>s.name===rawName);
-    const textHide=q&&!name.includes(q);
-    const busyHide=_busyOnly&&(!sess||sess.activity_status!=='busy');
-    const snoozeHide=isSnoozed(rawName);
-    const doneHide=_hideDone&&isSessionDone(rawName);
-    item.classList.toggle('nav-hidden',textHide||busyHide||snoozeHide||doneHide);
-  });
-  // If current selected session got hidden, select first visible
-  if(q||_busyOnly||Object.keys(_snoozed).length||_hideDone){
-    const active=navEl.querySelector('.nav-item.active:not(.nav-hidden)');
-    if(!active){
-      const first=navEl.querySelector('.nav-item:not(.nav-hidden)');
-      if(first){
-        const name=first.id.replace('nav-','');
-        selectSession(name);
-      }
-    }
-  }
-}
-
-// ============================================================
-// FEATURE: Copy-to-clipboard on chat messages
-// ============================================================
-function copyMsg(btn){
-  const bubble=btn.closest('.chat-msg');
-  if(!bubble)return;
-  const clone=bubble.cloneNode(true);
-  clone.querySelectorAll('.chat-meta,.chat-copy-btn,.chat-bmark-btn').forEach(el=>el.remove());
-  const text=clone.textContent.trim();
-  if(navigator.clipboard&&window.isSecureContext){
-    navigator.clipboard.writeText(text).then(()=>{
-      btn.textContent='copied!';btn.classList.add('copied');
-      showToast('Copied to clipboard','success',1800);
-      setTimeout(()=>{btn.textContent='copy';btn.classList.remove('copied')},1500);
-    }).catch(()=>fallbackCopy(btn,text));
-  }else{
-    fallbackCopy(btn,text);
-  }
-}
-function fallbackCopy(btn,text){
-  const ta=document.createElement('textarea');
-  ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
-  document.body.appendChild(ta);ta.select();
-  try{document.execCommand('copy');btn.textContent='copied!';btn.classList.add('copied');}
-  catch(e){btn.textContent='err';}
-  document.body.removeChild(ta);
-  setTimeout(()=>{btn.textContent='copy';btn.classList.remove('copied')},1500);
-}
-
-// ============================================================
-// FEATURE: Export conversation as Markdown
-// ============================================================
-function exportConversation(name){
-  const msgs=chatMessages[name]||[];
-  if(!msgs.length){alert('No messages to export.');return}
-  const s=sessions.find(x=>x.name===name);
-  const title=s&&s.title?s.title:name;
-  const now=new Date().toISOString().slice(0,16).replace('T',' ');
-  let md=`# Conversation: ${title}\n\n`;
-  md+=`**Session**: \`${name}\`  \n**Exported**: ${now}\n\n---\n\n`;
-  msgs.forEach(m=>{
-    const ts=m.ts?new Date(m.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
-    const role=m.role==='user'?'**You**':'**Claude**';
-    md+=`### ${role} ${ts?'<sup>'+ts+'</sup>':''}\n\n${m.text}\n\n---\n\n`;
-  });
-  const blob=new Blob([md],{type:'text/markdown;charset=utf-8'});
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');
-  a.href=url;a.download=`${name}-conversation.md`;
-  document.body.appendChild(a);a.click();
-  setTimeout(()=>{URL.revokeObjectURL(url);document.body.removeChild(a)},500);
-}
-
-// ============================================================
-// FEATURE: Browser notifications for idle sessions
-// ============================================================
-let _notifGranted=false;
-function requestNotifPermission(){
-  if(!('Notification' in window)){return;}
-  if(Notification.permission==='granted'){
-    _notifGranted=true;
-    const btn=document.getElementById('notif-btn');
-    if(btn){btn.classList.add('granted');btn.title='Notifications enabled';}
-    return;
-  }
-  Notification.requestPermission().then(perm=>{
-    _notifGranted=perm==='granted';
-    const btn=document.getElementById('notif-btn');
-    if(btn){
-      btn.classList.toggle('granted',_notifGranted);
-      btn.title=_notifGranted?'Notifications enabled':'Notifications blocked';
-    }
-  });
-}
-function maybeNotify(sessionName,awayMode,goNutsMode){
-  if(!_notifGranted)return;
-  if(document.visibilityState==='visible')return; // Only notify if tab not focused
-  let title='Session idle: '+sessionName;
-  let body='Claude has finished working.';
-  if(awayMode){title='Away Mode complete: '+sessionName;body='Away Mode finished. Check the results!';}
-  else if(goNutsMode){title='Go Nuts complete: '+sessionName;body='Go Nuts Mode finished building features!';}
-  try{
-    const n=new Notification(title,{body,icon:"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%233fb950'/></svg>"});
-    n.onclick=()=>{window.focus();n.close();selectSession(sessionName)};
-    setTimeout(()=>n.close(),8000);
-  }catch(e){}
-}
-// Auto-check notification permission on load
-(function initNotifBtn(){
-  if('Notification' in window&&Notification.permission==='granted'){
-    _notifGranted=true;
-    // Set button state after DOM ready
-    setTimeout(()=>{
-      const btn=document.getElementById('notif-btn');
-      if(btn){btn.classList.add('granted');btn.title='Notifications enabled';}
-    },100);
-  }
-})();
-
-// ============================================================
-// FEATURE: Command palette (Ctrl+K)
-// ============================================================
-let _paletteSel=0;
-const _paletteActions=[
-  {icon:'&#x1F4CA;',label:'Open System Stats',hint:'Stats',fn:()=>openStats()},
-  {icon:'&#x1F4DD;',label:'Open CLAUDE.md editor',hint:'Editor',fn:()=>openClaudeMd()},
-  {icon:'&#x2795;',label:'New tmux session',hint:'Create',fn:()=>showCreateModal()},
-  {icon:'&#x1F514;',label:'Enable notifications',hint:'Notif',fn:()=>requestNotifPermission()},
-  {icon:'&#x26F6;',label:'Toggle focus mode',hint:'F',fn:()=>toggleFocusMode()},
-  {icon:'&#x26AB;',label:'Toggle busy-only filter',hint:'B',fn:()=>toggleBusyFilter()},
-  {icon:'&#x1F4E1;',label:'Broadcast to sessions',hint:'Send',fn:()=>openBroadcast()},
-];
-function openPalette(){
-  const overlay=document.getElementById('palette-overlay');
-  if(!overlay)return;
-  overlay.classList.add('active');
-  const inp=document.getElementById('palette-input');
-  if(inp){inp.value='';inp.focus();}
-  _paletteSel=0;
-  renderPalette('');
-}
-function closePalette(){
-  const overlay=document.getElementById('palette-overlay');
-  if(overlay)overlay.classList.remove('active');
-}
-function renderPalette(query){
-  const el=document.getElementById('palette-results');
-  if(!el)return;
-  const q=(query||'').toLowerCase().trim();
-  let html='';
-  // Sessions section
-  const matchSessions=sessions.filter(s=>!q||s.name.toLowerCase().includes(q)||(s.title||'').toLowerCase().includes(q));
-  if(matchSessions.length){
-    html+='<div class="palette-section">Sessions</div>';
-    matchSessions.forEach((s,i)=>{
-      const dotCol=s.activity_status==='busy'?'#f85149':s.activity_status==='idle'?'#3fb950':'#d2a8ff';
-      const hint=s.activity_status+(s.away_mode?' · AW':'')+(s.go_nuts_mode?' · GN':'');
-      html+=`<div class="palette-item${i===0&&!q?' pal-selected':''}" onclick="closePalette();selectSession('${esc(s.name)}')">
-        <span class="palette-item-dot" style="background:${dotCol}"></span>
-        <span class="palette-item-label">${esc(s.name)}${s.title?'<span style="color:#6e7681;font-size:.78rem;margin-left:8px">'+esc(s.title)+'</span>':''}</span>
-        <span class="palette-item-hint">${esc(hint)}</span>
-      </div>`;
-    });
-  }
-  // Session actions for current session — stored in a global so onclick can call by index
-  if(selectedSession){
-    const sess=sessions.find(s=>s.name===selectedSession);
-    const sn=selectedSession;
-    window._pal_sess_fns=[];
-    const sessActions=[
-      {icon:'&#x270F;',label:'Rename session',hint:sn,fn:()=>{const el=document.querySelector('#nav-'+sn+' .nav-session-id');if(el)startRename(sn,el);}},
-      {icon:'&#x21E9;',label:'Export conversation',hint:'MD',fn:()=>exportConversation(sn)},
-      {icon:'&#x1F527;',label:'Toggle markdown',hint:'MD',fn:()=>toggleMarkdown(sn)},
-      {icon:'&#x25B6;',label:(sess&&sess.away_mode?'Stop':'Start')+' Away Mode',hint:'Away',fn:()=>quickToggleAway(sn)},
-      {icon:'&#x1F914;',label:(sess&&sess.go_nuts_mode?'Stop':'Start')+' Go Nuts',hint:'GN',fn:()=>quickToggleGoNuts(sn)},
-      {icon:'&#x2398;',label:'Duplicate session',hint:'Clone',fn:()=>duplicateSession(sn)},
-      {icon:'&#x1F634;',label:'Snooze session 15min',hint:'X',fn:()=>snoozeSession(sn,15)},
-    ];
-    if(sess&&sess.activity_status==='busy')sessActions.unshift({icon:'&#x23F9;',label:'Interrupt Claude',hint:'Esc',fn:()=>interruptSession(sn)});
-    const matchSessAct=sessActions.filter(a=>!q||a.label.toLowerCase().includes(q)||a.hint.toLowerCase().includes(q));
-    if(matchSessAct.length){
-      html+='<div class="palette-section">Session: '+esc(sn)+'</div>';
-      matchSessAct.forEach(a=>{
-        const idx=window._pal_sess_fns.length;
-        window._pal_sess_fns.push(a.fn);
-        html+=`<div class="palette-item" onclick="closePalette();window._pal_sess_fns[${idx}]&&window._pal_sess_fns[${idx}]()">
-          <span class="palette-item-icon">${a.icon}</span>
-          <span class="palette-item-label">${esc(a.label)}</span>
-          <span class="palette-item-hint">${esc(a.hint)}</span>
-        </div>`;
-      });
-    }
-  }
-  // Actions section
-  const matchActions=_paletteActions.filter(a=>!q||a.label.toLowerCase().includes(q));
-  if(matchActions.length){
-    html+='<div class="palette-section">Actions</div>';
-    const offset=matchSessions.length;
-    matchActions.forEach((a,i)=>{
-      html+=`<div class="palette-item" onclick="closePalette();(_paletteActions.find(x=>x.label===\`${a.label.replace(/`/g,'\\`')}\`)||{fn:()=>{}}).fn()" data-pal-idx="${offset+i}">
-        <span class="palette-item-icon">${a.icon}</span>
-        <span class="palette-item-label">${esc(a.label)}</span>
-        <span class="palette-item-hint">${esc(a.hint)}</span>
-      </div>`;
-    });
-  }
-  if(!html){
-    html='<div class="palette-no-results">No results for "'+esc(q)+'"</div>';
-  }
-  el.innerHTML=html;
-  _paletteSel=0;
-  updatePaletteSel();
-}
-function updatePaletteSel(){
-  const items=document.querySelectorAll('#palette-results .palette-item');
-  items.forEach((item,i)=>item.classList.toggle('pal-selected',i===_paletteSel));
-  const sel=items[_paletteSel];
-  if(sel)sel.scrollIntoView({block:'nearest'});
-}
-function handlePaletteKey(e){
-  const items=document.querySelectorAll('#palette-results .palette-item');
-  if(e.key==='ArrowDown'){e.preventDefault();_paletteSel=(_paletteSel+1)%Math.max(1,items.length);updatePaletteSel();}
-  else if(e.key==='ArrowUp'){e.preventDefault();_paletteSel=(_paletteSel-1+items.length)%Math.max(1,items.length);updatePaletteSel();}
-  else if(e.key==='Enter'){e.preventDefault();const sel=items[_paletteSel];if(sel)sel.click();}
-  else if(e.key==='Escape'){closePalette();}
-}
-
-// ============================================================
-// FEATURE: Global keyboard shortcuts
-// ============================================================
-document.addEventListener('keydown',function(e){
-  // Ctrl+K or Cmd+K → command palette
-  if((e.ctrlKey||e.metaKey)&&e.key==='k'){
-    e.preventDefault();
-    const pal=document.getElementById('palette-overlay');
-    if(pal&&pal.classList.contains('active'))closePalette();
-    else openPalette();
-    return;
-  }
-  // Escape → close palette if open
-  if(e.key==='Escape'){
-    const pal=document.getElementById('palette-overlay');
-    if(pal&&pal.classList.contains('active')){closePalette();return;}
-  }
-  // Ctrl+F → focus session search
-  if((e.ctrlKey||e.metaKey)&&e.key==='f'){
-    // If on raw terminal tab, open raw search; otherwise focus session nav search
-    if(selectedSession&&(activeTabs[selectedSession]||'raw')==='raw'){
-      e.preventDefault();
-      openRawSearch(selectedSession);
-    }else{
-      const srch=document.getElementById('nav-search');
-      if(srch&&document.activeElement!==srch){e.preventDefault();srch.focus();srch.select();}
-    }
-    return;
-  }
-  // Ctrl+N → new session
-  if((e.ctrlKey||e.metaKey)&&e.key==='n'&&!e.shiftKey){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA');
-    if(!isInput){e.preventDefault();showCreateModal();}
-    return;
-  }
-  // Alt+1-9 → switch to nth session
-  if(e.altKey&&e.key>='1'&&e.key<='9'){
-    e.preventDefault();
-    const idx=parseInt(e.key)-1;
-    const visible=sessions.filter(s=>{
-      const item=document.getElementById('nav-'+s.name);
-      return item&&!item.classList.contains('nav-hidden');
-    });
-    if(visible[idx])selectSession(visible[idx].name);
-    return;
-  }
-  // Ctrl+] or Ctrl+ArrowRight → next session; Ctrl+[ or Ctrl+ArrowLeft → prev session
-  const isNavJump=(e.ctrlKey||e.metaKey)&&(e.key===']'||e.key==='['||e.key==='ArrowRight'||e.key==='ArrowLeft');
-  if(isNavJump){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA');
-    if(!isInput){
-      e.preventDefault();
-      const isNext=e.key===']'||e.key==='ArrowRight';
-      const visible=sessions.filter(s=>{
-        const item=document.getElementById('nav-'+s.name);
-        return item&&!item.classList.contains('nav-hidden');
-      });
-      const cur=visible.findIndex(s=>s.name===selectedSession);
-      const next=isNext?Math.min(visible.length-1,cur+1):Math.max(0,cur-1);
-      if(visible[next]&&visible[next].name!==selectedSession)selectSession(visible[next].name);
-      return;
-    }
-  }
-  // B → toggle busy-only filter (when not in input)
-  if(e.key==='b'||e.key==='B'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput){toggleBusyFilter();return;}
-  }
-  // F → toggle focus mode (when not in input)
-  if(e.key==='f'||e.key==='F'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput){toggleFocusMode();return;}
-  }
-  // / → focus chat search (when not in input, switches to chat tab)
-  if(e.key==='/'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      e.preventDefault();
-      if((activeTabs[selectedSession]||'raw')!=='chat')switchTab(selectedSession,'chat');
-      const srch=document.getElementById('chat-srch-'+selectedSession);
-      if(srch){setTimeout(()=>{srch.focus();srch.select();},50);}
-      return;
-    }
-  }
-  // G → jump to last message; Shift+G → jump to first message (when not in input)
-  if(e.key==='g'||e.key==='G'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      const chatEl=document.getElementById('chat-'+selectedSession);
-      if(chatEl){
-        if(e.shiftKey){chatEl.scrollTop=0;}else{chatEl.scrollTop=chatEl.scrollHeight;}
-      }
-      return;
-    }
-  }
-  // T → cycle tabs for current session (when not in input)
-  if(e.key==='t'||e.key==='T'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      const tabOrder=['raw','chat','info'];
-      const cur=activeTabs[selectedSession]||'raw';
-      const next=tabOrder[(tabOrder.indexOf(cur)+1)%tabOrder.length];
-      switchTab(selectedSession,next);
-      return;
-    }
-  }
-  // I → interrupt current session (when not in input)
-  if(e.key==='i'||e.key==='I'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      const sess=sessions.find(s=>s.name===selectedSession);
-      if(sess&&sess.activity_status==='busy'){interruptSession(selectedSession);return;}
-    }
-  }
-  // E → export current session conversation (when not in input)
-  if(e.key==='e'||e.key==='E'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){exportConversation(selectedSession);return;}
-  }
-  // S → focus chat send input for current session (when not in input, switch to chat)
-  if(e.key==='s'||e.key==='S'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      if((activeTabs[selectedSession]||'raw')!=='chat')switchTab(selectedSession,'chat');
-      const inp=document.getElementById('cmd-chat-'+selectedSession);
-      if(inp){setTimeout(()=>inp.focus(),50);}
-      return;
-    }
-  }
-  // X → snooze current session for 15 min (hide from nav, when not in input)
-  if(e.key==='x'||e.key==='X'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){snoozeSession(selectedSession,15);return;}
-  }
-  // P → pin/unpin current session (when not in input)
-  if(e.key==='p'||e.key==='P'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){togglePin(selectedSession);return;}
-  }
-  // H → toggle hide done sessions in nav (when not in input)
-  if(e.key==='h'||e.key==='H'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput){toggleHideDone();return;}
-  }
-  // W → toggle Away mode for current session (when not in input)
-  if(e.key==='w'||e.key==='W'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){quickToggleAway(selectedSession);return;}
-  }
-  // N → new session (when not in input)
-  if(e.key==='n'||e.key==='N'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput){showCreateModal();return;}
-  }
-  // R → rename current session (when not in input)
-  if(e.key==='r'||e.key==='R'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput&&selectedSession){
-      const spanEl=document.querySelector('#nav-'+CSS.escape(selectedSession)+' .nav-session-id');
-      if(spanEl)startRename(selectedSession,spanEl);
-      return;
-    }
-  }
-  // ? → show keyboard shortcut help (when not in input)
-  if(e.key==='?'){
-    const focused=document.activeElement;
-    const isInput=focused&&(focused.tagName==='INPUT'||focused.tagName==='TEXTAREA'||focused.isContentEditable);
-    if(!isInput){showKeyboardHelp();return;}
-  }
-});
-
-// ============================================================
-// FEATURE: Keyboard shortcut help modal (press ?)
-// ============================================================
-function showKeyboardHelp(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`
-    <h3 id="modal-title">Keyboard Shortcuts</h3>
-    <table style="width:100%;border-collapse:collapse;font-size:.85rem;margin-top:12px">
-      <tr style="color:#6e7681;font-size:.72rem"><th style="text-align:left;padding:4px 8px">Key</th><th style="text-align:left;padding:4px 8px">Action</th></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+K</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Open command palette</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus session search</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Alt+1-9</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Switch to session 1–9</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+]</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Next session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Ctrl+[</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Previous session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">/</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus chat message search</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">G</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Jump to latest message in chat</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+G</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Jump to first message in chat</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">T</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Cycle tabs (Terminal → Chat → Info)</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">B</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle busy-only filter</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">F</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle focus mode (hide nav)</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">?</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Show this help</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Send message / command</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">I</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy)</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">E</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Export current session conversation</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">S</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Focus chat send input</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">X</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Snooze current session for 15 min</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">N</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">R</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Rename current session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">P</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Pin / unpin current session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">H</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Hide / show done sessions in nav</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">W</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Toggle Away mode for current session</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Shift+Enter</kbd></td><td style="padding:6px 8px;color:#c9d1d9">New line in message</td></tr>
-      <tr><td style="padding:6px 8px"><kbd style="background:#21262d;border:1px solid #30363d;padding:2px 7px;border-radius:3px;color:#c9d1d9">Escape</kbd></td><td style="padding:6px 8px;color:#c9d1d9">Interrupt Claude (when busy) / close modal</td></tr>
-    </table>
-    <div style="margin-top:16px;text-align:right">
-      <button class="btn btn-full" onclick="closeModal()">Got it</button>
-    </div>`;
-  document.getElementById('modal-overlay').classList.add('active');
-}
-
-// ==================== Feature 7: Chat Message Search ====================
-function searchChatMessages(name,query){
-  const chatEl=document.getElementById('chat-'+name);
-  if(!chatEl)return;
-  const msgs=chatEl.querySelectorAll('.chat-msg');
-  const countEl=document.getElementById('chat-srch-count-'+name);
-  if(!query){
-    msgs.forEach(el=>{el.classList.remove('search-dim','search-match')});
-    if(countEl)countEl.textContent='';
-    return;
-  }
-  const lq=query.toLowerCase();
-  let matches=0;
-  let firstMatch=null;
-  msgs.forEach(el=>{
-    // Extract text without copy-btn / meta content
-    const clone=el.cloneNode(true);
-    clone.querySelectorAll('.chat-meta,.chat-copy-btn,.chat-bmark-btn').forEach(x=>x.remove());
-    const text=clone.textContent.toLowerCase();
-    if(text.includes(lq)){
-      el.classList.add('search-match');
-      el.classList.remove('search-dim');
-      matches++;
-      if(!firstMatch)firstMatch=el;
-    }else{
-      el.classList.add('search-dim');
-      el.classList.remove('search-match');
-    }
-  });
-  if(countEl)countEl.textContent=matches+' match'+(matches!==1?'es':'');
-  if(firstMatch)firstMatch.scrollIntoView({block:'nearest',behavior:'smooth'});
-}
-
-// ==================== Feature 8: Session Pinning ====================
-function getPinnedSessions(){
-  try{return new Set(JSON.parse(localStorage.getItem('tmux-pinned')||'[]'));}catch{return new Set();}
-}
-function togglePin(name){
-  const pinned=getPinnedSessions();
-  if(pinned.has(name))pinned.delete(name);else pinned.add(name);
-  localStorage.setItem('tmux-pinned',JSON.stringify([...pinned]));
-  renderNav();
-  const activeEl=navEl.querySelector('.nav-item.active');
-  if(activeEl)activeEl.scrollIntoView({block:'nearest',inline:'nearest',behavior:'smooth'});
-}
-
-// ==================== Feature 12: Auto-scroll lock ====================
-const scrollLocked=new Set();
-function toggleScrollLock(name){
-  const btn=document.getElementById('scroll-lock-'+name);
-  if(scrollLocked.has(name)){
-    scrollLocked.delete(name);
-    if(btn){btn.textContent='Auto-scroll: ON';btn.classList.remove('locked');}
-  }else{
-    scrollLocked.add(name);
-    if(btn){btn.textContent='Auto-scroll: OFF';btn.classList.add('locked');}
-  }
-}
-
-// ==================== Copy raw terminal ====================
-function copyRawTerminal(name){
-  const rawEl=document.getElementById('raw-'+name);
-  if(!rawEl)return;
-  const text=rawEl.innerText||rawEl.textContent;
-  if(navigator.clipboard&&window.isSecureContext){
-    navigator.clipboard.writeText(text).then(()=>{
-      showToast('Terminal copied to clipboard','success',2000);
-    }).catch(()=>_rawCopyFallback(text));
-  }else{_rawCopyFallback(text);}
-}
-function _rawCopyFallback(text){
-  const ta=document.createElement('textarea');
-  ta.value=text;ta.style.position='fixed';ta.style.top='-9999px';
-  document.body.appendChild(ta);ta.select();
-  try{document.execCommand('copy');showToast('Terminal copied','success',2000);}
-  catch(e){showToast('Copy failed','warn',2000);}
-  document.body.removeChild(ta);
-}
-
-// ==================== Message Bookmarks ====================
-const _bookmarks={};
-function _loadBookmarks(name){
-  if(_bookmarks[name])return;
-  try{
-    const raw=localStorage.getItem('tmux-bmarks-'+name);
-    _bookmarks[name]=raw?new Set(JSON.parse(raw)):new Set();
-  }catch(e){_bookmarks[name]=new Set();}
-}
-function _saveBookmarks(name){
-  try{localStorage.setItem('tmux-bmarks-'+name,JSON.stringify([..._bookmarks[name]]));}
-  catch(e){}
-}
-function isBookmarked(name,idx){
-  _loadBookmarks(name);
-  return _bookmarks[name].has(idx);
-}
-function toggleBookmark(btn){
-  const msgEl=btn.closest('.chat-msg');
-  if(!msgEl)return;
-  const name=msgEl.dataset.session;
-  const idx=parseInt(msgEl.dataset.msgIdx,10);
-  if(isNaN(idx)||!name)return;
-  _loadBookmarks(name);
-  if(_bookmarks[name].has(idx)){
-    _bookmarks[name].delete(idx);
-    btn.classList.remove('bookmarked');
-    msgEl.classList.remove('bookmarked');
-    btn.title='Bookmark message';
-    showToast('Bookmark removed','success',1500);
-  }else{
-    _bookmarks[name].add(idx);
-    btn.classList.add('bookmarked');
-    msgEl.classList.add('bookmarked');
-    btn.title='Remove bookmark';
-    showToast('Message bookmarked','success',1500);
-  }
-  _saveBookmarks(name);
-}
-
-// ==================== Clear chat view ====================
-function clearChatView(name){
-  if(!confirm('Clear messages from view? (Does not delete anything — reload to restore)'))return;
-  chatMessages[name]=[];
-  const chatEl=document.getElementById('chat-'+name);
-  if(chatEl)chatEl.innerHTML='<div style="text-align:center;padding:32px;color:#484f58;font-size:.85rem">View cleared — switch sessions or reload to restore</div>';
-  showToast('Chat view cleared','success',2000);
-}
-
-// ==================== Chat Font Size ====================
-const _CHAT_FONT_SIZES=['default','sm','lg'];
-let _chatFontIdx=0;
-(function(){
-  const saved=localStorage.getItem('tmux-chat-font');
-  const idx=_CHAT_FONT_SIZES.indexOf(saved);
-  _chatFontIdx=idx>=0?idx:0;
-  _applyChatFont(false);
-})();
-function getChatFontLabel(){return['A-','A','A+'][_chatFontIdx]||'A';}
-function _applyChatFont(toast){
-  document.documentElement.classList.remove('chat-font-sm','chat-font-lg');
-  const mode=_CHAT_FONT_SIZES[_chatFontIdx];
-  if(mode!=='default')document.documentElement.classList.add('chat-font-'+mode);
-  localStorage.setItem('tmux-chat-font',mode);
-  document.querySelectorAll('[id^="chat-font-btn-"]').forEach(function(btn){btn.textContent=getChatFontLabel();});
-  if(toast)showToast(['Default font','Small font','Large font'][_chatFontIdx],'success',1500);
-}
-function cycleChatFont(){_chatFontIdx=(_chatFontIdx+1)%_CHAT_FONT_SIZES.length;_applyChatFont(true);}
-
-// ==================== Sound Notifications ====================
-let _soundEnabled=localStorage.getItem('tmux-sound')==='true';
-const _prevActivityStatus={};
-function initSoundBtn(){
-  const btn=document.getElementById('sound-btn');
-  if(btn){
-    btn.textContent=_soundEnabled?'\uD83D\uDD14':'\uD83D\uDD07';
-    btn.title=_soundEnabled?'Sound: ON (click to mute)':'Sound: OFF (click to enable)';
-  }
-}
-function toggleSound(){
-  _soundEnabled=!_soundEnabled;
-  localStorage.setItem('tmux-sound',String(_soundEnabled));
-  initSoundBtn();
-  showToast(_soundEnabled?'Sound notifications ON':'Sound notifications OFF','success',1500);
-}
-function _playBeep(freq,dur,vol){
-  freq=freq||660;dur=dur||0.18;vol=vol||0.22;
-  try{
-    const ACtx=window.AudioContext||window.webkitAudioContext;
-    if(!ACtx)return;
-    const ctx=new ACtx();
-    const osc=ctx.createOscillator();
-    const gain=ctx.createGain();
-    osc.connect(gain);gain.connect(ctx.destination);
-    osc.type='sine';osc.frequency.value=freq;
-    gain.gain.setValueAtTime(vol,ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+dur);
-    osc.start();osc.stop(ctx.currentTime+dur);
-    setTimeout(function(){try{ctx.close();}catch(e){}},600);
-  }catch(e){}
-}
-
-// ==================== Feature 10: Token budget — handled via backend API ====================
-
-// ==================== Feature 13: Markdown Rendering ====================
-const _mdDisabled=new Set(); // sessions where MD is turned OFF (default ON)
-
-function mdEnabled(name){return!_mdDisabled.has(name);}
-
-function toggleMarkdown(name){
-  const btn=document.getElementById('md-toggle-'+name);
-  if(_mdDisabled.has(name)){
-    _mdDisabled.delete(name);
-    if(btn)btn.textContent='MD: ON';
-  }else{
-    _mdDisabled.add(name);
-    if(btn)btn.textContent='MD: OFF';
-  }
-  // Re-render all chat bubbles
-  const chatEl=document.getElementById('chat-'+name);
-  if(chatEl){
-    const typing=chatEl.querySelector('.chat-typing');
-    chatEl.innerHTML=renderChatBubbles(name);
-    if(typing)chatEl.appendChild(typing);
-  }
-}
-
-function renderMarkdown(raw){
-  if(!raw)return'';
-  // Step 1: Extract fenced code blocks to placeholders (protect from further processing)
-  const blocks=[];
-  let s=raw.replace(/```([\w.-]*)\n?([\s\S]*?)```/g,(_, lang, code)=>{
-    const idx=blocks.length;
-    const langAttr=lang?lang.toLowerCase():'';
-    blocks.push(`<div class="code-block-wrap"><button class="code-copy-btn" onclick="copyCodeBlock(this)">copy</button><pre><code class="code-block${langAttr?' lang-'+langAttr:''}">${escMd(code.replace(/\n$/,''))}</code></pre></div>`);
-    return'\x00B'+idx+'\x00';
-  });
-  // Step 2: Escape remaining HTML
-  s=escMd(s);
-  // Step 3: Inline code (after HTML escaping)
-  s=s.replace(/`([^`\n]+?)`/g,'<code>$1</code>');
-  // Step 4: Headers
-  s=s.replace(/^(#{1,3}) (.+)$/gm,(_, h, txt)=>{
-    const lvl=h.length;
-    return`<h${lvl}>${txt}</h${lvl}>`;
-  });
-  // Step 5: Bold and italic (order matters: bold first)
-  s=s.replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>');
-  s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-  s=s.replace(/\*([^*\n]+?)\*/g,'<em>$1</em>');
-  s=s.replace(/__(.+?)__/g,'<strong>$1</strong>');
-  s=s.replace(/_([^_\n]+?)_/g,'<em>$1</em>');
-  // Step 6: Blockquotes
-  s=s.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
-  // Step 7: Horizontal rules
-  s=s.replace(/^(---|===|\*\*\*)$/gm,'<hr>');
-  // Step 8: Lists — collect consecutive list lines
-  // Unordered (-, *, +)
-  s=s.replace(/((?:^[-*+] .+\n?)+)/gm,match=>{
-    const items=match.trim().split('\n').map(l=>'<li>'+l.replace(/^[-*+] /,'')+' </li>').join('');
-    return'<ul>'+items+'</ul>';
-  });
-  // Ordered (1. 2. etc.)
-  s=s.replace(/((?:^\d+\. .+\n?)+)/gm,match=>{
-    const items=match.trim().split('\n').map(l=>'<li>'+l.replace(/^\d+\. /,'')+' </li>').join('');
-    return'<ol>'+items+'</ol>';
-  });
-  // Step 9: Links
-  s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-  // Step 10: Paragraphs — double newlines become paragraph breaks
-  s=s.replace(/\n\n+/g,'</p><p>');
-  // Single newlines in non-special contexts become <br>
-  s=s.replace(/\n/g,'<br>');
-  // Step 11: Restore code blocks
-  blocks.forEach((block,idx)=>{
-    s=s.replace('\x00B'+idx+'\x00',block);
-  });
-  // Wrap in paragraph
-  s='<p>'+s+'</p>';
-  // Clean up empty paragraphs
-  s=s.replace(/<p><\/p>/g,'').replace(/<p>(<[hH][1-6]|<ul|<ol|<hr|<blockquote|<pre)/g,'$1').replace(/(<\/h[1-6]>|<\/ul>|<\/ol>|<hr>|<\/blockquote>|<\/pre>)<\/p>/g,'$1');
-  return'<div class="chat-body md-rendered">'+s+'</div>';
-}
-
-function escMd(str){
-  // Minimal HTML escape for markdown content (not using esc() to avoid the DOM roundtrip)
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ==================== Feature 9: Custom Commands ====================
-function getCustomCmds(){
-  try{return JSON.parse(localStorage.getItem('tmux-custom-cmds')||'[]');}catch{return[];}
-}
-function saveCustomCmds(cmds){
-  localStorage.setItem('tmux-custom-cmds',JSON.stringify(cmds));
-}
-function buildCustomCmdBtns(name){
-  const cmds=getCustomCmds();
-  if(!cmds.length)return'';
-  return cmds.map((cmd,idx)=>`
-    <button class="key-btn key-custom" onclick="sendSlashCommand('${esc(name)}','${esc(cmd.cmd)}')" title="${esc(cmd.cmd)}" oncontextmenu="event.preventDefault();removeCustomCmd(${idx})">${esc(cmd.label||cmd.cmd)}</button>`
-  ).join('');
-}
-function openAddCustomCmd(name){
-  const modal=document.getElementById('modal-overlay');
-  const body=document.getElementById('modal-body');
-  if(!modal||!body)return;
-  const cmds=getCustomCmds();
-  body.innerHTML=`
-    <div style="font-size:1rem;font-weight:600;color:#e6edf3;margin-bottom:12px">Custom Commands</div>
-    <div style="font-size:.8rem;color:#8b949e;margin-bottom:12px">Right-click a custom button to remove it.</div>
-    <div id="custom-cmd-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
-      ${cmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
-        <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
-        <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
-        <button onclick="removeCustomCmd(${i})" title="Remove command" aria-label="Remove command" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
-      </div>`).join('')}
-    </div>
-    <div style="display:flex;gap:8px;margin-bottom:8px">
-      <input id="new-cmd-input" type="text" placeholder="Command (e.g. /plan)" style="flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 9px;border-radius:4px;font-size:.8rem;font-family:monospace;outline:none" autocomplete="off" spellcheck="false">
-      <input id="new-cmd-label" type="text" placeholder="Label (optional)" style="width:120px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 9px;border-radius:4px;font-size:.8rem;outline:none" autocomplete="off" spellcheck="false">
-    </div>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
-      <button class="btn" onclick="closeModal()">Done</button>
-      <button class="btn btn-full" onclick="addCustomCmd()">Add Command</button>
-    </div>`;
-  modal.classList.add('active');
-  document.getElementById('new-cmd-input').focus();
-}
-function addCustomCmd(){
-  const input=document.getElementById('new-cmd-input');
-  const labelInput=document.getElementById('new-cmd-label');
-  if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
-  const label=labelInput?labelInput.value.trim():'';
-  const cmds=getCustomCmds();
-  cmds.push({cmd,label});
-  saveCustomCmds(cmds);
-  input.value='';
-  if(labelInput)labelInput.value='';
-  // Refresh list in modal
-  const listEl=document.getElementById('custom-cmd-list');
-  if(listEl){
-    const newCmds=getCustomCmds();
-    listEl.innerHTML=newCmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
-      <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
-      <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
-      <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
-    </div>`).join('');
-  }
-  // Refresh all visible key bars
-  refreshKeyBars();
-}
-function removeCustomCmd(idx){
-  const cmds=getCustomCmds();
-  cmds.splice(idx,1);
-  saveCustomCmds(cmds);
-  // Refresh list in modal if open
-  const listEl=document.getElementById('custom-cmd-list');
-  if(listEl){
-    const newCmds=getCustomCmds();
-    listEl.innerHTML=newCmds.map((c,i)=>`<div style="display:flex;align-items:center;gap:8px;background:#161b22;padding:6px 10px;border-radius:4px;border:1px solid #30363d">
-      <span style="flex:1;font-size:.8rem;color:#c9d1d9;font-family:monospace">${esc(c.cmd)}</span>
-      <span style="font-size:.75rem;color:#6e7681">${esc(c.label||'')}</span>
-      <button onclick="removeCustomCmd(${i})" style="background:none;border:none;color:#f85149;cursor:pointer;font-size:.85rem;padding:0 4px">&#x2715;</button>
-    </div>`).join('');
-  }
-  refreshKeyBars();
-}
-function refreshKeyBars(){
-  // Re-render only the custom cmd section in visible key bars
-  if(selectedSession){
-    const s=sessions.find(x=>x.name===selectedSession);
-    if(!s)return;
-    const tab=activeTabs[selectedSession]||'raw';
-    const barId='keybar-'+tab+'-'+selectedSession;
-    const bar=document.getElementById(barId);
-    if(bar){
-      // Find the custom section placeholder and replace it
-      // Easiest: re-render the whole detail
-      renderDetail();
-    }
-  }
-}
-
-// ==================== Broadcast (Bulk Send) ====================
-function openBroadcast(){
-  const modal=document.getElementById('modal-overlay');
-  const body=document.getElementById('modal-body');
-  if(!modal||!body)return;
-  body.innerHTML=`
-    <div style="font-size:1rem;font-weight:600;color:#e6edf3;margin-bottom:8px">&#x1F4E1; Broadcast to Sessions</div>
-    <div style="font-size:.8rem;color:#8b949e;margin-bottom:12px">Send the same message or command to multiple sessions at once.</div>
-    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:12px;max-height:180px;overflow-y:auto">
-      ${sessions.map(s=>`
-        <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#161b22;border:1px solid #30363d;border-radius:4px;cursor:pointer;font-size:.82rem;color:#c9d1d9">
-          <input type="checkbox" class="bc-session-chk" value="${esc(s.name)}" ${s.name===selectedSession?'checked':''} style="cursor:pointer">
-          <span class="nav-dot ${esc(s.activity_status)}" style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${s.activity_status==='busy'?'#f85149':s.activity_status==='idle'?'#3fb950':'#d2a8ff'}"></span>
-          ${esc(s.name)}
-        </label>`).join('')}
-    </div>
-    <textarea id="bc-message" rows="3" placeholder="Type a message or command..." style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:8px 10px;border-radius:4px;font-size:.85rem;font-family:inherit;resize:vertical;outline:none" spellcheck="false"></textarea>
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">
-      <label style="display:flex;align-items:center;gap:6px;font-size:.78rem;color:#8b949e;cursor:pointer">
-        <input type="checkbox" id="bc-select-all" onchange="document.querySelectorAll('.bc-session-chk').forEach(c=>c.checked=this.checked)">
-        Select all
-      </label>
-      <div style="display:flex;gap:8px">
-        <button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-full" onclick="executeBroadcast()">Send</button>
-      </div>
-    </div>`;
-  modal.classList.add('active');
-  document.getElementById('bc-message').focus();
-}
-async function executeBroadcast(){
-  const msg=document.getElementById('bc-message');
-  if(!msg||!msg.value.trim()){alert('Enter a message first.');return;}
-  const text=msg.value.trim();
-  const checked=[...document.querySelectorAll('.bc-session-chk:checked')].map(c=>c.value);
-  if(!checked.length){alert('Select at least one session.');return;}
-  closeModal();
-  let ok=0,fail=0;
-  await Promise.all(checked.map(async name=>{
-    try{
-      appendChatBubble(name,'user',text,Date.now()/1000);
-      const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({command:text})
-      });
-      if(resp.ok)ok++;else fail++;
-    }catch{fail++;}
-  }));
-  if(fail)alert(\`Broadcast: \${ok} sent, \${fail} failed.\`);
-}
-
-// ==================== Session Rename ====================
-function startRename(name,spanEl){
-  const current=spanEl.textContent;
-  const input=document.createElement('input');
-  input.value=current;
-  input.style.cssText='width:'+(Math.max(60,current.length*8))+'px;background:#0d1117;border:1px solid #58a6ff;color:#58a6ff;border-radius:3px;padding:1px 5px;font-size:.75rem;font-weight:700;font-family:inherit;outline:none;max-width:140px';
-  spanEl.replaceWith(input);
-  input.select();
-  const finish=async(save)=>{
-    const newName=input.value.trim();
-    // Restore span
-    const newSpan=document.createElement('span');
-    newSpan.className='nav-session-id';
-    newSpan.title='Double-click to rename';
-    newSpan.ondblclick=(e)=>{e.stopPropagation();startRename(save&&newName?newName:name,newSpan)};
-    newSpan.textContent=save&&newName&&newName!==name?newName:name;
-    input.replaceWith(newSpan);
-    if(!save||!newName||newName===name)return;
-    try{
-      const resp=await fetch(BASE+'/api/sessions/'+name+'/rename',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({new_name:newName})
-      });
-      const data=await resp.json();
-      if(!resp.ok){alert(data.error||'Rename failed');renderNav();return;}
-      if(selectedSession===name)selectedSession=data.name;
-      await loadAll();
-    }catch{alert('Rename failed');}
-  };
-  input.onkeydown=(e)=>{
-    if(e.key==='Enter'){e.preventDefault();finish(true);}
-    else if(e.key==='Escape')finish(false);
-  };
-  input.onblur=()=>finish(true);
-  input.onclick=(e)=>e.stopPropagation();
-}
-
-// ==================== Rate Limit Alarm Banner ====================
-const _rateAlarmState={};
-function updateRateAlarm(name,rateStatus){
-  // Only show alarm for the currently selected session
-  if(name!==selectedSession)return;
-  _rateAlarmState[name]=rateStatus;
-  const banner=document.getElementById('rate-alarm');
-  if(!banner)return;
-  if(rateStatus==='severely_limited'){
-    banner.className='rate-alarm severely_limited visible';
-    banner.innerHTML='&#x26A0; <strong>Rate Limit: Severely Throttled</strong> — Claude is responding much slower than peak. Consider waiting or switching to a different session.&nbsp;&nbsp;<button onclick="this.closest(\'.rate-alarm\').classList.remove(\'visible\')" style="background:none;border:1px solid #f85149;color:#f85149;border-radius:3px;padding:1px 8px;cursor:pointer;font-size:.7rem;margin-left:auto">Dismiss</button>';
-  }else if(rateStatus==='limited'){
-    banner.className='rate-alarm limited visible';
-    banner.innerHTML='&#x26A0; <strong>Rate Limited</strong> — Claude response speed is reduced.&nbsp;&nbsp;<button onclick="this.closest(\'.rate-alarm\').classList.remove(\'visible\')" style="background:none;border:1px solid #d29922;color:#d29922;border-radius:3px;padding:1px 8px;cursor:pointer;font-size:.7rem;margin-left:auto">Dismiss</button>';
-  }else{
-    banner.classList.remove('visible');
-  }
-}
-
-// ==================== Quick Notes ====================
-function getQuickNote(name){
-  try{return localStorage.getItem('tmux-qnote-'+name)||'';}catch{return'';}
-}
-function saveQuickNote(name,val){
-  try{
-    if(val)localStorage.setItem('tmux-qnote-'+name,val);
-    else localStorage.removeItem('tmux-qnote-'+name);
-  }catch{}
-}
-
-// ==================== Jump to Bottom + Command History ====================
-function updateJumpBtn(name,chatEl){
-  const btn=document.getElementById('jump-btn-'+name);
-  if(!btn)return;
-  const distFromBottom=chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight;
-  if(distFromBottom>120)btn.classList.add('visible');
-  else btn.classList.remove('visible');
-}
-function jumpToBottom(name){
-  const chatEl=document.getElementById('chat-'+name);
-  if(chatEl){chatEl.scrollTop=chatEl.scrollHeight;}
-  const btn=document.getElementById('jump-btn-'+name);
-  if(btn)btn.classList.remove('visible');
-}
-
 loadAll();
 checkClaudeAuth();
-initSoundBtn();
 </script>
 </body></html>
 """
