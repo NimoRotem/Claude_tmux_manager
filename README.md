@@ -2,7 +2,7 @@
 
 A single-file FastAPI web app that turns every `tmux` session on your box into a fully manageable workspace in the browser — built specifically for orchestrating multiple concurrent **Claude Code** sessions.
 
-![Claude tmux Manager dashboard](screenshots/dashboard.png)
+![Claude tmux Manager dashboard](screenshots/tmux-screenshot.png)
 
 ## What it does
 
