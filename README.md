@@ -1,22 +1,29 @@
-# tmux Dashboard
+# Claude tmux Manager
 
-A single-file FastAPI web application that provides a browser-based dashboard for managing tmux sessions running Claude Code.
+A single-file FastAPI web app that turns every `tmux` session on your box into a fully manageable workspace in the browser — built specifically for orchestrating multiple concurrent **Claude Code** sessions.
 
-## Features
+![Claude tmux Manager dashboard](screenshots/dashboard.png)
 
-- Live view of all tmux sessions with terminal output
-- AI-generated session titles, descriptions, and progress summaries (via OpenAI)
-- Away Mode: autonomous Claude Code operation with phase-based prompt sequences
-- Go Nuts Mode: autonomous feature-building loop
-- File upload to session working directories
-- CLAUDE.md viewer/editor (home directory only, path-traversal protected)
-- Login rate limiting, session name validation, CSP/HSTS security headers
+## What it does
+
+Claude Code runs beautifully inside a `tmux` session, but once you start juggling five or ten of them across different projects, the terminal stops scaling. This dashboard gives you:
+
+- A **tabbed view of every session** with live terminal output and a parallel chat transcript
+- **AI-generated titles, descriptions, and progress summaries** (OpenAI) so you know what each session is doing at a glance
+- **Away Mode** — multi-phase autonomous prompt sequences that keep Claude working while you're AFK
+- **Go Nuts Mode** — an autonomous feature-building loop that plans, implements, tests, and commits in a tight cycle
+- **System stats**, per-session cost, token usage, idle detection, context-window warnings, and activity sparklines
+- **Keyboard-first navigation** — rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
+- **File upload**, **CLAUDE.md viewer/editor** (home-dir-scoped, path-traversal protected), **sticky notes**, **message bookmarks**, **quick-reply templates**, toast notifications, and sound alerts
+- **Hardened auth** — HMAC session cookie, rate-limited login, CSP/HSTS/Permissions-Policy headers, session-name validation before any shell call
+
+It's a single Python file with no database — everything persists as JSON under `~/.tmux-dashboard/`.
 
 ## Prerequisites
 
 - Python 3.9+
-- tmux installed and accessible on PATH
-- OpenAI API key (optional — for LLM summaries)
+- `tmux` installed and on `PATH`
+- OpenAI API key (optional — required for LLM summaries)
 - Nginx or another reverse proxy (recommended for HTTPS)
 
 ## Quick Start
@@ -52,7 +59,7 @@ All persistent data is stored in `~/.tmux-dashboard/` (permissions: `700`):
 |------|-------------|
 | `messages.json` | Per-session chat message history |
 | `notes.json` | AI-extracted session notes |
-| `autonomous-modes.json` | Persisted away/go-nuts mode state |
+| `autonomous-modes.json` | Persisted Away Mode / Go Nuts Mode state |
 | `anthropic_api_key` | Encrypted-at-rest API key (chmod 600) |
 
 ## Running via Supervisor
@@ -126,12 +133,14 @@ make backup
 > **Status**: Deferred. openai 2.x is a major version with breaking changes. Human review required before upgrading.
 
 Current usage in `app.py` (all standard, minimal API surface):
+
 - `openai.AsyncOpenAI(api_key=...)` — client init
 - `client.chat.completions.create(model, messages, max_tokens, temperature)` — single call pattern
 - `resp.choices[0].message.content` — response access
 - `resp.usage.total_tokens` — token counting
 
 **Migration steps** (when ready):
+
 1. Install: `pip install openai==2.*`
 2. Run tests: `make test` (expect failures if any API changed)
 3. Check openai v2 migration guide for any response schema changes
@@ -160,5 +169,9 @@ Current usage in `app.py` (all standard, minimal API surface):
 | GET | `/api/auth/claude-status` | Claude Code OAuth status |
 | POST | `/api/auth/logout` | Revoke Claude Code OAuth session |
 | GET | `/api/auth/usage` | Today's Claude Code token usage |
-| GET/POST | `/api/sessions/{name}/away-mode` | Get/toggle away mode |
-| GET/POST | `/api/sessions/{name}/go-nuts-mode` | Get/toggle go nuts mode |
+| GET/POST | `/api/sessions/{name}/away-mode` | Get/toggle Away Mode |
+| GET/POST | `/api/sessions/{name}/go-nuts-mode` | Get/toggle Go Nuts Mode |
+
+## License
+
+MIT — see source header in `app.py` for attribution.

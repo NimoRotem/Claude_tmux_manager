@@ -47,6 +47,10 @@ desktop.ini
 *.jpg
 *.jpeg
 
+# ...but allow screenshots used in README
+!screenshots/
+!screenshots/**
+
 # Generated data / logs
 *.jsonl
 *.log
