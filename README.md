@@ -172,6 +172,117 @@ Current usage in `app.py` (all standard, minimal API surface):
 | GET/POST | `/api/sessions/{name}/away-mode` | Get/toggle Away Mode |
 | GET/POST | `/api/sessions/{name}/go-nuts-mode` | Get/toggle Go Nuts Mode |
 
+---
+
+## PGS Pipeline Tooling (23andClaude)
+
+This repo also contains tooling scripts used to manage the **Polygenic Score (PGS) pipeline** for the [23andClaude](https://github.com/NimoRotem/23andClaude) genomics app running on `genom-beast-gpu` (34.135.47.236). These scripts live here because they were developed and run from the tmux dashboard's Claude Code sessions.
+
+### Background
+
+The 23andClaude app computes Polygenic Risk Scores for uploaded genome files (VCF/BAM/CRAM). Each PGS test:
+
+1. **Scores** the sample using `plink2 --score` against a PGS Catalog scoring file
+2. **Computes a percentile** by comparing the sample's score against a reference population distribution (1000 Genomes Phase 3, EUR ancestry, GRCh38 build)
+3. **Reports** the result with a confidence level and optional AI interpretation
+
+The percentile step requires **precomputed reference statistics** (mean and standard deviation of scores across 633 EUR samples). Without these stats, the percentile cannot be reliably computed.
+
+### The Problem We Solved
+
+The pipeline originally had two methods for computing percentiles:
+
+- **Precomputed stats** — Fixed EUR reference mean/std from pre-scored 1000 Genomes data. Stable and reproducible.
+- **Dynamic scoring** — Re-scored the 1000G panel on-the-fly using only the variants that matched the sample. Unstable: the same sample could get different percentiles across runs because the reference distribution changed with each variant subset.
+
+We overhauled the pipeline in 6 patches:
+
+1. **Audit** (`pgs_stats_audit.py`) — Inventoried all 269 unique PGS IDs, classified each as `precomputed_ok`, `precomputed_stale`, or `missing` based on available reference stats files
+2. **Hard-fail dynamic scoring** — Removed the unstable dynamic fallback from `_compute_percentile()`. PGS without precomputed stats now return `method=unavailable` instead of unreliable percentiles
+3. **Test gating** — PGS tests without valid stats are disabled at startup via an audit overlay. Disabled tests are hidden from the UI and skipped in "Run All"
+4. **Confidence tagging** — Every PGS result now includes `confidence: "high"|"low"` with reasons (missing stats, low match rate, build mismatch, sanity gates)
+5. **UI confidence display** — Low-confidence badge on results, details in report modal, AI interpretation explicitly warns about low-confidence results
+6. **Registry rebuild** — Replaced the PGS test list with 270 curated entries across 10 categories
+
+### Scripts
+
+#### `generate_pgs_stats.py`
+
+Generates precomputed EUR GRCh38 reference statistics for PGS IDs that lack them. Scores the full 1000 Genomes Phase 3 reference panel with each PGS scoring file.
+
+```bash
+# On genom-beast-gpu (34.135.47.236):
+cd /home/nimrod_rotem/simple-genomics
+
+# Generate stats for specific PGS IDs
+python3 generate_pgs_stats.py PGS002012 PGS002231 PGS003573
+
+# Generate stats for all IDs in the TARGET_PGS_IDS list
+python3 generate_pgs_stats.py
+```
+
+**How it works:**
+1. Downloads the PGS Catalog scoring file for each ID
+2. Converts it to plink2 format with ref-panel-compatible variant IDs (`chr:pos:ref:alt`), emitting both allele orientations
+3. Runs `plink2 --score` against the 1000G panel (3,202 samples total, 633 EUR)
+4. Extracts EUR sample SCORE1_AVG values, computes mean/std/median/min/max
+5. Saves to `/data/pgs2/ref_panel_stats/{pgs_id}_EUR_GRCh38.json`
+
+**Key detail:** Reference panel variant IDs use the format `1:751133:C:CGT` (chr:pos:ref:alt). The script emits both `{chr}:{pos}:{oa}:{ea}` and `{chr}:{pos}:{ea}:{oa}` orientations so plink2 can match either one.
+
+#### `rebuild_pgs_registry.py`
+
+Parses `pgs_reorganized.md` and rebuilds the PGS section of `test_registry.py` on the genomics server.
+
+```bash
+# On genom-beast-gpu:
+cd /home/nimrod_rotem/simple-genomics
+python3 rebuild_pgs_registry.py
+```
+
+Replaces everything between `# -- PGS - Cancer` and `# -- Monogenic` in `test_registry.py` with entries parsed from the markdown. Backs up the original, runs syntax check and import verification, and rolls back if anything fails.
+
+#### `pgs_stats_audit.py` (on remote server)
+
+Audits all PGS tests against available precomputed stats. Produces `pgs_stats_audit.json` which the app loads at startup to gate tests.
+
+```bash
+# On genom-beast-gpu:
+cd /home/nimrod_rotem/simple-genomics
+python3 pgs_stats_audit.py
+```
+
+### Data Files
+
+| File | Description |
+|------|-------------|
+| `pgs_reorganized.md` | 270 curated PGS test definitions across 10 categories, in markdown format |
+| `pgs_curated_list.md` | Compact reference list of high-impact PGS IDs with traits |
+
+### Current Status (April 2026)
+
+- **270 PGS tests** registered across 10 categories
+- **41 PGS IDs** have precomputed EUR GRCh38 reference stats (`precomputed_ok`)
+- **228 PGS IDs** still missing stats — these are disabled in the UI until stats are generated
+- Stats generation takes ~2-5 minutes per PGS ID using `generate_pgs_stats.py`
+
+### Architecture
+
+```
+genom-beast-gpu (34.135.47.236)
+├── /home/nimrod_rotem/simple-genomics/
+│   ├── app.py              — FastAPI web app (UI + API)
+│   ├── runners.py          — PGS scoring pipeline + _compute_percentile()
+│   ├── test_registry.py    — 370 tests (270 PGS + 14 rsID + 86 non-PGS)
+│   ├── pgs_stats_audit.py  — Audit script → pgs_stats_audit.json
+│   ├── generate_pgs_stats.py — Reference stats generator
+│   └── rebuild_pgs_registry.py — Registry rebuilder from markdown
+├── /data/pgs2/
+│   ├── ref_panel_stats/    — 48 precomputed stats JSON files
+│   └── scoring_files/      — Downloaded PGS Catalog scoring files
+└── /data/pgs2/ref_panel/   — 1000G Phase 3 plink2 pgen/pvar/psam files
+```
+
 ## License
 
 MIT — see source header in `app.py` for attribution.
