@@ -345,6 +345,8 @@ async def security_headers_middleware(request: Request, call_next):
     """Add security headers to all responses and log slow requests."""
     start = time.time()
     response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -373,11 +375,15 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     path = request.url.path
     # Allow login routes without auth
-    if path in ("/login", "/login/"):
+    rp = request.scope.get("root_path", "")
+    if path in ("/login", "/login/", rp + "/login", rp + "/login/"):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
-        return HTMLResponse(LOGIN_PAGE)
+        resp = HTMLResponse(LOGIN_PAGE)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
     return await call_next(request)
 
 
@@ -491,7 +497,7 @@ def _load_session_messages(session_name: str) -> list:
 
 DESCRIPTION_TTL = 0    # never auto-expire
 PROGRESS_TTL = 600     # 10 minutes
-REALTIME_TTL = 60      # 1 minute
+REALTIME_TTL = 15      # 15 seconds — text extraction is cheap (no LLM call usually)
 NOTES_TTL = 600        # 10 minutes
 
 
@@ -509,8 +515,11 @@ def get_tmux_sessions() -> list[dict]:
             if not line:
                 continue
             parts = line.split(":")
+            name = parts[0]
+            if name.startswith("__") and name.endswith("__"):
+                continue  # Skip internal sessions (e.g. __auth_login_tmp__)
             sessions.append({
-                "name": parts[0],
+                "name": name,
                 "windows": parts[1] if len(parts) > 1 else "?",
                 "created": parts[2] if len(parts) > 2 else "",
                 "attached": parts[3] == "1" if len(parts) > 3 else False,
@@ -1134,54 +1143,139 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
     )
 
 
+def _extract_claude_text(terminal_output: str) -> str:
+    """Extract Claude's human-readable text from terminal output.
+
+    Claude's terminal output uses these patterns:
+    - '● Text here...' = Claude's spoken text (INCLUDE)
+    - '● ToolName(args...)' = Tool call (EXCLUDE)
+    - '  ⎿ ...' = Tool output / indented continuation (EXCLUDE)
+    - '✻ ...' = Status line (EXCLUDE)
+    - Lines starting with '❯' = User prompt (EXCLUDE)
+
+    Returns extracted text paragraphs joined by newlines.
+    """
+    lines = terminal_output.split("\n")
+    # Known tool prefixes that indicate a tool call, not text
+    tool_names = (
+        "Bash(", "Read(", "Edit(", "Write(", "Grep(", "Glob(", "Task(",
+        "WebFetch(", "WebSearch(", "NotebookEdit(", "AskUser", "Skill(",
+        "EnterPlanMode", "ExitPlanMode", "TaskCreate(", "TaskUpdate(",
+        "TaskGet(", "TaskList(", "TodoWrite(", "mcp__",
+    )
+    text_blocks = []
+    current_block = []
+    in_text_block = False
+    in_tool_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Detect start of a Claude text block (● followed by text, not a tool)
+        if stripped.startswith("●"):
+            content_after = stripped[1:].strip()
+            # Check if this is a tool call
+            is_tool = any(content_after.startswith(t) for t in tool_names)
+            if is_tool:
+                # End any current text block
+                if current_block:
+                    text_blocks.append("\n".join(current_block))
+                    current_block = []
+                in_text_block = False
+                in_tool_block = True
+            else:
+                # This is Claude's spoken text
+                if current_block:
+                    text_blocks.append("\n".join(current_block))
+                    current_block = []
+                in_text_block = True
+                in_tool_block = False
+                if content_after:
+                    current_block.append(content_after)
+        elif stripped.startswith("⎿") or stripped.startswith("⎿"):
+            # Tool output — skip
+            in_text_block = False
+            in_tool_block = True
+        elif stripped.startswith("✻") or stripped.startswith("❯"):
+            # Status line or user prompt — end block
+            if current_block:
+                text_blocks.append("\n".join(current_block))
+                current_block = []
+            in_text_block = False
+            in_tool_block = False
+        elif stripped.startswith("───") or stripped == "":
+            # Separator or blank line
+            if in_text_block and current_block:
+                # Blank line within text block — preserve as paragraph break
+                if stripped == "":
+                    current_block.append("")
+                else:
+                    text_blocks.append("\n".join(current_block))
+                    current_block = []
+                    in_text_block = False
+        elif in_text_block:
+            # Continuation of Claude's text (indented lines under ●)
+            # Claude indents continuation lines with 2 spaces
+            current_block.append(stripped)
+        elif in_tool_block:
+            # Skip tool output continuation
+            pass
+
+    if current_block:
+        text_blocks.append("\n".join(current_block))
+
+    return "\n\n".join(b for b in text_blocks if b.strip())
+
+
+def _extract_claude_response_since_last_user(terminal_output: str) -> str:
+    """Extract Claude's text response since the last user message (❯ prompt).
+
+    Scans backward from the end of terminal output to find the last ❯ prompt,
+    then extracts all Claude text blocks after it.
+    """
+    lines = terminal_output.split("\n")
+    # Find the last user prompt line (❯)
+    last_prompt_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.startswith("❯") and len(stripped) > 1:
+            last_prompt_idx = i
+            break
+
+    # If no user prompt found, use all output
+    if last_prompt_idx < 0:
+        section = terminal_output
+    else:
+        section = "\n".join(lines[last_prompt_idx + 1:])
+
+    return _extract_claude_text(section)
+
+
 async def get_realtime(session_name: str) -> str:
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 80)
-    activity = await async_detect_activity(session_name)
-    status_hint = f"[Session is currently {activity['status'].upper()}"
-    if activity["detail"]:
-        status_hint += f" — {activity['detail']}"
-    status_hint += "]"
+    """Extract Claude's human-readable text from recent terminal output.
 
-    # Include recent chat messages for context to avoid repetition
-    entry = cache.get(session_name, {})
-    messages = entry.get("messages", [])
-    msg_context = ""
-    if messages:
-        recent_msgs = messages[-10:]
-        msg_lines = []
-        for m in recent_msgs:
-            prefix = "USER" if m["role"] == "user" else "ASSISTANT"
-            msg_lines.append(f"[{prefix}] {m['text']}")
-        msg_context = "\n\n=== RECENT CHAT MESSAGES ===\n" + "\n".join(msg_lines)
+    Instead of LLM summarization, directly parses Claude's text output.
+    Only falls back to LLM summarization if extracted text is very long (>500 words).
+    """
+    recent = await asyncio.to_thread(capture_pane_recent, session_name, 150)
 
+    extracted = _extract_claude_response_since_last_user(recent)
+
+    if not extracted.strip():
+        return ""
+
+    # If the extracted text is short enough, return it directly
+    word_count = len(extracted.split())
+    if word_count <= 500:
+        return extracted.strip()
+
+    # Text is very long — summarize it
     return await llm_call(
         system_prompt=(
-            "You summarize what happened in a terminal session SINCE the last user message. "
-            "Write 2-3 short sentences as a collaborative team update using 'we'.\n\n"
-            "RULES:\n"
-            "- Use first-person plural: 'We updated...', 'We're running...', 'We fixed...'.\n"
-            "- NEVER start with 'User asked' or 'User requested'.\n"
-            "- Focus on CONCRETE DETAILS: URLs, IPs, file paths modified, error messages, "
-            "credentials created, ports used, specific actions taken.\n"
-            "- If BUSY: describe what's actively happening. Include progress % if visible.\n"
-            "- If IDLE: describe what was accomplished since the last user message.\n"
-            "- Include any errors or warnings that appeared.\n"
-            "- Do NOT repeat information already in previous ASSISTANT messages.\n"
-            "- Refer to the RECENT CHAT MESSAGES to understand context and avoid repetition.\n"
-            "- Under 60 words.\n\n"
-            "GOOD examples:\n"
-            "- 'We added the /api/users endpoint and deployed to rotem.cc:8510. "
-            "The migration created 3 new tables. Server restarted successfully.'\n"
-            "- 'We're running the scraper pipeline — 64% done. Found 2 rate-limit errors.'\n"
-            "BAD examples:\n"
-            "- 'We're working on the project.' (too vague)\n"
-            "- 'User asked to fix the login bug.' (don't say 'user asked')\n"
-            "- 'Idle, waiting for input.' (what was just done?)"
+            "Summarize Claude's response text into a concise message (2-4 sentences). "
+            "Keep concrete details: file paths, URLs, numbers, outcomes. "
+            "Write in first person as Claude would. Under 80 words."
         ),
-        user_content=(
-            f"{status_hint}\n\ntmux session '{session_name}' latest output:\n\n{recent[-3000:]}"
-            f"{msg_context[:1500]}"
-        ),
+        user_content=f"Claude's response text:\n\n{extracted[:4000]}",
         max_tokens=200,
     )
 
@@ -1253,16 +1347,44 @@ def _msg_similarity(a: str, b: str) -> float:
 
 
 def _append_assistant_msg(entry: dict, text: str, ts: float):
-    """Append an assistant message, skipping if too similar to the last one."""
+    """Update or append an assistant message for the current Claude response.
+
+    Instead of appending multiple assistant messages per response, we maintain
+    a single assistant message after the last user message that gets updated
+    as Claude produces more text. This keeps the chat clean:
+    user → single assistant response → user → single assistant response.
+    """
+    if not text or not text.strip():
+        return
     msgs = entry.setdefault("messages", [])
-    # Find last assistant message
-    for m in reversed(msgs):
-        if m["role"] == "assistant":
-            # Skip if identical or very similar (>70% word overlap)
-            if m["text"] == text or _msg_similarity(m["text"], text) > 0.7:
-                return
+
+    # Find the last user message index
+    last_user_idx = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "user":
+            last_user_idx = i
             break
-    msgs.append({"role": "assistant", "text": text, "ts": ts})
+
+    # Find the last assistant message after the last user message
+    last_assistant_idx = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "assistant" and i > last_user_idx:
+            last_assistant_idx = i
+            break
+
+    if last_assistant_idx >= 0:
+        # Update existing assistant message if content changed
+        if msgs[last_assistant_idx]["text"] == text:
+            return  # No change
+        if _msg_similarity(msgs[last_assistant_idx]["text"], text) > 0.9:
+            return  # Too similar, skip
+        # Update the message with new content
+        msgs[last_assistant_idx]["text"] = text
+        msgs[last_assistant_idx]["ts"] = ts
+    else:
+        # No assistant message after last user message — create one
+        msgs.append({"role": "assistant", "text": text, "ts": ts})
+
     _save_messages()
 
 
@@ -1601,23 +1723,27 @@ def get_session_cwd(session_name: str) -> str:
     return ""
 
 
+UPLOADS_DIR = MESSAGES_DIR / "uploads"
+
+
 @app.post("/api/sessions/{session_name}/upload")
 async def api_upload_file(session_name: str, file: UploadFile = File(...)):
-    """Upload a file to the session's current working directory."""
+    """Upload a file to a session-specific uploads dir and register in CLAUDE.md."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     cwd = get_session_cwd(session_name)
-    if not cwd:
-        return JSONResponse({"error": "Could not determine session working directory"}, status_code=500)
 
     # Sanitize filename — keep only the basename
     filename = os.path.basename(file.filename or "upload")
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    dest = os.path.join(cwd, filename)
+    # Save to fixed session-specific uploads dir under ~/.tmux-dashboard/uploads/<session>/
+    uploads_dir = UPLOADS_DIR / session_name
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    dest = str(uploads_dir / filename)
     try:
         content = await file.read()
         max_size = 50 * 1024 * 1024  # 50 MB
@@ -1625,9 +1751,12 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
         with open(dest, "wb") as f:
             f.write(content)
+        # Append file path to session's CLAUDE.md (if we can determine cwd)
+        if cwd:
+            _append_upload_to_claude_md(cwd, dest, filename)
         # Record in chat history
         size_kb = len(content) / 1024
-        note = f"Uploaded {filename} ({size_kb:.1f} KB) to {cwd}"
+        note = f"Uploaded {filename} ({size_kb:.1f} KB) to {dest}"
         now = time.time()
         entry = cache.setdefault(session_name, {})
         if "messages" not in entry:
@@ -1637,6 +1766,32 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _append_upload_to_claude_md(cwd: str, file_path: str, filename: str):
+    """Append an uploaded file's path to the project CLAUDE.md so Claude Code can find it."""
+    md_path = os.path.join(cwd, "CLAUDE.md")
+    marker = "# Uploaded Files"
+    entry_line = f"- `{file_path}`"
+    try:
+        existing = ""
+        if os.path.exists(md_path):
+            with open(md_path) as f:
+                existing = f.read()
+        # Don't duplicate if already listed
+        if file_path in existing:
+            return
+        if marker in existing:
+            # Append under existing section
+            parts = existing.split(marker, 1)
+            updated = parts[0] + marker + parts[1].rstrip("\n") + "\n" + entry_line + "\n"
+        else:
+            # Add new section at the end
+            updated = existing.rstrip("\n") + "\n\n" + marker + "\n" + entry_line + "\n"
+        with open(md_path, "w") as f:
+            f.write(updated)
+    except Exception:
+        logger.debug("Failed to update CLAUDE.md with upload path %s", file_path, exc_info=True)
 
 
 # --- CLAUDE.md viewer/editor ---
@@ -4527,6 +4682,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
 .key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
 .key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
+.drop-zone{width:100%;margin-top:4px;padding:12px;border:2px dashed #30363d;border-radius:6px;text-align:center;color:#6e7681;font-size:.72rem;cursor:pointer;transition:all .2s;background:transparent}
+.drop-zone:hover{border-color:#58a6ff;color:#8b949e;background:#58a6ff08}
+.drop-zone.drag-over{border-color:#58a6ff;background:#58a6ff15;color:#58a6ff}
+.drop-zone-icon{font-size:1.2rem;margin-bottom:2px;pointer-events:none}
+.drop-zone-text{pointer-events:none}
+.upload-progress{width:100%;margin-top:6px;display:none}
+.upload-progress.active{display:block}
+.upload-progress-filename{font-size:.68rem;color:#8b949e;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upload-progress-bar{width:100%;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.upload-progress-fill{height:100%;width:0;background:#58a6ff;border-radius:2px;transition:width .15s}
+.upload-progress-fill.done{background:#3fb950}
+.upload-progress-fill.error{background:#f85149}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -4817,13 +4984,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
-const BASE='/tmux';
+const BASE='__ROOT_PATH__';
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false};return rawState[n]}
 const lastStatus={};
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
@@ -4977,7 +5144,7 @@ function renderDetail(){
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
             oninput="autoGrow(this)"
-            autocomplete="off" spellcheck="false"></textarea>
+            autocomplete="off" spellcheck="true" lang="en"></textarea>
           <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
@@ -5000,7 +5167,7 @@ function renderDetail(){
           placeholder="Type a command and press Enter..."
           onkeydown="handleRawKey(event,'${s.name}')"
           oninput="autoGrow(this)"
-          autocomplete="off" spellcheck="false"></textarea>
+          autocomplete="off" spellcheck="true" lang="en"></textarea>
         <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
@@ -5227,6 +5394,10 @@ function mergeChatMessages(name, serverMsgs){
   chatMessages[name]=merged;
 }
 
+function isChatAtBottom(chatEl){
+  return (chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight)<50;
+}
+
 function appendChatBubble(name,role,text,ts){
   if(!chatMessages[name])chatMessages[name]=[];
   // Avoid duplicate assistant messages
@@ -5244,6 +5415,7 @@ function appendChatBubble(name,role,text,ts){
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
     const chatEl=document.getElementById('chat-'+name);
     if(chatEl){
+      const wasAtBottom=isChatAtBottom(chatEl);
       // Remove typing indicator if present
       const typing=chatEl.querySelector('.chat-typing');
       if(typing)typing.remove();
@@ -5251,7 +5423,8 @@ function appendChatBubble(name,role,text,ts){
       bubble.className='chat-msg '+role;
       bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
       chatEl.appendChild(bubble);
-      chatEl.scrollTop=chatEl.scrollHeight;
+      // Only auto-scroll if user was at bottom or this is their own message
+      if(wasAtBottom||role==='user')chatEl.scrollTop=chatEl.scrollHeight;
     }
   }
 }
@@ -5361,24 +5534,78 @@ function scheduleBusyVerification(name){
   },5000);
 }
 
-async function uploadFile(name,input){
-  if(!input.files||!input.files.length)return;
-  for(const file of input.files){
+// Track which tab triggered the upload so progress shows in the right key bar
+let _uploadTab={};
+
+function _formatSize(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';
+  return (bytes/(1024*1024)).toFixed(1)+' MB';
+}
+
+function _uploadOneFile(name,tab,file){
+  return new Promise(function(resolve){
+    const progWrap=['chat','raw'].map(function(t){return document.getElementById('upload-progress-'+t+'-'+name)});
+    const progName=['chat','raw'].map(function(t){return document.getElementById('upload-progress-name-'+t+'-'+name)});
+    const progFill=['chat','raw'].map(function(t){return document.getElementById('upload-progress-fill-'+t+'-'+name)});
+    // Show progress bars in both tabs
+    progWrap.forEach(function(el){if(el)el.classList.add('active')});
+    progName.forEach(function(el){if(el)el.textContent='Uploading '+file.name+'...'});
+    progFill.forEach(function(el){if(el){el.style.width='0%';el.className='upload-progress-fill'}});
     const fd=new FormData();
     fd.append('file',file);
-    const sizeKb=(file.size/1024).toFixed(1);
-    appendChatBubble(name,'user',`Uploading ${file.name} (${sizeKb} KB)...`,Date.now()/1000);
-    try{
-      const resp=await fetch(BASE+'/api/sessions/'+name+'/upload',{method:'POST',body:fd});
-      const data=await resp.json();
-      if(!resp.ok){
-        appendChatBubble(name,'assistant','Upload failed: '+(data.error||'Unknown error'),Date.now()/1000);
+    const xhr=new XMLHttpRequest();
+    xhr.upload.addEventListener('progress',function(e){
+      if(e.lengthComputable){
+        const pct=Math.round(e.loaded/e.total*100);
+        progFill.forEach(function(el){if(el)el.style.width=pct+'%'});
+        progName.forEach(function(el){if(el)el.textContent='Uploading '+file.name+' ('+pct+'%)'});
       }
-    }catch(e){
+    });
+    xhr.addEventListener('load',function(){
+      if(xhr.status>=200&&xhr.status<300){
+        progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('done')}});
+        progName.forEach(function(el){if(el)el.textContent=file.name+' uploaded'});
+        appendChatBubble(name,'user','Uploaded '+file.name+' ('+_formatSize(file.size)+')',Date.now()/1000);
+      }else{
+        let msg='Upload failed';
+        try{const d=JSON.parse(xhr.responseText);if(d.error)msg+=': '+d.error}catch(e){}
+        progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('error')}});
+        progName.forEach(function(el){if(el)el.textContent=msg});
+        appendChatBubble(name,'assistant',msg,Date.now()/1000);
+      }
+      setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
+      resolve();
+    });
+    xhr.addEventListener('error',function(){
+      progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('error')}});
+      progName.forEach(function(el){if(el)el.textContent='Upload failed: network error'});
       appendChatBubble(name,'assistant','Upload failed: network error',Date.now()/1000);
-    }
+      setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
+      resolve();
+    });
+    xhr.open('POST',BASE+'/api/sessions/'+name+'/upload');
+    xhr.send(fd);
+  });
+}
+
+async function uploadFile(name,input){
+  if(!input.files||!input.files.length)return;
+  const tab=_uploadTab[name]||'chat';
+  for(const file of input.files){
+    await _uploadOneFile(name,tab,file);
   }
-  input.value='';
+  if(input.value!==undefined)input.value='';
+}
+
+function handleDrop(event,name,tab){
+  event.preventDefault();
+  const zone=document.getElementById('dropzone-'+tab+'-'+name);
+  if(zone)zone.classList.remove('drag-over');
+  const files=event.dataTransfer&&event.dataTransfer.files;
+  if(!files||!files.length)return;
+  _uploadTab[name]=tab;
+  uploadFile(name,{files:files});
 }
 
 async function sendCmd(name,source){
@@ -5399,7 +5626,13 @@ async function sendCmd(name,source){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
-    if(source==='raw')setTimeout(()=>pollRawDelta(name),500);
+    delete draftText[source+'-'+name];
+    if(source==='raw'){
+      // User just sent a command — they want to see the output, reset scroll lock
+      const st=getRawState(name);
+      st.userScrolledUp=false;
+      setTimeout(()=>pollRawDelta(name),500);
+    }
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
@@ -5428,18 +5661,34 @@ async function pollRawDelta(name){
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
   if(!rawEl)return;
+  // Track scroll position via user interaction (wheel/touch), not programmatic scroll events
+  if(!rawEl._scrollTracked){
+    rawEl._scrollTracked=true;
+    rawEl.addEventListener('wheel',()=>{
+      setTimeout(()=>{
+        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<80;
+        st.userScrolledUp=!atBottom;
+      },50);
+    },{passive:true});
+    rawEl.addEventListener('touchmove',()=>{
+      setTimeout(()=>{
+        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<80;
+        st.userScrolledUp=!atBottom;
+      },50);
+    },{passive:true});
+  }
   try{
     const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines='+st.knownLines);
     const data=await resp.json();
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      rawEl.style.scrollBehavior='auto';
-      rawEl.scrollTop=rawEl.scrollHeight;
-      rawEl.style.scrollBehavior='';
+      // Only auto-scroll on full load if user hasn't scrolled up
+      if(!st.userScrolledUp){
+        rawEl.scrollTop=rawEl.scrollHeight;
+      }
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
-      const wasAtBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<30;
       const newLines=data.raw.split('\n');
       const curText=rawEl.textContent;
       const existingLines=curText.split('\n');
@@ -5458,12 +5707,20 @@ async function pollRawDelta(name){
           rawEl.textContent=curText+'\n'+toAppend;
         }
       }else{
-        // Overlap did NOT match — content diverged, do a full replace to avoid duplication
-        rawEl.textContent=data.raw;
+        // Overlap did NOT match — content diverged. Do a full reload to get all history
+        st.knownLines=0;
+        const fullResp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines=0');
+        const fullData=await fullResp.json();
+        if(fullData.mode==='full'){
+          rawEl.textContent=fullData.raw||'(empty)';
+          st.knownLines=fullData.pane_total;
+          if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
+        }
       }
+      if(!overlapMatched)return; // already handled above
       st.knownLines=data.pane_total;
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
-      if(wasAtBottom)rawEl.scrollTop=rawEl.scrollHeight;
+      if(!st.userScrolledUp)rawEl.scrollTop=rawEl.scrollHeight;
     }
     // mode==='none': nothing to do
   }catch(e){}
@@ -5472,6 +5729,7 @@ async function pollRawDelta(name){
 async function loadRaw(name){
   const st=getRawState(name);
   st.knownLines=0;
+  st.userScrolledUp=false;
   const rawEl=document.getElementById('raw-'+name);
   if(rawEl)rawEl.textContent='Loading...';
   await pollRawDelta(name);
@@ -6229,7 +6487,19 @@ function buildKeyBar(name,tab){
     <span class="key-bar-label">Opts:</span>
     <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
     <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
+    <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
+    <div class="drop-zone" id="dropzone-${tab}-${name}"
+      ondragover="event.preventDefault();this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="handleDrop(event,'${name}','${tab}')"
+      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">
+      <div class="drop-zone-icon">&#x1F4C2;</div>
+      <div class="drop-zone-text">Drop files here or click to upload</div>
+      <div class="upload-progress" id="upload-progress-${tab}-${name}">
+        <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
+        <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -6561,6 +6831,10 @@ checkClaudeAuth();
 </script>
 </body></html>
 """
+
+# Inject the actual ROOT_PATH into the JS BASE variable
+HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
+LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
