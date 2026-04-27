@@ -4652,7 +4652,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
 .raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto;scroll-behavior:smooth}
+.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
 .raw-output::-webkit-scrollbar{width:6px;height:6px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
@@ -4996,12 +4996,15 @@ const lastStatus={};
 const chatMessages={};
 // Preserve textarea drafts across re-renders
 const draftText={};
+// Cache terminal content + scroll position across session switches
+const rawCache={}; // name -> {text, scrollTop, scrollHeight}
 
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
     sessions.forEach(s=>{
       const el=document.getElementById('cmd-'+tab+'-'+s.name);
-      if(el&&el.value)draftText[tab+'-'+s.name]=el.value;
+      if(!el)return; // element not in DOM — don't touch saved draft
+      if(el.value)draftText[tab+'-'+s.name]=el.value;
       else delete draftText[tab+'-'+s.name];
     });
   });
@@ -5095,8 +5098,18 @@ function renderChatBubbles(name){
     </div>`).join('');
 }
 
+function saveRawCache(){
+  // Save terminal content + scroll position before DOM is destroyed
+  sessions.forEach(s=>{
+    const rawEl=document.getElementById('raw-'+s.name);
+    if(rawEl&&!rawEl.textContent.startsWith('Loading')){
+      rawCache[s.name]={text:rawEl.textContent,scrollTop:rawEl.scrollTop,scrollHeight:rawEl.scrollHeight};
+    }
+  });
+}
 function renderDetail(){
   saveDrafts();
+  saveRawCache();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   const tab=activeTabs[s.name]||'raw';
@@ -5277,8 +5290,17 @@ function renderDetail(){
   stopStatsPolling();
   if(tab==='raw'){
     const rawEl=document.getElementById('raw-'+s.name);
-    if(rawEl&&rawEl.textContent.startsWith('Loading'))loadRaw(s.name);
-    startRawPolling(s.name);
+    if(rawEl){
+      const cached=rawCache[s.name];
+      if(cached){
+        rawEl.textContent=cached.text;
+        rawEl.scrollTop=rawEl.scrollHeight;
+        startRawPolling(s.name);
+      }else{
+        loadRaw(s.name);
+        startRawPolling(s.name);
+      }
+    }
   }
   if(tab==='info')startStatsPolling(s.name);
   if(tab==='skills')loadSkillFiles(s.name);
@@ -5683,16 +5705,12 @@ async function pollRawDelta(name){
     if(data.mode==='full'){
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      // Only auto-scroll on full load if user hasn't scrolled up
-      if(!st.userScrolledUp){
-        rawEl.scrollTop=rawEl.scrollHeight;
-      }
+      rawEl.scrollTop=rawEl.scrollHeight;
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
       const newLines=data.raw.split('\n');
       const curText=rawEl.textContent;
       const existingLines=curText.split('\n');
-      // Deduplicate using overlap — compare last N existing lines with first N new lines
       let appendFrom=0;
       let overlapMatched=false;
       if(data.overlap&&existingLines.length>=data.overlap){
@@ -5701,13 +5719,11 @@ async function pollRawDelta(name){
         if(tail===head){appendFrom=data.overlap;overlapMatched=true}
       }
       if(overlapMatched){
-        // Overlap matched — safe to append only new content
         const toAppend=newLines.slice(appendFrom).join('\n');
         if(toAppend){
           rawEl.textContent=curText+'\n'+toAppend;
         }
       }else{
-        // Overlap did NOT match — content diverged. Do a full reload to get all history
         st.knownLines=0;
         const fullResp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines=0');
         const fullData=await fullResp.json();
@@ -5715,14 +5731,14 @@ async function pollRawDelta(name){
           rawEl.textContent=fullData.raw||'(empty)';
           st.knownLines=fullData.pane_total;
           if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
+          rawEl.scrollTop=rawEl.scrollHeight;
         }
       }
-      if(!overlapMatched)return; // already handled above
+      if(!overlapMatched)return;
       st.knownLines=data.pane_total;
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
       if(!st.userScrolledUp)rawEl.scrollTop=rawEl.scrollHeight;
     }
-    // mode==='none': nothing to do
   }catch(e){}
 }
 
