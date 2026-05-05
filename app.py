@@ -128,6 +128,38 @@ def _load_autonomous_state() -> Dict[str, dict]:
     return {}
 
 
+# --- Simple Watchdog ---
+# Default-ON, lightweight watchdog that auto-replies "continue" when Claude is
+# idle waiting for the user to confirm whether to keep working on the current
+# task. Does NOT take initiative on truly finished work — only resolves the
+# "shall I continue?" pause case. Per-session opt-out persisted to disk.
+SIMPLE_WATCHDOG_DISABLED_FILE = MESSAGES_DIR / "simple-watchdog-disabled.json"
+_simple_watchdog_disabled: set = set()
+# Per-session log of recent "continue" sends, capped at 20 entries.
+_simple_watchdog_log: Dict[str, list] = {}
+# Per-session bookkeeping: {"idle_since": float, "last_action": float, "last_hash": str}
+_simple_watchdog_state: Dict[str, dict] = {}
+
+
+def _save_simple_watchdog_disabled():
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SIMPLE_WATCHDOG_DISABLED_FILE.write_text(json.dumps(sorted(_simple_watchdog_disabled)))
+    except Exception:
+        logger.debug("Failed to save simple-watchdog disabled list", exc_info=True)
+
+
+def _load_simple_watchdog_disabled():
+    global _simple_watchdog_disabled
+    try:
+        if SIMPLE_WATCHDOG_DISABLED_FILE.exists():
+            data = json.loads(SIMPLE_WATCHDOG_DISABLED_FILE.read_text())
+            if isinstance(data, list):
+                _simple_watchdog_disabled = set(data)
+    except Exception:
+        logger.debug("Failed to load simple-watchdog disabled list", exc_info=True)
+
+
 def _is_claude_running(session_name: str) -> bool:
     """Check if Claude Code process is running in the session (not just a bare shell).
 
@@ -222,12 +254,22 @@ async def lifespan(_app: FastAPI):
                        "Set a persistent secret for stable sessions.")
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
+    # Auto-responder: presses Enter ONLY when the visible pane shows a
+    # Claude Code selection prompt with ❯ directly on a numbered option.
+    # The detection refuses to fire when ❯ is followed by free text — that
+    # is the user input box and Enter would submit it (the "phantom
+    # message" bug). Approves plan/permission prompts hands-free.
     task = asyncio.create_task(_auto_responder_loop())
     _background_tasks.append(task)
     logger.info("Auto-responder background task started")
     watchdog_task = asyncio.create_task(_watchdog_loop())
     _background_tasks.append(watchdog_task)
     logger.info("Autonomous mode watchdog started")
+
+    _load_simple_watchdog_disabled()
+    simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
+    _background_tasks.append(simple_watchdog_task)
+    logger.info("Simple watchdog started (disabled for %d sessions)", len(_simple_watchdog_disabled))
 
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
@@ -766,8 +808,8 @@ def _detect_activity_raw(session_name: str) -> dict:
         except Exception:
             visible = ""
 
-        # Auto-approve plan/permission prompts
-        _check_auto_approve(session_name, visible)
+        # Auto-approve disabled: never type/select on the user's behalf.
+        # _check_auto_approve(session_name, visible)
 
         all_lines = visible.split("\n")
         # Strip trailing empty lines to find the real bottom
@@ -1411,6 +1453,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
         "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
         "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
         "model": _get_session_model(sess["name"]),
     }
 
@@ -1471,6 +1514,7 @@ async def api_sessions_fast():
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
             "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
             "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
             "model": _get_session_model(sess["name"]),
         })
     return JSONResponse(out)
@@ -1513,6 +1557,7 @@ async def api_status():
             "activity_detail": activity["detail"],
             "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
             "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
+        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
             "model": _get_session_model(sess["name"]),
         })
     return JSONResponse(out)
@@ -1536,15 +1581,40 @@ async def api_raw_output(session_name: str):
     })
 
 
+def _visible_pane_hash(session_name: str) -> str:
+    """Cheap fingerprint of the visible tmux pane (alternate-screen aware).
+
+    capture-pane without -S only returns the visible area, which Claude Code
+    redraws into via its TUI even when history_size never grows. We hash that
+    so the client can detect TUI redraws as content changes.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            return hashlib.md5(result.stdout.encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        logger.debug("Failed to hash visible pane for '%s'", session_name, exc_info=True)
+    return ""
+
+
 @app.get("/api/sessions/{session_name}/raw-tail")
-async def api_raw_tail(session_name: str, known_lines: int = 0):
-    """Return delta output since the client's last known line count."""
+async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str = ""):
+    """Return delta output since the client's last known line count.
+
+    Also detects in-place TUI redraws (Claude Code's alternate screen) by
+    hashing the visible pane — a hash mismatch forces a full capture even when
+    scrollback length is unchanged.
+    """
     _, found = _find_session(session_name)
     if not found:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
     pos = await asyncio.to_thread(get_pane_position, session_name)
     current_total = pos["total_lines"]
+    vis_hash = await asyncio.to_thread(_visible_pane_hash, session_name)
 
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
@@ -1554,14 +1624,25 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
             "raw": raw,
             "total_lines": len(raw.split("\n")),
             "pane_total": current_total,
+            "visible_hash": vis_hash,
         })
 
-    # No new content
+    # No scrollback growth, but visible content changed (TUI redraw) → full
     if current_total <= known_lines:
+        if last_hash and vis_hash and last_hash != vis_hash:
+            raw = await asyncio.to_thread(capture_pane_full, session_name)
+            return JSONResponse({
+                "mode": "full",
+                "raw": raw,
+                "total_lines": len(raw.split("\n")),
+                "pane_total": current_total,
+                "visible_hash": vis_hash,
+            })
         return JSONResponse({
             "mode": "none",
             "total_lines": known_lines,
             "pane_total": current_total,
+            "visible_hash": vis_hash,
         })
 
     # Delta: capture only the new lines + small overlap for dedup
@@ -1574,6 +1655,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0):
         "total_lines": current_total,
         "pane_total": current_total,
         "overlap": overlap,
+        "visible_hash": vis_hash,
     })
 
 
@@ -1703,6 +1785,11 @@ async def api_delete_session(session_name: str):
         if gn_state.get("task") and not gn_state["task"].done():
             gn_state["task"].cancel()
         _go_nuts_state.pop(session_name, None)
+        _simple_watchdog_state.pop(session_name, None)
+        _simple_watchdog_log.pop(session_name, None)
+        if session_name in _simple_watchdog_disabled:
+            _simple_watchdog_disabled.discard(session_name)
+            _save_simple_watchdog_disabled()
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -1764,6 +1851,51 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
         entry["messages"].append({"role": "user", "text": note, "ts": now})
         _save_messages()
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/sessions/{session_name}/uploads")
+async def api_list_uploads(session_name: str):
+    """List previously uploaded files for a session (newest first)."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    uploads_dir = UPLOADS_DIR / session_name
+    files = []
+    if uploads_dir.exists():
+        for entry in uploads_dir.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                st = entry.stat()
+                files.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+            except Exception:
+                continue
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+    return JSONResponse({"files": files})
+
+
+@app.delete("/api/sessions/{session_name}/uploads/{filename}")
+async def api_delete_upload(session_name: str, filename: str):
+    """Remove a previously uploaded file from the session uploads dir."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name.startswith("."):
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    target = UPLOADS_DIR / session_name / safe_name
+    try:
+        if target.exists() and target.is_file():
+            target.unlink()
+            return JSONResponse({"ok": True})
+        return JSONResponse({"error": "File not found"}, status_code=404)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -2976,6 +3108,12 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     """Check if visible terminal shows a Claude Code interactive prompt.
 
     Returns a description of the detected prompt, or None.
+
+    SAFETY: We require the ❯ cursor to sit DIRECTLY on a numbered option
+    line (e.g. "❯ 1. Yes"). If ❯ is followed by free text (e.g.
+    "❯ test it in the browser") that is the user input prompt, not a
+    selection — Enter would submit that text instead of selecting an option,
+    which is the "phantom message" bug we must avoid.
     """
     lines = visible_text.strip().split("\n")
     last_25 = lines[-25:]
@@ -2988,12 +3126,21 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     # Count lines that look like numbered options: "  1. text" or "❯ 1. text"
     numbered = 0
     has_selector_on_option = False
+    selector_followed_by_text = False
     for line in last_25:
         stripped = line.strip()
         if re.match(r"^[❯\u276f\s]*\d+\.\s", stripped):
             numbered += 1
         if re.match(r"^❯\s*\d+\.", stripped) or re.match(r"^\u276f\s*\d+\.", stripped):
             has_selector_on_option = True
+        # ❯ followed by non-numeric text = user input prompt with text waiting.
+        # Enter on this would submit that text — never auto-fire here.
+        if re.match(r"^[❯\u276f]\s+\S", stripped) and not re.match(r"^[❯\u276f]\s*\d+\.", stripped):
+            selector_followed_by_text = True
+
+    # Bail if cursor is in the user input box with text waiting.
+    if selector_followed_by_text and not has_selector_on_option:
+        return None
 
     # Strong signal: specific Claude Code prompt keywords
     strong_keywords = [
@@ -3001,13 +3148,13 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
         "manually approve edits",
         "shift+tab to approve",
         "Would you like to proceed",
-        "Tell Claude what to change",
         "approve with this feedback",
     ]
     has_strong = any(kw in text for kw in strong_keywords)
 
-    # Plan approval or known prompt pattern
-    if has_strong and numbered >= 2:
+    # Plan approval / permission prompt — keyword AND cursor on a numbered
+    # option, so Enter selects an option and never submits free text.
+    if has_strong and has_selector_on_option and numbered >= 2:
         return "plan_approval"
 
     # Generic Claude Code selection prompt: ❯ on a numbered option + 2+ options
@@ -3067,6 +3214,210 @@ async def _auto_responder_loop():
 async def api_auto_respond_log():
     """Recent auto-respond events for debugging."""
     return JSONResponse(_auto_respond_log[-20:])
+
+
+# --- Simple Watchdog Loop ---
+# Lightweight always-on supervisor. When a session sits idle with Claude having
+# offered to continue / paused for confirmation (e.g. "Pause me here if you
+# want…", "shall I proceed?", "Next: I'll do X"), we send "continue" so work
+# keeps moving without the user babysitting. Conservative: only fires when the
+# LLM is confident the agent is paused awaiting a yes/continue, never on
+# genuinely finished work or open-ended questions needing a real answer.
+
+_SIMPLE_WATCHDOG_INTERVAL = 20          # poll every 20s
+_SIMPLE_WATCHDOG_IDLE_SECS = 45         # idle this long before considering action
+_SIMPLE_WATCHDOG_COOLDOWN = 180         # min seconds between "continue" sends per session
+_SIMPLE_WATCHDOG_MAX_LOG = 20
+
+_SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
+    "You are monitoring a Claude Code terminal session. The user is away. "
+    "Decide whether the agent has paused mid-task and is waiting for the user to "
+    "say 'continue' / confirm before proceeding with work it already announced.\n\n"
+    "Reply CONTINUE only when ALL of these hold:\n"
+    "- The agent stated the next step it intends to take (e.g. 'Next: I'll do X', "
+    "  'Proceeding to Phase 2', 'Shall I continue?', 'Pause me here if you want...').\n"
+    "- The agent is now idle, not actively running tools.\n"
+    "- The next step is a direct continuation of the same task — not a fork that "
+    "  needs user judgment (e.g. 'which option do you prefer A or B?').\n\n"
+    "Reply WAIT in any of these cases:\n"
+    "- The agent finished the task and there is no announced next step.\n"
+    "- The agent is asking a substantive question that needs a real answer.\n"
+    "- The terminal shows a permission/selection prompt with numbered options.\n"
+    "- The agent is actively working (spinner, 'esc to interrupt', tool output streaming).\n"
+    "- You can't tell — default to WAIT.\n\n"
+    "Reply with EXACTLY one word: CONTINUE or WAIT."
+)
+
+
+def _simple_watchdog_record(session_name: str, action: str):
+    log = _simple_watchdog_log.setdefault(session_name, [])
+    log.append({"ts": time.time(), "action": action})
+    if len(log) > _SIMPLE_WATCHDOG_MAX_LOG:
+        del log[:-_SIMPLE_WATCHDOG_MAX_LOG]
+
+
+async def _simple_watchdog_send_continue(session_name: str) -> bool:
+    """Send 'continue' to the session's Claude Code prompt. Returns True on send."""
+    try:
+        # Type the word and press Enter. tmux send-keys handles literal text.
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "continue", "Enter"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return True
+    except Exception as e:
+        logger.debug("simple watchdog: failed to send continue to '%s': %s", session_name, e)
+        return False
+
+
+async def _simple_watchdog_loop():
+    """Background loop: nudge sessions that are paused waiting for 'continue'."""
+    slog = logging.getLogger("simple-watchdog")
+    await asyncio.sleep(8)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_SIMPLE_WATCHDOG_INTERVAL)
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            now = time.time()
+            for sess in sessions_list:
+                name = sess["name"]
+                # Per-session opt-out
+                if name in _simple_watchdog_disabled:
+                    _simple_watchdog_state.pop(name, None)
+                    continue
+                # Don't fight the autonomous-mode watchdog — those modes have their own loop
+                if _away_mode_state.get(name, {}).get("enabled"):
+                    continue
+                if _go_nuts_state.get(name, {}).get("enabled"):
+                    continue
+                # Don't fire if Claude isn't even running
+                if not await _async_is_claude_running(name):
+                    _simple_watchdog_state.pop(name, None)
+                    continue
+                # Cooldown
+                state = _simple_watchdog_state.setdefault(name, {})
+                last_action = state.get("last_action", 0)
+                if now - last_action < _SIMPLE_WATCHDOG_COOLDOWN:
+                    continue
+                # Activity must be idle
+                try:
+                    activity = await async_detect_activity(name)
+                except Exception:
+                    continue
+                if activity.get("status") != "idle":
+                    state["idle_since"] = 0
+                    continue
+                # Capture the visible pane to inspect the prompt area
+                try:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if vis.returncode != 0:
+                        continue
+                    visible = vis.stdout
+                except Exception:
+                    continue
+                # Skip if there's an interactive selection prompt — auto-responder owns it
+                if _detect_interactive_prompt(visible):
+                    continue
+                # Skip if user has typed something into the prompt box (don't clobber)
+                if _has_pending_user_input(visible):
+                    continue
+                # Track stable-idle duration
+                content_hash = hashlib.md5(visible.encode()).hexdigest()
+                if state.get("last_hash") != content_hash:
+                    state["last_hash"] = content_hash
+                    state["idle_since"] = now
+                    continue
+                idle_for = now - state.get("idle_since", now)
+                if idle_for < _SIMPLE_WATCHDOG_IDLE_SECS:
+                    continue
+                # Capture more context for the LLM (last ~60 lines)
+                recent = await asyncio.to_thread(capture_pane_recent, name, 60)
+                if not recent.strip():
+                    continue
+                try:
+                    verdict = await llm_call(
+                        system_prompt=_SIMPLE_WATCHDOG_SYSTEM_PROMPT,
+                        user_content=f"Session '{name}' terminal (last 60 lines):\n\n{recent[-4000:]}",
+                        max_tokens=4,
+                    )
+                except Exception:
+                    continue
+                verdict = (verdict or "").strip().upper()
+                if "CONTINUE" not in verdict:
+                    continue
+                # One more guard: re-check Claude is still running before sending
+                if not await _async_is_claude_running(name):
+                    continue
+                ok = await _simple_watchdog_send_continue(name)
+                if ok:
+                    state["last_action"] = now
+                    state["idle_since"] = now
+                    _simple_watchdog_record(name, f"sent 'continue' (idle {int(idle_for)}s)")
+                    slog.info("Simple watchdog sent 'continue' to '%s' after %ds idle", name, int(idle_for))
+        except asyncio.CancelledError:
+            slog.info("Simple watchdog cancelled")
+            raise
+        except Exception:
+            logger.debug("Simple watchdog iteration failed", exc_info=True)
+
+
+def _has_pending_user_input(visible: str) -> bool:
+    """True if the visible pane shows the ❯ user-input box with text already typed.
+
+    Pattern: a line like '❯ some text the user is typing'. We must NOT send
+    'continue' in that case — it would concatenate or submit the user's draft.
+    Empty input (just '❯' or '❯ ') is fine.
+    """
+    for line in visible.split("\n")[-20:]:
+        m = re.search(r"❯\s+(\S.*)", line)
+        if not m:
+            continue
+        tail = m.group(1).strip()
+        # Numbered selection lines like "❯ 1. Yes" are handled by the auto-responder
+        if re.match(r"^\d+\.", tail):
+            continue
+        # Trailing box-drawing chars are not real input
+        tail = tail.rstrip("│ \t")
+        if tail:
+            return True
+    return False
+
+
+@app.get("/api/sessions/{session_name}/simple-watchdog")
+async def api_simple_watchdog_status(session_name: str):
+    """Return per-session simple-watchdog state."""
+    enabled = session_name not in _simple_watchdog_disabled
+    return JSONResponse({
+        "enabled": enabled,
+        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+    })
+
+
+class SimpleWatchdogBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/sessions/{session_name}/simple-watchdog")
+async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody):
+    """Enable/disable the simple watchdog for a session. Default is enabled."""
+    if body.enabled:
+        if session_name in _simple_watchdog_disabled:
+            _simple_watchdog_disabled.discard(session_name)
+            _save_simple_watchdog_disabled()
+    else:
+        if session_name not in _simple_watchdog_disabled:
+            _simple_watchdog_disabled.add(session_name)
+            _save_simple_watchdog_disabled()
+        _simple_watchdog_state.pop(session_name, None)
+    return JSONResponse({
+        "enabled": session_name not in _simple_watchdog_disabled,
+        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+    })
 
 
 # --- Autonomous Mode Watchdog ---
@@ -4694,6 +5045,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .upload-progress-fill{height:100%;width:0;background:#58a6ff;border-radius:2px;transition:width .15s}
 .upload-progress-fill.done{background:#3fb950}
 .upload-progress-fill.error{background:#f85149}
+.uploaded-files{width:100%;margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.uploaded-files-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;text-align:left}
+.uploaded-file{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#0d1117;border:1px solid #21262d;border-radius:4px;font-size:.7rem;font-family:'SF Mono','Fira Code',Consolas,monospace;color:#c9d1d9;text-align:left;overflow:hidden}
+.uploaded-file:hover{border-color:#30363d}
+.uploaded-file-icon{flex-shrink:0;opacity:.7}
+.uploaded-file-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.uploaded-file-size{flex-shrink:0;color:#6e7681;font-size:.65rem}
+.uploaded-file-btn{flex-shrink:0;padding:2px 6px;font-size:.65rem;background:#21262d;border:1px solid #30363d;border-radius:3px;color:#8b949e;cursor:pointer}
+.uploaded-file-btn:hover{background:#30363d;color:#c9d1d9}
+.uploaded-file-btn.copied{background:#238636;border-color:#238636;color:#fff}
+.uploaded-file-btn.delete:hover{background:#da3633;border-color:#da3633;color:#fff}
 
 /* Info tab */
 .tab-info{padding-top:20px}
@@ -4751,6 +5113,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .gonuts-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
 .gonuts-toggle input:checked+.gonuts-toggle-slider{background:#da3633}
 .gonuts-toggle input:checked+.gonuts-toggle-slider:before{transform:translateX(20px);background:#fff}
+.watchdog-toggle{position:relative;display:inline-block;width:44px;height:24px}
+.watchdog-toggle input{opacity:0;width:0;height:0}
+.watchdog-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
+.watchdog-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
+.watchdog-toggle input:checked+.watchdog-toggle-slider{background:#238636}
+.watchdog-toggle input:checked+.watchdog-toggle-slider:before{transform:translateX(20px);background:#fff}
+.watchdog-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:120px;overflow-y:auto;scrollbar-width:thin}
+.watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
+.watchdog-log-entry .watchdog-ts{color:#56d364}
 .gonuts-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
 .gonuts-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
 .gonuts-log-entry .gonuts-ts{color:#f0883e}
@@ -4990,7 +5361,7 @@ let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true};return rawState[n]}
 const lastStatus={};
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
@@ -5172,7 +5543,7 @@ function renderDetail(){
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading terminal output...</div>
+      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
@@ -5240,6 +5611,20 @@ function renderDetail(){
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
       </div>
+      <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#56d364"></span>Simple Watchdog</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label class="watchdog-toggle">
+            <input type="checkbox" id="watchdog-toggle-${s.name}"
+              onchange="toggleSimpleWatchdog('${esc(s.name)}',this.checked)"
+              ${s.simple_watchdog!==false?'checked':''}>
+            <span class="watchdog-toggle-slider"></span>
+          </label>
+          <span id="watchdog-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.simple_watchdog!==false?'Watching':'Off'}</span>
+        </div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Claude is paused waiting for confirmation to keep going on the current task.</div>
+        <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
+      </div>
       <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
@@ -5282,6 +5667,8 @@ function renderDetail(){
 
   // Restore draft text in textareas
   restoreDrafts();
+  // Populate the uploaded-files list under the upload area
+  refreshUploadedFiles(s.name);
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
@@ -5302,7 +5689,11 @@ function renderDetail(){
       }
     }
   }
-  if(tab==='info')startStatsPolling(s.name);
+  if(tab==='info'){
+    startStatsPolling(s.name);
+    if(s.simple_watchdog!==false)startWatchdogPolling(s.name);
+    else loadWatchdogStatus(s.name);
+  }
   if(tab==='skills')loadSkillFiles(s.name);
 }
 
@@ -5340,6 +5731,7 @@ function switchTab(name,tab){
   stopStatsPolling();
   stopAllAwayPolling();
   stopAllGoNutsPolling();
+  stopAllWatchdogPolling();
   if(tab==='raw')startRawPolling(name);
   if(tab==='info'){
     startStatsPolling(name);
@@ -5348,6 +5740,8 @@ function switchTab(name,tab){
     else loadAwayStatus(name);
     if(s&&s.go_nuts_mode)startGoNutsPolling(name);
     else loadGoNutsStatus(name);
+    if(s&&s.simple_watchdog!==false)startWatchdogPolling(name);
+    else loadWatchdogStatus(name);
   }
   if(tab==='skills')loadSkillFiles(name);
   if(tab==='chat'){
@@ -5589,6 +5983,7 @@ function _uploadOneFile(name,tab,file){
         progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('done')}});
         progName.forEach(function(el){if(el)el.textContent=file.name+' uploaded'});
         appendChatBubble(name,'user','Uploaded '+file.name+' ('+_formatSize(file.size)+')',Date.now()/1000);
+        refreshUploadedFiles(name);
       }else{
         let msg='Upload failed';
         try{const d=JSON.parse(xhr.responseText);if(d.error)msg+=': '+d.error}catch(e){}
@@ -5667,7 +6062,17 @@ function startRawPolling(name){
   if(st.polling)return;
   st.polling=true;
   pollRawDelta(name);
-  st.timer=setInterval(()=>pollRawDelta(name),1000);
+  // Poll fast (300ms) for the first ~6s while Claude Code's TUI is booting,
+  // then drop to 1s steady-state polling.
+  let ticks=0;
+  st.timer=setInterval(()=>{
+    pollRawDelta(name);
+    ticks++;
+    if(ticks===20){ // ~6s of fast polling
+      clearInterval(st.timer);
+      st.timer=setInterval(()=>pollRawDelta(name),1000);
+    }
+  },300);
 }
 function stopRawPolling(name){
   const st=getRawState(name);
@@ -5700,12 +6105,18 @@ async function pollRawDelta(name){
     },{passive:true});
   }
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines='+st.knownLines);
+    const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'');
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail'+q);
     const data=await resp.json();
+    if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(data.mode==='full'){
+      // When user has scrolled up, preserve distance from bottom across content replacement
+      const distFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
       rawEl.textContent=data.raw||'(empty)';
       st.knownLines=data.pane_total;
-      rawEl.scrollTop=rawEl.scrollHeight;
+      st.firstLoad=false;
+      if(st.userScrolledUp){rawEl.scrollTop=rawEl.scrollHeight-distFromBottom}
+      else{rawEl.scrollTop=rawEl.scrollHeight}
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
       const newLines=data.raw.split('\n');
@@ -5724,6 +6135,7 @@ async function pollRawDelta(name){
           rawEl.textContent=curText+'\n'+toAppend;
         }
       }else{
+        const distFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
         st.knownLines=0;
         const fullResp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines=0');
         const fullData=await fullResp.json();
@@ -5731,7 +6143,8 @@ async function pollRawDelta(name){
           rawEl.textContent=fullData.raw||'(empty)';
           st.knownLines=fullData.pane_total;
           if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
-          rawEl.scrollTop=rawEl.scrollHeight;
+          if(st.userScrolledUp){rawEl.scrollTop=rawEl.scrollHeight-distFromBottom}
+          else{rawEl.scrollTop=rawEl.scrollHeight}
         }
       }
       if(!overlapMatched)return;
@@ -5746,8 +6159,10 @@ async function loadRaw(name){
   const st=getRawState(name);
   st.knownLines=0;
   st.userScrolledUp=false;
+  st.visibleHash='';
+  st.firstLoad=true;
   const rawEl=document.getElementById('raw-'+name);
-  if(rawEl)rawEl.textContent='Loading...';
+  if(rawEl)rawEl.textContent='Loading Claude Code...';
   await pollRawDelta(name);
 }
 
@@ -6465,6 +6880,65 @@ async function loadGoNutsStatus(name){
   }catch(e){}
 }
 
+// ── Simple Watchdog ──
+let _watchdogTimers={};
+async function toggleSimpleWatchdog(name,enabled){
+  const statusEl=document.getElementById('watchdog-status-'+name);
+  if(statusEl)statusEl.textContent=enabled?'Enabling...':'Disabling...';
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/simple-watchdog',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:enabled})
+    });
+    const data=await resp.json();
+    if(resp.ok){
+      const idx=sessions.findIndex(s=>s.name===name);
+      if(idx>=0)sessions[idx].simple_watchdog=data.enabled;
+      if(statusEl)statusEl.textContent=data.enabled?'Watching':'Off';
+      if(data.enabled)startWatchdogPolling(name);
+      else stopWatchdogPolling(name);
+    }else{
+      if(statusEl)statusEl.textContent='Failed';
+      const tog=document.getElementById('watchdog-toggle-'+name);
+      if(tog)tog.checked=!enabled;
+    }
+  }catch(e){
+    if(statusEl)statusEl.textContent='Error';
+    const tog=document.getElementById('watchdog-toggle-'+name);
+    if(tog)tog.checked=!enabled;
+  }
+}
+function startWatchdogPolling(name){
+  stopWatchdogPolling(name);
+  loadWatchdogStatus(name);
+  _watchdogTimers[name]=setInterval(()=>loadWatchdogStatus(name),15000);
+}
+function stopWatchdogPolling(name){
+  if(_watchdogTimers[name]){clearInterval(_watchdogTimers[name]);delete _watchdogTimers[name];}
+}
+function stopAllWatchdogPolling(){
+  Object.keys(_watchdogTimers).forEach(n=>stopWatchdogPolling(n));
+}
+async function loadWatchdogStatus(name){
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/simple-watchdog');
+    const data=await resp.json();
+    const statusEl=document.getElementById('watchdog-status-'+name);
+    const logEl=document.getElementById('watchdog-log-'+name);
+    const tog=document.getElementById('watchdog-toggle-'+name);
+    if(tog)tog.checked=!!data.enabled;
+    if(statusEl)statusEl.textContent=data.enabled?'Watching':'Off';
+    if(logEl&&data.log&&data.log.length){
+      logEl.innerHTML=data.log.slice(-10).map(e=>
+        '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
+      ).join('');
+      logEl.scrollTop=logEl.scrollHeight;
+    }
+    const idx=sessions.findIndex(s=>s.name===name);
+    if(idx>=0)sessions[idx].simple_watchdog=data.enabled;
+  }catch(e){}
+}
+
 // ── Key Bar + Slash Commands ──
 function buildKeyBar(name,tab){
   const id='keybar-'+tab+'-'+name;
@@ -6516,7 +6990,68 @@ function buildKeyBar(name,tab){
         <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
       </div>
     </div>
+    <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
   </div>`;
+}
+
+function _formatUploadSize(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';
+  return (bytes/(1024*1024)).toFixed(1)+' MB';
+}
+
+async function refreshUploadedFiles(name){
+  let files=[];
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/uploads');
+    if(resp.ok){const data=await resp.json();files=data.files||[]}
+  }catch(e){return}
+  ['chat','raw'].forEach(function(tab){
+    const container=document.getElementById('uploaded-files-'+tab+'-'+name);
+    if(!container)return;
+    if(!files.length){container.innerHTML='';return}
+    const rows=files.map(function(f){
+      const safePath=esc(f.path);
+      const safeName=esc(f.name);
+      return '<div class="uploaded-file" title="'+safePath+'">'
+        +'<span class="uploaded-file-icon">&#x1F4C4;</span>'
+        +'<span class="uploaded-file-name">'+safeName+'</span>'
+        +'<span class="uploaded-file-size">'+_formatUploadSize(f.size)+'</span>'
+        +'<button class="uploaded-file-btn" onclick="copyUploadPath(this,\''+encodeURIComponent(f.path)+'\')" title="Copy path">Copy path</button>'
+        +'<button class="uploaded-file-btn delete" onclick="deleteUploadedFile(\''+esc(name)+'\',\''+encodeURIComponent(f.name)+'\')" title="Remove">&#x2715;</button>'
+        +'</div>';
+    }).join('');
+    container.innerHTML='<div class="uploaded-files-label">Uploaded files</div>'+rows;
+  });
+}
+
+function copyUploadPath(btn,encodedPath){
+  const path=decodeURIComponent(encodedPath);
+  const done=function(){
+    const orig=btn.textContent;
+    btn.textContent='Copied';
+    btn.classList.add('copied');
+    setTimeout(function(){btn.textContent=orig;btn.classList.remove('copied')},1200);
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(path).then(done).catch(function(){
+      const ta=document.createElement('textarea');ta.value=path;document.body.appendChild(ta);ta.select();
+      try{document.execCommand('copy')}catch(e){}
+      document.body.removeChild(ta);done();
+    });
+  }else{
+    const ta=document.createElement('textarea');ta.value=path;document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')}catch(e){}
+    document.body.removeChild(ta);done();
+  }
+}
+
+async function deleteUploadedFile(name,encodedFilename){
+  const filename=decodeURIComponent(encodedFilename);
+  try{
+    await fetch(BASE+'/api/sessions/'+name+'/uploads/'+encodeURIComponent(filename),{method:'DELETE'});
+  }catch(e){}
+  refreshUploadedFiles(name);
 }
 
 function toggleKeyBar(barId,toggleEl){
