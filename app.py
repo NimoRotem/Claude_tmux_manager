@@ -10,20 +10,21 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Dict
+from typing import Dict, Optional
 import glob as globmod
 
 logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
 from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from pydantic import BaseModel
 import openai
 import uvicorn
@@ -206,6 +207,15 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
         log_fn(state, msg)
 
     try:
+        # Re-export the active profile's CLAUDE_CONFIG_DIR before launching, in
+        # case the shell was respawned (env vars don't survive a fresh bash).
+        try:
+            pid = _get_session_profile_id(session_name)
+            if pid != DEFAULT_PROFILE_ID:
+                await asyncio.to_thread(_send_profile_export, session_name, pid)
+                await asyncio.sleep(0.2)
+        except Exception:
+            logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
         # Send claude command to the bare shell
         await asyncio.to_thread(subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "claude --dangerously-skip-permissions", "Enter"],
@@ -420,6 +430,9 @@ async def auth_middleware(request: Request, call_next):
     rp = request.scope.get("root_path", "")
     if path in ("/login", "/login/", rp + "/login", rp + "/login/"):
         return await call_next(request)
+    # Allow qa-output files without auth
+    if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
+        return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
         resp = HTMLResponse(LOGIN_PAGE)
@@ -466,6 +479,18 @@ async def do_login(request: Request):
         resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
         return resp
     return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+
+
+QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
+
+@app.get("/qa-output/{filepath:path}")
+async def serve_qa_output(filepath: str):
+    target = (QA_OUTPUT_DIR / filepath).resolve()
+    if not str(target).startswith(str(QA_OUTPUT_DIR.resolve())):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if not target.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(str(target))
 
 
 # Three-tier cache per session
@@ -1058,7 +1083,11 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200)
     except Exception as e:
         duration = time.time() - start
         logger.error("LLM call failed after %.1fs: %s", duration, e)
-        return f"(error: {e})"
+        # Return empty string (not the error text) so callers don't cache the
+        # error as content. Downstream keyword checks (`"CONTINUE" not in ...`,
+        # `"LEGITIMATE" in ...`) treat empty as a no-op, which is the right
+        # fail-safe behavior.
+        return ""
 
 
 async def get_title_and_description(session_name: str, full_output: str) -> tuple:
@@ -1322,6 +1351,26 @@ async def get_realtime(session_name: str) -> str:
     )
 
 
+def _output_signature(text: str) -> str:
+    """Normalized hash of terminal output, used to skip LLM re-summarization when
+    the output hasn't meaningfully changed. Insensitive to trailing whitespace
+    and runs of blank lines (those flap a lot during spinners / redraws)."""
+    if not text:
+        return ""
+    out = []
+    blank = False
+    for ln in text.split("\n"):
+        ln = ln.rstrip()
+        if not ln:
+            if not blank:
+                out.append("")
+            blank = True
+        else:
+            out.append(ln)
+            blank = False
+    return hashlib.sha256("\n".join(out).encode("utf-8", "replace")).hexdigest()
+
+
 async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     now = time.time()
     # IMPORTANT: use setdefault so `entry` is the SAME object as cache[session_name].
@@ -1334,13 +1383,38 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     if "notes" not in entry:
         entry["notes"] = _load_session_notes(session_name)
 
-    need_description = force_all or "description" not in entry
-    need_progress = force_all or "progress" not in entry or (now - entry.get("progress_at", 0)) >= PROGRESS_TTL
-    need_notes = force_all or "notes" not in entry or (now - entry.get("notes_at", 0)) >= NOTES_TTL
+    has_description = "description" in entry
+    has_progress = "progress" in entry
+    has_notes = "notes" in entry
+    progress_ttl_expired = (now - entry.get("progress_at", 0)) >= PROGRESS_TTL
+    notes_ttl_expired = (now - entry.get("notes_at", 0)) >= NOTES_TTL
 
+    # Capture pane up front when any task might fire, so we can compare a
+    # content signature against the last successful summary and skip the LLM
+    # call when nothing has actually changed. Capture is a cheap subprocess
+    # call relative to an OpenAI request.
     full_output = None
-    if need_description or need_progress or need_notes:
+    sig = ""
+    might_need = force_all or (
+        not has_description
+        or not has_progress or progress_ttl_expired
+        or not has_notes or notes_ttl_expired
+    )
+    if might_need:
         full_output = capture_pane_full(session_name)
+        sig = _output_signature(full_output)
+
+    # Staleness gate: skip the LLM call when the captured output hasn't changed
+    # since the last successful summary. Force / missing cache still bypass.
+    need_description = force_all or not has_description or (
+        bool(sig) and entry.get("description_sig") != sig
+    )
+    need_progress = force_all or not has_progress or (
+        progress_ttl_expired and bool(sig) and entry.get("progress_sig") != sig
+    )
+    need_notes = force_all or not has_notes or (
+        notes_ttl_expired and bool(sig) and entry.get("notes_sig") != sig
+    )
 
     tasks = {}
     if need_description:
@@ -1357,19 +1431,32 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         result_map = dict(zip(tasks.keys(), results))
         if "title_desc" in result_map:
             title, description = result_map["title_desc"]
-            entry["title"] = title
-            entry["description"] = description
-            entry["description_at"] = now
+            # Only commit if at least one of the parallel calls succeeded.
+            # Empty strings come from llm_call's error path -- preserve prior
+            # cached value (and don't update sig, so we'll retry next round).
+            if (title and title.strip()) or (description and description.strip()):
+                entry["title"] = title or entry.get("title", "")
+                entry["description"] = description or entry.get("description", "")
+                entry["description_at"] = now
+                entry["description_sig"] = sig
         if "progress" in result_map:
-            entry["progress"] = result_map["progress"]
-            entry["progress_at"] = now
+            progress = result_map["progress"]
+            if progress and progress.strip():
+                entry["progress"] = progress
+                entry["progress_at"] = now
+                entry["progress_sig"] = sig
         if "notes" in result_map:
-            entry["notes"] = result_map["notes"]
-            entry["notes_at"] = now
+            notes = result_map["notes"]
+            if notes and notes.strip():
+                entry["notes"] = notes
+                entry["notes_at"] = now
+                entry["notes_sig"] = sig
         if "realtime" in result_map:
-            entry["realtime"] = result_map["realtime"]
-            entry["realtime_at"] = now
-            _append_assistant_msg(entry, result_map["realtime"], now)
+            realtime = result_map["realtime"]
+            if realtime and realtime.strip():
+                entry["realtime"] = realtime
+                entry["realtime_at"] = now
+                _append_assistant_msg(entry, realtime, now)
 
     cache[session_name] = entry
     if entry.get("messages"):
@@ -1455,6 +1542,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
         "model": _get_session_model(sess["name"]),
+        "profile_id": _get_session_profile_id(sess["name"]),
     }
 
 
@@ -1516,6 +1604,7 @@ async def api_sessions_fast():
             "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
             "model": _get_session_model(sess["name"]),
+            "profile_id": _get_session_profile_id(sess["name"]),
         })
     return JSONResponse(out)
 
@@ -1661,6 +1750,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 
 class CreateSession(BaseModel):
     name: str = ""
+    profile_id: str = ""
 
 
 @app.post("/api/sessions/create")
@@ -1701,6 +1791,16 @@ async def api_create_session(body: CreateSession):
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
+        # Apply profile (CLAUDE_CONFIG_DIR) if requested
+        requested_profile = (body.profile_id or "").strip() or DEFAULT_PROFILE_ID
+        if requested_profile != DEFAULT_PROFILE_ID:
+            roles = _load_roles()
+            if _find_profile(requested_profile, roles):
+                roles["session_profiles"][created] = requested_profile
+                _save_roles(roles)
+                _send_profile_export(created, requested_profile)
+            else:
+                logger.warning("Unknown profile_id '%s' on session create", requested_profile)
         # Optionally launch a command in the new session
         if NEW_SESSION_CMD:
             subprocess.run(
@@ -1790,6 +1890,15 @@ async def api_delete_session(session_name: str):
         if session_name in _simple_watchdog_disabled:
             _simple_watchdog_disabled.discard(session_name)
             _save_simple_watchdog_disabled()
+        # Drop session->profile mapping so a future session reusing this name
+        # starts on the default profile.
+        try:
+            _roles = _load_roles()
+            if session_name in _roles.get("session_profiles", {}):
+                _roles["session_profiles"].pop(session_name, None)
+                _save_roles(_roles)
+        except Exception:
+            logger.debug("Failed to clean up profile mapping for '%s'", session_name, exc_info=True)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -2022,22 +2131,371 @@ async def api_save_claude_md_global(body: SaveClaudeMd):
         return JSONResponse({"error": "Failed to save"}, status_code=500)
 
 
+# --- Session-scoped auto-memory (project MEMORY.md + sibling topic files) ---
+# Claude Code reads MEMORY.md from `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/memory/MEMORY.md`,
+# where the encoded path replaces `/` and `_` with `-`. We mirror that here.
+
+def _encode_project_path(cwd: str) -> str:
+    """Mirror Claude Code's project-dir encoding: replace `/` and `_` with `-`."""
+    return (cwd or "").replace("/", "-").replace("_", "-")
+
+
+def _session_memory_dir(session_name: str) -> tuple[Path, str, str]:
+    """Resolve the project memory dir for a session.
+    Returns (memory_dir_path, cwd, profile_id). memory_dir_path may not exist yet.
+    """
+    cwd = get_session_cwd(session_name) or ""
+    profile_id = _get_session_profile_id(session_name)
+    encoded = _encode_project_path(cwd)
+    base = _profile_dir(profile_id)
+    mem_dir = base / "projects" / encoded / "memory"
+    return mem_dir, cwd, profile_id
+
+
+_MEMORY_EXTRA_RE = re.compile(r"^[A-Za-z0-9._-]+\.md$")
+
+
+def _sanitize_memory_filename(name: str) -> str:
+    name = os.path.basename(name or "")
+    if not _MEMORY_EXTRA_RE.match(name):
+        return ""
+    return name
+
+
+@app.get("/api/sessions/{session_name}/memory-md")
+async def api_get_session_memory_md(session_name: str):
+    """Read the auto-memory MEMORY.md for the session's (profile, cwd) pair."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mem_dir, cwd, profile_id = _session_memory_dir(session_name)
+    if not cwd:
+        return JSONResponse({"error": "Could not determine session cwd"}, status_code=400)
+    mpath = mem_dir / "MEMORY.md"
+    content = ""
+    if mpath.exists():
+        try:
+            content = mpath.read_text()
+        except Exception:
+            logger.debug("Failed to read session MEMORY.md at %s", mpath, exc_info=True)
+    return JSONResponse({
+        "path": str(mpath), "content": content, "exists": mpath.exists(),
+        "dir": str(mem_dir), "cwd": cwd, "profile_id": profile_id,
+    })
+
+
+@app.post("/api/sessions/{session_name}/memory-md")
+async def api_save_session_memory_md(session_name: str, body: SaveClaudeMd):
+    """Save the auto-memory MEMORY.md (creates dir if missing)."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mem_dir, cwd, _profile_id = _session_memory_dir(session_name)
+    if not cwd:
+        return JSONResponse({"error": "Could not determine session cwd"}, status_code=400)
+    mpath = mem_dir / "MEMORY.md"
+    # Path safety: ensure mpath is inside mem_dir which is inside the profile dir
+    try:
+        if not str(mpath.resolve().parent) == str(mem_dir.resolve()):
+            return JSONResponse({"error": "Invalid path"}, status_code=400)
+    except Exception:
+        pass
+    real_target = os.path.realpath(body.path)
+    if real_target != os.path.realpath(str(mpath)):
+        return JSONResponse({"error": "Path mismatch"}, status_code=400)
+    try:
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        mpath.write_text(body.content)
+        return JSONResponse({"ok": True, "path": str(mpath)})
+    except Exception:
+        logger.exception("Failed to save session MEMORY.md")
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+@app.get("/api/sessions/{session_name}/memory-extras")
+async def api_list_session_memory_extras(session_name: str):
+    """List sibling .md topic files alongside MEMORY.md (excludes MEMORY.md itself)."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mem_dir, cwd, _profile_id = _session_memory_dir(session_name)
+    files = []
+    if mem_dir.exists():
+        for p in sorted(mem_dir.iterdir()):
+            if not (p.is_file() and p.suffix == ".md"):
+                continue
+            if p.name.upper() == "MEMORY.MD":
+                continue
+            try:
+                files.append({"name": p.name, "content": p.read_text(),
+                              "size": p.stat().st_size})
+            except Exception:
+                logger.debug("Failed to read memory topic %s", p, exc_info=True)
+    return JSONResponse({"files": files, "dir": str(mem_dir), "cwd": cwd})
+
+
+@app.post("/api/sessions/{session_name}/memory-extras")
+async def api_save_session_memory_extra(session_name: str, body: SkillFileBody):
+    """Create or update a topic file in the session's memory dir."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mem_dir, cwd, _profile_id = _session_memory_dir(session_name)
+    if not cwd:
+        return JSONResponse({"error": "Could not determine session cwd"}, status_code=400)
+    fname = _sanitize_memory_filename(body.name)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename. Use alphanumerics/dots/dashes/underscores ending in .md."}, status_code=400)
+    if fname.upper() == "MEMORY.MD":
+        return JSONResponse({"error": "MEMORY.md has its own editor."}, status_code=400)
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    fpath = mem_dir / fname
+    if not str(fpath.resolve()).startswith(str(mem_dir.resolve()) + os.sep):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        fpath.write_text(body.content)
+        return JSONResponse({"ok": True, "name": fname})
+    except Exception:
+        logger.exception("Failed to save memory topic file")
+        return JSONResponse({"error": "Failed to save file"}, status_code=500)
+
+
+@app.delete("/api/sessions/{session_name}/memory-extras/{filename}")
+async def api_delete_session_memory_extra(session_name: str, filename: str):
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mem_dir, _cwd, _profile_id = _session_memory_dir(session_name)
+    fname = _sanitize_memory_filename(filename)
+    if not fname or fname.upper() == "MEMORY.MD":
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    fpath = mem_dir / fname
+    if not str(fpath.resolve()).startswith(str(mem_dir.resolve()) + os.sep):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if fpath.exists():
+        try:
+            fpath.unlink()
+        except Exception:
+            logger.exception("Failed to delete memory topic file")
+            return JSONResponse({"error": "Failed to delete"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+# --- Global extras: sidecar markdown files in ~/ matching CLAUDE*.md ---
+# (e.g. ~/CLAUDE_API_KEYS.md, ~/CLAUDE_GITHUB_RULES.md). The main CLAUDE.md
+# has its own dedicated editor and is excluded here.
+_GLOBAL_EXTRA_RE = re.compile(r"^CLAUDE[A-Za-z0-9._-]+\.md$")
+
+
+def _sanitize_global_extra_filename(name: str) -> str:
+    name = os.path.basename(name or "")
+    if not _GLOBAL_EXTRA_RE.match(name):
+        return ""
+    if name.upper() == "CLAUDE.MD":
+        return ""
+    return name
+
+
+@app.get("/api/global-extras")
+async def api_list_global_extras():
+    home = Path.home()
+    files = []
+    try:
+        for p in sorted(home.iterdir()):
+            if not p.is_file():
+                continue
+            if not _GLOBAL_EXTRA_RE.match(p.name):
+                continue
+            if p.name.upper() == "CLAUDE.MD":
+                continue
+            try:
+                files.append({"name": p.name, "content": p.read_text(),
+                              "size": p.stat().st_size})
+            except Exception:
+                logger.debug("Failed to read global extra %s", p, exc_info=True)
+    except Exception:
+        logger.exception("Failed to list global extras")
+    return JSONResponse({"files": files, "path": str(home)})
+
+
+@app.post("/api/global-extras")
+async def api_save_global_extra(body: SkillFileBody):
+    fname = _sanitize_global_extra_filename(body.name)
+    if not fname:
+        return JSONResponse({"error": "Filename must match CLAUDE_<something>.md (e.g. CLAUDE_API_KEYS.md)."}, status_code=400)
+    home = Path.home()
+    fpath = home / fname
+    if not str(fpath.resolve()).startswith(str(home.resolve()) + os.sep):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        fpath.write_text(body.content)
+        # API-key-style files often need restrictive perms; we apply 600
+        # because these conventionally hold secrets and live next to CLAUDE.md.
+        try:
+            os.chmod(fpath, 0o600)
+        except Exception:
+            logger.debug("chmod 600 failed for %s", fpath, exc_info=True)
+        return JSONResponse({"ok": True, "name": fname})
+    except Exception:
+        logger.exception("Failed to save global extra")
+        return JSONResponse({"error": "Failed to save file"}, status_code=500)
+
+
+@app.delete("/api/global-extras/{filename}")
+async def api_delete_global_extra(filename: str):
+    fname = _sanitize_global_extra_filename(filename)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    home = Path.home()
+    fpath = home / fname
+    if not str(fpath.resolve()).startswith(str(home.resolve()) + os.sep):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if fpath.exists():
+        try:
+            fpath.unlink()
+        except Exception:
+            logger.exception("Failed to delete global extra")
+            return JSONResponse({"error": "Failed to delete"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
 # --- Skills file management ---
+#
+# There are three layers:
+#   1. Library:  ~/.tmux-dashboard/skill-library/<name>/SKILL.md
+#                Canonical user-authored skills with YAML frontmatter
+#                (name + description). This is the source of truth.
+#   2. Profile:  ~/.claude-<profile_id>/skills/<name>/SKILL.md
+#                Per-profile skills directory that Claude Code reads when
+#                CLAUDE_CONFIG_DIR is set. Library skills are *symlinked* in
+#                here on a per-profile basis, so the same library entry can
+#                be enabled in some profiles and disabled in others.
+#   3. Built-ins: bundled into the Claude Code binary itself. Always present,
+#                not configurable per profile. Listed via /api/builtin-skills
+#                so the UI can surface them as read-only.
 
 SKILLS_DIR = MESSAGES_DIR / "skills"
 SKILL_LIBRARY_DIR = MESSAGES_DIR / "skill-library"
 
 _SKILL_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_-]+\.md$")
+_SKILL_DIR_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+# Built-in skills bundled with Claude Code itself. Always available; cannot be
+# disabled per profile. Surfaced to the UI as a read-only "Built-in" section
+# so users understand which skills are available without any configuration.
+_BUILTIN_SKILLS = [
+    {"name": "update-config", "description": "Configure Claude Code via settings.json (hooks, permissions, env)."},
+    {"name": "keybindings-help", "description": "Customize keyboard shortcuts in ~/.claude/keybindings.json."},
+    {"name": "simplify", "description": "Review changed code for reuse, quality, and efficiency, then fix issues."},
+    {"name": "fewer-permission-prompts", "description": "Allowlist common read-only Bash/MCP calls to reduce prompts."},
+    {"name": "loop", "description": "Run a prompt or slash command on a recurring interval."},
+    {"name": "claude-api", "description": "Build, debug, and optimize Claude API / Anthropic SDK apps."},
+    {"name": "init", "description": "Initialize a new CLAUDE.md file with codebase documentation."},
+    {"name": "review", "description": "Review a pull request."},
+    {"name": "security-review", "description": "Complete a security review of pending changes on the current branch."},
+]
 
 
 def _sanitize_skill_filename(name: str) -> str:
-    """Sanitize and validate a skill filename."""
+    """Sanitize and validate a flat .md skill filename (legacy session/profile flat-file API)."""
     name = os.path.basename(name)
     if not name.endswith(".md"):
         name += ".md"
     if not _SKILL_FILENAME_RE.match(name):
         return ""
     return name
+
+
+def _sanitize_skill_dir_name(name: str) -> str:
+    """Sanitize a skill directory name (the canonical Skill `<name>`)."""
+    name = os.path.basename((name or "").strip())
+    if name.endswith(".md"):
+        name = name[:-3]
+    if not _SKILL_DIR_NAME_RE.match(name):
+        return ""
+    return name
+
+
+def _parse_skill_frontmatter(skill_md_path: Path) -> dict:
+    """Extract `name` and `description` from a SKILL.md YAML frontmatter block.
+
+    Falls back to the parent directory name when frontmatter is missing or malformed.
+    """
+    out = {"name": skill_md_path.parent.name, "description": ""}
+    try:
+        text = skill_md_path.read_text()
+    except Exception:
+        return out
+    if not text.startswith("---"):
+        return out
+    # Find the closing fence
+    end = text.find("\n---", 3)
+    if end == -1:
+        return out
+    block = text[3:end]
+    for raw in block.splitlines():
+        line = raw.strip()
+        if line.startswith("name:"):
+            v = line.split(":", 1)[1].strip().strip('"').strip("'")
+            if v:
+                out["name"] = v
+        elif line.startswith("description:"):
+            v = line.split(":", 1)[1].strip().strip('"').strip("'")
+            if v:
+                out["description"] = v
+    return out
+
+
+def _read_skill_dir(d: Path) -> Optional[dict]:
+    """Read a skill directory; return metadata dict or None if not a valid skill."""
+    if not d.is_dir():
+        return None
+    skill_md = d / "SKILL.md"
+    if not skill_md.is_file():
+        return None
+    fm = _parse_skill_frontmatter(skill_md)
+    try:
+        content = skill_md.read_text()
+    except Exception:
+        content = ""
+    return {
+        "name": fm["name"],
+        "dir_name": d.name,
+        "description": fm["description"],
+        "path": str(skill_md),
+        "content": content,
+    }
+
+
+def _list_library_skills() -> list:
+    """List all skills in the library (sorted by directory name)."""
+    SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    out = []
+    for entry in sorted(SKILL_LIBRARY_DIR.iterdir()):
+        info = _read_skill_dir(entry)
+        if info:
+            out.append(info)
+    return out
+
+
+def _profile_skills_dir(profile_id: str) -> Path:
+    """Return the skills/ directory for a given profile, creating it if needed."""
+    d = _profile_dir(profile_id) / "skills"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _is_library_link(skills_dir: Path, skill_dir_name: str) -> bool:
+    """Return True iff `skills_dir/skill_dir_name` is a symlink to the library copy."""
+    target = skills_dir / skill_dir_name
+    if not target.is_symlink():
+        return False
+    try:
+        resolved = target.resolve()
+    except Exception:
+        return False
+    expected = (SKILL_LIBRARY_DIR / skill_dir_name).resolve()
+    return resolved == expected
 
 
 def _skill_dir_for_session(session_name: str) -> Path:
@@ -2051,9 +2509,14 @@ class SkillFileBody(BaseModel):
     content: str
 
 
+class SaveLibrarySkillBody(BaseModel):
+    description: str = ""
+    content: str
+
+
 class SkillLibraryBody(BaseModel):
     name: str
-    session_name: str
+    session_name: str = ""
 
 
 @app.get("/api/sessions/{session_name}/skills")
@@ -2127,59 +2590,1023 @@ async def api_delete_skill(session_name: str, filename: str):
 
 @app.get("/api/skill-library")
 async def api_list_skill_library():
-    """List all saved skill sets in the library."""
-    SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-    sets = []
-    for d in sorted(SKILL_LIBRARY_DIR.iterdir()):
-        if d.is_dir():
-            files = [f.name for f in sorted(d.iterdir()) if f.suffix == ".md" and f.is_file()]
-            try:
-                created = d.stat().st_ctime
-            except Exception:
-                created = 0
-            sets.append({"name": d.name, "files": files, "created": created})
-    return JSONResponse({"sets": sets})
+    """List all skills in the library with their frontmatter metadata."""
+    return JSONResponse({"skills": _list_library_skills()})
 
 
-@app.post("/api/skill-library/save")
-async def api_save_to_library(body: SkillLibraryBody):
-    """Copy a session's skill files to the library under a given set name."""
-    _, sess = _find_session(body.session_name)
+@app.get("/api/skill-library/{skill_name}")
+async def api_get_library_skill(skill_name: str):
+    """Return the SKILL.md content + metadata for a single library skill."""
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    info = _read_skill_dir(SKILL_LIBRARY_DIR / name)
+    if not info:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    return JSONResponse(info)
+
+
+@app.post("/api/skill-library/{skill_name}")
+async def api_save_library_skill(skill_name: str, body: SaveLibrarySkillBody):
+    """Create or update a library skill.
+
+    Body content is the raw SKILL.md text. If it already starts with a `---`
+    frontmatter block, it is trusted as-is. Otherwise we synthesize a frontmatter
+    block from `skill_name` and `description`.
+    """
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name (alphanumeric, hyphens, underscores; max 64 chars)"}, status_code=400)
+    desc = (body.description or "").strip().replace("\n", " ").replace("\r", " ")
+    raw = (body.content or "").lstrip()
+    if raw.startswith("---"):
+        full = raw if raw.endswith("\n") else raw + "\n"
+    else:
+        full = f"---\nname: {name}\ndescription: {desc}\n---\n\n{raw.rstrip()}\n"
+    d = SKILL_LIBRARY_DIR / name
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(full)
+    except Exception:
+        logger.exception("Failed to save library skill")
+        return JSONResponse({"error": "Failed to save skill"}, status_code=500)
+    return JSONResponse({"ok": True, "name": name})
+
+
+@app.delete("/api/skill-library/{skill_name}")
+async def api_delete_library_skill(skill_name: str):
+    """Delete a library skill (and break any per-profile symlinks pointing to it)."""
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    d = SKILL_LIBRARY_DIR / name
+    if not d.is_dir():
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    # Sweep all profile skills/ dirs and remove dangling/library-pointing symlinks
+    try:
+        for profile in _load_roles().get("profiles", []):
+            pid = profile.get("id")
+            if not pid or pid == DEFAULT_PROFILE_ID:
+                continue
+            sd = _profile_dir(pid) / "skills"
+            link = sd / name
+            if link.is_symlink():
+                try:
+                    link.unlink()
+                except Exception:
+                    logger.debug("Failed to clean up profile symlink %s", link, exc_info=True)
+    except Exception:
+        logger.debug("Failed to sweep profile symlinks for deleted skill", exc_info=True)
+    try:
+        shutil.rmtree(str(d))
+    except Exception:
+        logger.exception("Failed to delete library skill")
+        return JSONResponse({"error": "Failed to delete skill"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/builtin-skills")
+async def api_list_builtin_skills():
+    """Return the list of skills bundled with Claude Code itself (read-only)."""
+    return JSONResponse({"skills": list(_BUILTIN_SKILLS)})
+
+
+# --- Claude Code role profiles (per-role isolated configs via CLAUDE_CONFIG_DIR) ---
+
+ROLES_FILE = MESSAGES_DIR / "claude-roles.json"
+DEFAULT_PROFILE_ID = "default"
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_RESERVED_PROFILE_IDS = {DEFAULT_PROFILE_ID}
+
+# Common permissions + env baseline applied to every profile (uniform
+# "no permission prompts + telemetry off + generous bash timeouts" across
+# all roles). Individual profiles can still override via the Profiles editor.
+_COMMON_PERMISSIONS = {
+    "defaultMode": "bypassPermissions",
+    "allow": ["*"],
+    "deny": [],
+}
+_COMMON_ENV = {
+    "CLAUDE_CODE_PERMISSION_MODE": "bypassPermissions",
+    "DISABLE_AUTOUPDATER": "0",
+    "DISABLE_TELEMETRY": "1",
+    "BASH_DEFAULT_TIMEOUT_MS": "120000",
+    "BASH_MAX_TIMEOUT_MS": "600000",
+}
+
+# Built-in role presets seeded on first run. Each becomes ~/.claude-<id>/
+# with settings.json, CLAUDE.md, and an empty skills/ dir. The user can edit
+# any of these via the Profiles editor in Settings.
+_PROFILE_PRESETS = [
+    {
+        "id": "ui-expert", "name": "UI Expert",
+        "model": "claude-sonnet-4-6", "effort": "medium",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# UI Expert\n\n"
+            "## Verify visually\n"
+            "After every UI change: run dev server, screenshot the affected viewport at 375/768/1280/1920px. "
+            "Compare against the previous screenshot. Don't claim \"done\" without the diff.\n\n"
+            "## Design tokens are law\n"
+            "Use design tokens from `src/styles/tokens.css`. No raw hex, rem, or px in component files. "
+            "If a token is missing, propose adding it before hardcoding.\n\n"
+            "## Component patterns\n"
+            "- Composition > props explosion. Slot/children before 12-prop variants.\n"
+            "- Every interactive element must have :hover, :focus-visible, :disabled, :active.\n"
+            "- Motion: prefers-reduced-motion respected always.\n\n"
+            "## Accessibility floor\n"
+            "WCAG 2.2 AA minimum. Every PR runs axe via Playwright. Never ship contrast < 4.5:1.\n"
+        ),
+    },
+    {
+        "id": "ux-expert", "name": "UX Expert",
+        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# UX Expert\n\n"
+            "## Process discipline\n"
+            "Problem -> user -> JTBD -> flow -> wireframe -> copy -> test plan. "
+            "Never jump to UI before the JTBD is written down in one sentence.\n\n"
+            "## Outputs\n"
+            "- Flows: mermaid stateDiagram or flowchart\n"
+            "- Heuristic evals: severity 0-4 (Nielsen scale), one finding per row, with screenshot ref\n"
+            "- Microcopy: provide 3 variants, label each by tone (direct / warm / playful)\n\n"
+            "## Synthesis rules\n"
+            "When given >3 transcripts: cluster by theme first, count mentions, "
+            "quote sparingly (<=15 words), surface contradictions explicitly.\n\n"
+            "## Reject without data\n"
+            "If asked \"should we add X feature\": ask what user evidence exists. "
+            "No evidence -> propose smallest test to gather it before designing.\n"
+        ),
+    },
+    {
+        "id": "qa-agent", "name": "QA Agent",
+        "model": "claude-sonnet-4-6", "effort": "medium",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# QA Agent\n\n"
+            "## Test pyramid targets\n"
+            "70% unit, 20% integration, 10% e2e. Question any PR that inverts this.\n\n"
+            "## Coverage rules\n"
+            "Lines >= 80%, branches >= 75%. New code: >= 90% lines or justify in PR. "
+            "Coverage is necessary, not sufficient -- also assert behavior, not just calls.\n\n"
+            "## Flake protocol\n"
+            "Failed test re-run passes? Don't merge. Mark `.flaky`, file an issue, "
+            "investigate root cause within 48h. Never @retry on green CI.\n\n"
+            "## Edge case checklist (always)\n"
+            "- empty / null / undefined inputs\n"
+            "- boundary values (0, 1, max, max+1, negative)\n"
+            "- concurrent operations / race conditions\n"
+            "- network failure / timeout\n"
+            "- malformed input / fuzzing\n"
+            "- a11y: keyboard-only path, screen reader labels\n\n"
+            "## Browser-driven verification (use agent-browser)\n"
+            "For any web-app QA, drive a real Chromium via the `agent-browser` CLI -- "
+            "do NOT scrape with curl/fetch. Before issuing commands the first time, "
+            "run `agent-browser skills get core --full` to load the version-matched "
+            "command reference, and `agent-browser skills get dogfood` for the QA "
+            "exploration workflow.\n\n"
+            "Standard loop:\n"
+            "```\n"
+            "agent-browser --session qa open <URL>\n"
+            "agent-browser --session qa snapshot -i        # interactive elements with @eN refs\n"
+            "agent-browser --session qa click @e3           # use refs, not CSS\n"
+            "agent-browser --session qa screenshot --annotate ./qa-output/<step>.png\n"
+            "agent-browser --session qa errors              # JS errors\n"
+            "agent-browser --session qa console             # console logs\n"
+            "agent-browser --session qa close               # when done\n"
+            "```\n\n"
+            "Save artifacts to `./qa-output/{screenshots,videos}/`. Use `--annotate` for "
+            "evidence screenshots. Reference elements by `@eN` (from `snapshot -i`), not CSS "
+            "selectors -- refs survive minor DOM changes. Always check `errors` + `console` "
+            "after every interaction.\n\n"
+            "## What I don't do\n"
+            "Write or modify production code. Push to remote. Approve my own PRs.\n"
+        ),
+        "seed_skills": [
+            {
+                "path": "agent-browser/SKILL.md",
+                "content": (
+                    "---\n"
+                    "name: agent-browser\n"
+                    "description: Browser automation CLI for AI agents. Use when QA work needs to interact with websites -- navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or any browser automation. Triggers include 'open a website', 'fill out a form', 'click a button', 'take a screenshot', 'test this web app', 'login to a site', 'automate browser actions', 'dogfood', 'exploratory test', 'find issues', 'bug hunt', 'review the quality of this app'. Prefer agent-browser over WebFetch / curl / built-in browser tools.\n"
+                    "allowed-tools: Bash(agent-browser:*), Bash(npx agent-browser:*)\n"
+                    "---\n\n"
+                    "# agent-browser\n\n"
+                    "Fast browser automation CLI for AI agents. Chrome/Chromium via CDP with\n"
+                    "accessibility-tree snapshots and compact `@eN` element refs.\n\n"
+                    "Already installed globally on this machine: `which agent-browser` -> /usr/bin/agent-browser.\n\n"
+                    "## Start here (read before running any agent-browser command)\n\n"
+                    "This file is a discovery stub. Load the version-matched workflow content from the CLI:\n\n"
+                    "```bash\n"
+                    "agent-browser skills get core              # workflows, common patterns, troubleshooting\n"
+                    "agent-browser skills get core --full       # also includes full command reference\n"
+                    "agent-browser skills get dogfood           # systematic QA / exploratory testing playbook\n"
+                    "```\n\n"
+                    "Always invoke as `agent-browser ...` directly -- never `npx agent-browser`. The\n"
+                    "direct binary uses the fast Rust client; npx routes through Node and is slower.\n\n"
+                    "## QA workflow at a glance\n\n"
+                    "1. **Open** target URL with a named session: `agent-browser --session qa open <URL>`\n"
+                    "2. **Snapshot** to discover interactive elements with refs: `agent-browser --session qa snapshot -i`\n"
+                    "3. **Act** using `@eN` refs from the snapshot:\n"
+                    "   - `agent-browser --session qa click @e3`\n"
+                    "   - `agent-browser --session qa fill @e2 \"value\"`\n"
+                    "   - `agent-browser --session qa press Enter`\n"
+                    "4. **Verify** state: `agent-browser --session qa errors` (JS errors), `console` (logs),\n"
+                    "   `screenshot --annotate ./qa-output/<step>.png` (visual evidence).\n"
+                    "5. **Close** when finished: `agent-browser --session qa close`.\n\n"
+                    "Always:\n"
+                    "- Use `@eN` refs from `snapshot -i`, not CSS selectors -- refs survive minor DOM changes.\n"
+                    "- After every interaction check `errors` and `console` for regressions.\n"
+                    "- Take an annotated screenshot of every reproducible bug. Save under `./qa-output/`.\n"
+                    "- Use `--session <name>` so login/cookies persist between commands.\n\n"
+                    "## QA report format\n\n"
+                    "Return findings as structured JSON when the user asks for a report:\n\n"
+                    "```json\n"
+                    "{\n"
+                    "  \"verdict\": \"HEALTHY | MINOR_ISSUES | CRITICAL_BUGS\",\n"
+                    "  \"summary\": \"<one-paragraph executive summary>\",\n"
+                    "  \"bugs\": [\n"
+                    "    {\n"
+                    "      \"severity\": \"critical | major | minor\",\n"
+                    "      \"title\": \"<short>\",\n"
+                    "      \"description\": \"<what, where, repro steps, expected vs actual>\",\n"
+                    "      \"evidence\": \"<path to screenshot or log>\"\n"
+                    "    }\n"
+                    "  ]\n"
+                    "}\n"
+                    "```\n\n"
+                    "Severity rubric:\n"
+                    "- **critical**: blocks the user (crash, broken login, data loss, security)\n"
+                    "- **major**: core feature degraded but workaround exists\n"
+                    "- **minor**: cosmetic, copy, polish\n"
+                ),
+            },
+            {
+                "path": "qa-browser-checklist.md",
+                "content": (
+                    "---\n"
+                    "name: qa-browser-checklist\n"
+                    "description: Per-page QA checklist to run after navigating to any web page during exploratory testing. Use alongside agent-browser. Trigger when doing QA, dogfood, exploratory test, smoke test, or bug hunt on a web app.\n"
+                    "---\n\n"
+                    "# Per-page QA checklist\n\n"
+                    "After every page load (or significant state change) during browser-driven QA, run\n"
+                    "through this checklist before moving on. Skip items that are clearly not applicable.\n\n"
+                    "## 1. Render & layout\n"
+                    "- Page loads without spinner stuck > 5s\n"
+                    "- No empty regions where content should be\n"
+                    "- No overlapping or cut-off text (check at 1280 and 375 viewport)\n"
+                    "- Critical above-the-fold content visible without scrolling\n\n"
+                    "## 2. Console & network\n"
+                    "```\n"
+                    "agent-browser --session qa errors\n"
+                    "agent-browser --session qa console\n"
+                    "agent-browser --session qa network requests --filter 4xx\n"
+                    "agent-browser --session qa network requests --filter 5xx\n"
+                    "```\n"
+                    "Any 4xx/5xx other than expected auth challenges is a finding. JS exceptions\n"
+                    "are a finding even if the page looks fine.\n\n"
+                    "## 3. Interactivity\n"
+                    "- Primary CTA reachable by Tab from the top of the page\n"
+                    "- :focus-visible ring present on every focusable element\n"
+                    "- Forms: try empty submit, invalid email, too-long input, special chars in name\n"
+                    "- Modals/dialogs close with Escape and with the close button\n\n"
+                    "## 4. Accessibility floor\n"
+                    "- Every form field has a label (use `agent-browser snapshot -i` and look for unlabelled inputs)\n"
+                    "- Images have alt text\n"
+                    "- Color contrast looks adequate; flag any low-contrast text for verification\n\n"
+                    "## 5. Performance smell test\n"
+                    "```\n"
+                    "agent-browser --session qa vitals\n"
+                    "```\n"
+                    "Flag LCP > 2.5s, INP > 200ms, CLS > 0.1 on the critical path.\n\n"
+                    "## 6. State leakage\n"
+                    "- Refresh the page -- does state persist as expected?\n"
+                    "- Navigate away and back -- does it restore correctly?\n"
+                    "- Open in a new tab -- does it work standalone?\n\n"
+                    "## What goes in the bug report\n\n"
+                    "For each finding: title, severity, exact repro steps using `@eN` refs from a fresh\n"
+                    "`snapshot -i`, expected vs actual, screenshot path under `./qa-output/screenshots/`,\n"
+                    "and a console/errors excerpt if relevant.\n"
+                ),
+            },
+        ],
+    },
+    {
+        "id": "researcher", "name": "Researcher",
+        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# Researcher\n\n"
+            "## Output format (always)\n"
+            "1. Executive summary (<=150 words)\n"
+            "2. Key findings (bulleted, each with source link)\n"
+            "3. Methodology\n"
+            "4. Detailed sections\n"
+            "5. Open questions\n"
+            "6. Sources (numbered, full citations)\n\n"
+            "Save to `.research/<topic>/final_report.md`. Cache raw fetches in `.research/<topic>/raw/`.\n\n"
+            "## Source hierarchy\n"
+            "Primary > peer-reviewed > industry reports > reputable news > blogs > forums. "
+            "Every load-bearing claim needs a primary source.\n\n"
+            "## Decomposition first\n"
+            "For any non-trivial query: write 3-7 sub-questions before searching. "
+            "Run searches in parallel where possible. Aggregate, then synthesize.\n\n"
+            "## Quote discipline\n"
+            "Paraphrase by default. Direct quotes only when wording is legally / technically "
+            "load-bearing. Max one quote per source, <=15 words.\n\n"
+            "## Uncertainty is a finding\n"
+            "\"I couldn't determine X\" is a valid output. Don't fabricate to fill gaps.\n"
+        ),
+    },
+    {
+        "id": "security-expert", "name": "Security Expert",
+        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# Security Expert\n\n"
+            "## Default posture: read-only\n"
+            "I review, report, and recommend. I do not patch unless explicitly asked "
+            "(\"apply the fix\"). I do not run network commands. I do not exfiltrate "
+            "data -- even sample logs go in redacted form.\n\n"
+            "## Review framework\n"
+            "For every concern: STRIDE category -> CVSS estimate -> exploitability notes -> "
+            "proof-of-concept (sanitized) -> remediation -> references (CWE/CVE/OWASP).\n\n"
+            "## Always check\n"
+            "- Secrets in code/config/history (gitleaks before review)\n"
+            "- Dependency CVEs (npm/pip/cargo audit)\n"
+            "- Auth: session fixation, CSRF, OAuth state, JWT alg=none, weak rotation\n"
+            "- Injection: SQL, command, SSTI, prompt injection in LLM contexts\n"
+            "- Crypto: deprecated algorithms, ECB mode, hardcoded IVs, weak RNG\n"
+            "- IDOR / authz at every endpoint, not just authn\n"
+            "- SSRF / file inclusion / path traversal\n"
+            "- Supply chain: lockfile drift, typosquats, install scripts\n\n"
+            "## Reporting\n"
+            "Severity: Critical / High / Medium / Low / Info. One issue per finding.\n\n"
+            "## What I don't do\n"
+            "Run exploits against live systems. Modify .env / secrets / IAM. "
+            "Disable checks \"to test something.\" Approve my own findings.\n"
+        ),
+    },
+    {
+        "id": "optimizer", "name": "Optimizer",
+        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "permissions": dict(_COMMON_PERMISSIONS),
+        "env": dict(_COMMON_ENV),
+        "claude_md": (
+            "# Optimizer\n\n"
+            "## Measure first, always\n"
+            "No optimization without a baseline number. Format every proposal as:\n"
+            "  Before: X (units, conditions)\n"
+            "  After:  Y (same conditions)\n"
+            "  Method: how measured, repetitions, variance\n\n"
+            "If I can't produce \"Before\", I don't propose \"After\".\n\n"
+            "## Performance budgets (web)\n"
+            "- LCP < 2.5s, INP < 200ms, CLS < 0.1 (75th percentile, mobile, slow 4G)\n"
+            "- JS bundle: < 170KB gzipped initial route\n"
+            "- Lighthouse perf >= 90 on every PR touching the critical path\n\n"
+            "## Order of operations\n"
+            "1. Profile (find the hot path)\n"
+            "2. Algorithmic fix (Big-O)\n"
+            "3. Reduce work (memo, dedupe, cache)\n"
+            "4. Parallelize / defer\n"
+            "5. Lower-level tuning (allocations, syscalls)\n"
+            "Never invert this order.\n\n"
+            "## Anti-patterns I flag\n"
+            "- Premature memo / useMemo on cheap pure expressions\n"
+            "- Cache without invalidation strategy\n"
+            "- \"It's faster on my machine\" without prod-like data volume\n"
+            "- Micro-benchmarks without warmup, GC pause, statistical test\n"
+            "- Optimizing the 1% case while the 99% case is the bottleneck\n\n"
+            "## Cost dimension\n"
+            "Performance includes $ -- token cost, compute cost, egress cost. "
+            "Always note cost delta alongside latency delta.\n"
+        ),
+    },
+]
+
+
+def _default_profile_record() -> dict:
+    return {"id": DEFAULT_PROFILE_ID, "name": "Default", "model": "",
+            "effort": "",
+            "permissions": dict(_COMMON_PERMISSIONS),
+            "env": dict(_COMMON_ENV),
+            "claude_md": "", "memory_md": "", "builtin": True}
+
+
+def _save_roles(data: dict):
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ROLES_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.exception("Failed to save %s", ROLES_FILE)
+
+
+_PRESET_FIELDS = ("model", "effort", "permissions", "env", "claude_md", "memory_md", "seed_skills")
+
+
+def _refresh_builtin_presets(data: dict) -> bool:
+    """Bring built-in preset entries up-to-date with `_PROFILE_PRESETS` content.
+
+    Only touches profiles where `builtin: True` AND `edited` is falsy. New presets
+    that weren't in the file yet are appended. The default profile is also
+    refreshed from `_default_profile_record()`. Returns True if any change.
+    """
+    changed = False
+    by_id = {p["id"]: p for p in data["profiles"]}
+    # Refresh the default record (treating _default_profile_record() as its preset)
+    default_existing = by_id.get(DEFAULT_PROFILE_ID)
+    if default_existing is not None and not default_existing.get("edited"):
+        default_template = _default_profile_record()
+        for field in _PRESET_FIELDS:
+            new_val = default_template.get(field) if field in default_template else None
+            if default_existing.get(field) != new_val:
+                if new_val is None:
+                    default_existing.pop(field, None)
+                else:
+                    default_existing[field] = new_val
+                changed = True
+    for preset in _PROFILE_PRESETS:
+        existing = by_id.get(preset["id"])
+        if existing is None:
+            data["profiles"].append({**preset, "builtin": True})
+            changed = True
+            continue
+        if not existing.get("builtin") or existing.get("edited"):
+            continue
+        for field in _PRESET_FIELDS:
+            new_val = preset.get(field) if field in preset else None
+            if existing.get(field) != new_val:
+                if new_val is None:
+                    existing.pop(field, None)
+                else:
+                    existing[field] = new_val
+                changed = True
+        # Don't auto-rename: name is the most user-visible field
+    return changed
+
+
+def _load_roles() -> dict:
+    """Load profiles + per-session mappings; seed presets on first run."""
+    if not ROLES_FILE.exists():
+        data = {
+            "profiles": [_default_profile_record()] + [{**p, "builtin": True} for p in _PROFILE_PRESETS],
+            "session_profiles": {},
+        }
+        _save_roles(data)
+        return data
+    try:
+        with open(ROLES_FILE) as f:
+            data = json.load(f)
+        data.setdefault("profiles", [])
+        data.setdefault("session_profiles", {})
+        if not any(p.get("id") == DEFAULT_PROFILE_ID for p in data["profiles"]):
+            data["profiles"].insert(0, _default_profile_record())
+        if _refresh_builtin_presets(data):
+            _save_roles(data)
+        return data
+    except Exception:
+        logger.exception("Failed to load %s -- using defaults", ROLES_FILE)
+        return {"profiles": [_default_profile_record()], "session_profiles": {}}
+
+
+def _profile_dir(profile_id: str) -> Path:
+    """Filesystem path used for CLAUDE_CONFIG_DIR for a given profile id."""
+    if profile_id == DEFAULT_PROFILE_ID:
+        return Path.home() / ".claude"
+    return Path.home() / f".claude-{profile_id}"
+
+
+def _materialize_profile(profile: dict):
+    """Write settings.json, CLAUDE.md, and ensure skills/ exists.
+
+    For non-default profiles: settings.json is fully owned by the dashboard and
+    overwritten with the profile content (we created the dir).
+
+    For the default profile (~/.claude): MERGE settings.json so we only touch
+    `model`, `env`, `permissions` -- preserving any other keys the user has
+    (e.g. `preferences`, `spinnerTipsEnabled`). On first write we back up the
+    existing settings.json once.
+    """
+    pid = profile["id"]
+    d = _profile_dir(pid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "skills").mkdir(parents=True, exist_ok=True)
+    is_default = (pid == DEFAULT_PROFILE_ID)
+
+    settings_path = d / "settings.json"
+    claudemd_path = d / "CLAUDE.md"
+    memorymd_path = d / "MEMORY.md"
+
+    # Compose the dashboard-managed slice
+    managed: dict = {}
+    if profile.get("model"):
+        managed["model"] = profile["model"]
+    env = dict(profile.get("env") or {})
+    if profile.get("effort"):
+        env.setdefault("CLAUDE_CODE_EFFORT_LEVEL", profile["effort"])
+    if env:
+        managed["env"] = env
+    if profile.get("permissions"):
+        managed["permissions"] = profile["permissions"]
+
+    try:
+        if is_default:
+            # Merge: preserve user's existing keys outside our managed slice
+            existing: dict = {}
+            if settings_path.exists():
+                try:
+                    existing = json.loads(settings_path.read_text())
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except Exception:
+                    logger.warning("~/.claude/settings.json was not valid JSON; will rewrite")
+                    existing = {}
+                # One-time backup before our first write
+                bak = settings_path.with_suffix(".json.bak-pre-dashboard")
+                if not bak.exists():
+                    try:
+                        bak.write_text(settings_path.read_text())
+                    except Exception:
+                        logger.debug("Failed to back up ~/.claude/settings.json", exc_info=True)
+            merged = dict(existing)
+            for key in ("model", "env", "permissions"):
+                if key in managed:
+                    merged[key] = managed[key]
+                # If user blanked the field via the editor, drop it from settings
+                elif key in merged and not profile.get(key) and key in ("model",):
+                    merged.pop(key, None)
+            settings_path.write_text(json.dumps(merged, indent=2))
+        else:
+            settings_path.write_text(json.dumps(managed, indent=2))
+        claudemd_path.write_text(profile.get("claude_md") or "")
+        memorymd_path.write_text(profile.get("memory_md") or "")
+        # Seed initial skill files only when they are missing -- never overwrite,
+        # so the user (or a fresh `agent-browser skills get` pull) can edit them.
+        seed_skills = profile.get("seed_skills") or []
+        if seed_skills:
+            skills_root = d / "skills"
+            for entry in seed_skills:
+                rel = (entry.get("path") or "").lstrip("/").replace("\\", "/")
+                content = entry.get("content") or ""
+                if not rel:
+                    continue
+                target = (skills_root / rel).resolve()
+                # Path traversal guard
+                try:
+                    target.relative_to(skills_root.resolve())
+                except ValueError:
+                    logger.warning("Skipping seed skill outside skills dir: %s", rel)
+                    continue
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+    except Exception:
+        logger.exception("Failed to materialize profile %s at %s", pid, d)
+
+
+def _find_profile(profile_id: str, data: dict | None = None):
+    if data is None:
+        data = _load_roles()
+    for p in data["profiles"]:
+        if p["id"] == profile_id:
+            return p
+    return None
+
+
+def _get_session_profile_id(session_name: str) -> str:
+    data = _load_roles()
+    return data["session_profiles"].get(session_name) or DEFAULT_PROFILE_ID
+
+
+# Seed roles file + materialize built-ins at import time
+try:
+    _initial_roles = _load_roles()
+    for _p in _initial_roles["profiles"]:
+        if _p["id"] != DEFAULT_PROFILE_ID:
+            _materialize_profile(_p)
+except Exception:
+    logger.exception("Failed to initialize role profiles")
+
+
+def _profile_summary(p: dict) -> dict:
+    return {
+        "id": p["id"], "name": p.get("name", p["id"]),
+        "model": p.get("model", ""), "effort": p.get("effort", ""),
+        "builtin": bool(p.get("builtin")),
+    }
+
+
+class CreateProfileBody(BaseModel):
+    name: str
+    from_preset: str = ""
+
+
+class UpdateProfileBody(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    claude_md: Optional[str] = None
+    memory_md: Optional[str] = None
+    permissions: Optional[dict] = None
+    env: Optional[dict] = None
+
+
+class SetSessionProfileBody(BaseModel):
+    profile_id: str
+    restart: bool = False
+
+
+@app.get("/api/profiles")
+async def api_list_profiles():
+    data = _load_roles()
+    return JSONResponse({"profiles": [_profile_summary(p) for p in data["profiles"]]})
+
+
+@app.get("/api/profiles/{profile_id}")
+async def api_get_profile(profile_id: str):
+    data = _load_roles()
+    p = _find_profile(profile_id, data)
+    if not p:
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    out = dict(p)
+    out["dir"] = "" if profile_id == DEFAULT_PROFILE_ID else str(_profile_dir(profile_id))
+    return JSONResponse(out)
+
+
+@app.post("/api/profiles")
+async def api_create_profile(body: CreateProfileBody):
+    name = body.name.strip()
+    if not name:
+        return JSONResponse({"error": "Name is required"}, status_code=400)
+    pid = re.sub(r"[^a-z0-9-]", "-", name.lower())
+    pid = re.sub(r"-+", "-", pid).strip("-")[:32]
+    if not pid or not _PROFILE_ID_RE.match(pid) or pid in _RESERVED_PROFILE_IDS:
+        return JSONResponse({"error": "Invalid name (use letters/numbers; can't be 'default')"}, status_code=400)
+    data = _load_roles()
+    if any(p["id"] == pid for p in data["profiles"]):
+        return JSONResponse({"error": f"Profile id '{pid}' already exists"}, status_code=409)
+    base = _find_profile(body.from_preset, data) if body.from_preset else None
+    new_p = {
+        "id": pid, "name": name,
+        "model": (base or {}).get("model", ""),
+        "effort": (base or {}).get("effort", ""),
+        "permissions": (base or {}).get("permissions", {}),
+        "env": (base or {}).get("env", {}),
+        "claude_md": (base or {}).get("claude_md", ""),
+        "memory_md": (base or {}).get("memory_md", ""),
+        "builtin": False,
+    }
+    data["profiles"].append(new_p)
+    _save_roles(data)
+    _materialize_profile(new_p)
+    return JSONResponse({"ok": True, "id": pid, "profile": _profile_summary(new_p)})
+
+
+@app.put("/api/profiles/{profile_id}")
+async def api_update_profile(profile_id: str, body: UpdateProfileBody):
+    data = _load_roles()
+    p = _find_profile(profile_id, data)
+    if not p:
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    if body.name is not None and body.name.strip():
+        p["name"] = body.name.strip()
+    if body.model is not None:
+        p["model"] = body.model
+    if body.effort is not None:
+        p["effort"] = body.effort
+    if body.claude_md is not None:
+        p["claude_md"] = body.claude_md
+    if body.memory_md is not None:
+        p["memory_md"] = body.memory_md
+    if body.permissions is not None:
+        p["permissions"] = body.permissions
+    if body.env is not None:
+        p["env"] = body.env
+    # Lock this profile against future preset refreshes -- user has customized it.
+    p["edited"] = True
+    _save_roles(data)
+    _materialize_profile(p)
+    return JSONResponse({"ok": True, "id": profile_id})
+
+
+@app.delete("/api/profiles/{profile_id}")
+async def api_delete_profile(profile_id: str):
+    if profile_id == DEFAULT_PROFILE_ID:
+        return JSONResponse({"error": "The default profile cannot be deleted."}, status_code=400)
+    data = _load_roles()
+    if not any(p["id"] == profile_id for p in data["profiles"]):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    data["profiles"] = [p for p in data["profiles"] if p["id"] != profile_id]
+    # Reset any sessions on this profile to default
+    for sname, pid in list(data["session_profiles"].items()):
+        if pid == profile_id:
+            data["session_profiles"].pop(sname, None)
+    _save_roles(data)
+    # Note: ~/.claude-<id>/ is intentionally NOT removed automatically. It may
+    # contain history/credentials the user wants. They can `rm -rf` manually.
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/profiles/{profile_id}/skills")
+async def api_list_profile_skills(profile_id: str):
+    """List the skills currently installed under ~/.claude-<profile>/skills/.
+
+    Each entry is a directory containing SKILL.md (the format Claude Code reads).
+    Library symlinks are flagged with `from_library: true`. Any leftover flat .md
+    files are surfaced under `legacy_files` so the UI can warn the user.
+    """
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    d = _profile_skills_dir(profile_id)
+    skills = []
+    legacy_files = []
+    for entry in sorted(d.iterdir()):
+        info = _read_skill_dir(entry)
+        if info:
+            info["from_library"] = _is_library_link(d, entry.name)
+            skills.append(info)
+        elif entry.is_file() and entry.suffix == ".md":
+            legacy_files.append(entry.name)
+    return JSONResponse({"skills": skills, "legacy_files": legacy_files, "path": str(d)})
+
+
+@app.get("/api/profiles/{profile_id}/skills/library")
+async def api_list_profile_library_state(profile_id: str):
+    """Return the full library with per-profile enabled state."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    skills_dir = _profile_skills_dir(profile_id)
+    out = []
+    for sk in _list_library_skills():
+        out.append({
+            "name": sk["name"],
+            "dir_name": sk["dir_name"],
+            "description": sk["description"],
+            "enabled": _is_library_link(skills_dir, sk["dir_name"]),
+        })
+    return JSONResponse({"skills": out, "default_profile": profile_id == DEFAULT_PROFILE_ID})
+
+
+@app.post("/api/profiles/{profile_id}/skills/library/{skill_name}")
+async def api_enable_library_skill(profile_id: str, skill_name: str):
+    """Enable a library skill for this profile by symlinking it into the profile's skills/ dir."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    if profile_id == DEFAULT_PROFILE_ID:
+        return JSONResponse({"error": "Toggle library skills on a non-default profile. Manage ~/.claude/skills/ manually for the default profile."}, status_code=400)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    src = SKILL_LIBRARY_DIR / name
+    if not (src / "SKILL.md").is_file():
+        return JSONResponse({"error": "Library skill not found"}, status_code=404)
+    skills_dir = _profile_skills_dir(profile_id)
+    target = skills_dir / name
+    if target.is_symlink() or target.exists():
+        if _is_library_link(skills_dir, name):
+            return JSONResponse({"ok": True, "already_enabled": True})
+        return JSONResponse({"error": f"'{name}' already exists in this profile and isn't a library link"}, status_code=409)
+    try:
+        target.symlink_to(src.resolve(), target_is_directory=True)
+    except Exception:
+        logger.exception("Failed to symlink library skill %s into %s", name, skills_dir)
+        return JSONResponse({"error": "Failed to enable skill"}, status_code=500)
+    return JSONResponse({"ok": True, "enabled": True})
+
+
+@app.delete("/api/profiles/{profile_id}/skills/library/{skill_name}")
+async def api_disable_library_skill(profile_id: str, skill_name: str):
+    """Disable a library skill for this profile by removing its symlink."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    if profile_id == DEFAULT_PROFILE_ID:
+        return JSONResponse({"error": "Toggle library skills on a non-default profile."}, status_code=400)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    skills_dir = _profile_skills_dir(profile_id)
+    target = skills_dir / name
+    if not target.is_symlink() and not target.exists():
+        return JSONResponse({"ok": True, "already_disabled": True})
+    if not _is_library_link(skills_dir, name):
+        return JSONResponse({"error": f"'{name}' is not a library link in this profile (refusing to delete custom content)"}, status_code=409)
+    try:
+        target.unlink()
+    except Exception:
+        logger.exception("Failed to unlink library skill %s from %s", name, skills_dir)
+        return JSONResponse({"error": "Failed to disable skill"}, status_code=500)
+    return JSONResponse({"ok": True, "disabled": True})
+
+
+@app.post("/api/profiles/{profile_id}/skills")
+async def api_save_profile_skill(profile_id: str, body: SkillFileBody):
+    """Legacy: write a flat .md file at the profile root skills/ dir.
+
+    Kept so existing tooling doesn't break. Claude Code does NOT load these as
+    Skills (they're not in the `<name>/SKILL.md` directory format). Prefer the
+    library + per-profile toggle endpoints for new content.
+    """
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    fname = _sanitize_skill_filename(body.name)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename. Use alphanumeric, hyphens, underscores with .md extension."}, status_code=400)
+    d = _profile_dir(profile_id) / "skills"
+    d.mkdir(parents=True, exist_ok=True)
+    fpath = d / fname
+    if not str(fpath.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        fpath.write_text(body.content)
+        return JSONResponse({"ok": True, "name": fname})
+    except Exception:
+        logger.exception("Failed to save profile skill")
+        return JSONResponse({"error": "Failed to save skill"}, status_code=500)
+
+
+@app.delete("/api/profiles/{profile_id}/skills/{filename}")
+async def api_delete_profile_skill(profile_id: str, filename: str):
+    """Legacy: delete a flat .md file (or a directory-form skill) from a profile's skills/.
+
+    Refuses to delete library symlinks via this endpoint — use the library
+    enable/disable endpoints instead.
+    """
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    d = _profile_dir(profile_id) / "skills"
+    raw = os.path.basename((filename or "").strip())
+    target = d / raw
+    if not str(target.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if _is_library_link(d, raw):
+        return JSONResponse({"error": "Use the library disable endpoint to remove a library link"}, status_code=409)
+    if not target.exists() and not target.is_symlink():
+        return JSONResponse({"ok": True, "already_absent": True})
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(str(target))
+    except Exception:
+        logger.exception("Failed to delete profile skill")
+        return JSONResponse({"error": "Failed to delete skill"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+# Reserved names that the extras editor must NOT touch (these have their own
+# dedicated editors). Comparison is case-insensitive against the sanitized name.
+_EXTRAS_RESERVED_NAMES = {"claude.md", "memory.md", "settings.json"}
+
+
+@app.get("/api/profiles/{profile_id}/extras")
+async def api_list_profile_extras(profile_id: str):
+    """List user-added .md files at the profile root (excludes CLAUDE.md/MEMORY.md)."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    d = _profile_dir(profile_id)
+    d.mkdir(parents=True, exist_ok=True)
+    files = []
+    for p in sorted(d.iterdir()):
+        if not (p.suffix == ".md" and p.is_file()):
+            continue
+        if p.name.lower() in _EXTRAS_RESERVED_NAMES:
+            continue
+        try:
+            files.append({"name": p.name, "content": p.read_text(),
+                          "size": p.stat().st_size})
+        except Exception:
+            logger.debug("Failed to read profile extra %s", p, exc_info=True)
+    return JSONResponse({"files": files, "path": str(d)})
+
+
+@app.post("/api/profiles/{profile_id}/extras")
+async def api_save_profile_extra(profile_id: str, body: SkillFileBody):
+    """Create or update a sidecar .md file at the profile root."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    fname = _sanitize_skill_filename(body.name)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename. Use alphanumeric, hyphens, underscores with .md extension."}, status_code=400)
+    if fname.lower() in _EXTRAS_RESERVED_NAMES:
+        return JSONResponse({"error": f"'{fname}' is reserved. Use the dedicated editor for it."}, status_code=400)
+    d = _profile_dir(profile_id)
+    d.mkdir(parents=True, exist_ok=True)
+    fpath = d / fname
+    if not str(fpath.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        fpath.write_text(body.content)
+        return JSONResponse({"ok": True, "name": fname})
+    except Exception:
+        logger.exception("Failed to save profile extra")
+        return JSONResponse({"error": "Failed to save extra file"}, status_code=500)
+
+
+@app.delete("/api/profiles/{profile_id}/extras/{filename}")
+async def api_delete_profile_extra(profile_id: str, filename: str):
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    fname = _sanitize_skill_filename(filename)
+    if not fname:
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    if fname.lower() in _EXTRAS_RESERVED_NAMES:
+        return JSONResponse({"error": "Reserved filename"}, status_code=400)
+    d = _profile_dir(profile_id)
+    fpath = d / fname
+    if not str(fpath.resolve()).startswith(str(d.resolve())):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if fpath.exists():
+        try:
+            fpath.unlink()
+        except Exception:
+            logger.exception("Failed to delete profile extra")
+            return JSONResponse({"error": "Failed to delete extra file"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+def _send_profile_export(session_name: str, profile_id: str):
+    """Send `export CLAUDE_CONFIG_DIR=...` (or unset) to the tmux pane shell."""
+    if profile_id == DEFAULT_PROFILE_ID:
+        cmd = "unset CLAUDE_CONFIG_DIR"
+    else:
+        cmd = f"export CLAUDE_CONFIG_DIR={shlex.quote(str(_profile_dir(profile_id)))}"
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", cmd],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"],
+                       capture_output=True, text=True, timeout=5)
+        return True
+    except Exception:
+        logger.debug("send-keys failed for profile export", exc_info=True)
+        return False
+
+
+@app.post("/api/sessions/{session_name}/profile")
+async def api_set_session_profile(session_name: str, body: SetSessionProfileBody):
+    _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    set_name = re.sub(r"[^a-zA-Z0-9_-]", "", body.name)
-    if not set_name:
-        return JSONResponse({"error": "Invalid set name"}, status_code=400)
-    src = _skill_dir_for_session(body.session_name)
-    dest = SKILL_LIBRARY_DIR / set_name
-    dest.mkdir(parents=True, exist_ok=True)
-    copied = []
-    for p in src.iterdir():
-        if p.suffix == ".md" and p.is_file():
-            shutil.copy2(str(p), str(dest / p.name))
-            copied.append(p.name)
-    return JSONResponse({"ok": True, "name": set_name, "files": copied})
+    data = _load_roles()
+    profile = _find_profile(body.profile_id, data)
+    if not profile:
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    pid = body.profile_id
+    if pid == DEFAULT_PROFILE_ID:
+        data["session_profiles"].pop(session_name, None)
+    else:
+        data["session_profiles"][session_name] = pid
+    _save_roles(data)
 
+    claude_running = await _async_is_claude_running(session_name)
+    exported = False
+    restarted = False
+    if not claude_running:
+        # Shell is exposed -- export immediately so the next `claude` invocation picks it up
+        exported = _send_profile_export(session_name, pid)
+    elif body.restart:
+        # Send /exit to Claude, wait for shell, export, relaunch
+        try:
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
+                capture_output=True, text=True, timeout=5)
+            for _ in range(15):
+                await asyncio.sleep(1)
+                if not await _async_is_claude_running(session_name):
+                    break
+            exported = _send_profile_export(session_name, pid)
+            await asyncio.sleep(0.3)
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 "claude --dangerously-skip-permissions"],
+                capture_output=True, text=True, timeout=5)
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5)
+            restarted = True
+        except Exception:
+            logger.exception("Failed to restart Claude with new profile")
 
-@app.post("/api/skill-library/load")
-async def api_load_from_library(body: SkillLibraryBody):
-    """Load a skill set from the library into a session's skills dir (merge/overwrite)."""
-    _, sess = _find_session(body.session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    set_name = re.sub(r"[^a-zA-Z0-9_-]", "", body.name)
-    if not set_name:
-        return JSONResponse({"error": "Invalid set name"}, status_code=400)
-    src = SKILL_LIBRARY_DIR / set_name
-    if not src.is_dir():
-        return JSONResponse({"error": "Library set not found"}, status_code=404)
-    dest = _skill_dir_for_session(body.session_name)
-    loaded = []
-    for p in src.iterdir():
-        if p.suffix == ".md" and p.is_file():
-            shutil.copy2(str(p), str(dest / p.name))
-            loaded.append(p.name)
-    return JSONResponse({"ok": True, "name": set_name, "files": loaded})
+    return JSONResponse({
+        "ok": True, "profile_id": pid,
+        "claude_was_running": claude_running,
+        "exported": exported, "restarted": restarted,
+    })
 
 
 # --- System stats ---
@@ -2372,6 +3799,56 @@ async def api_claude_auth_logout():
 
 
 _usage_cache: dict = {"ts": 0, "data": {}}
+_anthropic_limits_cache: dict = {"ts": 0, "data": None}
+
+
+@app.get("/api/usage/limits")
+async def api_anthropic_usage_limits():
+    """Fetch live 5h + 7-day rate-limit utilization from Anthropic OAuth usage API.
+
+    Cached for 1 hour per the user-facing requirement (poll hourly while
+    sessions are active). On upstream failure, returns the last good payload.
+    """
+    now = time.time()
+    if now - _anthropic_limits_cache["ts"] < 3600 and _anthropic_limits_cache["data"]:
+        return JSONResponse(_anthropic_limits_cache["data"])
+
+    creds_file = Path.home() / ".claude" / ".credentials.json"
+    token = ""
+    try:
+        creds = json.loads(creds_file.read_text())
+        token = creds.get("claudeAiOauth", {}).get("accessToken", "") or ""
+    except Exception:
+        pass
+    if not token:
+        return JSONResponse({"error": "not_authenticated"}, status_code=401)
+
+    def _fetch():
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "tmux-dashboard/1.0",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        data = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        logger.warning("Anthropic OAuth usage fetch failed: %s", e)
+        if _anthropic_limits_cache["data"]:
+            return JSONResponse(_anthropic_limits_cache["data"])
+        return JSONResponse({"error": "fetch_failed"}, status_code=502)
+
+    payload = {"fetched_at": now, **data}
+    _anthropic_limits_cache["ts"] = now
+    _anthropic_limits_cache["data"] = payload
+    return JSONResponse(payload)
+
 
 @app.get("/api/auth/usage")
 async def api_claude_usage():
@@ -4923,7 +6400,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
-.nav-status-text{font-size:.75rem;color:#6e7681;white-space:nowrap;padding-right:12px}
+.nav-usage{display:flex;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage-item{display:flex;align-items:center;gap:5px;cursor:default;line-height:1}
+.nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
+.nav-usage-bar{position:relative;width:96px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-usage-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
+.nav-usage-fill.warn{background:#d29922}
+.nav-usage-fill.crit{background:#f85149}
+.nav-usage.disabled{display:none}
+.nav-status-text{display:none}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -5228,30 +6713,87 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 /* CLAUDE.md editor modal */
 /* Skills tab */
-.skills-panel{display:flex;flex-direction:column;height:100%;gap:8px;padding:12px 0}
-.skills-toolbar{display:flex;gap:8px;padding:0 0 8px 0}
-.skills-list{flex:0 0 auto;max-height:200px;overflow-y:auto}
-.skills-file{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #21262d}
-.skills-file:hover{background:#161b22}
-.skills-file-name{color:#58a6ff;cursor:pointer;font-size:.85rem}
-.skills-file-meta{font-size:.7rem;color:#6e7681;margin-left:8px}
-.skills-file-actions{display:flex;gap:6px}
-.skills-editor-wrap{flex:1;display:flex;flex-direction:column;min-height:0}
-.skills-editor-header{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.skills-editor-header input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:6px 10px;font-size:.85rem;font-family:monospace}
+.skills-panel{display:flex;flex-direction:column;height:100%;gap:10px;padding:12px 0}
+.skills-meta{font-size:.78rem;color:#8b949e;padding:6px 10px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
+.skills-meta code{color:#79c0ff;background:transparent;padding:0;font-size:.78rem}
+.skills-toolbar{display:flex;gap:8px}
+.skills-section{display:flex;flex-direction:column}
+.skills-section-header{font-size:.78rem;color:#c9d1d9;font-weight:600;padding:4px 0;border-bottom:1px solid #30363d;margin-bottom:4px}
+.skills-section-hint{color:#6e7681;font-weight:400;font-size:.72rem;margin-left:4px}
+.skills-list{flex:0 0 auto;max-height:240px;overflow-y:auto}
+.skills-row{display:flex;align-items:flex-start;gap:8px;padding:8px 6px;border-bottom:1px solid #21262d}
+.skills-row:last-child{border-bottom:0}
+.skills-row.disabled-row{opacity:.65}
+.skills-row-toggle{flex:0 0 auto;display:flex;align-items:center;padding-top:2px}
+.skills-row-toggle input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#58a6ff}
+.skills-row-body{flex:1;min-width:0}
+.skills-row-name{color:#58a6ff;font-size:.85rem;font-weight:500;font-family:monospace}
+.skills-row-name.readonly-name{color:#c9d1d9;cursor:default}
+.skills-row-name.custom-name{color:#7ee787}
+.skills-row-desc{font-size:.75rem;color:#8b949e;margin-top:2px;line-height:1.4}
+.skills-row-tags{font-size:.68rem;color:#6e7681;margin-top:3px;font-style:italic}
+.skills-row-actions{flex:0 0 auto;display:flex;gap:6px}
+.skills-row-actions .btn{padding:2px 8px;font-size:.72rem}
+.skills-editor-wrap{flex:1;display:flex;flex-direction:column;min-height:0;margin-top:8px;border:1px solid #30363d;border-radius:6px;padding:8px;background:#0d1117}
+.skills-editor-header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.skills-editor-header input{flex:1;min-width:140px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:6px 10px;font-size:.85rem;font-family:monospace}
 .skills-editor{flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;resize:none;min-height:200px;line-height:1.5;outline:none}
 .skills-editor:focus{border-color:#58a6ff}
-.skills-empty{color:#6e7681;font-size:.85rem;padding:16px 0;text-align:center}
-/* Skills library overlay */
-.skills-library-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
-.skills-library-overlay.active{display:flex}
-.skills-library-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:500px;max-width:calc(100vw - 32px);max-height:calc(100vh - 120px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5)}
-.skills-library-panel h3{color:#f0f6fc;margin-bottom:16px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
-.skills-library-set{padding:10px 12px;border:1px solid #21262d;border-radius:8px;margin-bottom:8px;cursor:pointer;transition:background .15s}
-.skills-library-set:hover{background:#21262d}
-.skills-library-set-name{color:#58a6ff;font-weight:500;font-size:.9rem}
-.skills-library-set-meta{font-size:.72rem;color:#6e7681;margin-top:2px}
-.skills-library-actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end}
+.skills-empty{color:#6e7681;font-size:.8rem;padding:12px 0;text-align:center}
+/* Profile dropdown next to Terminal tab */
+.profile-wrap{display:flex;align-items:center;gap:6px;margin-left:8px;padding-left:8px;border-left:1px solid #21262d}
+.profile-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
+.profile-select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-size:.78rem;padding:4px 22px 4px 8px;border-radius:6px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%238b949e' d='M5 7L1 3h8z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center}
+.profile-select:focus{border-color:#58a6ff}
+.profile-restart-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:.85rem;line-height:1}
+.profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
+.profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
+@media(max-width:768px){.profile-label{display:none}.profile-wrap{margin-left:4px;padding-left:6px}}
+
+/* Profile editor modal */
+.profiles-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
+.profiles-overlay.active{display:flex}
+.profiles-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;width:900px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.profiles-panel h3{color:#f0f6fc;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.profiles-hint{font-size:.72rem;color:#6e7681;margin-bottom:12px;line-height:1.4}
+.profiles-body{display:flex;gap:14px;flex:1;min-height:0}
+.profiles-list{width:240px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;border-right:1px solid #21262d;padding-right:14px;overflow-y:auto}
+.profile-row{padding:8px 10px;border:1px solid #21262d;border-radius:6px;cursor:pointer;background:#0d1117;display:flex;flex-direction:column;gap:2px}
+.profile-row:hover{background:#1c2128}
+.profile-row.selected{border-color:#58a6ff;background:#0d2340}
+.profile-row-name{color:#c9d1d9;font-size:.85rem;font-weight:500}
+.profile-row-meta{color:#6e7681;font-size:.7rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.profile-row-builtin{color:#d2a8ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em}
+.profile-new-btn{background:#1c2333;border:1px solid #388bfd44;color:#58a6ff;padding:7px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500}
+.profile-new-btn:hover{background:#253049}
+.profile-edit{flex:1;display:flex;flex-direction:column;gap:8px;overflow-y:auto;min-width:0}
+.profile-edit label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-top:4px}
+.profile-edit input,.profile-edit textarea,.profile-edit select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.profile-edit input:focus,.profile-edit textarea:focus,.profile-edit select:focus{border-color:#58a6ff}
+.profile-edit textarea{resize:vertical;line-height:1.5}
+.profile-edit .ed-claude{min-height:200px}
+.profile-edit .ed-memory{min-height:120px}
+.profile-edit .ed-permissions{min-height:80px}
+.profile-edit .extras-section{border:1px solid #21262d;border-radius:6px;padding:8px;background:#0d1117}
+.profile-edit .extras-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #161b22}
+.profile-edit .extras-row:last-child{border-bottom:none}
+.profile-edit .extras-name{flex:1;color:#c9d1d9;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;cursor:pointer}
+.profile-edit .extras-name:hover{color:#58a6ff}
+.profile-edit .extras-meta{color:#6e7681;font-size:.68rem}
+.profile-edit .extras-empty{color:#6e7681;font-size:.78rem;font-style:italic;padding:4px 0}
+.profile-edit .extras-actions{display:flex;gap:6px;margin-top:6px}
+.profile-edit .extras-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:5px;font-size:.72rem;cursor:pointer}
+.profile-edit .extras-btn:hover{background:#30363d}
+.profile-edit .extras-del{color:#f85149;background:transparent;border:none;cursor:pointer;font-size:.95rem;padding:0 4px}
+.profile-edit .extras-del:hover{color:#ff7b72}
+.profile-edit .extras-editor{display:none;flex-direction:column;gap:6px;margin-top:6px;padding-top:6px;border-top:1px dashed #30363d}
+.profile-edit .extras-editor.active{display:flex}
+.profile-edit .extras-editor textarea{min-height:160px}
+.profile-edit .row2{display:flex;gap:8px}
+.profile-edit .row2>div{flex:1;display:flex;flex-direction:column;gap:4px}
+.profile-edit-actions{display:flex;gap:8px;justify-content:space-between;margin-top:10px;border-top:1px solid #21262d;padding-top:10px}
+.profile-empty{color:#6e7681;font-size:.85rem;text-align:center;padding:40px 20px}
+.profile-edit-readonly{color:#6e7681;font-style:italic;padding:8px 0;font-size:.8rem}
 
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .claudemd-overlay.active{display:flex}
@@ -5261,6 +6803,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .claudemd-editor:focus{border-color:#58a6ff}
 .claudemd-path{font-size:.7rem;color:#6e7681;margin-bottom:8px;font-family:'SF Mono','Fira Code',Consolas,monospace}
 .claudemd-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.claudemd-label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:4px;display:block}
+.claudemd-extras{padding:8px;border:1px solid #21262d;border-radius:6px;background:#0d1117}
+.claudemd-extras .extras-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #161b22}
+.claudemd-extras .extras-row:last-child{border-bottom:none}
+.claudemd-extras .extras-name{flex:1;color:#c9d1d9;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;cursor:pointer}
+.claudemd-extras .extras-name:hover{color:#58a6ff}
+.claudemd-extras .extras-meta{color:#6e7681;font-size:.68rem}
+.claudemd-extras .extras-empty{color:#6e7681;font-size:.78rem;font-style:italic;padding:4px 0}
+.claudemd-extras .extras-actions{display:flex;gap:6px;margin-top:6px}
+.claudemd-extras .extras-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:5px;font-size:.72rem;cursor:pointer}
+.claudemd-extras .extras-btn:hover{background:#30363d}
+.claudemd-extras .extras-del{color:#f85149;background:transparent;border:none;cursor:pointer;font-size:.95rem;padding:0 4px}
+.claudemd-extras .extras-del:hover{color:#ff7b72}
+.claudemd-extras .extras-editor{display:none;flex-direction:column;gap:6px;margin-top:6px;padding-top:6px;border-top:1px dashed #30363d}
+.claudemd-extras .extras-editor.active{display:flex}
+.claudemd-extras .extras-editor textarea{min-height:160px;width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
+.claudemd-extras .extras-editor textarea:focus{border-color:#58a6ff}
 
 /* Mobile */
 @media(max-width:768px){
@@ -5272,6 +6831,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   .nav-attached{display:none}
   .nav-server-stats{display:none}
   .nav-status-text{display:none}
+  .nav-usage{padding:0 6px 0 2px;margin-right:6px}
+  .nav-usage-bar{width:60px}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
   .claude-auth .status-dot{width:10px;height:10px}
@@ -5299,12 +6860,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </nav>
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
+  <span class="nav-usage" id="nav-usage" style="display:none">
+    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="">
+      <span class="nav-usage-label">5h</span>
+      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
+    </span>
+    <span class="nav-usage-item" id="nav-usage-7d-wrap" title="">
+      <span class="nav-usage-label">7d</span>
+      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
+    </span>
+  </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
   <div class="nav-tools-wrap">
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> CLAUDE.md</div>
+      <div class="nav-tools-item" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
+      <div class="nav-tools-item" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
     </div>
   </div>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
@@ -5327,26 +6899,51 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <div id="stats-content">Loading...</div>
   </div>
 </div>
-<!-- CLAUDE.md editor overlay -->
-<div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
-  <div class="claudemd-panel" id="claudemd-panel">
-    <h3>CLAUDE.md (Global) <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
-    <div class="claudemd-path" id="claudemd-path"></div>
-    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false"></textarea>
+<!-- Session MEMORY.md editor overlay -->
+<div class="claudemd-overlay" id="memorymd-overlay" onclick="if(event.target===this)closeSessionMemory()">
+  <div class="claudemd-panel">
+    <h3>MEMORY.md <span id="memorymd-session-tag" style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px"></span> <button class="stats-close" onclick="closeSessionMemory()">&times;</button></h3>
+    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Claude Code in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair.</div>
+    <label class="claudemd-label">MEMORY.md (index)</label>
+    <div class="claudemd-path" id="memorymd-path"></div>
+    <textarea class="claudemd-editor" id="memorymd-editor" spellcheck="false"></textarea>
     <div class="claudemd-actions">
-      <button class="btn" onclick="closeClaudeMd()">Cancel</button>
-      <button class="btn btn-full" onclick="saveClaudeMd()">Save</button>
+      <button class="btn" onclick="closeSessionMemory()">Close</button>
+      <button class="btn btn-full" onclick="saveSessionMemory()">Save MEMORY.md</button>
+    </div>
+    <label class="claudemd-label" style="margin-top:14px">Topic files in same directory</label>
+    <div class="extras-section claudemd-extras" id="memorymd-extras">
+      <div class="extras-empty">Loading...</div>
     </div>
   </div>
 </div>
-<!-- Skills library overlay -->
-<div class="skills-library-overlay" id="skills-library-overlay" onclick="if(event.target===this)closeSkillLibrary()">
-  <div class="skills-library-panel">
-    <h3>Skill Library <button class="stats-close" onclick="closeSkillLibrary()">&times;</button></h3>
-    <div id="skills-library-list"></div>
-    <div class="skills-library-actions">
-      <button class="btn" onclick="closeSkillLibrary()">Cancel</button>
-      <button class="btn btn-full" onclick="saveCurrentToLibrary()">Save Current Set</button>
+
+<!-- CLAUDE.md editor overlay -->
+<div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
+  <div class="claudemd-panel" id="claudemd-panel">
+    <h3>Global Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
+    <div class="profiles-hint" style="margin-bottom:10px">Files in your home directory loaded by every Claude Code session. <code>CLAUDE.md</code> is loaded automatically; sidecar <code>CLAUDE_*.md</code> files (like <code>CLAUDE_API_KEYS.md</code>) are loaded on demand when referenced from <code>CLAUDE.md</code>.</div>
+    <label class="claudemd-label">CLAUDE.md</label>
+    <div class="claudemd-path" id="claudemd-path"></div>
+    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false"></textarea>
+    <div class="claudemd-actions">
+      <button class="btn" onclick="closeClaudeMd()">Close</button>
+      <button class="btn btn-full" onclick="saveClaudeMd()">Save CLAUDE.md</button>
+    </div>
+    <label class="claudemd-label" style="margin-top:14px">Additional <code>CLAUDE_*.md</code> files in <code>~/</code></label>
+    <div class="extras-section claudemd-extras" id="global-extras">
+      <div class="extras-empty">Loading...</div>
+    </div>
+  </div>
+</div>
+<!-- Profiles editor overlay -->
+<div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
+  <div class="profiles-panel">
+    <h3>Claude Profiles <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
+    <div class="profiles-hint">Each profile is a fully isolated Claude Code config (settings.json, CLAUDE.md, MEMORY.md, skills/, plus any extra <code>.md</code> sidecar files you add) under <code>~/.claude-&lt;id&gt;/</code> selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>. The <strong>Default</strong> profile uses the standard <code>~/.claude</code>.</div>
+    <div class="profiles-body">
+      <div class="profiles-list" id="profiles-list">Loading...</div>
+      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
     </div>
   </div>
 </div>
@@ -5361,7 +6958,95 @@ let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:''};return rawState[n]}
+
+// --- "Hide Bash/Fetch" filter ---
+function getHideBashPref(){
+  try{const v=localStorage.getItem('hideBashLines');return v===null?true:v==='true'}catch(e){return true}
+}
+function setHideBashPref(v){
+  try{localStorage.setItem('hideBashLines',v?'true':'false')}catch(e){}
+}
+// Claude Code's TUI lays out tool calls like:
+//   ● Bash(sleep 540 && gcloud ...
+//         --command="date; ...")        <- wrap continuation, indented, no marker
+//     ⎿  Mon May 11 ...                 <- output
+//
+// The user wants the "specific commands the agent is writing" hidden — so we
+// hide the bullet header line AND its wrap-continuation lines (indented, no
+// bullet/output marker). We KEEP the `⎿` output lines so the user can still
+// see what the command produced.
+const _BASH_FILTER_RE=/^(?:Bash|Fetch)\b/i;
+const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
+const _OUTPUT_MARKER_RE=/^[\s]*⎿/;
+const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
+function _isBashFetchHeader(line){
+  const stripped=line.replace(_ANY_DECORATION_RE,'');
+  return _BASH_FILTER_RE.test(stripped);
+}
+function applyRawFilter(text){
+  if(!getHideBashPref())return text;
+  if(!text)return text;
+  const lines=text.split('\n');
+  const out=[];
+  let suppressing=false;
+  for(const line of lines){
+    if(_isBashFetchHeader(line)){
+      suppressing=true;
+      continue;
+    }
+    if(suppressing){
+      // End suppression when we hit an output marker, a new bullet (different
+      // tool), or a clearly unrelated structural line (empty line / something
+      // starting at column 0 that isn't an indented continuation).
+      if(_OUTPUT_MARKER_RE.test(line)){
+        suppressing=false;
+        // keep this output line
+      }else if(_LEADING_BULLET_RE.test(line)){
+        suppressing=false;
+        // keep this bullet line (different tool)
+      }else if(line.trim()===''){
+        suppressing=false;
+        // keep blank lines so paragraph breaks stay intact
+      }else if(/^\S/.test(line)){
+        // Starts at column 0 with non-space — not a wrap continuation
+        suppressing=false;
+      }else{
+        // Indented continuation of the hidden command — skip
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+function renderRawText(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  const wasAtBottom=!st.userScrolledUp;
+  const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
+  const filtered=applyRawFilter(st.fullText);
+  rawEl._programmaticScroll=true;
+  rawEl.textContent=filtered||'(empty)';
+  if(wasAtBottom){
+    rawEl.scrollTop=rawEl.scrollHeight;
+  }else{
+    rawEl.scrollTop=Math.max(0,rawEl.scrollHeight-prevDistFromBottom);
+  }
+}
+function rerenderAllRaw(){
+  // Called after the filter preference changes — re-render every cached buffer
+  for(const n in rawState){
+    if(rawState[n]&&rawState[n].fullText)renderRawText(n);
+  }
+}
+function toggleHideBash(name,checked){
+  setHideBashPref(checked);
+  const lbl=document.getElementById('hidebash-status-'+name);
+  if(lbl)lbl.textContent=checked?'On — hiding tool calls':'Off — showing all output';
+  rerenderAllRaw();
+}
 const lastStatus={};
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
@@ -5470,11 +7155,16 @@ function renderChatBubbles(name){
 }
 
 function saveRawCache(){
-  // Save terminal content + scroll position before DOM is destroyed
+  // Save terminal content + scroll position before DOM is destroyed.
+  // Prefer the unfiltered fullText (so the filter toggle keeps working after a
+  // re-render) and remember the line count so the info label can be restored.
   sessions.forEach(s=>{
     const rawEl=document.getElementById('raw-'+s.name);
     if(rawEl&&!rawEl.textContent.startsWith('Loading')){
-      rawCache[s.name]={text:rawEl.textContent,scrollTop:rawEl.scrollTop,scrollHeight:rawEl.scrollHeight};
+      const st=rawState[s.name]||{};
+      const fullText=st.fullText||rawEl.textContent;
+      const lineCount=fullText?fullText.split('\n').length:0;
+      rawCache[s.name]={text:fullText,scrollTop:rawEl.scrollTop,scrollHeight:rawEl.scrollHeight,lineCount:lineCount};
     }
   });
 }
@@ -5493,12 +7183,14 @@ function renderDetail(){
   mainEl.innerHTML=`
     <div class="tab-bar">
       <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
+      ${renderProfileDropdown(s)}
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'} &#9662;</div>
         <div class="tab-more-menu" id="tab-more-menu">
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
           <div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
+          <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">MEMORY.md</div>
         </div>
       </div>
       <div class="detail-badges">
@@ -5560,18 +7252,31 @@ function renderDetail(){
 
     <div class="tab-content ${tab==='skills'?'active':''}" id="tab-skills-${s.name}">
       <div class="skills-panel">
+        <div class="skills-meta" id="skills-meta-${s.name}">Loading...</div>
         <div class="skills-toolbar">
-          <button class="btn" onclick="newSkillFile('${s.name}')">+ New File</button>
-          <button class="btn" onclick="openSkillLibrary('${s.name}')">Library</button>
+          <button class="btn" onclick="newLibrarySkill('${s.name}')">+ New Library Skill</button>
+          <button class="btn" onclick="loadProfileSkills('${s.name}')">Refresh</button>
         </div>
-        <div class="skills-list" id="skills-list-${s.name}"></div>
+        <div class="skills-section">
+          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Claude in this profile)</span></div>
+          <div class="skills-list" id="skills-active-${s.name}"></div>
+        </div>
+        <div class="skills-section">
+          <div class="skills-section-header">Library <span class="skills-section-hint">(toggle on/off for this profile)</span></div>
+          <div class="skills-list" id="skills-library-${s.name}"></div>
+        </div>
+        <div class="skills-section">
+          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with Claude Code; always available)</span></div>
+          <div class="skills-list" id="skills-builtin-${s.name}"></div>
+        </div>
         <div class="skills-editor-wrap" id="skills-editor-wrap-${s.name}" style="display:none">
           <div class="skills-editor-header">
-            <input id="skills-filename-${s.name}" placeholder="filename.md">
-            <button class="btn" onclick="saveSkillFile('${s.name}')">Save</button>
+            <input id="skills-filename-${s.name}" placeholder="skill-name (e.g. my-skill)">
+            <input id="skills-description-${s.name}" placeholder="One-line description (used by Claude to discover the skill)">
+            <button class="btn" onclick="saveLibrarySkill('${s.name}')">Save</button>
             <button class="btn" onclick="closeSkillEditor('${s.name}')">Cancel</button>
           </div>
-          <textarea class="skills-editor" id="skills-editor-${s.name}"></textarea>
+          <textarea class="skills-editor" id="skills-editor-${s.name}" placeholder="# Skill body (markdown)..."></textarea>
         </div>
       </div>
     </div>
@@ -5610,6 +7315,19 @@ function renderDetail(){
       <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
+      </div>
+      <div class="tier" style="margin-top:12px" id="hidebash-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide Bash/Fetch</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label class="watchdog-toggle">
+            <input type="checkbox" id="hidebash-toggle-${s.name}"
+              onchange="toggleHideBash('${esc(s.name)}',this.checked)"
+              ${getHideBashPref()?'checked':''}>
+            <span class="watchdog-toggle-slider"></span>
+          </label>
+          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls':'Off — showing all output'}</span>
+        </div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides lines whose stripped content starts with <code style="color:#79c0ff">Bash(...)</code> or <code style="color:#79c0ff">Fetch(...)</code> so you can focus on the conversation. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Simple Watchdog</div>
@@ -5679,9 +7397,16 @@ function renderDetail(){
     const rawEl=document.getElementById('raw-'+s.name);
     if(rawEl){
       const cached=rawCache[s.name];
+      const infoEl=document.getElementById('raw-info-'+s.name);
       if(cached){
-        rawEl.textContent=cached.text;
+        // Restore unfiltered text into state, then render through the filter
+        const st=getRawState(s.name);
+        st.fullText=cached.text;
+        st.userScrolledUp=false;
+        rawEl._programmaticScroll=true;
+        rawEl.textContent=applyRawFilter(cached.text)||'(empty)';
         rawEl.scrollTop=rawEl.scrollHeight;
+        if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
         startRawPolling(s.name);
       }else{
         loadRaw(s.name);
@@ -5694,7 +7419,7 @@ function renderDetail(){
     if(s.simple_watchdog!==false)startWatchdogPolling(s.name);
     else loadWatchdogStatus(s.name);
   }
-  if(tab==='skills')loadSkillFiles(s.name);
+  if(tab==='skills')loadProfileSkills(s.name);
 }
 
 function selectSession(name){
@@ -5743,7 +7468,7 @@ function switchTab(name,tab){
     if(s&&s.simple_watchdog!==false)startWatchdogPolling(name);
     else loadWatchdogStatus(name);
   }
-  if(tab==='skills')loadSkillFiles(name);
+  if(tab==='skills')loadProfileSkills(name);
   if(tab==='chat'){
     // Re-render chat bubbles to pick up messages added while on other tabs
     const chatEl=document.getElementById('chat-'+name);
@@ -6083,45 +7808,45 @@ function stopAllRawPolling(){
   for(const n in rawState)stopRawPolling(n);
 }
 
+function _ensureRawScrollTracking(rawEl,st){
+  if(rawEl._scrollTracked)return;
+  rawEl._scrollTracked=true;
+  // Single `scroll` listener catches wheel, touch, scrollbar drag, and keyboard
+  // navigation. Programmatic scrolls flip `_programmaticScroll` so they don't
+  // get misclassified as user scrolls.
+  rawEl.addEventListener('scroll',()=>{
+    if(rawEl._programmaticScroll){
+      rawEl._programmaticScroll=false;
+      // Programmatic scroll-to-bottom keeps the "follow-tail" mode on
+      const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<10;
+      if(atBottom)st.userScrolledUp=false;
+      return;
+    }
+    const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<24;
+    st.userScrolledUp=!atBottom;
+  },{passive:true});
+}
+
 async function pollRawDelta(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
   if(!rawEl)return;
-  // Track scroll position via user interaction (wheel/touch), not programmatic scroll events
-  if(!rawEl._scrollTracked){
-    rawEl._scrollTracked=true;
-    rawEl.addEventListener('wheel',()=>{
-      setTimeout(()=>{
-        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<80;
-        st.userScrolledUp=!atBottom;
-      },50);
-    },{passive:true});
-    rawEl.addEventListener('touchmove',()=>{
-      setTimeout(()=>{
-        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<80;
-        st.userScrolledUp=!atBottom;
-      },50);
-    },{passive:true});
-  }
+  _ensureRawScrollTracking(rawEl,st);
   try{
     const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'');
     const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail'+q);
     const data=await resp.json();
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(data.mode==='full'){
-      // When user has scrolled up, preserve distance from bottom across content replacement
-      const distFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
-      rawEl.textContent=data.raw||'(empty)';
+      st.fullText=data.raw||'';
       st.knownLines=data.pane_total;
       st.firstLoad=false;
-      if(st.userScrolledUp){rawEl.scrollTop=rawEl.scrollHeight-distFromBottom}
-      else{rawEl.scrollTop=rawEl.scrollHeight}
+      renderRawText(name);
       if(infoEl)infoEl.textContent=data.total_lines+' lines';
     }else if(data.mode==='delta'&&data.raw){
       const newLines=data.raw.split('\n');
-      const curText=rawEl.textContent;
-      const existingLines=curText.split('\n');
+      const existingLines=(st.fullText||'').split('\n');
       let appendFrom=0;
       let overlapMatched=false;
       if(data.overlap&&existingLines.length>=data.overlap){
@@ -6132,25 +7857,31 @@ async function pollRawDelta(name){
       if(overlapMatched){
         const toAppend=newLines.slice(appendFrom).join('\n');
         if(toAppend){
-          rawEl.textContent=curText+'\n'+toAppend;
+          st.fullText=(st.fullText?st.fullText+'\n':'')+toAppend;
         }
+        st.knownLines=data.pane_total;
+        renderRawText(name);
+        if(infoEl)infoEl.textContent=data.total_lines+' lines';
       }else{
-        const distFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
+        // Overlap mismatch — fetch a full snapshot to resync
         st.knownLines=0;
         const fullResp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines=0');
         const fullData=await fullResp.json();
         if(fullData.mode==='full'){
-          rawEl.textContent=fullData.raw||'(empty)';
+          st.fullText=fullData.raw||'';
           st.knownLines=fullData.pane_total;
+          renderRawText(name);
           if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
-          if(st.userScrolledUp){rawEl.scrollTop=rawEl.scrollHeight-distFromBottom}
-          else{rawEl.scrollTop=rawEl.scrollHeight}
         }
       }
-      if(!overlapMatched)return;
-      st.knownLines=data.pane_total;
-      if(infoEl)infoEl.textContent=data.total_lines+' lines';
-      if(!st.userScrolledUp)rawEl.scrollTop=rawEl.scrollHeight;
+    }else if(data.mode==='none'){
+      // No change upstream — but if the info label still says "Loading..."
+      // (e.g. first poll after restoring cached content) make sure it's
+      // replaced so the user doesn't see a stuck loading indicator.
+      if(infoEl&&/loading/i.test(infoEl.textContent)){
+        const lineCount=(st.fullText||'').split('\n').length;
+        infoEl.textContent=(data.total_lines||lineCount)+' lines';
+      }
     }
   }catch(e){}
 }
@@ -6161,8 +7892,11 @@ async function loadRaw(name){
   st.userScrolledUp=false;
   st.visibleHash='';
   st.firstLoad=true;
+  st.fullText='';
   const rawEl=document.getElementById('raw-'+name);
   if(rawEl)rawEl.textContent='Loading Claude Code...';
+  const infoEl=document.getElementById('raw-info-'+name);
+  if(infoEl)infoEl.textContent='Loading terminal...';
   await pollRawDelta(name);
 }
 
@@ -6346,6 +8080,59 @@ async function refreshNavStats(){
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
+
+// --- Anthropic OAuth usage limits (5h + 7d) in nav header ---
+let _usageLimitsTimer=null;
+function _fmtResetTime(iso){
+  if(!iso)return'';
+  try{
+    const d=new Date(iso);
+    const now=new Date();
+    const diffMs=d-now;
+    if(diffMs<=0)return'now';
+    const mins=Math.floor(diffMs/60000);
+    if(mins<60)return'in '+mins+'m';
+    const hrs=Math.floor(mins/60);
+    if(hrs<48)return'in '+hrs+'h';
+    return'in '+Math.floor(hrs/24)+'d';
+  }catch(e){return''}
+}
+function _applyUsageStyle(fillEl,pctNum){
+  if(!fillEl)return;
+  fillEl.style.width=Math.min(100,Math.max(0,pctNum))+'%';
+  let cls='';
+  if(pctNum>=90)cls='crit';
+  else if(pctNum>=70)cls='warn';
+  fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
+}
+async function refreshUsageLimits(){
+  const wrap=document.getElementById('nav-usage');
+  if(!wrap)return;
+  try{
+    const resp=await fetch(BASE+'/api/usage/limits');
+    if(!resp.ok){wrap.style.display='none';return}
+    const data=await resp.json();
+    if(!data||(!data.five_hour&&!data.seven_day)){wrap.style.display='none';return}
+    wrap.style.display='flex';
+    const fh=data.five_hour||{};
+    const sd=data.seven_day||{};
+    _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
+    _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
+    const fhWrap=document.getElementById('nav-usage-5h-wrap');
+    const sdWrap=document.getElementById('nav-usage-7d-wrap');
+    if(fhWrap)fhWrap.title='Anthropic 5-hour limit · '+(Math.round(Number(fh.utilization)||0))+'% used · resets '+_fmtResetTime(fh.resets_at);
+    if(sdWrap)sdWrap.title='Anthropic 7-day limit · '+(Math.round(Number(sd.utilization)||0))+'% used · resets '+_fmtResetTime(sd.resets_at);
+  }catch(e){
+    /* keep last known display */
+  }
+}
+function startUsageLimitsPolling(){
+  if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
+  refreshUsageLimits();
+  // Poll every hour (3600s) while page is open — backend caches upstream calls
+  _usageLimitsTimer=setInterval(refreshUsageLimits,3600*1000);
+}
+startUsageLimitsPolling();
 
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 
@@ -7083,167 +8870,749 @@ async function sendSlashCommand(name,cmd){
 }
 
 // ── Skills Tab ──
-let _skillsLibrarySession='';
+// Per-profile skills UI:
+//   • Active section: what Claude actually loads from ~/.claude-<profile>/skills/
+//   • Library section: toggle-on/off canonical skills from ~/.tmux-dashboard/skill-library/
+//     (enabling = symlink into the profile's skills dir; disabling = unlink)
+//   • Built-in section: read-only list of skills bundled with Claude Code
+//
+// The session's profile_id (set per tmux session) determines the scope.
+let _builtinSkillsCache=null;
+let _editingSkillSession=null;
+let _editingSkillName=null;
 
-async function loadSkillFiles(name){
-  const listEl=document.getElementById('skills-list-'+name);
-  if(!listEl)return;
-  listEl.innerHTML='<div class="skills-empty">Loading...</div>';
+function _profileForSession(name){
+  const s=sessions.find(x=>x.name===name);
+  return (s&&s.profile_id)||'default';
+}
+
+async function loadProfileSkills(name){
+  const meta=document.getElementById('skills-meta-'+name);
+  const activeEl=document.getElementById('skills-active-'+name);
+  const libEl=document.getElementById('skills-library-'+name);
+  const builtinEl=document.getElementById('skills-builtin-'+name);
+  if(!activeEl||!libEl||!builtinEl)return;
+  const pid=_profileForSession(name);
+  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>'+(pid==='default'?' &nbsp;<span style="color:#d29922">(library toggling is disabled on the default profile — manage <code>~/.claude/skills/</code> directly)</span>':'');
+  activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
+  libEl.innerHTML='<div class="skills-empty">Loading...</div>';
+  builtinEl.innerHTML='<div class="skills-empty">Loading...</div>';
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills');
-    const data=await resp.json();
-    if(!data.files||!data.files.length){
-      listEl.innerHTML='<div class="skills-empty">No skill files yet. Click "+ New File" to create one.</div>';
-      return;
-    }
-    listEl.innerHTML=data.files.map(f=>`
-      <div class="skills-file">
-        <span>
-          <span class="skills-file-name" onclick="editSkillFile('${name}','${esc(f.name)}')">${esc(f.name)}</span>
-          <span class="skills-file-meta">${(f.size/1024).toFixed(1)} KB</span>
-        </span>
-        <span class="skills-file-actions">
-          <button class="btn" style="padding:2px 8px;font-size:.75rem" onclick="editSkillFile('${name}','${esc(f.name)}')">Edit</button>
-          <button class="btn btn-danger" style="padding:2px 8px;font-size:.75rem" onclick="deleteSkillFile('${name}','${esc(f.name)}')">Del</button>
-        </span>
-      </div>`).join('');
+    const [activeResp,libResp,builtinResp]=await Promise.all([
+      fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills'),
+      fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library'),
+      _builtinSkillsCache?Promise.resolve({ok:true,json:()=>Promise.resolve({skills:_builtinSkillsCache})}):fetch(BASE+'/api/builtin-skills'),
+    ]);
+    const activeData=await activeResp.json();
+    const libData=await libResp.json();
+    const builtinData=await builtinResp.json();
+    if(builtinData&&builtinData.skills)_builtinSkillsCache=builtinData.skills;
+    _renderActiveSkills(name,pid,activeData);
+    _renderLibrarySkills(name,pid,libData);
+    _renderBuiltinSkills(name,builtinData.skills||[]);
   }catch(e){
-    listEl.innerHTML='<div class="skills-empty" style="color:#f85149">Failed to load skills.</div>';
+    activeEl.innerHTML='<div class="skills-empty" style="color:#f85149">Failed to load.</div>';
+    libEl.innerHTML='<div class="skills-empty" style="color:#f85149">Failed to load.</div>';
+    builtinEl.innerHTML='<div class="skills-empty" style="color:#f85149">Failed to load.</div>';
   }
 }
 
-function newSkillFile(name){
-  const wrap=document.getElementById('skills-editor-wrap-'+name);
-  const fnameEl=document.getElementById('skills-filename-'+name);
-  const editorEl=document.getElementById('skills-editor-'+name);
+function _renderActiveSkills(name,pid,data){
+  const el=document.getElementById('skills-active-'+name);
+  if(!el)return;
+  const skills=(data&&data.skills)||[];
+  const legacy=(data&&data.legacy_files)||[];
+  const rows=[];
+  if(!skills.length&&!legacy.length){
+    el.innerHTML='<div class="skills-empty">No skills installed for this profile. Enable some from the Library below.</div>';
+    return;
+  }
+  for(const sk of skills){
+    const tag=sk.from_library?'library link':'custom (in-profile)';
+    const nameClass=sk.from_library?'':'custom-name';
+    rows.push(`
+      <div class="skills-row">
+        <div class="skills-row-body">
+          <div class="skills-row-name ${nameClass}">${esc(sk.name)}</div>
+          <div class="skills-row-desc">${esc(sk.description||'(no description in frontmatter)')}</div>
+          <div class="skills-row-tags">${esc(tag)} · ${esc(sk.dir_name)}/SKILL.md</div>
+        </div>
+      </div>`);
+  }
+  for(const fname of legacy){
+    rows.push(`
+      <div class="skills-row disabled-row">
+        <div class="skills-row-body">
+          <div class="skills-row-name custom-name">${esc(fname)}</div>
+          <div class="skills-row-desc">Legacy flat file. Claude Code does not load this format — wrap it in a <code>${esc(fname.replace(/\.md$/,''))}/SKILL.md</code> directory with frontmatter to load.</div>
+        </div>
+      </div>`);
+  }
+  el.innerHTML=rows.join('');
+}
+
+function _renderLibrarySkills(name,pid,data){
+  const el=document.getElementById('skills-library-'+name);
+  if(!el)return;
+  const skills=(data&&data.skills)||[];
+  const isDefault=!!(data&&data.default_profile);
+  if(!skills.length){
+    el.innerHTML='<div class="skills-empty">No skills in the library yet. Click "+ New Library Skill" to create one.</div>';
+    return;
+  }
+  el.innerHTML=skills.map(sk=>{
+    const disabledAttr=isDefault?'disabled':'';
+    return `
+      <div class="skills-row${sk.enabled?'':' disabled-row'}">
+        <div class="skills-row-toggle"><input type="checkbox" ${sk.enabled?'checked':''} ${disabledAttr} onchange="toggleLibrarySkill('${esc(name)}','${esc(sk.dir_name)}',this.checked)"></div>
+        <div class="skills-row-body">
+          <div class="skills-row-name">${esc(sk.name)}</div>
+          <div class="skills-row-desc">${esc(sk.description||'(no description)')}</div>
+          <div class="skills-row-tags">${esc(sk.dir_name)}/SKILL.md ${sk.enabled?'· enabled':'· disabled'}</div>
+        </div>
+        <div class="skills-row-actions">
+          <button class="btn" onclick="editLibrarySkill('${esc(name)}','${esc(sk.dir_name)}')">Edit</button>
+          <button class="btn btn-danger" onclick="deleteLibrarySkill('${esc(name)}','${esc(sk.dir_name)}')">Del</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function _renderBuiltinSkills(name,skills){
+  const el=document.getElementById('skills-builtin-'+name);
+  if(!el)return;
+  if(!skills.length){
+    el.innerHTML='<div class="skills-empty">No built-in skills reported.</div>';
+    return;
+  }
+  el.innerHTML=skills.map(sk=>`
+    <div class="skills-row">
+      <div class="skills-row-body">
+        <div class="skills-row-name readonly-name">${esc(sk.name)}</div>
+        <div class="skills-row-desc">${esc(sk.description||'')}</div>
+        <div class="skills-row-tags">bundled · always available</div>
+      </div>
+    </div>`).join('');
+}
+
+async function toggleLibrarySkill(sessionName,skillDirName,enable){
+  const pid=_profileForSession(sessionName);
+  if(pid==='default'){
+    alert('Cannot toggle library skills on the default profile. Manage ~/.claude/skills/ directly.');
+    loadProfileSkills(sessionName);
+    return;
+  }
+  const url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library/'+encodeURIComponent(skillDirName);
+  try{
+    const resp=await fetch(url,{method:enable?'POST':'DELETE'});
+    const data=await resp.json();
+    if(!resp.ok){
+      alert(data.error||'Failed to toggle skill');
+    }
+  }catch(e){
+    alert('Failed to toggle skill.');
+  }
+  loadProfileSkills(sessionName);
+}
+
+function newLibrarySkill(sessionName){
+  _editingSkillSession=sessionName;
+  _editingSkillName=null;
+  const wrap=document.getElementById('skills-editor-wrap-'+sessionName);
+  const fnameEl=document.getElementById('skills-filename-'+sessionName);
+  const descEl=document.getElementById('skills-description-'+sessionName);
+  const editorEl=document.getElementById('skills-editor-'+sessionName);
   if(!wrap||!fnameEl||!editorEl)return;
   fnameEl.value='';
-  editorEl.value='';
+  fnameEl.disabled=false;
+  if(descEl)descEl.value='';
+  editorEl.value='# My new skill\n\nDescribe what this skill does and when to use it.\n';
   wrap.style.display='flex';
   fnameEl.focus();
 }
 
-async function editSkillFile(name,filename){
-  const wrap=document.getElementById('skills-editor-wrap-'+name);
-  const fnameEl=document.getElementById('skills-filename-'+name);
-  const editorEl=document.getElementById('skills-editor-'+name);
+async function editLibrarySkill(sessionName,skillDirName){
+  _editingSkillSession=sessionName;
+  _editingSkillName=skillDirName;
+  const wrap=document.getElementById('skills-editor-wrap-'+sessionName);
+  const fnameEl=document.getElementById('skills-filename-'+sessionName);
+  const descEl=document.getElementById('skills-description-'+sessionName);
+  const editorEl=document.getElementById('skills-editor-'+sessionName);
   if(!wrap||!fnameEl||!editorEl)return;
-  // Fetch content from the list we already loaded, or re-fetch
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills');
+    const resp=await fetch(BASE+'/api/skill-library/'+encodeURIComponent(skillDirName));
     const data=await resp.json();
-    const file=data.files.find(f=>f.name===filename);
-    if(file){
-      fnameEl.value=file.name;
-      editorEl.value=file.content;
-    }else{
-      fnameEl.value=filename;
-      editorEl.value='';
+    if(!resp.ok){alert(data.error||'Failed to load skill');return}
+    fnameEl.value=data.dir_name||skillDirName;
+    fnameEl.disabled=true;  // can't rename via this editor
+    if(descEl)descEl.value=data.description||'';
+    // Strip frontmatter from content for display so the user edits the body only
+    let body=data.content||'';
+    if(body.startsWith('---')){
+      const end=body.indexOf('\n---',3);
+      if(end!==-1){
+        body=body.slice(end+4).replace(/^\s*\n/,'');
+      }
     }
-  }catch(e){
-    fnameEl.value=filename;
-    editorEl.value='';
-  }
-  wrap.style.display='flex';
-  editorEl.focus();
+    editorEl.value=body;
+    wrap.style.display='flex';
+    editorEl.focus();
+  }catch(e){alert('Failed to load skill for editing.')}
 }
 
-async function saveSkillFile(name){
-  const fnameEl=document.getElementById('skills-filename-'+name);
-  const editorEl=document.getElementById('skills-editor-'+name);
+async function saveLibrarySkill(sessionName){
+  const fnameEl=document.getElementById('skills-filename-'+sessionName);
+  const descEl=document.getElementById('skills-description-'+sessionName);
+  const editorEl=document.getElementById('skills-editor-'+sessionName);
   if(!fnameEl||!editorEl)return;
-  let fname=fnameEl.value.trim();
-  if(!fname){alert('Please enter a filename.');return}
-  if(!fname.endsWith('.md'))fname+='.md';
+  let skillName=(_editingSkillName||fnameEl.value||'').trim();
+  if(!skillName){alert('Please enter a skill name (e.g. my-skill).');return}
+  // Strip .md if user typed it; sanitize to allowed chars (server validates too)
+  if(skillName.endsWith('.md'))skillName=skillName.slice(0,-3);
+  if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(skillName)){
+    alert('Skill name must be alphanumeric, hyphens, or underscores (max 64 chars).');
+    return;
+  }
+  const description=descEl?descEl.value.trim():'';
+  if(!description){
+    if(!confirm('No description set. Claude Code uses the description to discover skills — without one, this skill may never trigger automatically. Save anyway?'))return;
+  }
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills',{
+    const resp=await fetch(BASE+'/api/skill-library/'+encodeURIComponent(skillName),{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:fname,content:editorEl.value})
+      body:JSON.stringify({description:description,content:editorEl.value})
     });
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed to save');return}
-    closeSkillEditor(name);
-    loadSkillFiles(name);
-  }catch(e){alert('Failed to save skill file.')}
+    closeSkillEditor(sessionName);
+    loadProfileSkills(sessionName);
+  }catch(e){alert('Failed to save skill.')}
 }
 
-async function deleteSkillFile(name,filename){
-  if(!confirm('Delete '+filename+'?'))return;
+async function deleteLibrarySkill(sessionName,skillDirName){
+  if(!confirm('Delete library skill "'+skillDirName+'"?\nThis removes it from EVERY profile (any symlinks pointing to it will also be removed).'))return;
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/skills/'+encodeURIComponent(filename),{method:'DELETE'});
+    const resp=await fetch(BASE+'/api/skill-library/'+encodeURIComponent(skillDirName),{method:'DELETE'});
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed to delete');return}
-    loadSkillFiles(name);
-  }catch(e){alert('Failed to delete skill file.')}
+    loadProfileSkills(sessionName);
+  }catch(e){alert('Failed to delete skill.')}
 }
 
 function closeSkillEditor(name){
   const wrap=document.getElementById('skills-editor-wrap-'+name);
   if(wrap)wrap.style.display='none';
+  _editingSkillSession=null;
+  _editingSkillName=null;
 }
 
-async function openSkillLibrary(name){
-  _skillsLibrarySession=name;
-  const overlay=document.getElementById('skills-library-overlay');
-  overlay.classList.add('active');
-  const listEl=document.getElementById('skills-library-list');
-  listEl.innerHTML='<div style="color:#8b949e;padding:8px">Loading...</div>';
+// ── Claude profiles ──
+let _profilesCache = null;        // [{id,name,model,effort,builtin}, ...]
+let _profilesEditing = null;       // currently-edited full profile object
+let _profilePending = {};          // sessionName -> "pending restart" flag
+
+async function loadProfiles(force){
+  if(_profilesCache && !force) return _profilesCache;
   try{
-    const resp=await fetch(BASE+'/api/skill-library');
-    const data=await resp.json();
-    if(!data.sets||!data.sets.length){
-      listEl.innerHTML='<div style="color:#6e7681;padding:12px;text-align:center">No saved skill sets yet.</div>';
-      return;
+    const resp = await fetch(BASE+'/api/profiles');
+    const data = await resp.json();
+    _profilesCache = data.profiles || [];
+  }catch(e){ _profilesCache = []; }
+  return _profilesCache;
+}
+
+function renderProfileDropdown(s){
+  const cur = s.profile_id || 'default';
+  const list = _profilesCache || [];
+  const opts = list.length
+    ? list.map(p=>`<option value="${esc(p.id)}" ${p.id===cur?'selected':''}>${esc(p.name)}</option>`).join('')
+    : `<option value="default" selected>Default</option>`;
+  const pending = _profilePending[s.name] ? ' pending' : '';
+  const restartTitle = _profilePending[s.name]
+    ? 'Restart Claude to apply the new profile'
+    : 'Restart Claude with this profile';
+  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)">
+    <span class="profile-label">Profile</span>
+    <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
+    <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
+  </div>`;
+}
+
+async function onProfileChange(sessionName, profileId){
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({profile_id: profileId, restart: false})
+    });
+    const data = await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to set profile'); return;}
+    // Update local cache so the badge stays consistent across re-renders
+    const sess = sessions.find(x=>x.name===sessionName);
+    if(sess) sess.profile_id = profileId;
+    if(data.claude_was_running && !data.restarted){
+      _profilePending[sessionName] = true;
+    }else{
+      delete _profilePending[sessionName];
     }
-    listEl.innerHTML=data.sets.map(s=>`
-      <div class="skills-library-set" onclick="loadSkillSet('${_skillsLibrarySession}','${esc(s.name)}')">
-        <div class="skills-library-set-name">${esc(s.name)}</div>
-        <div class="skills-library-set-meta">${s.files.length} file${s.files.length!==1?'s':''}: ${s.files.join(', ')}</div>
-      </div>`).join('');
+    if(selectedSession===sessionName) renderDetail();
+  }catch(e){ alert('Failed to set profile.'); }
+}
+
+async function restartWithProfile(sessionName){
+  const sess = sessions.find(x=>x.name===sessionName);
+  const pid = (sess && sess.profile_id) || 'default';
+  if(!confirm('Exit Claude in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Claude state will be lost.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({profile_id: pid, restart: true})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to restart'); return; }
+    delete _profilePending[sessionName];
+    if(selectedSession===sessionName) renderDetail();
+  }catch(e){ alert('Failed to restart Claude.'); }
+}
+
+async function openProfiles(){
+  const overlay = document.getElementById('profiles-overlay');
+  overlay.classList.add('active');
+  await loadProfiles(true);
+  renderProfilesList();
+  document.getElementById('profile-edit').innerHTML =
+    '<div class="profile-empty">Select a profile on the left, or create a new one.</div>';
+}
+
+function closeProfiles(){
+  document.getElementById('profiles-overlay').classList.remove('active');
+  _profilesEditing = null;
+}
+
+function renderProfilesList(){
+  const list = _profilesCache || [];
+  const el = document.getElementById('profiles-list');
+  let html = '<button class="profile-new-btn" onclick="newProfilePrompt()">+ New profile</button>';
+  list.forEach(p => {
+    const sel = (_profilesEditing && _profilesEditing.id===p.id) ? ' selected' : '';
+    const tag = p.builtin
+      ? (p.id==='default' ? '<span class="profile-row-builtin">default</span>' : '<span class="profile-row-builtin">preset</span>')
+      : '';
+    const meta = (p.model||'') + (p.effort?(' &middot; '+esc(p.effort)):'');
+    html += `<div class="profile-row${sel}" onclick="editProfile('${esc(p.id)}')">
+      <div class="profile-row-name">${esc(p.name)} ${tag}</div>
+      <div class="profile-row-meta">${meta || '&mdash;'}</div>
+    </div>`;
+  });
+  el.innerHTML = html;
+}
+
+async function editProfile(profileId){
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId));
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to load profile'); return; }
+    _profilesEditing = data;
+    renderProfilesList();
+    renderProfileEdit();
+  }catch(e){ alert('Failed to load profile.'); }
+}
+
+function renderProfileEdit(){
+  const p = _profilesEditing;
+  const el = document.getElementById('profile-edit');
+  if(!p){ el.innerHTML = '<div class="profile-empty">Select a profile.</div>'; return; }
+  const isDefault = (p.id === 'default');
+  const permJson = JSON.stringify(p.permissions||{}, null, 2);
+  const envJson = JSON.stringify(p.env||{}, null, 2);
+  const dir = p.dir || (isDefault ? '~/.claude (merged)' : ('~/.claude-'+p.id));
+  const builtinTag = isDefault
+    ? ' <span class="profile-row-builtin">default</span>'
+    : (p.builtin ? ' <span class="profile-row-builtin">preset</span>' : '');
+  // Effort glyphs requested by user
+  const EFFORTS = [
+    {v:'',      label:'(default)'},
+    {v:'medium',label:'medium (◐)'},
+    {v:'high',  label:'high (●)'},
+    {v:'xhigh', label:'xhigh (◉)'},
+    {v:'max',   label:'max (⬤)'},
+  ];
+  const effortOpts = EFFORTS.map(o =>
+    `<option value="${o.v}"${(p.effort||'')===o.v?' selected':''}>${o.label}</option>`
+  ).join('');
+  const deleteBtn = isDefault
+    ? ''
+    : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
+  const headerNote = isDefault
+    ? '<div class="profiles-hint" style="margin:0 0 6px">Edits here are merged into <code>~/.claude/settings.json</code> -- only <code>model</code>, <code>env</code>, and <code>permissions</code> are touched. Other keys you set elsewhere are preserved. A backup is kept at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
+    : '';
+  el.innerHTML = `
+    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}${builtinTag}</div>
+    ${headerNote}
+    <label>Name</label>
+    <input id="ed-name" value="${esc(p.name||'')}">
+    <div class="row2">
+      <div>
+        <label>Model</label>
+        <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-7[1m] / blank">
+      </div>
+      <div>
+        <label>Effort level</label>
+        <select id="ed-effort">${effortOpts}</select>
+      </div>
+    </div>
+    <label>CLAUDE.md</label>
+    <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
+    <label>MEMORY.md</label>
+    <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
+    <label>Permissions (JSON)</label>
+    <textarea id="ed-permissions" class="ed-permissions" spellcheck="false">${esc(permJson)}</textarea>
+    <label>Env (JSON)</label>
+    <textarea id="ed-env" class="ed-permissions" spellcheck="false">${esc(envJson)}</textarea>
+    <label>Additional markdown files</label>
+    <div class="extras-section" id="ed-extras">
+      <div class="extras-empty">Loading...</div>
+    </div>
+    <div class="profile-edit-actions">
+      ${deleteBtn || '<span></span>'}
+      <div style="display:flex;gap:8px">
+        <button class="modal-cancel" onclick="closeProfiles()">Close</button>
+        <button class="modal-confirm-create" onclick="saveProfile()">Save</button>
+      </div>
+    </div>
+  `;
+  loadProfileExtras(p.id);
+}
+
+let _profileExtras = {profileId:'', files:[], editing:''};
+
+async function loadProfileExtras(profileId){
+  _profileExtras = {profileId, files:[], editing:''};
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId)+'/extras');
+    const data = await resp.json();
+    if(!resp.ok){ throw new Error(data.error||'load failed'); }
+    _profileExtras.files = data.files || [];
   }catch(e){
-    listEl.innerHTML='<div style="color:#f85149;padding:8px">Failed to load library.</div>';
+    _profileExtras.files = [];
   }
+  renderProfileExtras();
 }
 
-function closeSkillLibrary(){
-  document.getElementById('skills-library-overlay').classList.remove('active');
-}
-
-async function loadSkillSet(name,setName){
-  if(!confirm('Load skill set "'+setName+'" into session '+name+'? Existing files with the same name will be overwritten.'))return;
-  try{
-    const resp=await fetch(BASE+'/api/skill-library/load',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:setName,session_name:name})
+function renderProfileExtras(){
+  const el = document.getElementById('ed-extras');
+  if(!el) return;
+  const files = _profileExtras.files || [];
+  let html = '';
+  if(!files.length){
+    html += '<div class="extras-empty">No extra files yet. Add one — e.g. <code>CLAUDE_API_KEYS.md</code> — and reference it from CLAUDE.md.</div>';
+  } else {
+    files.forEach(f => {
+      const isEditing = _profileExtras.editing === f.name;
+      html += `<div class="extras-row">
+        <span class="extras-name" onclick="toggleExtraEditor('${esc(f.name)}')">${esc(f.name)}</span>
+        <span class="extras-meta">${f.size} bytes</span>
+        <button class="extras-btn" onclick="toggleExtraEditor('${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
+        <button class="extras-del" onclick="deleteProfileExtra('${esc(f.name)}')" title="Delete">&times;</button>
+      </div>
+      <div class="extras-editor${isEditing?' active':''}" id="extras-editor-${esc(f.name)}">
+        <textarea spellcheck="false" data-extra-name="${esc(f.name)}">${esc(f.content||'')}</textarea>
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          <button class="extras-btn" onclick="saveProfileExtra('${esc(f.name)}')">Save changes</button>
+        </div>
+      </div>`;
     });
-    const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to load');return}
-    closeSkillLibrary();
-    loadSkillFiles(name);
-  }catch(e){alert('Failed to load skill set.')}
+  }
+  html += `<div class="extras-actions">
+    <button class="extras-btn" onclick="addProfileExtra()">+ Add markdown file</button>
+  </div>`;
+  el.innerHTML = html;
 }
 
-async function saveCurrentToLibrary(){
-  const name=_skillsLibrarySession;
-  const setName=prompt('Enter a name for this skill set:');
-  if(!setName)return;
+function toggleExtraEditor(name){
+  _profileExtras.editing = (_profileExtras.editing === name) ? '' : name;
+  renderProfileExtras();
+}
+
+async function addProfileExtra(){
+  const raw = window.prompt('New filename (must end in .md):', 'CLAUDE_API_KEYS.md');
+  if(raw === null) return;
+  let name = (raw||'').trim();
+  if(!name) return;
+  if(!name.toLowerCase().endsWith('.md')) name += '.md';
+  if(['claude.md','memory.md'].includes(name.toLowerCase())){
+    alert("'"+name+"' has a dedicated editor above — pick a different name.");
+    return;
+  }
   try{
-    const resp=await fetch(BASE+'/api/skill-library/save',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:setName,session_name:name})
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ''})
     });
-    const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to save');return}
-    alert('Saved '+data.files.length+' file(s) to library as "'+data.name+'"');
-    openSkillLibrary(name);
-  }catch(e){alert('Failed to save to library.')}
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create file'); return; }
+    _profileExtras.editing = data.name;
+    await loadProfileExtras(_profileExtras.profileId);
+  }catch(e){ alert('Failed to create file.'); }
+}
+
+async function saveProfileExtra(name){
+  const ta = document.querySelector('textarea[data-extra-name="'+CSS.escape(name)+'"]');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    // Update in-memory copy without re-rendering (preserves cursor)
+    const f = (_profileExtras.files || []).find(x => x.name === name);
+    if(f){ f.content = ta.value; f.size = new Blob([ta.value]).size; }
+    // Visual flash
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save.'); }
+}
+
+async function deleteProfileExtra(name){
+  if(!confirm('Delete '+name+'?')) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras/'+encodeURIComponent(name), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    if(_profileExtras.editing === name) _profileExtras.editing = '';
+    await loadProfileExtras(_profileExtras.profileId);
+  }catch(e){ alert('Failed to delete.'); }
+}
+
+async function saveProfile(){
+  const p = _profilesEditing;
+  if(!p) return;
+  const name = (document.getElementById('ed-name').value||'').trim();
+  const model = (document.getElementById('ed-model').value||'').trim();
+  const effort = document.getElementById('ed-effort').value;
+  const claudeMd = document.getElementById('ed-claude').value;
+  const memoryMd = document.getElementById('ed-memory').value;
+  let permissions, env;
+  try{ permissions = JSON.parse(document.getElementById('ed-permissions').value||'{}'); }
+  catch(e){ alert('Permissions JSON is invalid: '+e.message); return; }
+  try{ env = JSON.parse(document.getElementById('ed-env').value||'{}'); }
+  catch(e){ alert('Env JSON is invalid: '+e.message); return; }
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(p.id), {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, model, effort, claude_md: claudeMd, memory_md: memoryMd, permissions, env})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    await loadProfiles(true);
+    await editProfile(p.id);
+  }catch(e){ alert('Failed to save profile.'); }
+}
+
+async function deleteProfile(profileId){
+  if(profileId==='default'){ alert("The default profile can't be deleted."); return; }
+  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.claude-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    _profilesEditing = null;
+    await loadProfiles(true);
+    renderProfilesList();
+    document.getElementById('profile-edit').innerHTML =
+      '<div class="profile-empty">Profile deleted.</div>';
+    // Refresh visible session dropdowns
+    if(selectedSession) renderDetail();
+  }catch(e){ alert('Failed to delete profile.'); }
+}
+
+async function newProfilePrompt(){
+  const list = _profilesCache || [];
+  const presets = list.filter(p => p.builtin && p.id!=='default');
+  let promptMsg = 'New profile name (e.g. "My UI Reviewer"):';
+  if(presets.length){
+    promptMsg += '\\n\\nLeave empty to start blank. To clone a preset, append " | preset-id" -- available preset ids:\\n  '
+      + presets.map(p=>p.id).join(', ');
+  }
+  const raw = window.prompt(promptMsg, '');
+  if(raw === null) return;
+  let name = raw.trim();
+  let fromPreset = '';
+  if(name.includes('|')){
+    const parts = name.split('|');
+    name = parts[0].trim();
+    fromPreset = parts[1].trim();
+  }
+  if(!name){ alert('Name is required.'); return; }
+  try{
+    const resp = await fetch(BASE+'/api/profiles', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, from_preset: fromPreset})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create profile'); return; }
+    await loadProfiles(true);
+    await editProfile(data.id);
+    if(selectedSession) renderDetail();
+  }catch(e){ alert('Failed to create profile.'); }
+}
+
+// ── Session MEMORY.md Editor (project auto-memory) ──
+let _sessMem = {sessionName:'', path:'', dir:'', cwd:'', profileId:'', content:'', exists:false};
+let _sessMemExtras = {files:[], editing:''};
+
+async function openSessionMemory(sessionName){
+  _sessMem = {sessionName, path:'', dir:'', cwd:'', profileId:'', content:'', exists:false};
+  _sessMemExtras = {files:[], editing:''};
+  document.getElementById('memorymd-overlay').classList.add('active');
+  document.getElementById('memorymd-session-tag').textContent = '— '+sessionName;
+  document.getElementById('memorymd-editor').value = 'Loading...';
+  document.getElementById('memorymd-path').textContent = '';
+  document.getElementById('memorymd-dir').textContent = '';
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/memory-md');
+    const data = await resp.json();
+    if(!resp.ok){
+      document.getElementById('memorymd-editor').value = '';
+      alert(data.error||'Failed to load MEMORY.md');
+    } else {
+      _sessMem = {...data, sessionName};
+      document.getElementById('memorymd-editor').value = data.content || '';
+      document.getElementById('memorymd-path').textContent = data.path;
+      document.getElementById('memorymd-dir').textContent = data.dir;
+      if(!data.exists){
+        document.getElementById('memorymd-path').textContent = data.path + '  (will be created on save)';
+      }
+    }
+  }catch(e){
+    document.getElementById('memorymd-editor').value = 'Error loading MEMORY.md';
+  }
+  loadSessionMemoryExtras();
+}
+
+function closeSessionMemory(){
+  document.getElementById('memorymd-overlay').classList.remove('active');
+}
+
+async function saveSessionMemory(){
+  if(!_sessMem.sessionName) return;
+  const content = document.getElementById('memorymd-editor').value;
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_sessMem.sessionName)+'/memory-md', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: _sessMem.path, content})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    _sessMem.content = content;
+    _sessMem.exists = true;
+    document.getElementById('memorymd-path').textContent = _sessMem.path;
+    const ta = document.getElementById('memorymd-editor');
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save MEMORY.md'); }
+}
+
+async function loadSessionMemoryExtras(){
+  _sessMemExtras = {files:[], editing:_sessMemExtras.editing||''};
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_sessMem.sessionName)+'/memory-extras');
+    const data = await resp.json();
+    if(!resp.ok) throw new Error(data.error||'load failed');
+    _sessMemExtras.files = data.files || [];
+  }catch(e){
+    _sessMemExtras.files = [];
+  }
+  renderSessionMemoryExtras();
+}
+
+function renderSessionMemoryExtras(){
+  const el = document.getElementById('memorymd-extras');
+  if(!el) return;
+  const files = _sessMemExtras.files || [];
+  let html = '';
+  if(!files.length){
+    html += '<div class="extras-empty">No topic files yet. MEMORY.md typically links to per-topic files (e.g. <code>read_click.md</code>) in the same directory.</div>';
+  } else {
+    files.forEach(f => {
+      const isEditing = _sessMemExtras.editing === f.name;
+      html += `<div class="extras-row">
+        <span class="extras-name" onclick="toggleSessionMemoryExtra('${esc(f.name)}')">${esc(f.name)}</span>
+        <span class="extras-meta">${f.size} bytes</span>
+        <button class="extras-btn" onclick="toggleSessionMemoryExtra('${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
+        <button class="extras-del" onclick="deleteSessionMemoryExtra('${esc(f.name)}')" title="Delete">&times;</button>
+      </div>
+      <div class="extras-editor${isEditing?' active':''}">
+        <textarea spellcheck="false" data-mem-extra="${esc(f.name)}">${esc(f.content||'')}</textarea>
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          <button class="extras-btn" onclick="saveSessionMemoryExtra('${esc(f.name)}')">Save changes</button>
+        </div>
+      </div>`;
+    });
+  }
+  html += `<div class="extras-actions">
+    <button class="extras-btn" onclick="addSessionMemoryExtra()">+ Add topic file</button>
+  </div>`;
+  el.innerHTML = html;
+}
+
+function toggleSessionMemoryExtra(name){
+  _sessMemExtras.editing = (_sessMemExtras.editing === name) ? '' : name;
+  renderSessionMemoryExtras();
+}
+
+async function addSessionMemoryExtra(){
+  const raw = window.prompt('New topic filename (must end in .md):', 'topic_name.md');
+  if(raw === null) return;
+  let name = (raw||'').trim();
+  if(!name) return;
+  if(!name.toLowerCase().endsWith('.md')) name += '.md';
+  if(name.toUpperCase()==='MEMORY.MD'){ alert('MEMORY.md has the dedicated editor above.'); return; }
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_sessMem.sessionName)+'/memory-extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ''})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create file'); return; }
+    _sessMemExtras.editing = data.name;
+    await loadSessionMemoryExtras();
+  }catch(e){ alert('Failed to create file.'); }
+}
+
+async function saveSessionMemoryExtra(name){
+  const ta = document.querySelector('textarea[data-mem-extra="'+CSS.escape(name)+'"]');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_sessMem.sessionName)+'/memory-extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    const f = (_sessMemExtras.files || []).find(x => x.name === name);
+    if(f){ f.content = ta.value; f.size = new Blob([ta.value]).size; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save.'); }
+}
+
+async function deleteSessionMemoryExtra(name){
+  if(!confirm('Delete '+name+'?')) return;
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_sessMem.sessionName)+'/memory-extras/'+encodeURIComponent(name), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    if(_sessMemExtras.editing === name) _sessMemExtras.editing = '';
+    await loadSessionMemoryExtras();
+  }catch(e){ alert('Failed to delete.'); }
 }
 
 // ── CLAUDE.md Editor (global only) ──
 let _claudeMdGlobal={path:'',content:'',exists:false};
+let _globalExtras={files:[], editing:''};
 
 async function openClaudeMd(){
   const overlay=document.getElementById('claudemd-overlay');
@@ -7259,6 +9628,102 @@ async function openClaudeMd(){
   }catch(e){
     document.getElementById('claudemd-editor').value='Error loading CLAUDE.md';
   }
+  loadGlobalExtras();
+}
+
+async function loadGlobalExtras(){
+  _globalExtras = {files:[], editing:_globalExtras.editing||''};
+  try{
+    const resp = await fetch(BASE+'/api/global-extras');
+    const data = await resp.json();
+    if(!resp.ok) throw new Error(data.error||'load failed');
+    _globalExtras.files = data.files || [];
+  }catch(e){
+    _globalExtras.files = [];
+  }
+  renderGlobalExtras();
+}
+
+function renderGlobalExtras(){
+  const el = document.getElementById('global-extras');
+  if(!el) return;
+  const files = _globalExtras.files || [];
+  let html = '';
+  if(!files.length){
+    html += '<div class="extras-empty">No additional files. Add e.g. <code>CLAUDE_API_KEYS.md</code> and reference it from <code>CLAUDE.md</code>.</div>';
+  } else {
+    files.forEach(f => {
+      const isEditing = _globalExtras.editing === f.name;
+      html += `<div class="extras-row">
+        <span class="extras-name" onclick="toggleGlobalExtra('${esc(f.name)}')">${esc(f.name)}</span>
+        <span class="extras-meta">${f.size} bytes</span>
+        <button class="extras-btn" onclick="toggleGlobalExtra('${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
+        <button class="extras-del" onclick="deleteGlobalExtra('${esc(f.name)}')" title="Delete">&times;</button>
+      </div>
+      <div class="extras-editor${isEditing?' active':''}">
+        <textarea spellcheck="false" data-global-extra="${esc(f.name)}">${esc(f.content||'')}</textarea>
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          <button class="extras-btn" onclick="saveGlobalExtra('${esc(f.name)}')">Save changes</button>
+        </div>
+      </div>`;
+    });
+  }
+  html += `<div class="extras-actions">
+    <button class="extras-btn" onclick="addGlobalExtra()">+ Add CLAUDE_*.md file</button>
+  </div>`;
+  el.innerHTML = html;
+}
+
+function toggleGlobalExtra(name){
+  _globalExtras.editing = (_globalExtras.editing === name) ? '' : name;
+  renderGlobalExtras();
+}
+
+async function addGlobalExtra(){
+  const raw = window.prompt('New filename (must start with CLAUDE_ and end in .md):', 'CLAUDE_GITHUB_RULES.md');
+  if(raw === null) return;
+  let name = (raw||'').trim();
+  if(!name) return;
+  if(!name.toLowerCase().endsWith('.md')) name += '.md';
+  if(name.toUpperCase()==='CLAUDE.MD'){ alert('CLAUDE.md has a dedicated editor above.'); return; }
+  try{
+    const resp = await fetch(BASE+'/api/global-extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ''})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create file'); return; }
+    _globalExtras.editing = data.name;
+    await loadGlobalExtras();
+  }catch(e){ alert('Failed to create file.'); }
+}
+
+async function saveGlobalExtra(name){
+  const ta = document.querySelector('textarea[data-global-extra="'+CSS.escape(name)+'"]');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/global-extras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    const f = (_globalExtras.files || []).find(x => x.name === name);
+    if(f){ f.content = ta.value; f.size = new Blob([ta.value]).size; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save.'); }
+}
+
+async function deleteGlobalExtra(name){
+  if(!confirm('Delete '+name+'?')) return;
+  try{
+    const resp = await fetch(BASE+'/api/global-extras/'+encodeURIComponent(name), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    if(_globalExtras.editing === name) _globalExtras.editing = '';
+    await loadGlobalExtras();
+  }catch(e){ alert('Failed to delete.'); }
 }
 
 async function saveClaudeMd(){
@@ -7377,6 +9842,7 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
+loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
 loadAll();
 checkClaudeAuth();
 </script>

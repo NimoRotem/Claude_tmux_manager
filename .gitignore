@@ -38,6 +38,24 @@ desktop.ini
 *.bak-*
 *.orig
 *.away-mode-backup
+*.go-nuts-backup
+*.go-nuts-backup-*
+*.pre-skills-backup
+
+# Pidfiles, archives
+*.pid
+*.tar.gz
+
+# Local QA artifacts and one-off patch scripts
+qa-output/
+fix_*.py
+patch_*.py
+patch[0-9]*.py
+
+# Codex local config
+.codex/
+.codex-config.toml
+codex-config.tmp.toml
 
 # Project-specific: non-source files in repo root
 *.zip
