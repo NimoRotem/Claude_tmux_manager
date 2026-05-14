@@ -281,6 +281,10 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(simple_watchdog_task)
     logger.info("Simple watchdog started (disabled for %d sessions)", len(_simple_watchdog_disabled))
 
+    tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
+    _background_tasks.append(tmp_watchdog_task)
+    logger.info("Tmp watchdog started")
+
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
     if saved:
@@ -5009,6 +5013,129 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
         # Don't set enabled=False — watchdog zombie detection will restart us
     finally:
         state["task"] = None
+
+
+_TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
+_TMP_WATCHDOG_WARN_PCT = 75             # start cleaning at 75% full
+_TMP_WATCHDOG_CRITICAL_PCT = 90         # aggressive clean at 90% full
+_TMP_WATCHDOG_SAFE_AGE_NORMAL = 3600    # delete files older than 1h at warn level
+_TMP_WATCHDOG_SAFE_AGE_CRITICAL = 600   # delete files older than 10m at critical
+_TMP_WATCHDOG_PROTECTED_PREFIXES = (
+    ".",                # .X11-unix, .ICE-unix, dotfiles
+    "claude-",          # active Claude CLI cache
+    "tsx-",             # active tsx cache
+    "tmux-",            # tmux server sockets
+    "systemd-",         # systemd runtime
+    "snap-",            # snap runtime
+    "node-compile-cache",
+    "data-gym-cache",   # tiktoken cache (recreated on demand but expensive)
+    "vscode-",
+)
+
+
+async def _tmp_watchdog_loop():
+    """Background watchdog: prevents /tmp from filling up.
+
+    When /tmp is a tmpfs (RAM-backed), filling it breaks bash commands and
+    any tool that writes temp files. This loop monitors usage and prunes
+    stale files before that happens.
+    """
+    tlog = logging.getLogger("tmp_watchdog")
+    tlog.info("Tmp watchdog started — interval=%ds warn=%d%% critical=%d%%",
+              _TMP_WATCHDOG_INTERVAL, _TMP_WATCHDOG_WARN_PCT, _TMP_WATCHDOG_CRITICAL_PCT)
+    while True:
+        try:
+            await asyncio.sleep(_TMP_WATCHDOG_INTERVAL)
+            await asyncio.to_thread(_tmp_watchdog_check, tlog)
+        except asyncio.CancelledError:
+            tlog.info("Tmp watchdog cancelled")
+            raise
+        except Exception as e:
+            tlog.error(f"Tmp watchdog loop error: {e}")
+            await asyncio.sleep(60)
+
+
+def _tmp_watchdog_check(tlog: logging.Logger) -> None:
+    """One iteration: check /tmp usage and clean if needed. Runs in a thread."""
+    try:
+        usage = shutil.disk_usage("/tmp")
+    except OSError as e:
+        tlog.error(f"shutil.disk_usage('/tmp') failed: {e}")
+        return
+    pct = (usage.used / usage.total) * 100 if usage.total else 0
+    if pct < _TMP_WATCHDOG_WARN_PCT:
+        return  # plenty of room
+
+    if pct >= _TMP_WATCHDOG_CRITICAL_PCT:
+        max_age = _TMP_WATCHDOG_SAFE_AGE_CRITICAL
+        level = "CRITICAL"
+    else:
+        max_age = _TMP_WATCHDOG_SAFE_AGE_NORMAL
+        level = "WARN"
+
+    tlog.warning("/tmp at %.1f%% (%s) — pruning entries older than %ds",
+                 pct, level, max_age)
+    deleted, freed = _tmp_watchdog_prune(max_age, tlog)
+    try:
+        new_usage = shutil.disk_usage("/tmp")
+        new_pct = (new_usage.used / new_usage.total) * 100 if new_usage.total else 0
+    except OSError:
+        new_pct = pct
+    tlog.warning("/tmp cleanup done — removed %d entries (~%d KB freed), now %.1f%% used",
+                 deleted, freed // 1024, new_pct)
+
+
+def _tmp_watchdog_prune(max_age_secs: int, tlog: logging.Logger) -> tuple[int, int]:
+    """Delete files/dirs in /tmp older than max_age_secs. Returns (count, bytes_freed).
+
+    Skips any entry whose name starts with a protected prefix (system sockets,
+    active CLI caches). Also skips entries owned by other users.
+    """
+    deleted = 0
+    freed = 0
+    now = time.time()
+    my_uid = os.getuid()
+    try:
+        entries = list(os.scandir("/tmp"))
+    except OSError as e:
+        tlog.error(f"scandir /tmp failed: {e}")
+        return (0, 0)
+    for entry in entries:
+        name = entry.name
+        if any(name.startswith(p) for p in _TMP_WATCHDOG_PROTECTED_PREFIXES):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if st.st_uid != my_uid:
+            continue  # don't touch other users' files
+        age = now - st.st_mtime
+        if age < max_age_secs:
+            continue
+        size = _tmp_watchdog_size(entry.path) if entry.is_dir(follow_symlinks=False) else st.st_size
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path, ignore_errors=True)
+            else:
+                os.unlink(entry.path)
+            deleted += 1
+            freed += size
+        except OSError as e:
+            tlog.warning(f"Failed to delete {entry.path}: {e}")
+    return (deleted, freed)
+
+
+def _tmp_watchdog_size(path: str) -> int:
+    """Recursive size of a directory in bytes. Best-effort, ignores errors."""
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
 
 
 async def _watchdog_loop():
