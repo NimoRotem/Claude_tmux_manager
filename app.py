@@ -572,6 +572,78 @@ REALTIME_TTL = 15      # 15 seconds — text extraction is cheap (no LLM call us
 NOTES_TTL = 600        # 10 minutes
 
 
+# Sessions whose pane is running OpenAI codex belong to the codax dashboard,
+# not the claude tmux dashboard. Filter them out by walking pane descendants
+# and checking /proc/<pid>/comm for the codex/claude executable names.
+_CLAUDE_DASH_VISIBILITY_CACHE: Dict[str, tuple] = {}
+_CLAUDE_DASH_VISIBILITY_TTL = 5.0
+
+
+def _session_is_claude(name: str) -> bool:
+    """Return True if this tmux session belongs to the claude dashboard.
+
+    Mirrors the heuristic in codax-dashboard but flips the verdict.
+    """
+    now = time.time()
+    cached = _CLAUDE_DASH_VISIBILITY_CACHE.get(name)
+    if cached and now - cached[1] < _CLAUDE_DASH_VISIBILITY_TTL:
+        return cached[0]
+    try:
+        pp = subprocess.run(
+            ["tmux", "display-message", "-t", name, "-p", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if pp.returncode != 0:
+            _CLAUDE_DASH_VISIBILITY_CACHE[name] = (False, now)
+            return False
+        pane_pid = (pp.stdout or "").strip()
+        if not pane_pid.isdigit():
+            _CLAUDE_DASH_VISIBILITY_CACHE[name] = (False, now)
+            return False
+        to_check = [pane_pid]
+        seen = {pane_pid}
+        descendants = []
+        for _ in range(50):
+            if not to_check:
+                break
+            current = to_check.pop(0)
+            try:
+                child_res = subprocess.run(
+                    ["pgrep", "-P", current],
+                    capture_output=True, text=True, timeout=2,
+                )
+            except Exception:
+                continue
+            for pid in (child_res.stdout or "").strip().split():
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    descendants.append(pid)
+                    to_check.append(pid)
+        has_codex = False
+        has_claude = False
+        for pid in descendants:
+            try:
+                with open(f"/proc/{pid}/comm", "r") as f:
+                    comm = f.read().strip().lower()
+            except Exception:
+                continue
+            if comm == "codex":
+                has_codex = True
+                break
+            if comm == "claude":
+                has_claude = True
+        if has_codex:
+            decision = False
+        elif has_claude:
+            decision = True
+        else:
+            decision = True  # bare shell or unknown -> allow on the claude dashboard
+    except Exception:
+        decision = False
+    _CLAUDE_DASH_VISIBILITY_CACHE[name] = (decision, now)
+    return decision
+
+
 def get_tmux_sessions() -> list[dict]:
     try:
         result = subprocess.run(
@@ -589,6 +661,8 @@ def get_tmux_sessions() -> list[dict]:
             name = parts[0]
             if name.startswith("__") and name.endswith("__"):
                 continue  # Skip internal sessions (e.g. __auth_login_tmp__)
+            if not _session_is_claude(name):
+                continue  # Hide codex sessions from the claude tmux dashboard
             sessions.append({
                 "name": name,
                 "windows": parts[1] if len(parts) > 1 else "?",
@@ -1928,12 +2002,10 @@ UPLOADS_DIR = MESSAGES_DIR / "uploads"
 
 @app.post("/api/sessions/{session_name}/upload")
 async def api_upload_file(session_name: str, file: UploadFile = File(...)):
-    """Upload a file to a session-specific uploads dir and register in CLAUDE.md."""
+    """Upload a file to a session-specific uploads dir; record only in this session's chat history."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    cwd = get_session_cwd(session_name)
 
     # Sanitize filename — keep only the basename
     filename = os.path.basename(file.filename or "upload")
@@ -1951,10 +2023,8 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
         with open(dest, "wb") as f:
             f.write(content)
-        # Append file path to session's CLAUDE.md (if we can determine cwd)
-        if cwd:
-            _append_upload_to_claude_md(cwd, dest, filename)
-        # Record in chat history
+        # Per-session record only — never touch the project CLAUDE.md, which is
+        # shared across every session running in the same cwd.
         size_kb = len(content) / 1024
         note = f"Uploaded {filename} ({size_kb:.1f} KB) to {dest}"
         now = time.time()
@@ -2011,32 +2081,6 @@ async def api_delete_upload(session_name: str, filename: str):
         return JSONResponse({"error": "File not found"}, status_code=404)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
-def _append_upload_to_claude_md(cwd: str, file_path: str, filename: str):
-    """Append an uploaded file's path to the project CLAUDE.md so Claude Code can find it."""
-    md_path = os.path.join(cwd, "CLAUDE.md")
-    marker = "# Uploaded Files"
-    entry_line = f"- `{file_path}`"
-    try:
-        existing = ""
-        if os.path.exists(md_path):
-            with open(md_path) as f:
-                existing = f.read()
-        # Don't duplicate if already listed
-        if file_path in existing:
-            return
-        if marker in existing:
-            # Append under existing section
-            parts = existing.split(marker, 1)
-            updated = parts[0] + marker + parts[1].rstrip("\n") + "\n" + entry_line + "\n"
-        else:
-            # Add new section at the end
-            updated = existing.rstrip("\n") + "\n\n" + marker + "\n" + entry_line + "\n"
-        with open(md_path, "w") as f:
-            f.write(updated)
-    except Exception:
-        logger.debug("Failed to update CLAUDE.md with upload path %s", file_path, exc_info=True)
 
 
 # --- CLAUDE.md viewer/editor ---
@@ -3362,12 +3406,13 @@ async def api_list_profile_library_state(profile_id: str):
 
 @app.post("/api/profiles/{profile_id}/skills/library/{skill_name}")
 async def api_enable_library_skill(profile_id: str, skill_name: str):
-    """Enable a library skill for this profile by symlinking it into the profile's skills/ dir."""
+    """Enable a library skill for this profile by symlinking it into the profile's skills/ dir.
+
+    Works on the default profile too — the library is now the source of truth.
+    """
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    if profile_id == DEFAULT_PROFILE_ID:
-        return JSONResponse({"error": "Toggle library skills on a non-default profile. Manage ~/.claude/skills/ manually for the default profile."}, status_code=400)
     name = _sanitize_skill_dir_name(skill_name)
     if not name:
         return JSONResponse({"error": "Invalid skill name"}, status_code=400)
@@ -3390,12 +3435,13 @@ async def api_enable_library_skill(profile_id: str, skill_name: str):
 
 @app.delete("/api/profiles/{profile_id}/skills/library/{skill_name}")
 async def api_disable_library_skill(profile_id: str, skill_name: str):
-    """Disable a library skill for this profile by removing its symlink."""
+    """Disable a library skill for this profile by removing its symlink.
+
+    Works on the default profile too — the library is now the source of truth.
+    """
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    if profile_id == DEFAULT_PROFILE_ID:
-        return JSONResponse({"error": "Toggle library skills on a non-default profile."}, status_code=400)
     name = _sanitize_skill_dir_name(skill_name)
     if not name:
         return JSONResponse({"error": "Invalid skill name"}, status_code=400)
@@ -3411,6 +3457,49 @@ async def api_disable_library_skill(profile_id: str, skill_name: str):
         logger.exception("Failed to unlink library skill %s from %s", name, skills_dir)
         return JSONResponse({"error": "Failed to disable skill"}, status_code=500)
     return JSONResponse({"ok": True, "disabled": True})
+
+
+@app.post("/api/profiles/{profile_id}/skills/{skill_name}/promote")
+async def api_promote_profile_skill(profile_id: str, skill_name: str):
+    """Move a custom in-profile skill into the shared library so any profile can enable it.
+
+    Copies <profile>/skills/<name>/ -> ~/.tmux-dashboard/skill-library/<name>/, then
+    replaces the original with a symlink so the source profile keeps it active.
+    """
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    src = _profile_dir(profile_id) / "skills" / name
+    if not (src / "SKILL.md").is_file():
+        return JSONResponse({"error": "Skill not found in this profile"}, status_code=404)
+    if src.is_symlink():
+        return JSONResponse({"error": "Skill is already a library link"}, status_code=409)
+    SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    dst = SKILL_LIBRARY_DIR / name
+    if dst.exists():
+        return JSONResponse({"error": f"A library skill named '{name}' already exists"},
+                            status_code=409)
+    try:
+        shutil.copytree(str(src), str(dst))
+    except Exception:
+        logger.exception("Failed to copy skill %s -> library", src)
+        return JSONResponse({"error": "Failed to copy skill to library"}, status_code=500)
+    # Replace original with a symlink to the library copy.
+    try:
+        backup = src.with_name(src.name + ".pre-promote")
+        if backup.exists():
+            shutil.rmtree(str(backup))
+        shutil.move(str(src), str(backup))
+        src.symlink_to(dst.resolve(), target_is_directory=True)
+        shutil.rmtree(str(backup))
+    except Exception:
+        logger.exception("Failed to swap %s with symlink", src)
+        return JSONResponse({"error": "Promoted to library but failed to relink source"},
+                            status_code=500)
+    return JSONResponse({"ok": True, "promoted": name})
 
 
 @app.post("/api/profiles/{profile_id}/skills")
@@ -3542,6 +3631,346 @@ async def api_delete_profile_extra(profile_id: str, filename: str):
             logger.exception("Failed to delete profile extra")
             return JSONResponse({"error": "Failed to delete extra file"}, status_code=500)
     return JSONResponse({"ok": True})
+
+
+# --- Profile file browser (full ~/.claude-<id>/ contents) ---
+# Lets the Profiles editor expose every file Claude Code actually loads from the
+# config dir: settings.json (full), .claude.json (MCP/projects), agents/, commands/,
+# plus a credentials.json status read (we never expose the token contents).
+
+# Categories the UI surfaces. The first element of each tuple is the relative path
+# under the profile dir; the second is the kind ("json", "md", "binary").
+_PROFILE_FILE_CATEGORIES = {
+    "settings": [("settings.json", "json")],
+    "mcp":      [(".claude.json", "json")],
+    "agents":   "agents",       # directory: list *.md
+    "commands": "commands",     # directory: list *.md or *.json
+    "plugins":  "plugins",      # directory: list top-level entries (read-only)
+}
+
+# Files we refuse to surface for editing under the generic file API.
+_PROFILE_FILE_BLOCKLIST = {".credentials.json"}
+
+
+def _safe_profile_path(profile_id: str, rel: str) -> Optional[Path]:
+    """Return an absolute Path inside the profile dir, or None if rel escapes it."""
+    rel = (rel or "").lstrip("/").replace("\\", "/")
+    if not rel or ".." in rel.split("/"):
+        return None
+    base = _profile_dir(profile_id).resolve()
+    target = (base / rel).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return None
+    name = target.name
+    if name in _PROFILE_FILE_BLOCKLIST:
+        return None
+    return target
+
+
+def _read_dir_entries(d: Path, exts: tuple = (".md", ".json", ".toml")) -> list:
+    out = []
+    if not d.exists() or not d.is_dir():
+        return out
+    for entry in sorted(d.iterdir()):
+        rel_name = entry.name
+        if entry.is_dir():
+            out.append({"name": rel_name, "kind": "dir",
+                        "size": 0, "modified": entry.stat().st_mtime})
+        elif entry.is_file():
+            if exts and entry.suffix.lower() not in exts:
+                continue
+            try:
+                out.append({
+                    "name": rel_name,
+                    "kind": "file",
+                    "size": entry.stat().st_size,
+                    "modified": entry.stat().st_mtime,
+                })
+            except Exception:
+                logger.debug("Failed to stat %s", entry, exc_info=True)
+    return out
+
+
+@app.get("/api/profiles/{profile_id}/files")
+async def api_list_profile_files(profile_id: str):
+    """Return a structured inventory of every editable file inside the profile dir."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    base = _profile_dir(profile_id)
+    base.mkdir(parents=True, exist_ok=True)
+
+    inv: dict = {"dir": str(base), "categories": {}}
+
+    # Top-level singletons
+    for cat, items in (("settings", _PROFILE_FILE_CATEGORIES["settings"]),
+                       ("mcp", _PROFILE_FILE_CATEGORIES["mcp"])):
+        files = []
+        for rel, kind in items:
+            p = base / rel
+            files.append({
+                "path": rel, "kind": kind,
+                "exists": p.exists(),
+                "size": p.stat().st_size if p.exists() else 0,
+            })
+        inv["categories"][cat] = {"type": "files", "files": files}
+
+    # Directory categories
+    for cat in ("agents", "commands"):
+        sub = _PROFILE_FILE_CATEGORIES[cat]
+        d = base / sub
+        d.mkdir(parents=True, exist_ok=True)
+        inv["categories"][cat] = {
+            "type": "dir", "path": sub,
+            "files": _read_dir_entries(d, exts=(".md", ".json", ".toml")),
+        }
+
+    # Plugins: list top-level dirs only, read-only
+    plugins_dir = base / "plugins"
+    plugin_entries: list = []
+    if plugins_dir.exists() and plugins_dir.is_dir():
+        for entry in sorted(plugins_dir.iterdir()):
+            try:
+                plugin_entries.append({
+                    "name": entry.name,
+                    "kind": "dir" if entry.is_dir() else "file",
+                })
+            except Exception:
+                logger.debug("Failed to inspect plugin entry %s", entry, exc_info=True)
+    inv["categories"]["plugins"] = {"type": "dir-readonly", "path": "plugins",
+                                    "files": plugin_entries}
+
+    return JSONResponse(inv)
+
+
+class ProfileFileBody(BaseModel):
+    path: str
+    content: str
+
+
+@app.get("/api/profiles/{profile_id}/file")
+async def api_get_profile_file(profile_id: str, path: str):
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    target = _safe_profile_path(profile_id, path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    content = ""
+    exists = target.exists()
+    if exists:
+        try:
+            content = target.read_text()
+        except Exception:
+            logger.debug("Failed to read %s", target, exc_info=True)
+            return JSONResponse({"error": "Could not read file"}, status_code=500)
+    return JSONResponse({"path": path, "content": content, "exists": exists,
+                         "size": target.stat().st_size if exists else 0})
+
+
+@app.put("/api/profiles/{profile_id}/file")
+async def api_save_profile_file(profile_id: str, body: ProfileFileBody):
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    target = _safe_profile_path(profile_id, body.path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    # JSON files must parse before write
+    if target.suffix.lower() == ".json" and body.content.strip():
+        try:
+            json.loads(body.content)
+        except Exception as e:
+            return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body.content)
+        return JSONResponse({"ok": True, "path": body.path,
+                             "size": target.stat().st_size})
+    except Exception:
+        logger.exception("Failed to write profile file %s", target)
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+@app.delete("/api/profiles/{profile_id}/file")
+async def api_delete_profile_file(profile_id: str, path: str):
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    target = _safe_profile_path(profile_id, path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    # Refuse to delete the singletons settings.json / .claude.json — they're
+    # managed by Claude Code itself. Only files inside agents/ or commands/ are
+    # safely deletable here.
+    rel_parts = path.split("/")
+    if rel_parts[0] not in ("agents", "commands"):
+        return JSONResponse({"error": "Only files under agents/ or commands/ can be deleted here"},
+                            status_code=400)
+    if target.exists():
+        try:
+            if target.is_file() or target.is_symlink():
+                target.unlink()
+            else:
+                shutil.rmtree(str(target))
+        except Exception:
+            logger.exception("Failed to delete profile file %s", target)
+            return JSONResponse({"error": "Failed to delete"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/profiles/{profile_id}/credentials")
+async def api_profile_credentials_status(profile_id: str):
+    """Read login status from .credentials.json -- never returns the token."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    creds_path = _profile_dir(profile_id) / ".credentials.json"
+    out = {"loggedIn": False, "path": str(creds_path), "exists": creds_path.exists()}
+    if not creds_path.exists():
+        return JSONResponse(out)
+    try:
+        creds = json.loads(creds_path.read_text())
+        oauth = creds.get("claudeAiOauth") or {}
+        expires_at = int(oauth.get("expiresAt") or 0)
+        now_ms = int(time.time() * 1000)
+        out["loggedIn"] = bool(oauth and expires_at > now_ms)
+        out["subscriptionType"] = oauth.get("subscriptionType", "")
+        out["expiresAt"] = expires_at
+        out["expiresInDays"] = max(0, (expires_at - now_ms) // 86400000) if expires_at else 0
+    except Exception:
+        logger.debug("Failed to parse %s", creds_path, exc_info=True)
+        out["error"] = "Credentials file is unreadable"
+    return JSONResponse(out)
+
+
+@app.delete("/api/profiles/{profile_id}/credentials")
+async def api_profile_logout(profile_id: str):
+    """Remove .credentials.json for this profile (forces /login on next run)."""
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    creds_path = _profile_dir(profile_id) / ".credentials.json"
+    if creds_path.exists():
+        try:
+            creds_path.unlink()
+        except Exception:
+            logger.exception("Failed to delete %s", creds_path)
+            return JSONResponse({"error": "Failed to delete credentials"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+# --- Project-scope (per-session, cwd-bound) file management ---
+# Claude Code loads these on top of the active profile, regardless of which profile
+# the session uses: <cwd>/CLAUDE.md, <cwd>/.claude/settings.local.json, <cwd>/.mcp.json.
+# Surface them in the session's "More" dropdown so the user can edit per-project
+# rules without leaving the dashboard.
+
+_PROJECT_FILES = [
+    ("CLAUDE.md", "md",
+     "Project rules loaded on top of the profile's CLAUDE.md."),
+    (".claude/settings.json", "json",
+     "Project settings (model, env, hooks) loaded on top of profile settings."),
+    (".claude/settings.local.json", "json",
+     "Project-local settings (not committed). Loaded last; wins over everything."),
+    (".mcp.json", "json",
+     "Project-scope MCP servers (added to profile MCP servers)."),
+]
+
+
+def _safe_project_path(cwd: str, rel: str) -> Optional[Path]:
+    """Confine writes to known per-project files under cwd."""
+    if not cwd:
+        return None
+    rel_clean = (rel or "").lstrip("/").replace("\\", "/")
+    allowed = {p for p, _, _ in _PROJECT_FILES}
+    if rel_clean not in allowed:
+        return None
+    base = Path(cwd).resolve()
+    if not base.exists() or not base.is_dir():
+        return None
+    target = (base / rel_clean).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return None
+    return target
+
+
+@app.get("/api/sessions/{session_name}/project-files")
+async def api_list_session_project_files(session_name: str):
+    """Inventory of project-scope files for this session's cwd."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    cwd = get_session_cwd(session_name) or ""
+    files = []
+    if cwd:
+        base = Path(cwd)
+        for rel, kind, desc in _PROJECT_FILES:
+            p = base / rel
+            files.append({
+                "path": rel, "kind": kind, "description": desc,
+                "exists": p.exists(),
+                "size": p.stat().st_size if p.exists() else 0,
+            })
+    return JSONResponse({"cwd": cwd, "files": files})
+
+
+@app.get("/api/sessions/{session_name}/project-file")
+async def api_get_session_project_file(session_name: str, path: str):
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    cwd = get_session_cwd(session_name) or ""
+    target = _safe_project_path(cwd, path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path (not an allowed project file or session has no cwd)"},
+                            status_code=400)
+    content = ""
+    exists = target.exists()
+    if exists:
+        try:
+            content = target.read_text()
+        except Exception:
+            logger.debug("Failed to read %s", target, exc_info=True)
+            return JSONResponse({"error": "Could not read file"}, status_code=500)
+    return JSONResponse({"path": path, "abs_path": str(target),
+                         "content": content, "exists": exists,
+                         "cwd": cwd,
+                         "size": target.stat().st_size if exists else 0})
+
+
+class ProjectFileBody(BaseModel):
+    path: str
+    content: str
+
+
+@app.put("/api/sessions/{session_name}/project-file")
+async def api_save_session_project_file(session_name: str, body: ProjectFileBody):
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    cwd = get_session_cwd(session_name) or ""
+    target = _safe_project_path(cwd, body.path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if target.suffix.lower() == ".json" and body.content.strip():
+        try:
+            json.loads(body.content)
+        except Exception as e:
+            return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body.content)
+        return JSONResponse({"ok": True, "path": body.path,
+                             "abs_path": str(target),
+                             "size": target.stat().st_size})
+    except Exception:
+        logger.exception("Failed to write project file %s", target)
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
 
 
 def _send_profile_export(session_name: str, profile_id: str):
@@ -6921,6 +7350,29 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .profile-edit-actions{display:flex;gap:8px;justify-content:space-between;margin-top:10px;border-top:1px solid #21262d;padding-top:10px}
 .profile-empty{color:#6e7681;font-size:.85rem;text-align:center;padding:40px 20px}
 .profile-edit-readonly{color:#6e7681;font-style:italic;padding:8px 0;font-size:.8rem}
+/* Profile editor section tabs */
+.pf-tabs{display:flex;gap:2px;flex-wrap:wrap;border-bottom:1px solid #21262d;margin-bottom:8px;flex-shrink:0}
+.pf-tab{padding:6px 10px;font-size:.75rem;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;user-select:none;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.pf-tab:hover{color:#c9d1d9}
+.pf-tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.pf-section{display:none;flex-direction:column;gap:8px;flex:1;min-height:0;overflow-y:auto}
+.pf-section.active{display:flex}
+.pf-section .ed-rawjson{min-height:240px;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.pf-section .ed-mcp{min-height:200px;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.pf-section .pf-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #161b22}
+.pf-section .pf-row:last-child{border-bottom:none}
+.pf-section .pf-row-name{flex:1;color:#c9d1d9;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;cursor:pointer}
+.pf-section .pf-row-name:hover{color:#58a6ff}
+.pf-section .pf-row-meta{color:#6e7681;font-size:.68rem}
+.pf-section .pf-row-tag{color:#d2a8ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;border:1px solid #d2a8ff44;border-radius:3px;padding:1px 5px}
+.pf-section .pf-empty{color:#6e7681;font-size:.78rem;font-style:italic;padding:6px 0}
+.pf-section .pf-actions{display:flex;gap:6px;margin-top:8px}
+.pf-section .pf-status{padding:8px;border-radius:6px;background:#0d1117;border:1px solid #21262d;font-size:.82rem;color:#c9d1d9}
+.pf-section .pf-status.ok{border-color:#238636;color:#7ee787}
+.pf-section .pf-status.warn{border-color:#9e6a03;color:#e3b341}
+.pf-section .pf-status.err{border-color:#da3633;color:#ff7b72}
+.pf-section .pf-banner{font-size:.72rem;color:#6e7681;padding:6px 8px;background:#0d1117;border:1px dashed #21262d;border-radius:6px;line-height:1.4}
+.pf-section .pf-help{font-size:.7rem;color:#6e7681;font-style:italic}
 
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .claudemd-overlay.active{display:flex}
@@ -7026,11 +7478,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <div id="stats-content">Loading...</div>
   </div>
 </div>
+<!-- Project-scope (cwd-bound) file editor overlay -->
+<div class="claudemd-overlay" id="projfile-overlay" onclick="if(event.target===this)closeProjectFile()">
+  <div class="claudemd-panel">
+    <h3 id="projfile-title">Project file <button class="stats-close" onclick="closeProjectFile()">&times;</button></h3>
+    <div class="profiles-hint" style="margin-bottom:10px" id="projfile-banner"></div>
+    <label class="claudemd-label" id="projfile-label">File</label>
+    <div class="claudemd-path" id="projfile-path"></div>
+    <textarea class="claudemd-editor" id="projfile-editor" spellcheck="false"></textarea>
+    <div class="claudemd-actions">
+      <button class="btn" onclick="closeProjectFile()">Close</button>
+      <button class="btn btn-full" onclick="saveProjectFile()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Session MEMORY.md editor overlay -->
 <div class="claudemd-overlay" id="memorymd-overlay" onclick="if(event.target===this)closeSessionMemory()">
   <div class="claudemd-panel">
     <h3>MEMORY.md <span id="memorymd-session-tag" style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px"></span> <button class="stats-close" onclick="closeSessionMemory()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Claude Code in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair.</div>
+    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Claude Code in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair. <span style="color:#e3b341">Note:</span> two tmux sessions on the same profile + cwd share this file. To isolate, put each session on its own profile.</div>
     <label class="claudemd-label">MEMORY.md (index)</label>
     <div class="claudemd-path" id="memorymd-path"></div>
     <textarea class="claudemd-editor" id="memorymd-editor" spellcheck="false"></textarea>
@@ -7262,7 +7729,6 @@ function renderNav(){
       <span class="nav-session-id">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
-        <span class="nav-attached ${s.attached?'yes':'no'}">${s.attached?'A':'D'}</span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
@@ -7317,7 +7783,13 @@ function renderDetail(){
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
           <div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">MEMORY.md</div>
+          <div style="height:1px;background:#21262d;margin:4px 0"></div>
+          <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
+          <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','CLAUDE.md');closeTabMore()">Project CLAUDE.md</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.json');closeTabMore()">Project settings.json</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.local.json');closeTabMore()">Project settings.local.json</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>
         </div>
       </div>
       <div class="detail-badges">
@@ -8202,8 +8674,7 @@ async function refreshNavStats(){
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
     const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
     const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span>'
-      +'<span>MEM <span class="stat-val '+memClass+'">'+memPct+'%</span></span>';
+    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span>';
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
@@ -8923,19 +9394,64 @@ async function refreshUploadedFiles(name){
   ['chat','raw'].forEach(function(tab){
     const container=document.getElementById('uploaded-files-'+tab+'-'+name);
     if(!container)return;
-    if(!files.length){container.innerHTML='';return}
-    const rows=files.map(function(f){
-      const safePath=esc(f.path);
-      const safeName=esc(f.name);
-      return '<div class="uploaded-file" title="'+safePath+'">'
-        +'<span class="uploaded-file-icon">&#x1F4C4;</span>'
-        +'<span class="uploaded-file-name">'+safeName+'</span>'
-        +'<span class="uploaded-file-size">'+_formatUploadSize(f.size)+'</span>'
-        +'<button class="uploaded-file-btn" onclick="copyUploadPath(this,\''+encodeURIComponent(f.path)+'\')" title="Copy path">Copy path</button>'
-        +'<button class="uploaded-file-btn delete" onclick="deleteUploadedFile(\''+esc(name)+'\',\''+encodeURIComponent(f.name)+'\')" title="Remove">&#x2715;</button>'
-        +'</div>';
-    }).join('');
-    container.innerHTML='<div class="uploaded-files-label">Uploaded files</div>'+rows;
+    // Wipe + rebuild via DOM APIs (not innerHTML string interpolation). Inline
+    // onclick attribute strings were silently failing for some users; direct
+    // addEventListener bindings are immune to any escaping or bubbling issues.
+    container.replaceChildren();
+    if(!files.length)return;
+    const label=document.createElement('div');
+    label.className='uploaded-files-label';
+    label.textContent='Uploaded files';
+    container.appendChild(label);
+    files.forEach(function(f){
+      const row=document.createElement('div');
+      row.className='uploaded-file';
+      row.title=f.path||'';
+
+      const icon=document.createElement('span');
+      icon.className='uploaded-file-icon';
+      icon.textContent='\u{1F4C4}';
+      row.appendChild(icon);
+
+      const nameSpan=document.createElement('span');
+      nameSpan.className='uploaded-file-name';
+      nameSpan.textContent=f.name;
+      row.appendChild(nameSpan);
+
+      const sizeSpan=document.createElement('span');
+      sizeSpan.className='uploaded-file-size';
+      sizeSpan.textContent=_formatUploadSize(f.size);
+      row.appendChild(sizeSpan);
+
+      const copyBtn=document.createElement('button');
+      copyBtn.type='button';
+      copyBtn.className='uploaded-file-btn';
+      copyBtn.title='Copy path';
+      copyBtn.textContent='Copy path';
+      copyBtn.addEventListener('click',function(ev){
+        ev.preventDefault();
+        ev.stopPropagation();
+        copyUploadPath(copyBtn,encodeURIComponent(f.path));
+      });
+      row.appendChild(copyBtn);
+
+      const delBtn=document.createElement('button');
+      delBtn.type='button';
+      delBtn.className='uploaded-file-btn delete';
+      delBtn.title='Remove';
+      delBtn.textContent='✕';
+      delBtn.addEventListener('click',function(ev){
+        ev.preventDefault();
+        ev.stopPropagation();
+        // Immediate visual feedback so the user knows the click registered
+        delBtn.disabled=true;
+        delBtn.textContent='…';
+        deleteUploadedFile(name,encodeURIComponent(f.name));
+      });
+      row.appendChild(delBtn);
+
+      container.appendChild(row);
+    });
   });
 }
 
@@ -8963,8 +9479,17 @@ function copyUploadPath(btn,encodedPath){
 async function deleteUploadedFile(name,encodedFilename){
   const filename=decodeURIComponent(encodedFilename);
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/uploads/'+encodeURIComponent(filename),{method:'DELETE'});
-  }catch(e){}
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/uploads/'+encodeURIComponent(filename),{method:'DELETE'});
+    if(!resp.ok){
+      let msg='Delete failed ('+resp.status+')';
+      try{const d=await resp.json();if(d&&d.error)msg=d.error}catch(_){}
+      console.warn('deleteUploadedFile:',msg);
+      appendChatBubble(name,'assistant','Failed to delete '+filename+': '+msg,Date.now()/1000);
+    }
+  }catch(e){
+    console.warn('deleteUploadedFile error:',e);
+    appendChatBubble(name,'assistant','Failed to delete '+filename+': network error',Date.now()/1000);
+  }
   refreshUploadedFiles(name);
 }
 
@@ -9020,7 +9545,7 @@ async function loadProfileSkills(name){
   const builtinEl=document.getElementById('skills-builtin-'+name);
   if(!activeEl||!libEl||!builtinEl)return;
   const pid=_profileForSession(name);
-  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>'+(pid==='default'?' &nbsp;<span style="color:#d29922">(library toggling is disabled on the default profile — manage <code>~/.claude/skills/</code> directly)</span>':'');
+  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>';
   activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
   libEl.innerHTML='<div class="skills-empty">Loading...</div>';
   builtinEl.innerHTML='<div class="skills-empty">Loading...</div>';
@@ -9057,12 +9582,22 @@ function _renderActiveSkills(name,pid,data){
   for(const sk of skills){
     const tag=sk.from_library?'library link':'custom (in-profile)';
     const nameClass=sk.from_library?'':'custom-name';
+    const promoteBtn=sk.from_library?'':`
+      <button class="btn" onclick="promoteProfileSkill('${esc(name)}','${esc(sk.dir_name)}')" title="Move this skill to the shared library so other profiles can enable it">Promote</button>`;
+    const removeLabel=sk.from_library?'Disable':'Delete';
+    const removeTitle=sk.from_library
+      ? 'Disable this library skill in this profile (the library copy is kept).'
+      : 'Delete this custom skill from this profile.';
     rows.push(`
       <div class="skills-row">
         <div class="skills-row-body">
           <div class="skills-row-name ${nameClass}">${esc(sk.name)}</div>
           <div class="skills-row-desc">${esc(sk.description||'(no description in frontmatter)')}</div>
           <div class="skills-row-tags">${esc(tag)} · ${esc(sk.dir_name)}/SKILL.md</div>
+        </div>
+        <div class="skills-row-actions">
+          ${promoteBtn}
+          <button class="btn btn-danger" onclick="removeProfileSkill('${esc(name)}','${esc(sk.dir_name)}',${sk.from_library?'true':'false'})" title="${esc(removeTitle)}">${removeLabel}</button>
         </div>
       </div>`);
   }
@@ -9088,10 +9623,9 @@ function _renderLibrarySkills(name,pid,data){
     return;
   }
   el.innerHTML=skills.map(sk=>{
-    const disabledAttr=isDefault?'disabled':'';
     return `
       <div class="skills-row${sk.enabled?'':' disabled-row'}">
-        <div class="skills-row-toggle"><input type="checkbox" ${sk.enabled?'checked':''} ${disabledAttr} onchange="toggleLibrarySkill('${esc(name)}','${esc(sk.dir_name)}',this.checked)"></div>
+        <div class="skills-row-toggle"><input type="checkbox" ${sk.enabled?'checked':''} onchange="toggleLibrarySkill('${esc(name)}','${esc(sk.dir_name)}',this.checked)"></div>
         <div class="skills-row-body">
           <div class="skills-row-name">${esc(sk.name)}</div>
           <div class="skills-row-desc">${esc(sk.description||'(no description)')}</div>
@@ -9124,11 +9658,6 @@ function _renderBuiltinSkills(name,skills){
 
 async function toggleLibrarySkill(sessionName,skillDirName,enable){
   const pid=_profileForSession(sessionName);
-  if(pid==='default'){
-    alert('Cannot toggle library skills on the default profile. Manage ~/.claude/skills/ directly.');
-    loadProfileSkills(sessionName);
-    return;
-  }
   const url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library/'+encodeURIComponent(skillDirName);
   try{
     const resp=await fetch(url,{method:enable?'POST':'DELETE'});
@@ -9139,6 +9668,41 @@ async function toggleLibrarySkill(sessionName,skillDirName,enable){
   }catch(e){
     alert('Failed to toggle skill.');
   }
+  loadProfileSkills(sessionName);
+}
+
+async function promoteProfileSkill(sessionName, skillDirName){
+  const pid=_profileForSession(sessionName);
+  if(!confirm('Promote "'+skillDirName+'" to the shared library?\n\n' +
+              'It will move to ~/.tmux-dashboard/skill-library/ and the current profile ' +
+              'will keep it active via a symlink. Other profiles can then toggle it on ' +
+              'from their Library list.')) return;
+  try{
+    const resp=await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/'+encodeURIComponent(skillDirName)+'/promote', {method:'POST'});
+    const data=await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to promote skill'); return; }
+  }catch(e){ alert('Failed to promote skill.'); }
+  loadProfileSkills(sessionName);
+}
+
+async function removeProfileSkill(sessionName, skillDirName, fromLibrary){
+  const pid=_profileForSession(sessionName);
+  const verb=fromLibrary?'Disable':'Delete';
+  const desc=fromLibrary
+    ? 'This removes the symlink from this profile. The library copy is kept and can be re-enabled later.'
+    : 'This permanently deletes '+skillDirName+'/SKILL.md from this profile. If you want to keep it for other profiles, click Promote first.';
+  if(!confirm(verb+' "'+skillDirName+'" in profile "'+pid+'"?\n\n'+desc)) return;
+  try{
+    let url;
+    if(fromLibrary){
+      url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library/'+encodeURIComponent(skillDirName);
+    }else{
+      url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/'+encodeURIComponent(skillDirName);
+    }
+    const resp=await fetch(url,{method:'DELETE'});
+    const data=await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to '+verb.toLowerCase()+' skill'); return; }
+  }catch(e){ alert('Failed to '+verb.toLowerCase()+' skill.'); }
   loadProfileSkills(sessionName);
 }
 
@@ -9267,18 +9831,42 @@ function renderProfileDropdown(s){
 }
 
 async function onProfileChange(sessionName, profileId){
+  // First call: probe whether Claude is currently running in this session
+  // (we pass restart:false so we get back the running state). If it IS running,
+  // ask the user whether to restart now; otherwise the new profile won't take
+  // effect until Claude is next launched and the user's memory will appear to
+  // "spill" from the previous profile.
   try{
-    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
+    let resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({profile_id: profileId, restart: false})
     });
-    const data = await resp.json();
+    let data = await resp.json();
     if(!resp.ok){alert(data.error||'Failed to set profile'); return;}
-    // Update local cache so the badge stays consistent across re-renders
     const sess = sessions.find(x=>x.name===sessionName);
     if(sess) sess.profile_id = profileId;
+
     if(data.claude_was_running && !data.restarted){
-      _profilePending[sessionName] = true;
+      const wantRestart = confirm(
+        'Profile switched to "' + profileId + '".\n\n' +
+        'Claude is still running with the previous profile and will keep using it ' +
+        '(including its memory) until you restart it.\n\n' +
+        'Restart Claude now?'
+      );
+      if(wantRestart){
+        resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({profile_id: profileId, restart: true})
+        });
+        data = await resp.json();
+        if(resp.ok && data.restarted){
+          delete _profilePending[sessionName];
+        }else{
+          _profilePending[sessionName] = true;
+        }
+      }else{
+        _profilePending[sessionName] = true;
+      }
     }else{
       delete _profilePending[sessionName];
     }
@@ -9345,6 +9933,19 @@ async function editProfile(profileId){
   }catch(e){ alert('Failed to load profile.'); }
 }
 
+let _profileActiveTab = 'identity';
+const _PROFILE_TABS = [
+  {id:'identity', label:'Identity'},
+  {id:'memory',   label:'Memory'},
+  {id:'login',    label:'Login'},
+  {id:'settings', label:'Settings'},
+  {id:'mcp',      label:'MCP'},
+  {id:'agents',   label:'Agents'},
+  {id:'commands', label:'Commands'},
+  {id:'plugins',  label:'Plugins'},
+  {id:'extras',   label:'Extras'},
+];
+
 function renderProfileEdit(){
   const p = _profilesEditing;
   const el = document.getElementById('profile-edit');
@@ -9371,44 +9972,345 @@ function renderProfileEdit(){
     ? ''
     : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
   const headerNote = isDefault
-    ? '<div class="profiles-hint" style="margin:0 0 6px">Edits here are merged into <code>~/.claude/settings.json</code> -- only <code>model</code>, <code>env</code>, and <code>permissions</code> are touched. Other keys you set elsewhere are preserved. A backup is kept at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
+    ? '<div class="profiles-hint" style="margin:0 0 6px">Settings → identity edits are merged into <code>~/.claude/settings.json</code> (only <code>model</code>, <code>env</code>, <code>permissions</code> touched). Backup at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
     : '';
+
+  const tabBar = _PROFILE_TABS.map(t =>
+    `<div class="pf-tab${_profileActiveTab===t.id?' active':''}" onclick="switchProfileTab('${t.id}')">${t.label}</div>`
+  ).join('');
+
   el.innerHTML = `
     <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}${builtinTag}</div>
     ${headerNote}
-    <label>Name</label>
-    <input id="ed-name" value="${esc(p.name||'')}">
-    <div class="row2">
-      <div>
-        <label>Model</label>
-        <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-7[1m] / blank">
+    <div class="pf-tabs">${tabBar}</div>
+
+    <div class="pf-section${_profileActiveTab==='identity'?' active':''}" id="pf-section-identity">
+      <label>Name</label>
+      <input id="ed-name" value="${esc(p.name||'')}">
+      <div class="row2">
+        <div>
+          <label>Model</label>
+          <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-7[1m] / blank">
+        </div>
+        <div>
+          <label>Effort level</label>
+          <select id="ed-effort">${effortOpts}</select>
+        </div>
       </div>
-      <div>
-        <label>Effort level</label>
-        <select id="ed-effort">${effortOpts}</select>
+      <label>Permissions (JSON)</label>
+      <textarea id="ed-permissions" class="ed-permissions" spellcheck="false">${esc(permJson)}</textarea>
+      <label>Env (JSON)</label>
+      <textarea id="ed-env" class="ed-permissions" spellcheck="false">${esc(envJson)}</textarea>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='memory'?' active':''}" id="pf-section-memory">
+      <div class="pf-banner">CLAUDE.md and MEMORY.md live at the profile root. Claude Code loads them at every launch in this profile.</div>
+      <label>CLAUDE.md</label>
+      <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
+      <label>MEMORY.md</label>
+      <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='login'?' active':''}" id="pf-section-login">
+      <div class="pf-banner">Each profile keeps its own <code>.credentials.json</code>. Logging in once per profile is enough — switching profiles does not re-prompt.</div>
+      <div id="pf-credentials" class="pf-status">Loading login status...</div>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="refreshProfileCredentials('${esc(p.id)}')">Refresh status</button>
+        <button class="extras-btn" onclick="logoutProfile('${esc(p.id)}')" style="color:#f85149;border-color:#f8514944">Log out (remove credentials)</button>
+      </div>
+      <div class="pf-help">To log in: open a session on this profile and run <code>/login</code> inside Claude. The token is written to <code>.credentials.json</code> inside the profile dir.</div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='settings'?' active':''}" id="pf-section-settings">
+      <div class="pf-banner">Full <code>settings.json</code> as Claude Code reads it. The Identity tab edits the <code>model</code>, <code>env</code>, and <code>permissions</code> keys — keep them in sync by saving here OR there, not both.</div>
+      <label>settings.json</label>
+      <textarea id="ed-settings-json" class="ed-rawjson" spellcheck="false">Loading...</textarea>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','settings.json','ed-settings-json')">Save settings.json</button>
+        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','settings.json','ed-settings-json')">Reload</button>
       </div>
     </div>
-    <label>CLAUDE.md</label>
-    <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
-    <label>MEMORY.md</label>
-    <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
-    <label>Permissions (JSON)</label>
-    <textarea id="ed-permissions" class="ed-permissions" spellcheck="false">${esc(permJson)}</textarea>
-    <label>Env (JSON)</label>
-    <textarea id="ed-env" class="ed-permissions" spellcheck="false">${esc(envJson)}</textarea>
-    <label>Additional markdown files</label>
-    <div class="extras-section" id="ed-extras">
-      <div class="extras-empty">Loading...</div>
+
+    <div class="pf-section${_profileActiveTab==='mcp'?' active':''}" id="pf-section-mcp">
+      <div class="pf-banner">Profile-scope MCP servers + per-project approvals. Lives at <code>.claude.json</code>. Project-scope <code>.mcp.json</code> is edited per session via the More dropdown.</div>
+      <label>.claude.json</label>
+      <textarea id="ed-mcp-json" class="ed-mcp" spellcheck="false">Loading...</textarea>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','.claude.json','ed-mcp-json')">Save .claude.json</button>
+        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','.claude.json','ed-mcp-json')">Reload</button>
+      </div>
     </div>
+
+    <div class="pf-section${_profileActiveTab==='agents'?' active':''}" id="pf-section-agents">
+      <div class="pf-banner">Custom subagents in <code>agents/</code>. Each <code>.md</code> file with frontmatter (<code>name</code>, <code>description</code>) becomes a delegatable agent in this profile.</div>
+      <div id="pf-agents-list">Loading...</div>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="addProfileSubfile('${esc(p.id)}','agents')">+ New agent</button>
+      </div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='commands'?' active':''}" id="pf-section-commands">
+      <div class="pf-banner">Custom slash commands in <code>commands/</code>. Each <code>.md</code> file becomes <code>/&lt;name&gt;</code>.</div>
+      <div id="pf-commands-list">Loading...</div>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="addProfileSubfile('${esc(p.id)}','commands')">+ New command</button>
+      </div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='plugins'?' active':''}" id="pf-section-plugins">
+      <div class="pf-banner">Installed plugins under <code>plugins/</code>. Read-only here — install/remove plugins from inside Claude Code with <code>/plugin</code>.</div>
+      <div id="pf-plugins-list">Loading...</div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='extras'?' active':''}" id="pf-section-extras">
+      <div class="pf-banner">Sidecar markdown files at the profile root (e.g. <code>CLAUDE_API_KEYS.md</code>) referenced from CLAUDE.md.</div>
+      <div class="extras-section" id="ed-extras">
+        <div class="extras-empty">Loading...</div>
+      </div>
+    </div>
+
     <div class="profile-edit-actions">
       ${deleteBtn || '<span></span>'}
       <div style="display:flex;gap:8px">
         <button class="modal-cancel" onclick="closeProfiles()">Close</button>
-        <button class="modal-confirm-create" onclick="saveProfile()">Save</button>
+        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + memory</button>
       </div>
     </div>
   `;
   loadProfileExtras(p.id);
+  loadProfileSectionData(p.id, _profileActiveTab);
+}
+
+function switchProfileTab(tabId){
+  _profileActiveTab = tabId;
+  document.querySelectorAll('.pf-tab').forEach(t=>{
+    t.classList.toggle('active', t.textContent.trim().toLowerCase()===tabId);
+  });
+  document.querySelectorAll('.pf-section').forEach(s=>{
+    s.classList.toggle('active', s.id==='pf-section-'+tabId);
+  });
+  if(_profilesEditing) loadProfileSectionData(_profilesEditing.id, tabId);
+}
+
+// ── Section loaders ─────────────────────────────────────────────────────────
+async function loadProfileSectionData(pid, tab){
+  if(tab==='login'){ refreshProfileCredentials(pid); return; }
+  if(tab==='settings'){ loadProfileRawFile(pid, 'settings.json', 'ed-settings-json'); return; }
+  if(tab==='mcp'){ loadProfileRawFile(pid, '.claude.json', 'ed-mcp-json'); return; }
+  if(tab==='agents'){ loadProfileDirSection(pid, 'agents', 'pf-agents-list'); return; }
+  if(tab==='commands'){ loadProfileDirSection(pid, 'commands', 'pf-commands-list'); return; }
+  if(tab==='plugins'){ loadProfilePluginsList(pid); return; }
+}
+
+async function refreshProfileCredentials(pid){
+  const el = document.getElementById('pf-credentials');
+  if(!el) return;
+  el.className = 'pf-status';
+  el.textContent = 'Loading...';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/credentials');
+    const data = await resp.json();
+    if(!resp.ok){ el.className='pf-status err'; el.textContent = data.error||'Failed to load'; return; }
+    if(data.loggedIn){
+      el.className='pf-status ok';
+      const days = data.expiresInDays;
+      const plan = data.subscriptionType ? ` · ${data.subscriptionType}` : '';
+      el.textContent = `Logged in${plan}${days ? ` · ~${days} days until token expires` : ''}`;
+    } else if(data.exists){
+      el.className='pf-status warn';
+      el.textContent = 'Credentials present but token expired. Run /login in a session on this profile.';
+    } else {
+      el.className='pf-status warn';
+      el.textContent = 'Not logged in. Open a session on this profile and run /login inside Claude.';
+    }
+  }catch(e){
+    el.className='pf-status err';
+    el.textContent = 'Failed to load credentials status';
+  }
+}
+
+async function logoutProfile(pid){
+  if(!confirm('Remove .credentials.json for this profile? You will need to /login again in any session that uses it.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/credentials', {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to log out'); return; }
+    refreshProfileCredentials(pid);
+  }catch(e){ alert('Failed to log out'); }
+}
+
+async function loadProfileRawFile(pid, relPath, taId){
+  const ta = document.getElementById(taId);
+  if(!ta) return;
+  ta.value = 'Loading...';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(relPath));
+    const data = await resp.json();
+    if(!resp.ok){ ta.value=''; alert(data.error||'Failed to load'); return; }
+    ta.value = data.content || '';
+    if(!data.exists){
+      ta.placeholder = relPath + ' does not exist yet — saving will create it.';
+    }
+  }catch(e){ ta.value=''; alert('Failed to load file'); }
+}
+
+async function saveProfileRawFile(pid, relPath, taId){
+  const ta = document.getElementById(taId);
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: relPath, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save'); }
+}
+
+let _profileDirSections = {agents:{files:[],editing:''}, commands:{files:[],editing:''}};
+
+async function loadProfileDirSection(pid, cat, containerId){
+  const container = document.getElementById(containerId);
+  if(!container) return;
+  container.innerHTML = '<div class="pf-empty">Loading...</div>';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/files');
+    const data = await resp.json();
+    if(!resp.ok){ container.innerHTML='<div class="pf-empty">'+(data.error||'Failed to load')+'</div>'; return; }
+    const entry = (data.categories||{})[cat] || {files:[]};
+    const files = (entry.files||[]).filter(f => f.kind==='file');
+    _profileDirSections[cat] = _profileDirSections[cat] || {files:[],editing:''};
+    _profileDirSections[cat].files = files;
+    renderProfileDirSection(pid, cat, containerId);
+  }catch(e){ container.innerHTML='<div class="pf-empty">Failed to load</div>'; }
+}
+
+function renderProfileDirSection(pid, cat, containerId){
+  const container = document.getElementById(containerId);
+  if(!container) return;
+  const state = _profileDirSections[cat] || {files:[],editing:''};
+  const files = state.files || [];
+  if(!files.length){
+    container.innerHTML = '<div class="pf-empty">No '+cat+' yet.</div>';
+    return;
+  }
+  let html = '';
+  files.forEach(f => {
+    const isEditing = state.editing === f.name;
+    html += `<div class="pf-row">
+      <span class="pf-row-name" onclick="toggleProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">${esc(f.name)}</span>
+      <span class="pf-row-meta">${f.size} bytes</span>
+      <button class="extras-btn" onclick="toggleProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
+      <button class="extras-del" onclick="deleteProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')" title="Delete">&times;</button>
+    </div>
+    <div class="extras-editor${isEditing?' active':''}" id="dirfile-editor-${esc(cat)}-${esc(f.name)}">
+      <textarea spellcheck="false" data-dir-name="${esc(f.name)}">Loading...</textarea>
+      <div style="display:flex;gap:6px;justify-content:flex-end">
+        <button class="extras-btn" onclick="saveProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">Save changes</button>
+      </div>
+    </div>`;
+  });
+  container.innerHTML = html;
+  // Lazy-load content for the currently-editing one
+  if(state.editing){
+    loadProfileDirFileContent(pid, cat, state.editing);
+  }
+}
+
+async function toggleProfileDirFile(pid, cat, name){
+  const state = _profileDirSections[cat] || {files:[],editing:''};
+  state.editing = (state.editing === name) ? '' : name;
+  renderProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
+}
+
+async function loadProfileDirFileContent(pid, cat, name){
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(cat+'/'+name));
+    const data = await resp.json();
+    if(!resp.ok){ return; }
+    const ta = document.querySelector('#dirfile-editor-'+CSS.escape(cat)+'-'+CSS.escape(name)+' textarea');
+    if(ta) ta.value = data.content || '';
+  }catch(e){}
+}
+
+async function saveProfileDirFile(pid, cat, name){
+  const ta = document.querySelector('#dirfile-editor-'+CSS.escape(cat)+'-'+CSS.escape(name)+' textarea');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: cat+'/'+name, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save'); }
+}
+
+async function deleteProfileDirFile(pid, cat, name){
+  if(!confirm('Delete '+cat+'/'+name+'?')) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(cat+'/'+name), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    loadProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
+  }catch(e){ alert('Failed to delete'); }
+}
+
+async function addProfileSubfile(pid, cat){
+  const example = cat==='agents'
+    ? 'my-agent.md'
+    : 'my-command.md';
+  const raw = window.prompt('New '+cat.slice(0,-1)+' filename (must end in .md):', example);
+  if(raw === null) return;
+  let name = (raw||'').trim();
+  if(!name) return;
+  if(!name.toLowerCase().endsWith('.md')) name += '.md';
+  // Sanitize: alphanumeric + dash + underscore + .md
+  if(!/^[A-Za-z0-9._-]+\.md$/.test(name)){
+    alert('Use alphanumerics, dashes, underscores, dots only; must end in .md.');
+    return;
+  }
+  // Boilerplate frontmatter
+  const stub = cat==='agents'
+    ? `---\nname: ${name.replace(/\.md$/,'')}\ndescription: Describe when Claude should delegate to this agent.\ntools: '*'\n---\n\n# ${name.replace(/\.md$/,'')}\n\nInstructions...\n`
+    : `---\ndescription: One-line summary shown in the slash-command menu.\nallowed-tools: '*'\n---\n\n# /${name.replace(/\.md$/,'')}\n\nWhat this command does...\n`;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: cat+'/'+name, content: stub})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create'); return; }
+    _profileDirSections[cat] = _profileDirSections[cat] || {files:[],editing:''};
+    _profileDirSections[cat].editing = name;
+    loadProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
+  }catch(e){ alert('Failed to create'); }
+}
+
+async function loadProfilePluginsList(pid){
+  const container = document.getElementById('pf-plugins-list');
+  if(!container) return;
+  container.innerHTML = '<div class="pf-empty">Loading...</div>';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/files');
+    const data = await resp.json();
+    if(!resp.ok){ container.innerHTML='<div class="pf-empty">'+(data.error||'Failed')+'</div>'; return; }
+    const entries = ((data.categories||{}).plugins||{}).files || [];
+    if(!entries.length){
+      container.innerHTML = '<div class="pf-empty">No plugins installed. Use <code>/plugin</code> inside Claude to install.</div>';
+      return;
+    }
+    container.innerHTML = entries.map(e =>
+      `<div class="pf-row">
+        <span class="pf-row-name">${esc(e.name)}</span>
+        <span class="pf-row-tag">${esc(e.kind)}</span>
+      </div>`
+    ).join('');
+  }catch(e){ container.innerHTML='<div class="pf-empty">Failed to load</div>'; }
 }
 
 let _profileExtras = {profileId:'', files:[], editing:''};
@@ -9584,6 +10486,76 @@ async function newProfilePrompt(){
     await editProfile(data.id);
     if(selectedSession) renderDetail();
   }catch(e){ alert('Failed to create profile.'); }
+}
+
+// ── Project-scope file editor (per-session, cwd-bound) ──
+let _projFile = {sessionName:'', path:'', absPath:'', cwd:'', content:'', exists:false};
+
+const _PROJFILE_LABELS = {
+  'CLAUDE.md': 'Project CLAUDE.md',
+  '.claude/settings.json': 'Project settings.json',
+  '.claude/settings.local.json': 'Project settings.local.json',
+  '.mcp.json': 'Project .mcp.json',
+};
+
+const _PROJFILE_DESCRIPTIONS = {
+  'CLAUDE.md': 'Markdown rules loaded on top of the profile-level CLAUDE.md whenever Claude runs inside this cwd. Use this for repo-specific conventions.',
+  '.claude/settings.json': 'JSON. Project-level settings (model, env, hooks, permissions). Loaded on top of profile settings.',
+  '.claude/settings.local.json': 'JSON. Project-local overrides (typically gitignored). Loaded last and wins over both profile and project settings.',
+  '.mcp.json': 'JSON. Project-scope MCP servers — merged with the profile MCP servers when Claude runs in this cwd.',
+};
+
+async function openProjectFile(sessionName, relPath){
+  _projFile = {sessionName, path:relPath, absPath:'', cwd:'', content:'', exists:false};
+  const overlay = document.getElementById('projfile-overlay');
+  overlay.classList.add('active');
+  document.getElementById('projfile-title').firstChild.textContent =
+    (_PROJFILE_LABELS[relPath] || relPath) + ' ';
+  document.getElementById('projfile-banner').innerHTML =
+    (_PROJFILE_DESCRIPTIONS[relPath] || '') + ' Session: <code>'+esc(sessionName)+'</code>';
+  document.getElementById('projfile-label').textContent = relPath;
+  document.getElementById('projfile-editor').value = 'Loading...';
+  document.getElementById('projfile-path').textContent = '';
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)
+      +'/project-file?path='+encodeURIComponent(relPath));
+    const data = await resp.json();
+    if(!resp.ok){
+      document.getElementById('projfile-editor').value = '';
+      document.getElementById('projfile-path').textContent = data.error || 'Failed to load';
+      return;
+    }
+    _projFile = {...data, sessionName};
+    document.getElementById('projfile-editor').value = data.content || '';
+    document.getElementById('projfile-path').textContent = data.abs_path
+      + (data.exists ? '' : '  (will be created on save)');
+  }catch(e){
+    document.getElementById('projfile-editor').value = '';
+    document.getElementById('projfile-path').textContent = 'Error loading';
+  }
+}
+
+function closeProjectFile(){
+  document.getElementById('projfile-overlay').classList.remove('active');
+}
+
+async function saveProjectFile(){
+  if(!_projFile.sessionName || !_projFile.path) return;
+  const content = document.getElementById('projfile-editor').value;
+  try{
+    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(_projFile.sessionName)+'/project-file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: _projFile.path, content})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    _projFile.exists = true;
+    _projFile.absPath = data.abs_path;
+    document.getElementById('projfile-path').textContent = data.abs_path;
+    const ta = document.getElementById('projfile-editor');
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+  }catch(e){ alert('Failed to save'); }
 }
 
 // ── Session MEMORY.md Editor (project auto-memory) ──
