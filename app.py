@@ -6956,7 +6956,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
-.nav-usage{display:flex;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage{display:none;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage.has-data{display:flex}
 .nav-usage-item{display:flex;align-items:center;gap:5px;cursor:default;line-height:1}
 .nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
 .nav-usage-bar{position:relative;width:96px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
@@ -6964,6 +6965,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
 .nav-usage.disabled{display:none}
+/* Usage bars mirrored into tools dropdown (mobile only) */
+.nav-tools-usage{display:none;padding:8px 14px 4px 14px}
+.nav-tools-usage-title{color:#6e7681;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.nav-tools-usage-row{display:flex;align-items:center;gap:8px;margin-top:6px}
+.nav-tools-usage-label{color:#8b949e;font-weight:600;font-size:.7rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
+.nav-tools-usage-bar{flex:1;height:5px;background:#21262d;border-radius:3px;overflow:hidden;position:relative}
+.nav-tools-usage-pct{color:#8b949e;font-size:.7rem;width:38px;text-align:right;font-variant-numeric:tabular-nums}
+.nav-tools-usage-divider{height:1px;background:#21262d;margin:8px 0 0 0}
 .nav-status-text{display:none}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
@@ -6998,11 +7007,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 /* Tab-more dropdown (Chat/Skills/Info) */
 .tab-more-wrap{position:relative}
 .tab-more-trigger{display:flex;align-items:center;gap:4px}
+.tab-more-icon{display:none;font-size:1.1rem;line-height:1}
 .tab-more-menu{display:none;position:absolute;top:100%;left:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:120px;padding:4px 0;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .tab-more-menu.open{display:block}
 .tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
 .tab-more-item:hover{background:#1c2128;color:#c9d1d9}
 .tab-more-item.active{color:#58a6ff}
+.tab-more-model-block{display:none}
+.tab-more-model-row{padding:6px 16px;font-size:.7rem;color:#8b949e;cursor:default}
+.tab-more-model-row .tab-more-model-label{color:#6e7681;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
+.tab-more-model-row .tab-more-model-value{margin-left:6px;color:#c9d1d9}
+.tab-more-model-sep{height:1px;background:#21262d;margin:4px 0}
 .tab-content{display:none}
 .tab-content.active{display:flex;flex-direction:column;flex:1;min-height:0}
 
@@ -7410,8 +7425,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   .nav-attached{display:none}
   .nav-server-stats{display:none}
   .nav-status-text{display:none}
-  .nav-usage{padding:0 6px 0 2px;margin-right:6px}
-  .nav-usage-bar{width:60px}
+  .nav-usage.has-data{display:none}
+  .nav-tools-usage.has-data{display:block}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
   .claude-auth .status-dot{width:10px;height:10px}
@@ -7422,12 +7437,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   .detail-header{flex-direction:column;align-items:flex-start;gap:8px}
   .detail-title-text{font-size:1.1rem}
   .detail-badges{flex-wrap:wrap}
+  .detail-badges .status-pill{display:none}
+  .detail-badges .model-badge{display:none}
   .chat-msg{max-width:92%}
   .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
   .raw-output{max-height:50vh}
   .modal{min-width:280px;margin:0 16px}
   .tab{padding:8px 12px;font-size:.8rem}
-  .tab-more-menu{min-width:100px}
+  .tab-more-menu{min-width:160px}
+  .tab-more-label{display:none}
+  .tab-more-arrow{display:none}
+  .tab-more-icon{display:inline-block}
+  .tab-more-model-block{display:block}
+  .profile-select{width:34px;padding:4px;color:transparent;-webkit-text-fill-color:transparent;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16'%3E%3Cpath fill='%238b949e' d='M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1c-2.21 0-6 1.106-6 3.3V14h12v-1.7C14 10.106 10.21 9 8 9z'/%3E%3C/svg%3E");background-position:center;background-repeat:no-repeat}
 }
 </style></head>
 <body>
@@ -7439,7 +7461,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </nav>
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
-  <span class="nav-usage" id="nav-usage" style="display:none">
+  <span class="nav-usage" id="nav-usage">
     <span class="nav-usage-item" id="nav-usage-5h-wrap" title="">
       <span class="nav-usage-label">5h</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
@@ -7453,6 +7475,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="nav-tools-wrap">
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
+      <div class="nav-tools-usage" id="nav-tools-usage">
+        <div class="nav-tools-usage-title">Anthropic limits</div>
+        <div class="nav-tools-usage-row" id="tools-usage-5h-wrap" title="">
+          <span class="nav-tools-usage-label">5h</span>
+          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-5h-fill" style="width:0%"></span></span>
+          <span class="nav-tools-usage-pct" id="tools-usage-5h-pct">&mdash;</span>
+        </div>
+        <div class="nav-tools-usage-row" id="tools-usage-7d-wrap" title="">
+          <span class="nav-tools-usage-label">7d</span>
+          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-7d-fill" style="width:0%"></span></span>
+          <span class="nav-tools-usage-pct" id="tools-usage-7d-pct">&mdash;</span>
+        </div>
+        <div class="nav-tools-usage-divider"></div>
+      </div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
       <div class="nav-tools-item" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
@@ -7778,8 +7814,9 @@ function renderDetail(){
       <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
       ${renderProfileDropdown(s)}
       <div class="tab-more-wrap">
-        <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'} &#9662;</div>
+        <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
+          ${s.model?`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}">${formatModelName(s.model)}</span></div><div class="tab-more-model-sep"></div></div>`:''}
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
           <div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
@@ -8042,7 +8079,7 @@ function switchTab(name,tab){
       if(rawTab)rawTab.classList.add('active');
     }else{
       const trigger=tabBar.querySelector('.tab-more-trigger');
-      if(trigger){trigger.classList.add('active');trigger.innerHTML=({'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More')+' &#9662;';}
+      if(trigger){trigger.classList.add('active');trigger.innerHTML='<span class="tab-more-label">'+({'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More')+'</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span>';}
     }
     tabBar.querySelectorAll('.tab-more-item').forEach(el=>el.classList.remove('active'));
     const items=tabBar.querySelectorAll('.tab-more-item');
@@ -8650,6 +8687,9 @@ async function pollStatus(){
           // Update detail model badge if visible
           const mb=document.getElementById('model-badge-'+st.name);
           if(mb)mb.textContent=formatModelName(st.model);
+          // Also update the model value shown in the mobile More dropdown
+          const mm=document.getElementById('more-model-'+st.name);
+          if(mm)mm.textContent=formatModelName(st.model);
         }
         if(navChanged)renderNav();
       }
@@ -8705,21 +8745,40 @@ function _applyUsageStyle(fillEl,pctNum){
 }
 async function refreshUsageLimits(){
   const wrap=document.getElementById('nav-usage');
+  const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
+  const setHasData=(has)=>{
+    wrap.classList.toggle('has-data',has);
+    if(toolsWrap)toolsWrap.classList.toggle('has-data',has);
+  };
   try{
     const resp=await fetch(BASE+'/api/usage/limits');
-    if(!resp.ok){wrap.style.display='none';return}
+    if(!resp.ok){setHasData(false);return}
     const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){wrap.style.display='none';return}
-    wrap.style.display='flex';
+    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false);return}
+    setHasData(true);
     const fh=data.five_hour||{};
     const sd=data.seven_day||{};
+    const fhPct=Math.round(Number(fh.utilization)||0);
+    const sdPct=Math.round(Number(sd.utilization)||0);
     _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
     _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
+    _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
+    _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
+    const pct5h=document.getElementById('tools-usage-5h-pct');
+    const pct7d=document.getElementById('tools-usage-7d-pct');
+    if(pct5h)pct5h.textContent=fhPct+'%';
+    if(pct7d)pct7d.textContent=sdPct+'%';
+    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at);
+    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at);
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
-    if(fhWrap)fhWrap.title='Anthropic 5-hour limit · '+(Math.round(Number(fh.utilization)||0))+'% used · resets '+_fmtResetTime(fh.resets_at);
-    if(sdWrap)sdWrap.title='Anthropic 7-day limit · '+(Math.round(Number(sd.utilization)||0))+'% used · resets '+_fmtResetTime(sd.resets_at);
+    if(fhWrap)fhWrap.title=fhTitle;
+    if(sdWrap)sdWrap.title=sdTitle;
+    const tfh=document.getElementById('tools-usage-5h-wrap');
+    const tsd=document.getElementById('tools-usage-7d-wrap');
+    if(tfh)tfh.title=fhTitle;
+    if(tsd)tsd.title=sdTitle;
   }catch(e){
     /* keep last known display */
   }
