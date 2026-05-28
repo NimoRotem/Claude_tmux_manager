@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import mimetypes
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -353,17 +354,278 @@ AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
 AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 
 
-def _make_token(username: str) -> str:
-    sig = hmac.new(AUTH_SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()[:24]
-    return f"{username}:{sig}"
+def _make_token(user_id: str) -> str:
+    sig = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{user_id}:{sig}"
 
 
 def _check_token(token: str) -> bool:
     if not token or ":" not in token:
         return False
-    username, sig = token.split(":", 1)
-    expected = hmac.new(AUTH_SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()[:24]
+    user_id, sig = token.split(":", 1)
+    expected = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
     return hmac.compare_digest(sig, expected)
+
+
+# --- Multi-user store ---
+# Each user record:
+#   { id, username, password_hash, password_salt, role ("admin"|"user"),
+#     created_at, last_login }
+# Admin (id="admin") is bootstrapped from TMUX_DASH_USER / TMUX_DASH_PASS env vars
+# on first run, then writable via the admin UI. Per-user data lives at
+# ~/.tmux-dashboard/users/<id>/  (the admin keeps the legacy paths to preserve
+# existing messages.json / notes.json / uploads). Per-user Claude config lives
+# at ~/.claude-user-<id>/ for non-admin users; admin still uses ~/.claude.
+USERS_FILE = MESSAGES_DIR / "users.json"
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+def _new_salt() -> str:
+    return secrets.token_hex(16)
+
+
+def _new_user_id() -> str:
+    return "u_" + secrets.token_hex(8)
+
+
+def _load_users() -> list:
+    """Load users from disk. On first run, seed an admin from env vars."""
+    if USERS_FILE.exists():
+        try:
+            data = json.loads(USERS_FILE.read_text())
+            users = data.get("users") if isinstance(data, dict) else None
+            if isinstance(users, list) and users:
+                return users
+        except Exception:
+            logger.exception("Failed to read %s -- re-seeding", USERS_FILE)
+    # Seed admin from env vars (single-user legacy mode)
+    salt = _new_salt()
+    admin = {
+        "id": "admin",
+        "username": AUTH_USER or "admin",
+        "password_hash": _hash_password(AUTH_PASS or "", salt),
+        "password_salt": salt,
+        "role": "admin",
+        "created_at": time.time(),
+        "last_login": 0,
+    }
+    _save_users([admin])
+    return [admin]
+
+
+def _save_users(users: list):
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        USERS_FILE.write_text(json.dumps({"users": users}, indent=2))
+        try:
+            USERS_FILE.chmod(0o600)
+        except Exception:
+            logger.debug("chmod 600 on users.json failed", exc_info=True)
+    except Exception:
+        logger.exception("Failed to save users to %s", USERS_FILE)
+
+
+def _find_user_by_id(user_id: str) -> Optional[dict]:
+    for u in _load_users():
+        if u.get("id") == user_id:
+            return u
+    return None
+
+
+def _find_user_by_username(username: str) -> Optional[dict]:
+    for u in _load_users():
+        if u.get("username") == username:
+            return u
+    return None
+
+
+def _verify_password(user: dict, password: str) -> bool:
+    salt = user.get("password_salt", "")
+    expected = user.get("password_hash", "")
+    candidate = _hash_password(password, salt)
+    return bool(expected) and hmac.compare_digest(candidate, expected)
+
+
+def _user_from_token(token: Optional[str]) -> Optional[dict]:
+    """Validate token signature AND look up the user. Returns user dict or None."""
+    if not token or not _check_token(token):
+        return None
+    user_id = token.split(":", 1)[0]
+    return _find_user_by_id(user_id)
+
+
+def _current_user(request: Request) -> Optional[dict]:
+    """Resolve the user for an HTTP request via the tmux_auth cookie.
+
+    When AUTH_PASS is empty (auth disabled), behave as if the admin is logged
+    in so every downstream check (`is_admin`, ownership filters, etc.) still
+    works without per-call ``if not AUTH_PASS`` branches.
+    """
+    if not AUTH_PASS:
+        admin = _find_user_by_id("admin")
+        if admin:
+            return admin
+        return {
+            "id": "admin", "username": AUTH_USER or "admin",
+            "role": "admin", "_synthetic": True,
+        }
+    # Stash on request.state to avoid re-loading users.json per request.
+    cached = getattr(request.state, "_current_user", None)
+    if cached is not None:
+        return cached or None  # explicit None vs sentinel
+    user = _user_from_token(request.cookies.get("tmux_auth"))
+    request.state._current_user = user or {}
+    return user
+
+
+def _is_admin(user: Optional[dict]) -> bool:
+    return bool(user) and user.get("role") == "admin"
+
+
+# Initialize the users store on import so the admin always exists.
+try:
+    _load_users()
+except Exception:
+    logger.exception("Failed to initialize users.json")
+
+
+# --- Per-user data dirs ---
+# Admin keeps the legacy ~/.tmux-dashboard/ root for backwards compatibility
+# with existing messages.json / notes.json / uploads/ on disk. Non-admin users
+# are isolated under ~/.tmux-dashboard/users/<user_id>/.
+def _user_data_dir(user: Optional[dict]) -> Path:
+    if not user or user.get("id") == "admin":
+        return MESSAGES_DIR
+    d = MESSAGES_DIR / "users" / user["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _user_messages_file(user: Optional[dict]) -> Path:
+    return _user_data_dir(user) / "messages.json"
+
+
+def _user_notes_file(user: Optional[dict]) -> Path:
+    return _user_data_dir(user) / "notes.json"
+
+
+def _user_uploads_dir(user: Optional[dict]) -> Path:
+    return _user_data_dir(user) / "uploads"
+
+
+def _user_autonomous_file(user: Optional[dict]) -> Path:
+    return _user_data_dir(user) / "autonomous-modes.json"
+
+
+def _user_claude_config_dir(user: Optional[dict]) -> Path:
+    """Where Claude Code reads CLAUDE.md / MEMORY.md / settings.json / skills/
+    / projects/ / memory/ for this user. Admin uses ~/.claude (the global root,
+    profiles still apply). Non-admin users get a fully isolated dir.
+    """
+    if not user or user.get("id") == "admin":
+        return Path.home() / ".claude"
+    return Path.home() / f".claude-user-{user['id']}"
+
+
+def _ensure_user_claude_config_dir(user: dict):
+    """Create + seed a fresh Claude config dir for a non-admin user."""
+    if not user or user.get("id") == "admin":
+        return
+    d = _user_claude_config_dir(user)
+    d.mkdir(parents=True, exist_ok=True)
+    for sub in ("skills", "projects", "memory", "agents", "commands"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    # Seed minimal files so Claude Code has something to read.
+    claude_md = d / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(
+            f"# {user.get('username', user['id'])}'s CLAUDE.md\n"
+            "Personal notes and project context for this user.\n"
+        )
+    memory_md = d / "MEMORY.md"
+    if not memory_md.exists():
+        memory_md.write_text(f"# {user.get('username', user['id'])}'s Memory Index\n")
+    settings = d / "settings.json"
+    if not settings.exists():
+        settings.write_text(json.dumps({
+            "permissions": {},
+            "env": {},
+        }, indent=2))
+    # Stub .claude.json so first launch doesn't spam the onboarding prompts.
+    claude_json = d / ".claude.json"
+    if not claude_json.exists():
+        claude_json.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "numStartups": 1,
+        }, indent=2))
+
+
+# --- Session ownership ---
+SESSION_OWNERS_FILE = MESSAGES_DIR / "session_owners.json"
+_session_owners_cache: Optional[Dict[str, str]] = None
+
+
+def _load_session_owners() -> Dict[str, str]:
+    global _session_owners_cache
+    if _session_owners_cache is not None:
+        return _session_owners_cache
+    try:
+        if SESSION_OWNERS_FILE.exists():
+            data = json.loads(SESSION_OWNERS_FILE.read_text())
+            if isinstance(data, dict):
+                _session_owners_cache = {str(k): str(v) for k, v in data.items()}
+                return _session_owners_cache
+    except Exception:
+        logger.debug("Failed to load session owners", exc_info=True)
+    _session_owners_cache = {}
+    return _session_owners_cache
+
+
+def _save_session_owners():
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_OWNERS_FILE.write_text(json.dumps(_load_session_owners(), indent=2))
+    except Exception:
+        logger.debug("Failed to save session owners", exc_info=True)
+
+
+def _session_owner_id(session_name: str) -> str:
+    """Return the owner user_id for a session. Pre-existing sessions with no
+    recorded owner default to the admin."""
+    owners = _load_session_owners()
+    return owners.get(session_name, "admin")
+
+
+def _set_session_owner(session_name: str, user_id: str):
+    owners = _load_session_owners()
+    owners[session_name] = user_id
+    _save_session_owners()
+
+
+def _clear_session_owner(session_name: str):
+    owners = _load_session_owners()
+    if session_name in owners:
+        owners.pop(session_name, None)
+        _save_session_owners()
+
+
+def _user_for_session(session_name: str) -> Optional[dict]:
+    """Find the user record that owns this session, falling back to admin."""
+    owner_id = _session_owner_id(session_name)
+    user = _find_user_by_id(owner_id) or _find_user_by_id("admin")
+    return user
+
+
+def _user_can_access_session(user: Optional[dict], session_name: str) -> bool:
+    """Admins see everything. Regular users only see sessions they own."""
+    if _is_admin(user):
+        return True
+    if not user:
+        return False
+    return _session_owner_id(session_name) == user["id"]
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -424,6 +686,56 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# Regex for /api/sessions/<name>/... and /api/sessions/<name> (DELETE/GET on bare URL).
+_SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)(?:/.*)?$")
+
+
+_ADMIN_ONLY_PREFIXES = (
+    "/api/profiles",
+    "/api/skill-library",
+    "/api/global-claude",
+    "/api/global",
+    "/api/all-sessions",
+)
+
+
+@app.middleware("http")
+async def session_ownership_middleware(request: Request, call_next):
+    """Block per-session API calls when the caller doesn't own the session
+    and reject admin-only routes for non-admin users.
+
+    Admins always pass. Sessions with no recorded owner default to admin, so
+    legacy sessions stay accessible by the admin without migration.
+    """
+    if not AUTH_PASS:
+        return await call_next(request)
+    path = request.url.path
+    rp = request.scope.get("root_path", "")
+    if rp and path.startswith(rp):
+        rel = path[len(rp):] or "/"
+    else:
+        rel = path
+    user = _current_user(request)
+    # Admin-only routes (Profiles, global CLAUDE.md, etc.)
+    for prefix in _ADMIN_ONLY_PREFIXES:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            if not _is_admin(user):
+                return JSONResponse({"error": "Admin only"}, status_code=403)
+            break
+    # Only gate paths under /api/sessions/<name>. The list endpoints
+    # /api/sessions and /api/sessions-fast are handled at the route level
+    # (they filter to the caller's owned sessions).
+    if rel in ("/api/sessions", "/api/sessions-fast", "/api/sessions/create"):
+        return await call_next(request)
+    m = _SESSION_PATH_RE.match(rel)
+    if not m:
+        return await call_next(request)
+    session_name = m.group(1)
+    if not _user_can_access_session(user, session_name):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     # Skip auth entirely if no password is configured
@@ -434,6 +746,8 @@ async def auth_middleware(request: Request, call_next):
     rp = request.scope.get("root_path", "")
     if path in ("/login", "/login/", rp + "/login", rp + "/login/"):
         return await call_next(request)
+    if path in ("/logout", "/logout/", rp + "/logout", rp + "/logout/"):
+        return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
         return await call_next(request)
@@ -443,6 +757,15 @@ async def auth_middleware(request: Request, call_next):
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
+    # Token signature is valid — also verify the user still exists. If users.json
+    # was tampered with or the user got deleted while logged in, fall back to
+    # the login screen.
+    user = _user_from_token(token)
+    if not user:
+        resp = HTMLResponse(LOGIN_PAGE)
+        resp.delete_cookie("tmux_auth")
+        return resp
+    request.state._current_user = user
     return await call_next(request)
 
 
@@ -476,13 +799,422 @@ async def do_login(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
-    if hmac.compare_digest(username, AUTH_USER) and hmac.compare_digest(password, AUTH_PASS):
-        token = _make_token(username)
-        resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
-        is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-        resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
-        return resp
-    return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+    # Legacy env-var path: if the credentials match TMUX_DASH_USER/TMUX_DASH_PASS,
+    # accept and treat as the admin user. This keeps the dashboard reachable even
+    # if users.json was deleted by hand.
+    legacy_ok = (
+        AUTH_PASS
+        and hmac.compare_digest(username, AUTH_USER)
+        and hmac.compare_digest(password, AUTH_PASS)
+    )
+    user = _find_user_by_username(username)
+    if user and _verify_password(user, password):
+        target_user = user
+    elif legacy_ok:
+        # Rebuild the admin user record on the fly if missing/out of sync. Find
+        # the admin inside *this* `users` list so the mutation we save below
+        # actually lands on the right object (calling _find_user_by_id would
+        # return a copy from a separate _load_users()).
+        users = _load_users()
+        target_user = next((u for u in users if u.get("id") == "admin"), None)
+        salt = _new_salt()
+        if target_user is None:
+            target_user = {
+                "id": "admin",
+                "username": username,
+                "password_hash": _hash_password(password, salt),
+                "password_salt": salt,
+                "role": "admin",
+                "created_at": time.time(),
+                "last_login": 0,
+            }
+            users.append(target_user)
+        else:
+            # Re-sync username + password hash to whatever the env says (this
+            # protects against a stale users.json shipped with an old salt).
+            target_user["username"] = username
+            target_user["password_salt"] = salt
+            target_user["password_hash"] = _hash_password(password, salt)
+        _save_users(users)
+    else:
+        return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+
+    # Update last_login
+    try:
+        users = _load_users()
+        for u in users:
+            if u.get("id") == target_user["id"]:
+                u["last_login"] = time.time()
+                break
+        _save_users(users)
+    except Exception:
+        logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
+
+    token = _make_token(target_user["id"])
+    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    return resp
+
+
+@app.post("/logout")
+async def do_logout(request: Request):
+    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
+    resp.delete_cookie("tmux_auth")
+    return resp
+
+
+class CreateUserBody(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UpdateUserBody(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = None
+    username: Optional[str] = None
+
+
+def _public_user(u: dict) -> dict:
+    """Strip secrets before returning a user record to the client."""
+    return {
+        "id": u.get("id", ""),
+        "username": u.get("username", ""),
+        "role": u.get("role", "user"),
+        "created_at": u.get("created_at", 0),
+        "last_login": u.get("last_login", 0),
+    }
+
+
+def _user_session_count(user_id: str) -> int:
+    owners = _load_session_owners()
+    return sum(1 for v in owners.values() if v == user_id)
+
+
+@app.get("/api/admin/users")
+async def api_admin_list_users(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    users = _load_users()
+    out = []
+    for u in users:
+        rec = _public_user(u)
+        rec["session_count"] = _user_session_count(u["id"])
+        out.append(rec)
+    return JSONResponse({"users": out})
+
+
+@app.post("/api/admin/users")
+async def api_admin_create_user(request: Request, body: CreateUserBody):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    username = (body.username or "").strip()
+    password = body.password or ""
+    role = body.role if body.role in ("user", "admin") else "user"
+    if not username:
+        return JSONResponse({"error": "Username is required"}, status_code=400)
+    if not re.match(r"^[A-Za-z0-9._@-]{2,40}$", username):
+        return JSONResponse({"error": "Username must be 2-40 chars (letters, numbers, . _ @ -)"}, status_code=400)
+    if len(password) < 6:
+        return JSONResponse({"error": "Password must be at least 6 characters"}, status_code=400)
+    users = _load_users()
+    if any(u.get("username") == username for u in users):
+        return JSONResponse({"error": f"Username '{username}' already exists"}, status_code=409)
+    salt = _new_salt()
+    new_user = {
+        "id": _new_user_id(),
+        "username": username,
+        "password_hash": _hash_password(password, salt),
+        "password_salt": salt,
+        "role": role,
+        "created_at": time.time(),
+        "last_login": 0,
+    }
+    users.append(new_user)
+    _save_users(users)
+    # Seed the user's data + Claude config dirs so they're ready to use.
+    try:
+        _user_data_dir(new_user)
+        _ensure_user_claude_config_dir(new_user)
+    except Exception:
+        logger.exception("Failed to seed dirs for new user %s", new_user["id"])
+    logger.info("Admin '%s' created user '%s' (role=%s)", user["username"], username, role)
+    return JSONResponse({"ok": True, "user": _public_user(new_user)})
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def api_admin_update_user(request: Request, user_id: str, body: UpdateUserBody):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    users = _load_users()
+    target = next((u for u in users if u["id"] == user_id), None)
+    if not target:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    changed = False
+    if body.username is not None:
+        new_un = body.username.strip()
+        if not re.match(r"^[A-Za-z0-9._@-]{2,40}$", new_un):
+            return JSONResponse({"error": "Invalid username"}, status_code=400)
+        if any(u.get("username") == new_un and u["id"] != user_id for u in users):
+            return JSONResponse({"error": "Username already taken"}, status_code=409)
+        target["username"] = new_un
+        changed = True
+    if body.password is not None:
+        if len(body.password) < 6:
+            return JSONResponse({"error": "Password must be at least 6 characters"}, status_code=400)
+        salt = _new_salt()
+        target["password_salt"] = salt
+        target["password_hash"] = _hash_password(body.password, salt)
+        changed = True
+    if body.role is not None:
+        if body.role not in ("user", "admin"):
+            return JSONResponse({"error": "Role must be 'user' or 'admin'"}, status_code=400)
+        # Block demoting the last remaining admin so we don't lock everyone out.
+        if target["id"] == "admin" and body.role != "admin":
+            return JSONResponse({"error": "The default admin cannot be demoted"}, status_code=400)
+        admin_count = sum(1 for u in users if u.get("role") == "admin")
+        if target.get("role") == "admin" and body.role != "admin" and admin_count <= 1:
+            return JSONResponse({"error": "Cannot demote the only remaining admin"}, status_code=400)
+        target["role"] = body.role
+        changed = True
+    if changed:
+        _save_users(users)
+    return JSONResponse({"ok": True, "user": _public_user(target)})
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def api_admin_delete_user(request: Request, user_id: str):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    if user_id == "admin":
+        return JSONResponse({"error": "The default admin cannot be deleted"}, status_code=400)
+    users = _load_users()
+    target = next((u for u in users if u["id"] == user_id), None)
+    if not target:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    # Kill any tmux sessions this user owned (their content would otherwise
+    # become orphaned and visible only to admins).
+    owners = _load_session_owners()
+    owned = [name for name, oid in owners.items() if oid == user_id]
+    for name in owned:
+        try:
+            subprocess.run(["tmux", "kill-session", "-t", name],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            logger.debug("Failed to kill session '%s' during user delete", name, exc_info=True)
+        _clear_session_owner(name)
+    # Remove the user record.
+    users = [u for u in users if u["id"] != user_id]
+    _save_users(users)
+    # Tear down per-user data + Claude config dirs.
+    try:
+        data_dir = MESSAGES_DIR / "users" / user_id
+        if data_dir.exists():
+            shutil.rmtree(data_dir, ignore_errors=True)
+    except Exception:
+        logger.debug("Failed to remove user data dir for %s", user_id, exc_info=True)
+    try:
+        cfg_dir = Path.home() / f".claude-user-{user_id}"
+        if cfg_dir.exists():
+            shutil.rmtree(cfg_dir, ignore_errors=True)
+    except Exception:
+        logger.debug("Failed to remove user claude config for %s", user_id, exc_info=True)
+    logger.info("Admin '%s' deleted user '%s' (and %d sessions)",
+                user["username"], target.get("username", user_id), len(owned))
+    return JSONResponse({"ok": True})
+
+
+class SaveMyContextBody(BaseModel):
+    content: str
+
+
+def _my_context_path(user: dict, filename: str) -> Optional[Path]:
+    """Resolve a writable per-user context file. Returns None for paths that
+    would escape the user's Claude config dir."""
+    base = _user_claude_config_dir(user)
+    base.mkdir(parents=True, exist_ok=True)
+    target = (base / filename).resolve()
+    try:
+        target.relative_to(base.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+_MY_CONTEXT_ALLOWED = {"CLAUDE.md", "MEMORY.md", "settings.json"}
+
+
+@app.get("/api/my/context")
+async def api_my_context(request: Request):
+    """Return current user's CLAUDE.md / MEMORY.md / settings.json contents."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    out = {"dir": str(_user_claude_config_dir(user)), "files": []}
+    for name in ("CLAUDE.md", "MEMORY.md", "settings.json"):
+        p = _my_context_path(user, name)
+        content = ""
+        exists = False
+        if p and p.exists():
+            try:
+                content = p.read_text()
+                exists = True
+            except Exception:
+                logger.debug("Failed to read %s", p, exc_info=True)
+        out["files"].append({"name": name, "content": content, "exists": exists, "path": str(p)})
+    return JSONResponse(out)
+
+
+@app.post("/api/my/context/{filename}")
+async def api_my_context_save(request: Request, filename: str, body: SaveMyContextBody):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    if filename not in _MY_CONTEXT_ALLOWED:
+        return JSONResponse({"error": "Not editable from this endpoint"}, status_code=400)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    p = _my_context_path(user, filename)
+    if p is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        # Validate settings.json before writing — Claude Code crashes hard
+        # on invalid JSON in this file.
+        if filename == "settings.json":
+            try:
+                json.loads(body.content or "{}")
+            except json.JSONDecodeError as e:
+                return JSONResponse({"error": f"Invalid JSON: {e.msg}"}, status_code=400)
+        p.write_text(body.content or "")
+        return JSONResponse({"ok": True, "path": str(p)})
+    except Exception:
+        logger.exception("Failed to save my-context %s for %s", filename, user["id"])
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+# --- History (per-user past sessions) ---
+
+@app.get("/api/history")
+async def api_history(request: Request):
+    """List past sessions for the current user, with title/notes/last activity.
+
+    A "session" here is any entry in the user's messages.json (current OR
+    deleted). Each entry includes the Key Info (notes) so the history list
+    can show it inline without a second round-trip.
+    """
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    messages_by_session = _load_messages(user)
+    notes_by_session = _load_all_notes(user)
+    # Live cache might have newer in-memory entries for currently active sessions
+    # this user owns; merge them in so the list reflects the most recent state.
+    live_sessions = set()
+    owners = _load_session_owners()
+    for sess in get_tmux_sessions():
+        if owners.get(sess["name"], "admin") == user["id"]:
+            live_sessions.add(sess["name"])
+    out = []
+    all_names = set(messages_by_session.keys()) | set(notes_by_session.keys()) | live_sessions
+    # Live sessions for the admin without explicit ownership records
+    if _is_admin(user):
+        for sess in get_tmux_sessions():
+            if owners.get(sess["name"], "admin") == "admin":
+                all_names.add(sess["name"])
+                live_sessions.add(sess["name"])
+    for name in all_names:
+        msgs = messages_by_session.get(name) or []
+        # If the session is currently in cache (memory), prefer the live list
+        # so newly-sent messages show up without waiting for the next save.
+        cache_entry = cache.get(name) or {}
+        if cache_entry.get("messages"):
+            msgs = cache_entry["messages"]
+        notes = notes_by_session.get(name, "") or cache_entry.get("notes", "")
+        title = cache_entry.get("title") or ""
+        last_ts = 0
+        user_msg_count = 0
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            ts = m.get("ts") or 0
+            if ts > last_ts:
+                last_ts = ts
+            if m.get("role") == "user":
+                user_msg_count += 1
+        out.append({
+            "session_name": name,
+            "title": title,
+            "key_info": notes,
+            "user_message_count": user_msg_count,
+            "total_messages": len(msgs),
+            "last_message_at": last_ts,
+            "is_live": name in live_sessions,
+        })
+    out.sort(key=lambda e: e["last_message_at"], reverse=True)
+    return JSONResponse({"sessions": out})
+
+
+@app.get("/api/history/{session_name}")
+async def api_history_detail(request: Request, session_name: str):
+    """Return all user messages + Key Info for a past session this user owns."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    # Ownership check (admins bypass)
+    if not _is_admin(user):
+        owner_id = _load_session_owners().get(session_name, "admin")
+        if owner_id != user["id"]:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+    # Prefer the live cache for currently-active sessions, fall back to disk.
+    msgs: list = []
+    cache_entry = cache.get(session_name) or {}
+    if cache_entry.get("messages"):
+        msgs = cache_entry["messages"]
+    else:
+        msgs = _load_messages(user).get(session_name, [])
+    notes = ""
+    if cache_entry.get("notes"):
+        notes = cache_entry["notes"]
+    else:
+        notes = _load_all_notes(user).get(session_name, "")
+    user_msgs = [
+        {"text": m.get("text", ""), "ts": m.get("ts", 0)}
+        for m in msgs
+        if isinstance(m, dict) and m.get("role") == "user"
+    ]
+    return JSONResponse({
+        "session_name": session_name,
+        "key_info": notes,
+        "user_messages": user_msgs,
+        "total_user_messages": len(user_msgs),
+    })
+
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    """Return the currently logged-in user (for the frontend to know who they are)."""
+    user = _current_user(request)
+    if not user:
+        # Auth disabled (no AUTH_PASS) → expose a synthetic admin so the UI works.
+        if not AUTH_PASS:
+            return JSONResponse({
+                "id": "admin", "username": AUTH_USER or "admin",
+                "role": "admin", "auth_disabled": True,
+            })
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    return JSONResponse({
+        "id": user["id"],
+        "username": user.get("username", ""),
+        "role": user.get("role", "user"),
+        "auth_disabled": False,
+    })
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -497,73 +1229,262 @@ async def serve_qa_output(filepath: str):
     return FileResponse(str(target))
 
 
+# Serve absolute-path files referenced in terminal output. The frontend
+# linkifier turns paths like /home/.../foo.md into <BASE>/file?path=/home/.../foo.md
+# links. Auth-gated by the global middleware; we still reject obviously
+# sensitive paths and require the resolved real path to match what was asked
+# (so symlinks can't escape into something unexpected).
+_FILE_SERVE_DENYLIST = {
+    "/etc/shadow", "/etc/gshadow", "/etc/sudoers",
+    "/root/.ssh/id_rsa", "/root/.ssh/id_ed25519",
+}
+_FILE_SERVE_DENY_PREFIXES = (
+    "/proc/", "/sys/", "/dev/",
+)
+
+# Some paths the terminal linkifier turns into <BASE>/file?path=... links are
+# not absolute filesystem paths but URL routes on sister apps (typically the
+# grabo.cc dashboards). When the local lookup misses, we 302-redirect to the
+# upstream host so the user reaches the actual resource. Comma-separated
+# overrides via TMUX_DASHBOARD_URL_REDIRECT_MAP="/prefix=https://host,...".
+_DEFAULT_URL_REDIRECT_MAP = {
+    "/data-dashboard": "https://grabo.cc",
+    "/extensiv":        "https://grabo.cc",
+    "/shippo":          "https://grabo.cc",
+    "/invoices":        "https://grabo.cc",
+    "/sztx":            "https://grabo.cc",
+    "/hztx":            "https://grabo.cc",
+    "/hzbs":            "https://grabo.cc",
+    "/outflows":        "https://grabo.cc",
+    "/productmanagement": "https://grabo.cc",
+    "/sznptinventory":  "https://grabo.cc",
+    "/ups":             "https://grabo.cc",
+    "/upsv3":           "https://grabo.cc",
+    "/usabanks":        "https://grabo.cc",
+    "/hsbchk":          "https://grabo.cc",
+    "/gusto":           "https://grabo.cc",
+    "/inventory":       "https://grabo.cc",
+    "/po":              "https://grabo.cc",
+    "/balance-sheet":   "https://grabo.cc",
+    "/bom":             "https://grabo.cc",
+    "/docvault":        "https://grabo.cc",
+}
+
+
+def _load_url_redirect_map() -> Dict[str, str]:
+    raw = os.environ.get("TMUX_DASHBOARD_URL_REDIRECT_MAP", "").strip()
+    if not raw:
+        return dict(_DEFAULT_URL_REDIRECT_MAP)
+    merged = dict(_DEFAULT_URL_REDIRECT_MAP)
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        prefix, host = entry.split("=", 1)
+        prefix = prefix.strip().rstrip("/")
+        host = host.strip().rstrip("/")
+        if prefix.startswith("/") and host.startswith("http"):
+            merged[prefix] = host
+    return merged
+
+
+_URL_REDIRECT_MAP = _load_url_redirect_map()
+
+
+def _upstream_url_for_path(path: str) -> Optional[str]:
+    """Return upstream URL if `path` is a known dashboard URL slug, else None."""
+    if not path.startswith("/"):
+        return None
+    first = "/" + path.lstrip("/").split("/", 1)[0]
+    host = _URL_REDIRECT_MAP.get(first)
+    if not host:
+        return None
+    return host + path
+
+
+def _file_error(request: Request, status: int, title: str, message: str, path: str):
+    """Return JSON for API clients, friendly HTML for browsers."""
+    accept = (request.headers.get("accept") or "").lower()
+    wants_html = "text/html" in accept and "application/json" not in accept
+    if not wants_html:
+        return JSONResponse({"error": title.lower(), "message": message, "path": path}, status_code=status)
+    safe_path = (path or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_msg = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    rp = request.scope.get("root_path", "") or "/"
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>{status} · {title} · tmux Dashboard</title>
+<style>
+  body{{margin:0;background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;box-sizing:border-box}}
+  .card{{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:28px 32px;max-width:640px;width:100%;box-shadow:0 6px 30px rgba(0,0,0,.4)}}
+  .status{{font-size:.8rem;letter-spacing:.08em;text-transform:uppercase;color:#8b949e;margin-bottom:6px}}
+  h1{{font-size:1.4rem;margin:0 0 12px 0;color:#f0f6fc}}
+  p{{margin:0 0 14px 0;color:#c9d1d9;line-height:1.55}}
+  .path{{display:block;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;color:#79c0ff;word-break:break-all;margin:4px 0 14px 0}}
+  .meta{{color:#6e7681;font-size:.85rem}}
+  a{{color:#58a6ff;text-decoration:none}}
+  a:hover{{text-decoration:underline}}
+</style></head>
+<body><div class="card">
+  <div class="status">Error {status} · {title}</div>
+  <h1>{safe_msg}</h1>
+  <p>The terminal link pointed to:</p>
+  <code class="path">{safe_path or '(no path)'}</code>
+  <p class="meta">If this is a file you expected to exist, double-check the spelling, or that the dashboard is running on the host where the file lives.</p>
+  <p><a href="{rp}">← back to dashboard</a></p>
+</div></body></html>"""
+    return HTMLResponse(html, status_code=status)
+
+
+@app.get("/file")
+async def serve_terminal_file(request: Request, path: str = "", download: int = 0):
+    """Serve a file referenced from terminal output.
+
+    The terminal linkifier (frontend) discovers absolute file paths like
+    /home/nimrod_rotem/tmux-dashboard-original/away-mode-skills.md and turns
+    them into <BASE>/file?path=... links. We serve them inline by default so
+    .md / .py / images / PDFs render in the browser tab; pass ?download=1 to
+    force a download.
+    """
+    if not path or not path.startswith("/"):
+        return _file_error(request, 400, "Bad request", "An absolute path is required (must start with /).", path)
+    if path in _FILE_SERVE_DENYLIST:
+        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", path)
+    for pref in _FILE_SERVE_DENY_PREFIXES:
+        if path.startswith(pref):
+            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", path)
+    try:
+        target = Path(path).resolve()
+    except Exception:
+        return _file_error(request, 400, "Bad request", "That path could not be resolved.", path)
+    if not target.exists() or not target.is_file():
+        upstream = _upstream_url_for_path(path)
+        if upstream:
+            return RedirectResponse(url=upstream, status_code=302)
+        return _file_error(request, 404, "File not found", "No such file on this host.", path)
+    # Re-check denylist against the resolved real path (defeats symlink tricks).
+    real = str(target)
+    if real in _FILE_SERVE_DENYLIST:
+        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", path)
+    for pref in _FILE_SERVE_DENY_PREFIXES:
+        if real.startswith(pref):
+            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", path)
+    mime, _ = mimetypes.guess_type(real)
+    headers = {}
+    # Render text/markdown/code inline as plain text so the browser shows the
+    # content rather than offering a download dialog.
+    ext = target.suffix.lower()
+    text_like_exts = {
+        ".md", ".markdown", ".txt", ".log", ".py", ".js", ".ts", ".tsx", ".jsx",
+        ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh",
+        ".bash", ".zsh", ".env", ".csv", ".tsv", ".sql", ".html", ".htm",
+        ".css", ".scss", ".xml", ".rb", ".go", ".rs", ".c", ".h", ".cpp",
+        ".hpp", ".java", ".kt", ".swift", ".php", ".lua", ".r", ".dockerfile",
+        ".gitignore", ".gitattributes",
+    }
+    if not mime and ext in text_like_exts:
+        mime = "text/plain; charset=utf-8"
+    elif mime and mime.startswith("text/"):
+        mime = mime + "; charset=utf-8" if "charset" not in mime else mime
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{target.name}"'
+    else:
+        headers["Content-Disposition"] = f'inline; filename="{target.name}"'
+    return FileResponse(str(target), media_type=mime or "application/octet-stream", headers=headers)
+
+
 # Three-tier cache per session
 cache: Dict[str, dict] = {}
 
 # Persistent message storage
+# NOTE: messages + notes are now scoped per-user. The legacy
+# ~/.tmux-dashboard/messages.json and notes.json are the admin's files. Other
+# users get ~/.tmux-dashboard/users/<id>/messages.json and notes.json.
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
 
 
-def _load_all_notes() -> Dict[str, str]:
-    """Load all session notes from disk."""
+def _read_json_file(path: Path) -> dict:
     try:
-        if NOTES_FILE.exists():
-            return json.loads(NOTES_FILE.read_text())
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return data
     except Exception:
-        logger.debug("Failed to load notes from %s", NOTES_FILE, exc_info=True)
+        logger.debug("Failed to read %s", path, exc_info=True)
     return {}
+
+
+def _write_json_file(path: Path, data: dict):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+    except Exception:
+        logger.debug("Failed to write %s", path, exc_info=True)
+
+
+def _load_all_notes(user: Optional[dict] = None) -> Dict[str, str]:
+    """Load all session notes for a given user from disk. Falls back to admin
+    file if `user` is None (matches legacy single-user behaviour)."""
+    return _read_json_file(_user_notes_file(user))
 
 
 def _save_notes():
-    """Persist all session notes to disk."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        existing = _load_all_notes()
-        for name, entry in cache.items():
-            notes = entry.get("notes")
-            if notes:
-                existing[name] = notes
-        NOTES_FILE.write_text(json.dumps(existing))
-    except Exception:
-        logger.debug("Failed to save notes to %s", NOTES_FILE, exc_info=True)
+    """Persist all session notes to per-user files based on session ownership."""
+    # Group cache entries by owning user
+    by_user: Dict[str, Dict[str, str]] = {}
+    for name, entry in cache.items():
+        notes = entry.get("notes")
+        if not notes:
+            continue
+        owner_id = _session_owner_id(name)
+        by_user.setdefault(owner_id, {})[name] = notes
+
+    # Write each user's file, merged with any sessions not currently in cache.
+    user_ids = set(by_user.keys())
+    # Also touch files for users whose cache is empty but who have existing notes
+    # so we don't accidentally drop them: just don't write empty files.
+    for uid, updates in by_user.items():
+        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
+        path = _user_notes_file(owner)
+        existing = _read_json_file(path)
+        existing.update(updates)
+        _write_json_file(path, existing)
 
 
 def _load_session_notes(session_name: str) -> str:
-    """Get persisted notes for a specific session."""
-    return _load_all_notes().get(session_name, "")
+    """Get persisted notes for a specific session, from its owner's file."""
+    owner = _user_for_session(session_name)
+    return _load_all_notes(owner).get(session_name, "")
 
 
-def _load_messages() -> Dict[str, list]:
-    """Load all session messages from disk."""
-    try:
-        if MESSAGES_FILE.exists():
-            return json.loads(MESSAGES_FILE.read_text())
-    except Exception:
-        logger.debug("Failed to load messages from %s", MESSAGES_FILE, exc_info=True)
-    return {}
+def _load_messages(user: Optional[dict] = None) -> Dict[str, list]:
+    """Load all session messages for a given user from disk."""
+    return _read_json_file(_user_messages_file(user))
 
 
 def _save_messages():
-    """Persist all session messages to disk (merge with existing)."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        # Load existing to avoid dropping sessions not yet in cache
-        existing = _load_messages()
-        # Update with current cache data
-        for name, entry in cache.items():
-            msgs = entry.get("messages")
-            if msgs:
-                existing[name] = msgs
-        MESSAGES_FILE.write_text(json.dumps(existing))
-    except Exception:
-        logger.debug("Failed to save messages to %s", MESSAGES_FILE, exc_info=True)
+    """Persist all session messages to per-user files based on session ownership."""
+    by_user: Dict[str, Dict[str, list]] = {}
+    for name, entry in cache.items():
+        msgs = entry.get("messages")
+        if not msgs:
+            continue
+        owner_id = _session_owner_id(name)
+        by_user.setdefault(owner_id, {})[name] = msgs
+
+    for uid, updates in by_user.items():
+        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
+        path = _user_messages_file(owner)
+        existing = _read_json_file(path)
+        existing.update(updates)
+        _write_json_file(path, existing)
 
 
 def _load_session_messages(session_name: str) -> list:
-    """Get persisted messages for a specific session."""
-    all_msgs = _load_messages()
-    return all_msgs.get(session_name, [])
+    """Get persisted messages for a specific session from its owner's file."""
+    owner = _user_for_session(session_name)
+    return _load_messages(owner).get(session_name, [])
 
 
 DESCRIPTION_TTL = 0    # never auto-expire
@@ -686,10 +1607,35 @@ def _find_session(session_name: str) -> tuple:
     return sessions, None
 
 
+def _filter_sessions_for_user(sessions: list, user: Optional[dict]) -> list:
+    """Restrict a session list to the ones the given user is allowed to see."""
+    if _is_admin(user):
+        return sessions
+    if not user:
+        return []
+    owners = _load_session_owners()
+    uid = user["id"]
+    return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+
+
+def _find_session_for_user(session_name: str, user: Optional[dict]) -> tuple:
+    """Same as _find_session but enforces user ownership. Returns
+    (sessions, session_dict) on success or (sessions, None) if missing OR not
+    owned by `user` (admins bypass)."""
+    sessions, sess = _find_session(session_name)
+    if sess is None:
+        return sessions, None
+    if not _user_can_access_session(user, session_name):
+        return sessions, None
+    return sessions, sess
+
+
 def capture_pane_full(session_name: str) -> str:
     try:
+        # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
+        # login URLs) come back intact instead of split at pane width.
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-"],
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", "-"],
             capture_output=True, text=True, timeout=10
         )
         return result.stdout if result.returncode == 0 else ""
@@ -700,12 +1646,25 @@ def capture_pane_full(session_name: str) -> str:
 def capture_pane_recent(session_name: str, lines: int = 80) -> str:
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", f"-{lines}"],
             capture_output=True, text=True, timeout=5
         )
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def get_pane_width(session_name: str) -> int:
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_width}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 80
 
 
 def get_pane_position(session_name: str) -> dict:
@@ -1632,8 +2591,9 @@ async def index():
 
 
 @app.get("/api/sessions")
-async def api_sessions():
-    sessions = get_tmux_sessions()
+async def api_sessions(request: Request):
+    user = _current_user(request)
+    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
     results, activities = await asyncio.gather(
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
@@ -1645,9 +2605,10 @@ async def api_sessions():
 
 
 @app.get("/api/sessions-fast")
-async def api_sessions_fast():
+async def api_sessions_fast(request: Request):
     """Return session list with cached data only — no LLM calls. Fast startup."""
-    sessions = get_tmux_sessions()
+    user = _current_user(request)
+    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
     # Run activity detection for all sessions in parallel threads
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
@@ -1710,9 +2671,10 @@ async def api_refresh_all_tiers(session_name: str):
 
 
 @app.get("/api/status")
-async def api_status():
+async def api_status(request: Request):
     """Lightweight: return only activity status per session, no LLM calls."""
-    sessions = get_tmux_sessions()
+    user = _current_user(request)
+    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
@@ -1738,10 +2700,12 @@ async def api_raw_output(session_name: str):
         return JSONResponse({"error": "Session not found"}, status_code=404)
     raw = await asyncio.to_thread(capture_pane_full, session_name)
     activity = await async_detect_activity(session_name)
+    pane_width = await asyncio.to_thread(get_pane_width, session_name)
     return JSONResponse({
         "name": session_name,
         "raw": raw,
         "lines": len(raw.split("\n")),
+        "pane_width": pane_width,
         "activity_status": activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
@@ -1782,6 +2746,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     pos = await asyncio.to_thread(get_pane_position, session_name)
     current_total = pos["total_lines"]
     vis_hash = await asyncio.to_thread(_visible_pane_hash, session_name)
+    pane_width = await asyncio.to_thread(get_pane_width, session_name)
 
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
@@ -1791,6 +2756,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
             "raw": raw,
             "total_lines": len(raw.split("\n")),
             "pane_total": current_total,
+            "pane_width": pane_width,
             "visible_hash": vis_hash,
         })
 
@@ -1803,12 +2769,14 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
                 "raw": raw,
                 "total_lines": len(raw.split("\n")),
                 "pane_total": current_total,
+                "pane_width": pane_width,
                 "visible_hash": vis_hash,
             })
         return JSONResponse({
             "mode": "none",
             "total_lines": known_lines,
             "pane_total": current_total,
+            "pane_width": pane_width,
             "visible_hash": vis_hash,
         })
 
@@ -1821,6 +2789,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
         "raw": raw,
         "total_lines": current_total,
         "pane_total": current_total,
+        "pane_width": pane_width,
         "overlap": overlap,
         "visible_hash": vis_hash,
     })
@@ -1832,8 +2801,9 @@ class CreateSession(BaseModel):
 
 
 @app.post("/api/sessions/create")
-async def api_create_session(body: CreateSession):
+async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
+    user = _current_user(request)
     name = body.name.strip()
     if name:
         # Validate name: alphanumeric, dash, underscore only
@@ -1855,6 +2825,26 @@ async def api_create_session(body: CreateSession):
             created = name
         else:
             created = sessions[-1]["name"] if sessions else "unknown"
+        # Record session ownership. If auth is disabled, fall back to admin.
+        owner_id = user["id"] if user else "admin"
+        _set_session_owner(created, owner_id)
+        # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
+        # `claude` invocation in this pane reads from the user's private config.
+        if user and not _is_admin(user):
+            try:
+                _ensure_user_claude_config_dir(user)
+                user_cfg = _user_claude_config_dir(user)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", created, "-l",
+                     f"export CLAUDE_CONFIG_DIR={shlex.quote(str(user_cfg))}"],
+                    capture_output=True, text=True, timeout=5
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", created, "Enter"],
+                    capture_output=True, text=True, timeout=5
+                )
+            except Exception:
+                logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
         # Inject stored API key so Claude Code can authenticate
         if _stored_anthropic_key:
             subprocess.run(
@@ -1869,9 +2859,12 @@ async def api_create_session(body: CreateSession):
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
-        # Apply profile (CLAUDE_CONFIG_DIR) if requested
+        # Apply profile (CLAUDE_CONFIG_DIR) if requested. For non-admin users the
+        # per-user dir we exported above takes precedence; honoring profile_id
+        # would let one user point at another's profile, so we ignore it for
+        # non-admins. Admins keep the existing behavior.
         requested_profile = (body.profile_id or "").strip() or DEFAULT_PROFILE_ID
-        if requested_profile != DEFAULT_PROFILE_ID:
+        if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
             roles = _load_roles()
             if _find_profile(requested_profile, roles):
                 roles["session_profiles"][created] = requested_profile
@@ -1897,9 +2890,10 @@ async def api_create_session(body: CreateSession):
 
 
 @app.delete("/api/sessions/{session_name}")
-async def api_delete_session(session_name: str):
+async def api_delete_session(request: Request, session_name: str):
     """Kill a tmux session and all its child processes."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
@@ -1977,6 +2971,9 @@ async def api_delete_session(session_name: str):
                 _save_roles(_roles)
         except Exception:
             logger.debug("Failed to clean up profile mapping for '%s'", session_name, exc_info=True)
+        # Drop the ownership record. Messages/notes are kept on disk so they
+        # show up in the user's History tab even after the live session dies.
+        _clear_session_owner(session_name)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -2188,6 +3185,19 @@ def _encode_project_path(cwd: str) -> str:
     return (cwd or "").replace("/", "-").replace("_", "-")
 
 
+def _session_config_base(session_name: str) -> Path:
+    """Resolve the CLAUDE_CONFIG_DIR a session actually uses.
+
+    Non-admin users always use their isolated ``~/.claude-user-<id>/`` dir,
+    overriding any profile_id that may have been recorded. Admin sessions fall
+    back to the normal profile resolver.
+    """
+    owner = _user_for_session(session_name)
+    if owner and not _is_admin(owner):
+        return _user_claude_config_dir(owner)
+    return _profile_dir(_get_session_profile_id(session_name))
+
+
 def _session_memory_dir(session_name: str) -> tuple[Path, str, str]:
     """Resolve the project memory dir for a session.
     Returns (memory_dir_path, cwd, profile_id). memory_dir_path may not exist yet.
@@ -2195,7 +3205,7 @@ def _session_memory_dir(session_name: str) -> tuple[Path, str, str]:
     cwd = get_session_cwd(session_name) or ""
     profile_id = _get_session_profile_id(session_name)
     encoded = _encode_project_path(cwd)
-    base = _profile_dir(profile_id)
+    base = _session_config_base(session_name)
     mem_dir = base / "projects" / encoded / "memory"
     return mem_dir, cwd, profile_id
 
@@ -7063,6 +8073,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .raw-output::-webkit-scrollbar{width:6px;height:6px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+.raw-link{color:#58a6ff;text-decoration:underline;text-decoration-color:#30363d;text-underline-offset:2px;word-break:break-all;cursor:pointer}
+.raw-link:hover{color:#79c0ff;text-decoration-color:#58a6ff}
+.raw-link:visited{color:#a371f7}
 .raw-resize-handle{width:100%;height:8px;cursor:ns-resize;background:transparent;display:flex;align-items:center;justify-content:center;user-select:none;flex-shrink:0}
 .raw-resize-handle:hover{background:#21262d}
 .raw-resize-handle::after{content:'';width:40px;height:3px;border-radius:2px;background:#30363d}
@@ -7389,6 +8402,58 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .pf-section .pf-banner{font-size:.72rem;color:#6e7681;padding:6px 8px;background:#0d1117;border:1px dashed #21262d;border-radius:6px;line-height:1.4}
 .pf-section .pf-help{font-size:.7rem;color:#6e7681;font-style:italic}
 
+/* Settings tabs */
+.settings-tabs{display:flex;gap:2px;border-bottom:1px solid #21262d;flex-shrink:0;flex-wrap:wrap}
+.settings-tab{padding:8px 14px;font-size:.78rem;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;user-select:none;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.settings-tab:hover{color:#c9d1d9}
+.settings-tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.settings-section{display:flex;flex-direction:column;gap:10px;height:100%}
+.settings-section label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-top:4px}
+.settings-section textarea{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace;resize:vertical;line-height:1.5}
+.settings-section textarea:focus{border-color:#58a6ff}
+.settings-section .my-ctx-claude{min-height:240px}
+.settings-section .my-ctx-memory{min-height:160px}
+.settings-section .my-ctx-settings{min-height:120px}
+.settings-section .my-ctx-path{font-size:.7rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:2px}
+.settings-section .my-ctx-actions{display:flex;justify-content:flex-end;gap:8px}
+.settings-section .pf-banner{font-size:.72rem;color:#6e7681;padding:6px 8px;background:#0d1117;border:1px dashed #21262d;border-radius:6px;line-height:1.4}
+.history-list{display:flex;flex-direction:column;gap:8px}
+.history-row{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px 12px;cursor:pointer;display:flex;flex-direction:column;gap:5px}
+.history-row:hover{border-color:#58a6ff;background:#1c2128}
+.history-row-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.history-row-name{color:#e6edf3;font-weight:500;font-size:.9rem;display:flex;align-items:center;gap:8px}
+.history-row-pill{font-size:.62rem;color:#7ee787;border:1px solid #238636;border-radius:3px;padding:1px 6px;text-transform:uppercase;letter-spacing:.05em}
+.history-row-meta{color:#6e7681;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.history-row-keyinfo{color:#c9d1d9;font-size:.78rem;line-height:1.4;background:#161b22;border-left:2px solid #58a6ff;padding:5px 8px;border-radius:0 4px 4px 0;white-space:pre-wrap;word-break:break-word;max-height:60px;overflow:hidden;position:relative}
+.history-row-keyinfo.empty{color:#6e7681;font-style:italic;border-left-color:#30363d}
+.history-detail-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px}
+.history-detail-back{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:5px;font-size:.78rem;cursor:pointer}
+.history-detail-back:hover{background:#30363d}
+.history-detail-name{color:#e6edf3;font-size:1rem;font-weight:600}
+.history-detail-keyinfo{background:#161b22;border:1px solid #21262d;border-left:3px solid #58a6ff;border-radius:0 6px 6px 0;padding:10px 12px;color:#c9d1d9;font-size:.85rem;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.history-detail-keyinfo.empty{color:#6e7681;font-style:italic;border-left-color:#30363d}
+.history-detail-msgs{display:flex;flex-direction:column;gap:8px}
+.history-msg{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px 10px;color:#e6edf3;font-size:.85rem;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.history-msg-ts{color:#6e7681;font-size:.68rem;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:4px}
+.history-empty{color:#6e7681;font-style:italic;font-size:.85rem;text-align:center;padding:40px 20px}
+.users-table{width:100%;border-collapse:collapse;font-size:.85rem}
+.users-table th{text-align:left;color:#8b949e;text-transform:uppercase;font-size:.68rem;letter-spacing:.06em;padding:6px 8px;border-bottom:1px solid #21262d}
+.users-table td{padding:8px;border-bottom:1px solid #161b22;color:#c9d1d9;vertical-align:middle}
+.users-table tr:last-child td{border-bottom:none}
+.users-actions{display:flex;gap:6px;justify-content:flex-end}
+.users-actions button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:3px 8px;border-radius:5px;font-size:.72rem;cursor:pointer}
+.users-actions button:hover{background:#30363d}
+.users-actions button.danger{color:#f85149;border-color:#f8514944}
+.users-actions button.danger:hover{background:#3f161a;color:#ff7b72}
+.users-role-admin{color:#d2a8ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;border:1px solid #d2a8ff44;border-radius:3px;padding:1px 5px}
+.users-role-user{color:#79c0ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px}
+.users-new-bar{display:flex;gap:8px;align-items:center;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;margin-bottom:12px}
+.users-new-bar input,.users-new-bar select{background:#161b22;border:1px solid #30363d;border-radius:5px;color:#e6edf3;padding:6px 8px;font-size:.82rem;outline:none}
+.users-new-bar input:focus,.users-new-bar select:focus{border-color:#58a6ff}
+.users-new-bar button{background:#1f6feb;color:#fff;border:none;padding:7px 14px;border-radius:5px;font-size:.82rem;cursor:pointer;font-weight:500}
+.users-new-bar button:hover{background:#388bfd}
+.nav-tools-divider{height:1px;background:#21262d;margin:4px 0}
+
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .claudemd-overlay.active{display:flex}
 .claudemd-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
@@ -7490,8 +8555,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         <div class="nav-tools-usage-divider"></div>
       </div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
-      <div class="nav-tools-item" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
+      <div class="nav-tools-item" onclick="openSettings('mycontext');closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
+      <div class="nav-tools-item" onclick="openSettings('history');closeToolsMenu()"><span class="icon">&#x1F4C5;</span> History</div>
+      <div class="nav-tools-divider"></div>
+      <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
+      <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
     </div>
   </div>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
@@ -7578,6 +8648,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 
+<!-- Settings overlay (My Context / History / Users) -->
+<div class="profiles-overlay" id="settings-overlay" onclick="if(event.target===this)closeSettings()">
+  <div class="profiles-panel" style="width:980px">
+    <h3>Settings <button class="stats-close" onclick="closeSettings()">&times;</button></h3>
+    <div class="settings-tabs" id="settings-tabs"></div>
+    <div class="settings-body" id="settings-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
+      <div id="settings-content" style="flex:1;min-height:0;overflow-y:auto;padding-top:8px"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
@@ -7588,7 +8669,7 @@ let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:''};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
 
 // --- "Hide Bash/Fetch" filter ---
 function getHideBashPref(){
@@ -7650,6 +8731,142 @@ function applyRawFilter(text){
   }
   return out.join('\n');
 }
+function _escTermHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// Linkify http(s):// URLs and absolute file paths in raw terminal output.
+// URL handling:
+//  (1) URL on one logical line — escape, trim trailing punctuation, wrap in <a>.
+//  (2) URL split across multiple rows by Claude Code's alt-screen TUI — when a
+//      whitespace/newline appears at column ≥ paneWidth-4 followed by row
+//      padding and a URL-valid char on the next row, treat as a soft wrap:
+//      strip padding+newline from href but emit per-chunk <a> tags so the
+//      visual layout matches the terminal and every chunk is clickable.
+// File-path handling:
+//  Absolute paths like /home/foo/bar.md become <BASE>/file?path=... links so
+//  the user can open the file in a new tab. Paths inside URLs are skipped
+//  because the URL match is preferred at any tied position. Single-line only.
+const _RAW_URL_TRAIL_RE=/[.,;:!?)\]}>'"]/;
+const _RAW_PATH_TRAIL_RE=/[,;:!?)\]}>'"]/;
+const _RAW_PATH_CHAR_RE=/[A-Za-z0-9._\-\/]/;
+function _findNextLinkable(text,from){
+  // Return earliest URL or path occurrence at or after `from`, or null.
+  let best=null;
+  const urlIdx=text.slice(from).search(/https?:\/\//);
+  if(urlIdx>=0)best={kind:'url',start:from+urlIdx};
+  // For file paths, require: leading '/', not preceded by ':' (i.e. not inside
+  // a scheme:// URL), then 1+ segments, last segment has a '.' extension.
+  const pathRe=/(?:^|[^A-Za-z0-9_./:\-])(\/(?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]+)/g;
+  pathRe.lastIndex=Math.max(0,from-1);
+  let pm;
+  while((pm=pathRe.exec(text))!==null){
+    const pStart=pm.index+(pm[0].length-pm[1].length);
+    if(pStart<from){pathRe.lastIndex=pm.index+1;continue;}
+    if(!best||pStart<best.start){best={kind:'path',start:pStart};}
+    break;
+  }
+  return best;
+}
+function _renderUrlSpan(text,start,paneWidth){
+  const pw=Math.max(20,paneWidth||80);
+  const wrapCol=pw-4;
+  const MAX_WRAP_LINES=20;
+  const MAX_URL_LEN=4096;
+  let j=start;
+  let crossedNewlines=0;
+  while(j<text.length&&(j-start)<MAX_URL_LEN){
+    const ch=text[j];
+    if(ch==='<'||ch==='>'||ch==='"'||ch==="'"||ch==='`')break;
+    if(/\s/.test(ch)){
+      let ls=j;
+      while(ls>0&&text[ls-1]!=='\n')ls--;
+      const col=j-ls;
+      if(col<wrapCol)break;
+      let k=j;
+      while(k<text.length&&(text[k]===' '||text[k]==='\t'))k++;
+      if(k>=text.length||text[k]!=='\n')break;
+      if(crossedNewlines>=MAX_WRAP_LINES)break;
+      const next=text[k+1];
+      if(!next||/\s/.test(next))break;
+      if(next==='<'||next==='>'||next==='"'||next==="'"||next==='`')break;
+      const nextSlice=text.slice(k+1,k+9);
+      if(nextSlice.startsWith('http://')||nextSlice.startsWith('https://'))break;
+      crossedNewlines++;
+      j=k+1;
+      continue;
+    }
+    j++;
+  }
+  const urlRaw=text.slice(start,j);
+  const hasNewlines=urlRaw.indexOf('\n')>=0;
+  let href=urlRaw.replace(/[ \t]*\n[ \t]*/g,'');
+  let trailText='';
+  if(!hasNewlines){
+    while(href.length>0&&_RAW_URL_TRAIL_RE.test(href[href.length-1])){
+      trailText=href[href.length-1]+trailText;
+      href=href.slice(0,-1);
+    }
+  }
+  let html;
+  if(href.length===0){
+    html=_escTermHtml(urlRaw);
+  }else if(!hasNewlines){
+    const dispText=urlRaw.slice(0,urlRaw.length-trailText.length);
+    html='<a href="'+_escTermHtml(href)+'" target="_blank" rel="noopener noreferrer" class="raw-link">'+_escTermHtml(dispText)+'</a>'+_escTermHtml(trailText);
+  }else{
+    const parts=urlRaw.split(/(\s+)/);
+    const hrefEsc=_escTermHtml(href);
+    html='';
+    for(const part of parts){
+      if(!part)continue;
+      if(/^\s+$/.test(part)){
+        html+=_escTermHtml(part);
+      }else{
+        html+='<a href="'+hrefEsc+'" target="_blank" rel="noopener noreferrer" class="raw-link">'+_escTermHtml(part)+'</a>';
+      }
+    }
+  }
+  return {html:html,end:j};
+}
+function _renderPathSpan(text,start){
+  const MAX_PATH_LEN=1024;
+  let j=start;
+  while(j<text.length&&(j-start)<MAX_PATH_LEN&&_RAW_PATH_CHAR_RE.test(text[j]))j++;
+  let pathRaw=text.slice(start,j);
+  let trail='';
+  while(pathRaw.length>0&&_RAW_PATH_TRAIL_RE.test(pathRaw[pathRaw.length-1])){
+    trail=pathRaw[pathRaw.length-1]+trail;
+    pathRaw=pathRaw.slice(0,-1);
+  }
+  if(!/\.[A-Za-z0-9]+$/.test(pathRaw)){
+    return {html:_escTermHtml(text.slice(start,j)),end:j};
+  }
+  const href=BASE+'/file?path='+encodeURIComponent(pathRaw);
+  return {
+    html:'<a href="'+_escTermHtml(href)+'" target="_blank" rel="noopener noreferrer" class="raw-link" data-file-path="'+_escTermHtml(pathRaw)+'">'+_escTermHtml(pathRaw)+'</a>'+_escTermHtml(trail),
+    end:j,
+  };
+}
+function _linkifyTerminalText(text,paneWidth){
+  if(!text)return '(empty)';
+  let out='';
+  let i=0;
+  while(i<text.length){
+    const hit=_findNextLinkable(text,i);
+    if(!hit){out+=_escTermHtml(text.slice(i));break;}
+    out+=_escTermHtml(text.slice(i,hit.start));
+    let rendered;
+    if(hit.kind==='url'){
+      rendered=_renderUrlSpan(text,hit.start,paneWidth);
+    }else{
+      rendered=_renderPathSpan(text,hit.start);
+    }
+    out+=rendered.html;
+    i=rendered.end;
+    if(i<=hit.start)i=hit.start+1;
+  }
+  return out;
+}
 function renderRawText(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
@@ -7658,7 +8875,7 @@ function renderRawText(name){
   const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
   const filtered=applyRawFilter(st.fullText);
   rawEl._programmaticScroll=true;
-  rawEl.textContent=filtered||'(empty)';
+  rawEl.innerHTML=_linkifyTerminalText(filtered,st.paneWidth);
   if(wasAtBottom){
     rawEl.scrollTop=rawEl.scrollHeight;
   }else{
@@ -8040,7 +9257,7 @@ function renderDetail(){
         st.fullText=cached.text;
         st.userScrolledUp=false;
         rawEl._programmaticScroll=true;
-        rawEl.textContent=applyRawFilter(cached.text)||'(empty)';
+        rawEl.innerHTML=_linkifyTerminalText(applyRawFilter(cached.text),st.paneWidth);
         rawEl.scrollTop=rawEl.scrollHeight;
         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
         startRawPolling(s.name);
@@ -8474,6 +9691,7 @@ async function pollRawDelta(name){
     const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail'+q);
     const data=await resp.json();
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
+    if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
     if(data.mode==='full'){
       st.fullText=data.raw||'';
       st.knownLines=data.pane_total;
@@ -8506,6 +9724,7 @@ async function pollRawDelta(name){
         if(fullData.mode==='full'){
           st.fullText=fullData.raw||'';
           st.knownLines=fullData.pane_total;
+          if(typeof fullData.pane_width==='number'&&fullData.pane_width>0)st.paneWidth=fullData.pane_width;
           renderRawText(name);
           if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
         }
@@ -9949,6 +11168,376 @@ async function restartWithProfile(sessionName){
   }catch(e){ alert('Failed to restart Claude.'); }
 }
 
+// ── Current-user awareness ──────────────────────────────────────────────────
+let _currentUser = null;
+
+async function loadCurrentUser(){
+  if(_currentUser) return _currentUser;
+  try{
+    const resp = await fetch(BASE+'/api/me');
+    if(resp.ok){
+      _currentUser = await resp.json();
+    }
+  }catch(e){ /* noop */ }
+  return _currentUser;
+}
+
+async function applyRoleVisibility(){
+  await loadCurrentUser();
+  const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
+  document.querySelectorAll('.nav-tools-admin').forEach(el => {
+    el.style.display = isAdmin ? '' : 'none';
+  });
+  const whoamiEl = document.getElementById('nav-tools-whoami');
+  if(whoamiEl && _currentUser){
+    const role = _currentUser.role==='admin' ? ' (admin)' : '';
+    whoamiEl.textContent = 'Signed in as ' + (_currentUser.username||'?') + role;
+  }
+}
+
+async function doLogout(){
+  if(!confirm('Log out?')) return;
+  try{
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = BASE + '/logout';
+    document.body.appendChild(form);
+    form.submit();
+  }catch(e){ alert('Logout failed'); }
+}
+
+// ── Settings modal (My Context / History / Users) ───────────────────────────
+let _settingsActiveTab = 'mycontext';
+let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
+
+async function openSettings(tab){
+  await loadCurrentUser();
+  _settingsActiveTab = tab || 'mycontext';
+  _settingsHistoryDetail = null;
+  const overlay = document.getElementById('settings-overlay');
+  overlay.classList.add('active');
+  renderSettingsTabs();
+  renderSettingsContent();
+}
+
+function closeSettings(){
+  document.getElementById('settings-overlay').classList.remove('active');
+  _settingsHistoryDetail = null;
+}
+
+function renderSettingsTabs(){
+  const tabsEl = document.getElementById('settings-tabs');
+  const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
+  const tabs = [
+    {id:'mycontext', label:'My Context'},
+    {id:'history',   label:'History'},
+  ];
+  if(isAdmin) tabs.push({id:'users', label:'Users'});
+  tabsEl.innerHTML = tabs.map(t =>
+    `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
+  ).join('');
+}
+
+function switchSettingsTab(tab){
+  _settingsActiveTab = tab;
+  _settingsHistoryDetail = null;
+  renderSettingsTabs();
+  renderSettingsContent();
+}
+
+function renderSettingsContent(){
+  const el = document.getElementById('settings-content');
+  if(_settingsActiveTab === 'mycontext'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
+    loadMyContext();
+  }else if(_settingsActiveTab === 'history'){
+    if(_settingsHistoryDetail){
+      renderHistoryDetail();
+    }else{
+      el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading your past sessions...</div></div>';
+      loadHistory();
+    }
+  }else if(_settingsActiveTab === 'users'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading users...</div></div>';
+    loadUsersAdmin();
+  }
+}
+
+// --- My Context tab ---
+async function loadMyContext(){
+  let data;
+  try{
+    const resp = await fetch(BASE+'/api/my/context');
+    data = await resp.json();
+    if(!resp.ok){ throw new Error(data.error||'Failed to load context'); }
+  }catch(e){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const files = {};
+  (data.files||[]).forEach(f => { files[f.name] = f; });
+  const claude = files['CLAUDE.md'] || {content:'', path:''};
+  const memory = files['MEMORY.md'] || {content:'', path:''};
+  const settings = files['settings.json'] || {content:'', path:''};
+  const html = `
+    <div class="settings-section">
+      <div class="pf-banner">These files are read by Claude Code in <strong>every session you launch</strong> (set via <code>CLAUDE_CONFIG_DIR=${esc(data.dir||'')}</code>). They are private to your account.</div>
+      <label>CLAUDE.md</label>
+      <div class="my-ctx-path">${esc(claude.path||'')}</div>
+      <textarea class="my-ctx-claude" id="my-ctx-claude" spellcheck="false">${esc(claude.content||'')}</textarea>
+      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('CLAUDE.md','my-ctx-claude')">Save CLAUDE.md</button></div>
+      <label>MEMORY.md</label>
+      <div class="my-ctx-path">${esc(memory.path||'')}</div>
+      <textarea class="my-ctx-memory" id="my-ctx-memory" spellcheck="false">${esc(memory.content||'')}</textarea>
+      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('MEMORY.md','my-ctx-memory')">Save MEMORY.md</button></div>
+      <label>settings.json</label>
+      <div class="my-ctx-path">${esc(settings.path||'')}</div>
+      <textarea class="my-ctx-settings" id="my-ctx-settings" spellcheck="false">${esc(settings.content||'')}</textarea>
+      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('settings.json','my-ctx-settings')">Save settings.json</button></div>
+    </div>`;
+  document.getElementById('settings-content').innerHTML = html;
+}
+
+async function saveMyContext(filename, textareaId){
+  const ta = document.getElementById(textareaId);
+  if(!ta) return;
+  const content = ta.value;
+  try{
+    const resp = await fetch(BASE+'/api/my/context/'+encodeURIComponent(filename), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({content})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Save failed'); return; }
+    // Subtle confirmation via the path line
+    const banner = ta.parentElement.querySelector('.my-ctx-path');
+    if(banner){
+      const orig = banner.textContent;
+      banner.textContent = 'Saved ✓ — '+orig;
+      setTimeout(() => { banner.textContent = orig; }, 2000);
+    }
+  }catch(e){ alert('Save failed: '+e.message); }
+}
+
+// --- History tab ---
+async function loadHistory(){
+  let data;
+  try{
+    const resp = await fetch(BASE+'/api/history');
+    data = await resp.json();
+    if(!resp.ok){ throw new Error(data.error||'Failed to load history'); }
+  }catch(e){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load history: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const sessions = data.sessions || [];
+  if(!sessions.length){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="history-empty">No past sessions yet. Create a session and send some messages — they will appear here.</div></div>';
+    return;
+  }
+  const rows = sessions.map(s => {
+    const ts = s.last_message_at ? timeAgo(s.last_message_at) : 'no activity';
+    const livePill = s.is_live ? '<span class="history-row-pill">Live</span>' : '';
+    const title = s.title ? ' · '+esc(s.title) : '';
+    const keyInfo = (s.key_info||'').trim();
+    const keyInfoBlock = keyInfo
+      ? `<div class="history-row-keyinfo">${esc(keyInfo)}</div>`
+      : '<div class="history-row-keyinfo empty">No Key Info captured for this session.</div>';
+    return `<div class="history-row" onclick="openHistoryDetail('${esc(s.session_name)}')">
+      <div class="history-row-top">
+        <div class="history-row-name">${esc(s.session_name)}${title} ${livePill}</div>
+        <div class="history-row-meta">${ts} · ${s.user_message_count} msgs</div>
+      </div>
+      ${keyInfoBlock}
+    </div>`;
+  }).join('');
+  document.getElementById('settings-content').innerHTML =
+    '<div class="settings-section"><div class="history-list">'+rows+'</div></div>';
+}
+
+async function openHistoryDetail(sessionName){
+  _settingsHistoryDetail = {session_name: sessionName, loading: true};
+  renderHistoryDetail();
+  try{
+    const resp = await fetch(BASE+'/api/history/'+encodeURIComponent(sessionName));
+    const data = await resp.json();
+    if(!resp.ok){
+      _settingsHistoryDetail = null;
+      alert(data.error||'Failed to load session');
+      renderSettingsContent();
+      return;
+    }
+    _settingsHistoryDetail = {session_name: sessionName, loading: false, data};
+    renderHistoryDetail();
+  }catch(e){
+    _settingsHistoryDetail = null;
+    alert('Failed to load session: '+e.message);
+    renderSettingsContent();
+  }
+}
+
+function renderHistoryDetail(){
+  if(!_settingsHistoryDetail) return;
+  const el = document.getElementById('settings-content');
+  const {session_name, loading, data} = _settingsHistoryDetail;
+  if(loading){
+    el.innerHTML = `<div class="settings-section">
+      <div class="history-detail-header">
+        <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
+        <div class="history-detail-name">${esc(session_name)}</div>
+      </div>
+      <div class="pf-banner">Loading...</div></div>`;
+    return;
+  }
+  const keyInfo = (data.key_info||'').trim();
+  const keyInfoBlock = keyInfo
+    ? `<div class="history-detail-keyinfo">${esc(keyInfo)}</div>`
+    : '<div class="history-detail-keyinfo empty">No Key Info captured for this session.</div>';
+  const msgs = data.user_messages || [];
+  const msgsHtml = msgs.length
+    ? msgs.map(m => `<div class="history-msg">
+        <div class="history-msg-ts">${m.ts?timeAgo(m.ts):'no timestamp'}</div>
+        ${esc(m.text||'').replace(/\\n/g,'<br>')}
+      </div>`).join('')
+    : '<div class="history-empty">No user messages were recorded for this session.</div>';
+  el.innerHTML = `<div class="settings-section">
+    <div class="history-detail-header">
+      <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
+      <div class="history-detail-name">${esc(session_name)} <span style="font-size:.72rem;color:#6e7681;font-weight:400">· ${msgs.length} messages</span></div>
+    </div>
+    <label>Key Info</label>
+    ${keyInfoBlock}
+    <label style="margin-top:10px">Your messages</label>
+    <div class="history-detail-msgs">${msgsHtml}</div>
+  </div>`;
+}
+
+function backToHistoryList(){
+  _settingsHistoryDetail = null;
+  renderSettingsContent();
+}
+
+// --- Users tab (admin only) ---
+async function loadUsersAdmin(){
+  let data;
+  try{
+    const resp = await fetch(BASE+'/api/admin/users');
+    data = await resp.json();
+    if(!resp.ok){ throw new Error(data.error||'Failed'); }
+  }catch(e){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const users = data.users || [];
+  const rows = users.map(u => {
+    const roleTag = u.role==='admin'
+      ? '<span class="users-role-admin">admin</span>'
+      : '<span class="users-role-user">user</span>';
+    const lastLogin = u.last_login ? timeAgo(u.last_login) : 'never';
+    const isMe = (_currentUser && _currentUser.id===u.id);
+    const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase;letter-spacing:.05em">you</span>' : '';
+    const actions = (u.id==='admin' || isMe) ? `
+      <div class="users-actions">
+        <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset password</button>
+      </div>
+    ` : `
+      <div class="users-actions">
+        <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset password</button>
+        <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote to user':'Promote to admin'}</button>
+        <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>
+      </div>
+    `;
+    return `<tr>
+      <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
+      <td>${roleTag}</td>
+      <td>${u.session_count||0} sessions</td>
+      <td>${lastLogin}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+  const html = `<div class="settings-section">
+    <div class="pf-banner">Admins can create new users. Each user has their own isolated <code>CLAUDE_CONFIG_DIR</code>, messages history, and tmux sessions. Non-admins cannot see other users' data.</div>
+    <div class="users-new-bar">
+      <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
+      <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
+      <select id="users-new-role">
+        <option value="user">user</option>
+        <option value="admin">admin</option>
+      </select>
+      <button onclick="createUserFromForm()">+ Create user</button>
+    </div>
+    <table class="users-table">
+      <thead><tr><th>Username</th><th>Role</th><th>Sessions</th><th>Last login</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="5" class="history-empty">No users yet.</td></tr>'}</tbody>
+    </table>
+  </div>`;
+  document.getElementById('settings-content').innerHTML = html;
+}
+
+async function createUserFromForm(){
+  const username = (document.getElementById('users-new-username')||{}).value || '';
+  const password = (document.getElementById('users-new-password')||{}).value || '';
+  const role = (document.getElementById('users-new-role')||{}).value || 'user';
+  if(!username.trim() || password.length<6){
+    alert('Username + at least 6-character password required.');
+    return;
+  }
+  try{
+    const resp = await fetch(BASE+'/api/admin/users', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username:username.trim(), password, role})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create user'); return; }
+    loadUsersAdmin();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function resetUserPassword(userId, username){
+  const pw = prompt('New password for "'+username+'" (min 6 chars):');
+  if(pw===null) return;
+  if(pw.length < 6){ alert('Password must be at least 6 characters.'); return; }
+  try{
+    const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId), {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    alert('Password updated for '+username+'.');
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function toggleUserRole(userId, currentRole){
+  const newRole = currentRole==='admin' ? 'user' : 'admin';
+  if(!confirm('Change role to "'+newRole+'"?')) return;
+  try{
+    const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId), {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({role: newRole})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    loadUsersAdmin();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function deleteUser(userId, username){
+  if(!confirm('Delete user "'+username+'"? This kills their tmux sessions and removes their data and CLAUDE config directory. This cannot be undone.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId), {
+      method:'DELETE'
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    loadUsersAdmin();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
 async function openProfiles(){
   const overlay = document.getElementById('profiles-overlay');
   overlay.classList.add('active');
@@ -11000,6 +12589,7 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
+loadCurrentUser().then(applyRoleVisibility);
 loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
 loadAll();
 checkClaudeAuth();
