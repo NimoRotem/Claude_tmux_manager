@@ -9365,6 +9365,49 @@ function closeToolsMenu(){
 // Close dropdowns on outside click
 document.addEventListener('click',function(){closeTabMore();closeToolsMenu()});
 
+// ── Physical keyboard → tmux forwarding ──────────────────────────────
+// When a session's terminal (raw) tab is open and you're NOT typing in a
+// text field, keystrokes are sent straight to the tmux session — so the
+// "Keys" bar (Esc, Ctrl+C, Enter, arrows, Tab, y/n, …) works from the
+// real keyboard without clicking the on-screen buttons.
+let terminalKeyboardEnabled=true;
+// Single keys that map to a named tmux key (everything else printable is sent literally).
+const _KB_NAMED={
+  'Escape':'Escape','Enter':'Enter','Tab':'Tab','Backspace':'BSpace',' ':'Space',
+  'ArrowUp':'Up','ArrowDown':'Down','ArrowLeft':'Left','ArrowRight':'Right',
+  'Home':'Home','End':'End','PageUp':'PageUp','PageDown':'PageDown',
+};
+// Ctrl+<letter> combos tmux accepts.
+const _KB_CTRL=new Set(['c','d','z','l','a','e','u','k','w']);
+function _kbIsEditable(el){
+  if(!el)return false;
+  const tag=el.tagName;
+  return tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||el.isContentEditable;
+}
+document.addEventListener('keydown',function(e){
+  if(!terminalKeyboardEnabled)return;
+  if(!selectedSession)return;
+  // Only drive the terminal while the raw/terminal tab is the active view.
+  if((activeTabs[selectedSession]||'raw')!=='raw')return;
+  // Don't hijack typing in the command box, chat box, modals, etc.
+  if(_kbIsEditable(e.target))return;
+  // Leave browser/OS shortcuts (Cmd/⌘, Alt) alone.
+  if(e.metaKey||e.altKey)return;
+  let key=null;
+  if(e.ctrlKey){
+    const c=e.key.toLowerCase();
+    if(_KB_CTRL.has(c))key='C-'+c; else return; // let other Ctrl combos through to the browser
+  }else if(e.key in _KB_NAMED){
+    key=_KB_NAMED[e.key];
+  }else if(e.key.length===1){
+    key=e.key; // literal printable char (letters, digits, y/n/q, punctuation)
+  }else{
+    return; // unhandled key (F-keys, etc.)
+  }
+  e.preventDefault();
+  sendRawKeys(selectedSession,[key]);
+});
+
 function mergeChatMessages(name, serverMsgs){
   // Merge server messages with local messages, preserving any locally-added
   // messages (e.g. from raw tab) that the server hasn't echoed back yet.
