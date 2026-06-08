@@ -9371,10 +9371,19 @@ document.addEventListener('click',function(){closeTabMore();closeToolsMenu()});
 // "Keys" bar (Esc, Ctrl+C, Enter, arrows, Tab, y/n, …) works from the
 // real keyboard without clicking the on-screen buttons.
 let terminalKeyboardEnabled=true;
+// Flip to false (or set window.KB_DEBUG=false in the console) to silence the
+// per-keystroke trace below. Handy for debugging why a key isn't reaching tmux,
+// especially on Windows where modifier/key-name reporting differs from macOS.
+let terminalKeyboardDebug=true;
+function _kbLog(){if(terminalKeyboardDebug&&window.KB_DEBUG!==false)console.log('[kb]',...arguments);}
 // Single keys that map to a named tmux key (everything else printable is sent literally).
+// Values include legacy/non-standard e.key names (IE/old-Edge on Windows reported
+// 'Esc','Del','Left','Up','Spacebar','Scroll' instead of the modern names).
 const _KB_NAMED={
-  'Escape':'Escape','Enter':'Enter','Tab':'Tab','Backspace':'BSpace',' ':'Space',
+  'Escape':'Escape','Esc':'Escape','Enter':'Enter','Tab':'Tab',
+  'Backspace':'BSpace',' ':'Space','Spacebar':'Space','Delete':'DC','Del':'DC',
   'ArrowUp':'Up','ArrowDown':'Down','ArrowLeft':'Left','ArrowRight':'Right',
+  'Up':'Up','Down':'Down','Left':'Left','Right':'Right',
   'Home':'Home','End':'End','PageUp':'PageUp','PageDown':'PageDown',
 };
 // Ctrl+<letter> combos tmux accepts.
@@ -9385,25 +9394,39 @@ function _kbIsEditable(el){
   return tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||el.isContentEditable;
 }
 document.addEventListener('keydown',function(e){
-  if(!terminalKeyboardEnabled)return;
-  if(!selectedSession)return;
+  if(!terminalKeyboardEnabled){_kbLog('skip: disabled');return;}
+  if(!selectedSession){_kbLog('skip: no selected session');return;}
   // Only drive the terminal while the raw/terminal tab is the active view.
-  if((activeTabs[selectedSession]||'raw')!=='raw')return;
+  const _tab=activeTabs[selectedSession]||'raw';
+  if(_tab!=='raw'){_kbLog('skip: tab is',_tab,'(need raw)');return;}
   // Don't hijack typing in the command box, chat box, modals, etc.
-  if(_kbIsEditable(e.target))return;
-  // Leave browser/OS shortcuts (Cmd/⌘, Alt) alone.
-  if(e.metaKey||e.altKey)return;
+  if(_kbIsEditable(e.target)){_kbLog('skip: editable target',e.target&&e.target.tagName);return;}
+  // Skip keys generated mid-IME-composition (Windows/CJK input).
+  if(e.isComposing||e.keyCode===229){_kbLog('skip: IME composing');return;}
+  _kbLog('keydown',{key:e.key,code:e.code,ctrl:e.ctrlKey,alt:e.altKey,meta:e.metaKey,shift:e.shiftKey});
+  // The Windows/⌘ super key is never ours — let the OS/browser have it.
+  if(e.metaKey){_kbLog('skip: meta/super key');return;}
+  // AltGr (common on non-US Windows keyboards) reports as ctrl+alt and yields a
+  // printable char (@, \, |, {, }, …). Send that char literally — older code
+  // dropped it because of the blanket alt check, which is the main reason typing
+  // "didn't work" on international Windows layouts.
+  const _altGr=e.ctrlKey&&e.altKey;
   let key=null;
-  if(e.ctrlKey){
+  if(_altGr&&e.key.length===1){
+    key=e.key;
+  }else if(e.altKey){
+    _kbLog('skip: alt modifier');return; // leave plain Alt shortcuts to the browser
+  }else if(e.ctrlKey){
     const c=e.key.toLowerCase();
-    if(_KB_CTRL.has(c))key='C-'+c; else return; // let other Ctrl combos through to the browser
+    if(_KB_CTRL.has(c)){key='C-'+c;}else{_kbLog('skip: unmapped Ctrl combo',e.key);return;} // let other Ctrl combos through
   }else if(e.key in _KB_NAMED){
     key=_KB_NAMED[e.key];
   }else if(e.key.length===1){
     key=e.key; // literal printable char (letters, digits, y/n/q, punctuation)
   }else{
-    return; // unhandled key (F-keys, etc.)
+    _kbLog('skip: unhandled key',e.key); return; // F-keys, dead keys, etc.
   }
+  _kbLog('send →',key);
   e.preventDefault();
   sendRawKeys(selectedSession,[key]);
 });
