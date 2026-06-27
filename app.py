@@ -5156,6 +5156,315 @@ async def api_health():
     return JSONResponse(checks)
 
 
+# --- Claude account identity + per-session stale-login detection ---
+#
+# A running `claude` process pins whatever account was in `.credentials.json`
+# at startup; the file changing later does NOT switch a live session. So a
+# session started before a login switch keeps showing the OLD account's 5-hour
+# usage bar inside its TUI. We detect that by comparing each session's claude
+# process start time against when the active account last *changed* (not merely
+# refreshed) for that session's CLAUDE_CONFIG_DIR.
+
+def _friendly_plan(sub: str, tier: str) -> str:
+    t = (tier or "").lower()
+    if "max_20x" in t:
+        return "Max 20x"
+    if "max_5x" in t:
+        return "Max 5x"
+    if "pro" in t:
+        return "Pro"
+    if "team" in t:
+        return "Team"
+    s = (sub or "").lower()
+    if s == "max":
+        return "Max"
+    if s == "pro":
+        return "Pro"
+    if s == "free":
+        return "Free"
+    return sub.capitalize() if sub else "—"
+
+
+def _clk_tck() -> int:
+    try:
+        return os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return 100
+
+
+_btime_cache: list = [0.0]
+
+
+def _system_btime() -> float:
+    if _btime_cache[0]:
+        return _btime_cache[0]
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    _btime_cache[0] = float(line.split()[1])
+                    break
+    except Exception:
+        pass
+    return _btime_cache[0]
+
+
+def _proc_start_epoch(pid) -> float:
+    """Wall-clock epoch when process <pid> started, from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # comm (field 2) is wrapped in parens and may contain spaces/parens, so
+        # split after the last ')'. starttime is field 22 (clock ticks since boot).
+        fields = data[data.rfind(")") + 2:].split()
+        if len(fields) <= 19:
+            return 0.0
+        btime = _system_btime()
+        if btime <= 0:
+            return 0.0
+        return btime + float(fields[19]) / _clk_tck()
+    except Exception:
+        return 0.0
+
+
+def _build_proc_tree() -> tuple:
+    """One `ps` call -> (children_by_ppid: dict, comm_by_pid: dict)."""
+    children: dict = {}
+    comm: dict = {}
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,comm="],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in (res.stdout or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            pid, ppid = parts[0], parts[1]
+            children.setdefault(ppid, []).append(pid)
+            comm[pid] = parts[2] if len(parts) > 2 else ""
+    except Exception:
+        pass
+    return children, comm
+
+
+def _all_pane_pids_by_session() -> dict:
+    """One `tmux list-panes -a` call -> {session_name: [pane_pid, ...]}."""
+    m: dict = {}
+    try:
+        res = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in (res.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                m.setdefault(parts[0], []).append(parts[1])
+    except Exception:
+        pass
+    return m
+
+
+def _claude_pids_under(roots, children: dict, comm: dict) -> list:
+    """BFS the process tree from pane roots, returning descendant `claude` pids."""
+    out = []
+    stack = list(roots)
+    seen = set(roots)
+    steps = 0
+    while stack and steps < 10000:
+        steps += 1
+        cur = stack.pop()
+        for ch in children.get(cur, []):
+            if ch in seen:
+                continue
+            seen.add(ch)
+            stack.append(ch)
+            if (comm.get(ch, "") or "").lower() == "claude":
+                out.append(ch)
+    return out
+
+
+_account_ident_cache: dict = {}
+
+
+def _account_identity(config_dir) -> dict:
+    """Current Claude account for a CLAUDE_CONFIG_DIR (cached 30s)."""
+    key = str(config_dir)
+    now = time.time()
+    cached = _account_ident_cache.get(key)
+    if cached and now - cached[0] < 30:
+        return cached[1]
+    config_dir = Path(config_dir)
+    sub = tier = email = org = ""
+    cred_mtime = 0.0
+    creds = config_dir / ".credentials.json"
+    try:
+        cred_mtime = creds.stat().st_mtime
+        oauth = json.loads(creds.read_text()).get("claudeAiOauth", {})
+        sub = oauth.get("subscriptionType", "") or ""
+        tier = oauth.get("rateLimitTier", "") or ""
+    except Exception:
+        pass
+    # The big config (with oauthAccount.emailAddress) lives at <dir>/.claude.json,
+    # except the default ~/.claude whose config is the home-level ~/.claude.json.
+    cj = config_dir / ".claude.json"
+    profile_fetched = 0.0
+    try:
+        if not cj.exists() and config_dir == Path.home() / ".claude":
+            cj = Path.home() / ".claude.json"
+        oa = json.loads(cj.read_text()).get("oauthAccount", {})
+        email = oa.get("emailAddress", "") or ""
+        org = oa.get("organizationUuid", "") or ""
+        # profileFetchedAt (ms) marks when this account was last logged in/switched.
+        # Unlike the credentials mtime, it does NOT move on a routine token refresh,
+        # so it's the correct anchor for "when did the active account change".
+        pf = oa.get("profileFetchedAt") or 0
+        profile_fetched = float(pf) / 1000.0 if pf else 0.0
+    except Exception:
+        pass
+    ident = {
+        "email": email, "sub": sub, "tier": tier,
+        "plan": _friendly_plan(sub, tier),
+        "fp": org or (sub + "/" + tier),  # account fingerprint (changes per account)
+        "cred_mtime": cred_mtime,
+        "profile_fetched": profile_fetched,
+    }
+    _account_ident_cache[key] = (now, ident)
+    return ident
+
+
+_LOGIN_STATE_FILE = Path.home() / ".tmux-dashboard" / "login_state.json"
+
+
+def _load_login_state() -> dict:
+    try:
+        return json.loads(_LOGIN_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_login_state(state: dict):
+    try:
+        _LOGIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _LOGIN_STATE_FILE.write_text(json.dumps(state))
+    except Exception:
+        logger.debug("Could not persist login_state.json", exc_info=True)
+
+
+def _login_active_since(config_dir, ident: dict) -> float:
+    """Epoch since which `ident['fp']` has been the active account for this dir.
+
+    Persisted so it survives dashboard restarts. Advances ONLY when the account
+    identity actually changes (a routine token refresh rewrites .credentials.json
+    but keeps the same fingerprint, so it does not count as a switch).
+    """
+    key = str(config_dir)
+    state = _load_login_state()
+    cur = state.get(key)
+    now = time.time()
+    fp = ident.get("fp", "")
+    # Anchor on profileFetchedAt (true login/switch time, refresh-proof); fall
+    # back to the creds mtime, then now.
+    anchor = ident.get("profile_fetched") or ident.get("cred_mtime") or now
+    if not cur:
+        state[key] = {"fp": fp, "since": anchor}
+        _save_login_state(state)
+        return anchor
+    if cur.get("fp") != fp:
+        # Account actually changed since last poll -> re-anchor to the new login.
+        state[key] = {"fp": fp, "since": anchor}
+        _save_login_state(state)
+        return anchor
+    # Same account: keep the stored anchor even if a refresh / periodic profile
+    # re-fetch moved the timestamps, so refreshes never flag healthy sessions.
+    return cur.get("since", 0) or 0
+
+
+@app.get("/api/login-health")
+async def api_login_health():
+    """Per-session Claude login health: flags sessions whose live `claude`
+    process started before the current account became active (i.e. its in-TUI
+    5-hour usage bar reflects a previous account)."""
+    def _compute():
+        sessions = get_tmux_sessions()
+        children, comm = _build_proc_tree()
+        panes = _all_pane_pids_by_session()
+        ident_by_dir: dict = {}
+        out = []
+        for s in sessions:
+            name = s["name"]
+            base = _session_config_base(name)
+            key = str(base)
+            ident = ident_by_dir.get(key)
+            if ident is None:
+                ident = _account_identity(base)
+                ident_by_dir[key] = ident
+            since = _login_active_since(base, ident)
+            cpids = _claude_pids_under(panes.get(name, []), children, comm)
+            starts = [e for e in (_proc_start_epoch(p) for p in cpids) if e > 0]
+            claude_started = min(starts) if starts else 0
+            # 5s slack avoids flagging a session launched in the same moment.
+            stale = bool(claude_started and since and claude_started < since - 5)
+            out.append({
+                "name": name,
+                "stale": stale,
+                "claude_running": bool(cpids),
+                "claude_started": claude_started,
+                "plan": ident["plan"],
+                "account": ident["email"] or ident["sub"],
+            })
+        active = _account_identity(Path.home() / ".claude")
+        return {
+            "account": {"email": active["email"], "plan": active["plan"],
+                        "sub": active["sub"], "tier": active["tier"]},
+            "stale_count": sum(1 for x in out if x["stale"]),
+            "sessions": out,
+        }
+    try:
+        data = await asyncio.to_thread(_compute)
+    except Exception:
+        logger.exception("login-health compute failed")
+        return JSONResponse({"account": {}, "stale_count": 0, "sessions": []})
+    return JSONResponse(data)
+
+
+@app.post("/api/sessions/{session_name}/relogin")
+async def api_session_relogin(session_name: str, request: Request):
+    """Gracefully exit Claude and relaunch it on the CURRENT login, preserving
+    the conversation via --continue. Fixes a session stuck on a previous account."""
+    user = _current_user(request)
+    if not _user_can_access_session(user, session_name):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    running = await _async_is_claude_running(session_name)
+    if running:
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
+            capture_output=True, text=True, timeout=5)
+        for _ in range(20):
+            await asyncio.sleep(1)
+            if not await _async_is_claude_running(session_name):
+                break
+    # Re-export the session's profile CLAUDE_CONFIG_DIR (non-default) before the
+    # relaunch, in case the shell was respawned and lost the env var.
+    try:
+        pid = _get_session_profile_id(session_name)
+        if pid != DEFAULT_PROFILE_ID:
+            await asyncio.to_thread(_send_profile_export, session_name, pid)
+            await asyncio.sleep(0.3)
+    except Exception:
+        logger.debug("relogin: profile re-export failed", exc_info=True)
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "-l",
+         "NODE_OPTIONS=--max-old-space-size=8192 claude --dangerously-skip-permissions --continue"],
+        capture_output=True, text=True, timeout=5)
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        capture_output=True, text=True, timeout=5)
+    # Invalidate caches so the next poll reflects the relaunch immediately.
+    _account_ident_cache.clear()
+    return JSONResponse({"ok": True, "relaunched": True, "claude_was_running": running})
+
+
 # --- Claude Code auth management ---
 
 _claude_auth_cache: dict = {"ts": 0, "data": {}}
@@ -5178,7 +5487,11 @@ async def api_claude_auth_status():
         if oauth and oauth.get("expiresAt", 0) > now * 1000:  # expiresAt is millis
             result_data["loggedIn"] = True
             result_data["subscriptionType"] = oauth.get("subscriptionType", "")
-            result_data["email"] = "Claude Code"
+            ident = _account_identity(Path.home() / ".claude")
+            result_data["rateLimitTier"] = oauth.get("rateLimitTier", "") or ident.get("tier", "")
+            result_data["plan"] = ident.get("plan") or _friendly_plan(
+                oauth.get("subscriptionType", ""), oauth.get("rateLimitTier", ""))
+            result_data["email"] = ident.get("email") or "Claude Code"
             _claude_auth_cache["ts"] = now
             _claude_auth_cache["data"] = result_data
             return JSONResponse(result_data)
@@ -5242,7 +5555,7 @@ async def api_claude_auth_logout():
 
 
 _usage_cache: dict = {"ts": 0, "data": {}}
-_anthropic_limits_cache: dict = {"ts": 0, "data": None}
+_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": ""}
 
 
 @app.get("/api/usage/limits")
@@ -5251,11 +5564,10 @@ async def api_anthropic_usage_limits():
 
     Cached for 1 hour per the user-facing requirement (poll hourly while
     sessions are active). On upstream failure, returns the last good payload.
+    The cache is keyed on the current token, so a login switch busts it at once
+    instead of showing a previous account's usage for up to an hour.
     """
     now = time.time()
-    if now - _anthropic_limits_cache["ts"] < 3600 and _anthropic_limits_cache["data"]:
-        return JSONResponse(_anthropic_limits_cache["data"])
-
     creds_file = Path.home() / ".claude" / ".credentials.json"
     token = ""
     try:
@@ -5265,6 +5577,11 @@ async def api_anthropic_usage_limits():
         pass
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
+    fp = hashlib.sha1(token.encode()).hexdigest()[:16]
+    if (now - _anthropic_limits_cache["ts"] < 3600
+            and _anthropic_limits_cache["data"]
+            and _anthropic_limits_cache.get("fp") == fp):
+        return JSONResponse(_anthropic_limits_cache["data"])
 
     def _fetch():
         import urllib.request
@@ -5290,6 +5607,7 @@ async def api_anthropic_usage_limits():
     payload = {"fetched_at": now, **data}
     _anthropic_limits_cache["ts"] = now
     _anthropic_limits_cache["data"] = payload
+    _anthropic_limits_cache["fp"] = fp
     return JSONResponse(payload)
 
 
@@ -9165,6 +9483,7 @@ function renderDetail(){
           <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
         </div>
       </div>
+      <div id="login-health-${s.name}"></div>
       <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
@@ -10010,6 +10329,54 @@ function startUsageLimitsPolling(){
 }
 startUsageLimitsPolling();
 
+// ── Login health: detect sessions whose Claude is on a previous login ──
+let _loginHealth={account:null,stale_count:0,sessions:[]};
+let _loginHealthTimer=null;
+async function refreshLoginHealth(){
+  try{
+    const resp=await fetch(BASE+'/api/login-health');
+    if(!resp.ok)return;
+    _loginHealth=await resp.json();
+  }catch(e){return}
+  renderLoginHealth();
+  try{renderAuthIndicator();}catch(e){}
+}
+function renderLoginHealth(){
+  const lh=_loginHealth||{};
+  const acct=lh.account||{};
+  const byName={};(lh.sessions||[]).forEach(s=>byName[s.name]=s);
+  document.querySelectorAll('[id^="login-health-"]').forEach(el=>{
+    const name=el.id.slice('login-health-'.length);
+    const s=byName[name];
+    if(s&&s.stale){
+      const curAcct=acct.email?(esc(acct.email)+(acct.plan?' · '+esc(acct.plan):'')):'the current login';
+      el.innerHTML='<div style="margin-top:12px;background:#3d1d1d;border:1px solid #f85149;border-radius:8px;padding:10px 12px;color:#ffdcd6;font-size:.82rem;display:flex;flex-direction:column;gap:8px">'
+        +'<span>⚠ This session\'s Claude started on a <b>previous login</b> and is still using it. Its in-terminal 5-hour usage bar reflects that older account — not the current login ('+curAcct+'). Restart to move it onto the current account (the conversation is preserved via --continue).</span>'
+        +'<button onclick="reloginSession(\''+esc(name)+'\')" style="align-self:flex-start;background:#da3633;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:.8rem;cursor:pointer">Restart Claude on current login</button>'
+        +'</div>';
+    }else{
+      el.innerHTML='';
+    }
+  });
+}
+async function reloginSession(name){
+  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch with --continue to preserve the conversation.'))return;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/relogin',{method:'POST'});
+    const data=await resp.json();
+    if(!resp.ok){alert(data.error||'Failed to restart');return}
+    const el=document.getElementById('login-health-'+name);
+    if(el)el.innerHTML='<div style="margin-top:12px;color:#8b949e;font-size:.82rem">Restarting Claude on the current login…</div>';
+    setTimeout(refreshLoginHealth,9000);
+  }catch(e){alert('Failed to restart Claude.')}
+}
+function startLoginHealthPolling(){
+  if(_loginHealthTimer)clearInterval(_loginHealthTimer);
+  refreshLoginHealth();
+  _loginHealthTimer=setInterval(refreshLoginHealth,60000);
+}
+startLoginHealthPolling();
+
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 
 function showCreateModal(){
@@ -10106,8 +10473,10 @@ function renderAuthIndicator(){
   if(_authCache.loggedIn){
     dot.className='status-dot idle';dot.style.background='';
     const email=_authCache.email||'';
-    const plan=_authCache.subscriptionType||'';
-    label.textContent=email+(plan?' · '+plan.charAt(0).toUpperCase()+plan.slice(1):'');
+    const plan=_authCache.plan||(_authCache.subscriptionType?_authCache.subscriptionType.charAt(0).toUpperCase()+_authCache.subscriptionType.slice(1):'');
+    const stale=(_loginHealth&&_loginHealth.stale_count)||0;
+    label.textContent=(stale>0?'⚠ '+stale+' on old login · ':'')+email+(plan?' · '+plan:'');
+    if(stale>0){dot.className='status-dot';dot.style.background='#f85149';}
   }else{
     dot.className='status-dot busy';dot.style.background='';
     label.textContent='Not connected';
@@ -10164,10 +10533,11 @@ function renderAuthPanel(){
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
+    const planLabel=_authCache.plan||(plan.charAt(0).toUpperCase()+plan.slice(1));
     el.innerHTML=`
       <div class="auth-title">Claude Code Connected</div>
       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
-      <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
+      <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(planLabel)}</span></span></div>
       <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMethod||'—')}</span></div>
       ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">API Key</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
       ${usageHtml}
