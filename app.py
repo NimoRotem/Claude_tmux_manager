@@ -1361,6 +1361,129 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
         logger.debug("Failed to write customApiKeyResponses into %s", sp, exc_info=True)
 
 
+def _seed_trust(cfg_dir: Path, cwd: str):
+    """Pre-accept Claude Code's per-folder trust dialog for `cwd` in this config
+    dir's .claude.json so it doesn't prompt (which would hang a detached session)."""
+    cj = cfg_dir / ".claude.json"
+    try:
+        d = json.loads(cj.read_text()) if cj.exists() else {}
+        if not isinstance(d, dict):
+            d = {}
+    except Exception:
+        d = {}
+    projects = d.get("projects") if isinstance(d.get("projects"), dict) else {}
+    proj = projects.get(cwd) if isinstance(projects.get(cwd), dict) else {}
+    proj["hasTrustDialogAccepted"] = True
+    projects[cwd] = proj
+    d["projects"] = projects
+    d.setdefault("hasCompletedOnboarding", True)
+    try:
+        cj.write_text(json.dumps(d, indent=2))
+    except Exception:
+        logger.debug("Failed to seed trust into %s", cj, exc_info=True)
+
+
+# A standalone primer that opens a real PTY, accepts the one-time "Bypass
+# Permissions" warning, then exits. Without this, claude in a detached tmux
+# session (no attached client) can't confirm the warning and exits immediately.
+PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.py"
+_PRIME_SCRIPT = r'''#!/usr/bin/env python3
+import os, sys, pty, time, select, pathlib
+cfg = sys.argv[1]
+key = ""
+kf = os.environ.get("NEMO_KEY_FILE", "")
+try:
+    key = pathlib.Path(kf).read_text().strip() if kf else ""
+except Exception:
+    pass
+marker = pathlib.Path(cfg) / ".nemo_primed"
+if marker.exists():
+    print("already primed"); sys.exit(0)
+env = dict(os.environ)
+env["CLAUDE_CONFIG_DIR"] = cfg
+env["PATH"] = env.get("PATH", "") + ":/usr/local/bin:/usr/bin"
+if key:
+    env["ANTHROPIC_API_KEY"] = key
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvpe("claude", ["claude", "--dangerously-skip-permissions"], env)
+    except Exception:
+        os._exit(127)
+buf = ""; accepted = False; ready = False
+deadline = time.time() + 75
+while time.time() < deadline:
+    try:
+        r, _, _ = select.select([fd], [], [], 1)
+    except Exception:
+        break
+    if not r:
+        continue
+    try:
+        data = os.read(fd, 8192).decode("utf-8", "replace")
+    except OSError:
+        break
+    if not data:
+        break
+    buf = (buf + data)[-20000:]
+    if not accepted and "Yes, I accept" in buf:
+        time.sleep(0.6); os.write(fd, b"\x1b[B")  # Down -> "Yes, I accept"
+        time.sleep(0.4); os.write(fd, b"\r")
+        accepted = True; buf = ""; continue
+    if "bypass permissions on" in buf or "/effort to tune" in buf or "? for shortcuts" in buf:
+        ready = True; break
+try:
+    os.write(fd, b"\x03"); time.sleep(0.3); os.write(fd, b"\x03")
+except Exception:
+    pass
+time.sleep(0.4)
+try:
+    os.close(fd)
+except Exception:
+    pass
+if ready or accepted:
+    try:
+        marker.write_text(str(int(time.time())))
+    except Exception:
+        pass
+    print("primed"); sys.exit(0)
+print("prime failed"); sys.exit(1)
+'''
+
+
+def _write_prime_script():
+    PRIME_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if (not PRIME_SCRIPT_PATH.exists()) or PRIME_SCRIPT_PATH.read_text() != _PRIME_SCRIPT:
+            PRIME_SCRIPT_PATH.write_text(_PRIME_SCRIPT)
+        PRIME_SCRIPT_PATH.chmod(0o755)
+    except Exception:
+        logger.debug("Failed to write prime script", exc_info=True)
+
+
+def _prime_claude_config(cfg_dir: Path) -> bool:
+    """One-time per config dir: accept the bypass-permissions warning so detached
+    sessions launch cleanly. Idempotent via a marker file."""
+    if not _stored_anthropic_key:
+        return False
+    marker = cfg_dir / ".nemo_primed"
+    if marker.exists():
+        return True
+    try:
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        _seed_trust(cfg_dir, os.getcwd())
+        _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
+        _write_prime_script()
+        env = dict(os.environ,
+                   NEMO_KEY_FILE=str(ANTHROPIC_API_KEY_FILE),
+                   PATH=os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin")
+        subprocess.run(["python3", str(PRIME_SCRIPT_PATH), str(cfg_dir)],
+                       cwd=os.getcwd(), env=env, capture_output=True, text=True, timeout=90)
+    except Exception:
+        logger.debug("prime_claude_config failed for %s", cfg_dir, exc_info=True)
+    return marker.exists()
+
+
 _SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
 # NEMO-DEV soft-sandbox guard (auto-generated; do not edit).
 # PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
@@ -3487,6 +3610,12 @@ async def api_create_session(request: Request, body: CreateSession):
                 _send_profile_export(created, requested_profile)
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
+        # When authenticating via a shared API key, prime the config dir's one-time
+        # bypass-permissions acceptance BEFORE launching, or the detached session's
+        # claude would hit the warning with no attached client and exit. Runs once
+        # per config dir (marker-guarded); first session per user waits ~10-20s.
+        if _stored_anthropic_key:
+            await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session
         if NEW_SESSION_CMD:
             subprocess.run(
