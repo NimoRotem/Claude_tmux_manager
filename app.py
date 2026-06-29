@@ -7943,7 +7943,12 @@ function setHideBashPref(v){
 // hide the bullet header line AND its wrap-continuation lines (indented, no
 // bullet/output marker). We KEEP the `⎿` output lines so the user can still
 // see what the command produced.
-const _BASH_FILTER_RE=/^(?:Bash|Fetch)\b/i;
+// Tool-call headers Claude Code renders as "● ToolName(args)". We require the
+// "(" so we never hide ordinary prose that happens to start with a word like
+// "Read"/"Write"/"Update"/"Add"/"Task". Covers file ops (Write/Edit/Read/...),
+// shell, web, search and mcp__ tools so the terminal shows the conversation, not
+// the plumbing.
+const _BASH_FILTER_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add)\s*\(|mcp__[^(\s]+\s*\()/i;
 const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
 const _OUTPUT_MARKER_RE=/^[\s]*⎿/;
 const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
@@ -8475,7 +8480,7 @@ function renderDetail(){
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
       </div>
       <div class="tier" style="margin-top:12px" id="hidebash-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide Bash/Fetch</div>
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool calls</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
           <label class="watchdog-toggle">
             <input type="checkbox" id="hidebash-toggle-${s.name}"
@@ -8485,7 +8490,7 @@ function renderDetail(){
           </label>
           <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides lines whose stripped content starts with <code style="color:#79c0ff">Bash(...)</code> or <code style="color:#79c0ff">Fetch(...)</code> so you can focus on the conversation. Setting is shared across all sessions.</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Output (<code style="color:#79c0ff">⎿</code>) stays. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Simple Watchdog</div>
