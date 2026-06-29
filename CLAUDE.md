@@ -11,6 +11,15 @@ Work as independently as possible. Follow these guidelines:
 - **No upfront permission-asking either.** Same rule applies before acting: don't ask "should I X?" Decide and do.
 - **Be concise. Lead with the answer.** Write short, plain, to-the-point. Cut preamble, analogies, hedging, and don't restate the question. Use the fewest lines that fully answer — tight lines over headers/sections. For explanations follow: what happened → cause → fix → recommendation, ~1 line each.
 
+## Context management
+
+Most context is burned at task time, not by always-loaded files. Keep the window lean:
+
+- **Never read `app.py` whole — it's ~575KB (~144K tokens, ~70% of the window) in a single call.** Use `grep` or `Read` with offset+limit to target only the lines you need, or hand it to a subagent. Same rule for any large log/DB/JSON dump.
+- **Delegate research and broad codebase search to subagents** (Explore/Agent). Raw web pages and file contents stay inside the subagent; only the summary returns to the main thread.
+- **Keep big command output out of context** — pipe through `head`, or write to a file and `grep` it; never `cat` whole logs.
+- **`/compact` mid-task, or start a fresh session per task** to reclaim accumulated tool output.
+
 ## Git
 
 - Never commit secrets (.env, API keys, private keys).
