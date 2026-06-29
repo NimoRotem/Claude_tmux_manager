@@ -8171,11 +8171,45 @@ async def _login_watchdog_loop():
                     recent = await asyncio.to_thread(capture_pane_recent, name, 40)
                 except Exception:
                     continue
+                low = (recent or "").lower()
+                # Is a Claude /login flow currently on screen? (auth-method menu,
+                # OAuth URL, paste-code prompt, or the "invalid code — retry" error).
+                login_flow_open = bool(recent) and (
+                    ("paste" in low and "code" in low)
+                    or ("https://" in recent and "oauth" in low)
+                    or ("oauth error" in low)
+                    or ("select login method" in low)
+                    or ("press enter to retry" in low and "esc to cancel" in low)
+                )
+
+                # Shared API-key (team) mode: /login is HARMFUL here. It writes OAuth
+                # creds that override the working apiKeyHelper key and 401 ("Invalid
+                # bearer token"), which then reads as "login required" and would
+                # retrigger this watchdog forever — the loop members actually hit. So
+                # in key mode we NEVER run /login; instead, if a stray /login flow is
+                # stuck on screen we cancel it (Esc) so the session falls back to the
+                # shared key. An un-completed /login writes no creds, so Esc fully
+                # restores key auth.
+                if _stored_anthropic_key:
+                    if login_flow_open:
+                        try:
+                            for _ in range(2):  # menu -> cancel needs two Escapes
+                                await asyncio.to_thread(
+                                    subprocess.run,
+                                    ["tmux", "send-keys", "-t", name, "Escape"],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                await asyncio.sleep(0.4)
+                            state["last_action"] = now
+                            llog.warning("Cancelled stray /login in '%s' (key mode — restored shared-key auth)", name)
+                        except Exception as e:
+                            llog.debug("login watchdog esc failed for '%s': %s", name, e)
+                    continue
+
                 if not recent or not _LOGIN_NEEDED_RE.search(recent):
                     continue
-                low = recent.lower()
                 # A /login flow is already on screen (URL / paste-code prompt) — leave it.
-                if ("paste" in low and "code" in low) or ("https://" in recent and "oauth" in low):
+                if login_flow_open:
                     continue
                 try:
                     await asyncio.to_thread(
