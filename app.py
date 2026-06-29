@@ -197,16 +197,16 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
                 await asyncio.sleep(0.2)
         except Exception:
             logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
-        # Re-apply clean shared-API-key auth for member sessions before relaunch so
-        # an accidental /login (which writes a stray .credentials.json that overrides
-        # apiKeyHelper and causes a 401) self-heals on the next claude start.
+        # Re-apply clean member auth before relaunch so an accidental /login (which
+        # writes stray creds that 401 against the shared key) self-heals on the next
+        # start. Picks the right mode: subscription plan if live, else API key.
         try:
-            if _stored_anthropic_key:
+            if TEAM_MODE:
                 _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
                 if _owner and not _is_admin(_owner):
-                    _apply_api_key_auth(_user_claude_config_dir(_owner))
+                    _apply_member_auth(_user_claude_config_dir(_owner))
         except Exception:
-            logger.debug("Failed to re-apply api-key auth on relaunch", exc_info=True)
+            logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
         # Relaunch Claude on the bare shell, resuming the prior conversation.
         resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
         launch = ("NODE_OPTIONS=--max-old-space-size=8192 "
@@ -519,13 +519,9 @@ def _ensure_user_claude_config_dir(user: dict):
     # stays current (e.g. after the admin edits the global context).
     if TEAM_MODE:
         try:
-            if _stored_anthropic_key:
-                # Shared API key mode (subscription token is dead): authenticate
-                # via apiKeyHelper, no subscription creds.
-                _apply_api_key_auth(d)
-            else:
-                # Shared subscription mode: symlink to the admin's live token.
-                _share_credentials_symlink(d)
+            # Prefer the subscription PLAN; fall back to the shared API key only if
+            # there's no live plan token.
+            _apply_member_auth(d)
             _sync_global_context_into(claude_md)
             _sync_group_context_into(claude_md, user.get("group", ""))
             _sync_group_skills_into(d, user.get("group", ""))
@@ -1480,6 +1476,58 @@ def _apply_api_key_auth(cfg_dir: Path):
     _remove_subscription_creds(cfg_dir)
     _set_api_key_helper(cfg_dir)
     _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
+
+
+def _subscription_token_valid() -> bool:
+    """True when the shared admin subscription token (~/.claude/.credentials.json)
+    exists and isn't expired — i.e. the Max/Pro PLAN is usable for members."""
+    try:
+        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
+        return bool(o) and int(o.get("expiresAt") or 0) > int(time.time() * 1000)
+    except Exception:
+        return False
+
+
+def _remove_api_key_helper(cfg_dir: Path):
+    """Strip apiKeyHelper + customApiKeyResponses so claude uses the (symlinked)
+    subscription token instead of the metered API key."""
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            return
+    except Exception:
+        return
+    if "apiKeyHelper" in s or "customApiKeyResponses" in s:
+        s.pop("apiKeyHelper", None)
+        s.pop("customApiKeyResponses", None)
+        try:
+            sp.write_text(json.dumps(s, indent=2))
+        except Exception:
+            logger.debug("Failed to strip apiKeyHelper from %s", sp, exc_info=True)
+
+
+def _apply_subscription_auth(cfg_dir: Path):
+    """Configure a config dir to authenticate via the shared subscription PLAN:
+    symlink .credentials.json to the admin token and remove API-key settings."""
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    _remove_api_key_helper(cfg_dir)
+    _share_credentials_symlink(cfg_dir)
+
+
+def _apply_member_auth(cfg_dir: Path) -> str:
+    """Pick the member auth mode. PREFER the subscription plan when a valid shared
+    token exists (per Nimo: use the plan, not the metered API); fall back to the
+    shared API key only if there's no live subscription. Returns the mode used."""
+    if _subscription_token_valid():
+        _apply_subscription_auth(cfg_dir)
+        return "subscription"
+    if _stored_anthropic_key:
+        _apply_api_key_auth(cfg_dir)
+        return "api"
+    # No live plan and no key: still symlink so a future plan login just works.
+    _apply_subscription_auth(cfg_dir)
+    return "subscription"
 
 
 def _seed_trust(cfg_dir: Path, cwd: str):
@@ -4080,14 +4128,12 @@ async def api_create_session(request: Request, body: CreateSession):
                 )
             except Exception:
                 logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
-        # Authenticate via the shared Anthropic API key for ALL users (admin +
-        # members) when one is stored. We use settings.json `apiKeyHelper` (not an
-        # env var) — interactive claude ignores a bare ANTHROPIC_API_KEY and would
-        # fall back to /login — and remove any dead subscription creds. The key
-        # stays in a 0600 file, never echoed into the session scrollback.
-        if _stored_anthropic_key:
-            _apply_api_key_auth(_user_claude_config_dir(user))
-            _session_auth_mode[created] = "api"
+        # Authenticate the session. Prefer the subscription PLAN (symlink to the
+        # admin's live token); fall back to the shared API key (settings.json
+        # `apiKeyHelper`, since interactive claude ignores a bare env var) only when
+        # there's no live plan token. Admins use ~/.claude directly (their own login).
+        if user and not _is_admin(user):
+            _session_auth_mode[created] = _apply_member_auth(_user_claude_config_dir(user))
         else:
             _session_auth_mode[created] = "subscription"
         # Apply profile (CLAUDE_CONFIG_DIR) if requested. For non-admin users the
