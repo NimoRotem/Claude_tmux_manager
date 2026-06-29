@@ -3756,7 +3756,11 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         entry["_chat_was_busy"] = True
     _summary_due = (now - entry.get("chat_summary_at", 0)) >= REALTIME_TTL
     if _chat_status == "idle" and (force_all or entry.get("_chat_was_busy") or _summary_due):
-        tasks["chat_summary"] = get_chat_summary(session_name, entry.get("chat_summary_sig", ""))
+        # Pass the last user message so the right transcript is matched when
+        # several sessions share a cwd (project dir).
+        _last_user = next((m.get("text", "") for m in reversed(entry.get("messages", []))
+                           if m.get("role") == "user"), "")
+        tasks["chat_summary"] = get_chat_summary(session_name, entry.get("chat_summary_sig", ""), _last_user)
         entry["chat_summary_at"] = now
         entry["_chat_was_busy"] = False
 
@@ -3895,14 +3899,67 @@ def _is_genuine_user_content(cont) -> bool:
     return False
 
 
-def _extract_last_assistant_turn(session_name: str) -> str:
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").split()).lower()
+
+
+def _last_genuine_user_text(path: str) -> str:
+    """The most recent genuine human prompt recorded in a transcript file."""
+    last = ""
+    for ln in _read_jsonl_tail(path):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        m = o.get("message")
+        if o.get("type") == "user" and isinstance(m, dict) and _is_genuine_user_content(m.get("content")):
+            c = m.get("content")
+            if isinstance(c, str):
+                last = c
+            elif isinstance(c, list):
+                last = " ".join(
+                    (b.get("text") or "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+    return last.strip()
+
+
+def _resolve_session_transcript(session_name: str, last_user_text: str):
+    """Pick the transcript that belongs to THIS tmux session.
+
+    Several sessions can share one cwd (hence one Claude `projects/<dir>` with
+    many JSONL files), so newest-mtime is NOT a reliable per-session signal — it
+    can point at a sibling session that happened to write more recently. Instead
+    match on content: the transcript whose latest human prompt equals the command
+    the dashboard last sent to this session. Returns None when it can't be
+    disambiguated (caller falls back to this session's own terminal pane)."""
+    files = _find_session_jsonl_files(session_name)
+    if not files:
+        return None
+    if len(files) == 1:
+        return files[0]
+    want = _norm_text(last_user_text)
+    if not want:
+        return None  # nothing to match on — don't guess across sessions
+    key = want[:60]
+    for path in sorted(files, key=os.path.getmtime, reverse=True):
+        lu = _norm_text(_last_genuine_user_text(path))
+        if lu and (lu.startswith(key) or key in lu):
+            return path
+    return None
+
+
+def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") -> str:
     """Clean text of Claude's most recent turn: every assistant `text` block
     since the last genuine user message in the transcript. Thinking and tool
-    calls/results are excluded. Falls back to the terminal scrape."""
-    files = _find_session_jsonl_files(session_name)
-    if files:
+    calls/results are excluded. Falls back to this session's terminal pane when
+    the transcript can't be unambiguously matched to this session."""
+    path = _resolve_session_transcript(session_name, last_user_text)
+    if path:
         try:
-            path = max(files, key=os.path.getmtime)
             texts: list = []
             for ln in _read_jsonl_tail(path):
                 ln = ln.strip()
@@ -3976,9 +4033,9 @@ async def _summarize_turn(text: str) -> str:
     return summary or _trim_plain(body, 600)
 
 
-async def get_chat_summary(session_name: str, prev_sig: str):
+async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str = ""):
     """Return {'sig','summary'} for the latest turn, or None when unchanged/empty."""
-    turn_text = await asyncio.to_thread(_extract_last_assistant_turn, session_name)
+    turn_text = await asyncio.to_thread(_extract_last_assistant_turn, session_name, last_user_text)
     turn_text = (turn_text or "").strip()
     if not turn_text:
         return None
@@ -8993,6 +9050,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
+.chat-empty{align-self:center;margin:auto 0;max-width:80%;text-align:center;color:#6e7681;font-size:.9rem;line-height:1.6}
 .chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
 .chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
@@ -10041,6 +10099,9 @@ function renderNav(){
 
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
+  if(!msgs.length){
+    return '<div class="chat-empty">No messages yet. Type below to talk to Claude — each reply shows up here as a short summary.</div>';
+  }
   return msgs.map(m=>`
     <div class="chat-msg ${m.role}">
       ${esc(m.text)}
@@ -10067,7 +10128,8 @@ function renderDetail(){
   saveRawCache();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
-  const tab=activeTabs[s.name]||'raw';
+  // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
+  const tab=activeTabs[s.name]||(NEMO_SIMPLE?'chat':'raw');
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -10429,7 +10491,9 @@ function appendChatBubble(name,role,text,ts){
     const chatEl=document.getElementById('chat-'+name);
     if(chatEl){
       const wasAtBottom=isChatAtBottom(chatEl);
-      // Remove typing indicator if present
+      // Clear the "no messages yet" placeholder + any typing indicator
+      const empty=chatEl.querySelector('.chat-empty');
+      if(empty)empty.remove();
       const typing=chatEl.querySelector('.chat-typing');
       if(typing)typing.remove();
       const bubble=document.createElement('div');
@@ -10440,6 +10504,39 @@ function appendChatBubble(name,role,text,ts){
       if(wasAtBottom||role==='user')chatEl.scrollTop=chatEl.scrollHeight;
     }
   }
+}
+
+// Mirror the server's "one assistant summary per turn" model into the local
+// chat + DOM: update the latest assistant bubble in place when its text changes,
+// append it when the turn is new. Prevents duplicate summary bubbles.
+function reconcileAssistantSummary(name, serverMsgs){
+  // The server's latest assistant message within the current turn.
+  let srv=null;
+  for(let i=serverMsgs.length-1;i>=0;i--){
+    if(serverMsgs[i].role==='assistant'){srv=serverMsgs[i];break;}
+    if(serverMsgs[i].role==='user')break;
+  }
+  if(!srv||!srv.text)return;
+  const local=chatMessages[name]||(chatMessages[name]=[]);
+  // Latest local assistant message after the last local user message.
+  let lu=-1;for(let i=local.length-1;i>=0;i--){if(local[i].role==='user'){lu=i;break;}}
+  let la=-1;for(let i=local.length-1;i>lu;i--){if(local[i].role==='assistant'){la=i;break;}}
+  if(la>=0){
+    if(local[la].text!==srv.text){
+      local[la].text=srv.text;local[la].ts=srv.ts;
+      updateLastAssistantBubble(name,srv.text,srv.ts);
+    }
+  }else{
+    appendChatBubble(name,'assistant',srv.text,srv.ts);
+  }
+}
+function updateLastAssistantBubble(name,text,ts){
+  if(name!==selectedSession||(activeTabs[name]||'chat')!=='chat')return;
+  const chatEl=document.getElementById('chat-'+name);
+  if(!chatEl)return;
+  const bubbles=chatEl.querySelectorAll('.chat-msg.assistant');
+  const el=bubbles[bubbles.length-1];
+  if(el)el.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
 }
 
 function autoGrow(el){
@@ -10860,16 +10957,12 @@ function updateStatusPill(name,status,detail){
 }
 
 function updateCard(s){
-  // Sync messages from server response
+  // Sync messages from server. The server keeps ONE assistant summary per turn,
+  // updated in place as Claude's output settles, so mirror that: refresh the
+  // latest assistant bubble when its text changes, append it when it's new —
+  // never duplicate it.
   if(s.messages&&s.messages.length){
-    const local=chatMessages[s.name]||[];
-    // Find new assistant messages from server not in local
-    s.messages.forEach(m=>{
-      if(m.role==='assistant'){
-        const exists=local.some(l=>l.role==='assistant'&&l.text===m.text);
-        if(!exists)appendChatBubble(s.name,'assistant',m.text,m.ts);
-      }
-    });
+    reconcileAssistantSummary(s.name, s.messages);
   }
 
   if(s.name!==selectedSession)return;
