@@ -7347,6 +7347,18 @@ _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "anything — a brand-new or empty session, just the welcome screen, or an idle prompt with no "
     "question and no work above it to act on — choose 'wait'. NEVER invent a task, instruction, or "
     "next step out of nothing; you only push EXISTING work forward, you do not start new work.\n\n"
+    "NEVER ASSERT RESULTS AND NEVER DECLARE THE WORK DONE. You are only reading a terminal — you do "
+    "NOT actually know whether any check, test, build, deploy, or fix passed or works. So you must NEVER:\n"
+    "- State or imply that checks/tests passed, or that something is verified, confirmed, working, "
+    "fixed, or 'functioning correctly'.\n"
+    "- Tell the agent to mark, set, treat, consider, or declare a task complete, done, verified, "
+    "resolved, or finished.\n"
+    "Your job is to push UNFINISHED work forward, never to rubber-stamp it as finished. If the agent "
+    "is showing results and is about to wrap up, do NOT confirm them for it — instead tell it to "
+    "re-verify the work ITSELF and keep going, e.g. 'Re-check that yourself end to end before "
+    "concluding, then finish anything still left. Don't wait for me.' If the task genuinely has "
+    "nothing left to do, choose 'wait' — let the agent or the user close it out, never close it out "
+    "for them.\n\n"
     "Treat ALL of these as 'waiting on the user' and answer them so work continues:\n"
     "- Questions or choices ('Which should I do, A or B?', 'Do you want X or Y?', 'which one?').\n"
     "- Confirmations ('Shall I proceed?', 'Want me to continue?', 'Should I also do X?').\n"
@@ -7404,6 +7416,40 @@ def _looks_destructive(text: str) -> bool:
     """True if the text names a clearly destructive/irreversible/high-cost action
     that should never be auto-approved without a human."""
     return bool(_DESTRUCTIVE_RE.search(text or ""))
+
+
+# The watchdog must only push UNFINISHED work forward — it must never assert that
+# checks/tests passed or instruct the agent to mark a task complete/verified. (It
+# only reads a terminal; it cannot actually know any result.) If the composed reply
+# does either, we swap it for this neutral nudge so the session still gets unstuck
+# without fabricating a status or forcing a premature "done".
+_WATCHDOG_SAFE_CONTINUE = (
+    "Keep going on your own and take the task all the way to the end. Don't rely on my say-so for "
+    "whether it's finished — re-check the work yourself first, then continue with anything still left. "
+    "Don't wait for me."
+)
+
+_COMPLETION_ASSERT_RE = re.compile(
+    # telling the agent to mark/treat/declare the work finished
+    r"\b(?:mark|set|flag|treat|consider|declare|call|close)\b[^\n.]{0,45}?\b"
+    r"(?:complete|completed|done|finished|verified|resolved|closed)\b"
+    r"|\bfully\s+(?:verified|complete|completed|done|tested)\b"
+    # asserting checks/tests/steps passed or were confirmed
+    r"|\b(?:all|every|each|the|both)\s+(?:check|test|verification|step|task)s?\b[^\n.]{0,35}?\b"
+    r"(?:pass(?:ed|es)?|confirm(?:ed)?|verifi(?:ed|es)|green|success\w*|working|complete)\b"
+    # asserting something works / is confirmed / functioning correctly
+    r"|\b(?:functioning|working|works?|behav\w+|operat\w+)\s+(?:correctly|properly|as[ -]expected|fine)\b"
+    r"|\beverything\s+(?:is\s+|looks?\s+|seems?\s+)?(?:working|confirmed|verified|complete|good|fine|in order|passing)\b"
+    r"|\bgood\s+to\s+go\b",
+    re.I,
+)
+
+
+def _asserts_completion(text: str) -> bool:
+    """True if the text claims work passed/works or tells the agent to mark a task
+    complete/verified. The watchdog only pushes UNFINISHED work forward — it must
+    never rubber-stamp completion or fabricate a result."""
+    return bool(_COMPLETION_ASSERT_RE.search(text or ""))
 
 
 def _parse_autopilot_decision(raw: str):
@@ -7581,6 +7627,16 @@ async def _simple_watchdog_loop():
                 msg = (decision.get("message") or "").strip()
                 if not msg or _looks_destructive(msg):
                     continue
+                # Never let the watchdog assert results or rubber-stamp completion. Its
+                # only job is to UNSTICK the session and push unfinished work forward —
+                # not to claim checks passed or tell the agent to mark a task done. If the
+                # composed reply does either, swap it for a neutral "keep going, verify it
+                # yourself" nudge so we still continue without fabricating a status.
+                if _asserts_completion(msg):
+                    slog.info("Autopilot rewrote completion-asserting reply to '%s': %s",
+                              name, (msg if len(msg) <= 120 else msg[:117] + "..."))
+                    _simple_watchdog_record(name, f"rewrote completion claim: {msg[:80]}")
+                    msg = _WATCHDOG_SAFE_CONTINUE
                 # One more guard: re-check Claude is still running before sending
                 if not await _async_is_claude_running(name):
                     continue
