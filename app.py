@@ -518,6 +518,7 @@ def _ensure_user_claude_config_dir(user: dict):
                 _share_credentials_symlink(d)
             _sync_global_context_into(claude_md)
             _install_sandbox_hook(d, user)
+            _ensure_google_mcp(d, user)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
@@ -1793,15 +1794,15 @@ def _callback_uri(request: Request) -> str:
     return base + ROOT_PATH + "/api/connections/google/callback"
 
 
-def _write_google_mcp(user: dict, service: str):
-    """If a Google MCP command is configured, expose this connection to the user's
-    Claude via their per-user .claude.json mcpServers. No-op otherwise (the tokens
-    are still stored, ready for when the MCP command is configured)."""
+def _ensure_google_mcp(cfg_dir: Path, user: dict):
+    """Register the single `google` MCP server (Drive/Gmail/Calendar) in this user's
+    .claude.json so their Claude has the tools. The server reads the user's per-user
+    OAuth tokens at call time; tools return a friendly 'connect first' message until
+    the user connects a service. No-op if GOOGLE_MCP_COMMAND isn't configured."""
     cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
-    if not cmd:
+    if not cmd or not user or not user.get("id"):
         return
-    cfg = _user_claude_config_dir(user)
-    cj = cfg / ".claude.json"
+    cj = cfg_dir / ".claude.json"
     try:
         data = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(data, dict):
@@ -1810,16 +1811,24 @@ def _write_google_mcp(user: dict, service: str):
         data = {}
     parts = shlex.split(cmd)
     servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
-    servers["google-" + service] = {
+    servers["google"] = {
         "command": parts[0],
         "args": parts[1:],
-        "env": {"GOOGLE_MCP_CREDENTIALS_DIR": str(_conn_path(user["id"], service).parent)},
+        "env": {
+            "GOOGLE_MCP_CREDENTIALS_DIR": str(CONNECTIONS_DIR / user["id"]),
+            "GOOGLE_OAUTH_CLIENT_FILE": str(GOOGLE_OAUTH_CLIENT_FILE),
+        },
     }
     data["mcpServers"] = servers
     try:
         cj.write_text(json.dumps(data, indent=2))
     except Exception:
-        logger.debug("Failed to write google MCP entry", exc_info=True)
+        logger.debug("Failed to write google MCP entry into %s", cj, exc_info=True)
+
+
+def _write_google_mcp(user: dict, service: str):
+    """Called after a successful connect; ensures the google MCP server is registered."""
+    _ensure_google_mcp(_user_claude_config_dir(user), user)
 
 
 @app.get("/api/connections")
