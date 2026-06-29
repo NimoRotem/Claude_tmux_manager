@@ -35,6 +35,20 @@ PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
+# --- NEMO-DEV team mode ---------------------------------------------------
+# When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
+# simplified UI, a shared Claude auth token, per-user context, OAuth connections,
+# and a soft sandbox (cross-server actions are blocked + sent to the admin for
+# approval). Gated behind env so the shared codebase is unchanged for the personal
+# single-admin dashboards (instance-3, builder) that never set these vars.
+TEAM_MODE = os.environ.get("TMUX_DASH_TEAM_MODE", "") == "1"
+BRAND_NAME = os.environ.get("TMUX_DASH_BRAND", "tmux")
+ADMIN_APPROVAL_EMAIL = os.environ.get("TMUX_DASH_ADMIN_EMAIL", "nimrod.rotem@gmail.com")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", "NEMO-DEV <nemo-dev@grabo.cc>")
+PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
+DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
+
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
@@ -490,6 +504,16 @@ def _ensure_user_claude_config_dir(user: dict):
             "hasCompletedOnboarding": True,
             "numStartups": 1,
         }, indent=2))
+    # NEMO-DEV team mode: shared Claude auth token, managed global context block,
+    # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
+    # stays current (e.g. after the admin edits the global context).
+    if TEAM_MODE:
+        try:
+            _share_credentials_symlink(d)
+            _sync_global_context_into(claude_md)
+            _install_sandbox_hook(d, user)
+        except Exception:
+            logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
 
 # --- Session ownership ---
@@ -560,7 +584,7 @@ def _user_can_access_session(user: Optional[dict], session_name: str) -> bool:
 LOGIN_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>tmux Dashboard — Login</title>
+<title>__BRAND__ Dashboard — Login</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;align-items:center;justify-content:center}
@@ -576,7 +600,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .login-btn:hover{background:#388bfd}
 </style></head><body>
 <form class="login-box" method="POST" action="login">
-  <h2>tmux Dashboard</h2>
+  <h2>__BRAND__ Dashboard</h2>
   <p>Enter credentials to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
   <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
@@ -679,6 +703,11 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
+        return await call_next(request)
+    # Sandbox guard hook calls this from localhost with no cookie (it checks the
+    # client host itself). OAuth callback self-verifies a signed state param and
+    # must work even when the cross-site redirect from Google drops the cookie.
+    if path.endswith("/api/sandbox/check") or path.endswith("/api/connections/google/callback"):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
@@ -1136,14 +1165,576 @@ async def api_me(request: Request):
             return JSONResponse({
                 "id": "admin", "username": AUTH_USER or "admin",
                 "role": "admin", "auth_disabled": True,
+                "team_mode": TEAM_MODE, "brand": BRAND_NAME, "simple": False,
             })
         return JSONResponse({"error": "Not logged in"}, status_code=401)
+    is_admin = _is_admin(user)
     return JSONResponse({
         "id": user["id"],
         "username": user.get("username", ""),
         "role": user.get("role", "user"),
         "auth_disabled": False,
+        "team_mode": TEAM_MODE,
+        "brand": BRAND_NAME,
+        # "simple" = the heavily-stripped team UI shown to non-admin members.
+        "simple": bool(TEAM_MODE and not is_admin),
     })
+
+
+# ===========================================================================
+# NEMO-DEV team mode: shared auth, global context, soft sandbox, approvals,
+# Google connections. All gated behind TEAM_MODE; no effect on personal boxes.
+# ===========================================================================
+import base64
+import urllib.request
+import urllib.parse
+
+SHARED_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "nemo-global-context.md"
+SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "nemo_sandbox_guard.py"
+APPROVALS_FILE = MESSAGES_DIR / "approvals.json"
+CONNECTIONS_DIR = MESSAGES_DIR / "connections"
+GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
+
+_GLOBAL_CTX_BEGIN = "<!-- NEMO-DEV GLOBAL CONTEXT (managed — edits below are overwritten) -->"
+_GLOBAL_CTX_END = "<!-- END NEMO-DEV GLOBAL CONTEXT -->"
+
+_DEFAULT_GLOBAL_CONTEXT = """# NEMO-DEV environment (shared global context)
+You are running inside **NEMO-DEV**, a shared team development environment on the
+server `dianaotech.com`. Several team members share this machine; each has their
+own private workspace, memory, and context below this block.
+
+## Hard rules — soft sandbox
+- You may freely read, create, and change files and run services **on this server only**.
+- Do **NOT** modify, deploy to, SSH into, or change configuration on any OTHER
+  server or cloud resource (other GCP VMs, other hosts, production systems, buckets).
+- Reaching sensitive data on other servers is blocked by a guard. If you truly need
+  it, the block automatically emails the admin for approval — do not try to work
+  around it (no obfuscation, no alternate tooling).
+- Remote/cloud tools (`gcloud`, `gsutil`, `bq`, `ssh`, `scp`, `kubectl`, `aws`, the
+  GCP metadata server, …) are restricted; expect them to be denied unless approved.
+
+Stay focused on the user's project in this workspace.
+"""
+
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ensure_global_context_file():
+    GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not GLOBAL_CONTEXT_FILE.exists():
+        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT)
+
+
+def _read_global_context() -> str:
+    _ensure_global_context_file()
+    try:
+        return GLOBAL_CONTEXT_FILE.read_text()
+    except Exception:
+        return ""
+
+
+def _sync_global_context_into(claude_md: Path):
+    """Keep a managed global-context block at the TOP of a user's CLAUDE.md,
+    preserving the user's own content below the END marker."""
+    block = _GLOBAL_CTX_BEGIN + "\n" + _read_global_context().rstrip() + "\n" + _GLOBAL_CTX_END + "\n"
+    existing = ""
+    if claude_md.exists():
+        try:
+            existing = claude_md.read_text()
+        except Exception:
+            existing = ""
+    if _GLOBAL_CTX_BEGIN in existing and _GLOBAL_CTX_END in existing:
+        pre = existing.split(_GLOBAL_CTX_BEGIN, 1)[0]
+        post = existing.split(_GLOBAL_CTX_END, 1)[1]
+        user_part = (pre + post).lstrip("\n")
+    else:
+        user_part = existing.lstrip("\n")
+    claude_md.write_text(block + "\n" + user_part)
+
+
+def _share_credentials_symlink(cfg_dir: Path):
+    """Point a user's .credentials.json at the shared admin token so one login
+    authenticates everyone. A single file = a single refresh token, which avoids
+    the OAuth rotation war that divergent copies would cause."""
+    try:
+        link = cfg_dir / ".credentials.json"
+        if link.is_symlink():
+            try:
+                if os.readlink(link) == str(SHARED_CREDENTIALS):
+                    return
+            except OSError:
+                pass
+            link.unlink()
+        elif link.exists():
+            link.unlink()
+        link.symlink_to(SHARED_CREDENTIALS)
+    except Exception:
+        logger.debug("Failed to symlink shared credentials into %s", cfg_dir, exc_info=True)
+
+
+_SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
+# NEMO-DEV soft-sandbox guard (auto-generated; do not edit).
+# PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
+# routes them to the admin for approval. Local changes on this server are allowed.
+import sys, json, os, re, urllib.request
+
+DASH_URL = os.environ.get("NEMO_DASH_URL", "__DASH_URL__")
+
+BLOCK_PATTERNS = [
+    r"\bgcloud\b", r"\bgsutil\b", r"\bbq\b", r"\bkubectl\b", r"\bhelm\b",
+    r"\bssh\b", r"\bscp\b", r"\bsftp\b", r"\bsshpass\b", r"\bmosh\b",
+    r"\bdoctl\b", r"\baws\b", r"\baz\b", r"\bterraform\b",
+    r"169\.254\.169\.254", r"metadata\.google\.internal",
+    r"\brsync\b[^\n]*::", r"\brsync\b[^\n]*@",
+]
+BLOCK_RE = [re.compile(p, re.I) for p in BLOCK_PATTERNS]
+
+
+def extract_text(tool_input):
+    if not isinstance(tool_input, dict):
+        return ""
+    parts = []
+    for k in ("command", "cmd", "script", "url"):
+        v = tool_input.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    return "\n".join(parts)
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+    tool_name = data.get("tool_name", "")
+    text = extract_text(data.get("tool_input", {}))
+    if not text or not any(rx.search(text) for rx in BLOCK_RE):
+        sys.exit(0)
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    uid = ""
+    if ".claude-user-" in cfg:
+        uid = cfg.split(".claude-user-", 1)[1].strip("/").split("/")[0]
+    payload = json.dumps({
+        "user_id": uid, "tool": tool_name,
+        "command": text[:4000], "cwd": data.get("cwd", os.getcwd()),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            DASH_URL.rstrip("/") + "/api/sandbox/check",
+            data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            resp = json.load(r)
+    except Exception:
+        print("NEMO-DEV sandbox: cross-server action blocked (approval service "
+              "unreachable). This server only — other servers are off-limits.",
+              file=sys.stderr)
+        sys.exit(2)
+    if resp.get("decision") == "allow":
+        sys.exit(0)
+    print(resp.get("reason") or
+          "NEMO-DEV sandbox: this targets another server and is blocked; the admin "
+          "was asked to approve. Do not attempt to bypass it.", file=sys.stderr)
+    sys.exit(2)
+
+
+main()
+'''
+
+
+def _write_sandbox_hook_script():
+    SANDBOX_HOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    content = _SANDBOX_HOOK_SCRIPT.replace("__DASH_URL__", DASH_LOCAL_URL)
+    try:
+        if (not SANDBOX_HOOK_PATH.exists()) or SANDBOX_HOOK_PATH.read_text() != content:
+            SANDBOX_HOOK_PATH.write_text(content)
+        SANDBOX_HOOK_PATH.chmod(0o755)
+    except Exception:
+        logger.debug("Failed to write sandbox hook", exc_info=True)
+
+
+def _install_sandbox_hook(cfg_dir: Path, user: dict):
+    """Register the guard as a PreToolUse(Bash) hook in the user's settings.json."""
+    _write_sandbox_hook_script()
+    settings_path = cfg_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        if not isinstance(settings, dict):
+            settings = {}
+    except Exception:
+        settings = {}
+    hook_cmd = "python3 " + shlex.quote(str(SANDBOX_HOOK_PATH))
+    entry = {"matcher": "Bash|WebFetch", "hooks": [{"type": "command", "command": hook_cmd}]}
+    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    pre = hooks.get("PreToolUse")
+    if not isinstance(pre, list):
+        pre = []
+    pre = [h for h in pre if "nemo_sandbox_guard" not in json.dumps(h)]
+    pre.append(entry)
+    hooks["PreToolUse"] = pre
+    settings["hooks"] = hooks
+    try:
+        settings_path.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        logger.debug("Failed to install sandbox hook into %s", settings_path, exc_info=True)
+
+
+# --- email (Resend) --------------------------------------------------------
+def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
+    to = to or ADMIN_APPROVAL_EMAIL
+    if not RESEND_API_KEY:
+        logger.warning("NEMO-DEV email not sent (no RESEND_API_KEY): %s", subject)
+        return False
+    payload = json.dumps({
+        "from": MAIL_FROM, "to": [to], "subject": subject,
+        "html": html_body, "text": re.sub("<[^>]+>", "", html_body),
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://api.resend.com/emails", data=payload,
+            headers={"Authorization": "Bearer " + RESEND_API_KEY,
+                     "Content-Type": "application/json",
+                     # Resend is behind Cloudflare, which 403s (error 1010) the
+                     # default Python-urllib User-Agent. Send a normal one.
+                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NEMO-DEV/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        return True
+    except Exception:
+        logger.exception("Failed to send email via Resend")
+        return False
+
+
+# --- approval store --------------------------------------------------------
+def _load_approvals() -> dict:
+    try:
+        d = json.loads(APPROVALS_FILE.read_text())
+        return d if isinstance(d, dict) else {"requests": {}}
+    except Exception:
+        return {"requests": {}}
+
+
+def _save_approvals(data: dict):
+    try:
+        APPROVALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        APPROVALS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.exception("Failed to save approvals")
+
+
+def _approval_key(user_id: str, command: str) -> str:
+    norm = re.sub(r"\s+", " ", (command or "").strip())
+    return hashlib.sha256((str(user_id) + "|" + norm).encode()).hexdigest()[:16]
+
+
+def _notify_admin_approval(rec: dict):
+    base = PUBLIC_BASE_URL.rstrip("/")
+    who = rec.get("username") or rec.get("user_id") or "a user"
+    subj = "[NEMO-DEV] Approval needed: " + who + " requested cross-server access"
+    html = (
+        '<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:640px">'
+        "<h2>NEMO-DEV — cross-server action blocked</h2>"
+        "<p>A team member's Claude session tried something that reaches another "
+        "server. It was blocked and is awaiting your approval.</p>"
+        "<p><b>User:</b> " + _html_escape(who) + " (" + _html_escape(rec.get("user_id", "")) + ")<br>"
+        "<b>Tool:</b> " + _html_escape(rec.get("tool", "")) + "<br>"
+        "<b>Working dir:</b> " + _html_escape(rec.get("cwd", "")) + "</p>"
+        "<p><b>Command:</b></p><pre style=\"background:#f4f4f4;padding:10px;border-radius:6px;"
+        "white-space:pre-wrap;word-break:break-all\">" + _html_escape((rec.get("command") or "")[:2000]) + "</pre>"
+        '<p>Log in to <a href="' + (base or "#") + '">NEMO-DEV</a> and open the '
+        "<b>Approvals</b> panel (gear menu) to approve or deny.</p></div>"
+    )
+    _send_email(subj, html)
+
+
+@app.post("/api/sandbox/check")
+async def api_sandbox_check(request: Request):
+    """Called by the per-user PreToolUse guard hook (localhost only). Records the
+    blocked attempt, notifies the admin once, and reports allow/deny."""
+    if request.client and request.client.host not in ("127.0.0.1", "::1", "localhost"):
+        return JSONResponse({"decision": "deny", "reason": "forbidden"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_id = (body.get("user_id") or "").strip()
+    command = body.get("command") or ""
+    cwd = body.get("cwd") or ""
+    tool = body.get("tool") or ""
+    key = _approval_key(user_id, command)
+    data = _load_approvals()
+    reqs = data.setdefault("requests", {})
+    rec = reqs.get(key)
+    now = time.time()
+    if rec and rec.get("status") == "approved" and now - rec.get("decided_at", 0) < 3600:
+        return JSONResponse({"decision": "allow"})
+    if rec and rec.get("status") == "denied" and now - rec.get("decided_at", 0) < 600:
+        return JSONResponse({"decision": "deny",
+                             "reason": "NEMO-DEV: the admin denied this cross-server action."})
+    u = _find_user_by_id(user_id) if user_id else None
+    is_new = rec is None
+    reqs[key] = {
+        "key": key, "user_id": user_id,
+        "username": (u or {}).get("username", "") if u else "",
+        "tool": tool, "command": command[:4000], "cwd": cwd,
+        "status": "pending",
+        "created_at": rec.get("created_at", now) if rec else now,
+        "last_seen": now,
+        "count": (rec.get("count", 0) + 1) if rec else 1,
+    }
+    _save_approvals(data)
+    if is_new:
+        try:
+            _notify_admin_approval(reqs[key])
+        except Exception:
+            logger.exception("Failed to notify admin of approval request")
+    return JSONResponse({"decision": "deny", "reason":
+        "NEMO-DEV sandbox: this action targets another server and is blocked. A "
+        "request was sent to the admin (" + ADMIN_APPROVAL_EMAIL + ") for approval. "
+        "Keep working on things that stay on this server; do not try to bypass."})
+
+
+@app.get("/api/approvals")
+async def api_list_approvals(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    reqs = list(_load_approvals().get("requests", {}).values())
+    reqs.sort(key=lambda r: r.get("last_seen", 0), reverse=True)
+    return JSONResponse({"requests": reqs})
+
+
+@app.post("/api/approvals/{key}/{action}")
+async def api_decide_approval(request: Request, key: str, action: str):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    if action not in ("approve", "deny"):
+        return JSONResponse({"error": "Bad action"}, status_code=400)
+    data = _load_approvals()
+    rec = data.get("requests", {}).get(key)
+    if not rec:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    rec["status"] = "approved" if action == "approve" else "denied"
+    rec["decided_at"] = time.time()
+    rec["decided_by"] = user.get("username", "admin")
+    _save_approvals(data)
+    return JSONResponse({"ok": True, "status": rec["status"]})
+
+
+# --- Google connections (Drive / Gmail / Calendar) -------------------------
+GOOGLE_SCOPES = {
+    "drive": ["https://www.googleapis.com/auth/drive.readonly"],
+    "gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
+    "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
+}
+GOOGLE_LABELS = {"drive": "Google Drive", "gmail": "Gmail", "calendar": "Google Calendar"}
+
+
+def _google_client():
+    cid = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+    csec = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    if (not cid or not csec) and GOOGLE_OAUTH_CLIENT_FILE.exists():
+        try:
+            j = json.loads(GOOGLE_OAUTH_CLIENT_FILE.read_text())
+            j = j.get("web") or j.get("installed") or j
+            cid = cid or j.get("client_id", "")
+            csec = csec or j.get("client_secret", "")
+        except Exception:
+            logger.debug("Failed to read Google OAuth client file", exc_info=True)
+    return cid, csec
+
+
+def _conn_path(user_id: str, service: str) -> Path:
+    return CONNECTIONS_DIR / str(user_id) / (service + ".json")
+
+
+def _sign_state(payload: str) -> str:
+    sig = hmac.new(AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:24]
+    return base64.urlsafe_b64encode((payload + "|" + sig).encode()).decode()
+
+
+def _verify_state(state: str) -> Optional[str]:
+    try:
+        raw = base64.urlsafe_b64decode(state.encode()).decode()
+        payload, sig = raw.rsplit("|", 1)
+        exp = hmac.new(AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:24]
+        if hmac.compare_digest(sig, exp):
+            return payload
+    except Exception:
+        pass
+    return None
+
+
+def _callback_uri(request: Request) -> str:
+    base = PUBLIC_BASE_URL.rstrip("/") or str(request.base_url).rstrip("/")
+    return base + ROOT_PATH + "/api/connections/google/callback"
+
+
+def _write_google_mcp(user: dict, service: str):
+    """If a Google MCP command is configured, expose this connection to the user's
+    Claude via their per-user .claude.json mcpServers. No-op otherwise (the tokens
+    are still stored, ready for when the MCP command is configured)."""
+    cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
+    if not cmd:
+        return
+    cfg = _user_claude_config_dir(user)
+    cj = cfg / ".claude.json"
+    try:
+        data = json.loads(cj.read_text()) if cj.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    parts = shlex.split(cmd)
+    servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
+    servers["google-" + service] = {
+        "command": parts[0],
+        "args": parts[1:],
+        "env": {"GOOGLE_MCP_CREDENTIALS_DIR": str(_conn_path(user["id"], service).parent)},
+    }
+    data["mcpServers"] = servers
+    try:
+        cj.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.debug("Failed to write google MCP entry", exc_info=True)
+
+
+@app.get("/api/connections")
+async def api_connections(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    cid, _ = _google_client()
+    out = {
+        "configured": bool(cid),
+        "mcp_ready": bool(os.environ.get("GOOGLE_MCP_COMMAND", "")),
+        "services": [],
+    }
+    for svc in ("drive", "gmail", "calendar"):
+        out["services"].append({
+            "id": svc, "label": GOOGLE_LABELS[svc],
+            "connected": _conn_path(user["id"], svc).exists(),
+        })
+    return JSONResponse(out)
+
+
+@app.get("/api/connections/{service}/start")
+async def api_connection_start(request: Request, service: str):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    if service not in GOOGLE_SCOPES:
+        return JSONResponse({"error": "Unknown service"}, status_code=400)
+    cid, csec = _google_client()
+    if not cid or not csec:
+        return JSONResponse({"error": "Google connections are not configured yet. "
+                             "Ask the admin to add the OAuth client."}, status_code=503)
+    state = _sign_state(user["id"] + ":" + service + ":" + str(int(time.time())))
+    params = urllib.parse.urlencode({
+        "client_id": cid,
+        "redirect_uri": _callback_uri(request),
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES[service]),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    })
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+
+
+@app.get("/api/connections/google/callback")
+async def api_connection_callback(request: Request):
+    if request.query_params.get("error"):
+        return RedirectResponse(ROOT_PATH + "/?connect=denied")
+    code = request.query_params.get("code")
+    payload = _verify_state(request.query_params.get("state") or "")
+    if not code or not payload:
+        return HTMLResponse("Invalid OAuth state", status_code=400)
+    try:
+        user_id, service, ts = payload.split(":")
+    except ValueError:
+        return HTMLResponse("Invalid OAuth state", status_code=400)
+    if service not in GOOGLE_SCOPES or time.time() - int(ts) > 600:
+        return HTMLResponse("OAuth flow expired — please retry.", status_code=400)
+    cid, csec = _google_client()
+    data = urllib.parse.urlencode({
+        "code": code, "client_id": cid, "client_secret": csec,
+        "redirect_uri": _callback_uri(request), "grant_type": "authorization_code",
+    }).encode()
+    try:
+        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tok = json.load(r)
+    except Exception:
+        logger.exception("Google token exchange failed")
+        return RedirectResponse(ROOT_PATH + "/?connect=error")
+    p = _conn_path(user_id, service)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tok["_obtained_at"] = time.time()
+    tok["_service"] = service
+    try:
+        p.write_text(json.dumps(tok, indent=2))
+        p.chmod(0o600)
+    except Exception:
+        logger.exception("Failed to store connection token")
+        return RedirectResponse(ROOT_PATH + "/?connect=error")
+    u = _find_user_by_id(user_id)
+    if u:
+        _write_google_mcp(u, service)
+    return RedirectResponse(ROOT_PATH + "/?connect=ok&svc=" + service)
+
+
+@app.delete("/api/connections/{service}")
+async def api_connection_delete(request: Request, service: str):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    p = _conn_path(user["id"], service)
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            logger.exception("Failed to remove connection")
+    return JSONResponse({"ok": True})
+
+
+# --- Global system context (admin) -----------------------------------------
+@app.get("/api/global-context")
+async def api_get_global_context(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    return JSONResponse({"content": _read_global_context(), "path": str(GLOBAL_CONTEXT_FILE)})
+
+
+@app.post("/api/global-context")
+async def api_save_global_context(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    GLOBAL_CONTEXT_FILE.write_text(body.get("content", "") or "")
+    # Re-sync the managed block into every existing member's CLAUDE.md immediately.
+    synced = 0
+    for u in _load_users():
+        if u.get("role") == "admin":
+            continue
+        try:
+            d = _user_claude_config_dir(u)
+            d.mkdir(parents=True, exist_ok=True)
+            _sync_global_context_into(d / "CLAUDE.md")
+            synced += 1
+        except Exception:
+            logger.debug("Failed to re-sync global context for %s", u.get("id"), exc_info=True)
+    return JSONResponse({"ok": True, "synced": synced})
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -1242,7 +1833,7 @@ def _file_error(request: Request, status: int, title: str, message: str, path: s
     rp = request.scope.get("root_path", "") or "/"
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
-<title>{status} · {title} · tmux Dashboard</title>
+<title>{status} · {title} · {BRAND_NAME} Dashboard</title>
 <style>
   body{{margin:0;background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;box-sizing:border-box}}
   .card{{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:28px 32px;max-width:640px;width:100%;box-shadow:0 6px 30px rgba(0,0,0,.4)}}
@@ -2521,8 +3112,11 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
 # --- Routes ---
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
+async def index(request: Request):
+    # Inject the per-user "simple" flag so the member UI is correct from the very
+    # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
+    simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
+    return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
@@ -2776,8 +3370,11 @@ async def api_create_session(request: Request, body: CreateSession):
                 )
             except Exception:
                 logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
-        # Inject stored API key so Claude Code can authenticate
-        if _stored_anthropic_key:
+        # Inject stored API key so Claude Code can authenticate. Team-mode members
+        # ride the shared subscription token (symlinked .credentials.json), not a
+        # metered API key, so skip injection for them.
+        _inject_key = bool(_stored_anthropic_key) and not (TEAM_MODE and user and not _is_admin(user))
+        if _inject_key:
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
                  f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
@@ -7246,7 +7843,7 @@ def _tmp_watchdog_size(path: str) -> int:
 HTML_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>tmux Dashboard</title>
+<title>__BRAND__ Dashboard</title>
 <link rel="icon" id="favicon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%236e7681'/></svg>">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -7570,6 +8167,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
 .nav-tools-item:hover{background:#1c2128}
 .nav-tools-item .icon{font-size:.9rem}
+/* --- NEMO-DEV team (simplified member) mode --- */
+.nemo-only{display:none}
+body.nemo-simple .nemo-only{display:inline-flex;align-items:center;justify-content:center}
+body.nemo-simple .nav-tools-wrap{display:none}
+body.nemo-simple .claude-auth{display:none}
+body.nemo-simple .nav-server-stats{display:none}
+body.nemo-simple .nav-usage{display:none}
+body.nemo-simple .profile-select,body.nemo-simple .profile-wrap{display:none!important}
+body.nemo-simple .nemo-hide-simple{display:none!important}
+.approvals-badge{background:#f85149;color:#fff;border-radius:10px;padding:0 6px;font-size:.65rem;font-weight:600;margin-left:4px}
+.conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
+.conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
+.conn-row .conn-ico{font-size:1.15rem}
+.conn-status{font-size:.75rem;color:#3fb950;margin-right:8px}
+.conn-btn{background:#1f6feb;color:#fff;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:.8rem}
+.conn-btn.disconnect{background:#21262d;color:#f85149;border:1px solid #30363d}
+.conn-note{font-size:.75rem;color:#8b949e;margin:4px 0 14px}
+.approval-row{border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;background:#0d1117}
+.approval-row pre{background:#161b22;padding:8px;border-radius:6px;overflow:auto;font-size:.75rem;margin:6px 0;white-space:pre-wrap;word-break:break-all}
+.approval-meta{font-size:.78rem;color:#8b949e}
+.approval-actions{display:flex;gap:8px;margin-top:8px}
+.approval-actions button{border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:.8rem}
+.btn-approve{background:#238636;color:#fff}
+.btn-deny{background:#da3633;color:#fff}
+.pill-pending{color:#d29922}.pill-approved{color:#3fb950}.pill-denied{color:#f85149}
 
 /* Stats modal */
 .stats-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
@@ -7819,7 +8441,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <body>
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
-  <span class="nav-brand">tmux</span>
+  <span class="nav-brand">__BRAND__</span>
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
   <span class="nav-spacer"></span>
 </nav>
@@ -7856,6 +8478,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
+      <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
       <div class="nav-tools-item" onclick="openSettings('mycontext');closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-item" onclick="openSettings('history');closeToolsMenu()"><span class="icon">&#x1F4C5;</span> History</div>
       <div class="nav-tools-divider"></div>
@@ -7863,6 +8487,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
     </div>
   </div>
+  <!-- NEMO-DEV member-only nav controls (shown only in simplified team mode) -->
+  <button class="nav-icon-btn nemo-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
+  <button class="nav-icon-btn nemo-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
     <span class="status-dot unknown" id="claude-auth-dot"></span>
     <span class="claude-auth-label" id="claude-auth-label">...</span>
@@ -7963,6 +8590,8 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+const NEMO_BRAND='__BRAND__';
+let NEMO_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
@@ -8387,15 +9016,16 @@ function renderDetail(){
         <div class="tab-more-menu" id="tab-more-menu">
           ${s.model?`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}">${formatModelName(s.model)}</span></div><div class="tab-more-model-sep"></div></div>`:''}
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
-          <div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>
+          ${NEMO_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
+          ${NEMO_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','CLAUDE.md');closeTabMore()">Project CLAUDE.md</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.json');closeTabMore()">Project settings.json</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.local.json');closeTabMore()">Project settings.local.json</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>`}
         </div>
       </div>
       <div class="detail-badges">
@@ -9197,6 +9827,10 @@ function updateCard(s){
 
 async function loadAll(){
   try{
+    // Resolve simple-mode before the first render so member toggles don't flash.
+    await loadCurrentUser();
+    NEMO_SIMPLE=!!(_currentUser&&_currentUser.simple);
+    document.body.classList.toggle('nemo-simple',NEMO_SIMPLE);
     // Phase 1: Fast load — cached data + activity status, no LLM calls
     const resp=await fetch(BASE+'/api/sessions-fast');
     sessions=await resp.json();
@@ -9341,6 +9975,7 @@ function _applyUsageStyle(fillEl,pctNum){
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
 async function refreshUsageLimits(){
+  if(NEMO_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
   const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
@@ -9439,9 +10074,11 @@ startLoginHealthPolling();
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 
 function showCreateModal(){
+  // Simplified members: skip the dialog, auto-name with 5 random chars.
+  if(NEMO_SIMPLE){ createSessionAuto(); return; }
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>New tmux session</h3>
+    <h3>New __BRAND__ session</h3>
     <p>Leave blank for an auto-assigned name, or enter a custom name.</p>
     <input type="text" class="modal-input" id="new-session-name"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
@@ -9469,6 +10106,127 @@ async function createSession(){
     await loadAll();
   }catch(e){alert('Failed to create session.')}
 }
+
+function _randName(n){const c='abcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;}
+async function createSessionAuto(){
+  for(let attempt=0;attempt<5;attempt++){
+    const name=_randName(5);
+    try{
+      const resp=await fetch(BASE+'/api/sessions/create',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+      const data=await resp.json();
+      if(resp.ok){selectedSession=data.name;await loadAll();return}
+      if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
+    }catch(e){alert('Failed to create session.');return}
+  }
+  alert('Could not create a session — please try again.');
+}
+
+// ── Connections (Drive / Gmail / Calendar) ──
+async function openConnections(){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>Connect data sources</h3><p class="conn-note">Loading…</p>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  try{
+    const r=await fetch(BASE+'/api/connections'); const d=await r.json();
+    const icons={drive:'\u{1F4C1}',gmail:'✉️',calendar:'\u{1F4C5}'};
+    const rows=(d.services||[]).map(s=>`<div class="conn-row">
+        <span class="conn-name"><span class="conn-ico">${icons[s.id]||'\u{1F517}'}</span>${esc(s.label)}</span>
+        <span>${s.connected
+          ?`<span class="conn-status">● Connected</span><button class="conn-btn disconnect" onclick="disconnectService('${s.id}')">Disconnect</button>`
+          :`<button class="conn-btn" ${d.configured?'':'disabled title=\"Admin must configure Google OAuth first\"'} onclick="connectService('${s.id}')">Connect</button>`}</span>
+      </div>`).join('');
+    const note = !d.configured
+      ? 'Google connections aren’t configured yet — ask the admin to add the OAuth client.'
+      : (d.mcp_ready ? '' : 'Connected accounts are saved securely; Claude’s live access turns on once the admin enables the Google tool.');
+    modal.innerHTML=`<h3>Connect data sources</h3>
+      <p class="conn-note">Give Claude access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
+      ${rows}${note?`<p class="conn-note">${note}</p>`:''}
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }catch(e){
+    modal.innerHTML=`<h3>Connect data sources</h3><p class="conn-note">Failed to load.</p>
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }
+}
+function connectService(svc){ window.location.href=BASE+'/api/connections/'+svc+'/start'; }
+async function disconnectService(svc){
+  try{ await fetch(BASE+'/api/connections/'+svc,{method:'DELETE'}); }catch(e){}
+  openConnections();
+}
+
+// ── Approvals (admin: review blocked cross-server actions) ──
+async function openApprovals(){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">Loading…</p>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  try{
+    const r=await fetch(BASE+'/api/approvals'); const d=await r.json();
+    const reqs=d.requests||[];
+    if(!reqs.length){
+      modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">No cross-server requests.</p>
+        <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+      return;
+    }
+    const rows=reqs.map(x=>{
+      const cls={pending:'pill-pending',approved:'pill-approved',denied:'pill-denied'}[x.status]||'';
+      const act=x.status==='pending'
+        ?`<div class="approval-actions"><button class="btn-approve" onclick="decideApproval('${x.key}','approve')">Approve (1h)</button><button class="btn-deny" onclick="decideApproval('${x.key}','deny')">Deny</button></div>`:'';
+      return `<div class="approval-row"><div class="approval-meta"><b>${esc(x.username||x.user_id||'?')}</b> &middot; <span class="${cls}">${esc(x.status)}</span> &middot; ${esc(x.cwd||'')}</div><pre>${esc(x.command||'')}</pre>${act}</div>`;
+    }).join('');
+    modal.innerHTML=`<h3>Approvals</h3>
+      <p class="conn-note">Cross-server actions a member's Claude tried and the sandbox blocked. Approving allows that exact command for ~1 hour.</p>
+      ${rows}<div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }catch(e){
+    modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">Failed to load.</p>
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }
+}
+async function decideApproval(key,action){
+  try{ await fetch(BASE+'/api/approvals/'+key+'/'+action,{method:'POST'}); }catch(e){}
+  refreshApprovalsBadge(); openApprovals();
+}
+
+// ── Global context (admin) ──
+async function openGlobalContext(){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Loading…</p>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  try{
+    const r=await fetch(BASE+'/api/global-context'); const d=await r.json();
+    modal.innerHTML=`<h3>Global Context — every member's Claude</h3>
+      <p class="conn-note">Prepended as a managed block to each member's CLAUDE.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
+      <textarea id="gctx-ta" class="modal-input" style="height:320px;font-family:monospace;white-space:pre;width:100%">${esc(d.content||'')}</textarea>
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-confirm-create" onclick="saveGlobalContext()">Save &amp; sync</button></div>`;
+  }catch(e){
+    modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Failed to load.</p>
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }
+}
+async function saveGlobalContext(){
+  const ta=document.getElementById('gctx-ta'); if(!ta) return;
+  try{
+    const r=await fetch(BASE+'/api/global-context',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ta.value})});
+    const d=await r.json();
+    if(r.ok){ closeModal(); alert('Saved & synced to '+(d.synced||0)+' member(s).'); }
+    else alert(d.error||'Failed');
+  }catch(e){ alert('Failed to save.'); }
+}
+
+// Surface a one-time toast after returning from a Google OAuth connect flow.
+(function(){
+  try{
+    const q=new URLSearchParams(window.location.search);
+    if(q.has('connect')){
+      const st=q.get('connect');
+      const msg=st==='ok'?'Connected '+(q.get('svc')||'service')+' ✓':(st==='denied'?'Connection cancelled.':'Connection failed.');
+      setTimeout(()=>{ try{ alert(msg); }catch(e){} },300);
+      q.delete('connect'); q.delete('svc');
+      const url=window.location.pathname+(q.toString()?('?'+q.toString()):'');
+      window.history.replaceState({},'',url);
+    }
+  }catch(e){}
+})();
 
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
@@ -9904,6 +10662,25 @@ async function loadWatchdogStatus(name){
 
 // ── Key Bar + Slash Commands ──
 function buildKeyBar(name,tab){
+  // Simplified team members: no keys/commands, just drag-or-click file upload.
+  if(NEMO_SIMPLE){
+    return `<div class="key-bar expanded" id="keybar-${tab}-${name}" style="border-top:none">
+    <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
+    <div class="drop-zone" id="dropzone-${tab}-${name}"
+      ondragover="event.preventDefault();this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="handleDrop(event,'${name}','${tab}')"
+      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">
+      <div class="drop-zone-icon">&#x1F4C2;</div>
+      <div class="drop-zone-text">Drop files here or click to upload</div>
+      <div class="upload-progress" id="upload-progress-${tab}-${name}">
+        <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
+        <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
+      </div>
+    </div>
+    <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
+  </div>`;
+  }
   const id='keybar-'+tab+'-'+name;
   const isOpen=localStorage.getItem('keyBarOpen')==='true';
   return `<div class="key-bar-toggle${isOpen?' open':''}" onclick="toggleKeyBar('${id}',this)">
@@ -10382,6 +11159,7 @@ let _profilesEditing = null;       // currently-edited full profile object
 let _profilePending = {};          // sessionName -> "pending restart" flag
 
 async function loadProfiles(force){
+  if(NEMO_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
   if(_profilesCache && !force) return _profilesCache;
   try{
     const resp = await fetch(BASE+'/api/profiles');
@@ -10392,6 +11170,7 @@ async function loadProfiles(force){
 }
 
 function renderProfileDropdown(s){
+  if(NEMO_SIMPLE) return '';  // members have no profile selector
   const cur = s.profile_id || 'default';
   const list = _profilesCache || [];
   const opts = list.length
@@ -10485,6 +11264,9 @@ async function loadCurrentUser(){
 async function applyRoleVisibility(){
   await loadCurrentUser();
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
+  NEMO_SIMPLE = !!(_currentUser && _currentUser.simple);
+  document.body.classList.toggle('nemo-simple', NEMO_SIMPLE);
+  document.body.classList.toggle('nemo-admin', isAdmin);
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
@@ -10493,6 +11275,19 @@ async function applyRoleVisibility(){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
     whoamiEl.textContent = 'Signed in as ' + (_currentUser.username||'?') + role;
   }
+  // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
+  try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
+  if(isAdmin){ refreshApprovalsBadge(); if(!window._apTimer) window._apTimer=setInterval(refreshApprovalsBadge,30000); }
+}
+
+async function refreshApprovalsBadge(){
+  try{
+    const r=await fetch(BASE+'/api/approvals'); if(!r.ok)return;
+    const d=await r.json();
+    const pending=(d.requests||[]).filter(x=>x.status==='pending').length;
+    const b=document.getElementById('approvals-badge');
+    if(b){ b.textContent=pending?String(pending):''; b.style.display=pending?'':'none'; }
+  }catch(e){}
 }
 
 async function doLogout(){
@@ -11899,7 +12694,9 @@ checkClaudeAuth();
 
 # Inject the actual ROOT_PATH into the JS BASE variable
 HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
+HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
+LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
