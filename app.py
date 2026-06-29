@@ -1383,71 +1383,37 @@ def _seed_trust(cfg_dir: Path, cwd: str):
         logger.debug("Failed to seed trust into %s", cj, exc_info=True)
 
 
-# A standalone primer that opens a real PTY, accepts the one-time "Bypass
-# Permissions" warning, then exits. Without this, claude in a detached tmux
-# session (no attached client) can't confirm the warning and exits immediately.
-PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.py"
-_PRIME_SCRIPT = r'''#!/usr/bin/env python3
-import os, sys, pty, time, select, pathlib
-cfg = sys.argv[1]
-key = ""
-kf = os.environ.get("NEMO_KEY_FILE", "")
-try:
-    key = pathlib.Path(kf).read_text().strip() if kf else ""
-except Exception:
-    pass
-marker = pathlib.Path(cfg) / ".nemo_primed"
-if marker.exists():
-    print("already primed"); sys.exit(0)
-env = dict(os.environ)
-env["CLAUDE_CONFIG_DIR"] = cfg
-env["PATH"] = env.get("PATH", "") + ":/usr/local/bin:/usr/bin"
-if key:
-    env["ANTHROPIC_API_KEY"] = key
-pid, fd = pty.fork()
-if pid == 0:
-    try:
-        os.execvpe("claude", ["claude", "--dangerously-skip-permissions"], env)
-    except Exception:
-        os._exit(127)
-buf = ""; accepted = False; ready = False
-deadline = time.time() + 75
-while time.time() < deadline:
-    try:
-        r, _, _ = select.select([fd], [], [], 1)
-    except Exception:
-        break
-    if not r:
-        continue
-    try:
-        data = os.read(fd, 8192).decode("utf-8", "replace")
-    except OSError:
-        break
-    if not data:
-        break
-    buf = (buf + data)[-20000:]
-    if not accepted and "Yes, I accept" in buf:
-        time.sleep(0.6); os.write(fd, b"\x1b[B")  # Down -> "Yes, I accept"
-        time.sleep(0.4); os.write(fd, b"\r")
-        accepted = True; buf = ""; continue
-    if "bypass permissions on" in buf or "/effort to tune" in buf or "? for shortcuts" in buf:
-        ready = True; break
-try:
-    os.write(fd, b"\x03"); time.sleep(0.3); os.write(fd, b"\x03")
-except Exception:
-    pass
-time.sleep(0.4)
-try:
-    os.close(fd)
-except Exception:
-    pass
-if ready or accepted:
-    try:
-        marker.write_text(str(int(time.time())))
-    except Exception:
-        pass
-    print("primed"); sys.exit(0)
-print("prime failed"); sys.exit(1)
+# A standalone primer that drives a throwaway tmux session WITH an attached pty
+# client to accept the one-time "Bypass Permissions" warning. A detached session
+# (no client) can't confirm it and claude exits, so members would otherwise hang.
+PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
+_PRIME_SCRIPT = r'''#!/usr/bin/env bash
+# Accept the one-time --dangerously-skip-permissions warning for a config dir.
+CFG="$1"
+MARKER="$CFG/.nemo_primed"
+[ -f "$MARKER" ] && { echo "already primed"; exit 0; }
+KEY="$(cat "$NEMO_KEY_FILE" 2>/dev/null)"
+S="prime_$$"
+tmux kill-session -t "$S" 2>/dev/null
+tmux new-session -d -s "$S" -x 200 -y 50 -c "$PWD" || exit 1
+tmux send-keys -t "$S" "export ANTHROPIC_API_KEY=$KEY; export CLAUDE_CONFIG_DIR=$CFG; claude --dangerously-skip-permissions" Enter
+# Attach a pty client in the background so claude sees an interactive terminal.
+setsid bash -c "script -qfc 'tmux attach -t $S' /dev/null" >/dev/null 2>&1 &
+ok=0
+for i in $(seq 1 45); do
+  pane="$(tmux capture-pane -t "$S" -p 2>/dev/null)"
+  if echo "$pane" | grep -q "bypass permissions on"; then ok=1; break; fi
+  if echo "$pane" | grep -q "Yes, I accept"; then
+    tmux send-keys -t "$S" Down; sleep 1; tmux send-keys -t "$S" Enter; sleep 2
+  fi
+  sleep 1
+done
+tmux send-keys -t "$S" C-c 2>/dev/null
+sleep 1
+tmux kill-session -t "$S" 2>/dev/null
+pkill -f "tmux attach -t $S" 2>/dev/null
+if [ "$ok" = "1" ]; then date +%s > "$MARKER"; echo "primed"; exit 0; fi
+echo "prime failed"; exit 1
 '''
 
 
@@ -1477,7 +1443,7 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
         env = dict(os.environ,
                    NEMO_KEY_FILE=str(ANTHROPIC_API_KEY_FILE),
                    PATH=os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin")
-        subprocess.run(["python3", str(PRIME_SCRIPT_PATH), str(cfg_dir)],
+        subprocess.run(["bash", str(PRIME_SCRIPT_PATH), str(cfg_dir)],
                        cwd=os.getcwd(), env=env, capture_output=True, text=True, timeout=90)
     except Exception:
         logger.debug("prime_claude_config failed for %s", cfg_dir, exc_info=True)
