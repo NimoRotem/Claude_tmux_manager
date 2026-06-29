@@ -1395,7 +1395,10 @@ def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
         req = urllib.request.Request(
             "https://api.resend.com/emails", data=payload,
             headers={"Authorization": "Bearer " + RESEND_API_KEY,
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                     # Resend is behind Cloudflare, which 403s (error 1010) the
+                     # default Python-urllib User-Agent. Send a normal one.
+                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NEMO-DEV/1.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
         return True
