@@ -987,6 +987,54 @@ async def api_admin_delete_user(request: Request, user_id: str):
     return JSONResponse({"ok": True})
 
 
+def _set_auth_cookie(resp, request: Request, token: str):
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    resp.set_cookie("tmux_auth", token, max_age=86400 * 30,
+                    httponly=True, samesite="lax", secure=is_https)
+    return resp
+
+
+@app.post("/api/admin/users/{user_id}/impersonate")
+async def api_admin_impersonate(request: Request, user_id: str):
+    """Admin 'log in as' a user to see their work. Stashes the admin's own token
+    in a side cookie so they can return; swaps tmux_auth to the target."""
+    admin = _current_user(request)
+    if not _is_admin(admin):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = next((u for u in _load_users() if u["id"] == user_id), None)
+    if not target:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    if target["id"] == admin["id"]:
+        return JSONResponse({"error": "That's already you"}, status_code=400)
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    resp = JSONResponse({"ok": True, "username": target.get("username", "")})
+    # Keep the EARLIEST admin token if already impersonating, so a chain of
+    # impersonations still returns to the real admin.
+    orig = request.cookies.get("tmux_imp_orig")
+    if not (orig and _is_admin(_user_from_token(orig))):
+        orig = _make_token(admin["id"])
+    resp.set_cookie("tmux_imp_orig", orig, max_age=86400,
+                    httponly=True, samesite="lax", secure=is_https)
+    _set_auth_cookie(resp, request, _make_token(target["id"]))
+    logger.info("Admin '%s' is now impersonating '%s'", admin.get("username"), target.get("username"))
+    return resp
+
+
+@app.post("/api/unimpersonate")
+async def api_unimpersonate(request: Request):
+    """Return to the admin account. Authorized by possessing a valid admin token
+    in the tmux_imp_orig cookie, so the impersonated (non-admin) session can call it."""
+    orig = request.cookies.get("tmux_imp_orig")
+    admin = _user_from_token(orig) if orig else None
+    if not admin or not _is_admin(admin):
+        return JSONResponse({"error": "Not impersonating"}, status_code=400)
+    resp = JSONResponse({"ok": True, "username": admin.get("username", "")})
+    _set_auth_cookie(resp, request, orig)
+    resp.delete_cookie("tmux_imp_orig")
+    logger.info("Returned to admin '%s' from impersonation", admin.get("username"))
+    return resp
+
+
 class SaveMyContextBody(BaseModel):
     content: str
 
@@ -1169,6 +1217,11 @@ async def api_me(request: Request):
             })
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     is_admin = _is_admin(user)
+    # Impersonation: an admin "logged in as" this user has their real token in
+    # the side cookie, so we can surface a "return to admin" banner.
+    imp_orig = request.cookies.get("tmux_imp_orig")
+    imp_admin = _user_from_token(imp_orig) if imp_orig else None
+    impersonating = bool(imp_admin and _is_admin(imp_admin) and imp_admin["id"] != user["id"])
     return JSONResponse({
         "id": user["id"],
         "username": user.get("username", ""),
@@ -1178,6 +1231,8 @@ async def api_me(request: Request):
         "brand": BRAND_NAME,
         # "simple" = the heavily-stripped team UI shown to non-admin members.
         "simple": bool(TEAM_MODE and not is_admin),
+        "impersonating": impersonating,
+        "impersonator": imp_admin.get("username", "") if impersonating else "",
     })
 
 
@@ -8192,6 +8247,11 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
 .btn-approve{background:#238636;color:#fff}
 .btn-deny{background:#da3633;color:#fff}
 .pill-pending{color:#d29922}.pill-approved{color:#3fb950}.pill-denied{color:#f85149}
+/* impersonation ("log in as") banner */
+#imp-banner{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#9e6a03;color:#fff;display:flex;align-items:center;justify-content:center;gap:14px;padding:9px 14px;font-size:.85rem;box-shadow:0 -2px 12px rgba(0,0,0,.45)}
+#imp-banner button{background:#fff;color:#9e6a03;border:none;border-radius:6px;padding:5px 14px;font-size:.8rem;font-weight:600;cursor:pointer}
+#imp-banner button:hover{background:#ffe8b3}
+.users-actions button.imp{background:#1f6feb22;border:1px solid #1f6feb88;color:#79c0ff}
 
 /* Stats modal */
 .stats-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
@@ -8439,6 +8499,7 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
 }
 </style></head>
 <body>
+<div id="imp-banner" style="display:none"></div>
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">__BRAND__</span>
@@ -11275,6 +11336,7 @@ async function applyRoleVisibility(){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
     whoamiEl.textContent = 'Signed in as ' + (_currentUser.username||'?') + role;
   }
+  renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
   if(isAdmin){ refreshApprovalsBadge(); if(!window._apTimer) window._apTimer=setInterval(refreshApprovalsBadge,30000); }
@@ -11541,6 +11603,7 @@ async function loadUsersAdmin(){
       </div>
     ` : `
       <div class="users-actions">
+        <button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
         <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset password</button>
         <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote to user':'Promote to admin'}</button>
         <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>
@@ -11631,6 +11694,34 @@ async function deleteUser(userId, username){
     if(!resp.ok){ alert(data.error||'Failed'); return; }
     loadUsersAdmin();
   }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function impersonateUser(userId, username){
+  if(!confirm('Log in as "'+username+'"? You\'ll see the dashboard exactly as they do (their sessions, their view). Use the "Return to admin" bar at the bottom to come back.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId)+'/impersonate', {method:'POST'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    window.location.href = BASE + '/';  // reload as the impersonated user
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function returnToAdmin(){
+  try{ await fetch(BASE+'/api/unimpersonate', {method:'POST'}); }catch(e){}
+  window.location.href = BASE + '/';
+}
+
+function renderImpersonationBanner(){
+  const el = document.getElementById('imp-banner');
+  if(!el) return;
+  if(_currentUser && _currentUser.impersonating){
+    el.style.display = 'flex';
+    el.innerHTML = '\u{1F441}️ Viewing as <b style="margin:0 2px">'+esc(_currentUser.username||'')+
+      '</b> — impersonated by '+esc(_currentUser.impersonator||'admin')+
+      ' <button onclick="returnToAdmin()">Return to admin</button>';
+  } else {
+    el.style.display = 'none';
+  }
 }
 
 async function openProfiles(){
