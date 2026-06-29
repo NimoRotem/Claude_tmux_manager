@@ -51,6 +51,9 @@ DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
 TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
 TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
+# Email domain used for per-user git commit identity (commits are AUTHORED by the
+# member even though everyone shares one OS user).
+GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "dianaotech.com")
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -267,6 +270,12 @@ async def lifespan(_app: FastAPI):
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
+    if TEAM_MODE:
+        try:
+            _setup_shared_git_config()
+            logger.info("Team mode: shared git config applied")
+        except Exception:
+            logger.debug("shared git config setup failed", exc_info=True)
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
     # Auto-responder: presses Enter ONLY when the visible pane shows a
@@ -532,6 +541,7 @@ def _ensure_user_claude_config_dir(user: dict):
             _ensure_google_mcp(d, user)
             _disable_claude_ai_connectors(d)
             _set_team_model_effort(d)
+            _sync_git_rules_into(claude_md)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
@@ -1391,6 +1401,68 @@ def _sync_projects_note_into(claude_md: Path):
         claude_md.write_text(block + "\n" + existing)
     except Exception:
         logger.debug("Failed to sync projects note into %s", claude_md, exc_info=True)
+
+
+_GIT_RULES_BEGIN = "<!-- NEMO-DEV GIT RULES (managed) -->"
+_GIT_RULES_END = "<!-- END NEMO-DEV GIT RULES -->"
+_GIT_RULES = """## Git on a shared machine (multiple people, one box)
+Several teammates work on this server as the same OS user, so be disciplined:
+- **Identity is preset** — your commits are authored as `$GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>` (= your dashboard username). Do NOT change git `user.name`/`user.email` or pass `--author`; let the env vars stand so attribution is correct.
+- **Stay in your own space** — work inside this session's cwd / `$NEMO_PROJECT_DIR`. Never edit files in another member's project dir (`~/nemo-projects/<someone-else>/...`).
+- **Branch, never commit to a shared branch** — always work on a feature branch named `$NEMO_USER/<short-topic>`. Never commit directly to `main`/`master` or to a branch someone else is using.
+- **Sync before you start** — `git fetch` + rebase/merge latest so you're not building on stale code. Resolve conflicts cleanly.
+- **Push your branch, open a PR** — let the repo owner review/merge. **NEVER force-push** `main` or any shared branch.
+- **Isolate when sharing a repo** — if a teammate is already working in a repo's working tree, don't fight over it: make your own worktree — `git worktree add ../<repo>-$NEMO_USER -b $NEMO_USER/<topic>` — and work there.
+- **Never commit secrets** (.env, tokens, keys). Check `git status` before committing."""
+
+
+def _sync_git_rules_into(claude_md: Path):
+    """Maintain a managed GIT RULES block in a CLAUDE.md (members + admins). Placed
+    just under the projects note / top so it's always current regardless of edits."""
+    existing = claude_md.read_text() if claude_md.exists() else ""
+    if _GIT_RULES_BEGIN in existing and _GIT_RULES_END in existing:
+        pre = existing.split(_GIT_RULES_BEGIN, 1)[0]
+        post = existing.split(_GIT_RULES_END, 1)[1]
+        existing = (pre.rstrip("\n") + "\n" + post.lstrip("\n"))
+    block = _GIT_RULES_BEGIN + "\n" + _GIT_RULES + "\n" + _GIT_RULES_END + "\n"
+    # Insert after the projects-note block if present, else prepend.
+    try:
+        claude_md.parent.mkdir(parents=True, exist_ok=True)
+        if _PROJ_NOTE_END in existing:
+            head, tail = existing.split(_PROJ_NOTE_END, 1)
+            claude_md.write_text(head + _PROJ_NOTE_END + "\n\n" + block + tail.lstrip("\n"))
+        else:
+            claude_md.write_text(block + "\n" + existing.lstrip("\n"))
+    except Exception:
+        logger.debug("Failed to sync git rules into %s", claude_md, exc_info=True)
+
+
+def _setup_shared_git_config():
+    """Set safe, friction-reducing git defaults once for the shared OS user so
+    multi-user work behaves predictably. Idempotent (git config is declarative)."""
+    defaults = [
+        ("push.default", "current"),
+        ("push.autoSetupRemote", "true"),
+        ("pull.rebase", "false"),
+        ("init.defaultBranch", "main"),
+        ("rerere.enabled", "true"),
+        ("merge.conflictStyle", "zdiff3"),
+    ]
+    for k, v in defaults:
+        try:
+            subprocess.run(["git", "config", "--global", k, v],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            logger.debug("git config --global %s failed", k, exc_info=True)
+    # A global ignore so per-user/editor noise never gets committed by accident.
+    try:
+        gi = Path.home() / ".gitignore_global"
+        if not gi.exists():
+            gi.write_text(".DS_Store\n*.swp\n.serve.json\n.nemo_primed\nnode_modules/\n__pycache__/\n.venv/\n")
+        subprocess.run(["git", "config", "--global", "core.excludesfile", str(gi)],
+                       capture_output=True, text=True, timeout=5)
+    except Exception:
+        logger.debug("global gitignore setup failed", exc_info=True)
 
 
 def _share_credentials_symlink(cfg_dir: Path):
@@ -4362,9 +4434,16 @@ async def api_create_session(request: Request, body: CreateSession):
             _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
             _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
             _pub_base = PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com"
-            _exports = ("export NEMO_USER=%s NEMO_SESSION=%s NEMO_PROJECT_DIR=%s NEMO_PROJECT_URL=%s" % (
+            # Per-user git identity: every member shares ONE OS user, so set the
+            # commit author/committer per session → commits are attributed to the
+            # right person. Push still uses the box's shared GitHub creds.
+            _git_email = "%s@%s" % (_owner_name, GIT_EMAIL_DOMAIN)
+            _exports = ("export NEMO_USER=%s NEMO_SESSION=%s NEMO_PROJECT_DIR=%s NEMO_PROJECT_URL=%s "
+                        "GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s" % (
                 shlex.quote(_owner_name), shlex.quote(created),
-                shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created))))
+                shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created)),
+                shlex.quote(_owner_name), shlex.quote(_git_email),
+                shlex.quote(_owner_name), shlex.quote(_git_email)))
             subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
             subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
         except Exception:
@@ -4380,6 +4459,7 @@ async def api_create_session(request: Request, body: CreateSession):
                 _disable_claude_ai_connectors(acfg)
                 _ensure_google_mcp(acfg, user)
                 _set_team_model_effort(acfg)
+                _sync_git_rules_into(acfg / "CLAUDE.md")
         except Exception:
             logger.debug("Failed to harden admin team config", exc_info=True)
         # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
@@ -9635,6 +9715,7 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
         <div class="nav-tools-usage-divider"></div>
       </div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openTeamWorkspace();closeToolsMenu()"><span class="icon">&#x1F465;</span> Team &amp; Workspace</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
       <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
@@ -12545,6 +12626,11 @@ async function openSettings(tab){
 function closeSettings(){
   document.getElementById('settings-overlay').classList.remove('active');
   _settingsHistoryDetail = null;
+}
+
+// Admin shortcut: jump straight to the Users/Workspace management tab.
+async function openTeamWorkspace(){
+  await openSettings('users');
 }
 
 function renderSettingsTabs(){
