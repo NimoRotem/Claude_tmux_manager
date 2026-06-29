@@ -1516,16 +1516,10 @@ def _apply_subscription_auth(cfg_dir: Path):
 
 
 def _apply_member_auth(cfg_dir: Path) -> str:
-    """Pick the member auth mode. PREFER the subscription plan when a valid shared
-    token exists (per Nimo: use the plan, not the metered API); fall back to the
-    shared API key only if there's no live subscription. Returns the mode used."""
-    if _subscription_token_valid():
-        _apply_subscription_auth(cfg_dir)
-        return "subscription"
-    if _stored_anthropic_key:
-        _apply_api_key_auth(cfg_dir)
-        return "api"
-    # No live plan and no key: still symlink so a future plan login just works.
+    """Member auth = the shared subscription PLAN, always (per Nimo: use the plan,
+    never the metered API). Symlinks .credentials.json to the admin's plan token and
+    strips any apiKeyHelper so we can't accidentally fall back to the API key. The
+    metered-API path is intentionally NOT used here."""
     _apply_subscription_auth(cfg_dir)
     return "subscription"
 
@@ -1565,7 +1559,9 @@ KEY="$(cat "$NEMO_KEY_FILE" 2>/dev/null)"
 S="prime_$$"
 tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 200 -y 50 -c "$PWD" || exit 1
-tmux send-keys -t "$S" "export ANTHROPIC_API_KEY=$KEY; export CLAUDE_CONFIG_DIR=$CFG; claude --dangerously-skip-permissions" Enter
+# Subscription mode (no key): rely on the config dir's symlinked plan creds.
+if [ -n "$KEY" ]; then PRE="export ANTHROPIC_API_KEY=$KEY; "; else PRE="unset ANTHROPIC_API_KEY; "; fi
+tmux send-keys -t "$S" "${PRE}export CLAUDE_CONFIG_DIR=$CFG; claude --dangerously-skip-permissions" Enter
 # Attach a pty client in the background so claude sees an interactive terminal.
 setsid bash -c "script -qfc 'tmux attach -t $S' /dev/null" >/dev/null 2>&1 &
 ok=0
@@ -1598,8 +1594,9 @@ def _write_prime_script():
 
 def _prime_claude_config(cfg_dir: Path) -> bool:
     """One-time per config dir: accept the bypass-permissions warning so detached
-    sessions launch cleanly. Idempotent via a marker file."""
-    if not _stored_anthropic_key:
+    sessions launch cleanly. Idempotent via a marker file. Works in subscription
+    mode (symlinked plan creds) or, as a legacy path, with a stored API key."""
+    if not _subscription_token_valid() and not _stored_anthropic_key:
         return False
     marker = cfg_dir / ".nemo_primed"
     if marker.exists():
@@ -1607,7 +1604,8 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
     try:
         cfg_dir.mkdir(parents=True, exist_ok=True)
         _seed_trust(cfg_dir, os.getcwd())
-        _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
+        if _stored_anthropic_key:
+            _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
         _write_prime_script()
         env = dict(os.environ,
                    NEMO_KEY_FILE=str(ANTHROPIC_API_KEY_FILE),
