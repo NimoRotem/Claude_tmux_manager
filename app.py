@@ -527,6 +527,7 @@ def _ensure_user_claude_config_dir(user: dict):
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
+            _disable_claude_ai_connectors(d)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
@@ -1513,6 +1514,28 @@ def _apply_subscription_auth(cfg_dir: Path):
     cfg_dir.mkdir(parents=True, exist_ok=True)
     _remove_api_key_helper(cfg_dir)
     _share_credentials_symlink(cfg_dir)
+
+
+def _disable_claude_ai_connectors(cfg_dir: Path):
+    """Turn off the claude.ai ACCOUNT-level connectors (Drive/Gmail/Calendar that
+    ride the shared plan account, `mcp__claude_ai_*`). On the shared plan those are
+    the admin account's data — a leak into member sessions, and members can't
+    re-auth them when they expire. Members use our per-user `google` MCP instead.
+    Requires Claude Code >= 2.1.182. Custom mcpServers are unaffected."""
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            s = {}
+    except Exception:
+        s = {}
+    if s.get("disableClaudeAiConnectors") is not True:
+        s["disableClaudeAiConnectors"] = True
+        try:
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text(json.dumps(s, indent=2))
+        except Exception:
+            logger.debug("Failed to set disableClaudeAiConnectors in %s", sp, exc_info=True)
 
 
 def _apply_member_auth(cfg_dir: Path) -> str:
@@ -3724,6 +3747,19 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
         tasks["realtime"] = get_realtime(session_name)
 
+    # Simplified Chat tab: when Claude is idle, (re)generate ONE plain-language
+    # recap of its whole last turn. Triggered promptly on the busy->idle edge,
+    # then at most every REALTIME_TTL; the signature gate inside get_chat_summary
+    # skips the LLM call when the turn output hasn't changed.
+    _chat_status = _activity_state.get(session_name, {}).get("status", "")
+    if _chat_status == "busy":
+        entry["_chat_was_busy"] = True
+    _summary_due = (now - entry.get("chat_summary_at", 0)) >= REALTIME_TTL
+    if _chat_status == "idle" and (force_all or entry.get("_chat_was_busy") or _summary_due):
+        tasks["chat_summary"] = get_chat_summary(session_name, entry.get("chat_summary_sig", ""))
+        entry["chat_summary_at"] = now
+        entry["_chat_was_busy"] = False
+
     if tasks:
         results = await asyncio.gather(*tasks.values())
         result_map = dict(zip(tasks.keys(), results))
@@ -3752,9 +3788,15 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         if "realtime" in result_map:
             realtime = result_map["realtime"]
             if realtime and realtime.strip():
+                # Kept for the Info tab's "live" field only — NOT pushed into the
+                # Chat tab (that now shows the idle summary below, not raw text).
                 entry["realtime"] = realtime
                 entry["realtime_at"] = now
-                _append_assistant_msg(entry, realtime, now)
+        if "chat_summary" in result_map:
+            cs = result_map["chat_summary"]
+            if cs and cs.get("summary"):
+                _append_assistant_msg(entry, cs["summary"], now)
+                entry["chat_summary_sig"] = cs["sig"]
 
     cache[session_name] = entry
     if entry.get("messages"):
@@ -3813,6 +3855,141 @@ def _append_assistant_msg(entry: dict, text: str, ts: float):
         msgs.append({"role": "assistant", "text": text, "ts": ts})
 
     _save_messages()
+
+
+# --- Simplified Chat tab: one plain-language recap per completed Claude turn ---
+#
+# The Chat tab is for non-developer users who shouldn't see raw terminal/tool
+# output. Instead of streaming Claude's live text into the chat, we wait until
+# Claude goes idle and then post ONE short summary of everything it produced
+# that turn. The clean source of "everything Claude output" is the session's
+# JSONL transcript (assistant `text` blocks since the last genuine user
+# message) — far cleaner than scraping the pane. We fall back to the pane scrape
+# when no transcript exists.
+
+def _read_jsonl_tail(path: str, max_bytes: int = 1_500_000) -> list:
+    """Return the trailing lines of a (possibly huge) JSONL file cheaply."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # discard the partial first line
+            data = f.read()
+        return data.decode("utf-8", "replace").splitlines()
+    except Exception:
+        return []
+
+
+def _is_genuine_user_content(cont) -> bool:
+    """True for a real human prompt, False for a tool_result (also role=user)."""
+    if isinstance(cont, str):
+        return bool(cont.strip())
+    if isinstance(cont, list):
+        has_text = any(
+            isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+            for b in cont
+        )
+        has_tool = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in cont)
+        return has_text and not has_tool
+    return False
+
+
+def _extract_last_assistant_turn(session_name: str) -> str:
+    """Clean text of Claude's most recent turn: every assistant `text` block
+    since the last genuine user message in the transcript. Thinking and tool
+    calls/results are excluded. Falls back to the terminal scrape."""
+    files = _find_session_jsonl_files(session_name)
+    if files:
+        try:
+            path = max(files, key=os.path.getmtime)
+            texts: list = []
+            for ln in _read_jsonl_tail(path):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    o = json.loads(ln)
+                except Exception:
+                    continue
+                msg = o.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                t = o.get("type")
+                if t == "user":
+                    if _is_genuine_user_content(msg.get("content")):
+                        texts = []  # a new human turn begins — drop prior text
+                elif t == "assistant":
+                    for b in (msg.get("content") or []):
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            tx = (b.get("text") or "").strip()
+                            if tx:
+                                texts.append(tx)
+            if texts:
+                return "\n\n".join(texts).strip()
+        except Exception:
+            logger.debug("transcript turn extraction failed", exc_info=True)
+    # Fallback: scrape the visible terminal.
+    try:
+        recent = capture_pane_recent(session_name, 200)
+        return _extract_claude_response_since_last_user(recent).strip()
+    except Exception:
+        return ""
+
+
+def _trim_plain(text: str, limit: int = 600) -> str:
+    """Trim to a sentence/word boundary near `limit`, adding an ellipsis."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in (". ", "! ", "? ", "\n"):
+        i = cut.rfind(sep)
+        if i > limit * 0.5:
+            return cut[: i + 1].strip() + " …"
+    i = cut.rfind(" ")
+    return (cut[:i] if i > 0 else cut).strip() + " …"
+
+
+async def _summarize_turn(text: str) -> str:
+    """Short, plain-language recap of one assistant turn for non-dev users."""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    summary = await llm_call(
+        system_prompt=(
+            "You summarize what an AI coding assistant just did, for a "
+            "non-technical user who cannot see the terminal. Write a short, "
+            "plain, friendly recap (1-3 sentences, under 70 words) of what was "
+            "done, found, or decided. Keep concrete outcomes (what changed, what "
+            "was created/fixed, any link, number, or result). No code blocks, no "
+            "file-path jargon unless essential, no preamble or sign-off. Write in "
+            "first person as the assistant ('I ...'). If the assistant asked the "
+            "user something, state the question."
+        ),
+        user_content=f"The assistant's full output for this turn:\n\n{body[:8000]}",
+        max_tokens=170,
+    )
+    summary = (summary or "").strip()
+    # LLM unavailable/failed -> fall back to the assistant's own words (already
+    # clean prose from the transcript), trimmed, rather than raw terminal output.
+    return summary or _trim_plain(body, 600)
+
+
+async def get_chat_summary(session_name: str, prev_sig: str):
+    """Return {'sig','summary'} for the latest turn, or None when unchanged/empty."""
+    turn_text = await asyncio.to_thread(_extract_last_assistant_turn, session_name)
+    turn_text = (turn_text or "").strip()
+    if not turn_text:
+        return None
+    sig = _output_signature(turn_text)
+    if sig == prev_sig:
+        return None  # this exact output was already summarized
+    summary = await _summarize_turn(turn_text)
+    summary = (summary or "").strip()
+    if not summary:
+        return None
+    return {"sig": sig, "summary": summary}
 
 
 def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
@@ -4106,9 +4283,14 @@ async def api_create_session(request: Request, body: CreateSession):
         # convention directly (members already have it in their global context).
         try:
             if TEAM_MODE and _is_admin(user):
-                _sync_projects_note_into(_user_claude_config_dir(user) / "CLAUDE.md")
+                acfg = _user_claude_config_dir(user)
+                _sync_projects_note_into(acfg / "CLAUDE.md")
+                # Disable the shared-account claude.ai connectors for admins too (same
+                # leak/expiry issue) and give them our per-identity google MCP instead.
+                _disable_claude_ai_connectors(acfg)
+                _ensure_google_mcp(acfg, user)
         except Exception:
-            logger.debug("Failed to sync admin projects note", exc_info=True)
+            logger.debug("Failed to harden admin team config", exc_info=True)
         # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
         # `claude` invocation in this pane reads from the user's private config.
         if user and not _is_admin(user):
@@ -6628,33 +6810,46 @@ def _save_login_state(state: dict):
         logger.debug("Could not persist login_state.json", exc_info=True)
 
 
-def _login_active_since(config_dir, ident: dict) -> float:
-    """Epoch since which `ident['fp']` has been the active account for this dir.
+def _login_switch_time(config_dir, ident: dict) -> float:
+    """Epoch of the last *observed* account switch for this config dir, or 0.
 
-    Persisted so it survives dashboard restarts. Advances ONLY when the account
-    identity actually changes (a routine token refresh rewrites .credentials.json
-    but keeps the same fingerprint, so it does not count as a switch).
+    Returns 0 when the dashboard has only ever seen one account fingerprint for
+    this dir — i.e. no switch has happened — so long-running sessions are never
+    falsely flagged. The value advances ONLY when the active fingerprint is seen
+    to change between two polls.
+
+    Why not anchor on profileFetchedAt / the credentials mtime: BOTH of those
+    move on a routine OAuth token refresh (claude re-fetches the profile and
+    rewrites .credentials.json every few hours) even though the account is
+    unchanged. Anchoring on them made the first poll after a refresh look like a
+    brand-new login and flag every older — but identical-account — session as
+    "on old login". The fingerprint (org UUID / sub+tier) does NOT move on a
+    refresh, so a fingerprint *change* is the only reliable switch signal.
+
+    Persisted so a genuine switch (including one that happened while the
+    dashboard was down) survives restarts.
     """
     key = str(config_dir)
     state = _load_login_state()
     cur = state.get(key)
     now = time.time()
     fp = ident.get("fp", "")
-    # Anchor on profileFetchedAt (true login/switch time, refresh-proof); fall
-    # back to the creds mtime, then now.
+    # Best estimate of when a switch happened = the new account's profile fetch
+    # time (≈ when it was logged in/switched to); fall back to creds mtime/now.
     anchor = ident.get("profile_fetched") or ident.get("cred_mtime") or now
     if not cur:
-        state[key] = {"fp": fp, "since": anchor}
+        # First sight of this dir: record the account but do NOT assume a switch
+        # just happened — the account may have been active for a long time.
+        state[key] = {"fp": fp, "since": anchor, "switched_at": 0}
         _save_login_state(state)
-        return anchor
+        return 0.0
     if cur.get("fp") != fp:
-        # Account actually changed since last poll -> re-anchor to the new login.
-        state[key] = {"fp": fp, "since": anchor}
+        # A genuine account change observed between two polls -> record it.
+        state[key] = {"fp": fp, "since": anchor, "switched_at": anchor}
         _save_login_state(state)
         return anchor
-    # Same account: keep the stored anchor even if a refresh / periodic profile
-    # re-fetch moved the timestamps, so refreshes never flag healthy sessions.
-    return cur.get("since", 0) or 0
+    # Same account as last poll: keep the recorded switch time (0 if never).
+    return float(cur.get("switched_at", 0) or 0)
 
 
 @app.get("/api/login-health")
@@ -6676,12 +6871,14 @@ async def api_login_health():
             if ident is None:
                 ident = _account_identity(base)
                 ident_by_dir[key] = ident
-            since = _login_active_since(base, ident)
+            switched_at = _login_switch_time(base, ident)
             cpids = _claude_pids_under(panes.get(name, []), children, comm)
             starts = [e for e in (_proc_start_epoch(p) for p in cpids) if e > 0]
             claude_started = min(starts) if starts else 0
-            # 5s slack avoids flagging a session launched in the same moment.
-            stale = bool(claude_started and since and claude_started < since - 5)
+            # Flag stale only when an account switch was actually observed AND
+            # this session's claude predates it (5s slack avoids flagging a
+            # session launched in the same moment as the switch).
+            stale = bool(claude_started and switched_at and claude_started < switched_at - 5)
             out.append({
                 "name": name,
                 "stale": stale,
@@ -10243,12 +10440,26 @@ function autoGrow(el){
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,400)+'px';
 }
+// --- WhatsApp-style send behavior ---
+// Touch-primary devices (phones / tablets) report no hover + a coarse pointer.
+// There, like the WhatsApp mobile app, Enter inserts a newline and the only way
+// to send is the button. On desktop, Enter sends and Shift+Enter is a newline.
+function isTouchPrimary(){
+  try{return !!(window.matchMedia&&window.matchMedia('(hover: none) and (pointer: coarse)').matches);}
+  catch(e){return false;}
+}
+function _composerEnterSends(e){
+  // True only for a bare desktop Enter that isn't part of an IME composition.
+  return e.key==='Enter'&&!e.shiftKey&&!e.ctrlKey&&!e.metaKey&&!e.altKey
+    &&!e.isComposing&&e.keyCode!==229&&!isTouchPrimary();
+}
 function handleChatKey(e,name){
-  // Part 3: Enter (and Shift+Enter) inserts a newline. Messages send ONLY via the
-  // composer button — no keyboard shortcut sends, by design.
+  if(_composerEnterSends(e)){e.preventDefault();sendChat(name);}
+  // Otherwise Enter inserts a newline (Shift+Enter on desktop, Enter on mobile).
 }
 function handleRawKey(e,name){
-  // Part 3: Enter inserts a newline; the command/message sends ONLY via the button.
+  if(_composerEnterSends(e)){e.preventDefault();sendCmd(name,'raw');}
+  // Otherwise Enter inserts a newline; send via the button (mobile) or Enter (desktop).
 }
 
 // --- WhatsApp-style composer: mic icon when empty, paper-plane when typing ---
