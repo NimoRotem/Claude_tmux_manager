@@ -8171,7 +8171,7 @@ body.nemo-simple .nav-tools-wrap{display:none}
 body.nemo-simple .claude-auth{display:none}
 body.nemo-simple .nav-server-stats{display:none}
 body.nemo-simple .nav-usage{display:none}
-body.nemo-simple .profile-select{display:none!important}
+body.nemo-simple .profile-select,body.nemo-simple .profile-wrap{display:none!important}
 body.nemo-simple .nemo-hide-simple{display:none!important}
 .approvals-badge{background:#f85149;color:#fff;border-radius:10px;padding:0 6px;font-size:.65rem;font-weight:600;margin-left:4px}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
@@ -9972,6 +9972,7 @@ function _applyUsageStyle(fillEl,pctNum){
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
 async function refreshUsageLimits(){
+  if(NEMO_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
   const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
@@ -11155,6 +11156,7 @@ let _profilesEditing = null;       // currently-edited full profile object
 let _profilePending = {};          // sessionName -> "pending restart" flag
 
 async function loadProfiles(force){
+  if(NEMO_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
   if(_profilesCache && !force) return _profilesCache;
   try{
     const resp = await fetch(BASE+'/api/profiles');
