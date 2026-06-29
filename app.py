@@ -3425,11 +3425,10 @@ async def api_create_session(request: Request, body: CreateSession):
                 )
             except Exception:
                 logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
-        # Inject stored API key so Claude Code can authenticate. Team-mode members
-        # ride the shared subscription token (symlinked .credentials.json), not a
-        # metered API key, so skip injection for them.
-        _inject_key = bool(_stored_anthropic_key) and not (TEAM_MODE and user and not _is_admin(user))
-        if _inject_key:
+        # Inject the stored Anthropic API key so Claude Code authenticates via the
+        # shared key for ALL users (admin + team members). Used when there's no live
+        # Max subscription token; the env key overrides any (stale) OAuth creds.
+        if _stored_anthropic_key:
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
                  f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
