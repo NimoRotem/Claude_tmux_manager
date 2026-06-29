@@ -48,6 +48,9 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", "NEMO-DEV <nemo-dev@grabo.cc>")
 PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
+# Team-mode default model + reasoning effort, pinned into every session's config.
+TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
+TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -528,6 +531,7 @@ def _ensure_user_claude_config_dir(user: dict):
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
             _disable_claude_ai_connectors(d)
+            _set_team_model_effort(d)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
@@ -1536,6 +1540,35 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
             sp.write_text(json.dumps(s, indent=2))
         except Exception:
             logger.debug("Failed to set disableClaudeAiConnectors in %s", sp, exc_info=True)
+
+
+def _set_team_model_effort(cfg_dir: Path):
+    """Pin the team default model + reasoning effort (Opus 4.8, max effort) into a
+    config dir's settings.json so every session launches on it. Claude Code reads
+    `model` from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`."""
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            s = {}
+    except Exception:
+        s = {}
+    changed = False
+    if TEAM_MODEL and s.get("model") != TEAM_MODEL:
+        s["model"] = TEAM_MODEL
+        changed = True
+    if TEAM_EFFORT:
+        env = s.get("env") if isinstance(s.get("env"), dict) else {}
+        if env.get("CLAUDE_CODE_EFFORT_LEVEL") != TEAM_EFFORT:
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = TEAM_EFFORT
+            s["env"] = env
+            changed = True
+    if changed:
+        try:
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text(json.dumps(s, indent=2))
+        except Exception:
+            logger.debug("Failed to set team model/effort in %s", sp, exc_info=True)
 
 
 def _apply_member_auth(cfg_dir: Path) -> str:
@@ -4346,6 +4379,7 @@ async def api_create_session(request: Request, body: CreateSession):
                 # leak/expiry issue) and give them our per-identity google MCP instead.
                 _disable_claude_ai_connectors(acfg)
                 _ensure_google_mcp(acfg, user)
+                _set_team_model_effort(acfg)
         except Exception:
             logger.debug("Failed to harden admin team config", exc_info=True)
         # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
@@ -5295,7 +5329,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "ux-expert", "name": "UX Expert",
-        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "model": "claude-opus-4-8[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -5471,7 +5505,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "researcher", "name": "Researcher",
-        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "model": "claude-opus-4-8[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -5499,7 +5533,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "security-expert", "name": "Security Expert",
-        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "model": "claude-opus-4-8[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -5529,7 +5563,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "optimizer", "name": "Optimizer",
-        "model": "claude-opus-4-7[1m]", "effort": "high",
+        "model": "claude-opus-4-8[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -13059,7 +13093,7 @@ function renderProfileEdit(){
       <div class="row2">
         <div>
           <label>Model</label>
-          <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-7[1m] / blank">
+          <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-8[1m] / blank">
         </div>
         <div>
           <label>Effort level</label>
