@@ -721,7 +721,7 @@ async def auth_middleware(request: Request, call_next):
     # Public project serving: /<username>/<project>[/...] is served publicly (the
     # /<username> project-list page itself stays gated below).
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
-    if request.method == "GET" and _is_public_project_request(rel_path):
+    if _is_public_project_request(rel_path):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
