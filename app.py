@@ -1356,6 +1356,32 @@ def _sync_global_context_into(claude_md: Path):
     claude_md.write_text(block + "\n" + user_part)
 
 
+_PROJ_NOTE_BEGIN = "<!-- NEMO-DEV PROJECTS CONVENTION (managed) -->"
+_PROJ_NOTE_END = "<!-- END NEMO-DEV PROJECTS CONVENTION -->"
+_PROJ_NOTE = """## Projects & working folder
+- Publish projects at https://dianaotech.com/<username>/<project> (default <project> = the current tmux session name).
+- Put the project's web files in `$NEMO_PROJECT_DIR` (= `~/nemo-projects/<username>/<project>/`); static files are served immediately at `$NEMO_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$NEMO_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
+- This session: user `$NEMO_USER`, link `$NEMO_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
+
+
+def _sync_projects_note_into(claude_md: Path):
+    """Add a managed projects-convention block at the top of a config's CLAUDE.md
+    (used for admins, who don't receive the member global block)."""
+    existing = claude_md.read_text() if claude_md.exists() else ""
+    if _PROJ_NOTE_BEGIN in existing and _PROJ_NOTE_END in existing:
+        pre = existing.split(_PROJ_NOTE_BEGIN, 1)[0]
+        post = existing.split(_PROJ_NOTE_END, 1)[1]
+        existing = (pre + post).lstrip("\n")
+    else:
+        existing = existing.lstrip("\n")
+    block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE + "\n" + _PROJ_NOTE_END + "\n"
+    try:
+        claude_md.parent.mkdir(parents=True, exist_ok=True)
+        claude_md.write_text(block + "\n" + existing)
+    except Exception:
+        logger.debug("Failed to sync projects note into %s", claude_md, exc_info=True)
+
+
 def _share_credentials_symlink(cfg_dir: Path):
     """Point a user's .credentials.json at the shared admin token so one login
     authenticates everyone. A single file = a single refresh token, which avoids
@@ -4020,6 +4046,13 @@ async def api_create_session(request: Request, body: CreateSession):
             subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
         except Exception:
             logger.debug("Failed to export NEMO_* project env for %s", created, exc_info=True)
+        # Admins don't receive the member global block, so give them the projects
+        # convention directly (members already have it in their global context).
+        try:
+            if TEAM_MODE and _is_admin(user):
+                _sync_projects_note_into(_user_claude_config_dir(user) / "CLAUDE.md")
+        except Exception:
+            logger.debug("Failed to sync admin projects note", exc_info=True)
         # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
         # `claude` invocation in this pane reads from the user's private config.
         if user and not _is_admin(user):
