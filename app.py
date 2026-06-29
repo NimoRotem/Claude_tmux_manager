@@ -154,10 +154,15 @@ async def _async_is_claude_running(session_name: str) -> bool:
     return await asyncio.to_thread(_is_claude_running, session_name)
 
 
-async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None) -> bool:
+async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None,
+                                 resume_uuid: str = None) -> bool:
     """Check if Claude Code is running; if not, restart it. Returns True if Claude is running after check.
 
     This handles OOM crashes where Claude dies and the pane falls back to bash.
+    The relaunch reattaches to the crashed conversation so the task continues:
+    `--resume <uuid>` when the exact conversation is known (preferred — sessions
+    can share a cwd, which makes plain --continue grab the wrong one), otherwise
+    `--continue`. A larger Node heap is set to reduce repeat OOMs.
     """
     alog = logging.getLogger("autonomous")
     if await _async_is_claude_running(session_name):
@@ -178,9 +183,20 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
                 await asyncio.sleep(0.2)
         except Exception:
             logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
-        # Send claude command to the bare shell
+        # Relaunch Claude on the bare shell, resuming the prior conversation.
+        resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
+        launch = ("NODE_OPTIONS=--max-old-space-size=8192 "
+                  f"claude --dangerously-skip-permissions {resume_flag}")
+        # C-u first to discard any stray text left on the crashed shell's prompt
+        # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "NODE_OPTIONS=--max-old-space-size=8192 claude --dangerously-skip-permissions", "Enter"],
+            ["tmux", "send-keys", "-t", session_name, "C-u"],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", launch],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5)
 
         # Wait for Claude Code to start (up to 30s)
@@ -246,6 +262,10 @@ async def lifespan(_app: FastAPI):
     login_watchdog_task = asyncio.create_task(_login_watchdog_loop())
     _background_tasks.append(login_watchdog_task)
     logger.info("Login watchdog started")
+
+    crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
+    _background_tasks.append(crash_recovery_task)
+    logger.info("Crash-recovery watchdog started")
 
     yield  # Application is running
 
@@ -6481,6 +6501,11 @@ async def _simple_watchdog_loop():
                 # Skip if there's an interactive selection prompt — auto-responder owns it
                 if _detect_interactive_prompt(visible):
                     continue
+                # Never type "continue" into a bare shell. If Claude crashed to bash
+                # between the is-running check above and now, the crash-recovery loop
+                # owns relaunching it — typing here would just spam the shell.
+                if _looks_like_bare_shell(visible):
+                    continue
                 # Skip if user has typed something into the prompt box (don't clobber)
                 if _has_pending_user_input(visible):
                     continue
@@ -6580,6 +6605,210 @@ async def _login_watchdog_loop():
             raise
         except Exception:
             logger.debug("Login watchdog iteration failed", exc_info=True)
+
+
+# --- Crash-recovery watchdog: relaunch Claude when a session OOM/crashes to a shell ---
+# When Claude Code exhausts the V8 heap it prints "Aborted" (SIGABRT) — or the OS
+# OOM killer prints "Killed", or V8 prints "JavaScript heap out of memory" — and
+# the tmux pane drops back to the parent bash. At that point nothing on screen is
+# a live Claude prompt, so the auto-responder and simple-watchdog can't help: the
+# session just sits dead at a shell forever (the exact "stuck" symptom reported).
+# This loop detects that state and relaunches Claude, resuming the crashed
+# conversation so the task continues where it left off.
+
+_CRASH_RECOVERY_INTERVAL = 20          # poll every 20s
+_CRASH_RECOVERY_COOLDOWN = 120         # min seconds between restart attempts per session
+_CRASH_RECOVERY_MAX_ATTEMPTS = 3       # give up after this many consecutive failed restarts
+_CRASH_RECOVERY_MAX_TRANSCRIPT = 60_000_000   # don't scan transcripts larger than this (bytes)
+_crash_recovery_state: Dict[str, dict] = {}
+_seen_claude_running: set = set()       # sessions observed running Claude this process
+
+# Crash signatures that mean Claude (node) died and the pane fell back to a shell.
+# Only ever evaluated once the pane is already a bare shell, so false positives are
+# very unlikely. libc/kernel messages are matched as exact-case substrings (NOT
+# anchored to line-end) because on an OOM the "Aborted" is printed OVER leftover
+# TUI text — e.g. it lands mid-line as "Abortedn GRPO…" when Claude's alternate
+# screen wasn't cleared. Case-sensitivity still avoids matching a lowercase
+# "aborted"/"killed" sitting in prose above the shell.
+_CRASH_SIGNATURE_RE = re.compile(
+    r"Aborted|Killed|Segmentation fault|Bus error|"
+    r"Trace/breakpoint trap|Floating point exception|core dumped"
+)
+# V8 / out-of-memory death throes (case-insensitive).
+_CRASH_OOM_RE = re.compile(
+    r"JavaScript heap out of memory|Reached heap limit"
+    r"|FATAL ERROR:[^\n]*(?:heap|memory|allocation)"
+    r"|<--- Last few GCs --->|out of memory",
+    re.I,
+)
+
+
+def _looks_like_crash(text: str) -> bool:
+    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
+    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
+
+# A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
+_SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
+
+
+def _looks_like_bare_shell(visible: str) -> bool:
+    """True if the LAST non-empty line looks like a bash/zsh prompt (no Claude TUI)."""
+    for line in reversed(visible.split("\n")):
+        if not line.strip():
+            continue
+        return bool(_SHELL_PROMPT_RE.search(line.rstrip()))
+    return False
+
+
+def _shell_has_pending_input(visible: str) -> bool:
+    """True if the user seems to have typed a command at the shell prompt that a
+    relaunch would clobber. An empty prompt → safe to relaunch."""
+    for line in reversed(visible.split("\n")):
+        if not line.strip():
+            continue
+        m = _SHELL_PROMPT_RE.search(line.rstrip())
+        if not m:
+            return False  # last line is command output, not a typed-at prompt
+        return bool(m.group(1).strip())
+    return False
+
+
+def _project_dir_for_cwd(cwd: str) -> Optional[Path]:
+    """Map a working directory to its ~/.claude/projects/<encoded> transcript dir.
+    Claude encodes the path by replacing '/', '_' and '.' with '-'."""
+    base = Path.home() / ".claude" / "projects"
+    enc = re.sub(r"[/_.]", "-", cwd.rstrip("/"))
+    cand = base / enc
+    if cand.is_dir():
+        return cand
+    try:
+        leaf = re.sub(r"[/_.]", "-", cwd.rstrip("/").split("/")[-1])
+        for d in sorted(base.glob("*" + leaf)):
+            if d.is_dir():
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _find_session_transcript_uuid(session_name: str) -> Optional[str]:
+    """Best-effort: identify the exact conversation UUID a crashed session was
+    running, by matching distinctive lines still visible on the pane against the
+    project's *frozen* transcripts. Returns None when not confident, so the caller
+    falls back to --continue. This disambiguates the common case where several
+    sessions share one cwd and plain --continue would resume the wrong one."""
+    try:
+        cwd = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except Exception:
+        return None
+    if not cwd:
+        return None
+    proj = _project_dir_for_cwd(cwd)
+    if not proj:
+        return None
+    scroll = capture_pane_recent(session_name, 200)
+    if not scroll.strip():
+        return None
+    # Distinctive lines: long enough, contain real words, not prompts/box-drawing.
+    cand = []
+    for ln in scroll.split("\n"):
+        s = ln.strip().strip("│┃─ \t")
+        if len(s) < 20 or _SHELL_PROMPT_RE.search(s) or not re.search(r"[A-Za-z]{4,}", s):
+            continue
+        cand.append(s)
+    cand = sorted(dict.fromkeys(cand), key=len, reverse=True)[:8]
+    if not cand:
+        return None
+    now = time.time()
+    best_uuid, best_score = None, 0
+    try:
+        files = list(proj.glob("*.jsonl"))
+    except Exception:
+        return None
+    for f in files:
+        if f.name.startswith("agent-"):
+            continue
+        try:
+            st = f.stat()
+        except Exception:
+            continue
+        age = now - st.st_mtime
+        # Skip actively-written transcripts (owned by a live session), stale ones,
+        # and anything too large to scan cheaply.
+        if age < 45 or age > 86400 or st.st_size > _CRASH_RECOVERY_MAX_TRANSCRIPT:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except Exception:
+            continue
+        score = sum(1 for c in cand if c in text)
+        if score > best_score:
+            best_score, best_uuid = score, f.stem
+    return best_uuid if best_score >= 2 else None
+
+
+async def _crash_recovery_loop():
+    """Relaunch Claude in sessions that have crashed/OOM'd to a bare shell."""
+    rlog = logging.getLogger("crash-recovery")
+    await asyncio.sleep(12)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_CRASH_RECOVERY_INTERVAL)
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            now = time.time()
+            owners = _load_session_owners()
+            for sess in sessions_list:
+                name = sess["name"]
+                if await _async_is_claude_running(name):
+                    _seen_claude_running.add(name)
+                    st = _crash_recovery_state.get(name)
+                    if st:
+                        st["attempts"] = 0
+                        st["gave_up"] = False
+                    continue
+                # Pane is a bare shell. Only touch sessions we manage / have seen run Claude.
+                if name not in owners and name not in _seen_claude_running:
+                    continue
+                state = _crash_recovery_state.setdefault(name, {"attempts": 0, "last_action": 0})
+                if now - state.get("last_action", 0) < _CRASH_RECOVERY_COOLDOWN:
+                    continue
+                try:
+                    recent = await asyncio.to_thread(capture_pane_recent, name, 80)
+                except Exception:
+                    continue
+                if not recent.strip():
+                    continue
+                # Only recover genuine crashes — never hijack an intentional shell.
+                if not _looks_like_crash(recent):
+                    continue
+                # Don't clobber a command the user is typing at the shell.
+                if _shell_has_pending_input(recent):
+                    continue
+                if state.get("attempts", 0) >= _CRASH_RECOVERY_MAX_ATTEMPTS:
+                    if not state.get("gave_up"):
+                        rlog.error("Crash recovery giving up on '%s' after %d attempts — "
+                                   "manual restart needed", name, state["attempts"])
+                        state["gave_up"] = True
+                    continue
+                uuid = await asyncio.to_thread(_find_session_transcript_uuid, name)
+                state["attempts"] = state.get("attempts", 0) + 1
+                state["last_action"] = now
+                rlog.warning("Session '%s' crashed to shell — relaunching Claude (%s), attempt %d/%d",
+                             name, ("--resume " + uuid) if uuid else "--continue",
+                             state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
+                ok = await _ensure_claude_running(name, resume_uuid=uuid)
+                if ok:
+                    _seen_claude_running.add(name)
+                    _crash_recovery_state[name] = {"attempts": 0, "last_action": now, "gave_up": False}
+                    rlog.info("Recovered '%s' — Claude is running again", name)
+        except asyncio.CancelledError:
+            rlog.info("Crash recovery cancelled")
+            raise
+        except Exception:
+            logger.debug("Crash recovery iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
