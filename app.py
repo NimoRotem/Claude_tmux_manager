@@ -2880,6 +2880,8 @@ async def api_delete_session(request: Request, session_name: str):
         _session_auth_mode.pop(session_name, None)
         _simple_watchdog_state.pop(session_name, None)
         _simple_watchdog_log.pop(session_name, None)
+        _crash_recovery_state.pop(session_name, None)
+        _seen_claude_running.discard(session_name)
         if session_name in _simple_watchdog_disabled:
             _simple_watchdog_disabled.discard(session_name)
             _save_simple_watchdog_disabled()
