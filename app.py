@@ -37,6 +37,12 @@ NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claud
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
+# Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
+# Removed/disabled by default: it issued a continuous stream of gpt-4o-mini calls,
+# re-summarizing actively-changing sessions on every poll (high CPU + token cost).
+# Re-enable with TMUX_DASH_AUTO_SUMMARY=1 if ever wanted again.
+AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() in ("1", "true", "yes")
+
 # --- Claude Code API key storage ---
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
@@ -79,55 +85,10 @@ _load_anthropic_key()
 # Track auth mode per session: "subscription" or "api"
 _session_auth_mode: Dict[str, str] = {}
 
-# Away mode state per session
-_away_mode_state: Dict[str, dict] = {}
-# Per-session structure when active:
-# {
-#   "enabled": bool,
-#   "phase": int (1-5),
-#   "phase_name": str,
-#   "step": int,
-#   "step_name": str,
-#   "started_at": float,
-#   "log": [{"ts": float, "phase": int, "step": int, "action": str}],
-#   "report": str,
-#   "task": asyncio.Task | None,
-# }
-
-# Go Nuts mode state per session (same structure as away mode)
-_go_nuts_state: Dict[str, dict] = {}
 
 # Flag to prevent CancelledError handlers from wiping persisted state during shutdown.
 # When True, worker cancel handlers skip setting enabled=False and re-saving to disk.
 _shutting_down = False
-
-# --- Persistent autonomous mode state ---
-# Survives restarts: stores which sessions had away/go-nuts mode enabled.
-AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
-
-def _save_autonomous_state():
-    """Persist which sessions have away/go-nuts mode enabled to disk."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        state = {}
-        for name, s in _away_mode_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["away_mode"] = True
-        for name, s in _go_nuts_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["go_nuts_mode"] = True
-        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
-    except Exception:
-        logger.debug("Failed to save autonomous mode state", exc_info=True)
-
-def _load_autonomous_state() -> Dict[str, dict]:
-    """Load persisted autonomous mode state from disk."""
-    try:
-        if AUTONOMOUS_STATE_FILE.exists():
-            return json.loads(AUTONOMOUS_STATE_FILE.read_text())
-    except Exception:
-        logger.debug("Failed to load autonomous mode state", exc_info=True)
-    return {}
 
 
 # --- Simple Watchdog ---
@@ -193,10 +154,15 @@ async def _async_is_claude_running(session_name: str) -> bool:
     return await asyncio.to_thread(_is_claude_running, session_name)
 
 
-async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None) -> bool:
+async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None,
+                                 resume_uuid: str = None) -> bool:
     """Check if Claude Code is running; if not, restart it. Returns True if Claude is running after check.
 
     This handles OOM crashes where Claude dies and the pane falls back to bash.
+    The relaunch reattaches to the crashed conversation so the task continues:
+    `--resume <uuid>` when the exact conversation is known (preferred — sessions
+    can share a cwd, which makes plain --continue grab the wrong one), otherwise
+    `--continue`. A larger Node heap is set to reduce repeat OOMs.
     """
     alog = logging.getLogger("autonomous")
     if await _async_is_claude_running(session_name):
@@ -217,9 +183,20 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
                 await asyncio.sleep(0.2)
         except Exception:
             logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
-        # Send claude command to the bare shell
+        # Relaunch Claude on the bare shell, resuming the prior conversation.
+        resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
+        launch = ("NODE_OPTIONS=--max-old-space-size=8192 "
+                  f"claude --dangerously-skip-permissions {resume_flag}")
+        # C-u first to discard any stray text left on the crashed shell's prompt
+        # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "claude --dangerously-skip-permissions", "Enter"],
+            ["tmux", "send-keys", "-t", session_name, "C-u"],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", launch],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5)
 
         # Wait for Claude Code to start (up to 30s)
@@ -273,10 +250,6 @@ async def lifespan(_app: FastAPI):
     task = asyncio.create_task(_auto_responder_loop())
     _background_tasks.append(task)
     logger.info("Auto-responder background task started")
-    watchdog_task = asyncio.create_task(_watchdog_loop())
-    _background_tasks.append(watchdog_task)
-    logger.info("Autonomous mode watchdog started")
-
     _load_simple_watchdog_disabled()
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
@@ -286,40 +259,13 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(tmp_watchdog_task)
     logger.info("Tmp watchdog started")
 
-    # Restore persistent autonomous mode state from disk
-    saved = _load_autonomous_state()
-    if saved:
-        session_names = {s["name"] for s in sessions}
-        for name, modes in saved.items():
-            if name not in session_names:
-                logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
-                continue
-            if modes.get("away_mode"):
-                logger.info("Restoring Away Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _away_mode_state[name] = state
-                _away_log(state, "Away mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "away"))
-                state["task"] = t
-            elif modes.get("go_nuts_mode"):
-                logger.info("Restoring Go Nuts Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous Build (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _go_nuts_state[name] = state
-                _go_nuts_log(state, "Go Nuts mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
-                state["task"] = t
+    login_watchdog_task = asyncio.create_task(_login_watchdog_loop())
+    _background_tasks.append(login_watchdog_task)
+    logger.info("Login watchdog started")
 
-    # Clean up orphaned entries (sessions that no longer exist were skipped above
-    # but file still has their old state). Re-save now based on in-memory dicts only.
-    _save_autonomous_state()
+    crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
+    _background_tasks.append(crash_recovery_task)
+    logger.info("Crash-recovery watchdog started")
 
     yield  # Application is running
 
@@ -327,22 +273,9 @@ async def lifespan(_app: FastAPI):
     global _shutting_down
     _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
     logger.info("tmux Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
-    # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
-    _save_autonomous_state()
-    logger.info("Autonomous mode state saved to disk for restore on next startup")
     for t in _background_tasks:
         if not t.done():
             t.cancel()
-    # Cancel any running away-mode workers
-    for name, state in _away_mode_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled away-mode worker for '%s'", name)
-    # Cancel any running go-nuts-mode workers
-    for name, state in _go_nuts_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled go-nuts-mode worker for '%s'", name)
     logger.info("Shutdown complete")
 
 
@@ -514,10 +447,6 @@ def _user_notes_file(user: Optional[dict]) -> Path:
 
 def _user_uploads_dir(user: Optional[dict]) -> Path:
     return _user_data_dir(user) / "uploads"
-
-
-def _user_autonomous_file(user: Optional[dict]) -> Path:
-    return _user_data_dir(user) / "autonomous-modes.json"
 
 
 def _user_claude_config_dir(user: Optional[dict]) -> Path:
@@ -1341,7 +1270,7 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
     """Serve a file referenced from terminal output.
 
     The terminal linkifier (frontend) discovers absolute file paths like
-    /home/nimrod_rotem/tmux-dashboard-original/away-mode-skills.md and turns
+    /home/nimrod_rotem/tmux-dashboard-original/notes.md and turns
     them into <BASE>/file?path=... links. We serve them inline by default so
     .md / .py / images / PDFs render in the browser tab; pass ?download=1 to
     force a download.
@@ -2101,10 +2030,11 @@ async def async_detect_activity(session_name: str) -> dict:
     return await asyncio.to_thread(detect_activity, session_name)
 
 
-async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
+async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
+                   response_format: dict = None) -> str:
     start = time.time()
     try:
-        resp = await client.chat.completions.create(
+        kwargs = dict(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -2113,6 +2043,9 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200)
             max_tokens=max_tokens,
             temperature=0.3,
         )
+        if response_format:
+            kwargs["response_format"] = response_format
+        resp = await client.chat.completions.create(**kwargs)
         duration = time.time() - start
         tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
         logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
@@ -2373,7 +2306,7 @@ async def get_realtime(session_name: str) -> str:
 
     # If the extracted text is short enough, return it directly
     word_count = len(extracted.split())
-    if word_count <= 500:
+    if word_count <= 500 or not AUTO_SUMMARIZER_ENABLED:
         return extracted.strip()
 
     # Text is very long — summarize it
@@ -2432,11 +2365,11 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     # call relative to an OpenAI request.
     full_output = None
     sig = ""
-    might_need = force_all or (
+    might_need = AUTO_SUMMARIZER_ENABLED and (force_all or (
         not has_description
         or not has_progress or progress_ttl_expired
         or not has_notes or notes_ttl_expired
-    )
+    ))
     if might_need:
         full_output = capture_pane_full(session_name)
         sig = _output_signature(full_output)
@@ -2452,6 +2385,10 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     need_notes = force_all or not has_notes or (
         notes_ttl_expired and bool(sig) and entry.get("notes_sig") != sig
     )
+
+    # Auto-summarizer removed: never issue LLM title/description/progress/notes calls.
+    if not AUTO_SUMMARIZER_ENABLED:
+        need_description = need_progress = need_notes = False
 
     tasks = {}
     if need_description:
@@ -2575,8 +2512,6 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-        "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-        "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
         "model": _get_session_model(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
@@ -2639,8 +2574,6 @@ async def api_sessions_fast(request: Request):
             "activity_command": activity.get("command", ""),
             "activity_detail": activity.get("detail", ""),
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-            "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-            "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
             "model": _get_session_model(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
@@ -2684,8 +2617,6 @@ async def api_status(request: Request):
             "name": sess["name"],
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
-            "away_mode": _away_mode_state.get(sess["name"], {}).get("enabled", False),
-            "go_nuts_mode": _go_nuts_state.get(sess["name"], {}).get("enabled", False),
         "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
             "model": _get_session_model(sess["name"]),
         })
@@ -2951,14 +2882,10 @@ async def api_delete_session(request: Request, session_name: str):
         _session_stats_cache.pop(session_name, None)
         _auto_respond_cooldown.pop(session_name, None)
         _session_auth_mode.pop(session_name, None)
-        _away_mode_state.pop(session_name, None)
-        # Cancel go-nuts worker if running
-        gn_state = _go_nuts_state.get(session_name, {})
-        if gn_state.get("task") and not gn_state["task"].done():
-            gn_state["task"].cancel()
-        _go_nuts_state.pop(session_name, None)
         _simple_watchdog_state.pop(session_name, None)
         _simple_watchdog_log.pop(session_name, None)
+        _crash_recovery_state.pop(session_name, None)
+        _seen_claude_running.discard(session_name)
         if session_name in _simple_watchdog_disabled:
             _simple_watchdog_disabled.discard(session_name)
             _save_simple_watchdog_disabled()
@@ -5465,6 +5392,37 @@ async def api_session_relogin(session_name: str, request: Request):
     return JSONResponse({"ok": True, "relaunched": True, "claude_was_running": running})
 
 
+@app.post("/api/transcribe")
+async def api_transcribe(audio: UploadFile = File(...)):
+    """Transcribe a recorded voice clip to text (for the composer mic button)."""
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
+    try:
+        data = await audio.read()
+    except Exception:
+        return JSONResponse({"error": "Could not read audio."}, status_code=400)
+    if not data:
+        return JSONResponse({"error": "Empty audio."}, status_code=400)
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+
+    def _do():
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tf:
+            tf.write(data)
+            tf.flush()
+            client = openai.OpenAI(api_key=key)
+            with open(tf.name, "rb") as fh:
+                tr = client.audio.transcriptions.create(model="whisper-1", file=fh)
+            return (getattr(tr, "text", "") or "").strip()
+
+    try:
+        text = await asyncio.to_thread(_do)
+    except Exception as e:
+        logger.warning("transcribe failed: %s", e)
+        return JSONResponse({"error": "Transcription failed."}, status_code=502)
+    return JSONResponse({"text": text})
+
+
 # --- Claude Code auth management ---
 
 _claude_auth_cache: dict = {"ts": 0, "data": {}}
@@ -6108,12 +6066,6 @@ class SendKeys(BaseModel):
 class AuthModeBody(BaseModel):
     mode: str  # "api" or "subscription"
 
-class AwayModeBody(BaseModel):
-    enabled: bool
-
-class GoNutsModeBody(BaseModel):
-    enabled: bool
-
 
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(session_name: str, body: SendCommand):
@@ -6198,7 +6150,6 @@ async def api_send_command(session_name: str, body: SendCommand):
         return JSONResponse({"ok": True, "sent": body.command})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 
 @app.post("/api/sessions/{session_name}/interrupt")
@@ -6402,6 +6353,80 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     return None
 
 
+_MENU_PICK_SYSTEM_PROMPT = (
+    "A Claude Code agent is showing a numbered selection menu and THE USER IS AWAY and will "
+    "not answer. Pick the option number that best lets the agent CONTINUE and COMPLETE the work "
+    "on its own.\n"
+    "- Strongly prefer options that proceed / do the work / say Yes / auto-accept / "
+    "'yes, and don't ask again' / accept-edits / run it.\n"
+    "- AVOID options that pause, stop, cancel, exit, quit, reject, defer, or hand control back "
+    "to the user (e.g. 'no', 'let me decide', 'I'll do it myself', 'ask me later').\n"
+    "- If several options proceed, pick the one that makes the MOST progress with the fewest "
+    "future interruptions.\n"
+    "- If genuinely unsure, pick 1.\n"
+    "Reply with ONLY the option number, nothing else."
+)
+
+
+def _parse_menu_options(visible_text: str):
+    """Parse a Claude Code numbered menu. Returns (options, selected_idx) where
+    options = [(number, label), ...] in visual order and selected_idx is the
+    0-based position of the ❯-highlighted option (0 if none found)."""
+    options = []
+    selected = None
+    for line in visible_text.split("\n"):
+        s = line.strip()
+        m = re.match(r"^(❯|❯)?\s*(\d+)\.\s+(\S.*)$", s)
+        if not m:
+            continue
+        if m.group(1):
+            selected = len(options)
+        options.append((int(m.group(2)), m.group(3).strip()))
+    return options, (selected if selected is not None else 0)
+
+
+async def _llm_pick_menu_option(name: str, visible: str, options: list):
+    """Ask the LLM which menu option best continues the work. Returns the chosen
+    option NUMBER, or None to fall back to the default (Enter)."""
+    valid = {n for n, _ in options}
+    if not valid:
+        return None
+    try:
+        raw = await llm_call(
+            system_prompt=_MENU_PICK_SYSTEM_PROMPT,
+            user_content=(f"Session '{name}' is showing this menu:\n\n{visible[-2500:]}\n\n"
+                          f"Valid option numbers: {sorted(valid)}. Reply with ONE number."),
+            max_tokens=4,
+        )
+    except Exception:
+        return None
+    m = re.search(r"\d+", raw or "")
+    if not m:
+        return None
+    n = int(m.group())
+    return n if n in valid else None
+
+
+async def _select_menu_option(name: str, options: list, selected_idx: int, target_num: int) -> str:
+    """Navigate to the target option (arrow keys) and Enter. Returns a label for logging."""
+    target_idx = next((i for i, (n, _) in enumerate(options) if n == target_num), None)
+    if target_idx is None:
+        target_idx = selected_idx
+    delta = target_idx - selected_idx
+    if 0 < abs(delta) < len(options):
+        key = "Down" if delta > 0 else "Up"
+        for _ in range(abs(delta)):
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", name, key],
+                capture_output=True, text=True, timeout=3)
+            await asyncio.sleep(0.06)
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", name, "Enter"],
+        capture_output=True, text=True, timeout=3)
+    label = next((l for n, l in options if n == target_num), "")
+    return f"option {target_num} ({label[:40]})" if label else f"option {target_num}"
+
+
 async def _auto_responder_loop():
     """Background loop that auto-responds to Claude Code interactive prompts."""
     log = logging.getLogger("auto-responder")
@@ -6431,19 +6456,36 @@ async def _auto_responder_loop():
 
                 prompt_type = _detect_interactive_prompt(result.stdout)
                 if prompt_type:
-                    # Send Enter to accept the highlighted (first) option
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "send-keys", "-t", name, "Enter"],
-                        capture_output=True, text=True, timeout=3,
-                    )
+                    # Safety backstop: don't auto-approve a clearly destructive /
+                    # irreversible action — leave it for a human. (Back off ~60s to
+                    # avoid re-logging every poll.)
+                    if _looks_destructive(result.stdout):
+                        _auto_respond_cooldown[name] = now + 50
+                        log.info("Auto-responder HOLDING '%s' — destructive prompt needs a human", name)
+                        continue
+                    # Read the options and let the LLM choose the one that best
+                    # continues the work autonomously, then navigate to it + Enter.
+                    # Falls back to Enter (the highlighted/first option) if the LLM
+                    # is unavailable or unsure — menus still get handled instantly.
+                    options, selected_idx = _parse_menu_options(result.stdout)
+                    target = (await _llm_pick_menu_option(name, result.stdout, options)
+                              if len(options) >= 2 else None)
+                    if target is not None:
+                        chosen = await _select_menu_option(name, options, selected_idx, target)
+                    else:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            ["tmux", "send-keys", "-t", name, "Enter"],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                        chosen = "default option (Enter)"
                     _auto_respond_cooldown[name] = now
-                    event = {"session": name, "type": prompt_type, "ts": now}
+                    event = {"session": name, "type": prompt_type, "choice": chosen, "ts": now}
                     _auto_respond_log.append(event)
                     # Keep log bounded
                     if len(_auto_respond_log) > 50:
                         _auto_respond_log.pop(0)
-                    log.info(f"Auto-responded to {prompt_type} in session '{name}'")
+                    log.info(f"Auto-responded to {prompt_type} in session '{name}' -> {chosen}")
         except Exception:
             logger.debug("Auto-responder loop iteration failed", exc_info=True)
 
@@ -6454,37 +6496,108 @@ async def api_auto_respond_log():
     return JSONResponse(_auto_respond_log[-20:])
 
 
-# --- Simple Watchdog Loop ---
-# Lightweight always-on supervisor. When a session sits idle with Claude having
-# offered to continue / paused for confirmation (e.g. "Pause me here if you
-# want…", "shall I proceed?", "Next: I'll do X"), we send "continue" so work
-# keeps moving without the user babysitting. Conservative: only fires when the
-# LLM is confident the agent is paused awaiting a yes/continue, never on
-# genuinely finished work or open-ended questions needing a real answer.
+# --- Autopilot Watchdog Loop (formerly "simple watchdog") ---
+# Always-on smart supervisor. When a session goes idle because Claude stopped and
+# is waiting on the user in ANY way — a question, a choice, a confirmation, work
+# it deferred ("left for phase 2", "out of scope", "next steps", "we could
+# also…"), or just a soft pause — it reads the screen, asks an LLM what reply
+# keeps the work moving on its own, and types that reply back. The user is usually
+# away, so the bias is: ALWAYS find a way to continue autonomously. It only holds
+# off (WAIT) when Claude is still actively working, when the only next action is
+# genuinely destructive/irreversible (needs a human), or when the task is truly
+# 100% complete with nothing deferred or optional left.
 
 _SIMPLE_WATCHDOG_INTERVAL = 20          # poll every 20s
-_SIMPLE_WATCHDOG_IDLE_SECS = 45         # idle this long before considering action
-_SIMPLE_WATCHDOG_COOLDOWN = 180         # min seconds between "continue" sends per session
+_SIMPLE_WATCHDOG_IDLE_SECS = 45         # stable-idle this long before considering action
+_SIMPLE_WATCHDOG_COOLDOWN = 90          # min seconds between replies per session
 _SIMPLE_WATCHDOG_MAX_LOG = 20
+_SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
 
 _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
-    "You are monitoring a Claude Code terminal session. The user is away. "
-    "Decide whether the agent has paused mid-task and is waiting for the user to "
-    "say 'continue' / confirm before proceeding with work it already announced.\n\n"
-    "Reply CONTINUE only when ALL of these hold:\n"
-    "- The agent stated the next step it intends to take (e.g. 'Next: I'll do X', "
-    "  'Proceeding to Phase 2', 'Shall I continue?', 'Pause me here if you want...').\n"
-    "- The agent is now idle, not actively running tools.\n"
-    "- The next step is a direct continuation of the same task — not a fork that "
-    "  needs user judgment (e.g. 'which option do you prefer A or B?').\n\n"
-    "Reply WAIT in any of these cases:\n"
-    "- The agent finished the task and there is no announced next step.\n"
-    "- The agent is asking a substantive question that needs a real answer.\n"
-    "- The terminal shows a permission/selection prompt with numbered options.\n"
-    "- The agent is actively working (spinner, 'esc to interrupt', tool output streaming).\n"
-    "- You can't tell — default to WAIT.\n\n"
-    "Reply with EXACTLY one word: CONTINUE or WAIT."
+    "You are an autonomous operator keeping a Claude Code agent moving while THE USER IS AWAY. "
+    "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
+    "and is in ANY way waiting on the user before it can keep working, write the exact message to "
+    "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
+    "Treat ALL of these as 'waiting on the user' and answer them so work continues:\n"
+    "- Questions or choices ('Which should I do, A or B?', 'Do you want X or Y?', 'which one?').\n"
+    "- Confirmations ('Shall I proceed?', 'Want me to continue?', 'Should I also do X?').\n"
+    "- Deferrals / scope-punts ('I left this for phase 2', 'X is out of scope', 'as a follow-up', "
+    "'next steps:', 'we could also…', 'optionally', 'if you want I can…').\n"
+    "- Soft stops ('Let me know how you'd like to proceed', 'standing by', 'paused here').\n\n"
+    "How to answer — always push toward FULLY DONE, autonomously:\n"
+    "- Choice: pick the option that best completes the overall task and say to proceed with it, e.g. "
+    "'Go with option 2 and keep going — don't wait for me.'\n"
+    "- Deferral/scope-punt: tell it to do that work now, e.g. 'Do phase 2 now as well. Treat the "
+    "whole thing as in scope and finish it end to end. Don't stop to ask.'\n"
+    "- Confirmation: 'Yes, proceed. Keep going autonomously and don't wait for me.'\n"
+    "- Make reasonable default assumptions; NEVER ask the user anything back; never tell it to stop, "
+    "pause, or wait. Keep the message to 1-3 concrete sentences that include an instruction to "
+    "continue without the user.\n\n"
+    "Choose action 'wait' ONLY if:\n"
+    "- The agent is still actively working (spinner / 'esc to interrupt' / tool output streaming), OR\n"
+    "- The task is 100% complete: every goal met, nothing deferred, nothing optional left, no question "
+    "on screen, OR\n"
+    "- *** SAFETY OVERRIDE (this beats the continue-bias) *** the next action is genuinely "
+    "DESTRUCTIVE / IRREVERSIBLE / HIGH-COST and a human must decide: deleting or overwriting "
+    "production or unrecoverable data, dropping/truncating DB tables, force-pushing or rewriting "
+    "shared git history, spending real money above a small (~$100) threshold, or sending mass / "
+    "sensitive external messages. If there is ANY doubt about whether an action is destructive, "
+    "irreversible, or high-cost, choose 'wait'. Never auto-approve these.\n\n"
+    "Respond with STRICT JSON only: {\"action\":\"send\",\"message\":\"<what to type>\"} "
+    "or {\"action\":\"wait\"}."
 )
+
+
+# Deterministic safety backstop. If the recent screen (or the message we're about
+# to send) names a clearly catastrophic / irreversible operation, we NEVER
+# auto-drive it — we leave it for a human, regardless of what the LLM decided.
+# Kept tight so it doesn't block the common "just keep going" cases.
+_DESTRUCTIVE_RE = re.compile(
+    r"\bDROP\s+(?:TABLE|DATABASE|SCHEMA)\b"
+    r"|\bTRUNCATE\s+TABLE\b"
+    r"|\brm\s+-[rfRF]{1,2}\s+(?:-{1,2}\w+\s+)*(?:/|~|\$HOME|\*|/etc|/var|/usr|/home|/opt|/root|/boot)"
+    r"|\b(?:force[- ]?push|push\s+--force\b|push\s+-f\b|git\s+reset\s+--hard)\b"
+    r"|\b(?:delet|drop|wip|eras|destroy|purg)\w*\s+(?:\w+\s+){0,5}?(?:production|prod\b|all\s+(?:the\s+)?(?:user|customer|account|record|row|data|table))"
+    r"|\b(?:irreversibl\w*|cannot be undone|can'?t be undone|permanently\s+(?:delet|remov|eras|destroy)\w*)"
+    r"|\boverwrit\w*\s+(?:\w+\s+){0,5}?(?:production|remote\s+history|shared\s+history)"
+    # high-cost spend: a spend verb near a $100+ amount, or any $100+ /month|/year rate
+    # ($100+ = 3+ plain digits or comma-grouped thousands; "$99"/"$5/mo" stay under)
+    r"|\b(?:spend|purchas\w*|buy|buying|charg\w*|pay|paying|subscrib\w*|upgrad\w*|order\w*)\b[^\n]{0,40}\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)"
+    r"|\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)(?:\.\d+)?\s*(?:/|per)\s*(?:mo|month|yr|year)\b",
+    re.I,
+)
+
+
+def _looks_destructive(text: str) -> bool:
+    """True if the text names a clearly destructive/irreversible/high-cost action
+    that should never be auto-approved without a human."""
+    return bool(_DESTRUCTIVE_RE.search(text or ""))
+
+
+def _parse_autopilot_decision(raw: str):
+    """Parse the autopilot LLM JSON. Returns {'action':'send','message':...},
+    {'action':'wait'}, or None. Conservative: only 'send' on valid JSON + message."""
+    if not raw:
+        return None
+    t = raw.strip().strip("`").strip()
+    if re.fullmatch(r"(?i)wait\.?", t):
+        return {"action": "wait"}
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group())
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    act = str(d.get("action", "")).lower()
+    if act == "wait":
+        return {"action": "wait"}
+    if act == "send":
+        msg = str(d.get("message", "")).strip()
+        return {"action": "send", "message": msg} if msg else None
+    return None
 
 
 def _simple_watchdog_record(session_name: str, action: str):
@@ -6496,16 +6609,32 @@ def _simple_watchdog_record(session_name: str, action: str):
 
 async def _simple_watchdog_send_continue(session_name: str) -> bool:
     """Send 'continue' to the session's Claude Code prompt. Returns True on send."""
+    return await _simple_watchdog_send_text(session_name, "continue")
+
+
+async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
+    """Type a composed reply into the session's Claude Code input box and submit.
+    Collapses to a single line so Enter submits the whole message at once."""
+    text = " ".join((text or "").split())
+    if not text:
+        return False
     try:
-        # Type the word and press Enter. tmux send-keys handles literal text.
+        # -l sends the text literally (so it isn't interpreted as tmux key names);
+        # a separate Enter then submits it to Claude.
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "continue", "Enter"],
+            ["tmux", "send-keys", "-t", session_name, "-l", text],
+            capture_output=True, text=True, timeout=5,
+        )
+        await asyncio.sleep(0.1)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5,
         )
         return True
     except Exception as e:
-        logger.debug("simple watchdog: failed to send continue to '%s': %s", session_name, e)
+        logger.debug("autopilot: failed to send reply to '%s': %s", session_name, e)
         return False
 
 
@@ -6523,11 +6652,6 @@ async def _simple_watchdog_loop():
                 # Per-session opt-out
                 if name in _simple_watchdog_disabled:
                     _simple_watchdog_state.pop(name, None)
-                    continue
-                # Don't fight the autonomous-mode watchdog — those modes have their own loop
-                if _away_mode_state.get(name, {}).get("enabled"):
-                    continue
-                if _go_nuts_state.get(name, {}).get("enabled"):
                     continue
                 # Don't fire if Claude isn't even running
                 if not await _async_is_claude_running(name):
@@ -6561,6 +6685,11 @@ async def _simple_watchdog_loop():
                 # Skip if there's an interactive selection prompt — auto-responder owns it
                 if _detect_interactive_prompt(visible):
                     continue
+                # Never type "continue" into a bare shell. If Claude crashed to bash
+                # between the is-running check above and now, the crash-recovery loop
+                # owns relaunching it — typing here would just spam the shell.
+                if _looks_like_bare_shell(visible):
+                    continue
                 # Skip if user has typed something into the prompt box (don't clobber)
                 if _has_pending_user_input(visible):
                     continue
@@ -6573,35 +6702,325 @@ async def _simple_watchdog_loop():
                 idle_for = now - state.get("idle_since", now)
                 if idle_for < _SIMPLE_WATCHDOG_IDLE_SECS:
                     continue
-                # Capture more context for the LLM (last ~60 lines)
-                recent = await asyncio.to_thread(capture_pane_recent, name, 60)
+                # Back off if we keep hitting the EXACT same stalled screen — a reply
+                # that doesn't move it means poking again won't help; leave it for a human.
+                if content_hash == state.get("acted_hash"):
+                    same = state.get("same_stall", 0) + 1
+                    state["same_stall"] = same
+                    if same >= _SIMPLE_WATCHDOG_MAX_SAME_STALL:
+                        if not state.get("backed_off"):
+                            slog.info("Autopilot backing off '%s' — unchanged after %d replies", name, same)
+                            state["backed_off"] = True
+                        continue
+                else:
+                    state["same_stall"] = 0
+                    state["backed_off"] = False
+                # Read the screen and let the LLM compose the reply that keeps it moving.
+                recent = await asyncio.to_thread(capture_pane_recent, name, 80)
                 if not recent.strip():
                     continue
+                # Safety backstop: never auto-drive a clearly destructive/irreversible
+                # action — the one carve-out from the continue bias. Checked before the
+                # LLM call (cheap) so we don't waste a call either.
+                if _looks_destructive(recent):
+                    if state.get("held_hash") != content_hash:
+                        state["held_hash"] = content_hash
+                        slog.info("Autopilot HOLDING '%s' — possible destructive/irreversible "
+                                  "action on screen; needs a human", name)
+                    continue
                 try:
-                    verdict = await llm_call(
+                    raw = await llm_call(
                         system_prompt=_SIMPLE_WATCHDOG_SYSTEM_PROMPT,
-                        user_content=f"Session '{name}' terminal (last 60 lines):\n\n{recent[-4000:]}",
-                        max_tokens=4,
+                        user_content=f"Session '{name}' terminal (most recent lines):\n\n{recent[-4500:]}",
+                        max_tokens=160,
+                        response_format={"type": "json_object"},
                     )
                 except Exception:
                     continue
-                verdict = (verdict or "").strip().upper()
-                if "CONTINUE" not in verdict:
+                decision = _parse_autopilot_decision(raw)
+                if not decision or decision.get("action") != "send":
+                    continue
+                msg = (decision.get("message") or "").strip()
+                if not msg or _looks_destructive(msg):
                     continue
                 # One more guard: re-check Claude is still running before sending
                 if not await _async_is_claude_running(name):
                     continue
-                ok = await _simple_watchdog_send_continue(name)
+                ok = await _simple_watchdog_send_text(name, msg)
                 if ok:
                     state["last_action"] = now
                     state["idle_since"] = now
-                    _simple_watchdog_record(name, f"sent 'continue' (idle {int(idle_for)}s)")
-                    slog.info("Simple watchdog sent 'continue' to '%s' after %ds idle", name, int(idle_for))
+                    state["acted_hash"] = content_hash
+                    short = msg if len(msg) <= 90 else msg[:87] + "..."
+                    _simple_watchdog_record(name, f"replied (idle {int(idle_for)}s): {short}")
+                    slog.info("Autopilot replied to '%s' after %ds idle: %s", name, int(idle_for), short)
         except asyncio.CancelledError:
             slog.info("Simple watchdog cancelled")
             raise
         except Exception:
             logger.debug("Simple watchdog iteration failed", exc_info=True)
+
+
+# --- Auto /login watchdog: re-authenticate a session when Claude asks for login ---
+
+_LOGIN_NEEDED_RE = re.compile(
+    r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
+    r"invalid api key|authentication[ _]error|oauth[^\n]*(?:token)?[^\n]*(?:expired|invalid|revoked)|"
+    r"(?:your )?session (?:has )?expired|please (?:re-?)?log\s?in|login required|"
+    r"you (?:are|'re) not (?:logged in|authenticated)|sign in to continue)",
+    re.I,
+)
+_LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
+_LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
+_login_watchdog_state: Dict[str, dict] = {}
+
+
+async def _login_watchdog_loop():
+    """If a session's Claude shows a login-required message, auto-run /login once
+    (per cooldown) so the user doesn't have to notice and type it themselves."""
+    llog = logging.getLogger("login-watchdog")
+    await asyncio.sleep(10)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_LOGIN_WATCHDOG_INTERVAL)
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            now = time.time()
+            for sess in sessions_list:
+                name = sess["name"]
+                state = _login_watchdog_state.setdefault(name, {})
+                if now - state.get("last_action", 0) < _LOGIN_WATCHDOG_COOLDOWN:
+                    continue
+                if not await _async_is_claude_running(name):
+                    continue
+                try:
+                    recent = await asyncio.to_thread(capture_pane_recent, name, 40)
+                except Exception:
+                    continue
+                if not recent or not _LOGIN_NEEDED_RE.search(recent):
+                    continue
+                low = recent.lower()
+                # A /login flow is already on screen (URL / paste-code prompt) — leave it.
+                if ("paste" in low and "code" in low) or ("https://" in recent and "oauth" in low):
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "send-keys", "-t", name, "/login", "Enter"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    state["last_action"] = now
+                    llog.warning("Auto-ran /login in '%s' (login-required detected)", name)
+                except Exception as e:
+                    llog.debug("login watchdog send failed for '%s': %s", name, e)
+        except asyncio.CancelledError:
+            llog.info("Login watchdog cancelled")
+            raise
+        except Exception:
+            logger.debug("Login watchdog iteration failed", exc_info=True)
+
+
+# --- Crash-recovery watchdog: relaunch Claude when a session OOM/crashes to a shell ---
+# When Claude Code exhausts the V8 heap it prints "Aborted" (SIGABRT) — or the OS
+# OOM killer prints "Killed", or V8 prints "JavaScript heap out of memory" — and
+# the tmux pane drops back to the parent bash. At that point nothing on screen is
+# a live Claude prompt, so the auto-responder and simple-watchdog can't help: the
+# session just sits dead at a shell forever (the exact "stuck" symptom reported).
+# This loop detects that state and relaunches Claude, resuming the crashed
+# conversation so the task continues where it left off.
+
+_CRASH_RECOVERY_INTERVAL = 20          # poll every 20s
+_CRASH_RECOVERY_COOLDOWN = 120         # min seconds between restart attempts per session
+_CRASH_RECOVERY_MAX_ATTEMPTS = 3       # give up after this many consecutive failed restarts
+_CRASH_RECOVERY_MAX_TRANSCRIPT = 60_000_000   # don't scan transcripts larger than this (bytes)
+_crash_recovery_state: Dict[str, dict] = {}
+_seen_claude_running: set = set()       # sessions observed running Claude this process
+
+# Crash signatures that mean Claude (node) died and the pane fell back to a shell.
+# Only ever evaluated once the pane is already a bare shell, so false positives are
+# very unlikely. libc/kernel messages are matched as exact-case substrings (NOT
+# anchored to line-end) because on an OOM the "Aborted" is printed OVER leftover
+# TUI text — e.g. it lands mid-line as "Abortedn GRPO…" when Claude's alternate
+# screen wasn't cleared. Case-sensitivity still avoids matching a lowercase
+# "aborted"/"killed" sitting in prose above the shell.
+_CRASH_SIGNATURE_RE = re.compile(
+    r"Aborted|Killed|Segmentation fault|Bus error|"
+    r"Trace/breakpoint trap|Floating point exception|core dumped"
+)
+# V8 / out-of-memory death throes (case-insensitive).
+_CRASH_OOM_RE = re.compile(
+    r"JavaScript heap out of memory|Reached heap limit"
+    r"|FATAL ERROR:[^\n]*(?:heap|memory|allocation)"
+    r"|<--- Last few GCs --->|out of memory",
+    re.I,
+)
+
+
+def _looks_like_crash(text: str) -> bool:
+    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
+    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
+
+# A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
+_SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
+
+
+def _looks_like_bare_shell(visible: str) -> bool:
+    """True if the LAST non-empty line looks like a bash/zsh prompt (no Claude TUI)."""
+    for line in reversed(visible.split("\n")):
+        if not line.strip():
+            continue
+        return bool(_SHELL_PROMPT_RE.search(line.rstrip()))
+    return False
+
+
+def _shell_has_pending_input(visible: str) -> bool:
+    """True if the user seems to have typed a command at the shell prompt that a
+    relaunch would clobber. An empty prompt → safe to relaunch."""
+    for line in reversed(visible.split("\n")):
+        if not line.strip():
+            continue
+        m = _SHELL_PROMPT_RE.search(line.rstrip())
+        if not m:
+            return False  # last line is command output, not a typed-at prompt
+        return bool(m.group(1).strip())
+    return False
+
+
+def _project_dir_for_cwd(cwd: str) -> Optional[Path]:
+    """Map a working directory to its ~/.claude/projects/<encoded> transcript dir.
+    Claude encodes the path by replacing '/', '_' and '.' with '-'."""
+    base = Path.home() / ".claude" / "projects"
+    enc = re.sub(r"[/_.]", "-", cwd.rstrip("/"))
+    cand = base / enc
+    if cand.is_dir():
+        return cand
+    try:
+        leaf = re.sub(r"[/_.]", "-", cwd.rstrip("/").split("/")[-1])
+        for d in sorted(base.glob("*" + leaf)):
+            if d.is_dir():
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _find_session_transcript_uuid(session_name: str) -> Optional[str]:
+    """Best-effort: identify the exact conversation UUID a crashed session was
+    running, by matching distinctive lines still visible on the pane against the
+    project's *frozen* transcripts. Returns None when not confident, so the caller
+    falls back to --continue. This disambiguates the common case where several
+    sessions share one cwd and plain --continue would resume the wrong one."""
+    try:
+        cwd = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except Exception:
+        return None
+    if not cwd:
+        return None
+    proj = _project_dir_for_cwd(cwd)
+    if not proj:
+        return None
+    scroll = capture_pane_recent(session_name, 200)
+    if not scroll.strip():
+        return None
+    # Distinctive lines: long enough, contain real words, not prompts/box-drawing.
+    cand = []
+    for ln in scroll.split("\n"):
+        s = ln.strip().strip("│┃─ \t")
+        if len(s) < 20 or _SHELL_PROMPT_RE.search(s) or not re.search(r"[A-Za-z]{4,}", s):
+            continue
+        cand.append(s)
+    cand = sorted(dict.fromkeys(cand), key=len, reverse=True)[:8]
+    if not cand:
+        return None
+    now = time.time()
+    best_uuid, best_score = None, 0
+    try:
+        files = list(proj.glob("*.jsonl"))
+    except Exception:
+        return None
+    for f in files:
+        if f.name.startswith("agent-"):
+            continue
+        try:
+            st = f.stat()
+        except Exception:
+            continue
+        age = now - st.st_mtime
+        # Skip actively-written transcripts (owned by a live session), stale ones,
+        # and anything too large to scan cheaply.
+        if age < 45 or age > 86400 or st.st_size > _CRASH_RECOVERY_MAX_TRANSCRIPT:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except Exception:
+            continue
+        score = sum(1 for c in cand if c in text)
+        if score > best_score:
+            best_score, best_uuid = score, f.stem
+    return best_uuid if best_score >= 2 else None
+
+
+async def _crash_recovery_loop():
+    """Relaunch Claude in sessions that have crashed/OOM'd to a bare shell."""
+    rlog = logging.getLogger("crash-recovery")
+    await asyncio.sleep(12)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_CRASH_RECOVERY_INTERVAL)
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            now = time.time()
+            owners = _load_session_owners()
+            for sess in sessions_list:
+                name = sess["name"]
+                if await _async_is_claude_running(name):
+                    _seen_claude_running.add(name)
+                    st = _crash_recovery_state.get(name)
+                    if st:
+                        st["attempts"] = 0
+                        st["gave_up"] = False
+                    continue
+                # Pane is a bare shell. Only touch sessions we manage / have seen run Claude.
+                if name not in owners and name not in _seen_claude_running:
+                    continue
+                state = _crash_recovery_state.setdefault(name, {"attempts": 0, "last_action": 0})
+                if now - state.get("last_action", 0) < _CRASH_RECOVERY_COOLDOWN:
+                    continue
+                try:
+                    recent = await asyncio.to_thread(capture_pane_recent, name, 80)
+                except Exception:
+                    continue
+                if not recent.strip():
+                    continue
+                # Only recover genuine crashes — never hijack an intentional shell.
+                if not _looks_like_crash(recent):
+                    continue
+                # Don't clobber a command the user is typing at the shell.
+                if _shell_has_pending_input(recent):
+                    continue
+                if state.get("attempts", 0) >= _CRASH_RECOVERY_MAX_ATTEMPTS:
+                    if not state.get("gave_up"):
+                        rlog.error("Crash recovery giving up on '%s' after %d attempts — "
+                                   "manual restart needed", name, state["attempts"])
+                        state["gave_up"] = True
+                    continue
+                uuid = await asyncio.to_thread(_find_session_transcript_uuid, name)
+                state["attempts"] = state.get("attempts", 0) + 1
+                state["last_action"] = now
+                rlog.warning("Session '%s' crashed to shell — relaunching Claude (%s), attempt %d/%d",
+                             name, ("--resume " + uuid) if uuid else "--continue",
+                             state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
+                ok = await _ensure_claude_running(name, resume_uuid=uuid)
+                if ok:
+                    _seen_claude_running.add(name)
+                    _crash_recovery_state[name] = {"attempts": 0, "last_action": now, "gave_up": False}
+                    rlog.info("Recovered '%s' — Claude is running again", name)
+        except asyncio.CancelledError:
+            rlog.info("Crash recovery cancelled")
+            raise
+        except Exception:
+            logger.debug("Crash recovery iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
@@ -6656,120 +7075,6 @@ async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody
         "enabled": session_name not in _simple_watchdog_disabled,
         "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
     })
-
-
-# --- Autonomous Mode Watchdog ---
-# Monitors all active away-mode and go-nuts-mode sessions.
-# Detects stalls (no terminal change for too long) and unsticks them.
-
-_watchdog_snapshots: Dict[str, dict] = {}
-# Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
-
-_WATCHDOG_INTERVAL = 30         # Check every 30 seconds
-_STALL_THRESHOLD = 600          # 10 minutes of identical terminal = stalled
-_NUDGE_COOLDOWN = 180           # Wait 3 minutes between nudge attempts
-_MAX_NUDGES_BEFORE_RESTART = 3  # After 3 failed nudges, hard-restart the mode
-
-_NUDGE_PROMPT = """You appear to be idle or stuck. The user is not present — you are in autonomous mode.
-
-If you just finished a task: pick the next one and start working. Check your skill files and backlog.
-If you're waiting for something: cancel the wait (Ctrl+C if needed) and move to a different task.
-If you encountered an error: log it, revert if needed, and continue with the next item.
-
-Do NOT say "standing by" or ask for instructions. Take action NOW."""
-
-_UNSTICK_PROMPT_AWAY = """You are in Away Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Run `pwd` to confirm you are in the correct project directory
-2. Check git log to see what you've already done
-3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
-4. Pick the next most valuable skill to execute
-
-IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Take action immediately."""
-
-_UNSTICK_PROMPT_GONUTS = """You are in Go Nuts Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Run `pwd` to confirm you are in the correct project directory
-2. Check git log to see what you've already built
-3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
-4. Pick the next feature to build or generate new ideas
-
-IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Build something NOW."""
-
-
-async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
-    """Restore an autonomous mode after server restart: wait for session, send prompt, launch loop."""
-    rlog = logging.getLogger("restore")
-    rlog.info(f"Restoring {mode} mode for '{session_name}' — waiting 15s for tmux to stabilize")
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    try:
-        # Give tmux and Claude Code a moment to settle after server restart
-        await asyncio.sleep(15)
-
-        if not state.get("enabled"):
-            return
-
-        # Check the session still exists
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            log_fn(state, "Session not found during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
-        # Wait for session to be idle before sending prompt (max 10 min)
-        if activity.get("status") == "busy":
-            log_fn(state, "Session is busy — waiting for it to finish current task")
-            await _away_wait_for_idle(session_name, timeout=600)
-
-        if not state.get("enabled"):
-            return
-
-        # Ensure Claude Code is actually running (handles OOM/crash during server downtime)
-        claude_ok = await _ensure_claude_running(session_name, log_fn, state)
-        if not claude_ok:
-            log_fn(state, "Could not restart Claude Code during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
-        # Send the appropriate unstick/resume prompt (with project isolation)
-        skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-        unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-        log_fn(state, "Sending resume prompt to session")
-        await _away_send_prompt(session_name, unstick_prompt)
-        await asyncio.sleep(2)
-
-        # Now enter the continuous monitoring loop
-        if mode == "away":
-            await _away_mode_continuous_loop(session_name)
-        else:
-            await _go_nuts_continuous_loop(session_name)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            log_fn(state, f"{mode} restore cancelled (server shutdown — will restore)")
-        else:
-            log_fn(state, f"{mode} restore cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        log_fn(state, f"{mode} restore error: {e}")
-        rlog.error(f"Restore {mode} for '{session_name}' failed: {e}")
-        # Don't set enabled=False — watchdog zombie detection will restart us
-    finally:
-        state["task"] = None
 
 
 _TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
@@ -6893,1358 +7198,6 @@ def _tmp_watchdog_size(path: str) -> int:
             except OSError:
                 pass
     return total
-
-
-async def _watchdog_loop():
-    """Background watchdog: detects stalled autonomous sessions and unsticks them."""
-    wlog = logging.getLogger("watchdog")
-    wlog.info("Autonomous mode watchdog started")
-    while True:
-        try:
-            await asyncio.sleep(_WATCHDOG_INTERVAL)
-            # Collect all active autonomous sessions
-            active_sessions: list[tuple[str, dict, str]] = []  # (name, state, mode)
-            for name, state in _away_mode_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "away"))
-            for name, state in _go_nuts_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "gonuts"))
-
-            if not active_sessions:
-                if _watchdog_snapshots:
-                    _watchdog_snapshots.clear()
-                continue
-
-            for session_name, state, mode in active_sessions:
-                try:
-                    await _watchdog_check_session(session_name, state, mode, wlog)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
-
-            # Also check for zombie states: enabled=True but task is dead
-            for name, state in list(_away_mode_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Away mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "away", wlog)
-            for name, state in list(_go_nuts_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Go Nuts mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "gonuts", wlog)
-
-        except asyncio.CancelledError:
-            wlog.info("Watchdog cancelled")
-            raise
-        except Exception as e:
-            wlog.error(f"Watchdog loop error: {e}")
-            await asyncio.sleep(60)
-
-
-async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
-    """Check a single session for stalls."""
-    import hashlib
-    now = time.time()
-
-    # Capture recent terminal content (non-blocking)
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
-    if not recent.strip():
-        return  # Empty pane, can't assess
-
-    content_hash = hashlib.md5(recent.encode()).hexdigest()
-    snap = _watchdog_snapshots.get(session_name)
-
-    if snap is None or snap["content_hash"] != content_hash:
-        # Terminal content changed — session is making progress
-        _watchdog_snapshots[session_name] = {
-            "content_hash": content_hash,
-            "first_seen": now,
-            "nudge_count": 0,
-            "last_nudge": 0,
-        }
-        return
-
-    # Terminal content is UNCHANGED since last check
-    stall_duration = now - snap["first_seen"]
-
-    if stall_duration < _STALL_THRESHOLD:
-        return  # Not stalled yet — could be processing
-
-    # Terminal has been identical for >10 minutes. Check if there's a good reason.
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # Check if Claude Code has crashed (OOM, etc) — if so, restart immediately
-    if not await _async_is_claude_running(session_name):
-        wlog.warning(f"Claude Code not running in '{session_name}' — OOM/crash detected, restarting")
-        log_fn(state, "Watchdog: Claude Code crashed (OOM?) — restarting")
-        _watchdog_snapshots.pop(session_name, None)
-        await _watchdog_restart_mode(session_name, state, mode, wlog)
-        return
-
-    # First stall detection — use LLM to check if it's a legitimate long operation
-    if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
-        wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
-        try:
-            assessment = await llm_call(
-                system_prompt=(
-                    "You are monitoring an autonomous AI coding session. The terminal output has not changed "
-                    "for over 10 minutes. Assess whether this is:\n"
-                    "1. LEGITIMATE: downloading large files, compiling a big project, running extensive tests, "
-                    "waiting for a deployment, or any operation that genuinely takes >10 minutes\n"
-                    "2. STUCK: the agent said 'standing by', asked a question, hit an error and stopped, "
-                    "is waiting for user input, or simply finished and didn't continue\n\n"
-                    "Reply with ONLY one word: LEGITIMATE or STUCK"
-                ),
-                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
-                max_tokens=10,
-            )
-            assessment = assessment.strip().upper()
-        except Exception:
-            assessment = "STUCK"  # If we can't assess, assume stuck
-
-        if "LEGITIMATE" in assessment:
-            wlog.info(f"Session '{session_name}' stall assessed as LEGITIMATE — skipping for now")
-            log_fn(state, f"Watchdog: stall detected ({stall_duration:.0f}s) but appears legitimate — waiting")
-            # Push out the first_seen so we re-check in another 10 minutes
-            snap["first_seen"] = now - _STALL_THRESHOLD + 300  # Re-check in 5 min
-            return
-
-        wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
-
-    # Session is stuck. Try nudging.
-    if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
-        return  # Wait for cooldown between nudges
-
-    if snap["nudge_count"] < _MAX_NUDGES_BEFORE_RESTART:
-        # Gentle nudge: send continuation prompt
-        snap["nudge_count"] += 1
-        snap["last_nudge"] = now
-        log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
-        wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
-
-        # Ensure Claude Code is running before nudging
-        if not await _async_is_claude_running(session_name):
-            wlog.warning(f"Claude Code not running in '{session_name}' during nudge — restarting mode")
-            log_fn(state, "Watchdog: Claude Code not running during nudge — restarting")
-            _watchdog_snapshots.pop(session_name, None)
-            await _watchdog_restart_mode(session_name, state, mode, wlog)
-            return
-
-        # If session appears to be waiting for input or truly idle, just send the nudge
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            activity = {"status": "unknown"}
-
-        if activity["status"] == "busy":
-            # Session claims busy but terminal hasn't changed — might be truly stuck
-            # Send Ctrl+C first to break out of whatever it's doing
-            log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(5)
-
-        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
-        return
-
-    # Nudges exhausted — hard restart
-    log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
-    wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
-    await _watchdog_restart_mode(session_name, state, mode, wlog)
-    # Reset snapshot
-    _watchdog_snapshots.pop(session_name, None)
-
-
-async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
-    """Gracefully restart an autonomous mode session, preserving history."""
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # 1. Cancel existing task
-    old_task = state.get("task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-
-    # 2. Send Ctrl+C to break any stuck process in the terminal
-    try:
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(3)
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-    # 2b. Ensure Claude Code is actually running (handles OOM/crash recovery)
-    claude_ok = await _ensure_claude_running(session_name, log_fn, state)
-    if not claude_ok:
-        log_fn(state, "Watchdog: could not restart Claude Code — aborting restart")
-        state["enabled"] = False
-        _save_autonomous_state()
-        return
-
-    # 3. Preserve the log history, reset state for fresh loop
-    old_log = state.get("log", [])
-    old_started = state.get("started_at", time.time())
-    old_step = state.get("step", 0)
-
-    log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
-
-    # 4. Re-initialize state
-    state.update({
-        "enabled": True,
-        "phase": 4,
-        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
-        "step": old_step,
-        "step_name": "Watchdog restart",
-        "started_at": old_started,  # Keep original start time
-        "log": old_log,  # Keep full log history
-        "task": None,
-    })
-    _save_autonomous_state()
-
-    # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
-    skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-    unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-
-    await _away_send_prompt(session_name, unstick_prompt)
-    await asyncio.sleep(2)
-
-    # 6. Launch fresh worker that skips to continuous loop
-    if mode == "away":
-        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
-        state["task"] = task
-    else:
-        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
-        state["task"] = task
-
-    wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
-
-
-async def _away_mode_continuous_loop(session_name: str):
-    """Standalone continuous loop for away mode (used by watchdog restart)."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    try:
-        # Wait for the unstick prompt to be processed
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _away_log, state)
-                if not claude_ok:
-                    _away_log(state, "Claude Code dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _away_log(state, "Away mode (restarted) cancelled (server shutdown — will restore)")
-        else:
-            _away_log(state, "Away mode (restarted) cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode (restarted) error: {e}")
-        log.error(f"Away mode restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-async def _go_nuts_continuous_loop(session_name: str):
-    """Standalone continuous loop for go-nuts mode (used by watchdog restart)."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    try:
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _go_nuts_log, state)
-                if not claude_ok:
-                    _go_nuts_log(state, "Claude Code dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled (server shutdown — will restore)")
-        else:
-            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
-        log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-# --- Away Mode ---
-# Autonomous mode: sends structured prompts to a Claude Code session,
-# waits for idle, captures output, summarizes, advances to next phase.
-
-def _away_log(state: dict, action: str):
-    """Append a log entry to the away-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > 200:
-        state["log"] = state["log"][-200:]
-
-
-def _away_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of away-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _away_send_prompt(session_name: str, prompt: str):
-    """Send a long prompt to a Claude Code session via tmux paste-buffer.
-
-    Two-phase approach to defeat the bracketed paste "[Pasted text +N lines]" hang:
-    Phase 1: Write prompt to a temp file, then send a short shell-pipe command that
-             reads the file and feeds it to the Claude Code prompt via xdotool-style
-             keyboard simulation. This avoids bracketed paste entirely.
-    Phase 2 (fallback): If Phase 1 fails or Claude Code is truly at its ❯ prompt
-             (not a shell), use paste-buffer with aggressive Enter retries.
-    """
-    log = logging.getLogger("away-mode")
-    prompt_text = prompt.rstrip("\n\r ")  # Strip trailing whitespace/newlines
-    prompt_file = None
-    try:
-        fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
-        os.close(fd)
-        Path(prompt_file).write_text(prompt_text)
-
-        # Capture terminal state before paste to detect changes later
-        pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-
-        # --- Strategy: Disable bracketed paste, then paste raw ---
-        # Send \e[?2004l escape sequence directly to the terminal to disable
-        # bracketed paste mode. tmux send-keys -H sends raw hex bytes.
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H",
-             "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.sleep(0.2)
-
-        # Load file into tmux buffer and paste
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "load-buffer", prompt_file],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "paste-buffer", "-t", session_name],
-            capture_output=True, text=True, timeout=10,
-        )
-
-        # Scale wait time with prompt size
-        wait_secs = max(2.0, min(8.0, len(prompt_text) / 1500))
-        await asyncio.sleep(wait_secs)
-
-        # Send Enter to submit
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
-        log.info(f"Sent prompt to '{session_name}' ({len(prompt_text)} chars, waited {wait_secs:.1f}s)")
-
-        # Note: we do NOT re-enable bracketed paste (\e[?2004h) here.
-        # Bracketed paste causes "[Pasted text +N lines]" previews that hang.
-        # Users can toggle it back on from the Keys bar if they want it.
-
-        # --- Verify submission with retries ---
-        for attempt in range(3):
-            await asyncio.sleep(3)
-            try:
-                activity = await async_detect_activity(session_name)
-            except Exception:
-                activity = {"status": "unknown"}
-
-            if activity["status"] == "busy":
-                log.info(f"Session '{session_name}' is busy — prompt accepted")
-                return  # Success — session started processing
-
-            # Check if terminal output changed (even if still "idle" per detection)
-            post_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-            if post_snapshot != pre_snapshot:
-                log.info(f"Session '{session_name}' terminal changed — prompt likely accepted")
-                return  # Terminal content changed, prompt was received
-
-            # Still showing the same content — try Enter again
-            log.warning(f"Session '{session_name}' still idle after paste (attempt {attempt+1}/3) — retrying Enter")
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5,
-            )
-
-        # All Enter retries failed. Check if there's a bracketed paste preview stuck.
-        recent = await asyncio.to_thread(capture_pane_recent, session_name, 10)
-        if "Pasted text" in recent or "pasted" in recent.lower():
-            # Bracketed paste preview is stuck — Escape to cancel it, then re-send
-            log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
-            await asyncio.sleep(0.5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(1)
-            # Re-send the prompt, this time relying on bracketed paste disabled earlier
-            await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "paste-buffer", "-t", session_name], capture_output=True, text=True, timeout=10)
-            await asyncio.sleep(wait_secs)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Enter"], capture_output=True, text=True, timeout=5)
-            log.info(f"Re-sent prompt to '{session_name}' after clearing stuck paste")
-
-    except Exception as e:
-        log.error(f"Failed to send prompt to '{session_name}': {e}")
-    finally:
-        if prompt_file:
-            try:
-                os.unlink(prompt_file)
-            except (OSError, UnboundLocalError):
-                pass
-
-
-async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
-    """Wait for a session to become busy then return to idle. Returns True on success."""
-    log = logging.getLogger("away-mode")
-
-    # Phase A: wait for session to become busy (max 30s)
-    start = time.time()
-    became_busy = False
-    while time.time() - start < 30:
-        await asyncio.sleep(2)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "busy":
-            became_busy = True
-            break
-
-    if not became_busy:
-        log.warning(f"Session '{session_name}' never became busy, proceeding anyway")
-
-    # Phase B: wait for session to return to idle (up to timeout)
-    idle_count = 0
-    while time.time() - start < timeout:
-        await asyncio.sleep(5)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "idle":
-            idle_count += 1
-            if idle_count >= 2:  # 2 consecutive idle readings = confirmed idle
-                return True
-        else:
-            idle_count = 0
-
-    log.warning(f"Session '{session_name}' timed out after {timeout}s")
-    return False
-
-
-def _build_project_isolation_preamble(session_name: str) -> str:
-    """Build a preamble that anchors the autonomous mode to the correct project."""
-    cwd = get_session_cwd(session_name)
-    return f"""PROJECT ISOLATION — READ THIS FIRST:
-You are working in tmux session "{session_name}".
-Your project directory is: {cwd or '(unknown — run pwd to confirm)'}
-
-STRICT RULES:
-- ONLY modify files inside your project directory ({cwd or 'current working directory'}).
-- NEVER cd into, read from, or write to other project directories on this server.
-- NEVER modify files under /var/www/, /opt/, or ~/  that belong to other projects.
-- Write all reports and temp files to /tmp/ using your session name as prefix: /tmp/{session_name}-*.md
-- Do NOT write to generic paths like /tmp/away-mode-*.md or /tmp/go-nuts-*.md — always include the session name.
-- If you need to check infrastructure context, read ~/.claude/vm_projects_dir.md (read-only, never modify during autonomous mode).
-- If a skill or task does not apply to THIS project, skip it entirely.
-- Do NOT restart, modify configs for, or interact with services belonging to other projects.
-
-"""
-
-
-async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
-                               step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _away_log(state, f"Sending: {step_name}")
-
-    prompt = _build_project_isolation_preamble(session_name) + prompt
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _away_log(state, f"Timeout on: {step_name}")
-        # Send Ctrl+C to unstick if needed
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    # Capture output and summarize
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: files created/modified, tests run, errors, "
-                "branches created, findings. Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Away mode step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _away_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Phase implementations ---
-# Skills are installed at ~/.claude/away-mode-skills/XX-name/SKILL.md
-_SKILLS_DIR = str(Path.home() / ".claude" / "away-mode-skills")
-
-_PHASE1_PROMPT = f"""I'm putting you in Away Mode. You are autonomous — the user is not present. Every action must be safe, verifiable, and revertible. You cannot ask questions — make decisions and document reasoning.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Study the Project
-
-1. Read the project root directory structure
-2. Examine root config files (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, docker-compose.yml, .env.example, etc.)
-3. Examine source directories (src/, app/, lib/, components/, routes/, api/)
-4. Check test directories (test/, tests/, __tests__/, spec/, e2e/)
-5. Check git history: recent commits, active areas of development
-6. Create a project profile at /tmp/<SESSION_NAME>-away-mode-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above) covering:
-   - Project name, type, primary languages, frameworks
-   - Architecture: frontend, backend, database, external services
-   - Current state: can it build? tests? linting?
-   - Development patterns, known issues from TODOs
-7. Establish baseline:
-   - Record git status and recent commits
-   - Create safety branch: git checkout -b away-mode/session-$(date +%Y%m%d-%H%M%S)
-   - Run existing tests if available, record results
-   - Run linter if configured, record results
-
-CRITICAL: Never commit to main/master. Work on the away-mode branch.
-CRITICAL: If tests fail at baseline, note which tests fail — do NOT introduce NEW failures.
-
-When done with this phase, immediately continue to the next task without waiting."""
-
-_PHASE2_PROMPT = f"""PHASE 2: Select Applicable Skills
-
-Review the project profile you created. The following skills are available on disk. For each, read its SKILL.md to understand its scope, then decide if it applies to THIS project.
-
-Available skills (read the SKILL.md inside each directory):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing (ALWAYS applicable)
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage (ALWAYS applicable)
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring (ALWAYS applicable)
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
- 8. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
- 9. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing (if web app)
-10. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed (if web app/API)
-11. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
-12. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards (if public web pages)
-13. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility (if UI exists)
-14. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish (if UI)
-15. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-16. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-17. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements (if UI)
-18. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-
-For each skill, read the SKILL.md, then decide: applicable? priority? risk level?
-
-Write selection to /tmp/<SESSION_NAME>-away-mode-skills-selected.md (use your session name) with selected skills in priority order.
-
-When done, immediately continue to executing skills — do not wait."""
-
-_PHASE3_ROUND1_PROMPT = f"""PHASE 3, ROUND 1: Observe and Audit (NO code changes)
-
-Read these skill files and execute their AUDIT tasks. Do NOT modify code — observe and report only.
-
-1. Read {_SKILLS_DIR}/05-security/SKILL.md — execute all security scan tasks
-2. Read {_SKILLS_DIR}/06-content-integrity/SKILL.md — execute content integrity checks
-3. Read {_SKILLS_DIR}/21-codebase-audit/SKILL.md — execute codebase audit tasks
-
-For EVERY finding, log it in /tmp/<SESSION_NAME>-away-mode-audit.md (use your session name) with:
-- Category | Severity (critical/high/medium/low) | Description | File:Line
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND2_PROMPT = f"""PHASE 3, ROUND 2: Safe Mechanical Fixes
-
-Read these skill files and execute their FIX tasks — only safe, deterministic changes:
-
-1. Read {_SKILLS_DIR}/07-dependencies/SKILL.md — apply patch updates (semver-safe only)
-2. Read {_SKILLS_DIR}/22-config-hardening/SKILL.md — tighten configs, fix .gitignore
-3. Read {_SKILLS_DIR}/23-git-hygiene/SKILL.md — clean up git state
-
-EXECUTION WRAPPER for every change:
-1. Record current git SHA
-2. Make ONE logical change
-3. Run full test suite + build
-4. ALL GREEN → commit: [away-mode][category] description
-5. ANY RED → git checkout . to fully revert
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND3_PROMPT = f"""PHASE 3, ROUND 3: Test-Gated Improvements
-
-Read these skill files and execute their tasks:
-
-1. Read {_SKILLS_DIR}/08-testing/SKILL.md — generate tests for untested code (HIGHEST PRIORITY)
-2. Read {_SKILLS_DIR}/09-code-quality/SKILL.md — refactor, remove dead code, simplify
-3. Read {_SKILLS_DIR}/10-error-handling/SKILL.md — fix empty catches, add error handlers
-
-EXECUTION WRAPPER: one commit per change, test after each, revert on failure.
-
-When done, immediately continue to the next task."""
-
-async def _away_phase_study(session_name: str, state: dict):
-    """Phase 1: Study the project."""
-    state["phase"] = 1
-    state["phase_name"] = "Study Project"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 1: Study the Project")
-    await _away_send_and_wait(session_name, _PHASE1_PROMPT, state,
-                               "Study project structure & establish baseline", timeout=600)
-
-
-async def _away_phase_select(session_name: str, state: dict):
-    """Phase 2: Select applicable skills."""
-    state["phase"] = 2
-    state["phase_name"] = "Select Skills"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 2: Select Applicable Skills")
-    await _away_send_and_wait(session_name, _PHASE2_PROMPT, state,
-                               "Evaluate and select skills", timeout=300)
-
-
-async def _away_phase_execute(session_name: str, state: dict):
-    """Phase 3: Execute skills in rounds."""
-    state["phase"] = 3
-    state["phase_name"] = "Execute Skills"
-    state["step"] = 1
-
-    rounds = [
-        ("Round 1: Audit (read-only)", _PHASE3_ROUND1_PROMPT, 600),
-        ("Round 2: Safe fixes", _PHASE3_ROUND2_PROMPT, 900),
-        ("Round 3: Test-gated improvements", _PHASE3_ROUND3_PROMPT, 900),
-    ]
-
-    for round_name, prompt, timeout in rounds:
-        if not state.get("enabled"):
-            return
-        _away_log(state, f"Starting {round_name}")
-        await _away_send_and_wait(session_name, prompt, state, round_name, timeout=timeout)
-        # Brief pause between rounds
-        await asyncio.sleep(5)
-
-
-_AWAY_PING_PROMPT = f"""You are in Away Mode. The user is not present. You are autonomous.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do. Choose a skill you haven't fully completed yet, or revisit one that could be improved.
-
-STEP 1: Pick a skill from the list below.
-STEP 2: Read the SKILL.md file for that skill — it contains detailed tasks and instructions.
-STEP 3: Execute the tasks described in the SKILL.md.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing & Hardening
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed
- 8. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
- 9. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
-10. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
-11. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish
-12. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-13. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-14. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements
-15. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-16. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing
-17. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards
-18. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-21. {_SKILLS_DIR}/24-cost-optimization/SKILL.md — Cost Optimization
-22. {_SKILLS_DIR}/25-migration-readiness/SKILL.md — Migration Readiness
-23. {_SKILLS_DIR}/26-email-notifications/SKILL.md — Email & Notifications
-24. {_SKILLS_DIR}/27-mobile-pwa/SKILL.md — Mobile & PWA
-25. {_SKILLS_DIR}/28-asset-pipeline/SKILL.md — Asset Pipeline
-26. {_SKILLS_DIR}/29-developer-tooling/SKILL.md — Developer Tooling
-27. {_SKILLS_DIR}/30-disaster-recovery/SKILL.md — Disaster Recovery
-
-Rules:
-- Work on the away-mode branch (create one if not already on it)
-- Never commit to main/master
-- One logical change per commit: [away-mode][category] description
-- Run tests after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Take concrete action — don't just plan or summarize
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _away_mode_worker(session_name: str):
-    """Main away-mode coroutine. Runs initial phases then loops forever, pinging when idle."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    log.info(f"Away mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _away_phase_study(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Away mode phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_select(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Away mode phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_execute(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Away mode phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                # Wait for confirmed idle: 90 seconds of consecutive idle readings
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break  # Confirmed idle for 90s
-                    else:
-                        idle_since = None  # Reset — session is busy
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _away_log, state)
-                if not claude_ok:
-                    _away_log(state, "Claude Code dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                # Session has been idle for 90s — send ping prompt
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle for 90s — sending task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _away_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _away_log(state, "Away mode cancelled (server shutdown — will restore)")
-        else:
-            _away_log(state, "Away mode cancelled by user")
-            state["enabled"] = False
-            _save_autonomous_state()
-        log.info(f"Away mode cancelled for '{session_name}'")
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode fatal error: {e}")
-        log.error(f"Away mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Away mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
-    """Toggle away mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Don't allow both away mode and go-nuts mode at the same time on same session
-        if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Go Nuts Mode is active on this session. Disable it first."}, status_code=409)
-
-        # Check if already running for this session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
-
-        # Initialize and launch
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _away_mode_state[session_name] = state
-        _away_log(state, "Away mode enabled")
-        task = asyncio.create_task(_away_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-    else:
-        # Disable
-        state = _away_mode_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _away_log(state, "Away mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_status(session_name: str):
-    """Get current away-mode state for a session."""
-    state = _away_mode_state.get(session_name, {})
-    return JSONResponse(_away_state_summary(state))
-
-
-# --- Go Nuts Mode ---
-# Autonomous feature-building mode: discovers the project, generates a feature backlog,
-# then continuously builds features, tests, and improves the project in a loop.
-
-_GO_NUTS_SKILLS_DIR = str(Path.home() / ".claude" / "go-nuts-mode-skills")
-
-def _go_nuts_log(state: dict, action: str):
-    """Append a log entry to the go-nuts-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > 200:
-        state["log"] = state["log"][-200:]
-
-
-def _go_nuts_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of go-nuts-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
-                                  step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _go_nuts_log(state, f"Sending: {step_name}")
-
-    prompt = _build_project_isolation_preamble(session_name) + prompt
-    # Reuse the same send/wait infrastructure as away mode
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _go_nuts_log(state, f"Timeout on: {step_name}")
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: features built, files created/modified, tests run, errors. "
-                "Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Go Nuts step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _go_nuts_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Go Nuts Phase Prompts ---
-
-_GN_PHASE1_PROMPT = f"""I'm putting you in Go Nuts Mode. You are autonomous — the user is not present. Your job is to BUILD FEATURES and IMPROVE this project as aggressively as possible.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_GO_NUTS_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Discover the Project
-
-Read {_GO_NUTS_SKILLS_DIR}/01-project-discovery/SKILL.md and execute ALL tasks described in it.
-
-Key objectives:
-1. Map every route, endpoint, model, dependency, and feature
-2. Understand the product vision — who uses this, what does "done" look like?
-3. Assess maturity level (skeleton/prototype/MVP/early product/established)
-4. Map constraints — what can and can't we build?
-5. Write the product profile to /tmp/<SESSION_NAME>-go-nuts-product-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above)
-
-Then immediately read {_GO_NUTS_SKILLS_DIR}/02-product-gap-analysis/SKILL.md and execute it:
-1. Compare what exists vs what users of this product type expect
-2. Identify every missing feature and gap
-3. Write the gap analysis to /tmp/<SESSION_NAME>-go-nuts-gap-analysis.md (use your session name)
-
-CRITICAL: Create a working branch: git checkout -b go-nuts/session-$(date +%Y%m%d-%H%M%S)
-CRITICAL: Never commit to main/master. All work on the go-nuts branch.
-CRITICAL: After EVERY feature you build, run tests + build to verify nothing broke.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE2_PROMPT = f"""PHASE 2: Generate Feature Backlog
-
-Read {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md and execute ALL tasks:
-1. Use the brainstorming frameworks (What If, Adjacent Feature, Delight, Productization)
-2. Research competitors if possible (use web search)
-3. Score each feature on Impact/Feasibility/Independence/Novelty
-4. Write the prioritized backlog to /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name)
-
-Then pick the TOP 3 highest-priority features from the backlog and start building them.
-
-For EACH feature:
-1. Create a git checkpoint (read {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md)
-2. Build the complete feature — not a stub, not a placeholder, the REAL thing
-3. Match existing code style, design language, and patterns
-4. Handle all states: loading, empty, error, populated
-5. Run tests + build after completion
-6. If tests pass → commit: [go-nuts][feature] description
-7. If tests fail → revert and move to next feature
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE3_PROMPT = f"""PHASE 3: Build Features (Batch)
-
-Continue building features from the backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name from the PROJECT ISOLATION preamble).
-
-For each feature, use the relevant skill file:
-- UI/pages → Read {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md
-- API/backend → Read {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md
-- Auth/users → Read {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md
-- Navigation → Read {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md
-- Data/state → Read {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md
-- Search → Read {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md
-- Notifications → Read {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md
-- Settings → Read {_GO_NUTS_SKILLS_DIR}/11-settings-preferences/SKILL.md
-- Content pages → Read {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md
-- Dashboard → Read {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md
-- Import/Export → Read {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md
-
-EXECUTION WRAPPER for every feature:
-1. Checkpoint (git stash or note SHA)
-2. Build the COMPLETE feature
-3. Run tests + build
-4. ALL GREEN → commit: [go-nuts][feature] description
-5. ANY RED → full revert, log why it failed, move on
-
-Build as many features as you can. Prioritize high-impact, high-feasibility items.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PING_PROMPT = f"""You are in Go Nuts Mode. The user is not present. You are autonomous. Your mission: BUILD FEATURES and IMPROVE the project.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do.
-
-STEP 1: Check your backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name) — any features left to build?
-STEP 2: If backlog is empty or low, generate new ideas using {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md
-STEP 3: Pick a skill and execute it.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md — Build UI Pages & Components
- 2. {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md — Build API & Backend Features
- 3. {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md — Auth & User System
- 4. {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md — Navigation & Routing
- 5. {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md — Data & State Management
- 6. {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md — Search & Filtering
- 7. {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md — Notifications & Realtime
- 8. {_GO_NUTS_SKILLS_DIR}/11-settings-preferences/SKILL.md — Settings & Preferences
- 9. {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md — Content Pages
-10. {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md — Dashboard & Analytics
-11. {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md — Import & Export
-12. {_GO_NUTS_SKILLS_DIR}/15-social-collaboration/SKILL.md — Social & Collaboration
-13. {_GO_NUTS_SKILLS_DIR}/16-onboarding-empty-states/SKILL.md — Onboarding & Empty States
-14. {_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md — QA & Stability Audit
-15. {_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md — Security Sweep
-16. {_GO_NUTS_SKILLS_DIR}/19-web-research/SKILL.md — Web Research & Inspiration
-17. {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md — Feature Ideation & Brainstorming
-18. {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md — Backup & Checkpoint Manager
-
-Rules:
-- Work on the go-nuts branch (create one if not already on it)
-- Never commit to main/master
-- One feature per commit: [go-nuts][feature] description
-- Run tests + build after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Build COMPLETE features, not stubs or placeholders
-- Every 5th cycle, run QA audit ({_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md) and security sweep ({_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md)
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _go_nuts_phase_discover(session_name: str, state: dict):
-    """Phase 1: Discover the project and analyze gaps."""
-    state["phase"] = 1
-    state["phase_name"] = "Discover Project"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 1: Project Discovery & Gap Analysis")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE1_PROMPT, state,
-                                  "Discover project & analyze gaps", timeout=600)
-
-
-async def _go_nuts_phase_backlog(session_name: str, state: dict):
-    """Phase 2: Generate feature backlog and start building."""
-    state["phase"] = 2
-    state["phase_name"] = "Feature Backlog"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 2: Generate Feature Backlog & Build Top Features")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE2_PROMPT, state,
-                                  "Generate backlog & build top features", timeout=900)
-
-
-async def _go_nuts_phase_build(session_name: str, state: dict):
-    """Phase 3: Build features from backlog."""
-    state["phase"] = 3
-    state["phase_name"] = "Build Features"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 3: Build Features Batch")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE3_PROMPT, state,
-                                  "Build features from backlog", timeout=900)
-
-
-async def _go_nuts_mode_worker(session_name: str):
-    """Main go-nuts-mode coroutine. Runs discovery phases then loops forever, building features."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    log.info(f"Go Nuts mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _go_nuts_phase_discover(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Go Nuts phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_backlog(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Go Nuts phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_build(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Go Nuts phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next feature task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous Build"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Claude Code is running before sending prompt (OOM recovery)
-                claude_ok = await _ensure_claude_running(session_name, _go_nuts_log, state)
-                if not claude_ok:
-                    _go_nuts_log(state, "Claude Code dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle for 90s — sending build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _go_nuts_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _go_nuts_log(state, "Go Nuts mode cancelled (server shutdown — will restore)")
-        else:
-            _go_nuts_log(state, "Go Nuts mode cancelled by user")
-            state["enabled"] = False
-            _save_autonomous_state()
-        log.info(f"Go Nuts mode cancelled for '{session_name}'")
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
-        log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Go Nuts mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
-    """Toggle go-nuts mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Don't allow both away mode and go-nuts mode at the same time on same session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Away Mode is active on this session. Disable it first."}, status_code=409)
-
-        if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_go_nuts_state_summary(_go_nuts_state[session_name]))
-
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _go_nuts_state[session_name] = state
-        _go_nuts_log(state, "Go Nuts mode enabled")
-        task = asyncio.create_task(_go_nuts_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-    else:
-        state = _go_nuts_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _go_nuts_log(state, "Go Nuts mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_status(session_name: str):
-    """Get current go-nuts-mode state for a session."""
-    state = _go_nuts_state.get(session_name, {})
-    return JSONResponse(_go_nuts_state_summary(state))
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -8375,8 +7328,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
-.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
+.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
 .cmd-send:hover{background:#30363d}
+.cmd-send.is-mic{color:#8b949e}
+.cmd-send.is-send{color:#3fb950}
+.cmd-send.is-recording{color:#f85149;animation:composer-pulse 1s ease-in-out infinite}
+.cmd-send svg{display:block}
+@keyframes composer-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.composer-spin{display:inline-block;width:15px;height:15px;border:2px solid #484f58;border-top-color:#c9d1d9;border-radius:50%;animation:composer-spin .7s linear infinite}
+@keyframes composer-spin{to{transform:rotate(360deg)}}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -8481,25 +7441,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
-/* Away mode toggle */
-.away-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.away-toggle input{opacity:0;width:0;height:0}
-.away-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.away-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.away-toggle input:checked+.away-toggle-slider{background:#238636}
-.away-toggle input:checked+.away-toggle-slider:before{transform:translateX(20px);background:#fff}
-.away-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
-.away-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.away-log-entry .away-ts{color:#58a6ff}
-.nav-away{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#3d1f6d;color:#d2a8ff}
-
-/* Go Nuts mode toggle */
-.gonuts-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.gonuts-toggle input{opacity:0;width:0;height:0}
-.gonuts-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.gonuts-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.gonuts-toggle input:checked+.gonuts-toggle-slider{background:#da3633}
-.gonuts-toggle input:checked+.gonuts-toggle-slider:before{transform:translateX(20px);background:#fff}
+/* Watchdog toggle */
 .watchdog-toggle{position:relative;display:inline-block;width:44px;height:24px}
 .watchdog-toggle input{opacity:0;width:0;height:0}
 .watchdog-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
@@ -8509,10 +7451,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .watchdog-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:120px;overflow-y:auto;scrollbar-width:thin}
 .watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
 .watchdog-log-entry .watchdog-ts{color:#56d364}
-.gonuts-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
-.gonuts-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.gonuts-log-entry .gonuts-ts{color:#f0883e}
-.nav-gonuts{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#6e2a0a;color:#f0883e}
 
 /* Footer */
 .detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
@@ -9013,6 +7951,30 @@ function _isBashFetchHeader(line){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   return _BASH_FILTER_RE.test(stripped);
 }
+// Part 5: also hide noisy "update" output (claude/npm self-update logs). These are
+// long, low-value, and clutter the terminal. Folded into the same Hide toggle.
+const _UPDATE_NOISE_RES=[
+  /^checking for updates?/i,
+  /^installing\b.*\b(claude|update|npm|node|package|version|v?\d)/i,
+  /^downloading\b.*\b(claude|update|npm|version|package|v?\d)/i,
+  /\b(update (installed|complete|available)|successfully updated|already up to date|claude code v?\d[\d.]* installed)\b/i,
+  /^npm\b/i,
+  /\bnpm (warn|notice|info|err|http|verb|sill|deprecated|audit|fund)\b/i,
+  /^(added|changed|removed|audited)\s+\d+\s+packages?\b/i,
+  /\bpackages?\b[^\n]*\blooking for funding\b/i,
+  /^found \d+ vulnerabilit/i,
+  /\bnpm audit\b/i,
+  /\bto (apply|finish|complete) the update\b/i,
+  /^restart claude\b/i,
+  /^[\[(][#=>\-.\s]{3,}[\])]/,
+];
+function _isUpdateNoise(line){
+  if(!line)return false;
+  const s=line.replace(/^[\s⎿●⏺•·>*\-]+/,'').trim();
+  if(!s)return false;
+  for(let i=0;i<_UPDATE_NOISE_RES.length;i++){if(_UPDATE_NOISE_RES[i].test(s))return true;}
+  return false;
+}
 function applyRawFilter(text){
   if(!getHideBashPref())return text;
   if(!text)return text;
@@ -9020,6 +7982,7 @@ function applyRawFilter(text){
   const out=[];
   let suppressing=false;
   for(const line of lines){
+    if(_isUpdateNoise(line))continue;
     if(_isBashFetchHeader(line)){
       suppressing=true;
       continue;
@@ -9185,10 +8148,35 @@ function _linkifyTerminalText(text,paneWidth){
   }
   return out;
 }
+function _hasSelectionWithin(el){
+  const sel=window.getSelection?window.getSelection():null;
+  if(!sel||sel.isCollapsed||sel.rangeCount===0)return false;
+  for(let i=0;i<sel.rangeCount;i++){
+    const r=sel.getRangeAt(i);
+    if(el.contains(r.startContainer)||el.contains(r.endContainer)||el.contains(r.commonAncestorContainer))return true;
+  }
+  return false;
+}
+// Part 4: once the user clears a terminal selection, flush any render we deferred
+// while they were highlighting text to copy.
+document.addEventListener('selectionchange',()=>{
+  if(typeof rawState!=='object'||!rawState)return;
+  for(const n in rawState){
+    const st=rawState[n];
+    if(st&&st._pendingRender){
+      const el=document.getElementById('raw-'+n);
+      if(el&&!_hasSelectionWithin(el))renderRawText(n);
+    }
+  }
+});
 function renderRawText(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
+  // Part 4: don't clobber an active text selection inside the terminal — defer the
+  // re-render so the user can highlight & copy while output keeps streaming.
+  if(_hasSelectionWithin(rawEl)){st._pendingRender=true;return;}
+  st._pendingRender=false;
   const wasAtBottom=!st.userScrolledUp;
   const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
   const filtered=applyRawFilter(st.fullText);
@@ -9209,7 +8197,7 @@ function rerenderAllRaw(){
 function toggleHideBash(name,checked){
   setHideBashPref(checked);
   const lbl=document.getElementById('hidebash-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool calls':'Off — showing all output';
+  if(lbl)lbl.textContent=checked?'On — hiding tool calls + update logs':'Off — showing all output';
   rerenderAllRaw();
 }
 const lastStatus={};
@@ -9235,7 +8223,7 @@ function restoreDrafts(){
     sessions.forEach(s=>{
       const key=tab+'-'+s.name;
       const el=document.getElementById('cmd-'+tab+'-'+s.name);
-      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
+      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el);updateComposerBtn(key)}
     });
   });
 }
@@ -9300,8 +8288,6 @@ function renderNav(){
       <span class="nav-session-id">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
-        ${s.away_mode?'<span class="nav-away">AW</span>':''}
-        ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
     brand.after(item);
   });
@@ -9390,9 +8376,9 @@ function renderDetail(){
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this)"
+            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
@@ -9411,11 +8397,11 @@ function renderDetail(){
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a command and press Enter..."
+          placeholder="Type a message or command…"
           onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this)"
+          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
+        <button class="btn cmd-send is-mic" id="cmd-send-raw-${s.name}" onclick="composerAction('raw-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
       ${buildKeyBar(s.name,'raw')}
@@ -9497,7 +8483,7 @@ function renderDetail(){
               ${getHideBashPref()?'checked':''}>
             <span class="watchdog-toggle-slider"></span>
           </label>
-          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls':'Off — showing all output'}</span>
+          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
         </div>
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides lines whose stripped content starts with <code style="color:#79c0ff">Bash(...)</code> or <code style="color:#79c0ff">Fetch(...)</code> so you can focus on the conversation. Setting is shared across all sessions.</div>
       </div>
@@ -9514,32 +8500,6 @@ function renderDetail(){
         </div>
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Claude is paused waiting for confirmation to keep going on the current task.</div>
         <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="away-toggle">
-            <input type="checkbox" id="away-toggle-${s.name}"
-              onchange="toggleAwayMode('${esc(s.name)}',this.checked)"
-              ${s.away_mode?'checked':''}>
-            <span class="away-toggle-slider"></span>
-          </label>
-          <span id="away-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.away_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="away-log" id="away-log-${s.name}"></div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="gonuts-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Go Nuts Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="gonuts-toggle">
-            <input type="checkbox" id="gonuts-toggle-${s.name}"
-              onchange="toggleGoNutsMode('${esc(s.name)}',this.checked)"
-              ${s.go_nuts_mode?'checked':''}>
-            <span class="gonuts-toggle-slider"></span>
-          </label>
-          <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
       </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
@@ -9626,17 +8586,11 @@ function switchTab(name,tab){
   if(target)target.classList.add('active');
   stopAllRawPolling();
   stopStatsPolling();
-  stopAllAwayPolling();
-  stopAllGoNutsPolling();
   stopAllWatchdogPolling();
   if(tab==='raw')startRawPolling(name);
   if(tab==='info'){
     startStatsPolling(name);
     const s=sessions.find(x=>x.name===name);
-    if(s&&s.away_mode)startAwayPolling(name);
-    else loadAwayStatus(name);
-    if(s&&s.go_nuts_mode)startGoNutsPolling(name);
-    else loadGoNutsStatus(name);
     if(s&&s.simple_watchdog!==false)startWatchdogPolling(name);
     else loadWatchdogStatus(name);
   }
@@ -9748,10 +8702,69 @@ function autoGrow(el){
   el.style.height=Math.min(el.scrollHeight,400)+'px';
 }
 function handleChatKey(e,name){
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat(name)}
+  // Part 3: Enter (and Shift+Enter) inserts a newline. Messages send ONLY via the
+  // composer button — no keyboard shortcut sends, by design.
 }
 function handleRawKey(e,name){
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd(name,'raw')}
+  // Part 3: Enter inserts a newline; the command/message sends ONLY via the button.
+}
+
+// --- WhatsApp-style composer: mic icon when empty, paper-plane when typing ---
+const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3.3 20.7l18-8a.8.8 0 0 0 0-1.4l-18-8a.8.8 0 0 0-1.1.9L4 11l9 1-9 1-1.8 6.8a.8.8 0 0 0 1.1.9z"/></svg>';
+const _COMPOSER_MIC_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg>';
+const _COMPOSER_STOP_SVG='<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+const _recording={},_mediaRec={},_audioChunks={};
+// `key` is 'chat-<name>' or 'raw-<name>'. Input id = cmd-<key>, button id = cmd-send-<key>.
+function updateComposerBtn(key){
+  const inp=document.getElementById('cmd-'+key),btn=document.getElementById('cmd-send-'+key);
+  if(!inp||!btn||_recording[key])return;
+  const hasText=inp.value.trim().length>0;
+  btn.classList.toggle('is-send',hasText);
+  btn.classList.toggle('is-mic',!hasText);
+  btn.innerHTML=hasText?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
+  btn.title=hasText?'Send message':'Record voice message';
+}
+function composerAction(key){
+  const inp=document.getElementById('cmd-'+key);
+  if(inp&&inp.value.trim().length>0){
+    if(key.indexOf('raw-')===0)sendCmd(key.slice(4),'raw');
+    else sendChat(key.slice(5));
+  }else{toggleRecording(key);}
+}
+async function toggleRecording(key){
+  if(_recording[key]){const m=_mediaRec[key];if(m&&m.state!=='inactive')m.stop();return;}
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('Microphone is not available in this browser.');return;}
+  let stream;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
+  catch(e){alert('Microphone permission denied or unavailable.');return;}
+  let mr;
+  try{mr=new MediaRecorder(stream);}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Recording is not supported in this browser.');return;}
+  _mediaRec[key]=mr;_audioChunks[key]=[];
+  mr.ondataavailable=ev=>{if(ev.data&&ev.data.size>0)_audioChunks[key].push(ev.data);};
+  mr.onstop=async()=>{
+    stream.getTracks().forEach(t=>t.stop());
+    _recording[key]=false;
+    const blob=new Blob(_audioChunks[key],{type:(mr.mimeType||'audio/webm')});
+    const btn=document.getElementById('cmd-send-'+key);
+    if(btn)btn.classList.remove('is-recording');
+    if(!blob.size){updateComposerBtn(key);return;}
+    if(btn){btn.classList.add('is-transcribing');btn.innerHTML='<span class="composer-spin"></span>';btn.title='Transcribing…';}
+    try{
+      const fd=new FormData();fd.append('audio',blob,'voice.webm');
+      const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
+      const j=await resp.json().catch(()=>({}));
+      const inp=document.getElementById('cmd-'+key);
+      if(resp.ok&&j.text){
+        if(inp){inp.value=(inp.value.trim()?inp.value.replace(/\s*$/,'')+' ':'')+j.text;autoGrow(inp);inp.focus();updateComposerBtn(key);}
+      }else{alert((j&&j.error)||'Transcription failed.');}
+    }catch(e){alert('Transcription failed.');}
+    if(btn)btn.classList.remove('is-transcribing');
+    updateComposerBtn(key);
+  };
+  try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
+  _recording[key]=true;
+  const btn=document.getElementById('cmd-send-'+key);
+  if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
 }
 
 async function sendChat(name){
@@ -9770,7 +8783,7 @@ async function sendChat(name){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-    input.value='';input.style.height='auto';
+    input.value='';input.style.height='auto';updateComposerBtn('chat-'+name);
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
@@ -9939,7 +8952,7 @@ async function sendCmd(name,source){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-    input.value='';input.style.height='auto';
+    input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
     delete draftText[source+'-'+name];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
@@ -10214,12 +9227,10 @@ async function pollStatus(){
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update away_mode, go_nuts_mode, and model badges in nav
+      // Update model badge in nav
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
-        if(sessions[si].away_mode!==st.away_mode){sessions[si].away_mode=st.away_mode;navChanged=true;}
-        if(sessions[si].go_nuts_mode!==st.go_nuts_mode){sessions[si].go_nuts_mode=st.go_nuts_mode;navChanged=true;}
         if(st.model&&sessions[si].model!==st.model){
           sessions[si].model=st.model;navChanged=true;
           // Update detail model badge if visible
@@ -10782,135 +9793,6 @@ function startStatsPolling(name){
 function stopStatsPolling(){
   Object.values(_statsTimers).forEach(t=>clearInterval(t));
   _statsTimers={};
-}
-
-// ── Away Mode ──
-let _awayTimers={};
-async function toggleAwayMode(name,enabled){
-  const statusEl=document.getElementById('away-status-'+name);
-  if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/away-mode',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-    const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].away_mode=data.enabled;
-      if(statusEl)statusEl.textContent=data.enabled?'Running \u2014 Phase '+(data.phase||0)+': '+(data.phase_name||''):'Off';
-      if(data.enabled)startAwayPolling(name);
-      else stopAwayPolling(name);
-      renderNav();
-    }else{
-      if(statusEl)statusEl.textContent=data.error||'Failed';
-      const tog=document.getElementById('away-toggle-'+name);
-      if(tog)tog.checked=!enabled;
-    }
-  }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-    const tog=document.getElementById('away-toggle-'+name);
-    if(tog)tog.checked=!enabled;
-  }
-}
-function startAwayPolling(name){
-  stopAwayPolling(name);
-  loadAwayStatus(name);
-  _awayTimers[name]=setInterval(()=>loadAwayStatus(name),10000);
-}
-function stopAwayPolling(name){
-  if(_awayTimers[name]){clearInterval(_awayTimers[name]);delete _awayTimers[name];}
-}
-function stopAllAwayPolling(){
-  Object.keys(_awayTimers).forEach(n=>stopAwayPolling(n));
-}
-async function loadAwayStatus(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/away-mode');
-    const data=await resp.json();
-    const statusEl=document.getElementById('away-status-'+name);
-    const logEl=document.getElementById('away-log-'+name);
-    const tog=document.getElementById('away-toggle-'+name);
-    if(statusEl){
-      if(data.enabled)statusEl.textContent='Phase '+data.phase+': '+(data.phase_name||'');
-      else statusEl.textContent=data.log&&data.log.length?'Finished':'Off';
-    }
-    if(tog)tog.checked=!!data.enabled;
-    if(logEl&&data.log&&data.log.length){
-      logEl.innerHTML=data.log.slice(-15).map(e=>
-        '<div class="away-log-entry"><span class="away-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-      ).join('');
-      logEl.scrollTop=logEl.scrollHeight;
-    }
-    // Update nav badge
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].away_mode=data.enabled;
-    if(!data.enabled&&_awayTimers[name])stopAwayPolling(name);
-  }catch(e){}
-}
-
-// ── Go Nuts Mode ──
-let _goNutsTimers={};
-async function toggleGoNutsMode(name,enabled){
-  const statusEl=document.getElementById('gonuts-status-'+name);
-  if(statusEl)statusEl.textContent=enabled?'Starting...':'Stopping...';
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/go-nuts-mode',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-    const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].go_nuts_mode=data.enabled;
-      if(statusEl)statusEl.textContent=data.enabled?'Running \u2014 Phase '+(data.phase||0)+': '+(data.phase_name||''):'Off';
-      if(data.enabled)startGoNutsPolling(name);
-      else stopGoNutsPolling(name);
-      renderNav();
-    }else{
-      if(statusEl)statusEl.textContent=data.error||'Failed';
-      const tog=document.getElementById('gonuts-toggle-'+name);
-      if(tog)tog.checked=!enabled;
-    }
-  }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-    const tog=document.getElementById('gonuts-toggle-'+name);
-    if(tog)tog.checked=!enabled;
-  }
-}
-function startGoNutsPolling(name){
-  stopGoNutsPolling(name);
-  loadGoNutsStatus(name);
-  _goNutsTimers[name]=setInterval(()=>loadGoNutsStatus(name),10000);
-}
-function stopGoNutsPolling(name){
-  if(_goNutsTimers[name]){clearInterval(_goNutsTimers[name]);delete _goNutsTimers[name];}
-}
-function stopAllGoNutsPolling(){
-  Object.keys(_goNutsTimers).forEach(n=>stopGoNutsPolling(n));
-}
-async function loadGoNutsStatus(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/go-nuts-mode');
-    const data=await resp.json();
-    const statusEl=document.getElementById('gonuts-status-'+name);
-    const logEl=document.getElementById('gonuts-log-'+name);
-    const tog=document.getElementById('gonuts-toggle-'+name);
-    if(statusEl){
-      if(data.enabled)statusEl.textContent='Phase '+data.phase+': '+(data.phase_name||'');
-      else statusEl.textContent=data.log&&data.log.length?'Finished':'Off';
-    }
-    if(tog)tog.checked=!!data.enabled;
-    if(logEl&&data.log&&data.log.length){
-      logEl.innerHTML=data.log.slice(-15).map(e=>
-        '<div class="gonuts-log-entry"><span class="gonuts-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-      ).join('');
-      logEl.scrollTop=logEl.scrollHeight;
-    }
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].go_nuts_mode=data.enabled;
-    if(!data.enabled&&_goNutsTimers[name])stopGoNutsPolling(name);
-  }catch(e){}
 }
 
 // ── Simple Watchdog ──
