@@ -9028,9 +9028,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
 .raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
-.raw-output::-webkit-scrollbar{width:6px;height:6px}
+.raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
-.raw-output::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+.raw-output::-webkit-scrollbar-thumb{background:#484f58;border-radius:6px;border:2px solid #0d1117}
+.raw-output::-webkit-scrollbar-thumb:hover{background:#5b6571}
+.raw-output{scrollbar-width:auto;scrollbar-color:#484f58 #0d1117}
+/* Compact member upload footer (single row) so the terminal keeps full height */
+.nemo-upload-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:6px 0;flex-shrink:0}
+.nemo-drop{flex:1;min-width:120px;padding:7px 12px;border:1px dashed #30363d;border-radius:6px;color:#6e7681;font-size:.72rem;text-align:center;cursor:pointer;transition:all .15s}
+.nemo-drop.drag-over{border-color:#58a6ff;color:#58a6ff;background:#1f6feb22}
+.nemo-drop:hover{border-color:#484f58;color:#8b949e}
 .raw-link{color:#58a6ff;text-decoration:underline;text-decoration-color:#30363d;text-underline-offset:2px;word-break:break-all;cursor:pointer}
 .raw-link:hover{color:#79c0ff;text-decoration-color:#58a6ff}
 .raw-link:visited{color:#a371f7}
@@ -11755,21 +11762,20 @@ async function loadWatchdogStatus(name){
 
 // ── Key Bar + Slash Commands ──
 function buildKeyBar(name,tab){
-  // Simplified team members: no keys/commands, just drag-or-click file upload.
+  // Simplified team members: no keys/commands — a COMPACT single-row upload
+  // control. Keeping the footer short means the terminal gets full height and the
+  // page doesn't overflow (page overflow would steal the terminal's scroll).
   if(NEMO_SIMPLE){
-    return `<div class="key-bar expanded" id="keybar-${tab}-${name}" style="border-top:none">
+    return `<div class="key-bar expanded nemo-upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
     <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
-    <div class="drop-zone" id="dropzone-${tab}-${name}"
+    <div class="nemo-drop" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
       ondrop="handleDrop(event,'${name}','${tab}')"
-      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">
-      <div class="drop-zone-icon">&#x1F4C2;</div>
-      <div class="drop-zone-text">Drop files here or click to upload</div>
-      <div class="upload-progress" id="upload-progress-${tab}-${name}">
-        <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
-        <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
-      </div>
+      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">or drop files here</div>
+    <div class="upload-progress" id="upload-progress-${tab}-${name}">
+      <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
+      <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
     </div>
     <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
   </div>`;
