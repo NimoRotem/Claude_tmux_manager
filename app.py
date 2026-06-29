@@ -1330,6 +1330,37 @@ def _share_credentials_symlink(cfg_dir: Path):
         logger.debug("Failed to symlink shared credentials into %s", cfg_dir, exc_info=True)
 
 
+def _approve_anthropic_key(cfg_dir: Path, key: str):
+    """Pre-approve a shared ANTHROPIC_API_KEY in the config dir's settings.json so
+    Claude Code doesn't interactively prompt 'Detected a custom API key — use it?'
+    (which defaults to No). Claude matches on the key's last 20 chars."""
+    if not key:
+        return
+    suffix = key[-20:]
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            s = {}
+    except Exception:
+        s = {}
+    car = s.get("customApiKeyResponses")
+    if not isinstance(car, dict):
+        car = {}
+    approved = car.get("approved") if isinstance(car.get("approved"), list) else []
+    if suffix not in approved:
+        approved.append(suffix)
+    car["approved"] = approved
+    if not isinstance(car.get("rejected"), list):
+        car["rejected"] = []
+    s["customApiKeyResponses"] = car
+    try:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps(s, indent=2))
+    except Exception:
+        logger.debug("Failed to write customApiKeyResponses into %s", sp, exc_info=True)
+
+
 _SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
 # NEMO-DEV soft-sandbox guard (auto-generated; do not edit).
 # PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
@@ -3429,6 +3460,8 @@ async def api_create_session(request: Request, body: CreateSession):
         # shared key for ALL users (admin + team members). Used when there's no live
         # Max subscription token; the env key overrides any (stale) OAuth creds.
         if _stored_anthropic_key:
+            # Pre-approve the key so Claude Code doesn't prompt "use this API key?"
+            _approve_anthropic_key(_user_claude_config_dir(user), _stored_anthropic_key)
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
                  f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
