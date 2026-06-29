@@ -2030,10 +2030,11 @@ async def async_detect_activity(session_name: str) -> dict:
     return await asyncio.to_thread(detect_activity, session_name)
 
 
-async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
+async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
+                   response_format: dict = None) -> str:
     start = time.time()
     try:
-        resp = await client.chat.completions.create(
+        kwargs = dict(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -2042,6 +2043,9 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200)
             max_tokens=max_tokens,
             temperature=0.3,
         )
+        if response_format:
+            kwargs["response_format"] = response_format
+        resp = await client.chat.completions.create(**kwargs)
         duration = time.time() - start
         tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
         logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
@@ -6349,6 +6353,80 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     return None
 
 
+_MENU_PICK_SYSTEM_PROMPT = (
+    "A Claude Code agent is showing a numbered selection menu and THE USER IS AWAY and will "
+    "not answer. Pick the option number that best lets the agent CONTINUE and COMPLETE the work "
+    "on its own.\n"
+    "- Strongly prefer options that proceed / do the work / say Yes / auto-accept / "
+    "'yes, and don't ask again' / accept-edits / run it.\n"
+    "- AVOID options that pause, stop, cancel, exit, quit, reject, defer, or hand control back "
+    "to the user (e.g. 'no', 'let me decide', 'I'll do it myself', 'ask me later').\n"
+    "- If several options proceed, pick the one that makes the MOST progress with the fewest "
+    "future interruptions.\n"
+    "- If genuinely unsure, pick 1.\n"
+    "Reply with ONLY the option number, nothing else."
+)
+
+
+def _parse_menu_options(visible_text: str):
+    """Parse a Claude Code numbered menu. Returns (options, selected_idx) where
+    options = [(number, label), ...] in visual order and selected_idx is the
+    0-based position of the ❯-highlighted option (0 if none found)."""
+    options = []
+    selected = None
+    for line in visible_text.split("\n"):
+        s = line.strip()
+        m = re.match(r"^(❯|❯)?\s*(\d+)\.\s+(\S.*)$", s)
+        if not m:
+            continue
+        if m.group(1):
+            selected = len(options)
+        options.append((int(m.group(2)), m.group(3).strip()))
+    return options, (selected if selected is not None else 0)
+
+
+async def _llm_pick_menu_option(name: str, visible: str, options: list):
+    """Ask the LLM which menu option best continues the work. Returns the chosen
+    option NUMBER, or None to fall back to the default (Enter)."""
+    valid = {n for n, _ in options}
+    if not valid:
+        return None
+    try:
+        raw = await llm_call(
+            system_prompt=_MENU_PICK_SYSTEM_PROMPT,
+            user_content=(f"Session '{name}' is showing this menu:\n\n{visible[-2500:]}\n\n"
+                          f"Valid option numbers: {sorted(valid)}. Reply with ONE number."),
+            max_tokens=4,
+        )
+    except Exception:
+        return None
+    m = re.search(r"\d+", raw or "")
+    if not m:
+        return None
+    n = int(m.group())
+    return n if n in valid else None
+
+
+async def _select_menu_option(name: str, options: list, selected_idx: int, target_num: int) -> str:
+    """Navigate to the target option (arrow keys) and Enter. Returns a label for logging."""
+    target_idx = next((i for i, (n, _) in enumerate(options) if n == target_num), None)
+    if target_idx is None:
+        target_idx = selected_idx
+    delta = target_idx - selected_idx
+    if 0 < abs(delta) < len(options):
+        key = "Down" if delta > 0 else "Up"
+        for _ in range(abs(delta)):
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", name, key],
+                capture_output=True, text=True, timeout=3)
+            await asyncio.sleep(0.06)
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", name, "Enter"],
+        capture_output=True, text=True, timeout=3)
+    label = next((l for n, l in options if n == target_num), "")
+    return f"option {target_num} ({label[:40]})" if label else f"option {target_num}"
+
+
 async def _auto_responder_loop():
     """Background loop that auto-responds to Claude Code interactive prompts."""
     log = logging.getLogger("auto-responder")
@@ -6378,19 +6456,36 @@ async def _auto_responder_loop():
 
                 prompt_type = _detect_interactive_prompt(result.stdout)
                 if prompt_type:
-                    # Send Enter to accept the highlighted (first) option
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "send-keys", "-t", name, "Enter"],
-                        capture_output=True, text=True, timeout=3,
-                    )
+                    # Safety backstop: don't auto-approve a clearly destructive /
+                    # irreversible action — leave it for a human. (Back off ~60s to
+                    # avoid re-logging every poll.)
+                    if _looks_destructive(result.stdout):
+                        _auto_respond_cooldown[name] = now + 50
+                        log.info("Auto-responder HOLDING '%s' — destructive prompt needs a human", name)
+                        continue
+                    # Read the options and let the LLM choose the one that best
+                    # continues the work autonomously, then navigate to it + Enter.
+                    # Falls back to Enter (the highlighted/first option) if the LLM
+                    # is unavailable or unsure — menus still get handled instantly.
+                    options, selected_idx = _parse_menu_options(result.stdout)
+                    target = (await _llm_pick_menu_option(name, result.stdout, options)
+                              if len(options) >= 2 else None)
+                    if target is not None:
+                        chosen = await _select_menu_option(name, options, selected_idx, target)
+                    else:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            ["tmux", "send-keys", "-t", name, "Enter"],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                        chosen = "default option (Enter)"
                     _auto_respond_cooldown[name] = now
-                    event = {"session": name, "type": prompt_type, "ts": now}
+                    event = {"session": name, "type": prompt_type, "choice": chosen, "ts": now}
                     _auto_respond_log.append(event)
                     # Keep log bounded
                     if len(_auto_respond_log) > 50:
                         _auto_respond_log.pop(0)
-                    log.info(f"Auto-responded to {prompt_type} in session '{name}'")
+                    log.info(f"Auto-responded to {prompt_type} in session '{name}' -> {chosen}")
         except Exception:
             logger.debug("Auto-responder loop iteration failed", exc_info=True)
 
@@ -6401,37 +6496,108 @@ async def api_auto_respond_log():
     return JSONResponse(_auto_respond_log[-20:])
 
 
-# --- Simple Watchdog Loop ---
-# Lightweight always-on supervisor. When a session sits idle with Claude having
-# offered to continue / paused for confirmation (e.g. "Pause me here if you
-# want…", "shall I proceed?", "Next: I'll do X"), we send "continue" so work
-# keeps moving without the user babysitting. Conservative: only fires when the
-# LLM is confident the agent is paused awaiting a yes/continue, never on
-# genuinely finished work or open-ended questions needing a real answer.
+# --- Autopilot Watchdog Loop (formerly "simple watchdog") ---
+# Always-on smart supervisor. When a session goes idle because Claude stopped and
+# is waiting on the user in ANY way — a question, a choice, a confirmation, work
+# it deferred ("left for phase 2", "out of scope", "next steps", "we could
+# also…"), or just a soft pause — it reads the screen, asks an LLM what reply
+# keeps the work moving on its own, and types that reply back. The user is usually
+# away, so the bias is: ALWAYS find a way to continue autonomously. It only holds
+# off (WAIT) when Claude is still actively working, when the only next action is
+# genuinely destructive/irreversible (needs a human), or when the task is truly
+# 100% complete with nothing deferred or optional left.
 
 _SIMPLE_WATCHDOG_INTERVAL = 20          # poll every 20s
-_SIMPLE_WATCHDOG_IDLE_SECS = 45         # idle this long before considering action
-_SIMPLE_WATCHDOG_COOLDOWN = 180         # min seconds between "continue" sends per session
+_SIMPLE_WATCHDOG_IDLE_SECS = 45         # stable-idle this long before considering action
+_SIMPLE_WATCHDOG_COOLDOWN = 90          # min seconds between replies per session
 _SIMPLE_WATCHDOG_MAX_LOG = 20
+_SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
 
 _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
-    "You are monitoring a Claude Code terminal session. The user is away. "
-    "Decide whether the agent has paused mid-task and is waiting for the user to "
-    "say 'continue' / confirm before proceeding with work it already announced.\n\n"
-    "Reply CONTINUE only when ALL of these hold:\n"
-    "- The agent stated the next step it intends to take (e.g. 'Next: I'll do X', "
-    "  'Proceeding to Phase 2', 'Shall I continue?', 'Pause me here if you want...').\n"
-    "- The agent is now idle, not actively running tools.\n"
-    "- The next step is a direct continuation of the same task — not a fork that "
-    "  needs user judgment (e.g. 'which option do you prefer A or B?').\n\n"
-    "Reply WAIT in any of these cases:\n"
-    "- The agent finished the task and there is no announced next step.\n"
-    "- The agent is asking a substantive question that needs a real answer.\n"
-    "- The terminal shows a permission/selection prompt with numbered options.\n"
-    "- The agent is actively working (spinner, 'esc to interrupt', tool output streaming).\n"
-    "- You can't tell — default to WAIT.\n\n"
-    "Reply with EXACTLY one word: CONTINUE or WAIT."
+    "You are an autonomous operator keeping a Claude Code agent moving while THE USER IS AWAY. "
+    "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
+    "and is in ANY way waiting on the user before it can keep working, write the exact message to "
+    "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
+    "Treat ALL of these as 'waiting on the user' and answer them so work continues:\n"
+    "- Questions or choices ('Which should I do, A or B?', 'Do you want X or Y?', 'which one?').\n"
+    "- Confirmations ('Shall I proceed?', 'Want me to continue?', 'Should I also do X?').\n"
+    "- Deferrals / scope-punts ('I left this for phase 2', 'X is out of scope', 'as a follow-up', "
+    "'next steps:', 'we could also…', 'optionally', 'if you want I can…').\n"
+    "- Soft stops ('Let me know how you'd like to proceed', 'standing by', 'paused here').\n\n"
+    "How to answer — always push toward FULLY DONE, autonomously:\n"
+    "- Choice: pick the option that best completes the overall task and say to proceed with it, e.g. "
+    "'Go with option 2 and keep going — don't wait for me.'\n"
+    "- Deferral/scope-punt: tell it to do that work now, e.g. 'Do phase 2 now as well. Treat the "
+    "whole thing as in scope and finish it end to end. Don't stop to ask.'\n"
+    "- Confirmation: 'Yes, proceed. Keep going autonomously and don't wait for me.'\n"
+    "- Make reasonable default assumptions; NEVER ask the user anything back; never tell it to stop, "
+    "pause, or wait. Keep the message to 1-3 concrete sentences that include an instruction to "
+    "continue without the user.\n\n"
+    "Choose action 'wait' ONLY if:\n"
+    "- The agent is still actively working (spinner / 'esc to interrupt' / tool output streaming), OR\n"
+    "- The task is 100% complete: every goal met, nothing deferred, nothing optional left, no question "
+    "on screen, OR\n"
+    "- *** SAFETY OVERRIDE (this beats the continue-bias) *** the next action is genuinely "
+    "DESTRUCTIVE / IRREVERSIBLE / HIGH-COST and a human must decide: deleting or overwriting "
+    "production or unrecoverable data, dropping/truncating DB tables, force-pushing or rewriting "
+    "shared git history, spending real money above a small (~$100) threshold, or sending mass / "
+    "sensitive external messages. If there is ANY doubt about whether an action is destructive, "
+    "irreversible, or high-cost, choose 'wait'. Never auto-approve these.\n\n"
+    "Respond with STRICT JSON only: {\"action\":\"send\",\"message\":\"<what to type>\"} "
+    "or {\"action\":\"wait\"}."
 )
+
+
+# Deterministic safety backstop. If the recent screen (or the message we're about
+# to send) names a clearly catastrophic / irreversible operation, we NEVER
+# auto-drive it — we leave it for a human, regardless of what the LLM decided.
+# Kept tight so it doesn't block the common "just keep going" cases.
+_DESTRUCTIVE_RE = re.compile(
+    r"\bDROP\s+(?:TABLE|DATABASE|SCHEMA)\b"
+    r"|\bTRUNCATE\s+TABLE\b"
+    r"|\brm\s+-[rfRF]{1,2}\s+(?:-{1,2}\w+\s+)*(?:/|~|\$HOME|\*|/etc|/var|/usr|/home|/opt|/root|/boot)"
+    r"|\b(?:force[- ]?push|push\s+--force\b|push\s+-f\b|git\s+reset\s+--hard)\b"
+    r"|\b(?:delet|drop|wip|eras|destroy|purg)\w*\s+(?:\w+\s+){0,5}?(?:production|prod\b|all\s+(?:the\s+)?(?:user|customer|account|record|row|data|table))"
+    r"|\b(?:irreversibl\w*|cannot be undone|can'?t be undone|permanently\s+(?:delet|remov|eras|destroy)\w*)"
+    r"|\boverwrit\w*\s+(?:\w+\s+){0,5}?(?:production|remote\s+history|shared\s+history)"
+    # high-cost spend: a spend verb near a $100+ amount, or any $100+ /month|/year rate
+    # ($100+ = 3+ plain digits or comma-grouped thousands; "$99"/"$5/mo" stay under)
+    r"|\b(?:spend|purchas\w*|buy|buying|charg\w*|pay|paying|subscrib\w*|upgrad\w*|order\w*)\b[^\n]{0,40}\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)"
+    r"|\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)(?:\.\d+)?\s*(?:/|per)\s*(?:mo|month|yr|year)\b",
+    re.I,
+)
+
+
+def _looks_destructive(text: str) -> bool:
+    """True if the text names a clearly destructive/irreversible/high-cost action
+    that should never be auto-approved without a human."""
+    return bool(_DESTRUCTIVE_RE.search(text or ""))
+
+
+def _parse_autopilot_decision(raw: str):
+    """Parse the autopilot LLM JSON. Returns {'action':'send','message':...},
+    {'action':'wait'}, or None. Conservative: only 'send' on valid JSON + message."""
+    if not raw:
+        return None
+    t = raw.strip().strip("`").strip()
+    if re.fullmatch(r"(?i)wait\.?", t):
+        return {"action": "wait"}
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group())
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    act = str(d.get("action", "")).lower()
+    if act == "wait":
+        return {"action": "wait"}
+    if act == "send":
+        msg = str(d.get("message", "")).strip()
+        return {"action": "send", "message": msg} if msg else None
+    return None
 
 
 def _simple_watchdog_record(session_name: str, action: str):
@@ -6443,16 +6609,32 @@ def _simple_watchdog_record(session_name: str, action: str):
 
 async def _simple_watchdog_send_continue(session_name: str) -> bool:
     """Send 'continue' to the session's Claude Code prompt. Returns True on send."""
+    return await _simple_watchdog_send_text(session_name, "continue")
+
+
+async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
+    """Type a composed reply into the session's Claude Code input box and submit.
+    Collapses to a single line so Enter submits the whole message at once."""
+    text = " ".join((text or "").split())
+    if not text:
+        return False
     try:
-        # Type the word and press Enter. tmux send-keys handles literal text.
+        # -l sends the text literally (so it isn't interpreted as tmux key names);
+        # a separate Enter then submits it to Claude.
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "continue", "Enter"],
+            ["tmux", "send-keys", "-t", session_name, "-l", text],
+            capture_output=True, text=True, timeout=5,
+        )
+        await asyncio.sleep(0.1)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5,
         )
         return True
     except Exception as e:
-        logger.debug("simple watchdog: failed to send continue to '%s': %s", session_name, e)
+        logger.debug("autopilot: failed to send reply to '%s': %s", session_name, e)
         return False
 
 
@@ -6520,30 +6702,58 @@ async def _simple_watchdog_loop():
                 idle_for = now - state.get("idle_since", now)
                 if idle_for < _SIMPLE_WATCHDOG_IDLE_SECS:
                     continue
-                # Capture more context for the LLM (last ~60 lines)
-                recent = await asyncio.to_thread(capture_pane_recent, name, 60)
+                # Back off if we keep hitting the EXACT same stalled screen — a reply
+                # that doesn't move it means poking again won't help; leave it for a human.
+                if content_hash == state.get("acted_hash"):
+                    same = state.get("same_stall", 0) + 1
+                    state["same_stall"] = same
+                    if same >= _SIMPLE_WATCHDOG_MAX_SAME_STALL:
+                        if not state.get("backed_off"):
+                            slog.info("Autopilot backing off '%s' — unchanged after %d replies", name, same)
+                            state["backed_off"] = True
+                        continue
+                else:
+                    state["same_stall"] = 0
+                    state["backed_off"] = False
+                # Read the screen and let the LLM compose the reply that keeps it moving.
+                recent = await asyncio.to_thread(capture_pane_recent, name, 80)
                 if not recent.strip():
                     continue
+                # Safety backstop: never auto-drive a clearly destructive/irreversible
+                # action — the one carve-out from the continue bias. Checked before the
+                # LLM call (cheap) so we don't waste a call either.
+                if _looks_destructive(recent):
+                    if state.get("held_hash") != content_hash:
+                        state["held_hash"] = content_hash
+                        slog.info("Autopilot HOLDING '%s' — possible destructive/irreversible "
+                                  "action on screen; needs a human", name)
+                    continue
                 try:
-                    verdict = await llm_call(
+                    raw = await llm_call(
                         system_prompt=_SIMPLE_WATCHDOG_SYSTEM_PROMPT,
-                        user_content=f"Session '{name}' terminal (last 60 lines):\n\n{recent[-4000:]}",
-                        max_tokens=4,
+                        user_content=f"Session '{name}' terminal (most recent lines):\n\n{recent[-4500:]}",
+                        max_tokens=160,
+                        response_format={"type": "json_object"},
                     )
                 except Exception:
                     continue
-                verdict = (verdict or "").strip().upper()
-                if "CONTINUE" not in verdict:
+                decision = _parse_autopilot_decision(raw)
+                if not decision or decision.get("action") != "send":
+                    continue
+                msg = (decision.get("message") or "").strip()
+                if not msg or _looks_destructive(msg):
                     continue
                 # One more guard: re-check Claude is still running before sending
                 if not await _async_is_claude_running(name):
                     continue
-                ok = await _simple_watchdog_send_continue(name)
+                ok = await _simple_watchdog_send_text(name, msg)
                 if ok:
                     state["last_action"] = now
                     state["idle_since"] = now
-                    _simple_watchdog_record(name, f"sent 'continue' (idle {int(idle_for)}s)")
-                    slog.info("Simple watchdog sent 'continue' to '%s' after %ds idle", name, int(idle_for))
+                    state["acted_hash"] = content_hash
+                    short = msg if len(msg) <= 90 else msg[:87] + "..."
+                    _simple_watchdog_record(name, f"replied (idle {int(idle_for)}s): {short}")
+                    slog.info("Autopilot replied to '%s' after %ds idle: %s", name, int(idle_for), short)
         except asyncio.CancelledError:
             slog.info("Simple watchdog cancelled")
             raise
