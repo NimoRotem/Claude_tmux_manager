@@ -3112,8 +3112,11 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
 # --- Routes ---
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
+async def index(request: Request):
+    # Inject the per-user "simple" flag so the member UI is correct from the very
+    # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
+    simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
+    return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
@@ -8588,7 +8591,7 @@ const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
 const NEMO_BRAND='__BRAND__';
-let NEMO_SIMPLE=false;  // set true for non-admin members in team mode (see applyRoleVisibility)
+let NEMO_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
@@ -11167,6 +11170,7 @@ async function loadProfiles(force){
 }
 
 function renderProfileDropdown(s){
+  if(NEMO_SIMPLE) return '';  // members have no profile selector
   const cur = s.profile_id || 'default';
   const list = _profilesCache || [];
   const opts = list.length
