@@ -509,7 +509,13 @@ def _ensure_user_claude_config_dir(user: dict):
     # stays current (e.g. after the admin edits the global context).
     if TEAM_MODE:
         try:
-            _share_credentials_symlink(d)
+            if _stored_anthropic_key:
+                # Shared API key mode (subscription token is dead): authenticate
+                # via apiKeyHelper, no subscription creds.
+                _apply_api_key_auth(d)
+            else:
+                # Shared subscription mode: symlink to the admin's live token.
+                _share_credentials_symlink(d)
             _sync_global_context_into(claude_md)
             _install_sandbox_hook(d, user)
         except Exception:
@@ -1359,6 +1365,45 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
         sp.write_text(json.dumps(s, indent=2))
     except Exception:
         logger.debug("Failed to write customApiKeyResponses into %s", sp, exc_info=True)
+
+
+def _set_api_key_helper(cfg_dir: Path):
+    """Point Claude Code at the shared API key via settings.json `apiKeyHelper`.
+    Interactive claude does NOT honor a bare ANTHROPIC_API_KEY env var for
+    inference (it falls back to /login), but apiKeyHelper authenticates reliably —
+    and the key stays in a 0600 file rather than the terminal scrollback."""
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            s = {}
+    except Exception:
+        s = {}
+    s["apiKeyHelper"] = "cat " + shlex.quote(str(ANTHROPIC_API_KEY_FILE))
+    try:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps(s, indent=2))
+    except Exception:
+        logger.debug("Failed to set apiKeyHelper in %s", sp, exc_info=True)
+
+
+def _remove_subscription_creds(cfg_dir: Path):
+    """In API-key mode, drop any (dead) subscription .credentials.json so claude
+    uses the API key instead of trying the expired OAuth token and hitting /login."""
+    p = cfg_dir / ".credentials.json"
+    try:
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    except Exception:
+        logger.debug("Failed to remove subscription creds in %s", cfg_dir, exc_info=True)
+
+
+def _apply_api_key_auth(cfg_dir: Path):
+    """Configure a config dir to authenticate via the shared API key."""
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    _remove_subscription_creds(cfg_dir)
+    _set_api_key_helper(cfg_dir)
+    _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
 
 
 def _seed_trust(cfg_dir: Path, cwd: str):
@@ -3545,21 +3590,13 @@ async def api_create_session(request: Request, body: CreateSession):
                 )
             except Exception:
                 logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
-        # Inject the stored Anthropic API key so Claude Code authenticates via the
-        # shared key for ALL users (admin + team members). Used when there's no live
-        # Max subscription token; the env key overrides any (stale) OAuth creds.
+        # Authenticate via the shared Anthropic API key for ALL users (admin +
+        # members) when one is stored. We use settings.json `apiKeyHelper` (not an
+        # env var) — interactive claude ignores a bare ANTHROPIC_API_KEY and would
+        # fall back to /login — and remove any dead subscription creds. The key
+        # stays in a 0600 file, never echoed into the session scrollback.
         if _stored_anthropic_key:
-            # Pre-approve the key so Claude Code doesn't prompt "use this API key?"
-            _approve_anthropic_key(_user_claude_config_dir(user), _stored_anthropic_key)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
-                 f"export ANTHROPIC_API_KEY={_stored_anthropic_key}"],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            _apply_api_key_auth(_user_claude_config_dir(user))
             _session_auth_mode[created] = "api"
         else:
             _session_auth_mode[created] = "subscription"
