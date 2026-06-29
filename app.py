@@ -517,6 +517,8 @@ def _ensure_user_claude_config_dir(user: dict):
                 # Shared subscription mode: symlink to the admin's live token.
                 _share_credentials_symlink(d)
             _sync_global_context_into(claude_md)
+            _sync_group_context_into(claude_md, user.get("group", ""))
+            _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
         except Exception:
@@ -716,6 +718,11 @@ async def auth_middleware(request: Request, call_next):
     # must work even when the cross-site redirect from Google drops the cookie.
     if path.endswith("/api/sandbox/check") or path.endswith("/api/connections/google/callback"):
         return await call_next(request)
+    # Public project serving: /<username>/<project>[/...] is served publicly (the
+    # /<username> project-list page itself stays gated below).
+    rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
+    if request.method == "GET" and _is_public_project_request(rel_path):
+        return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
         resp = HTMLResponse(LOGIN_PAGE)
@@ -804,12 +811,17 @@ async def do_login(request: Request):
     else:
         return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
 
-    # Update last_login
+    # Update last_login + capture IP / browser for the admin audit view
+    ua = (request.headers.get("user-agent", "") or "")[:300]
+    fwd = request.headers.get("x-forwarded-for", "")
+    real_ip = fwd.split(",")[0].strip() if fwd else ip
     try:
         users = _load_users()
         for u in users:
             if u.get("id") == target_user["id"]:
                 u["last_login"] = time.time()
+                u["last_login_ip"] = real_ip
+                u["last_login_ua"] = ua
                 break
         _save_users(users)
     except Exception:
@@ -833,12 +845,14 @@ class CreateUserBody(BaseModel):
     username: str
     password: str
     role: str = "user"
+    group: str = ""
 
 
 class UpdateUserBody(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
     username: Optional[str] = None
+    group: Optional[str] = None
 
 
 def _public_user(u: dict) -> dict:
@@ -847,8 +861,11 @@ def _public_user(u: dict) -> dict:
         "id": u.get("id", ""),
         "username": u.get("username", ""),
         "role": u.get("role", "user"),
+        "group": u.get("group", ""),
         "created_at": u.get("created_at", 0),
         "last_login": u.get("last_login", 0),
+        "last_login_ip": u.get("last_login_ip", ""),
+        "last_login_ua": u.get("last_login_ua", ""),
     }
 
 
@@ -895,6 +912,7 @@ async def api_admin_create_user(request: Request, body: CreateUserBody):
         "password_hash": _hash_password(password, salt),
         "password_salt": salt,
         "role": role,
+        "group": (body.group or "").strip(),
         "created_at": time.time(),
         "last_login": 0,
     }
@@ -946,8 +964,17 @@ async def api_admin_update_user(request: Request, user_id: str, body: UpdateUser
             return JSONResponse({"error": "Cannot demote the only remaining admin"}, status_code=400)
         target["role"] = body.role
         changed = True
+    if body.group is not None:
+        target["group"] = body.group.strip()
+        changed = True
     if changed:
         _save_users(users)
+        # Re-apply per-user context (incl. the group block) for non-admin users.
+        try:
+            if not _is_admin(target):
+                _ensure_user_claude_config_dir(target)
+        except Exception:
+            logger.debug("Failed to re-apply context after user update", exc_info=True)
     return JSONResponse({"ok": True, "user": _public_user(target)})
 
 
@@ -1275,6 +1302,18 @@ own private workspace, memory, and context below this block.
   around it (no obfuscation, no alternate tooling).
 - Remote/cloud tools (`gcloud`, `gsutil`, `bq`, `ssh`, `scp`, `kubectl`, `aws`, the
   GCP metadata server, …) are restricted; expect them to be denied unless approved.
+
+## Projects & working folder
+- Unless told otherwise, publish every project you build at https://dianaotech.com/<username>/<project>.
+- Default <project> = the current tmux session name (unless that name is taken or you're
+  told another). Example: user "coffee" in session "XYABC" asks for a calculator app →
+  build it and publish it publicly at https://dianaotech.com/coffee/XYABC.
+- HOW TO PUBLISH: put the project's web files in `$NEMO_PROJECT_DIR` (= `~/nemo-projects/<username>/<project>/`,
+  exported in your shell; create it). Static sites: write `index.html` (+ assets) there and it's
+  served immediately at `$NEMO_PROJECT_URL`. Dynamic apps (Node/Flask/etc.): run your server on a
+  free port and write `$NEMO_PROJECT_DIR/.serve.json` = `{"port": <PORT>}`; it'll be reverse-proxied there.
+- Your username is `$NEMO_USER`, this session is `$NEMO_SESSION`, and the live link is `$NEMO_PROJECT_URL`
+  (also shown as a clickable link in the dashboard for this session).
 
 Stay focused on the user's project in this workspace.
 """
@@ -1964,6 +2003,389 @@ async def api_save_global_context(request: Request):
         except Exception:
             logger.debug("Failed to re-sync global context for %s", u.get("id"), exc_info=True)
     return JSONResponse({"ok": True, "synced": synced})
+
+
+# ===========================================================================
+# Work groups · admin context-file editor · admin user history · projects
+# ===========================================================================
+import mimetypes
+from starlette.responses import Response
+
+GROUPS_FILE = MESSAGES_DIR / "groups.json"
+GROUPS_DIR = MESSAGES_DIR / "groups"
+PROJECTS_ROOT = Path.home() / "nemo-projects"
+_GROUP_CTX_BEGIN = "<!-- NEMO-DEV GROUP CONTEXT (managed — edits below are overwritten) -->"
+_GROUP_CTX_END = "<!-- END NEMO-DEV GROUP CONTEXT -->"
+# Top-level path segments reserved for the app (never treated as usernames).
+_RESERVED_TOP = {"", "api", "login", "logout", "qa-output", "static", "favicon.ico",
+                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws"}
+
+
+def _load_groups() -> dict:
+    try:
+        d = json.loads(GROUPS_FILE.read_text())
+        return d if isinstance(d, dict) else {"groups": []}
+    except Exception:
+        return {"groups": []}
+
+
+def _save_groups(data: dict):
+    try:
+        GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GROUPS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.exception("Failed to save groups")
+
+
+def _group_dir(group_id: str) -> Path:
+    return GROUPS_DIR / group_id
+
+
+def _ensure_group_dir(group_id: str):
+    d = _group_dir(group_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "skills").mkdir(parents=True, exist_ok=True)
+    if not (d / "CLAUDE.md").exists():
+        (d / "CLAUDE.md").write_text("# Group context\nShared rules and context for everyone in this work group.\n")
+    if not (d / "MEMORY.md").exists():
+        (d / "MEMORY.md").write_text("# Group memory\n")
+    if not (d / "settings.json").exists():
+        (d / "settings.json").write_text(json.dumps({"permissions": {}, "env": {}}, indent=2))
+
+
+def _read_group_context(group_id: str) -> str:
+    p = _group_dir(group_id) / "CLAUDE.md"
+    try:
+        return p.read_text() if p.exists() else ""
+    except Exception:
+        return ""
+
+
+def _sync_group_context_into(claude_md: Path, group_id: str):
+    """Maintain a managed GROUP CONTEXT block in a member's CLAUDE.md (below the
+    global block). Removes it when the user has no group."""
+    existing = claude_md.read_text() if claude_md.exists() else ""
+    if _GROUP_CTX_BEGIN in existing and _GROUP_CTX_END in existing:
+        pre = existing.split(_GROUP_CTX_BEGIN, 1)[0]
+        post = existing.split(_GROUP_CTX_END, 1)[1]
+        existing = pre.rstrip("\n") + "\n" + post.lstrip("\n")
+    if not group_id:
+        claude_md.write_text(existing)
+        return
+    block = _GROUP_CTX_BEGIN + "\n" + _read_group_context(group_id).rstrip() + "\n" + _GROUP_CTX_END + "\n"
+    if _GLOBAL_CTX_END in existing:
+        head, tail = existing.split(_GLOBAL_CTX_END, 1)
+        existing = head + _GLOBAL_CTX_END + "\n\n" + block + tail.lstrip("\n")
+    else:
+        existing = block + "\n" + existing.lstrip("\n")
+    claude_md.write_text(existing)
+
+
+def _sync_group_skills_into(cfg_dir: Path, group_id: str):
+    """Symlink a group's skills into the member's skills dir (group-prefixed)."""
+    if not group_id:
+        return
+    src = _group_dir(group_id) / "skills"
+    if not src.exists():
+        return
+    dst = cfg_dir / "skills"
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for entry in src.iterdir():
+            link = dst / ("group-" + entry.name)
+            try:
+                if link.is_symlink():
+                    if os.readlink(link) == str(entry):
+                        continue
+                    link.unlink()
+                elif link.exists():
+                    continue
+                link.symlink_to(entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# --- admin context-file editor (per user / per group) ---------------------
+_CONTEXT_TOP_FILES = ["CLAUDE.md", "MEMORY.md", "settings.json", ".claude.json", ".mcp.json"]
+_CONTEXT_DIRS = ["skills", "agents", "commands"]
+
+
+def _context_root(scope: str, ident: str):
+    if scope == "user":
+        u = _find_user_by_id(ident)
+        if not u:
+            return None
+        d = _user_claude_config_dir(u)
+        if not _is_admin(u):
+            _ensure_user_claude_config_dir(u)
+        return d
+    if scope == "group":
+        if not any(g.get("id") == ident for g in _load_groups().get("groups", [])):
+            return None
+        _ensure_group_dir(ident)
+        return _group_dir(ident)
+    return None
+
+
+def _list_context_files(root: Path):
+    out = []
+    for name in _CONTEXT_TOP_FILES:
+        p = root / name
+        if p.is_file():
+            out.append({"path": name, "size": p.stat().st_size})
+    for d in _CONTEXT_DIRS:
+        base = root / d
+        if base.exists():
+            for p in sorted(base.rglob("*")):
+                if p.is_file() and not p.name.startswith("."):
+                    out.append({"path": str(p.relative_to(root)), "size": p.stat().st_size})
+    return out
+
+
+def _safe_ctx_path(root: Path, rel: str):
+    rel = (rel or "").lstrip("/").replace("\\", "/")
+    if not rel or ".." in rel.split("/"):
+        return None
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+class CtxFileBody(BaseModel):
+    path: str
+    content: str = ""
+
+
+@app.get("/api/admin/context/{scope}/{ident}")
+async def api_admin_context_list(request: Request, scope: str, ident: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    root = _context_root(scope, ident)
+    if root is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    root.mkdir(parents=True, exist_ok=True)
+    return JSONResponse({"root": str(root), "files": _list_context_files(root)})
+
+
+@app.get("/api/admin/context/{scope}/{ident}/file")
+async def api_admin_context_read(request: Request, scope: str, ident: str, path: str = ""):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    root = _context_root(scope, ident)
+    if root is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    target = _safe_ctx_path(root, path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not target.exists():
+        return JSONResponse({"path": path, "content": "", "exists": False})
+    try:
+        return JSONResponse({"path": path, "content": target.read_text(), "exists": True})
+    except Exception:
+        return JSONResponse({"error": "Unreadable (binary file?)"}, status_code=400)
+
+
+@app.post("/api/admin/context/{scope}/{ident}/file")
+async def api_admin_context_write(request: Request, scope: str, ident: str, body: CtxFileBody):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    root = _context_root(scope, ident)
+    if root is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    target = _safe_ctx_path(root, body.path)
+    if target is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if body.path.endswith(".json"):
+        try:
+            json.loads(body.content or "{}")
+        except json.JSONDecodeError as e:
+            return JSONResponse({"error": "Invalid JSON: " + e.msg}, status_code=400)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body.content or "")
+    except Exception:
+        return JSONResponse({"error": "Write failed"}, status_code=500)
+    # Group CLAUDE.md edit → re-sync that group's members immediately.
+    if scope == "group" and target.name == "CLAUDE.md":
+        for u in _load_users():
+            if u.get("group") == ident and u.get("role") != "admin":
+                try:
+                    _ensure_user_claude_config_dir(u)
+                except Exception:
+                    pass
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/admin/context/{scope}/{ident}/file")
+async def api_admin_context_delete(request: Request, scope: str, ident: str, path: str = ""):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    root = _context_root(scope, ident)
+    if root is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    target = _safe_ctx_path(root, path)
+    if target is None or not target.exists():
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    try:
+        shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink()
+    except Exception:
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+# --- work groups CRUD (admin) ---------------------------------------------
+class GroupBody(BaseModel):
+    name: str
+
+
+@app.get("/api/admin/groups")
+async def api_admin_groups(request: Request):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    users = _load_users()
+    out = []
+    for g in _load_groups().get("groups", []):
+        out.append({**g, "member_count": sum(1 for u in users if u.get("group") == g.get("id"))})
+    return JSONResponse({"groups": out})
+
+
+@app.post("/api/admin/groups")
+async def api_admin_create_group(request: Request, body: GroupBody):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    name = (body.name or "").strip()
+    gid = re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", name.lower())).strip("-")[:40]
+    if not name or not gid:
+        return JSONResponse({"error": "Valid name required"}, status_code=400)
+    data = _load_groups()
+    if any(g.get("id") == gid for g in data.get("groups", [])):
+        return JSONResponse({"error": "Group already exists"}, status_code=409)
+    data.setdefault("groups", []).append({"id": gid, "name": name, "created_at": time.time()})
+    _save_groups(data)
+    _ensure_group_dir(gid)
+    return JSONResponse({"ok": True, "id": gid})
+
+
+@app.delete("/api/admin/groups/{group_id}")
+async def api_admin_delete_group(request: Request, group_id: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    data = _load_groups()
+    data["groups"] = [g for g in data.get("groups", []) if g.get("id") != group_id]
+    _save_groups(data)
+    users = _load_users()
+    changed = False
+    for u in users:
+        if u.get("group") == group_id:
+            u["group"] = ""
+            changed = True
+    if changed:
+        _save_users(users)
+    return JSONResponse({"ok": True})
+
+
+# --- admin: view any user's full history ----------------------------------
+def _history_list_for(target: dict):
+    messages_by_session = _load_messages(target)
+    notes_by_session = _load_all_notes(target)
+    owners = _load_session_owners()
+    live = {s["name"] for s in get_tmux_sessions() if owners.get(s["name"], "admin") == target["id"]}
+    out = []
+    for name in set(messages_by_session) | set(notes_by_session) | live:
+        msgs = messages_by_session.get(name) or []
+        last_ts, uc = 0, 0
+        for m in msgs:
+            if isinstance(m, dict):
+                last_ts = max(last_ts, m.get("ts") or 0)
+                uc += 1 if m.get("role") == "user" else 0
+        out.append({"session_name": name, "key_info": notes_by_session.get(name, ""),
+                    "user_message_count": uc, "total_messages": len(msgs),
+                    "last_message_at": last_ts, "is_live": name in live})
+    out.sort(key=lambda e: e["last_message_at"], reverse=True)
+    return out
+
+
+@app.get("/api/admin/users/{user_id}/history")
+async def api_admin_user_history(request: Request, user_id: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = _find_user_by_id(user_id)
+    if not target:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    return JSONResponse({"sessions": _history_list_for(target)})
+
+
+@app.get("/api/admin/users/{user_id}/history/{session_name}")
+async def api_admin_user_history_detail(request: Request, user_id: str, session_name: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = _find_user_by_id(user_id)
+    if not target:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    return JSONResponse({
+        "session_name": session_name,
+        "key_info": _load_all_notes(target).get(session_name, ""),
+        "messages": _load_messages(target).get(session_name) or [],
+    })
+
+
+# --- public projects: serving + helpers -----------------------------------
+def _safe_seg(s: str) -> bool:
+    return bool(s) and re.match(r"^[A-Za-z0-9._-]{1,64}$", s or "") is not None and s not in (".", "..")
+
+
+def _user_projects_dir(username: str) -> Path:
+    return PROJECTS_ROOT / username
+
+
+def _list_projects(username: str):
+    d = _user_projects_dir(username)
+    if not d.exists():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def _project_dir(username: str, project: str):
+    if not _safe_seg(username) or not _safe_seg(project):
+        return None
+    return _user_projects_dir(username) / project
+
+
+def _is_public_project_request(rel: str) -> bool:
+    """A GET to /<username>/<project>[/...] for a real, non-reserved user is public."""
+    segs = [s for s in rel.split("/") if s != ""]
+    if len(segs) < 2 or segs[0] in _RESERVED_TOP:
+        return False
+    return _find_user_by_username(segs[0]) is not None
+
+
+async def _proxy_to_port(request: Request, port: int, subpath: str):
+    url = "http://127.0.0.1:%d/%s" % (port, subpath)
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body()
+    req = urllib.request.Request(url, data=body or None, method=request.method)
+    for h in ("content-type", "accept", "user-agent"):
+        v = request.headers.get(h)
+        if v:
+            req.add_header(h, v)
+
+    def _do():
+        return urllib.request.urlopen(req, timeout=30)
+    try:
+        resp = await asyncio.to_thread(_do)
+        return Response(content=resp.read(), status_code=resp.status,
+                        media_type=resp.headers.get("Content-Type", "application/octet-stream"))
+    except urllib.error.HTTPError as e:
+        return Response(content=e.read(), status_code=e.code,
+                        media_type=e.headers.get("Content-Type", "text/plain"))
+    except Exception:
+        return HTMLResponse("Project server isn't reachable on port %d (is it running?)." % port, status_code=502)
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -3372,6 +3794,8 @@ async def api_sessions_fast(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
+    _owners_map = _load_session_owners()
+    _uid_to_name = {u["id"]: u.get("username", "") for u in _load_users()}
     for sess, activity in zip(sessions, activities):
         entry = cache.get(sess["name"], {})
         if "messages" not in entry:
@@ -3383,6 +3807,7 @@ async def api_sessions_fast(request: Request):
             "name": sess["name"],
             "windows": sess["windows"],
             "attached": sess["attached"],
+            "owner": _uid_to_name.get(_owners_map.get(sess["name"], "admin"), "") or AUTH_USER,
             "title": entry.get("title", ""),
             "description": entry.get("description", ""),
             "description_at": entry.get("description_at", 0),
@@ -3582,6 +4007,19 @@ async def api_create_session(request: Request, body: CreateSession):
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
+        # Export project-publishing convention env vars so Claude can publish to
+        # https://dianaotech.com/<username>/<session> reliably (see global context).
+        try:
+            _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
+            _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
+            _pub_base = PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com"
+            _exports = ("export NEMO_USER=%s NEMO_SESSION=%s NEMO_PROJECT_DIR=%s NEMO_PROJECT_URL=%s" % (
+                shlex.quote(_owner_name), shlex.quote(created),
+                shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created))))
+            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
+            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            logger.debug("Failed to export NEMO_* project env for %s", created, exc_info=True)
         # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
         # `claude` invocation in this pane reads from the user's private config.
         if user and not _is_admin(user):
@@ -8481,6 +8919,20 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
 #imp-banner button{background:#fff;color:#9e6a03;border:none;border-radius:6px;padding:5px 14px;font-size:.8rem;font-weight:600;cursor:pointer}
 #imp-banner button:hover{background:#ffe8b3}
 .users-actions button.imp{background:#1f6feb22;border:1px solid #1f6feb88;color:#79c0ff}
+.create-spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:nemospin .8s linear infinite;margin:18px auto}
+@keyframes nemospin{to{transform:rotate(360deg)}}
+.ctx-wrap{display:flex;gap:12px;min-height:340px}
+.ctx-files{width:230px;flex:none;border:1px solid #30363d;border-radius:8px;overflow:auto;max-height:440px;background:#0d1117}
+.ctx-file{padding:7px 10px;font-size:.8rem;color:#c9d1d9;cursor:pointer;border-bottom:1px solid #161b22;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ctx-file:hover{background:#161b22}.ctx-file.active{background:#1f6feb33;color:#fff}
+.ctx-edit{flex:1;display:flex;flex-direction:column}
+.ctx-edit textarea{flex:1;min-height:340px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-family:monospace;font-size:.82rem;padding:10px;white-space:pre}
+.proj-link{display:inline-flex;align-items:center;gap:6px;font-size:.74rem;color:#3fb950;border:1px solid #2ea04340;background:#2ea04314;border-radius:6px;padding:3px 9px;margin-left:8px;text-decoration:none}
+.proj-link:hover{background:#2ea04326}
+.users-table td .grp-sel{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;font-size:.75rem;padding:3px 6px}
+.muted{color:#8b949e}
+.grp-chip{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2px 10px;margin:2px;font-size:.78rem}
+.grp-chip a{margin-left:4px;text-decoration:none}
 
 /* Stats modal */
 .stats-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:60px}
@@ -9326,6 +9778,7 @@ function renderDetail(){
         </span>
         ${s.model?'<span class="badge model-badge" id="model-badge-'+s.name+'">'+formatModelName(s.model)+'</span>':''}
         ${s.attached?'<span class="badge attached">attached</span>':''}
+        ${(_currentUser&&_currentUser.username)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
@@ -10364,37 +10817,55 @@ startLoginHealthPolling();
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 
 function showCreateModal(){
-  // Simplified members: skip the dialog, auto-name with 5 random chars.
-  if(NEMO_SIMPLE){ createSessionAuto(); return; }
   const modal=document.getElementById('modal-content');
+  // Members get a name pre-filled with 5 random chars (overridable); admins blank.
+  const pre = NEMO_SIMPLE ? _randName(5) : '';
   modal.innerHTML=`
     <h3>New __BRAND__ session</h3>
-    <p>Leave blank for an auto-assigned name, or enter a custom name.</p>
-    <input type="text" class="modal-input" id="new-session-name"
+    <p>${NEMO_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
+    <input type="text" class="modal-input" id="new-session-name" value="${pre}"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="createSession()">Create</button>
+      <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
     </div>`;
   document.getElementById('modal-overlay').classList.add('active');
-  setTimeout(()=>document.getElementById('new-session-name').focus(),50);
+  setTimeout(()=>{const i=document.getElementById('new-session-name');if(i){i.focus();i.select();}},50);
 }
 
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
-  closeModal();
+  const modal=document.getElementById('modal-content');
+  // Immediately show a loading state so it never looks frozen (the first session
+  // for a member can take a few seconds to provision).
+  if(modal){
+    modal.innerHTML=`<h3>Creating session…</h3>
+      <p class="conn-note">Setting up${name?(' "'+esc(name)+'"'):' your session'}. The first one can take a few seconds — hang tight.</p>
+      <div class="create-spinner"></div>`;
+  }
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name})
     });
     const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed');return}
+    if(!resp.ok){
+      if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
+        <p class="conn-note">${esc(data.error||'Failed')}</p>
+        <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button>
+        <button class="modal-confirm-create" onclick="showCreateModal()">Try again</button></div>`;}
+      return;
+    }
     selectedSession=data.name;
+    closeModal();
     await loadAll();
-  }catch(e){alert('Failed to create session.')}
+  }catch(e){
+    if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
+      <p class="conn-note">Network error — please try again.</p>
+      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;}
+  }
 }
 
 function _randName(n){const c='abcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;}
@@ -11807,68 +12278,87 @@ function backToHistoryList(){
 }
 
 // --- Users tab (admin only) ---
+let _groupsCache=[];
+function _browserName(ua){ua=ua||'';if(/Edg\//.test(ua))return'Edge';if(/OPR\//.test(ua))return'Opera';if(/Chrome\//.test(ua))return'Chrome';if(/Firefox\//.test(ua))return'Firefox';if(/Safari\//.test(ua))return'Safari';return (ua.slice(0,16)||'?');}
+function _groupOpts(sel){return '<option value="">— no group —</option>'+_groupsCache.map(g=>`<option value="${esc(g.id)}" ${g.id===sel?'selected':''}>${esc(g.name)}</option>`).join('');}
 async function loadUsersAdmin(){
-  let data;
+  let data, gdata={groups:[]};
   try{
     const resp = await fetch(BASE+'/api/admin/users');
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed'); }
+    const gr = await fetch(BASE+'/api/admin/groups'); if(gr.ok) gdata = await gr.json();
   }catch(e){
     document.getElementById('settings-content').innerHTML =
       '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
     return;
   }
+  _groupsCache = gdata.groups||[];
   const users = data.users || [];
   const rows = users.map(u => {
-    const roleTag = u.role==='admin'
-      ? '<span class="users-role-admin">admin</span>'
-      : '<span class="users-role-user">user</span>';
-    const lastLogin = u.last_login ? timeAgo(u.last_login) : 'never';
+    const roleTag = u.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
+    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')) : 'never';
     const isMe = (_currentUser && _currentUser.id===u.id);
-    const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase;letter-spacing:.05em">you</span>' : '';
-    const actions = (u.id==='admin' || isMe) ? `
-      <div class="users-actions">
-        <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset password</button>
-      </div>
-    ` : `
-      <div class="users-actions">
-        <button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
-        <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset password</button>
-        <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote to user':'Promote to admin'}</button>
-        <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>
-      </div>
-    `;
+    const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase">you</span>' : '';
+    const grpCell = u.role==='admin' ? '<span class="muted">—</span>' :
+      `<select class="grp-sel" onchange="setUserGroup('${esc(u.id)}',this.value)">${_groupOpts(u.group||'')}</select>`;
+    let acts = `<button class="imp" onclick="openContextEditor('user','${esc(u.id)}','${esc(u.username)}')">Context</button>
+      <button onclick="openUserHistory('${esc(u.id)}','${esc(u.username)}')">History</button>
+      <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset pw</button>`;
+    if(!(u.id==='admin'||isMe)) acts += `<button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
+      <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote':'Promote'}</button>
+      <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>`;
     return `<tr>
       <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
       <td>${roleTag}</td>
-      <td>${u.session_count||0} sessions</td>
-      <td>${lastLogin}</td>
-      <td>${actions}</td>
+      <td>${grpCell}</td>
+      <td>${u.session_count||0}</td>
+      <td style="font-size:.72rem">${ll}</td>
+      <td><div class="users-actions">${acts}</div></td>
     </tr>`;
   }).join('');
-  const html = `<div class="settings-section">
-    <div class="pf-banner">Admins can create new users. Each user has their own isolated <code>CLAUDE_CONFIG_DIR</code>, messages history, and tmux sessions. Non-admins cannot see other users' data.</div>
+  const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="openContextEditor('group','${esc(g.id)}','${esc(g.name)}');return false">ctx</a> <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
+  document.getElementById('settings-content').innerHTML = `<div class="settings-section">
+    <div class="pf-banner">Create users, place them in work groups, and view/edit each user's &amp; group's context files (CLAUDE.md, skills, MEMORY.md, settings.json…). Each user has an isolated config + history.</div>
     <div class="users-new-bar">
       <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
       <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
-      <select id="users-new-role">
-        <option value="user">user</option>
-        <option value="admin">admin</option>
-      </select>
+      <select id="users-new-role"><option value="user">user</option><option value="admin">admin</option></select>
+      <select id="users-new-group">${_groupOpts('')}</select>
       <button onclick="createUserFromForm()">+ Create user</button>
     </div>
+    <div class="users-new-bar" style="margin-top:8px;flex-wrap:wrap">
+      <input id="new-group-name" placeholder="new work group name" autocomplete="off">
+      <button onclick="createGroup()">+ Group</button>
+      <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
+    </div>
     <table class="users-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Sessions</th><th>Last login</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="5" class="history-empty">No users yet.</td></tr>'}</tbody>
+      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="history-empty">No users yet.</td></tr>'}</tbody>
     </table>
   </div>`;
-  document.getElementById('settings-content').innerHTML = html;
+}
+
+async function setUserGroup(userId, group){
+  try{ await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group})}); }
+  catch(e){ alert('Failed to set group'); }
+}
+async function createGroup(){
+  const el=document.getElementById('new-group-name'); const name=(el&&el.value||'').trim();
+  if(!name){ alert('Enter a group name'); return; }
+  const r=await fetch(BASE+'/api/admin/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const d=await r.json(); if(!r.ok){ alert(d.error||'Failed'); return; } loadUsersAdmin();
+}
+async function deleteGroup(id,name){
+  if(!confirm('Delete group "'+name+'"? Members will be unassigned (their per-user context stays).')) return;
+  await fetch(BASE+'/api/admin/groups/'+encodeURIComponent(id),{method:'DELETE'}); loadUsersAdmin();
 }
 
 async function createUserFromForm(){
   const username = (document.getElementById('users-new-username')||{}).value || '';
   const password = (document.getElementById('users-new-password')||{}).value || '';
   const role = (document.getElementById('users-new-role')||{}).value || 'user';
+  const group = (document.getElementById('users-new-group')||{}).value || '';
   if(!username.trim() || password.length<6){
     alert('Username + at least 6-character password required.');
     return;
@@ -11876,12 +12366,97 @@ async function createUserFromForm(){
   try{
     const resp = await fetch(BASE+'/api/admin/users', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username:username.trim(), password, role})
+      body: JSON.stringify({username:username.trim(), password, role, group})
     });
     const data = await resp.json();
     if(!resp.ok){ alert(data.error||'Failed to create user'); return; }
     loadUsersAdmin();
   }catch(e){ alert('Failed: '+e.message); }
+}
+
+// ── Admin: context-file editor (per user / per group) ──
+let _ctxState={scope:'user',ident:'',label:'',cur:''};
+async function openContextEditor(scope, ident, label){
+  _ctxState={scope,ident,label,cur:''};
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>Context files — ${esc(label)} <span class="muted">(${scope})</span></h3><p class="conn-note">Loading…</p>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  await _ctxRefresh();
+}
+async function _ctxRefresh(){
+  const {scope,ident}=_ctxState;
+  let d; try{ const r=await fetch(`${BASE}/api/admin/context/${scope}/${encodeURIComponent(ident)}`); d=await r.json(); if(!r.ok)throw new Error(d.error); }
+  catch(e){ document.getElementById('modal-content').innerHTML=`<h3>Context files</h3><p class="conn-note">Failed: ${esc(e.message||e)}</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`; return; }
+  const files=d.files||[];
+  const list=files.map(f=>`<div class="ctx-file ${f.path===_ctxState.cur?'active':''}" onclick="_ctxOpen('${esc(f.path)}')">${esc(f.path)}</div>`).join('')||'<div class="ctx-file muted">No files.</div>';
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>Context files — ${esc(_ctxState.label)} <span class="muted">(${_ctxState.scope})</span></h3>
+    <p class="conn-note">All files that shape Claude's behaviour. Edits apply to this ${_ctxState.scope}. Add a new file with the box below (e.g. <code>skills/mytool/SKILL.md</code>).</p>
+    <div class="ctx-wrap">
+      <div class="ctx-files">${list}</div>
+      <div class="ctx-edit">
+        <div id="ctx-editarea"><p class="conn-note">Select a file on the left, or add one below.</p></div>
+      </div>
+    </div>
+    <div class="users-new-bar" style="margin-top:10px">
+      <input id="ctx-newpath" placeholder="new file path e.g. skills/foo/SKILL.md" autocomplete="off" style="flex:1">
+      <button onclick="_ctxNew()">+ Add file</button>
+      <button class="modal-cancel" onclick="closeModal()">Close</button>
+    </div>`;
+  if(_ctxState.cur) _ctxOpen(_ctxState.cur);
+}
+async function _ctxOpen(path){
+  _ctxState.cur=path;
+  document.querySelectorAll('.ctx-file').forEach(el=>el.classList.toggle('active', el.textContent===path));
+  const {scope,ident}=_ctxState;
+  const area=document.getElementById('ctx-editarea'); if(area) area.innerHTML='<p class="conn-note">Loading…</p>';
+  let d; try{ const r=await fetch(`${BASE}/api/admin/context/${scope}/${encodeURIComponent(ident)}/file?path=${encodeURIComponent(path)}`); d=await r.json(); if(!r.ok)throw new Error(d.error); }
+  catch(e){ if(area)area.innerHTML=`<p class="conn-note">Failed: ${esc(e.message||e)}</p>`; return; }
+  if(!area)return;
+  area.innerHTML=`<textarea id="ctx-content" spellcheck="false">${esc(d.content||'')}</textarea>
+    <div class="modal-actions" style="margin-top:8px">
+      <button class="danger modal-cancel" onclick="_ctxDelete('${esc(path)}')">Delete</button>
+      <button class="modal-confirm-create" onclick="_ctxSave()">Save ${esc(path)}</button>
+    </div>`;
+}
+async function _ctxSave(){
+  const ta=document.getElementById('ctx-content'); if(!ta)return;
+  const {scope,ident,cur}=_ctxState;
+  const r=await fetch(`${BASE}/api/admin/context/${scope}/${encodeURIComponent(ident)}/file`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:cur,content:ta.value})});
+  const d=await r.json(); if(!r.ok){ alert(d.error||'Save failed'); return; }
+  const btn=document.querySelector('#ctx-editarea .modal-confirm-create'); if(btn){const o=btn.textContent;btn.textContent='Saved ✓';setTimeout(()=>btn.textContent=o,1500);}
+}
+async function _ctxNew(){
+  const el=document.getElementById('ctx-newpath'); const p=(el&&el.value||'').trim(); if(!p){alert('Enter a file path');return;}
+  _ctxState.cur=p; await _ctxRefresh();
+  const area=document.getElementById('ctx-editarea');
+  if(area) area.innerHTML=`<textarea id="ctx-content" spellcheck="false"></textarea>
+    <div class="modal-actions" style="margin-top:8px"><button class="modal-confirm-create" onclick="_ctxSave()">Create ${esc(p)}</button></div>`;
+}
+async function _ctxDelete(path){
+  if(!confirm('Delete '+path+'?')) return;
+  const {scope,ident}=_ctxState;
+  await fetch(`${BASE}/api/admin/context/${scope}/${encodeURIComponent(ident)}/file?path=${encodeURIComponent(path)}`,{method:'DELETE'});
+  _ctxState.cur=''; _ctxRefresh();
+}
+
+// ── Admin: view a user's full history ──
+async function openUserHistory(userId, username){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>History — ${esc(username)}</h3><p class="conn-note">Loading…</p>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  let d; try{ const r=await fetch(`${BASE}/api/admin/users/${encodeURIComponent(userId)}/history`); d=await r.json(); if(!r.ok)throw new Error(d.error); }
+  catch(e){ modal.innerHTML=`<h3>History — ${esc(username)}</h3><p class="conn-note">Failed: ${esc(e.message||e)}</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`; return; }
+  const ss=d.sessions||[];
+  const rows=ss.map(s=>`<div class="approval-row"><div class="approval-meta"><b>${esc(s.session_name)}</b> ${s.is_live?'<span class="pill-approved">live</span>':''} · ${s.user_message_count||0} msgs · ${s.last_message_at?timeAgo(s.last_message_at):'—'}</div>${s.key_info?`<div class="muted" style="font-size:.78rem">${esc((s.key_info||'').slice(0,160))}</div>`:''}<div class="approval-actions"><button class="btn-approve" onclick="_userHistDetail('${esc(userId)}','${esc(s.session_name)}','${esc(username)}')">View transcript</button></div></div>`).join('')||'<p class="conn-note">No history.</p>';
+  modal.innerHTML=`<h3>History — ${esc(username)}</h3><p class="conn-note">All of this user's sessions (live + past).</p>${rows}<div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+}
+async function _userHistDetail(userId, session, username){
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML=`<h3>${esc(session)} — ${esc(username)}</h3><p class="conn-note">Loading…</p>`;
+  let d; try{ const r=await fetch(`${BASE}/api/admin/users/${encodeURIComponent(userId)}/history/${encodeURIComponent(session)}`); d=await r.json(); if(!r.ok)throw new Error(d.error);}catch(e){modal.innerHTML=`<p class="conn-note">Failed: ${esc(e.message||e)}</p>`;return;}
+  const msgs=(d.messages||[]).map(m=>{const role=(m.role||'?');const cls=role==='user'?'pill-approved':'';return `<div class="approval-row"><div class="approval-meta ${cls}">${esc(role)} · ${m.ts?timeAgo(m.ts):''}</div><pre>${esc((m.text||m.content||'')+'')}</pre></div>`;}).join('')||'<p class="conn-note">No messages.</p>';
+  modal.innerHTML=`<h3>${esc(session)} — ${esc(username)}</h3>${d.key_info?`<p class="conn-note">Key info: ${esc(d.key_info)}</p>`:''}${msgs}<div class="modal-actions"><button class="modal-cancel" onclick="openUserHistory('${esc(userId)}','${esc(username)}')">← Back</button><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
 }
 
 async function resetUserPassword(userId, username){
@@ -13017,6 +13592,91 @@ HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
+
+
+# ===========================================================================
+# Catch-all routes for public projects + per-user project lists. Registered
+# LAST so every literal/api route takes precedence over these path params.
+# ===========================================================================
+_PROJECTS_PAGE_CSS = (
+    "body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0d1117;color:#e6edf3;"
+    "max-width:820px;margin:40px auto;padding:0 20px}a{color:#58a6ff;text-decoration:none}"
+    "a:hover{text-decoration:underline}h1{font-size:1.3rem}.muted{color:#8b949e;font-size:.85rem}"
+    "li{margin:7px 0;list-style:none}ul{padding:0}.grp{margin-top:18px;color:#79c0ff;font-weight:600}"
+    ".card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 22px;margin-top:16px}"
+    ".open{font-size:.72rem;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:1px 6px;margin-left:8px}"
+)
+
+
+def _projects_page_html(title: str, rows):
+    items = "".join(
+        '<li><a href="/%s/%s">dianaotech.com/%s/%s</a> <span class="open">open ↗</span></li>' % (u, p, u, p)
+        for (u, p) in rows) or '<li class="muted">No projects yet. Ask Claude in a session to build something — it gets published here.</li>'
+    return ("<!doctype html><html><head><meta charset=utf-8><title>%s · %s</title>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<style>%s</style></head><body><h1>%s</h1>"
+            "<div class=card><ul>%s</ul></div>"
+            "<p class=muted>%s — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
+            "</body></html>") % (title, BRAND_NAME, _PROJECTS_PAGE_CSS, title, items, BRAND_NAME)
+
+
+@app.get("/{username}", response_class=HTMLResponse)
+async def user_projects_page(request: Request, username: str):
+    if username in _RESERVED_TOP or "." in username:
+        return HTMLResponse("Not found", status_code=404)
+    target = _find_user_by_username(username)
+    if not target:
+        return HTMLResponse("Not found", status_code=404)
+    viewer = _current_user(request)
+    if not viewer:
+        return HTMLResponse(LOGIN_PAGE, status_code=401)
+    is_admin = _is_admin(viewer)
+    if viewer.get("id") != target["id"] and not is_admin:
+        return HTMLResponse("Forbidden — you can only view your own projects.", status_code=403)
+    # An admin visiting an admin's page gets the master list of everyone's projects.
+    if is_admin and _is_admin(target):
+        rows = []
+        for u in sorted(_load_users(), key=lambda x: x.get("username", "")):
+            for proj in _list_projects(u.get("username", "")):
+                rows.append((u["username"], proj))
+        return HTMLResponse(_projects_page_html("All projects (admin)", rows))
+    rows = [(username, proj) for proj in _list_projects(username)]
+    return HTMLResponse(_projects_page_html(username + "'s projects", rows))
+
+
+@app.api_route("/{username}/{project}", methods=["GET", "POST"])
+@app.api_route("/{username}/{project}/{subpath:path}", methods=["GET", "POST"])
+async def serve_project(request: Request, username: str, project: str, subpath: str = ""):
+    if username in _RESERVED_TOP:
+        return HTMLResponse("Not found", status_code=404)
+    pdir = _project_dir(username, project)
+    if pdir is None or not pdir.exists():
+        return HTMLResponse("Project not found. (Served from ~/nemo-projects/%s/%s/)" % (username, project),
+                            status_code=404)
+    serve_cfg = pdir / ".serve.json"
+    if serve_cfg.exists():
+        try:
+            port = int(json.loads(serve_cfg.read_text()).get("port", 0))
+        except Exception:
+            port = 0
+        if port:
+            return await _proxy_to_port(request, port, subpath)
+    rel = subpath or "index.html"
+    target = (pdir / rel).resolve()
+    try:
+        target.relative_to(pdir.resolve())
+    except ValueError:
+        return HTMLResponse("Forbidden", status_code=403)
+    if target.is_dir():
+        target = target / "index.html"
+    if not target.exists():
+        idx = pdir / "index.html"
+        target = idx if idx.exists() else None
+    if not target or not target.exists():
+        return HTMLResponse("Not found", status_code=404)
+    mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+    return FileResponse(str(target), media_type=mime)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
