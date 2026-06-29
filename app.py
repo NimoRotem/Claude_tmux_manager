@@ -197,6 +197,16 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
                 await asyncio.sleep(0.2)
         except Exception:
             logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
+        # Re-apply clean shared-API-key auth for member sessions before relaunch so
+        # an accidental /login (which writes a stray .credentials.json that overrides
+        # apiKeyHelper and causes a 401) self-heals on the next claude start.
+        try:
+            if _stored_anthropic_key:
+                _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
+                if _owner and not _is_admin(_owner):
+                    _apply_api_key_auth(_user_claude_config_dir(_owner))
+        except Exception:
+            logger.debug("Failed to re-apply api-key auth on relaunch", exc_info=True)
         # Relaunch Claude on the bare shell, resuming the prior conversation.
         resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
         launch = ("NODE_OPTIONS=--max-old-space-size=8192 "
