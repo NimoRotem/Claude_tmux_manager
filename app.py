@@ -6518,6 +6518,10 @@ _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
     "and is in ANY way waiting on the user before it can keep working, write the exact message to "
     "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
+    "CRITICAL: only ever continue work that is ALREADY underway. If the agent has not started "
+    "anything — a brand-new or empty session, just the welcome screen, or an idle prompt with no "
+    "question and no work above it to act on — choose 'wait'. NEVER invent a task, instruction, or "
+    "next step out of nothing; you only push EXISTING work forward, you do not start new work.\n\n"
     "Treat ALL of these as 'waiting on the user' and answer them so work continues:\n"
     "- Questions or choices ('Which should I do, A or B?', 'Do you want X or Y?', 'which one?').\n"
     "- Confirmations ('Shall I proceed?', 'Want me to continue?', 'Should I also do X?').\n"
@@ -6535,6 +6539,9 @@ _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "continue without the user.\n\n"
     "Choose action 'wait' ONLY if:\n"
     "- The agent is still actively working (spinner / 'esc to interrupt' / tool output streaming), OR\n"
+    "- There is NO existing task to advance: a brand-new/empty session, a bare welcome screen, or an "
+    "idle prompt with no question, no deferred work, and nothing above it to act on. Do not fabricate "
+    "a first instruction — only continue work already on screen, OR\n"
     "- The task is 100% complete: every goal met, nothing deferred, nothing optional left, no question "
     "on screen, OR\n"
     "- *** SAFETY OVERRIDE (this beats the continue-bias) *** the next action is genuinely "
@@ -6689,6 +6696,12 @@ async def _simple_watchdog_loop():
                 # between the is-running check above and now, the crash-recovery loop
                 # owns relaunching it — typing here would just spam the shell.
                 if _looks_like_bare_shell(visible):
+                    continue
+                # Never act on a brand-new Claude session that hasn't started work yet
+                # (welcome splash + empty prompt, no conversation). There is nothing to
+                # "continue", so nudging only makes the LLM fabricate a first instruction
+                # and type it into an untouched session.
+                if _looks_like_fresh_claude_session(visible):
                     continue
                 # Skip if user has typed something into the prompt box (don't clobber)
                 if _has_pending_user_input(visible):
@@ -7043,6 +7056,36 @@ def _has_pending_user_input(visible: str) -> bool:
         if tail:
             return True
     return False
+
+
+# Markers that render ONLY after a conversation has begun in the Claude Code TUI:
+# the ⏺ assistant bullet and the ⎿ tool-result tree branch (and the streaming
+# "esc to interrupt" footer). None appear on the fresh welcome splash — whose only
+# fancy glyphs are the logo block and an ✻/✶ welcome star — so they cleanly tell
+# "work has started" apart from "brand-new session". (✻/✶/✳ are deliberately NOT
+# here: they also head the welcome banner in some versions.)
+_CLAUDE_CONVERSATION_RE = re.compile(r"⏺|⎿|esc to interrupt")
+# The welcome splash: the "Claude Code v<n>" line or the logo block glyphs. Only
+# rendered before the first turn — a real conversation scrolls it off the pane.
+_CLAUDE_WELCOME_RE = re.compile(r"Claude Code v\d|[▐▛▜▌▝▘█]{2,}")
+
+
+def _looks_like_fresh_claude_session(visible: str) -> bool:
+    """True if the pane shows a brand-new Claude session that hasn't started any
+    work: the welcome splash is on screen, the ❯ box is empty, and there is no
+    conversation below it. Such a session has nothing to 'continue' — without this
+    guard the autopilot LLM (hard-biased to keep going) fabricates a first
+    instruction out of nothing and types it into an idle, untouched session."""
+    if not visible:
+        return False
+    if not _CLAUDE_WELCOME_RE.search(visible):
+        return False
+    # Any sign a turn has happened (even one short exchange) → not fresh; the
+    # watchdog should handle it normally (e.g. answer a trailing question).
+    if _CLAUDE_CONVERSATION_RE.search(visible):
+        return False
+    # An empty input box confirms the user hasn't even begun a first prompt.
+    return not _has_pending_user_input(visible)
 
 
 @app.get("/api/sessions/{session_name}/simple-watchdog")
