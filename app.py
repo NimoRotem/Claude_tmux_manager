@@ -9332,6 +9332,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
 .modal-overlay.active{display:flex}
 .modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;min-width:340px;max-width:440px}
+.modal.modal-wide{max-width:min(1180px,94vw);width:min(1180px,94vw);max-height:92vh;overflow:auto}
 .modal h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem}
 .modal p{color:#8b949e;font-size:.9rem;margin-bottom:16px;line-height:1.5}
 .modal-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 12px;font-size:.9rem;margin-bottom:16px;outline:none}
@@ -9423,12 +9424,12 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
 .users-actions button.imp{background:#1f6feb22;border:1px solid #1f6feb88;color:#79c0ff}
 .create-spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:nemospin .8s linear infinite;margin:18px auto}
 @keyframes nemospin{to{transform:rotate(360deg)}}
-.ctx-wrap{display:flex;gap:12px;min-height:340px}
-.ctx-files{width:230px;flex:none;border:1px solid #30363d;border-radius:8px;overflow:auto;max-height:440px;background:#0d1117}
+.ctx-wrap{display:flex;gap:12px;min-height:min(62vh,560px)}
+.ctx-files{width:230px;flex:none;border:1px solid #30363d;border-radius:8px;overflow:auto;max-height:min(62vh,560px);background:#0d1117}
 .ctx-file{padding:7px 10px;font-size:.8rem;color:#c9d1d9;cursor:pointer;border-bottom:1px solid #161b22;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ctx-file:hover{background:#161b22}.ctx-file.active{background:#1f6feb33;color:#fff}
 .ctx-edit{flex:1;display:flex;flex-direction:column}
-.ctx-edit textarea{flex:1;min-height:340px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-family:monospace;font-size:.82rem;padding:10px;white-space:pre}
+.ctx-edit textarea{flex:1;width:100%;min-height:min(58vh,520px);background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-family:monospace;font-size:.82rem;padding:10px;white-space:pre-wrap;word-break:break-word}
 .proj-link{display:inline-flex;align-items:center;gap:6px;font-size:.74rem;color:#3fb950;border:1px solid #2ea04340;background:#2ea04314;border-radius:6px;padding:3px 9px;margin-left:8px;text-decoration:none}
 .proj-link:hover{background:#2ea04326}
 .users-table td .grp-sel{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;font-size:.75rem;padding:3px 6px}
@@ -11366,7 +11367,7 @@ function startLoginHealthPolling(){
 }
 startLoginHealthPolling();
 
-function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
+function closeModal(){document.getElementById('modal-overlay').classList.remove('active');const c=document.getElementById('modal-content');if(c)c.classList.remove('modal-wide')}
 
 function showCreateModal(){
   const modal=document.getElementById('modal-content');
@@ -12935,6 +12936,7 @@ let _ctxState={scope:'user',ident:'',label:'',cur:''};
 async function openContextEditor(scope, ident, label){
   _ctxState={scope,ident,label,cur:''};
   const modal=document.getElementById('modal-content');
+  modal.classList.add('modal-wide');
   modal.innerHTML=`<h3>Context files — ${esc(label)} <span class="muted">(${scope})</span></h3><p class="conn-note">Loading…</p>`;
   document.getElementById('modal-overlay').classList.add('active');
   await _ctxRefresh();
