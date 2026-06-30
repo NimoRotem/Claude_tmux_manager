@@ -7569,7 +7569,12 @@ def _find_session_jsonl_files(session_name: str) -> list:
         return []
     # Claude Code sanitizes paths: replaces all non-alphanumeric chars with hyphens
     sanitized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-    projects_base = Path.home() / ".claude" / "projects"
+    # Use the session's OWN config dir as the transcript root. Team members run
+    # in an isolated ~/.claude-user-<id>/ where their Claude writes transcripts;
+    # the admin's ~/.claude would surface a different user's transcripts (or none),
+    # which is why member Chat tabs showed no summary. Admin sessions resolve to
+    # ~/.claude, so this is a no-op on non-team hosts.
+    projects_base = _session_config_base(session_name) / "projects"
     # Try exact match first, then fallback to glob match
     project_dir = str(projects_base / sanitized)
     if not os.path.isdir(project_dir):
