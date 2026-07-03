@@ -143,6 +143,50 @@ def _load_simple_watchdog_disabled():
         logger.debug("Failed to load simple-watchdog disabled list", exc_info=True)
 
 
+# --- Auto-push mode (per session): "off" | "basic" | "full" ---
+# Governs how much the dashboard is allowed to type into a session's terminal on
+# the user's behalf when Claude stops or waits:
+#   off   — never write anything at all (no option-picking, no Enter on prompts,
+#           no auto /login, no free-form "keep going" messages).
+#   basic — auto-pick from Claude's option menus and confirm permission/plan
+#           prompts (press Enter), and keep the session logged in. Does NOT type
+#           any free-form instructions.
+#   full  — everything in "basic" PLUS the autopilot watchdog that composes and
+#           types a "keep going" message when Claude pauses waiting on the user
+#           before a task is finished. (This was the previous always-on behavior.)
+# New sessions default to "basic". Persisted per session to disk.
+AUTOPUSH_MODES = ("off", "basic", "full")
+AUTOPUSH_DEFAULT = "basic"
+AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
+_autopush_mode: Dict[str, str] = {}
+
+
+def _get_autopush_mode(session_name: str) -> str:
+    m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
+    return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
+
+
+def _save_autopush_mode():
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        AUTOPUSH_MODE_FILE.write_text(json.dumps(_autopush_mode))
+    except Exception:
+        logger.debug("Failed to save autopush-mode map", exc_info=True)
+
+
+def _load_autopush_mode():
+    global _autopush_mode
+    try:
+        if AUTOPUSH_MODE_FILE.exists():
+            data = json.loads(AUTOPUSH_MODE_FILE.read_text())
+            if isinstance(data, dict):
+                _autopush_mode = {
+                    str(k): v for k, v in data.items() if v in AUTOPUSH_MODES
+                }
+    except Exception:
+        logger.debug("Failed to load autopush-mode map", exc_info=True)
+
+
 def _is_claude_running(session_name: str) -> bool:
     """Check if Claude Code process is running in the session (not just a bare shell).
 
@@ -287,9 +331,10 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(task)
     logger.info("Auto-responder background task started")
     _load_simple_watchdog_disabled()
+    _load_autopush_mode()
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
-    logger.info("Simple watchdog started (disabled for %d sessions)", len(_simple_watchdog_disabled))
+    logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
 
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
@@ -4175,7 +4220,8 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
+        "autopush_mode": _get_autopush_mode(sess["name"]),
+        "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
         "model": _get_session_model(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
     }
@@ -4243,7 +4289,8 @@ async def api_sessions_fast(request: Request):
             "activity_command": activity.get("command", ""),
             "activity_detail": activity.get("detail", ""),
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
-        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
+            "autopush_mode": _get_autopush_mode(sess["name"]),
+            "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             "model": _get_session_model(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
         })
@@ -4286,7 +4333,8 @@ async def api_status(request: Request):
             "name": sess["name"],
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
-        "simple_watchdog": sess["name"] not in _simple_watchdog_disabled,
+            "autopush_mode": _get_autopush_mode(sess["name"]),
+            "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             "model": _get_session_model(sess["name"]),
         })
     return JSONResponse(out)
@@ -8161,6 +8209,9 @@ async def _auto_responder_loop():
             now = time.time()
             for sess in sessions_list:
                 name = sess["name"]
+                # Auto-push "off" means never type anything into this terminal.
+                if _get_autopush_mode(name) == "off":
+                    continue
                 # Check cooldown
                 last = _auto_respond_cooldown.get(name, 0)
                 if now - last < _AUTO_RESPOND_COOLDOWN:
@@ -8425,8 +8476,10 @@ async def _simple_watchdog_loop():
             now = time.time()
             for sess in sessions_list:
                 name = sess["name"]
-                # Per-session opt-out
-                if name in _simple_watchdog_disabled:
+                # Free-form "keep going" nudges only run in FULL auto-push mode.
+                # ("off"/"basic" leave the composing watchdog idle; basic still
+                # gets option-picking + prompt confirms via the auto-responder.)
+                if _get_autopush_mode(name) != "full":
                     _simple_watchdog_state.pop(name, None)
                     continue
                 # Don't fire if Claude isn't even running
@@ -8579,6 +8632,9 @@ async def _login_watchdog_loop():
             now = time.time()
             for sess in sessions_list:
                 name = sess["name"]
+                # Auto-push "off" means fully hands-off — don't even auto /login.
+                if _get_autopush_mode(name) == "off":
+                    continue
                 state = _login_watchdog_state.setdefault(name, {})
                 if now - state.get("last_action", 0) < _LOGIN_WATCHDOG_COOLDOWN:
                     continue
@@ -8901,12 +8957,54 @@ def _looks_like_fresh_claude_session(visible: str) -> bool:
     return not _has_pending_user_input(visible)
 
 
+@app.get("/api/sessions/{session_name}/autopush")
+async def api_autopush_status(session_name: str):
+    """Return the per-session auto-push mode ('off'|'basic'|'full') + recent log."""
+    return JSONResponse({
+        "mode": _get_autopush_mode(session_name),
+        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+    })
+
+
+class AutopushBody(BaseModel):
+    mode: str
+
+
+@app.post("/api/sessions/{session_name}/autopush")
+async def api_autopush_set(session_name: str, body: AutopushBody):
+    """Set the per-session auto-push mode.
+
+    off   — the dashboard never types into this terminal.
+    basic — auto-pick option menus + confirm permission/plan prompts + keep the
+            session logged in (no free-form messages).
+    full  — everything in basic, plus auto-compose a "keep going" nudge when
+            Claude pauses waiting on the user before a task is finished.
+    """
+    mode = (body.mode or "").strip().lower()
+    if mode not in AUTOPUSH_MODES:
+        return JSONResponse(
+            {"error": f"mode must be one of {list(AUTOPUSH_MODES)}"}, status_code=400
+        )
+    _autopush_mode[session_name] = mode
+    _save_autopush_mode()
+    # Anything below "full" stops the free-form watchdog right away.
+    if mode != "full":
+        _simple_watchdog_state.pop(session_name, None)
+    return JSONResponse({
+        "mode": mode,
+        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+    })
+
+
+# --- Legacy simple-watchdog endpoints. Kept for back-compat and now mapped onto
+# the auto-push mode: "enabled" == full, "disabled" == basic. ---
 @app.get("/api/sessions/{session_name}/simple-watchdog")
 async def api_simple_watchdog_status(session_name: str):
-    """Return per-session simple-watchdog state."""
-    enabled = session_name not in _simple_watchdog_disabled
+    """Return per-session simple-watchdog state (legacy shape)."""
+    mode = _get_autopush_mode(session_name)
     return JSONResponse({
-        "enabled": enabled,
+        "enabled": mode == "full",
+        "mode": mode,
         "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
     })
 
@@ -8917,18 +9015,15 @@ class SimpleWatchdogBody(BaseModel):
 
 @app.post("/api/sessions/{session_name}/simple-watchdog")
 async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody):
-    """Enable/disable the simple watchdog for a session. Default is enabled."""
-    if body.enabled:
-        if session_name in _simple_watchdog_disabled:
-            _simple_watchdog_disabled.discard(session_name)
-            _save_simple_watchdog_disabled()
-    else:
-        if session_name not in _simple_watchdog_disabled:
-            _simple_watchdog_disabled.add(session_name)
-            _save_simple_watchdog_disabled()
+    """Enable/disable the free-form watchdog (legacy). Maps to auto-push full/basic."""
+    mode = "full" if body.enabled else "basic"
+    _autopush_mode[session_name] = mode
+    _save_autopush_mode()
+    if mode != "full":
         _simple_watchdog_state.pop(session_name, None)
     return JSONResponse({
-        "enabled": session_name not in _simple_watchdog_disabled,
+        "enabled": mode == "full",
+        "mode": mode,
         "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
     })
 
@@ -9315,6 +9410,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .watchdog-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:120px;overflow-y:auto;scrollbar-width:thin}
 .watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
 .watchdog-log-entry .watchdog-ts{color:#56d364}
+/* Auto-push 3-way segmented control (off / basic / full) */
+.autopush-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
+.autopush-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
+.autopush-seg button:last-child{border-right:none}
+.autopush-seg button:hover{background:#161b22;color:#c9d1d9}
+.autopush-seg button.active{color:#fff;font-weight:600}
+.autopush-seg button.ap-off.active{background:#484f58}
+.autopush-seg button.ap-basic.active{background:#1f6feb}
+.autopush-seg button.ap-full.active{background:#238636}
+.tab-more-menu .autopush-seg{margin:2px 16px 4px}
+.tab-more-menu .autopush-seg button{padding:4px 11px;font-size:.72rem}
 
 /* Footer */
 .detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
@@ -10265,6 +10371,9 @@ function renderDetail(){
         <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
           ${s.model?`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}">${formatModelName(s.model)}</span></div><div class="tab-more-model-sep"></div></div>`:''}
+          <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
+          ${autopushSeg(s.name, s.autopush_mode, true)}
+          <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
           ${NEMO_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
@@ -10417,17 +10526,14 @@ function renderDetail(){
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Output (<code style="color:#79c0ff">⎿</code>) stays. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#56d364"></span>Simple Watchdog</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="watchdog-toggle">
-            <input type="checkbox" id="watchdog-toggle-${s.name}"
-              onchange="toggleSimpleWatchdog('${esc(s.name)}',this.checked)"
-              ${s.simple_watchdog!==false?'checked':''}>
-            <span class="watchdog-toggle-slider"></span>
-          </label>
-          <span id="watchdog-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.simple_watchdog!==false?'Watching':'Off'}</span>
+        <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
+        <div style="margin-top:8px">${autopushSeg(s.name, s.autopush_mode, false)}</div>
+        <div id="autopush-status-${s.name}" style="font-size:.82rem;color:#8b949e;margin-top:8px">${autopushDesc(s.autopush_mode)}</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.5">
+          <b style="color:#8b949e">Off</b> — the dashboard never types into this terminal.<br>
+          <b style="color:#79c0ff">Basic</b> — auto-selects from Claude's option menus and confirms permission/plan prompts (presses Enter), and keeps the session logged in. No free-form messages.<br>
+          <b style="color:#56d364">Full</b> — everything in Basic, plus it writes a "keep going" instruction when Claude pauses or seems to stop before the task is 100% finished.
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Claude is paused waiting for confirmation to keep going on the current task.</div>
         <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
       </div>
       <div class="detail-footer" style="margin-top:24px">
@@ -10477,7 +10583,7 @@ function renderDetail(){
   }
   if(tab==='info'){
     startStatsPolling(s.name);
-    if(s.simple_watchdog!==false)startWatchdogPolling(s.name);
+    if((s.autopush_mode||'basic')==='full')startWatchdogPolling(s.name);
     else loadWatchdogStatus(s.name);
   }
   if(tab==='skills')loadProfileSkills(s.name);
@@ -10520,7 +10626,7 @@ function switchTab(name,tab){
   if(tab==='info'){
     startStatsPolling(name);
     const s=sessions.find(x=>x.name===name);
-    if(s&&s.simple_watchdog!==false)startWatchdogPolling(name);
+    if(s&&(s.autopush_mode||'basic')==='full')startWatchdogPolling(name);
     else loadWatchdogStatus(name);
   }
   if(tab==='skills')loadProfileSkills(name);
@@ -11915,32 +12021,73 @@ function stopStatsPolling(){
   _statsTimers={};
 }
 
-// ── Simple Watchdog ──
+// ── Auto-push (auto-responder + autopilot watchdog) ──
 let _watchdogTimers={};
-async function toggleSimpleWatchdog(name,enabled){
-  const statusEl=document.getElementById('watchdog-status-'+name);
-  if(statusEl)statusEl.textContent=enabled?'Enabling...':'Disabling...';
+const AUTOPUSH_TITLES={
+  off:'Off — the dashboard never types into this terminal',
+  basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
+  full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
+};
+function autopushDesc(mode){
+  return ({off:'Off — no auto-typing',
+           basic:'Basic — picks options + confirms prompts',
+           full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
+}
+// Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
+function autopushSeg(name,mode,compact){
+  mode=mode||'basic';
+  const b=(m,label)=>'<button type="button" class="ap-'+m+(mode===m?' active':'')+'" title="'+
+    esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
+    esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
+  return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
+    b('off','Off')+b('basic','Basic')+b('full','Full')+'</div>';
+}
+// Reflect a mode across every rendered control for this session (More menu + Info tab).
+function syncAutopushUI(name,mode){
+  mode=mode||'basic';
+  document.querySelectorAll('.autopush-seg').forEach(seg=>{
+    if(seg.dataset.name!==name)return;
+    seg.querySelectorAll('button').forEach(btn=>{
+      btn.classList.toggle('active',btn.classList.contains('ap-'+mode));
+    });
+  });
+  const st=document.getElementById('autopush-status-'+name);
+  if(st)st.textContent=autopushDesc(mode);
+}
+async function setAutopush(name,mode){
+  const idx=sessions.findIndex(s=>s.name===name);
+  const prev=(idx>=0?sessions[idx].autopush_mode:'basic')||'basic';
+  if(mode===prev){syncAutopushUI(name,mode);return;}
+  if(idx>=0)sessions[idx].autopush_mode=mode;   // optimistic
+  syncAutopushUI(name,mode);
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/simple-watchdog',{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/autopush',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
+      body:JSON.stringify({mode:mode})
     });
     const data=await resp.json();
-    if(resp.ok){
-      const idx=sessions.findIndex(s=>s.name===name);
-      if(idx>=0)sessions[idx].simple_watchdog=data.enabled;
-      if(statusEl)statusEl.textContent=data.enabled?'Watching':'Off';
-      if(data.enabled)startWatchdogPolling(name);
+    if(resp.ok&&data.mode){
+      if(idx>=0)sessions[idx].autopush_mode=data.mode;
+      syncAutopushUI(name,data.mode);
+      renderWatchdogLog(name,data.log);
+      if(data.mode==='full')startWatchdogPolling(name);
       else stopWatchdogPolling(name);
     }else{
-      if(statusEl)statusEl.textContent='Failed';
-      const tog=document.getElementById('watchdog-toggle-'+name);
-      if(tog)tog.checked=!enabled;
+      if(idx>=0)sessions[idx].autopush_mode=prev;
+      syncAutopushUI(name,prev);
     }
   }catch(e){
-    if(statusEl)statusEl.textContent='Error';
-    const tog=document.getElementById('watchdog-toggle-'+name);
-    if(tog)tog.checked=!enabled;
+    if(idx>=0)sessions[idx].autopush_mode=prev;
+    syncAutopushUI(name,prev);
+  }
+}
+function renderWatchdogLog(name,log){
+  const logEl=document.getElementById('watchdog-log-'+name);
+  if(logEl&&log&&log.length){
+    logEl.innerHTML=log.slice(-10).map(e=>
+      '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
+    ).join('');
+    logEl.scrollTop=logEl.scrollHeight;
   }
 }
 function startWatchdogPolling(name){
@@ -11956,21 +12103,12 @@ function stopAllWatchdogPolling(){
 }
 async function loadWatchdogStatus(name){
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/simple-watchdog');
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/autopush');
     const data=await resp.json();
-    const statusEl=document.getElementById('watchdog-status-'+name);
-    const logEl=document.getElementById('watchdog-log-'+name);
-    const tog=document.getElementById('watchdog-toggle-'+name);
-    if(tog)tog.checked=!!data.enabled;
-    if(statusEl)statusEl.textContent=data.enabled?'Watching':'Off';
-    if(logEl&&data.log&&data.log.length){
-      logEl.innerHTML=data.log.slice(-10).map(e=>
-        '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-      ).join('');
-      logEl.scrollTop=logEl.scrollHeight;
-    }
     const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].simple_watchdog=data.enabled;
+    if(idx>=0)sessions[idx].autopush_mode=data.mode;
+    syncAutopushUI(name,data.mode);
+    renderWatchdogLog(name,data.log);
   }catch(e){}
 }
 
