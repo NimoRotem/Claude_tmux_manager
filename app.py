@@ -776,6 +776,11 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if path in ("/logout", "/logout/", rp + "/logout", rp + "/logout/"):
         return await call_next(request)
+    # SSO verify endpoint for nginx auth_request from sibling knowva.ai apps:
+    # it must return its own 200/401 based on the cookie, NOT the login-page
+    # fallback (auth_request only treats a real 2xx as authenticated).
+    if path.endswith("/api/auth/verify"):
+        return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
         return await call_next(request)
@@ -805,6 +810,19 @@ async def auth_middleware(request: Request, call_next):
         return resp
     request.state._current_user = user
     return await call_next(request)
+
+
+@app.get("/api/auth/verify")
+async def api_auth_verify(request: Request):
+    """SSO check for nginx ``auth_request`` from sibling knowva.ai apps.
+
+    Returns 200 when the shared ``tmux_auth`` cookie is valid, else 401 — so a
+    single login to this dashboard unlocks the other knowva.ai apps (matcher,
+    crypto, zoom, ...) which gate on this endpoint instead of separate logins.
+    """
+    if _user_from_token(request.cookies.get("tmux_auth")):
+        return JSONResponse({"ok": True})
+    return JSONResponse({"ok": False}, status_code=401)
 
 
 # Simple in-memory login rate limiter: (ip, window_start_minute) -> attempt_count
