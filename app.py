@@ -7300,6 +7300,54 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": ""}
 
 
+def _usage_reset_passed(block: object, now_dt: datetime) -> bool:
+    """True if this usage window's ``resets_at`` is already in the past.
+
+    Once a window resets, its cached ``utilization`` is stale — the window has
+    rolled over to a fresh one (utilization ~0). Serving the old value shows a
+    maxed (e.g. 100%) bar for a window that no longer applies.
+    """
+    if not isinstance(block, dict):
+        return False
+    ra = block.get("resets_at")
+    if not ra:
+        return False
+    try:
+        rt = datetime.fromisoformat(str(ra).replace("Z", "+00:00"))
+        if rt.tzinfo is None:
+            rt = rt.replace(tzinfo=timezone.utc)
+        return rt <= now_dt
+    except Exception:
+        return False
+
+
+def _usage_windows_expired(data: object, now_dt: datetime) -> bool:
+    """True if any known usage window in the payload has already reset."""
+    if not isinstance(data, dict):
+        return False
+    return any(_usage_reset_passed(data.get(k), now_dt)
+               for k in ("five_hour", "seven_day"))
+
+
+def _sanitize_expired_windows(data: object, now_dt: datetime) -> object:
+    """Return a copy with utilization zeroed for any window that has reset.
+
+    Used only on the stale-cache fallback (upstream fetch failed) so a rolled-
+    over window never keeps showing its pre-reset peak (e.g. 100%). The real
+    value is unknown but a just-reset window is ~0, never maxed.
+    """
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    for key in ("five_hour", "seven_day"):
+        blk = out.get(key)
+        if isinstance(blk, dict) and _usage_reset_passed(blk, now_dt):
+            nb = dict(blk)
+            nb["utilization"] = 0
+            out[key] = nb
+    return out
+
+
 @app.get("/api/usage/limits")
 async def api_anthropic_usage_limits():
     """Fetch live 5h + 7-day rate-limit utilization from Anthropic OAuth usage API.
@@ -7310,6 +7358,7 @@ async def api_anthropic_usage_limits():
     instead of showing a previous account's usage for up to an hour.
     """
     now = time.time()
+    now_dt = datetime.now(timezone.utc)
     creds_file = Path.home() / ".claude" / ".credentials.json"
     token = ""
     try:
@@ -7320,9 +7369,13 @@ async def api_anthropic_usage_limits():
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
     fp = hashlib.sha1(token.encode()).hexdigest()[:16]
+    # Serve cache only if fresh (<1h), same token, AND none of its windows have
+    # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
+    # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
     if (now - _anthropic_limits_cache["ts"] < 3600
             and _anthropic_limits_cache["data"]
-            and _anthropic_limits_cache.get("fp") == fp):
+            and _anthropic_limits_cache.get("fp") == fp
+            and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
         return JSONResponse(_anthropic_limits_cache["data"])
 
     def _fetch():
@@ -7343,7 +7396,9 @@ async def api_anthropic_usage_limits():
     except Exception as e:
         logger.warning("Anthropic OAuth usage fetch failed: %s", e)
         if _anthropic_limits_cache["data"]:
-            return JSONResponse(_anthropic_limits_cache["data"])
+            # Serve last good payload, but zero out any window that has since
+            # reset so we never show a stale maxed bar on upstream failure.
+            return JSONResponse(_sanitize_expired_windows(_anthropic_limits_cache["data"], now_dt))
         return JSONResponse({"error": "fetch_failed"}, status_code=502)
 
     payload = {"fetched_at": now, **data}
