@@ -10349,15 +10349,24 @@ function _renderUrlSpan(text,start,paneWidth){
 function _renderPathSpan(text,start,paneWidth){
   const pw=Math.max(20,paneWidth||80);
   const wrapCol=pw-4;
+  const minWrap=Math.max(24,Math.floor(pw*0.5));
   const MAX_PATH_LEN=2048;
   const MAX_WRAP_LINES=20;
   // Greedily consume path chars. When we hit whitespace, decide whether it's the
-  // end of the path or just a soft wrap of one long path across TUI rows — the
-  // same situation _renderUrlSpan handles for URLs. A wrap looks like: whitespace
-  // at/after the wrap column, then optional row padding, a newline, and (after
-  // any leading indent on the next row) another path char. Long deliverable
-  // paths Claude prints — e.g. …/GRABO_Schmalz_ ⏎  GRIPSTER_…_2026-07-10.pdf —
-  // routinely break this way, and the file only carries its .ext on the last row.
+  // end of the path or a soft wrap of one long path across TUI rows — the same
+  // situation _renderUrlSpan handles for URLs. Long deliverable paths Claude
+  // prints — e.g. …/GRABO_Schmalz_ ⏎  GRIPSTER_…_2026-07-10.pdf — break this way,
+  // and the file only carries its .ext on the last row.
+  //
+  // Two wrap signals, because Claude Code doesn't always draw to the full pane
+  // width — inside a bordered/indented box the content wraps at a narrower width
+  // than pane_width reports, which used to leave the tail row linked on its own
+  // (a truncated /GRABO_Schmalz_…pdf pointing at nothing):
+  //   strong — the break sits at/after pane_width-4 (flush to the pane); trust it.
+  //   rescue — the path ran flush to a NARROWER row (≤4 trailing pad, row wide
+  //            enough to be real) AND what we have so far is an incomplete path
+  //            (no .ext, not a dir). The completeness gate means two *complete*
+  //            paths on adjacent full rows are never merged.
   let j=start;
   let crossedNewlines=0;
   while(j<text.length&&(j-start)<MAX_PATH_LEN){
@@ -10366,9 +10375,18 @@ function _renderPathSpan(text,start,paneWidth){
     if(/\s/.test(ch)){
       let ls=j;while(ls>0&&text[ls-1]!=='\n')ls--;
       const col=j-ls;
-      if(col<wrapCol)break;                 // whitespace well before the wrap column = a real gap
       let k=j;while(k<text.length&&(text[k]===' '||text[k]==='\t'))k++;
       if(k>=text.length||text[k]!=='\n')break;   // must be padding-then-newline to be a wrap
+      const rowWidth=k-ls;                        // this row's rendered width (rows are padded to a fixed width)
+      const padding=k-j;                          // trailing spaces between the path end and the newline
+      const strongWrap=col>=wrapCol;
+      let rescueWrap=false;
+      if(!strongWrap&&padding<=4&&rowWidth>=minWrap&&rowWidth<wrapCol){
+        const sofar=text.slice(start,j).replace(/[ \t]*\n[ \t]*/g,'');
+        const complete=/\.[A-Za-z0-9]+$/.test(sofar)||sofar.charAt(sofar.length-1)==='/';
+        rescueWrap=!complete;
+      }
+      if(!strongWrap&&!rescueWrap)break;
       if(crossedNewlines>=MAX_WRAP_LINES)break;
       let m=k+1;while(m<text.length&&(text[m]===' '||text[m]==='\t'))m++;  // skip the continuation-row indent
       if(m>=text.length||!_RAW_PATH_CHAR_RE.test(text[m]))break;           // next row must resume with a path char
