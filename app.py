@@ -2780,39 +2780,167 @@ def _file_error(request: Request, status: int, title: str, message: str, path: s
     return HTMLResponse(html, status_code=status)
 
 
+def _safe_is_dir(p: Path) -> bool:
+    try:
+        return p.is_dir()
+    except Exception:
+        return False
+
+
+def _human_size(n: int) -> str:
+    try:
+        size = float(n)
+    except Exception:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return (f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}")
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+_DIR_LISTING_MAX = 2000  # cap entries so a huge dir can't produce a giant page
+
+
+def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
+    """Render a clickable HTML listing for a directory referenced from terminal
+    output. Every row links back through /file?path=... so browsing stays behind
+    the dashboard's auth middleware — same login as the dashboard itself."""
+    rp = request.scope.get("root_path", "") or ""
+    real = str(dir_path)
+
+    def _attr(s: str) -> str:
+        return _html_escape(s).replace('"', "&quot;")
+
+    def _link(p: Path) -> str:
+        return rp + "/file?path=" + urllib.parse.quote(str(p), safe="")
+
+    try:
+        kids = list(dir_path.iterdir())
+    except PermissionError:
+        return _file_error(request, 403, "Forbidden", "Permission denied listing this directory.", real)
+    except Exception:
+        return _file_error(request, 500, "Error", "That directory could not be read.", real)
+    kids.sort(key=lambda p: (not _safe_is_dir(p), p.name.lower()))
+    total = len(kids)
+    truncated = total > _DIR_LISTING_MAX
+    kids = kids[:_DIR_LISTING_MAX]
+
+    rows = []
+    # Parent link (skip when already at the filesystem root).
+    if dir_path != dir_path.parent:
+        rows.append(
+            '<tr><td class="ic">&#128193;</td>'
+            f'<td><a class="row-link" href="{_attr(_link(dir_path.parent))}">../</a></td>'
+            '<td class="sz"></td><td class="mt"></td></tr>'
+        )
+    for p in kids:
+        is_dir = _safe_is_dir(p)
+        try:
+            st = p.stat()
+        except Exception:
+            st = None
+        name = p.name + ("/" if is_dir else "")
+        icon = "&#128193;" if is_dir else "&#128196;"
+        size = "" if (is_dir or st is None) else _human_size(st.st_size)
+        mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M") if st else ""
+        rows.append(
+            f'<tr><td class="ic">{icon}</td>'
+            f'<td><a class="row-link" href="{_attr(_link(p))}">{_html_escape(name)}</a></td>'
+            f'<td class="sz">{_html_escape(size)}</td>'
+            f'<td class="mt">{_html_escape(mtime)}</td></tr>'
+        )
+    body = "\n".join(rows) or '<tr><td colspan="4" class="empty">(empty directory)</td></tr>'
+    note = (f'<div class="note">Showing first {_DIR_LISTING_MAX} of {total} entries.</div>'
+            if truncated else "")
+    count_lbl = f"{total} item" + ("" if total == 1 else "s")
+    doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_html_escape(dir_path.name or '/')} · index · {BRAND_NAME} Dashboard</title>
+<style>
+  body{{margin:0;background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:24px;box-sizing:border-box}}
+  .wrap{{max-width:960px;margin:0 auto;background:#161b22;border:1px solid #21262d;border-radius:10px;overflow:hidden;box-shadow:0 6px 30px rgba(0,0,0,.4)}}
+  .hd{{padding:18px 22px;border-bottom:1px solid #21262d}}
+  .crumb{{font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.9rem;color:#79c0ff;word-break:break-all}}
+  .meta{{color:#8b949e;font-size:.8rem;margin-top:6px}}
+  .meta a{{color:#58a6ff;text-decoration:none}} .meta a:hover{{text-decoration:underline}}
+  table{{width:100%;border-collapse:collapse;font-size:.88rem}}
+  th{{text-align:left;color:#8b949e;font-weight:500;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;padding:8px 22px;border-bottom:1px solid #21262d}}
+  td{{padding:7px 22px;border-bottom:1px solid #1b2027;white-space:nowrap}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#1c2330}}
+  td.ic{{width:20px;padding-right:0;opacity:.85}}
+  .row-link{{color:#c9d1d9;text-decoration:none;word-break:break-all}}
+  .row-link:hover{{color:#79c0ff;text-decoration:underline}}
+  td.sz,td.mt,th.sz,th.mt{{color:#8b949e;text-align:right;font-variant-numeric:tabular-nums}}
+  td.mt,th.mt{{font-size:.8rem}}
+  .empty{{color:#6e7681;text-align:center;padding:24px}}
+  .note{{padding:10px 22px;color:#d29922;font-size:.8rem;border-top:1px solid #21262d}}
+</style></head>
+<body><div class="wrap">
+  <div class="hd">
+    <div class="crumb">&#128193; {_html_escape(real)}</div>
+    <div class="meta">{count_lbl} · directory listing · <a href="{rp or '/'}">← dashboard</a></div>
+  </div>
+  <table><thead><tr><th></th><th>Name</th><th class="sz">Size</th><th class="mt">Modified</th></tr></thead>
+  <tbody>
+{body}
+  </tbody></table>
+  {note}
+</div></body></html>"""
+    resp = HTMLResponse(doc)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/file")
 async def serve_terminal_file(request: Request, path: str = "", download: int = 0):
-    """Serve a file referenced from terminal output.
+    """Serve a file (or directory listing) referenced from terminal output.
 
-    The terminal linkifier (frontend) discovers absolute file paths like
-    /home/nimrod_rotem/tmux-dashboard-original/notes.md and turns
-    them into <BASE>/file?path=... links. We serve them inline by default so
-    .md / .py / images / PDFs render in the browser tab; pass ?download=1 to
-    force a download.
+    The terminal linkifier (frontend) discovers file paths — absolute
+    (/home/nimrod_rotem/notes.md) and home-relative (~/PROBST_LAWSUIT_2026-07-10/)
+    — and turns them into <BASE>/file?path=... links. Files render inline by
+    default so .md / .py / images / PDFs show in the browser tab (pass
+    ?download=1 to force a download); directories render a clickable listing.
+    This route sits behind the dashboard's auth middleware, so every link is
+    protected by the same login as the dashboard itself.
     """
-    if not path or not path.startswith("/"):
-        return _file_error(request, 400, "Bad request", "An absolute path is required (must start with /).", path)
+    orig_path = path
+    if not path:
+        return _file_error(request, 400, "Bad request", "A file path is required.", orig_path)
+    # Expand ~ / ~user home-relative paths (terminal output prints these a lot,
+    # e.g. "Deliverables in ~/PROBST_LAWSUIT_2026-07-10/").
+    if path.startswith("~"):
+        path = os.path.expanduser(path)
+    if not path.startswith("/"):
+        return _file_error(request, 400, "Bad request", "An absolute path (or a ~ home path) is required.", orig_path)
     if path in _FILE_SERVE_DENYLIST:
-        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", path)
+        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", orig_path)
     for pref in _FILE_SERVE_DENY_PREFIXES:
         if path.startswith(pref):
-            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", path)
+            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", orig_path)
     try:
         target = Path(path).resolve()
     except Exception:
-        return _file_error(request, 400, "Bad request", "That path could not be resolved.", path)
-    if not target.exists() or not target.is_file():
-        upstream = _upstream_url_for_path(path)
-        if upstream:
-            return RedirectResponse(url=upstream, status_code=302)
-        return _file_error(request, 404, "File not found", "No such file on this host.", path)
+        return _file_error(request, 400, "Bad request", "That path could not be resolved.", orig_path)
     # Re-check denylist against the resolved real path (defeats symlink tricks).
     real = str(target)
     if real in _FILE_SERVE_DENYLIST:
-        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", path)
+        return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", orig_path)
     for pref in _FILE_SERVE_DENY_PREFIXES:
         if real.startswith(pref):
-            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", path)
+            return _file_error(request, 403, "Forbidden", "Pseudo-filesystem paths (/proc, /sys, /dev) are not served.", orig_path)
+    if not target.exists():
+        upstream = _upstream_url_for_path(orig_path)
+        if upstream:
+            return RedirectResponse(url=upstream, status_code=302)
+        return _file_error(request, 404, "Not found", "No such file or directory on this host.", orig_path)
+    # Directories → a clickable listing (each row stays behind this auth route).
+    if target.is_dir():
+        return _render_dir_listing(request, target)
+    if not target.is_file():
+        return _file_error(request, 400, "Unsupported", "That path is not a regular file or directory.", orig_path)
     mime, _ = mimetypes.guess_type(real)
     headers = {}
     # Render text/markdown/code inline as plain text so the browser shows the
@@ -10131,15 +10259,19 @@ function _escTermHtml(s){
 //  because the URL match is preferred at any tied position. Single-line only.
 const _RAW_URL_TRAIL_RE=/[.,;:!?)\]}>'"]/;
 const _RAW_PATH_TRAIL_RE=/[,;:!?)\]}>'"]/;
-const _RAW_PATH_CHAR_RE=/[A-Za-z0-9._\-\/]/;
+const _RAW_PATH_CHAR_RE=/[A-Za-z0-9._~\-\/]/;
 function _findNextLinkable(text,from){
   // Return earliest URL or path occurrence at or after `from`, or null.
   let best=null;
   const urlIdx=text.slice(from).search(/https?:\/\//);
   if(urlIdx>=0)best={kind:'url',start:from+urlIdx};
-  // For file paths, require: leading '/', not preceded by ':' (i.e. not inside
-  // a scheme:// URL), then 1+ segments, last segment has a '.' extension.
-  const pathRe=/(?:^|[^A-Za-z0-9_./:\-])(\/(?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]+)/g;
+  // File paths we linkify: (a) ~/home-relative paths (e.g. ~/PROBST_LAWSUIT/),
+  // (b) absolute paths whose last segment carries a .ext, (c) absolute
+  // directory paths ending in '/'. Guard: not preceded by a path char or ':'
+  // so we stay out of scheme://host URLs and mid-token slashes ("TCP/IP",
+  // "and/or"). Only the START offset is used — _renderPathSpan() then greedily
+  // consumes the full path from there and makes the final keep/skip decision.
+  const pathRe=/(?:^|[^A-Za-z0-9_./:~\-])(~\/[A-Za-z0-9_.\-]+(?:\/[A-Za-z0-9_.\-]+)*\/?|\/(?:[A-Za-z0-9_.\-]+\/)*[A-Za-z0-9_.\-]+\.[A-Za-z0-9]+|\/(?:[A-Za-z0-9_.\-]+\/)+)/g;
   pathRe.lastIndex=Math.max(0,from-1);
   let pm;
   while((pm=pathRe.exec(text))!==null){
@@ -10221,7 +10353,13 @@ function _renderPathSpan(text,start){
     trail=pathRaw[pathRaw.length-1]+trail;
     pathRaw=pathRaw.slice(0,-1);
   }
-  if(!/\.[A-Za-z0-9]+$/.test(pathRaw)){
+  // Keep home-relative (~/…), directory (…/), or extensioned file paths; a bare
+  // no-extension token that's none of these stays plain text (avoids linkifying
+  // things like "/etc/hostname" or stray absolute-looking fragments).
+  const _isHome=pathRaw.slice(0,2)==='~/';
+  const _isDir=pathRaw.length>1&&pathRaw.charAt(pathRaw.length-1)==='/';
+  const _hasExt=/\.[A-Za-z0-9]+$/.test(pathRaw);
+  if(!_isHome&&!_isDir&&!_hasExt){
     return {html:_escTermHtml(text.slice(start,j)),end:j};
   }
   const href=BASE+'/file?path='+encodeURIComponent(pathRaw);
