@@ -10256,9 +10256,12 @@ function _escTermHtml(s){
 // File-path handling:
 //  Absolute paths like /home/foo/bar.md become <BASE>/file?path=... links so
 //  the user can open the file in a new tab. Paths inside URLs are skipped
-//  because the URL match is preferred at any tied position. Single-line only.
+//  because the URL match is preferred at any tied position.
+//  Like URLs, a path that Claude Code's TUI soft-wraps across rows (breaking at
+//  the pane width, often with a leading indent on the continuation row) is
+//  rejoined into one href — see _renderPathSpan for the wrap heuristic.
 const _RAW_URL_TRAIL_RE=/[.,;:!?)\]}>'"]/;
-const _RAW_PATH_TRAIL_RE=/[,;:!?)\]}>'"]/;
+const _RAW_PATH_TRAIL_RE=/[.,;:!?)\]}>'"]/;
 const _RAW_PATH_CHAR_RE=/[A-Za-z0-9._~\-\/]/;
 function _findNextLinkable(text,from){
   // Return earliest URL or path occurrence at or after `from`, or null.
@@ -10343,30 +10346,76 @@ function _renderUrlSpan(text,start,paneWidth){
   }
   return {html:html,end:j};
 }
-function _renderPathSpan(text,start){
-  const MAX_PATH_LEN=1024;
+function _renderPathSpan(text,start,paneWidth){
+  const pw=Math.max(20,paneWidth||80);
+  const wrapCol=pw-4;
+  const MAX_PATH_LEN=2048;
+  const MAX_WRAP_LINES=20;
+  // Greedily consume path chars. When we hit whitespace, decide whether it's the
+  // end of the path or just a soft wrap of one long path across TUI rows — the
+  // same situation _renderUrlSpan handles for URLs. A wrap looks like: whitespace
+  // at/after the wrap column, then optional row padding, a newline, and (after
+  // any leading indent on the next row) another path char. Long deliverable
+  // paths Claude prints — e.g. …/GRABO_Schmalz_ ⏎  GRIPSTER_…_2026-07-10.pdf —
+  // routinely break this way, and the file only carries its .ext on the last row.
   let j=start;
-  while(j<text.length&&(j-start)<MAX_PATH_LEN&&_RAW_PATH_CHAR_RE.test(text[j]))j++;
-  let pathRaw=text.slice(start,j);
-  let trail='';
-  while(pathRaw.length>0&&_RAW_PATH_TRAIL_RE.test(pathRaw[pathRaw.length-1])){
-    trail=pathRaw[pathRaw.length-1]+trail;
-    pathRaw=pathRaw.slice(0,-1);
+  let crossedNewlines=0;
+  while(j<text.length&&(j-start)<MAX_PATH_LEN){
+    const ch=text[j];
+    if(_RAW_PATH_CHAR_RE.test(ch)){j++;continue;}
+    if(/\s/.test(ch)){
+      let ls=j;while(ls>0&&text[ls-1]!=='\n')ls--;
+      const col=j-ls;
+      if(col<wrapCol)break;                 // whitespace well before the wrap column = a real gap
+      let k=j;while(k<text.length&&(text[k]===' '||text[k]==='\t'))k++;
+      if(k>=text.length||text[k]!=='\n')break;   // must be padding-then-newline to be a wrap
+      if(crossedNewlines>=MAX_WRAP_LINES)break;
+      let m=k+1;while(m<text.length&&(text[m]===' '||text[m]==='\t'))m++;  // skip the continuation-row indent
+      if(m>=text.length||!_RAW_PATH_CHAR_RE.test(text[m]))break;           // next row must resume with a path char
+      const nextSlice=text.slice(m,m+8);
+      if(nextSlice.startsWith('http://')||nextSlice.startsWith('https://'))break;  // don't swallow a URL on the next row
+      crossedNewlines++;
+      j=m;
+      continue;
+    }
+    break;
   }
+  // rawSpan keeps the internal newline+padding+indent so the on-screen layout is
+  // preserved; pathJoined strips them to form the real filesystem path/href.
+  let rawSpan=text.slice(start,j);
+  let trail='';
+  while(rawSpan.length>0&&_RAW_PATH_TRAIL_RE.test(rawSpan[rawSpan.length-1])){
+    trail=rawSpan[rawSpan.length-1]+trail;
+    rawSpan=rawSpan.slice(0,-1);
+  }
+  const pathJoined=rawSpan.replace(/[ \t]*\n[ \t]*/g,'');
   // Keep home-relative (~/…), directory (…/), or extensioned file paths; a bare
   // no-extension token that's none of these stays plain text (avoids linkifying
   // things like "/etc/hostname" or stray absolute-looking fragments).
-  const _isHome=pathRaw.slice(0,2)==='~/';
-  const _isDir=pathRaw.length>1&&pathRaw.charAt(pathRaw.length-1)==='/';
-  const _hasExt=/\.[A-Za-z0-9]+$/.test(pathRaw);
-  if(!_isHome&&!_isDir&&!_hasExt){
+  const _isHome=pathJoined.slice(0,2)==='~/';
+  const _isDir=pathJoined.length>1&&pathJoined.charAt(pathJoined.length-1)==='/';
+  const _hasExt=/\.[A-Za-z0-9]+$/.test(pathJoined);
+  if(pathJoined.length<2||(!_isHome&&!_isDir&&!_hasExt)){
     return {html:_escTermHtml(text.slice(start,j)),end:j};
   }
-  const href=BASE+'/file?path='+encodeURIComponent(pathRaw);
-  return {
-    html:'<a href="'+_escTermHtml(href)+'" target="_blank" rel="noopener noreferrer" class="raw-link" data-file-path="'+_escTermHtml(pathRaw)+'">'+_escTermHtml(pathRaw)+'</a>'+_escTermHtml(trail),
-    end:j,
-  };
+  const href=BASE+'/file?path='+encodeURIComponent(pathJoined);
+  const hrefEsc=_escTermHtml(href);
+  const dataEsc=_escTermHtml(pathJoined);
+  // Emit each non-whitespace chunk as its own <a> pointing at the joined href,
+  // leaving the wrap whitespace as plain text — the terminal layout is untouched
+  // and every visible piece of the path is clickable (mirrors _renderUrlSpan).
+  const parts=rawSpan.split(/(\s+)/);
+  let html='';
+  for(const part of parts){
+    if(!part)continue;
+    if(/^\s+$/.test(part)){
+      html+=_escTermHtml(part);
+    }else{
+      html+='<a href="'+hrefEsc+'" target="_blank" rel="noopener noreferrer" class="raw-link" data-file-path="'+dataEsc+'">'+_escTermHtml(part)+'</a>';
+    }
+  }
+  html+=_escTermHtml(trail);
+  return {html:html,end:j};
 }
 function _linkifyTerminalText(text,paneWidth){
   if(!text)return '(empty)';
@@ -10380,7 +10429,7 @@ function _linkifyTerminalText(text,paneWidth){
     if(hit.kind==='url'){
       rendered=_renderUrlSpan(text,hit.start,paneWidth);
     }else{
-      rendered=_renderPathSpan(text,hit.start);
+      rendered=_renderPathSpan(text,hit.start,paneWidth);
     }
     out+=rendered.html;
     i=rendered.end;
