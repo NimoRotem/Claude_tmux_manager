@@ -3807,18 +3807,28 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
             "Extract key reference info from this terminal session. "
             "Organize into these sections:\n\n"
             "CREDENTIALS — usernames, passwords, API keys, tokens, secrets\n"
-            "URLS — public URLs, domains, endpoints where this project is served or accessible\n"
+            "URLS — the public URL(s) where THIS project is served/accessible\n"
             "STACK — languages, frameworks, libraries, dependencies, tools, package managers\n"
             "SERVICES — databases, ports, process managers (PM2/supervisor/systemd), background services\n"
-            "STRUCTURE — project root, key files, directories, config file paths\n"
+            "STRUCTURE — the key source files created/edited for this deliverable\n"
             "UPLOADS — paths to any files that were uploaded to this session\n"
             "NOTES — important dev decisions, gotchas, deployment steps, things to remember\n\n"
             "Rules:\n"
             "- Only include info actually visible in the terminal output or chat history\n"
             "- Keep each item on one line, be specific (include actual values, paths, ports)\n"
-            "- If a section has nothing, omit it entirely\n"
+            "- Be SELECTIVE — surface only what the developer would actually reach for again, "
+            "not every path/URL that scrolled by. Prefer the primary deliverable over incidentals.\n"
+            "- URLS: EXCLUDE localhost/127.0.0.1/internal IPs, third-party API endpoints "
+            "(api.openai.com, api.anthropic.com, *.googleapis.com, oauth/health/rest calls), and "
+            "URLs for OTHER projects that merely got mentioned. Keep only THIS project's URL(s).\n"
+            "- STRUCTURE: EXCLUDE tooling/system paths (~/.claude*, ~/.tmux-dashboard*, ~/.codex*, "
+            "/etc, skill/memory files like SKILL.md/CLAUDE.md/claude-roles.json, nginx/supervisor "
+            ".conf files) and the dashboard repo dir itself (tmux-dashboard-original). Never emit "
+            "placeholder paths containing < or >. List a file at most once.\n"
+            "- If a section has nothing relevant, omit it entirely (don't pad it)\n"
             "- If previous notes exist, merge new findings into them — keep old data, "
-            "remove duplicates, update changed values\n"
+            "remove duplicates (including near-duplicates that differ only by whitespace/case), "
+            "update changed values\n"
             "- Redact nothing — this is the developer's own reference\n"
             "- No intro/outro text, just the section headers and their items"
         ),
@@ -9539,8 +9549,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .key-btn.key-slash:hover{background:#d2a8ff22;color:#f0f6fc;border-color:#d2a8ff88}
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
 /* Saved project keys/URLs/files inside the Keys & Commands drawer */
-.key-saved{width:100%;display:flex;flex-direction:column;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid #21262d}
-.key-saved-head{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.key-saved{width:100%;display:flex;flex-direction:column;margin-top:8px;padding-top:8px;border-top:1px solid #21262d}
+.key-saved-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.key-saved-toggle:hover{color:#c9d1d9}
+.key-saved-toggle .chevron{font-size:.55rem;transition:transform .2s;display:inline-block;transform:rotate(-90deg)}
+.key-saved-toggle.open .chevron{transform:rotate(0deg)}
+.key-saved-count{font-weight:400;text-transform:none;letter-spacing:0;color:#6e7681}
+.key-saved-body{display:none;flex-direction:column;gap:8px;margin-top:8px}
+.key-saved-body.open{display:flex}
 .key-saved-empty{font-size:.7rem;color:#6e7681}
 .key-saved-group{display:flex;flex-direction:column;gap:3px}
 .key-saved-title{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
@@ -12536,25 +12552,80 @@ function _splitItems(body){
   // Items are comma/semicolon/newline separated; strip bullet prefixes.
   return body.split(/[\n;,]+/).map(s=>s.replace(/^[\s\-•*]+/,'').trim()).filter(Boolean);
 }
-function parseKeyInfo(notes){
+// Relevance filters — the Key Info notes are a grab-bag of every URL/path the
+// agent ever saw (API endpoints, memory/skill files, other projects, system
+// configs). Keep only what the user would actually reach for.
+function _urlIsUseful(u){
+  try{const x=new URL(u);const h=x.hostname.toLowerCase(),path=x.pathname;
+    if(h==='localhost'||h==='0.0.0.0')return false;
+    if(/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h))return false;   // loopback/private
+    if(/^api\./.test(h))return false;                                               // api.* endpoints
+    if(/(^|\.)(anthropic|openai)\.com$/.test(h))return false;                        // LLM providers
+    if(/\.googleapis\.com$/.test(h)||h==='accounts.google.com'||h==='oauth2.googleapis.com')return false;
+    if(/(^|\/)(api|v1|v2|oauth|rest|graphql|health|callback|\.well-known)(\/|$)|\.(json|xml|txt|log|ico)$/i.test(path))return false;
+    return true;
+  }catch(e){return false}
+}
+const _URL_GENERIC_SEG=/^(api|v1|v2|www|app|index|home|login|health|dashboard|main|public|static|assets|admin)$/i;
+function _urlTokens(u){
+  try{const x=new URL(u);
+    const segs=x.pathname.split('/').filter(z=>z.length>=3&&!_URL_GENERIC_SEG.test(z));
+    return segs.length?segs.map(z=>z.toLowerCase()):[x.hostname.split('.')[0].toLowerCase()];
+  }catch(e){return[]}
+}
+const _CRED_CODE_RE=/os\.getenv|getenv\(|hashlib\.|secrets\.token|token_hex\(|process\.env|=\s*require\(|^\s*(import|from)\s/i;
+// Tooling/system/config paths that are never a user deliverable: any dot-dir or
+// dot-file (~/.claude, ~/.tmux-dashboard, ~/.codex*, .credentials.json…), /etc,
+// /var/{log,lib,cache}, SKILL/CLAUDE/AGENTS.md, roles json, and *.conf/.rules/.log/.bak/.pyc.
+const _PATH_DENY=/(^|\/)\.[^/]+(\/|$)|^\/etc\/|^\/var\/(log|lib|cache)\/|(^|\/)(SKILL|CLAUDE|AGENTS)\.md$|(^|\/)(claude-roles|session_owners|users)\.json$|\.(conf|rules|log|bak|pyc)$/i;
+function _pathIsUseful(p){
+  if(!p||/[<>]/.test(p))return false;                                       // placeholder like <name>
+  if(/\/uploads?\//i.test(p)&&/\.[A-Za-z0-9]{1,8}$/.test(p))return true;     // user-uploaded files always count
+  if(!/\.[A-Za-z0-9]{1,8}$/.test(p.replace(/\/+$/,'')))return false;         // concrete file only (drops bare dirs)
+  if(_PATH_DENY.test(p))return false;
+  return true;
+}
+function parseKeyInfo(notes,sess){
   const sec=_splitNoteSections(notes);
-  // URLs — pull every http(s):// URL from the URLS section AND the whole note so
-  // a formatting quirk never hides one; dedup + trim trailing punctuation.
-  const urlSet=new Set();
+  // Work-context blob for relevance (deliberately excludes the raw URL/path
+  // lists so an item can't validate itself).
+  const blob=(((sess&&sess.description)||'')+' '+((sess&&sess.progress)||'')+' '+((sess&&sess.title)||'')+' '+(sec.NOTES||'')+' '+(sec.STACK||'')+' '+(sec.SERVICES||'')).toLowerCase();
+
+  // URLs — extract, drop infra/API/localhost, dedup (ignoring trailing slash/case).
+  const seen=new Set(); let urls=[];
   const urlRe=/https?:\/\/[^\s,;'")<>]+/g;
-  let um; while((um=urlRe.exec((sec.URLS||'')+'\n'+(notes||'')))){urlSet.add(um[0].replace(/[.,;:)]+$/,''))}
-  // Credentials — label:value pairs (or bare values).
-  const creds=_splitItems(sec.CREDENTIALS).map(it=>{
+  let um; while((um=urlRe.exec((sec.URLS||'')+'\n'+(notes||'')))){
+    const u=um[0].replace(/[.,;:)]+$/,'');
+    if(!_urlIsUseful(u))continue;
+    const k=u.replace(/\/+$/,'').toLowerCase();
+    if(seen.has(k))continue; seen.add(k); urls.push(u);
+  }
+  // If several survive, keep only those whose distinctive token appears in the
+  // work context — drops URLs that leaked in from memory/other projects. Fail open.
+  if(urls.length>1&&blob.trim()){
+    const rel=urls.filter(u=>_urlTokens(u).some(t=>blob.includes(t)));
+    if(rel.length)urls=rel;
+  }
+
+  // Credentials — always kept; drop code-looking lines, dedup.
+  const cseen=new Set(); const creds=[];
+  _splitItems(sec.CREDENTIALS).forEach(it=>{
+    if(_CRED_CODE_RE.test(it))return;
+    const k=it.replace(/\s+/g,' ').trim().toLowerCase();
+    if(!k||cseen.has(k))return; cseen.add(k);
     const i=it.indexOf(':');
-    if(i>0&&i<=40)return{label:it.slice(0,i).trim(),value:it.slice(i+1).trim()};
-    return{label:'',value:it};
-  }).filter(c=>c.value);
-  // Files & paths — path-like tokens from STRUCTURE + UPLOADS, dedup.
-  const pathSet=new Set();
-  _splitItems((sec.STRUCTURE||'')+'\n'+(sec.UPLOADS||'')).forEach(p=>{
-    if(/^(\/|~\/|\.\.?\/)/.test(p)||/\.[A-Za-z0-9]{1,6}$/.test(p))pathSet.add(p);
+    creds.push(i>0&&i<=40?{label:it.slice(0,i).trim(),value:it.slice(i+1).trim()}:{label:'',value:it.trim()});
   });
-  return{urls:[...urlSet],creds,files:[...pathSet]};
+
+  // Files & paths — drop tooling/system/placeholder, dedup.
+  const fseen=new Set(); const files=[];
+  _splitItems((sec.STRUCTURE||'')+'\n'+(sec.UPLOADS||'')).forEach(p=>{
+    p=p.replace(/[)>,.;]+$/,'').trim();
+    if(!_pathIsUseful(p))return;
+    const k=p.replace(/\/+$/,'').toLowerCase();
+    if(fseen.has(k))return; fseen.add(k); files.push(p);
+  });
+  return{urls,creds:creds.filter(c=>c.value),files};
 }
 function _savedCopyBtn(text){
   const b=document.createElement('button');
@@ -12588,10 +12659,11 @@ function _savedCredRow(c){
   r.appendChild(_savedCopyBtn(c.value));
   return r;
 }
-function _savedFileRow(p){
+function _savedFileRow(p,disambiguate){
   const r=_savedRow();
   const linkable=/^(\/|~\/)/.test(p);
-  const nm=p.replace(/\/+$/,'').split('/').pop()||p;
+  const parts=p.replace(/\/+$/,'').split('/');
+  const nm=(disambiguate&&parts.length>1?parts.slice(-2).join('/'):parts[parts.length-1])||p;
   if(linkable){
     const a=document.createElement('a');
     a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p);a.target='_blank';a.rel='noopener noreferrer';
@@ -12605,25 +12677,51 @@ function _savedFileRow(p){
 }
 function renderSavedKeys(name,sessionObj){
   const s=sessionObj||sessions.find(x=>x.name===name);
-  const info=s?parseKeyInfo(s.notes||''):{urls:[],creds:[],files:[]};
+  const info=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  // Basenames that collide across kept files → show the parent dir to tell apart.
+  const baseCount={};
+  info.files.forEach(p=>{const b=p.replace(/\/+$/,'').split('/').pop();baseCount[b]=(baseCount[b]||0)+1});
+  const total=info.urls.length+info.creds.length+info.files.length;
+  const bits=[];
+  if(info.urls.length)bits.push(info.urls.length+' URL'+(info.urls.length>1?'s':''));
+  if(info.creds.length)bits.push(info.creds.length+' login'+(info.creds.length>1?'s':''));
+  if(info.files.length)bits.push(info.files.length+' file'+(info.files.length>1?'s':''));
+  const summary=total?bits.join(' · '):'nothing saved yet';
+  const isOpen=localStorage.getItem('keySavedOpen')==='true';
   ['chat','raw'].forEach(function(tab){
     const box=document.getElementById('keysaved-'+tab+'-'+name);
     if(!box)return;
     box.replaceChildren();
-    const head=document.createElement('div');
-    head.className='key-saved-head';head.textContent='Saved for this project';
-    box.appendChild(head);
-    if(!(info.urls.length||info.creds.length||info.files.length)){
+    // Collapsible header (chevron + count). Collapsed by default.
+    const tog=document.createElement('div');
+    tog.className='key-saved-toggle'+(isOpen?' open':'');
+    const chev=document.createElement('span');chev.className='chevron';chev.textContent='▼';tog.appendChild(chev);
+    tog.appendChild(document.createTextNode('Saved for this project '));
+    const cnt=document.createElement('span');cnt.className='key-saved-count';cnt.textContent='('+summary+')';tog.appendChild(cnt);
+    tog.addEventListener('click',toggleSavedKeys);
+    box.appendChild(tog);
+    // Body (hidden unless open).
+    const body=document.createElement('div');
+    body.className='key-saved-body'+(isOpen?' open':'');
+    if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='No URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
-      box.appendChild(empty);
-      return;
+      empty.textContent='No project URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
+      body.appendChild(empty);
+    }else{
+      if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
+      if(info.creds.length)body.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
+      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1))));
     }
-    if(info.urls.length)box.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
-    if(info.creds.length)box.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
-    if(info.files.length)box.appendChild(_savedGroup('Files & paths',info.files.map(_savedFileRow)));
+    box.appendChild(body);
   });
+}
+function toggleSavedKeys(){
+  const open=!(localStorage.getItem('keySavedOpen')==='true');
+  try{localStorage.setItem('keySavedOpen',open?'true':'false')}catch(e){}
+  // Keep both (chat + raw) drawers in sync.
+  document.querySelectorAll('.key-saved-toggle').forEach(function(t){t.classList.toggle('open',open)});
+  document.querySelectorAll('.key-saved-body').forEach(function(b){b.classList.toggle('open',open)});
 }
 function _formatUploadSize(bytes){
   if(bytes<1024)return bytes+' B';
