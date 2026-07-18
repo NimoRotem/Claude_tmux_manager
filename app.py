@@ -9538,6 +9538,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .key-btn.key-slash{color:#d2a8ff;border-color:#d2a8ff44;font-size:.68rem}
 .key-btn.key-slash:hover{background:#d2a8ff22;color:#f0f6fc;border-color:#d2a8ff88}
 .key-bar-sep{width:1px;height:18px;background:#30363d;margin:0 2px}
+/* Saved project keys/URLs/files inside the Keys & Commands drawer */
+.key-saved{width:100%;display:flex;flex-direction:column;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid #21262d}
+.key-saved-head{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.key-saved-empty{font-size:.7rem;color:#6e7681}
+.key-saved-group{display:flex;flex-direction:column;gap:3px}
+.key-saved-title{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
+.key-saved-row{display:flex;align-items:center;gap:8px;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:0}
+.key-saved-link{color:#58a6ff;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.key-saved-link:hover{text-decoration:underline}
+.key-saved-k{color:#8b949e;flex-shrink:0}
+.key-saved-v{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.key-saved-copy{margin-left:auto;flex-shrink:0;padding:1px 8px;font-size:.62rem;color:#8b949e;background:#21262d;border:1px solid #30363d;border-radius:4px;cursor:pointer}
+.key-saved-copy:hover{background:#30363d;color:#f0f6fc}
 .key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
 .key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
 .drop-zone{width:100%;margin-top:4px;padding:12px;border:2px dashed #30363d;border-radius:6px;text-align:center;color:#6e7681;font-size:.72rem;cursor:pointer;transition:all .2s;background:transparent}
@@ -10159,6 +10172,15 @@ function getHideBashPref(){
 function setHideBashPref(v){
   try{localStorage.setItem('hideBashLines',v?'true':'false')}catch(e){}
 }
+// Independently hide tool OUTPUT — the `⎿ …` result blocks (file dumps, command
+// output, "Shell cwd was reset…") plus their indented continuation rows — so the
+// terminal shows only Claude's spoken text, not the plumbing. Default on.
+function getHideOutputPref(){
+  try{const v=localStorage.getItem('hideOutputLines');return v===null?true:v==='true'}catch(e){return true}
+}
+function setHideOutputPref(v){
+  try{localStorage.setItem('hideOutputLines',v?'true':'false')}catch(e){}
+}
 // Claude Code's TUI lays out tool calls like:
 //   ● Bash(sleep 540 && gcloud ...
 //         --command="date; ...")        <- wrap continuation, indented, no marker
@@ -10206,38 +10228,40 @@ function _isUpdateNoise(line){
   return false;
 }
 function applyRawFilter(text){
-  if(!getHideBashPref())return text;
+  const hideBash=getHideBashPref();
+  const hideOut=getHideOutputPref();
+  if(!hideBash&&!hideOut)return text;
   if(!text)return text;
   const lines=text.split('\n');
   const out=[];
-  let suppressing=false;
+  // A single suppression state machine that composes two independent filters:
+  //   'call'   — a hidden tool-call header (● Bash(…), Read(…), mcp__…(…)) and
+  //              its wrap-continuation rows (indented, no marker).
+  //   'output' — a hidden `⎿ …` result block and its indented continuation rows
+  //              (file dumps, "Shell cwd was reset…", "… +N lines" markers).
+  // Suppression ends at the next bullet, blank line, another ⎿, or a column-0
+  // line — so Claude's spoken text and paragraph breaks are always kept.
+  let mode='';
   for(const line of lines){
-    if(_isUpdateNoise(line))continue;
-    if(_isBashFetchHeader(line)){
-      suppressing=true;
-      continue;
+    if(hideBash&&_isUpdateNoise(line))continue;
+    // Start of a ⎿ output block.
+    if(_OUTPUT_MARKER_RE.test(line)){
+      if(hideOut){mode='output';continue;}   // hide the ⎿ line itself
+      mode='';out.push(line);continue;        // keep output; end any call-suppression
     }
-    if(suppressing){
-      // End suppression when we hit an output marker, a new bullet (different
-      // tool), or a clearly unrelated structural line (empty line / something
-      // starting at column 0 that isn't an indented continuation).
-      if(_OUTPUT_MARKER_RE.test(line)){
-        suppressing=false;
-        // keep this output line
-      }else if(_LEADING_BULLET_RE.test(line)){
-        suppressing=false;
-        // keep this bullet line (different tool)
-      }else if(line.trim()===''){
-        suppressing=false;
-        // keep blank lines so paragraph breaks stay intact
-      }else if(/^\S/.test(line)){
-        // Starts at column 0 with non-space — not a wrap continuation
-        suppressing=false;
-      }else{
-        // Indented continuation of the hidden command — skip
-        continue;
-      }
+    const isBullet=_LEADING_BULLET_RE.test(line);
+    // Start of a hidden tool-call header.
+    if(hideBash&&isBullet&&_isBashFetchHeader(line)){
+      mode='call';continue;
     }
+    // A different bullet (Claude's spoken text) — always kept, ends suppression.
+    if(isBullet){mode='';out.push(line);continue;}
+    // Blank line — keep so paragraph breaks stay intact, ends suppression.
+    if(line.trim()===''){mode='';out.push(line);continue;}
+    // Column-0 non-space — not a wrap continuation, kept, ends suppression.
+    if(/^\S/.test(line)){mode='';out.push(line);continue;}
+    // Indented continuation row — drop it if it belongs to a hidden block.
+    if(mode)continue;
     out.push(line);
   }
   return out.join('\n');
@@ -10505,6 +10529,12 @@ function toggleHideBash(name,checked){
   setHideBashPref(checked);
   const lbl=document.getElementById('hidebash-status-'+name);
   if(lbl)lbl.textContent=checked?'On — hiding tool calls + update logs':'Off — showing all output';
+  rerenderAllRaw();
+}
+function toggleHideOutput(name,checked){
+  setHideOutputPref(checked);
+  const lbl=document.getElementById('hideoutput-status-'+name);
+  if(lbl)lbl.textContent=checked?'On — hiding tool output (⎿ …)':'Off — showing tool output';
   rerenderAllRaw();
 }
 const lastStatus={};
@@ -10801,7 +10831,20 @@ function renderDetail(){
           </label>
           <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Output (<code style="color:#79c0ff">⎿</code>) stays. Setting is shared across all sessions.</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Use <b>Hide tool output</b> below to also drop the <code style="color:#79c0ff">⎿</code> result blocks. Setting is shared across all sessions.</div>
+      </div>
+      <div class="tier" style="margin-top:12px" id="hideoutput-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool output</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label class="watchdog-toggle">
+            <input type="checkbox" id="hideoutput-toggle-${s.name}"
+              onchange="toggleHideOutput('${esc(s.name)}',this.checked)"
+              ${getHideOutputPref()?'checked':''}>
+            <span class="watchdog-toggle-slider"></span>
+          </label>
+          <span id="hideoutput-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideOutputPref()?'On — hiding tool output (⎿ …)':'Off — showing tool output'}</span>
+        </div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Claude's spoken text. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
@@ -10832,6 +10875,8 @@ function renderDetail(){
   restoreDrafts();
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
+  // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
+  renderSavedKeys(s.name, s);
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
@@ -11479,6 +11524,7 @@ function updateCard(s){
   if(desc)desc.textContent=s.description||'';
   if(prog)prog.textContent=s.progress||'';
   if(notesEl&&s.notes)notesEl.textContent=s.notes;
+  renderSavedKeys(s.name, s);
   const tsDesc=document.getElementById('ts-desc-'+s.name);
   const tsProg=document.getElementById('ts-prog-'+s.name);
   const tsNotes=document.getElementById('ts-notes-'+s.name);
@@ -12460,9 +12506,125 @@ function buildKeyBar(name,tab){
       </div>
     </div>
     <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
+    <div class="key-saved" id="keysaved-${tab}-${name}"></div>
   </div>`;
 }
 
+// ── Saved project keys (URLs · credentials · files) ──
+// Important URLs, logins and file paths scroll out of the terminal and get lost.
+// The per-session Key Info notes already extract them into labelled sections
+// (CREDENTIALS / URLS / STRUCTURE / UPLOADS); we parse those and surface them as
+// a persistent, clickable list inside the Keys & Commands drawer.
+const _KEY_SECTION_RE=/^\s*(CREDENTIALS|URLS?|STACK|SERVICES|STRUCTURE|UPLOADS|NOTES)\b\s*[—–\-:]*\s*/i;
+function _splitNoteSections(notes){
+  const sections={};
+  if(!notes)return sections;
+  let cur=null;
+  for(const line of notes.split('\n')){
+    const m=line.match(_KEY_SECTION_RE);
+    if(m){
+      cur=m[1].toUpperCase().replace(/^URL$/,'URLS');
+      sections[cur]=(line.slice(m[0].length)||'').trim();
+    }else if(cur){
+      sections[cur]+=(sections[cur]?'\n':'')+line;
+    }
+  }
+  return sections;
+}
+function _splitItems(body){
+  if(!body)return[];
+  // Items are comma/semicolon/newline separated; strip bullet prefixes.
+  return body.split(/[\n;,]+/).map(s=>s.replace(/^[\s\-•*]+/,'').trim()).filter(Boolean);
+}
+function parseKeyInfo(notes){
+  const sec=_splitNoteSections(notes);
+  // URLs — pull every http(s):// URL from the URLS section AND the whole note so
+  // a formatting quirk never hides one; dedup + trim trailing punctuation.
+  const urlSet=new Set();
+  const urlRe=/https?:\/\/[^\s,;'")<>]+/g;
+  let um; while((um=urlRe.exec((sec.URLS||'')+'\n'+(notes||'')))){urlSet.add(um[0].replace(/[.,;:)]+$/,''))}
+  // Credentials — label:value pairs (or bare values).
+  const creds=_splitItems(sec.CREDENTIALS).map(it=>{
+    const i=it.indexOf(':');
+    if(i>0&&i<=40)return{label:it.slice(0,i).trim(),value:it.slice(i+1).trim()};
+    return{label:'',value:it};
+  }).filter(c=>c.value);
+  // Files & paths — path-like tokens from STRUCTURE + UPLOADS, dedup.
+  const pathSet=new Set();
+  _splitItems((sec.STRUCTURE||'')+'\n'+(sec.UPLOADS||'')).forEach(p=>{
+    if(/^(\/|~\/|\.\.?\/)/.test(p)||/\.[A-Za-z0-9]{1,6}$/.test(p))pathSet.add(p);
+  });
+  return{urls:[...urlSet],creds,files:[...pathSet]};
+}
+function _savedCopyBtn(text){
+  const b=document.createElement('button');
+  b.type='button';b.className='key-saved-copy';b.title='Copy';b.textContent='Copy';
+  b.addEventListener('click',function(ev){
+    ev.preventDefault();ev.stopPropagation();
+    const done=()=>{b.textContent='Copied';setTimeout(()=>{b.textContent='Copy'},1200)};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(()=>{})}
+  });
+  return b;
+}
+function _savedRow(){const r=document.createElement('div');r.className='key-saved-row';return r}
+function _savedGroup(title,rows){
+  const g=document.createElement('div');g.className='key-saved-group';
+  const h=document.createElement('div');h.className='key-saved-title';h.textContent=title;g.appendChild(h);
+  rows.forEach(r=>g.appendChild(r));
+  return g;
+}
+function _savedLinkRow(label,href){
+  const r=_savedRow();
+  const a=document.createElement('a');
+  a.className='key-saved-link';a.href=href;a.target='_blank';a.rel='noopener noreferrer';
+  a.textContent=label;a.title=label;
+  r.appendChild(a);r.appendChild(_savedCopyBtn(href));
+  return r;
+}
+function _savedCredRow(c){
+  const r=_savedRow();
+  if(c.label){const k=document.createElement('span');k.className='key-saved-k';k.textContent=c.label+':';r.appendChild(k)}
+  const v=document.createElement('span');v.className='key-saved-v';v.textContent=c.value;v.title=c.value;r.appendChild(v);
+  r.appendChild(_savedCopyBtn(c.value));
+  return r;
+}
+function _savedFileRow(p){
+  const r=_savedRow();
+  const linkable=/^(\/|~\/)/.test(p);
+  const nm=p.replace(/\/+$/,'').split('/').pop()||p;
+  if(linkable){
+    const a=document.createElement('a');
+    a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p);a.target='_blank';a.rel='noopener noreferrer';
+    a.textContent=nm;a.title=p;
+    r.appendChild(a);
+  }else{
+    const span=document.createElement('span');span.className='key-saved-v';span.textContent=nm;span.title=p;r.appendChild(span);
+  }
+  r.appendChild(_savedCopyBtn(p));
+  return r;
+}
+function renderSavedKeys(name,sessionObj){
+  const s=sessionObj||sessions.find(x=>x.name===name);
+  const info=s?parseKeyInfo(s.notes||''):{urls:[],creds:[],files:[]};
+  ['chat','raw'].forEach(function(tab){
+    const box=document.getElementById('keysaved-'+tab+'-'+name);
+    if(!box)return;
+    box.replaceChildren();
+    const head=document.createElement('div');
+    head.className='key-saved-head';head.textContent='Saved for this project';
+    box.appendChild(head);
+    if(!(info.urls.length||info.creds.length||info.files.length)){
+      const empty=document.createElement('div');
+      empty.className='key-saved-empty';
+      empty.textContent='No URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
+      box.appendChild(empty);
+      return;
+    }
+    if(info.urls.length)box.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
+    if(info.creds.length)box.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
+    if(info.files.length)box.appendChild(_savedGroup('Files & paths',info.files.map(_savedFileRow)));
+  });
+}
 function _formatUploadSize(bytes){
   if(bytes<1024)return bytes+' B';
   if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';
