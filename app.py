@@ -47,6 +47,7 @@ ADMIN_APPROVAL_EMAIL = os.environ.get("TMUX_DASH_ADMIN_EMAIL", "nimrod.rotem@gma
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", f"{BRAND_NAME} <dev@grabo.cc>")
 PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
+PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
 TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
@@ -1388,10 +1389,10 @@ own private workspace, memory, and context below this block.
   GCP metadata server, …) are restricted; expect them to be denied unless approved.
 
 ## Projects & working folder
-- Unless told otherwise, publish every project you build at https://dianaotech.com/<username>/<project>.
+- Unless told otherwise, publish every project you build at __PUBURL__/<username>/<project>.
 - Default <project> = the current tmux session name (unless that name is taken or you're
   told another). Example: user "coffee" in session "XYABC" asks for a calculator app →
-  build it and publish it publicly at https://dianaotech.com/coffee/XYABC.
+  build it and publish it publicly at __PUBURL__/coffee/XYABC.
 - HOW TO PUBLISH: put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`,
   exported in your shell; create it). Static sites: write `index.html` (+ assets) there and it's
   served immediately at `$DASH_PROJECT_URL`. Dynamic apps (Node/Flask/etc.): run your server on a
@@ -1410,7 +1411,7 @@ def _html_escape(s: str) -> str:
 def _ensure_global_context_file():
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not GLOBAL_CONTEXT_FILE.exists():
-        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME))
+        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL))
 
 
 def _read_global_context() -> str:
@@ -1443,7 +1444,7 @@ def _sync_global_context_into(claude_md: Path):
 _PROJ_NOTE_BEGIN = "<!-- TEAM PROJECTS CONVENTION (managed) -->"
 _PROJ_NOTE_END = "<!-- END TEAM PROJECTS CONVENTION -->"
 _PROJ_NOTE = """## Projects & working folder
-- Publish projects at https://dianaotech.com/<username>/<project> (default <project> = the current tmux session name).
+- Publish projects at __PUBURL__/<username>/<project> (default <project> = the current tmux session name).
 - Put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`); static files are served immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
 - This session: user `$DASH_USER`, link `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
 
@@ -1458,7 +1459,7 @@ def _sync_projects_note_into(claude_md: Path):
         existing = (pre + post).lstrip("\n")
     else:
         existing = existing.lstrip("\n")
-    block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE + "\n" + _PROJ_NOTE_END + "\n"
+    block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE.replace("__PUBURL__", PUB_URL) + "\n" + _PROJ_NOTE_END + "\n"
     try:
         claude_md.parent.mkdir(parents=True, exist_ok=True)
         claude_md.write_text(block + "\n" + existing)
@@ -1963,7 +1964,7 @@ def _approval_key(user_id: str, command: str) -> str:
 
 
 def _notify_admin_approval(rec: dict):
-    base = PUBLIC_BASE_URL.rstrip("/")
+    base = PUB_URL
     who = rec.get("username") or rec.get("user_id") or "a user"
     subj = f"[{BRAND_NAME}] Approval needed: " + who + " requested cross-server access"
     html = (
@@ -4637,7 +4638,7 @@ async def api_create_session(request: Request, body: CreateSession):
         try:
             _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
             _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
-            _pub_base = PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com"
+            _pub_base = PUB_URL
             # Per-user git identity: every member shares ONE OS user, so set the
             # commit author/committer per session → commits are attributed to the
             # right person. Push still uses the box's shared GitHub creds.
