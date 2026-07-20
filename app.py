@@ -35,7 +35,7 @@ PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
-# --- NEMO-DEV team mode ---------------------------------------------------
+# --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, a shared Claude auth token, per-user context, OAuth connections,
 # and a soft sandbox (cross-server actions are blocked + sent to the admin for
@@ -45,7 +45,7 @@ TEAM_MODE = os.environ.get("TMUX_DASH_TEAM_MODE", "") == "1"
 BRAND_NAME = os.environ.get("TMUX_DASH_BRAND", "tmux")
 ADMIN_APPROVAL_EMAIL = os.environ.get("TMUX_DASH_ADMIN_EMAIL", "nimrod.rotem@gmail.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", "NEMO-DEV <nemo-dev@grabo.cc>")
+MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", f"{BRAND_NAME} <dev@grabo.cc>")
 PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
@@ -571,7 +571,7 @@ def _ensure_user_claude_config_dir(user: dict):
             "hasCompletedOnboarding": True,
             "numStartups": 1,
         }, indent=2))
-    # NEMO-DEV team mode: shared Claude auth token, managed global context block,
+    # Team mode: shared Claude auth token, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
     if TEAM_MODE:
@@ -1355,7 +1355,7 @@ async def api_me(request: Request):
 
 
 # ===========================================================================
-# NEMO-DEV team mode: shared auth, global context, soft sandbox, approvals,
+# Team mode: shared auth, global context, soft sandbox, approvals,
 # Google connections. All gated behind TEAM_MODE; no effect on personal boxes.
 # ===========================================================================
 import base64
@@ -1363,17 +1363,17 @@ import urllib.request
 import urllib.parse
 
 SHARED_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
-GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "nemo-global-context.md"
-SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "nemo_sandbox_guard.py"
+GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
+SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
 APPROVALS_FILE = MESSAGES_DIR / "approvals.json"
 CONNECTIONS_DIR = MESSAGES_DIR / "connections"
 GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
 
-_GLOBAL_CTX_BEGIN = "<!-- NEMO-DEV GLOBAL CONTEXT (managed — edits below are overwritten) -->"
-_GLOBAL_CTX_END = "<!-- END NEMO-DEV GLOBAL CONTEXT -->"
+_GLOBAL_CTX_BEGIN = "<!-- TEAM GLOBAL CONTEXT (managed — edits below are overwritten) -->"
+_GLOBAL_CTX_END = "<!-- END TEAM GLOBAL CONTEXT -->"
 
-_DEFAULT_GLOBAL_CONTEXT = """# NEMO-DEV environment (shared global context)
-You are running inside **NEMO-DEV**, a shared team development environment on the
+_DEFAULT_GLOBAL_CONTEXT = """# __BRAND__ environment (shared global context)
+You are running inside **__BRAND__**, a shared team development environment on the
 server `dianaotech.com`. Several team members share this machine; each has their
 own private workspace, memory, and context below this block.
 
@@ -1392,11 +1392,11 @@ own private workspace, memory, and context below this block.
 - Default <project> = the current tmux session name (unless that name is taken or you're
   told another). Example: user "coffee" in session "XYABC" asks for a calculator app →
   build it and publish it publicly at https://dianaotech.com/coffee/XYABC.
-- HOW TO PUBLISH: put the project's web files in `$NEMO_PROJECT_DIR` (= `~/nemo-projects/<username>/<project>/`,
+- HOW TO PUBLISH: put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`,
   exported in your shell; create it). Static sites: write `index.html` (+ assets) there and it's
-  served immediately at `$NEMO_PROJECT_URL`. Dynamic apps (Node/Flask/etc.): run your server on a
-  free port and write `$NEMO_PROJECT_DIR/.serve.json` = `{"port": <PORT>}`; it'll be reverse-proxied there.
-- Your username is `$NEMO_USER`, this session is `$NEMO_SESSION`, and the live link is `$NEMO_PROJECT_URL`
+  served immediately at `$DASH_PROJECT_URL`. Dynamic apps (Node/Flask/etc.): run your server on a
+  free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}`; it'll be reverse-proxied there.
+- Your username is `$DASH_USER`, this session is `$DASH_SESSION`, and the live link is `$DASH_PROJECT_URL`
   (also shown as a clickable link in the dashboard for this session).
 
 Stay focused on the user's project in this workspace.
@@ -1410,7 +1410,7 @@ def _html_escape(s: str) -> str:
 def _ensure_global_context_file():
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not GLOBAL_CONTEXT_FILE.exists():
-        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT)
+        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME))
 
 
 def _read_global_context() -> str:
@@ -1440,12 +1440,12 @@ def _sync_global_context_into(claude_md: Path):
     claude_md.write_text(block + "\n" + user_part)
 
 
-_PROJ_NOTE_BEGIN = "<!-- NEMO-DEV PROJECTS CONVENTION (managed) -->"
-_PROJ_NOTE_END = "<!-- END NEMO-DEV PROJECTS CONVENTION -->"
+_PROJ_NOTE_BEGIN = "<!-- TEAM PROJECTS CONVENTION (managed) -->"
+_PROJ_NOTE_END = "<!-- END TEAM PROJECTS CONVENTION -->"
 _PROJ_NOTE = """## Projects & working folder
 - Publish projects at https://dianaotech.com/<username>/<project> (default <project> = the current tmux session name).
-- Put the project's web files in `$NEMO_PROJECT_DIR` (= `~/nemo-projects/<username>/<project>/`); static files are served immediately at `$NEMO_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$NEMO_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
-- This session: user `$NEMO_USER`, link `$NEMO_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
+- Put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`); static files are served immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
+- This session: user `$DASH_USER`, link `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
 
 
 def _sync_projects_note_into(claude_md: Path):
@@ -1466,16 +1466,16 @@ def _sync_projects_note_into(claude_md: Path):
         logger.debug("Failed to sync projects note into %s", claude_md, exc_info=True)
 
 
-_GIT_RULES_BEGIN = "<!-- NEMO-DEV GIT RULES (managed) -->"
-_GIT_RULES_END = "<!-- END NEMO-DEV GIT RULES -->"
+_GIT_RULES_BEGIN = "<!-- TEAM GIT RULES (managed) -->"
+_GIT_RULES_END = "<!-- END TEAM GIT RULES -->"
 _GIT_RULES = """## Git on a shared machine (multiple people, one box)
 Several teammates work on this server as the same OS user, so be disciplined:
 - **Identity is preset** — your commits are authored as `$GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>` (= your dashboard username). Do NOT change git `user.name`/`user.email` or pass `--author`; let the env vars stand so attribution is correct.
-- **Stay in your own space** — work inside this session's cwd / `$NEMO_PROJECT_DIR`. Never edit files in another member's project dir (`~/nemo-projects/<someone-else>/...`).
-- **Branch, never commit to a shared branch** — always work on a feature branch named `$NEMO_USER/<short-topic>`. Never commit directly to `main`/`master` or to a branch someone else is using.
+- **Stay in your own space** — work inside this session's cwd / `$DASH_PROJECT_DIR`. Never edit files in another member's project dir (`~/web-projects/<someone-else>/...`).
+- **Branch, never commit to a shared branch** — always work on a feature branch named `$DASH_USER/<short-topic>`. Never commit directly to `main`/`master` or to a branch someone else is using.
 - **Sync before you start** — `git fetch` + rebase/merge latest so you're not building on stale code. Resolve conflicts cleanly.
 - **Push your branch, open a PR** — let the repo owner review/merge. **NEVER force-push** `main` or any shared branch.
-- **Isolate when sharing a repo** — if a teammate is already working in a repo's working tree, don't fight over it: make your own worktree — `git worktree add ../<repo>-$NEMO_USER -b $NEMO_USER/<topic>` — and work there.
+- **Isolate when sharing a repo** — if a teammate is already working in a repo's working tree, don't fight over it: make your own worktree — `git worktree add ../<repo>-$DASH_USER -b $DASH_USER/<topic>` — and work there.
 - **Never commit secrets** (.env, tokens, keys). Check `git status` before committing."""
 
 
@@ -1521,7 +1521,7 @@ def _setup_shared_git_config():
     try:
         gi = Path.home() / ".gitignore_global"
         if not gi.exists():
-            gi.write_text(".DS_Store\n*.swp\n.serve.json\n.nemo_primed\nnode_modules/\n__pycache__/\n.venv/\n")
+            gi.write_text(".DS_Store\n*.swp\n.serve.json\n.claude_primed\nnode_modules/\n__pycache__/\n.venv/\n")
         subprocess.run(["git", "config", "--global", "core.excludesfile", str(gi)],
                        capture_output=True, text=True, timeout=5)
     except Exception:
@@ -1744,9 +1744,9 @@ PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
 _PRIME_SCRIPT = r'''#!/usr/bin/env bash
 # Accept the one-time --dangerously-skip-permissions warning for a config dir.
 CFG="$1"
-MARKER="$CFG/.nemo_primed"
+MARKER="$CFG/.claude_primed"
 [ -f "$MARKER" ] && { echo "already primed"; exit 0; }
-KEY="$(cat "$NEMO_KEY_FILE" 2>/dev/null)"
+KEY="$(cat "$DASH_KEY_FILE" 2>/dev/null)"
 S="prime_$$"
 tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 200 -y 50 -c "$PWD" || exit 1
@@ -1789,7 +1789,7 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
     mode (symlinked plan creds) or, as a legacy path, with a stored API key."""
     if not _subscription_token_valid() and not _stored_anthropic_key:
         return False
-    marker = cfg_dir / ".nemo_primed"
+    marker = cfg_dir / ".claude_primed"
     if marker.exists():
         return True
     try:
@@ -1799,7 +1799,7 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
             _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
         _write_prime_script()
         env = dict(os.environ,
-                   NEMO_KEY_FILE=str(ANTHROPIC_API_KEY_FILE),
+                   DASH_KEY_FILE=str(ANTHROPIC_API_KEY_FILE),
                    PATH=os.environ.get("PATH", "") + ":/usr/local/bin:/usr/bin")
         subprocess.run(["bash", str(PRIME_SCRIPT_PATH), str(cfg_dir)],
                        cwd=os.getcwd(), env=env, capture_output=True, text=True, timeout=90)
@@ -1809,12 +1809,12 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
 
 
 _SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
-# NEMO-DEV soft-sandbox guard (auto-generated; do not edit).
+# Soft-sandbox guard (auto-generated; do not edit).
 # PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
 # routes them to the admin for approval. Local changes on this server are allowed.
 import sys, json, os, re, urllib.request
 
-DASH_URL = os.environ.get("NEMO_DASH_URL", "__DASH_URL__")
+DASH_URL = os.environ.get("DASH_URL", "__DASH_URL__")
 
 BLOCK_PATTERNS = [
     r"\bgcloud\b", r"\bgsutil\b", r"\bbq\b", r"\bkubectl\b", r"\bhelm\b",
@@ -1861,14 +1861,14 @@ def main():
         with urllib.request.urlopen(req, timeout=8) as r:
             resp = json.load(r)
     except Exception:
-        print("NEMO-DEV sandbox: cross-server action blocked (approval service "
+        print("__BRAND__ sandbox: cross-server action blocked (approval service "
               "unreachable). This server only — other servers are off-limits.",
               file=sys.stderr)
         sys.exit(2)
     if resp.get("decision") == "allow":
         sys.exit(0)
     print(resp.get("reason") or
-          "NEMO-DEV sandbox: this targets another server and is blocked; the admin "
+          "__BRAND__ sandbox: this targets another server and is blocked; the admin "
           "was asked to approve. Do not attempt to bypass it.", file=sys.stderr)
     sys.exit(2)
 
@@ -1879,7 +1879,7 @@ main()
 
 def _write_sandbox_hook_script():
     SANDBOX_HOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    content = _SANDBOX_HOOK_SCRIPT.replace("__DASH_URL__", DASH_LOCAL_URL)
+    content = _SANDBOX_HOOK_SCRIPT.replace("__DASH_URL__", DASH_LOCAL_URL).replace("__BRAND__", BRAND_NAME)
     try:
         if (not SANDBOX_HOOK_PATH.exists()) or SANDBOX_HOOK_PATH.read_text() != content:
             SANDBOX_HOOK_PATH.write_text(content)
@@ -1904,7 +1904,7 @@ def _install_sandbox_hook(cfg_dir: Path, user: dict):
     pre = hooks.get("PreToolUse")
     if not isinstance(pre, list):
         pre = []
-    pre = [h for h in pre if "nemo_sandbox_guard" not in json.dumps(h)]
+    pre = [h for h in pre if "sandbox_guard" not in json.dumps(h)]
     pre.append(entry)
     hooks["PreToolUse"] = pre
     settings["hooks"] = hooks
@@ -1918,7 +1918,7 @@ def _install_sandbox_hook(cfg_dir: Path, user: dict):
 def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
     to = to or ADMIN_APPROVAL_EMAIL
     if not RESEND_API_KEY:
-        logger.warning("NEMO-DEV email not sent (no RESEND_API_KEY): %s", subject)
+        logger.warning("Email not sent (no RESEND_API_KEY): %s", subject)
         return False
     payload = json.dumps({
         "from": MAIL_FROM, "to": [to], "subject": subject,
@@ -1931,7 +1931,7 @@ def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
                      "Content-Type": "application/json",
                      # Resend is behind Cloudflare, which 403s (error 1010) the
                      # default Python-urllib User-Agent. Send a normal one.
-                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NEMO-DEV/1.0"})
+                     "User-Agent": f"Mozilla/5.0 (X11; Linux x86_64) {BRAND_NAME}/1.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
         return True
@@ -1965,10 +1965,10 @@ def _approval_key(user_id: str, command: str) -> str:
 def _notify_admin_approval(rec: dict):
     base = PUBLIC_BASE_URL.rstrip("/")
     who = rec.get("username") or rec.get("user_id") or "a user"
-    subj = "[NEMO-DEV] Approval needed: " + who + " requested cross-server access"
+    subj = f"[{BRAND_NAME}] Approval needed: " + who + " requested cross-server access"
     html = (
         '<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:640px">'
-        "<h2>NEMO-DEV — cross-server action blocked</h2>"
+        f"<h2>{_html_escape(BRAND_NAME)} — cross-server action blocked</h2>"
         "<p>A team member's Claude session tried something that reaches another "
         "server. It was blocked and is awaiting your approval.</p>"
         "<p><b>User:</b> " + _html_escape(who) + " (" + _html_escape(rec.get("user_id", "")) + ")<br>"
@@ -1976,7 +1976,7 @@ def _notify_admin_approval(rec: dict):
         "<b>Working dir:</b> " + _html_escape(rec.get("cwd", "")) + "</p>"
         "<p><b>Command:</b></p><pre style=\"background:#f4f4f4;padding:10px;border-radius:6px;"
         "white-space:pre-wrap;word-break:break-all\">" + _html_escape((rec.get("command") or "")[:2000]) + "</pre>"
-        '<p>Log in to <a href="' + (base or "#") + '">NEMO-DEV</a> and open the '
+        '<p>Log in to <a href="' + (base or "#") + '">' + _html_escape(BRAND_NAME) + '</a> and open the '
         "<b>Approvals</b> panel (gear menu) to approve or deny.</p></div>"
     )
     _send_email(subj, html)
@@ -2005,7 +2005,7 @@ async def api_sandbox_check(request: Request):
         return JSONResponse({"decision": "allow"})
     if rec and rec.get("status") == "denied" and now - rec.get("decided_at", 0) < 600:
         return JSONResponse({"decision": "deny",
-                             "reason": "NEMO-DEV: the admin denied this cross-server action."})
+                             "reason": f"{BRAND_NAME}: the admin denied this cross-server action."})
     u = _find_user_by_id(user_id) if user_id else None
     is_new = rec is None
     reqs[key] = {
@@ -2024,7 +2024,7 @@ async def api_sandbox_check(request: Request):
         except Exception:
             logger.exception("Failed to notify admin of approval request")
     return JSONResponse({"decision": "deny", "reason":
-        "NEMO-DEV sandbox: this action targets another server and is blocked. A "
+        f"{BRAND_NAME} sandbox: this action targets another server and is blocked. A "
         "request was sent to the admin (" + ADMIN_APPROVAL_EMAIL + ") for approval. "
         "Keep working on things that stay on this server; do not try to bypass."})
 
@@ -2286,9 +2286,9 @@ from starlette.responses import Response
 
 GROUPS_FILE = MESSAGES_DIR / "groups.json"
 GROUPS_DIR = MESSAGES_DIR / "groups"
-PROJECTS_ROOT = Path.home() / "nemo-projects"
-_GROUP_CTX_BEGIN = "<!-- NEMO-DEV GROUP CONTEXT (managed — edits below are overwritten) -->"
-_GROUP_CTX_END = "<!-- END NEMO-DEV GROUP CONTEXT -->"
+PROJECTS_ROOT = Path.home() / "web-projects"
+_GROUP_CTX_BEGIN = "<!-- TEAM GROUP CONTEXT (managed — edits below are overwritten) -->"
+_GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
 # Top-level path segments reserved for the app (never treated as usernames).
 _RESERVED_TOP = {"", "api", "login", "logout", "qa-output", "static", "favicon.ico",
                  "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws"}
@@ -4642,7 +4642,7 @@ async def api_create_session(request: Request, body: CreateSession):
             # commit author/committer per session → commits are attributed to the
             # right person. Push still uses the box's shared GitHub creds.
             _git_email = "%s@%s" % (_owner_name, GIT_EMAIL_DOMAIN)
-            _exports = ("export NEMO_USER=%s NEMO_SESSION=%s NEMO_PROJECT_DIR=%s NEMO_PROJECT_URL=%s "
+            _exports = ("export DASH_USER=%s DASH_SESSION=%s DASH_PROJECT_DIR=%s DASH_PROJECT_URL=%s "
                         "GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s" % (
                 shlex.quote(_owner_name), shlex.quote(created),
                 shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created)),
@@ -4651,7 +4651,7 @@ async def api_create_session(request: Request, body: CreateSession):
             subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
             subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
         except Exception:
-            logger.debug("Failed to export NEMO_* project env for %s", created, exc_info=True)
+            logger.debug("Failed to export DASH_* project env for %s", created, exc_info=True)
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
@@ -9517,10 +9517,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .raw-output::-webkit-scrollbar-thumb:hover{background:#5b6571}
 .raw-output{scrollbar-width:auto;scrollbar-color:#484f58 #0d1117}
 /* Compact member upload footer (single row) so the terminal keeps full height */
-.nemo-upload-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:6px 0;flex-shrink:0}
-.nemo-drop{flex:1;min-width:120px;padding:7px 12px;border:1px dashed #30363d;border-radius:6px;color:#6e7681;font-size:.72rem;text-align:center;cursor:pointer;transition:all .15s}
-.nemo-drop.drag-over{border-color:#58a6ff;color:#58a6ff;background:#1f6feb22}
-.nemo-drop:hover{border-color:#484f58;color:#8b949e}
+.upload-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:6px 0;flex-shrink:0}
+.upload-drop{flex:1;min-width:120px;padding:7px 12px;border:1px dashed #30363d;border-radius:6px;color:#6e7681;font-size:.72rem;text-align:center;cursor:pointer;transition:all .15s}
+.upload-drop.drag-over{border-color:#58a6ff;color:#58a6ff;background:#1f6feb22}
+.upload-drop:hover{border-color:#484f58;color:#8b949e}
 .raw-link{color:#58a6ff;text-decoration:underline;text-decoration-color:#30363d;text-underline-offset:2px;word-break:break-all;cursor:pointer}
 .raw-link:hover{color:#79c0ff;text-decoration-color:#58a6ff}
 .raw-link:visited{color:#a371f7}
@@ -9728,15 +9728,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
 .nav-tools-item:hover{background:#1c2128}
 .nav-tools-item .icon{font-size:.9rem}
-/* --- NEMO-DEV team (simplified member) mode --- */
-.nemo-only{display:none}
-body.nemo-simple .nemo-only{display:inline-flex;align-items:center;justify-content:center}
-body.nemo-simple .nav-tools-wrap{display:none}
-body.nemo-simple .claude-auth{display:none}
-body.nemo-simple .nav-server-stats{display:none}
-body.nemo-simple .nav-usage{display:none}
-body.nemo-simple .profile-select,body.nemo-simple .profile-wrap{display:none!important}
-body.nemo-simple .nemo-hide-simple{display:none!important}
+/* --- Team (simplified member) mode --- */
+.member-only{display:none}
+body.member-simple .member-only{display:inline-flex;align-items:center;justify-content:center}
+body.member-simple .nav-tools-wrap{display:none}
+body.member-simple .claude-auth{display:none}
+body.member-simple .nav-server-stats{display:none}
+body.member-simple .nav-usage{display:none}
+body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
+body.member-simple .hide-in-simple{display:none!important}
 .approvals-badge{background:#f85149;color:#fff;border-radius:10px;padding:0 6px;font-size:.65rem;font-weight:600;margin-left:4px}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
@@ -9758,8 +9758,8 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
 #imp-banner button{background:#fff;color:#9e6a03;border:none;border-radius:6px;padding:5px 14px;font-size:.8rem;font-weight:600;cursor:pointer}
 #imp-banner button:hover{background:#ffe8b3}
 .users-actions button.imp{background:#1f6feb22;border:1px solid #1f6feb88;color:#79c0ff}
-.create-spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:nemospin .8s linear infinite;margin:18px auto}
-@keyframes nemospin{to{transform:rotate(360deg)}}
+.create-spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:memberspin .8s linear infinite;margin:18px auto}
+@keyframes memberspin{to{transform:rotate(360deg)}}
 .ctx-wrap{display:flex;gap:12px;min-height:min(62vh,560px)}
 .ctx-files{width:230px;flex:none;border:1px solid #30363d;border-radius:8px;overflow:auto;max-height:min(62vh,560px);background:#0d1117}
 .ctx-file{padding:7px 10px;font-size:.8rem;color:#c9d1d9;cursor:pointer;border-bottom:1px solid #161b22;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -10069,9 +10069,9 @@ body.nemo-simple .nemo-hide-simple{display:none!important}
       <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
     </div>
   </div>
-  <!-- NEMO-DEV member-only nav controls (shown only in simplified team mode) -->
-  <button class="nav-icon-btn nemo-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
-  <button class="nav-icon-btn nemo-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
+  <!-- Member-only nav controls (shown only in simplified team mode) -->
+  <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
+  <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
     <span class="status-dot unknown" id="claude-auth-dot"></span>
     <span class="claude-auth-label" id="claude-auth-label">...</span>
@@ -10172,8 +10172,7 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
-const NEMO_BRAND='__BRAND__';
-let NEMO_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
+let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
@@ -10680,7 +10679,7 @@ function renderDetail(){
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
-  const tab=activeTabs[s.name]||(NEMO_SIMPLE?'chat':'raw');
+  const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -10699,9 +10698,9 @@ function renderDetail(){
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
-          ${NEMO_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
+          ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          ${NEMO_SIMPLE?'':`
+          ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
@@ -11571,8 +11570,8 @@ async function loadAll(){
   try{
     // Resolve simple-mode before the first render so member toggles don't flash.
     await loadCurrentUser();
-    NEMO_SIMPLE=!!(_currentUser&&_currentUser.simple);
-    document.body.classList.toggle('nemo-simple',NEMO_SIMPLE);
+    MEMBER_SIMPLE=!!(_currentUser&&_currentUser.simple);
+    document.body.classList.toggle('member-simple',MEMBER_SIMPLE);
     // Phase 1: Fast load — cached data + activity status, no LLM calls
     const resp=await fetch(BASE+'/api/sessions-fast');
     sessions=await resp.json();
@@ -11717,7 +11716,7 @@ function _applyUsageStyle(fillEl,pctNum){
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
 async function refreshUsageLimits(){
-  if(NEMO_SIMPLE) return;  // members don't see usage bars
+  if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
   const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
@@ -11818,10 +11817,10 @@ function closeModal(){document.getElementById('modal-overlay').classList.remove(
 function showCreateModal(){
   const modal=document.getElementById('modal-content');
   // Members get a name pre-filled with 5 random chars (overridable); admins blank.
-  const pre = NEMO_SIMPLE ? _randName(5) : '';
+  const pre = MEMBER_SIMPLE ? _randName(5) : '';
   modal.innerHTML=`
     <h3>New __BRAND__ session</h3>
-    <p>${NEMO_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
+    <p>${MEMBER_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
@@ -12457,10 +12456,10 @@ function buildKeyBar(name,tab){
   // Simplified team members: no keys/commands — a COMPACT single-row upload
   // control. Keeping the footer short means the terminal gets full height and the
   // page doesn't overflow (page overflow would steal the terminal's scroll).
-  if(NEMO_SIMPLE){
-    return `<div class="key-bar expanded nemo-upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
+  if(MEMBER_SIMPLE){
+    return `<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
     <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
-    <div class="nemo-drop" id="dropzone-${tab}-${name}"
+    <div class="upload-drop" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
       ondrop="handleDrop(event,'${name}','${tab}')"
@@ -13148,7 +13147,7 @@ let _profilesEditing = null;       // currently-edited full profile object
 let _profilePending = {};          // sessionName -> "pending restart" flag
 
 async function loadProfiles(force){
-  if(NEMO_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
+  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
   if(_profilesCache && !force) return _profilesCache;
   try{
     const resp = await fetch(BASE+'/api/profiles');
@@ -13159,7 +13158,7 @@ async function loadProfiles(force){
 }
 
 function renderProfileDropdown(s){
-  if(NEMO_SIMPLE) return '';  // members have no profile selector
+  if(MEMBER_SIMPLE) return '';  // members have no profile selector
   const cur = s.profile_id || 'default';
   const list = _profilesCache || [];
   const opts = list.length
@@ -13253,9 +13252,9 @@ async function loadCurrentUser(){
 async function applyRoleVisibility(){
   await loadCurrentUser();
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
-  NEMO_SIMPLE = !!(_currentUser && _currentUser.simple);
-  document.body.classList.toggle('nemo-simple', NEMO_SIMPLE);
-  document.body.classList.toggle('nemo-admin', isAdmin);
+  MEMBER_SIMPLE = !!(_currentUser && _currentUser.simple);
+  document.body.classList.toggle('member-simple', MEMBER_SIMPLE);
+  document.body.classList.toggle('member-admin', isAdmin);
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
@@ -14885,7 +14884,7 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     pdir = _project_dir(username, project)
     if pdir is None or not pdir.exists():
-        return HTMLResponse("Project not found. (Served from ~/nemo-projects/%s/%s/)" % (username, project),
+        return HTMLResponse("Project not found. (Served from ~/web-projects/%s/%s/)" % (username, project),
                             status_code=404)
     serve_cfg = pdir / ".serve.json"
     if serve_cfg.exists():
