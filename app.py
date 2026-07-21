@@ -1154,6 +1154,640 @@ async def api_unimpersonate(request: Request):
     return resp
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API registry — a managed catalog of all external API keys/services (Brave,
+# SerpApi, ScrapingBee, OpenAI, Anthropic, …) with plan/limit/cost notes and,
+# where the provider exposes one, a LIVE usage fetch so you can see how close to
+# the limit you are. Admin-only. Secrets never live in git: the seed below is
+# metadata only, and actual key values are hydrated at first run from
+# ~/CLAUDE_API_KEYS.md (or the environment). Once seeded, the full records live
+# in ~/.tmux-dashboard/api_registry.json (chmod 600, not in the repo).
+# ─────────────────────────────────────────────────────────────────────────────
+import urllib.error
+
+API_REGISTRY_FILE = MESSAGES_DIR / "api_registry.json"
+_CLAUDE_API_KEYS_MD = Path.home() / "CLAUDE_API_KEYS.md"
+
+# Metadata-only seed (NO secret values). key_label is a substring hint used to
+# pick the right value when one env var appears multiple times in the md file.
+_API_SEED = [
+    # ── Search & Scrape ──────────────────────────────────────────────────────
+    {"seed_id": "brave", "name": "Brave Search", "provider": "brave", "category": "search",
+     "env_var": "BRAVE_API_KEY", "key_label": "", "plan": "Free/Data-for-Search",
+     "limits": "Free: ~2,000 q/mo · 1 q/s", "costs": "Free tier / from $3 CPM",
+     "usage_provider": "brave", "docs_url": "https://api-dashboard.search.brave.com/app/documentation",
+     "dashboard_url": "https://api-dashboard.search.brave.com/", "notes": "Web search API. Live rate-limit headers read on each fetch."},
+    {"seed_id": "serpapi", "name": "SerpApi", "provider": "serpapi", "category": "search",
+     "env_var": "SERPAPI_KEY", "key_label": "", "plan": "Production",
+     "limits": "15,000 searches/mo · 3,000/hr", "costs": "$150/mo",
+     "usage_provider": "serpapi", "docs_url": "https://serpapi.com/search-api",
+     "dashboard_url": "https://serpapi.com/dashboard", "notes": "Google/Bing/etc SERP scraping. Live usage supported."},
+    {"seed_id": "scrapingbee", "name": "ScrapingBee", "provider": "scrapingbee", "category": "search",
+     "env_var": "SCRAPINGBEE_API_KEY", "key_label": "", "plan": "",
+     "limits": "1,000,000 API credits/mo · 100 concurrency", "costs": "paid plan",
+     "usage_provider": "scrapingbee", "docs_url": "https://www.scrapingbee.com/documentation/",
+     "dashboard_url": "https://app.scrapingbee.com/dashboard", "notes": "Headless-browser scraping + JS render (SocialPanel gated-platform metrics). Live usage supported."},
+    {"seed_id": "firecrawl", "name": "Firecrawl", "provider": "firecrawl", "category": "search",
+     "env_var": "FIRECRAWL_API_KEY", "key_label": "", "plan": "",
+     "limits": "100,000 credits/period", "costs": "paid plan",
+     "usage_provider": "firecrawl", "docs_url": "https://docs.firecrawl.dev/",
+     "dashboard_url": "https://www.firecrawl.dev/app", "notes": "Crawl → markdown/JSON. Live usage supported."},
+    {"seed_id": "linkup", "name": "Linkup", "provider": "linkup", "category": "search",
+     "env_var": "LINKUP_API_KEY", "key_label": "", "plan": "",
+     "limits": "credit-based", "costs": "pay-as-you-go",
+     "usage_provider": "linkup", "docs_url": "https://docs.linkup.so/",
+     "dashboard_url": "https://app.linkup.so/", "notes": "AI web search. Live credit balance supported."},
+    {"seed_id": "exa", "name": "Exa", "provider": "exa", "category": "search",
+     "env_var": "EXA_API_KEY", "key_label": "", "plan": "",
+     "limits": "credit-based", "costs": "pay-as-you-go",
+     "usage_provider": "exa", "docs_url": "https://docs.exa.ai/",
+     "dashboard_url": "https://dashboard.exa.ai/", "notes": "Neural/semantic web search. No usage API — check dashboard."},
+    {"seed_id": "jina", "name": "Jina AI", "provider": "jina", "category": "search",
+     "env_var": "JINA_API_KEY", "key_label": "", "plan": "",
+     "limits": "token-based wallet", "costs": "pay-as-you-go",
+     "usage_provider": "jina", "docs_url": "https://jina.ai/reader/",
+     "dashboard_url": "https://jina.ai/api-dashboard/", "notes": "Reader (r.jina.ai) + embeddings + reranker. Live wallet balance supported."},
+    {"seed_id": "tavily", "name": "Tavily", "provider": "tavily", "category": "search",
+     "env_var": "TAVILY_API_KEY", "key_label": "", "plan": "Dev",
+     "limits": "credit-based", "costs": "free dev tier",
+     "usage_provider": "tavily", "docs_url": "https://docs.tavily.com/",
+     "dashboard_url": "https://app.tavily.com/", "notes": "AI search API. Live usage attempted."},
+    {"seed_id": "valyu", "name": "Valyu", "provider": "valyu", "category": "search",
+     "env_var": "VALYU_API_KEY", "key_label": "", "plan": "",
+     "limits": "credit-based", "costs": "pay-as-you-go",
+     "usage_provider": "valyu", "docs_url": "https://docs.valyu.network/",
+     "dashboard_url": "https://exchange.valyu.network/", "notes": "⚠️ Stored value currently duplicates the Tavily key — looks mislabeled; verify the real Valyu key."},
+    {"seed_id": "mistral", "name": "Mistral", "provider": "mistral", "category": "search",
+     "env_var": "MISTRAL_API_KEY", "key_label": "", "plan": "",
+     "limits": "token/req rate limits", "costs": "pay-as-you-go",
+     "usage_provider": "mistral", "docs_url": "https://docs.mistral.ai/",
+     "dashboard_url": "https://console.mistral.ai/", "notes": "LLM + OCR/document APIs. Key validated live; usage on dashboard."},
+    # ── LLM / AI models ──────────────────────────────────────────────────────
+    {"seed_id": "openai-grabo", "name": "OpenAI (GRABO-data)", "provider": "openai", "category": "llm",
+     "env_var": "OPENAI_API_KEY", "key_label": "GRABO-data", "plan": "",
+     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
+     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
+     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20. Hit 429 insufficient_quota 2026-07-17 → Vertex fallback."},
+    {"seed_id": "openai-rotemai", "name": "OpenAI (rotemai)", "provider": "openai", "category": "llm",
+     "env_var": "OPENAI_API_KEY", "key_label": "rotemai", "plan": "",
+     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
+     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
+     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20."},
+    {"seed_id": "anthropic-grabo", "name": "Anthropic (grabo-data)", "provider": "anthropic", "category": "llm",
+     "env_var": "ANTHROPIC_API_KEY", "key_label": "grabo-data", "plan": "",
+     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
+     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
+     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27. Cost/usage report needs an Admin API key."},
+    {"seed_id": "anthropic-docvault", "name": "Anthropic (docvault-GRABO)", "provider": "anthropic", "category": "llm",
+     "env_var": "ANTHROPIC_API_KEY", "key_label": "docvault", "plan": "",
+     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
+     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
+     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27."},
+    {"seed_id": "gemini", "name": "Gemini (Direct API)", "provider": "gemini", "category": "llm",
+     "env_var": "GEMINI_API_KEY", "key_label": "", "plan": "",
+     "limits": "per-model RPM/RPD", "costs": "free tier + pay-as-you-go",
+     "usage_provider": "gemini", "docs_url": "https://ai.google.dev/gemini-api/docs",
+     "dashboard_url": "https://aistudio.google.com/app/apikey", "notes": "Non-Vertex. Project 808242700204, rotated 2026-05-20. Key validated live; usage in Google Cloud console."},
+    {"seed_id": "vertex", "name": "Vertex AI / Gemini (GCE SA)", "provider": "vertex", "category": "llm",
+     "env_var": "", "key_label": "", "plan": "GCP", "limits": "GCP quotas",
+     "costs": "GCP billing (nimo-gpt)", "usage_provider": "vertex",
+     "docs_url": "https://cloud.google.com/vertex-ai/docs", "dashboard_url": "https://console.cloud.google.com/vertex-ai",
+     "notes": "No API key — GCE service account nimo-843@nimo-gpt. google.genai(vertexai=True, project='nimo-gpt', location='us-central1'). OpenAI-quota fallback."},
+    # ── Email / Messaging ────────────────────────────────────────────────────
+    {"seed_id": "resend-alphabell", "name": "Resend (alphabell-relay)", "provider": "resend", "category": "mail",
+     "env_var": "RESEND_API_KEY", "key_label": "alphabell", "plan": "",
+     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
+     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
+     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain alphabell.com. Used by alphabell/lisa mail relays."},
+    {"seed_id": "resend-grabo", "name": "Resend (grabo-relay)", "provider": "resend", "category": "mail",
+     "env_var": "RESEND_API_KEY", "key_label": "grabo-relay", "plan": "",
+     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
+     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
+     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain grabo.cc. Used by grabo-mail relay (2026-06-08)."},
+    {"seed_id": "twilio", "name": "Twilio (SMS + phone agent)", "provider": "twilio", "category": "mail",
+     "env_var": "", "key_label": "", "plan": "pay-as-you-go",
+     "limits": "account balance", "costs": "~$208 MTD (2026-07-17)",
+     "usage_provider": "twilio", "docs_url": "https://www.twilio.com/docs",
+     "dashboard_url": "https://console.twilio.com/", "notes": "SID ACe4d65af6… Live creds env-based on builder ~/phoneagent-app/.env (token not stored here). Killed Voice Intelligence auto-transcribe ~$27/day."},
+]
+
+
+def _parse_api_keys_md():
+    """Extract (env_var, label, value) triples from ~/CLAUDE_API_KEYS.md.
+    Lines look like `- SERPAPI_KEY: abc` or `- OPENAI_API_KEY (rotemai): sk-…`."""
+    out = []
+    try:
+        if not _CLAUDE_API_KEYS_MD.exists():
+            return out
+        for line in _CLAUDE_API_KEYS_MD.read_text(errors="replace").splitlines():
+            m = re.match(r"^\s*[-*]?\s*([A-Z][A-Z0-9_]{2,})\s*(?:\(([^)]*)\))?\s*:\s*(\S+)", line)
+            if m:
+                out.append((m.group(1), (m.group(2) or "").strip(), m.group(3).strip()))
+    except Exception:
+        logger.debug("Failed to parse CLAUDE_API_KEYS.md", exc_info=True)
+    return out
+
+
+def _resolve_seed_key(env_var, key_label):
+    """Best-effort hydrate a seed entry's key from the md file, then env."""
+    if not env_var:
+        return ""
+    triples = _parse_api_keys_md()
+    cands = [(lbl, val) for (ev, lbl_, val) in triples for lbl in [lbl_] if ev == env_var]
+    if cands:
+        if key_label:
+            hint = key_label.lower()
+            for lbl, val in cands:
+                if hint in lbl.lower():
+                    return val
+        return cands[0][1]
+    return os.environ.get(env_var, "") or ""
+
+
+def _new_api_id() -> str:
+    return "api_" + secrets.token_hex(6)
+
+
+def _seed_api_registry() -> list:
+    items = []
+    for s in _API_SEED:
+        e = dict(s)
+        e["id"] = "api_" + s["seed_id"]
+        e["key"] = _resolve_seed_key(s.get("env_var", ""), s.get("key_label", ""))
+        e["status"] = "active"
+        e["created_at"] = time.time()
+        e["updated_at"] = time.time()
+        items.append(e)
+    return items
+
+
+def _load_api_registry() -> list:
+    if API_REGISTRY_FILE.exists():
+        try:
+            data = json.loads(API_REGISTRY_FILE.read_text())
+            items = data.get("apis") if isinstance(data, dict) else None
+            if isinstance(items, list):
+                return items
+        except Exception:
+            logger.exception("Failed to read %s — re-seeding", API_REGISTRY_FILE)
+    items = _seed_api_registry()
+    _save_api_registry(items)
+    return items
+
+
+def _save_api_registry(items: list):
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        API_REGISTRY_FILE.write_text(json.dumps({"apis": items}, indent=2))
+        try:
+            API_REGISTRY_FILE.chmod(0o600)
+        except Exception:
+            logger.debug("chmod 600 on api_registry.json failed", exc_info=True)
+    except Exception:
+        logger.exception("Failed to save API registry to %s", API_REGISTRY_FILE)
+
+
+def _mask_key(k: str) -> str:
+    if not k:
+        return ""
+    if len(k) <= 12:
+        return k[:2] + "•" * (len(k) - 2)
+    return k[:6] + "…" + k[-4:]
+
+
+def _public_api_entry(e: dict) -> dict:
+    k = e.get("key", "") or ""
+    return {
+        "id": e.get("id", ""),
+        "name": e.get("name", ""),
+        "provider": e.get("provider", ""),
+        "category": e.get("category", "other"),
+        "env_var": e.get("env_var", ""),
+        "key_label": e.get("key_label", ""),
+        "key_masked": _mask_key(k),
+        "key_set": bool(k),
+        "plan": e.get("plan", ""),
+        "limits": e.get("limits", ""),
+        "costs": e.get("costs", ""),
+        "notes": e.get("notes", ""),
+        "docs_url": e.get("docs_url", ""),
+        "dashboard_url": e.get("dashboard_url", ""),
+        "usage_provider": e.get("usage_provider", ""),
+        "status": e.get("status", "active"),
+        "updated_at": e.get("updated_at", 0),
+    }
+
+
+_API_CATEGORY_ORDER = ["search", "llm", "mail", "other"]
+_API_CATEGORY_LABELS = {
+    "search": "Search & Scrape", "llm": "LLM / AI Models",
+    "mail": "Email & Messaging", "other": "Other",
+}
+
+# ── Live usage fetchers ──────────────────────────────────────────────────────
+def _api_http(url, headers=None, timeout=15, method="GET", data=None):
+    """GET/POST returning (status, body_text, lower-cased headers). Never raises;
+    HTTP errors are returned with their status + body so callers can read e.g. a
+    402 with rate-limit headers."""
+    # Some providers sit behind a WAF (Cloudflare) that 403s the default
+    # `Python-urllib/x.y` User-Agent. Present a normal browser-ish UA + Accept
+    # unless the caller set them explicitly.
+    hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) tmux-dashboard/1.0")
+    hdrs.setdefault("Accept", "application/json, */*")
+    req = urllib.request.Request(url, headers=hdrs, method=method, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+            return r.status, body, {k.lower(): v for k, v in r.headers.items()}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        hdrs = {}
+        try:
+            hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
+        except Exception:
+            pass
+        return e.code, body, hdrs
+    except Exception as e:
+        return 0, str(e), {}
+
+
+def _pct_status(pct):
+    if pct is None:
+        return "ok"
+    if pct >= 90:
+        return "err"
+    if pct >= 75:
+        return "warn"
+    return "ok"
+
+
+def _usage_na(msg="No live usage endpoint — open the dashboard"):
+    return {"ok": False, "status": "na", "summary": msg,
+            "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+
+
+def _usage_err(st, body):
+    return {"ok": False, "status": "err", "summary": f"HTTP {st}" if st else "request failed",
+            "used": None, "limit": None, "remaining": None, "pct": None,
+            "detail": (body or "")[:200]}
+
+
+def _fetch_api_usage_sync(entry: dict) -> dict:
+    prov = (entry.get("usage_provider") or "").lower()
+    key = entry.get("key") or ""
+    if entry.get("status") == "revoked":
+        return {"ok": False, "status": "na", "summary": "Revoked — not checked",
+                "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+    if prov in ("", "exa", "valyu", "vertex", "twilio") or (not key and prov not in ("vertex", "twilio")):
+        if prov == "vertex":
+            return _usage_na("Service-account auth — usage in GCP console")
+        if prov == "twilio":
+            return _usage_na("Token lives on builder VM — usage in Twilio console")
+        if not key:
+            return _usage_na("No key set")
+        return _usage_na()
+    try:
+        if prov == "serpapi":
+            st, body, _ = _api_http("https://serpapi.com/account?api_key=" + urllib.parse.quote(key))
+            if st == 200:
+                d = json.loads(body)
+                limit = d.get("searches_per_month"); used = d.get("this_month_usage")
+                left = d.get("total_searches_left")
+                pct = (used / limit * 100) if (limit and used is not None) else None
+                return {"ok": True, "status": _pct_status(pct),
+                        "summary": f"{used:,} / {limit:,} used · {left:,} left" if limit is not None else "OK",
+                        "used": used, "limit": limit, "remaining": left, "pct": pct,
+                        "detail": f"{d.get('plan_name','')} · ${d.get('plan_monthly_price','?')}/mo · renews {d.get('plan_renewal_date','?')} · {d.get('this_hour_searches','?')}/{d.get('account_rate_limit_per_hour','?')} this hr"}
+            return _usage_err(st, body)
+
+        if prov == "scrapingbee":
+            st, body, _ = _api_http("https://app.scrapingbee.com/api/v1/usage?api_key=" + urllib.parse.quote(key))
+            if st == 200:
+                d = json.loads(body)
+                limit = d.get("max_api_credit"); used = d.get("used_api_credit")
+                rem = (limit - used) if (limit is not None and used is not None) else None
+                pct = (used / limit * 100) if limit else None
+                return {"ok": True, "status": _pct_status(pct),
+                        "summary": f"{used:,} / {limit:,} credits used",
+                        "used": used, "limit": limit, "remaining": rem, "pct": pct,
+                        "detail": f"concurrency {d.get('current_concurrency','?')}/{d.get('max_concurrency','?')} · renews {str(d.get('renewal_subscription_date',''))[:10]}"}
+            return _usage_err(st, body)
+
+        if prov == "firecrawl":
+            st, body, _ = _api_http("https://api.firecrawl.dev/v1/team/credit-usage",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                d = (json.loads(body) or {}).get("data", {}) or {}
+                limit = d.get("plan_credits"); rem = d.get("remaining_credits")
+                used = (limit - rem) if (limit is not None and rem is not None) else None
+                pct = (used / limit * 100) if limit else None
+                return {"ok": True, "status": _pct_status(pct),
+                        "summary": f"{used:,} / {limit:,} credits used · {rem:,} left" if limit is not None else "OK",
+                        "used": used, "limit": limit, "remaining": rem, "pct": pct,
+                        "detail": f"period {str(d.get('billing_period_start',''))[:10]} → {str(d.get('billing_period_end',''))[:10]}"}
+            return _usage_err(st, body)
+
+        if prov == "brave":
+            st, body, hdrs = _api_http(
+                "https://api.search.brave.com/res/v1/web/search?q=ping&count=1",
+                headers={"X-Subscription-Token": key, "Accept": "application/json"})
+
+            def _last(s):
+                parts = [p.strip() for p in (s or "").split(",") if p.strip() != ""]
+                return parts[-1] if parts else ""
+            lim = hdrs.get("x-ratelimit-limit", ""); rem = hdrs.get("x-ratelimit-remaining", "")
+            mlim, mrem = _last(lim), _last(rem)
+            if st == 402:
+                return {"ok": True, "status": "err",
+                        "summary": "402 — free quota exhausted / plan inactive",
+                        "used": None, "limit": None, "remaining": None, "pct": None,
+                        "detail": f"monthly limit {mlim or '?'} · remaining {mrem or '?'}"}
+            if st == 200:
+                try:
+                    L = int(mlim); R = int(mrem); U = L - R
+                    pct = (U / L * 100) if L else None
+                    return {"ok": True, "status": _pct_status(pct),
+                            "summary": (f"{U:,} / {L:,} used this month · {R:,} left" if L else "Key valid"),
+                            "used": (U if L else None), "limit": (L or None),
+                            "remaining": (R if L else None), "pct": pct,
+                            "detail": f"per-second cap {(lim or '').split(',')[0].strip()}"}
+                except Exception:
+                    return {"ok": True, "status": "ok", "summary": "Key valid",
+                            "used": None, "limit": None, "remaining": None, "pct": None,
+                            "detail": f"limit {lim} · remaining {rem}"}
+            return _usage_err(st, body)
+
+        if prov == "linkup":
+            st, body, _ = _api_http("https://api.linkup.so/v1/credits/balance",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                bal = (json.loads(body) or {}).get("balance")
+                low = isinstance(bal, (int, float)) and bal <= 5
+                return {"ok": True, "status": "warn" if low else "ok",
+                        "summary": f"{bal} credits remaining",
+                        "used": None, "limit": None, "remaining": bal, "pct": None, "detail": ""}
+            return _usage_err(st, body)
+
+        if prov == "jina":
+            u = "https://embeddings-dashboard-api.jina.ai/api/v1/api_key/user?api_key=" + urllib.parse.quote(key)
+            st, body, _ = _api_http(u, headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                w = (json.loads(body) or {}).get("wallet", {}) or {}
+                bal = w.get("total_balance")
+                neg = isinstance(bal, (int, float)) and bal < 0
+                summ = (f"balance {bal:,} tokens" if isinstance(bal, (int, float)) else "Key valid")
+                if neg:
+                    summ += " (depleted / negative)"
+                return {"ok": True, "status": "err" if neg else "ok", "summary": summ,
+                        "used": None, "limit": None, "remaining": bal, "pct": None, "detail": ""}
+            return _usage_err(st, body)
+
+        if prov == "tavily":
+            st, body, _ = _api_http("https://api.tavily.com/usage",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                try:
+                    d = json.loads(body); acct = d.get("account", {}) or {}; k = d.get("key", {}) or {}
+                    limit = acct.get("plan_limit") or k.get("limit")
+                    used = acct.get("plan_usage") if acct.get("plan_usage") is not None else k.get("usage")
+                    if limit and used is not None:
+                        pct = used / limit * 100
+                        return {"ok": True, "status": _pct_status(pct),
+                                "summary": f"{used:,} / {limit:,} used",
+                                "used": used, "limit": limit, "remaining": limit - used,
+                                "pct": pct, "detail": ""}
+                    return {"ok": True, "status": "ok", "summary": "Key valid",
+                            "used": None, "limit": None, "remaining": None, "pct": None,
+                            "detail": json.dumps(d)[:180]}
+                except Exception:
+                    return {"ok": True, "status": "ok", "summary": "Key valid",
+                            "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+            return _usage_err(st, body)
+
+        if prov == "openai":
+            st, body, _ = _api_http("https://api.openai.com/v1/models",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                n = len((json.loads(body) or {}).get("data", []))
+                return {"ok": True, "status": "ok",
+                        "summary": f"Key valid ({n} models) — $/usage on dashboard",
+                        "used": None, "limit": None, "remaining": None, "pct": None,
+                        "detail": "Cost/usage numbers need an Admin API key; open the dashboard."}
+            if st == 429:
+                return {"ok": True, "status": "warn", "summary": "429 — rate/quota limited",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
+            if st == 401:
+                return {"ok": True, "status": "err", "summary": "401 — invalid/expired key",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
+            return _usage_err(st, body)
+
+        if prov == "anthropic":
+            st, body, _ = _api_http("https://api.anthropic.com/v1/models",
+                                    headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+            if st == 200:
+                n = len((json.loads(body) or {}).get("data", []))
+                return {"ok": True, "status": "ok",
+                        "summary": f"Key valid ({n} models) — $/usage on dashboard",
+                        "used": None, "limit": None, "remaining": None, "pct": None,
+                        "detail": "Cost/usage report needs an Admin API key (sk-ant-admin…)."}
+            if st == 429:
+                return {"ok": True, "status": "warn", "summary": "429 — rate/quota limited",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
+            if st in (401, 403):
+                return {"ok": True, "status": "err", "summary": f"{st} — invalid/expired key",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
+            return _usage_err(st, body)
+
+        if prov == "gemini":
+            st, body, _ = _api_http(
+                "https://generativelanguage.googleapis.com/v1beta/models?key=" + urllib.parse.quote(key))
+            if st == 200:
+                n = len((json.loads(body) or {}).get("models", []))
+                return {"ok": True, "status": "ok",
+                        "summary": f"Key valid ({n} models) — usage in GCP console",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+            return _usage_err(st, body)
+
+        if prov == "mistral":
+            st, body, _ = _api_http("https://api.mistral.ai/v1/models",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                n = len((json.loads(body) or {}).get("data", []))
+                return {"ok": True, "status": "ok",
+                        "summary": f"Key valid ({n} models) — usage on dashboard",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+            return _usage_err(st, body)
+
+        if prov == "resend":
+            st, body, _ = _api_http("https://api.resend.com/domains",
+                                    headers={"Authorization": "Bearer " + key})
+            if st == 200:
+                data = (json.loads(body) or {}).get("data", [])
+                doms = ", ".join(d.get("name", "") for d in data) if isinstance(data, list) else ""
+                return {"ok": True, "status": "ok",
+                        "summary": f"Key valid — {len(data) if isinstance(data, list) else 0} domain(s)",
+                        "used": None, "limit": None, "remaining": None, "pct": None,
+                        "detail": (doms or "Free tier: 100/day · 3,000/mo")}
+            # Resend returns 400/401 for a bad key, 403 for a valid but
+            # permission-restricted (send-only) key — the latter is not an error.
+            if st in (400, 401):
+                return {"ok": True, "status": "err", "summary": f"{st} — invalid key",
+                        "used": None, "limit": None, "remaining": None, "pct": None, "detail": (body or "")[:180]}
+            if st == 403:
+                return {"ok": True, "status": "ok", "summary": "Key valid — restricted (send-only)",
+                        "used": None, "limit": None, "remaining": None, "pct": None,
+                        "detail": "Key lacks domains:read; used by mail relays. Free tier: 100/day · 3,000/mo"}
+            return _usage_err(st, body)
+    except Exception as e:
+        logger.debug("usage fetch failed for %s", entry.get("id"), exc_info=True)
+        return {"ok": False, "status": "err", "summary": "fetch error: " + str(e)[:120],
+                "used": None, "limit": None, "remaining": None, "pct": None, "detail": ""}
+    return _usage_na()
+
+
+class ApiEntryBody(BaseModel):
+    name: Optional[str] = None
+    provider: Optional[str] = None
+    category: Optional[str] = None
+    key: Optional[str] = None
+    env_var: Optional[str] = None
+    key_label: Optional[str] = None
+    plan: Optional[str] = None
+    limits: Optional[str] = None
+    costs: Optional[str] = None
+    notes: Optional[str] = None
+    docs_url: Optional[str] = None
+    dashboard_url: Optional[str] = None
+    usage_provider: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.get("/api/admin/apis")
+async def api_admin_list_apis(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    items = _load_api_registry()
+    return JSONResponse({
+        "apis": [_public_api_entry(e) for e in items],
+        "category_order": _API_CATEGORY_ORDER,
+        "category_labels": _API_CATEGORY_LABELS,
+    })
+
+
+@app.post("/api/admin/apis")
+async def api_admin_create_api(request: Request, body: ApiEntryBody):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    name = (body.name or "").strip()
+    if not name:
+        return JSONResponse({"error": "Name is required"}, status_code=400)
+    items = _load_api_registry()
+    now = time.time()
+    entry = {
+        "id": _new_api_id(), "name": name,
+        "provider": (body.provider or "").strip(),
+        "category": (body.category or "other").strip() or "other",
+        "key": (body.key or "").strip(),
+        "env_var": (body.env_var or "").strip(),
+        "key_label": (body.key_label or "").strip(),
+        "plan": (body.plan or "").strip(),
+        "limits": (body.limits or "").strip(),
+        "costs": (body.costs or "").strip(),
+        "notes": (body.notes or "").strip(),
+        "docs_url": (body.docs_url or "").strip(),
+        "dashboard_url": (body.dashboard_url or "").strip(),
+        "usage_provider": (body.usage_provider or "").strip(),
+        "status": "active",
+        "created_at": now, "updated_at": now,
+    }
+    items.append(entry)
+    _save_api_registry(items)
+    logger.info("Admin '%s' added API '%s'", user.get("username"), name)
+    return JSONResponse({"ok": True, "api": _public_api_entry(entry)})
+
+
+@app.patch("/api/admin/apis/{api_id}")
+async def api_admin_update_api(request: Request, api_id: str, body: ApiEntryBody):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    items = _load_api_registry()
+    target = next((e for e in items if e.get("id") == api_id), None)
+    if not target:
+        return JSONResponse({"error": "API not found"}, status_code=404)
+    for field in ("name", "provider", "category", "env_var", "key_label", "plan",
+                  "limits", "costs", "notes", "docs_url", "dashboard_url", "usage_provider"):
+        val = getattr(body, field)
+        if val is not None:
+            target[field] = val.strip()
+    # Key: only overwrite when a non-empty value is sent (empty string leaves it
+    # untouched so an edit that doesn't retype the secret keeps it).
+    if body.key is not None and body.key.strip():
+        target["key"] = body.key.strip()
+    if body.status is not None:
+        if body.status not in ("active", "revoked"):
+            return JSONResponse({"error": "status must be active or revoked"}, status_code=400)
+        target["status"] = body.status
+    target["updated_at"] = time.time()
+    _save_api_registry(items)
+    return JSONResponse({"ok": True, "api": _public_api_entry(target)})
+
+
+@app.delete("/api/admin/apis/{api_id}")
+async def api_admin_delete_api(request: Request, api_id: str):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    items = _load_api_registry()
+    target = next((e for e in items if e.get("id") == api_id), None)
+    if not target:
+        return JSONResponse({"error": "API not found"}, status_code=404)
+    items = [e for e in items if e.get("id") != api_id]
+    _save_api_registry(items)
+    logger.info("Admin '%s' removed API '%s'", user.get("username"), target.get("name"))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/admin/apis/{api_id}/reveal")
+async def api_admin_reveal_api(request: Request, api_id: str):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = next((e for e in _load_api_registry() if e.get("id") == api_id), None)
+    if not target:
+        return JSONResponse({"error": "API not found"}, status_code=404)
+    return JSONResponse({"key": target.get("key", "")})
+
+
+@app.get("/api/admin/apis/{api_id}/usage")
+async def api_admin_api_usage(request: Request, api_id: str):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = next((e for e in _load_api_registry() if e.get("id") == api_id), None)
+    if not target:
+        return JSONResponse({"error": "API not found"}, status_code=404)
+    usage = await asyncio.to_thread(_fetch_api_usage_sync, target)
+    return JSONResponse({"id": api_id, "usage": usage})
+
+
+@app.get("/api/admin/apis-usage-all")
+async def api_admin_api_usage_all(request: Request):
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    items = _load_api_registry()
+    results = await asyncio.gather(*[asyncio.to_thread(_fetch_api_usage_sync, e) for e in items])
+    return JSONResponse({"usage": {e.get("id"): u for e, u in zip(items, results)}})
+
+
 class SaveMyContextBody(BaseModel):
     content: str
 
@@ -9954,6 +10588,61 @@ body.member-simple .hide-in-simple{display:none!important}
 .users-new-bar input:focus,.users-new-bar select:focus{border-color:#58a6ff}
 .users-new-bar button{background:#1f6feb;color:#fff;border:none;padding:7px 14px;border-radius:5px;font-size:.82rem;cursor:pointer;font-weight:500}
 .users-new-bar button:hover{background:#388bfd}
+/* APIs tab */
+.api-toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 2px}
+.api-summary{font-size:.75rem;color:#8b949e}
+.api-toolbar-btns{display:flex;gap:8px}
+.api-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 12px;border-radius:6px;font-size:.78rem;cursor:pointer}
+.api-btn:hover{background:#30363d}
+.api-btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.api-btn.primary:hover{background:#388bfd}
+.api-cat{margin-top:14px}
+.api-cat-title{font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.api-cat-count{color:#6e7681;border:1px solid #30363d;border-radius:10px;padding:0 7px;font-size:.66rem;font-weight:600}
+.api-table{width:100%;border-collapse:collapse;font-size:.8rem;table-layout:fixed}
+.api-table td{padding:9px 8px;border-bottom:1px solid #161b22;color:#c9d1d9;vertical-align:top;word-break:break-word}
+.api-row.is-revoked{opacity:.55}
+.api-c-name{width:24%}
+.api-c-key{width:22%}
+.api-c-meta{width:18%}
+.api-c-usage{width:24%}
+.api-c-act{width:12%}
+.api-name{color:#e6edf3;font-weight:600;font-size:.85rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.api-sub{color:#8b949e;font-size:.68rem;margin-top:2px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.api-env{font-family:'SF Mono','Fira Code',Consolas,monospace;color:#6e7681;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:0 5px;font-size:.64rem}
+.api-notes{color:#8b949e;font-size:.68rem;margin-top:5px;line-height:1.4}
+.api-pill{font-size:.58rem;text-transform:uppercase;letter-spacing:.05em;border-radius:3px;padding:1px 5px;font-weight:700}
+.api-pill.revoked{color:#f85149;border:1px solid #f8514944}
+.api-pill.nokey{color:#d29922;border:1px solid #d2992244}
+.api-key-mask,.api-key-full{font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.7rem;color:#c9d1d9;background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:2px 5px;display:inline-block;max-width:100%;overflow-wrap:anywhere}
+.api-key-full{color:#7ee787}
+.api-links{margin-top:5px;display:flex;gap:8px;flex-wrap:wrap}
+.api-mini{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:2px 7px;border-radius:4px;font-size:.66rem;cursor:pointer;margin:3px 3px 0 0;text-decoration:none;display:inline-block}
+.api-mini:hover{background:#30363d}
+.api-mini.warn{color:#e3b341;border-color:#9e6a0344}
+.api-mini.danger{color:#f85149;border-color:#f8514944}
+.api-mini.danger:hover{background:#3f161a;color:#ff7b72}
+.api-mini.link{color:#58a6ff;border-color:transparent;background:transparent;padding:2px 0;margin-right:10px}
+.api-mini.link:hover{text-decoration:underline;background:transparent}
+.api-meta-plan,.api-meta-lim,.api-meta-cost{display:block;font-size:.72rem;line-height:1.5}
+.api-meta-plan{color:#d2a8ff}
+.api-meta-lim{color:#c9d1d9}
+.api-meta-cost{color:#7ee787}
+.api-usage-wrap{min-height:16px}
+.api-bar{display:block;height:6px;background:#21262d;border-radius:4px;overflow:hidden;margin-bottom:4px}
+.api-bar-fill{display:block;height:100%;border-radius:4px;transition:width .3s}
+.api-usage-summ{display:block;font-size:.72rem;font-weight:600;line-height:1.35}
+.api-usage-detail{display:block;color:#6e7681;font-size:.64rem;margin-top:2px;line-height:1.35}
+.api-usage-na{color:#6e7681;font-size:.72rem}
+.api-usage-loading{color:#58a6ff;font-size:.72rem}
+.api-edit{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;margin:8px 0 4px}
+.api-edit-title{font-size:.82rem;color:#e6edf3;font-weight:700;margin-bottom:10px}
+.api-edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.api-edit-grid label{display:flex;flex-direction:column;gap:3px;font-size:.66rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.api-edit-grid input,.api-edit-grid select,.api-edit-grid textarea{background:#161b22;border:1px solid #30363d;border-radius:5px;color:#e6edf3;padding:6px 8px;font-size:.8rem;outline:none;font-family:inherit;text-transform:none;letter-spacing:normal;font-weight:400}
+.api-edit-grid input:focus,.api-edit-grid select:focus,.api-edit-grid textarea:focus{border-color:#58a6ff}
+.api-edit-grid .api-edit-wide{grid-column:1 / -1}
+.api-edit-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
 .nav-tools-divider{height:1px;background:#21262d;margin:4px 0}
 
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
@@ -10063,6 +10752,7 @@ body.member-simple .hide-in-simple{display:none!important}
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
       <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('apis');closeToolsMenu()"><span class="icon">&#x1F511;</span> API Keys &amp; Usage</div>
       <div class="nav-tools-item" onclick="openSettings('mycontext');closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-item" onclick="openSettings('history');closeToolsMenu()"><span class="icon">&#x1F4C5;</span> History</div>
       <div class="nav-tools-divider"></div>
@@ -13323,6 +14013,7 @@ function renderSettingsTabs(){
     {id:'history',   label:'History'},
   ];
   if(isAdmin) tabs.push({id:'users', label:'Users'});
+  if(isAdmin) tabs.push({id:'apis', label:'APIs'});
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
@@ -13350,6 +14041,9 @@ function renderSettingsContent(){
   }else if(_settingsActiveTab === 'users'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading users...</div></div>';
     loadUsersAdmin();
+  }else if(_settingsActiveTab === 'apis'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading APIs...</div></div>';
+    loadApisAdmin();
   }
 }
 
@@ -13508,6 +14202,263 @@ function renderHistoryDetail(){
 function backToHistoryList(){
   _settingsHistoryDetail = null;
   renderSettingsContent();
+}
+
+// --- APIs tab (admin only) — catalog of all external API keys + live usage ---
+let _apisCache = [];
+let _apiCatOrder = ['search','llm','mail','other'];
+let _apiCatLabels = {search:'Search & Scrape', llm:'LLM / AI Models', mail:'Email & Messaging', other:'Other'};
+let _apiUsage = {};      // id -> {loading}|usage object
+let _apiRevealed = {};   // id -> full key string (while revealed)
+let _apiEditId = null;   // 'new' | id | null
+
+async function loadApisAdmin(){
+  let data;
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis');
+    data = await resp.json();
+    if(!resp.ok){ throw new Error(data.error||'Failed to load APIs'); }
+  }catch(e){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load APIs: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  _apisCache = data.apis || [];
+  _apiCatOrder = data.category_order || _apiCatOrder;
+  _apiCatLabels = data.category_labels || _apiCatLabels;
+  _apiEditId = null;
+  renderApisAdmin();
+  refreshAllApiUsage();   // fire-and-forget: fills in live usage as it returns
+}
+
+function _apiStatusColor(s){
+  return s==='ok'?'#3fb950':s==='warn'?'#d29922':s==='err'?'#f85149':'#6e7681';
+}
+function _apiUsageProviderOptions(sel){
+  const provs = ['','brave','serpapi','scrapingbee','firecrawl','linkup','exa','jina','tavily','valyu','mistral','openai','anthropic','gemini','vertex','resend','twilio'];
+  return provs.map(p=>`<option value="${p}" ${p===sel?'selected':''}>${p||'— none —'}</option>`).join('');
+}
+function _apiCatOptions(sel){
+  return _apiCatOrder.map(c=>`<option value="${c}" ${c===sel?'selected':''}>${esc(_apiCatLabels[c]||c)}</option>`).join('');
+}
+
+function renderUsageCell(a){
+  const u = _apiUsage[a.id];
+  if(a.status==='revoked') return '<span class="api-usage-na">revoked</span>';
+  if(!u) return '<span class="api-usage-na" title="Not checked yet">—</span>';
+  if(u.loading) return '<span class="api-usage-loading">checking…</span>';
+  const col = _apiStatusColor(u.status);
+  let bar = '';
+  if(typeof u.pct === 'number' && !isNaN(u.pct)){
+    const pct = Math.max(0, Math.min(100, u.pct));
+    bar = `<span class="api-bar"><span class="api-bar-fill" style="width:${pct.toFixed(1)}%;background:${col}"></span></span>`;
+  }
+  const summ = `<span class="api-usage-summ" style="color:${col}">${esc(u.summary||'')}</span>`;
+  const detail = u.detail ? `<span class="api-usage-detail">${esc(u.detail)}</span>` : '';
+  return bar + summ + detail;
+}
+
+function renderApisAdmin(){
+  const el = document.getElementById('settings-content');
+  const total = _apisCache.length;
+  const withKeys = _apisCache.filter(a=>a.key_set).length;
+  const liveCount = _apisCache.filter(a=>a.usage_provider && !['exa','valyu','vertex','twilio',''].includes(a.usage_provider)).length;
+
+  let sections = '';
+  const cats = _apiCatOrder.filter(c => _apisCache.some(a => (a.category||'other')===c));
+  // include any categories not in the known order
+  _apisCache.forEach(a=>{ const c=a.category||'other'; if(!cats.includes(c)) cats.push(c); });
+
+  cats.forEach(cat=>{
+    const rows = _apisCache.filter(a => (a.category||'other')===cat);
+    if(!rows.length) return;
+    const body = rows.map(a=>renderApiRow(a)).join('');
+    sections += `<div class="api-cat">
+      <div class="api-cat-title">${esc(_apiCatLabels[cat]||cat)} <span class="api-cat-count">${rows.length}</span></div>
+      <table class="api-table"><tbody>${body}</tbody></table>
+    </div>`;
+  });
+
+  el.innerHTML = `<div class="settings-section">
+    <div class="pf-banner">Every external API key across the environment — plan, limits, cost and <strong>live usage</strong> where the provider exposes it. Seeded from <code>~/CLAUDE_API_KEYS.md</code>; managed records live in <code>~/.tmux-dashboard/api_registry.json</code> (chmod 600, never committed).</div>
+    <div class="api-toolbar">
+      <div class="api-summary">${total} services · ${withKeys} with keys · ${liveCount} report live usage</div>
+      <div class="api-toolbar-btns">
+        <button class="api-btn" onclick="refreshAllApiUsage()">↻ Refresh usage</button>
+        <button class="api-btn primary" onclick="startAddApi()">＋ Add API</button>
+      </div>
+    </div>
+    <div id="api-edit-host">${_apiEditId?renderApiEditForm():''}</div>
+    ${sections || '<div class="history-empty">No APIs registered.</div>'}
+  </div>`;
+}
+
+function renderApiRow(a){
+  const statusPill = a.status==='revoked'
+    ? '<span class="api-pill revoked">revoked</span>'
+    : (a.key_set ? '' : '<span class="api-pill nokey">no key</span>');
+  const revealed = _apiRevealed[a.id];
+  const keyCell = a.key_set
+    ? (revealed!==undefined
+        ? `<code class="api-key-full">${esc(revealed)}</code>
+           <button class="api-mini" onclick="copyText('${a.id}')" title="Copy">copy</button>
+           <button class="api-mini" onclick="hideApiKey('${a.id}')" title="Hide">hide</button>`
+        : `<code class="api-key-mask">${esc(a.key_masked)}</code>
+           <button class="api-mini" onclick="revealApiKey('${a.id}')" title="Reveal">reveal</button>`)
+    : '<span class="api-usage-na">—</span>';
+  const meta = [
+    a.plan?`<span class="api-meta-plan">${esc(a.plan)}</span>`:'',
+    a.limits?`<span class="api-meta-lim">${esc(a.limits)}</span>`:'',
+    a.costs?`<span class="api-meta-cost">${esc(a.costs)}</span>`:'',
+  ].filter(Boolean).join('');
+  const notes = a.notes?`<div class="api-notes">${esc(a.notes)}</div>`:'';
+  const envTag = a.env_var?`<span class="api-env">${esc(a.env_var)}${a.key_label?(' · '+esc(a.key_label)):''}</span>`:'';
+  const links = [
+    a.dashboard_url?`<a class="api-mini link" href="${esc(a.dashboard_url)}" target="_blank" rel="noopener">dashboard ↗</a>`:'',
+    a.docs_url?`<a class="api-mini link" href="${esc(a.docs_url)}" target="_blank" rel="noopener">docs ↗</a>`:'',
+  ].filter(Boolean).join('');
+  const revokeBtn = a.status==='revoked'
+    ? `<button class="api-mini" onclick="setApiStatus('${a.id}','active')">Enable</button>`
+    : `<button class="api-mini warn" onclick="setApiStatus('${a.id}','revoked')">Revoke</button>`;
+  return `<tr class="api-row ${a.status==='revoked'?'is-revoked':''}">
+    <td class="api-c-name">
+      <div class="api-name">${esc(a.name)} ${statusPill}</div>
+      <div class="api-sub">${esc(a.provider||'')} ${envTag}</div>
+      ${notes}
+    </td>
+    <td class="api-c-key">${keyCell}<div class="api-links">${links}</div></td>
+    <td class="api-c-meta">${meta||'<span class="api-usage-na">—</span>'}</td>
+    <td class="api-c-usage">
+      <div class="api-usage-wrap" id="api-usage-${a.id}">${renderUsageCell(a)}</div>
+      <button class="api-mini" onclick="fetchApiUsage('${a.id}')">check</button>
+    </td>
+    <td class="api-c-act">
+      <div class="api-actions">
+        <button class="api-mini" onclick="startEditApi('${a.id}')">Edit</button>
+        ${revokeBtn}
+        <button class="api-mini danger" onclick="removeApi('${a.id}','${esc((a.name||'').replace(/'/g,"\\'"))}')">Remove</button>
+      </div>
+    </td>
+  </tr>`;
+}
+
+function renderApiEditForm(){
+  const isNew = _apiEditId==='new';
+  const a = isNew ? {category:'search',status:'active'} : (_apisCache.find(x=>x.id===_apiEditId)||{});
+  return `<div class="api-edit">
+    <div class="api-edit-title">${isNew?'Add API':'Edit — '+esc(a.name||'')}</div>
+    <div class="api-edit-grid">
+      <label>Name<input id="af-name" value="${esc(a.name||'')}" placeholder="e.g. SerpApi"></label>
+      <label>Provider<input id="af-provider" value="${esc(a.provider||'')}" placeholder="serpapi"></label>
+      <label>Category<select id="af-category">${_apiCatOptions(a.category||'search')}</select></label>
+      <label>Usage provider<select id="af-usage">${_apiUsageProviderOptions(a.usage_provider||'')}</select></label>
+      <label>Env var<input id="af-env" value="${esc(a.env_var||'')}" placeholder="SERPAPI_KEY"></label>
+      <label>Key label<input id="af-label" value="${esc(a.key_label||'')}" placeholder="rotemai"></label>
+      <label class="api-edit-wide">API key<input id="af-key" type="password" autocomplete="off" placeholder="${isNew?'paste key':'leave blank to keep current'}"></label>
+      <label>Plan<input id="af-plan" value="${esc(a.plan||'')}"></label>
+      <label>Limits<input id="af-limits" value="${esc(a.limits||'')}"></label>
+      <label>Costs<input id="af-costs" value="${esc(a.costs||'')}"></label>
+      <label>Dashboard URL<input id="af-dash" value="${esc(a.dashboard_url||'')}"></label>
+      <label>Docs URL<input id="af-docs" value="${esc(a.docs_url||'')}"></label>
+      <label class="api-edit-wide">Notes<textarea id="af-notes" rows="2">${esc(a.notes||'')}</textarea></label>
+    </div>
+    <div class="api-edit-actions">
+      <button class="api-btn" onclick="cancelApiEdit()">Cancel</button>
+      <button class="api-btn primary" onclick="saveApiForm()">${isNew?'Add':'Save'}</button>
+    </div>
+  </div>`;
+}
+
+function startAddApi(){ _apiEditId='new'; renderApisAdmin(); document.getElementById('api-edit-host').scrollIntoView({behavior:'smooth',block:'nearest'}); }
+function startEditApi(id){ _apiEditId=id; renderApisAdmin(); document.getElementById('api-edit-host').scrollIntoView({behavior:'smooth',block:'nearest'}); }
+function cancelApiEdit(){ _apiEditId=null; renderApisAdmin(); }
+
+async function saveApiForm(){
+  const g = id => (document.getElementById(id)||{}).value;
+  const payload = {
+    name:g('af-name'), provider:g('af-provider'), category:g('af-category'),
+    usage_provider:g('af-usage'), env_var:g('af-env'), key_label:g('af-label'),
+    key:g('af-key'), plan:g('af-plan'), limits:g('af-limits'), costs:g('af-costs'),
+    dashboard_url:g('af-dash'), docs_url:g('af-docs'), notes:g('af-notes'),
+  };
+  if(!(payload.name||'').trim()){ alert('Name is required'); return; }
+  const isNew = _apiEditId==='new';
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis'+(isNew?'':'/'+encodeURIComponent(_apiEditId)), {
+      method: isNew?'POST':'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Save failed'); return; }
+    _apiEditId=null;
+    await loadApisAdmin();
+  }catch(e){ alert('Save failed: '+e.message); }
+}
+
+async function setApiStatus(id, status){
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis/'+encodeURIComponent(id), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    await loadApisAdmin();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+
+async function removeApi(id, name){
+  if(!confirm('Remove "'+name+'" from the registry?\\n\\nThis only deletes the dashboard record — it does NOT revoke the key at the provider.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis/'+encodeURIComponent(id), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Delete failed'); return; }
+    await loadApisAdmin();
+  }catch(e){ alert('Delete failed: '+e.message); }
+}
+
+async function revealApiKey(id){
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis/'+encodeURIComponent(id)+'/reveal');
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed'); return; }
+    _apiRevealed[id] = data.key||'';
+    renderApisAdmin();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+function hideApiKey(id){ delete _apiRevealed[id]; renderApisAdmin(); }
+async function copyText(id){
+  const t = _apiRevealed[id]; if(t===undefined) return;
+  try{ await navigator.clipboard.writeText(t); }catch(e){
+    const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta); ta.select();
+    try{document.execCommand('copy');}catch(_){} document.body.removeChild(ta);
+  }
+}
+
+async function fetchApiUsage(id){
+  _apiUsage[id] = {loading:true};
+  const cell = document.getElementById('api-usage-'+id);
+  const a = _apisCache.find(x=>x.id===id);
+  if(cell && a) cell.innerHTML = renderUsageCell(a);
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis/'+encodeURIComponent(id)+'/usage');
+    const data = await resp.json();
+    _apiUsage[id] = resp.ok ? (data.usage||{}) : {status:'err',summary:data.error||'failed'};
+  }catch(e){ _apiUsage[id] = {status:'err',summary:e.message}; }
+  const cell2 = document.getElementById('api-usage-'+id);
+  if(cell2 && a) cell2.innerHTML = renderUsageCell(a);
+}
+
+async function refreshAllApiUsage(){
+  _apisCache.forEach(a=>{ if(a.status!=='revoked') _apiUsage[a.id]={loading:true}; });
+  // reflect loading state without a full re-render
+  _apisCache.forEach(a=>{ const c=document.getElementById('api-usage-'+a.id); if(c) c.innerHTML=renderUsageCell(a); });
+  try{
+    const resp = await fetch(BASE+'/api/admin/apis-usage-all');
+    const data = await resp.json();
+    if(resp.ok && data.usage){ _apiUsage = Object.assign(_apiUsage, data.usage); }
+  }catch(e){ /* leave individual cells as-is */ }
+  _apisCache.forEach(a=>{ const c=document.getElementById('api-usage-'+a.id); if(c) c.innerHTML=renderUsageCell(a); });
 }
 
 // --- Users tab (admin only) ---
