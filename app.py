@@ -9027,6 +9027,7 @@ async def api_set_session_model(session_name: str, body: ModelBody):
             capture_output=True, text=True, timeout=5)
         # Give the CLI a beat, then check the pane for a rejection message.
         await asyncio.sleep(1.2)
+        downgraded = False
         try:
             tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
             low = tail.lower()
@@ -9035,6 +9036,35 @@ async def api_set_session_model(session_name: str, body: ModelBody):
                     {"error": f"Claude rejected the model id '{mid}' — it may not be "
                               "available on this plan or CLI version"},
                     status_code=400)
+            if "not available for your account" in low:
+                # Some sessions run on accounts without the 1M-context tier —
+                # fall back to the base model instead of leaving a dead switch.
+                if not mid.endswith("[1m]"):
+                    return JSONResponse(
+                        {"error": f"'{mid}' isn't available for this session's account"},
+                        status_code=400)
+                base = mid[: -len("[1m]")]
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "send-keys", "-t", session_name, "-l", "/model " + base],
+                    capture_output=True, text=True, timeout=5)
+                await asyncio.sleep(0.3)
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    capture_output=True, text=True, timeout=5)
+                ok2 = False
+                for _ in range(7):  # the confirm line can take a few seconds to render
+                    await asyncio.sleep(0.7)
+                    tail2 = await asyncio.to_thread(capture_pane_recent, session_name, 10)
+                    if "set model to" in tail2.lower():
+                        ok2 = True
+                        break
+                if not ok2:
+                    return JSONResponse(
+                        {"error": f"Neither '{mid}' nor '{base}' is available for "
+                                  "this session's account"},
+                        status_code=400)
+                mid = base
+                downgraded = True
         except Exception:
             logger.debug("Pane check after /model failed", exc_info=True)
         _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
@@ -9046,8 +9076,10 @@ async def api_set_session_model(session_name: str, body: ModelBody):
         # explicitly anyway; this guards manual `claude` runs).
         await asyncio.sleep(0.8)
         _restore_default_model_setting()
-        logger.info("Session '%s' model switch requested -> %s", session_name, mid)
-        return JSONResponse({"ok": True, "model": mid, "pending": True})
+        logger.info("Session '%s' model switch requested -> %s%s",
+                    session_name, mid, " (downgraded from 1M)" if downgraded else "")
+        return JSONResponse({"ok": True, "model": mid, "pending": True,
+                             "downgraded": downgraded})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
