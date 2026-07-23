@@ -962,7 +962,10 @@ async def do_login(request: Request):
             target_user["password_hash"] = _hash_password(password, salt)
         _save_users(users)
     else:
-        return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+        # Redirect to the root (which the auth gate serves as LOGIN_PAGE), NOT to
+        # /login — there is only a POST /login route, so GET /login?err=1 404s
+        # ("Not found"). The login page's inline JS shows the error on ?err=1.
+        return RedirectResponse(url=request.scope.get("root_path", "") + "/?err=1", status_code=303)
 
     # Update last_login + capture IP / browser for the admin audit view
     ua = (request.headers.get("user-agent", "") or "")[:300]
