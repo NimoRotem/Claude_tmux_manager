@@ -35,6 +35,71 @@ PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
 
+# Default model for dashboard-launched sessions. Passed as an explicit `--model`
+# flag at launch so the default can't drift when Claude Code persists a /model
+# choice — or a new release's auto-default — into ~/.claude/settings.json (that
+# drift is how default sessions silently became Sonnet 4.6, then Fable 5).
+DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-4-8[1m]")
+
+# Models offered in the session header dropdown (keep in sync with
+# MODEL_CHOICES in the frontend JS).
+ALLOWED_SESSION_MODELS = [
+    "claude-opus-4-8[1m]",
+    "claude-opus-4-8",
+    "claude-fable-5[1m]",
+    "claude-fable-5",
+    "claude-sonnet-4-6[1m]",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+]
+
+
+def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
+    """Build the pane launch line: force plan auth via ~/.claude/.credentials.json
+    (a stray ANTHROPIC_API_KEY would bill the metered API; a CLAUDE_CODE_OAUTH_TOKEN
+    env var makes claude brand itself "Claude API" even on the plan token) and pin
+    an explicit --model unless the command already carries one or the caller opts
+    out (profiles that pin their own model via settings.json)."""
+    out = cmd
+    if pin_model and DEFAULT_MODEL and "claude" in cmd and "--model" not in cmd:
+        out = f"{cmd} --model {shlex.quote(DEFAULT_MODEL)}"
+    return "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; " + out
+
+
+def _restore_default_model_setting():
+    """Keep ~/.claude/settings.json `model` pinned to DEFAULT_MODEL. Claude Code
+    rewrites it whenever anyone runs /model (and on new-model releases, e.g. the
+    Fable 5 auto-switch) — this heals the default so new sessions stay on it."""
+    if not DEFAULT_MODEL:
+        return
+    sp = Path.home() / ".claude" / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if isinstance(s, dict) and s.get("model") != DEFAULT_MODEL:
+            s["model"] = DEFAULT_MODEL
+            sp.write_text(json.dumps(s, indent=2))
+            logger.info("Restored default model in %s -> %s", sp, DEFAULT_MODEL)
+    except Exception:
+        logger.debug("Failed to restore default model in %s", sp, exc_info=True)
+
+
+def _model_flag_for_relaunch(session_name: str) -> str:
+    """` --model <id>` for a crash/relogin relaunch: preserve the session's
+    last-used model (so a deliberate /model switch survives a restart), mapping
+    the default family back to DEFAULT_MODEL to keep its [1m] context flag."""
+    try:
+        last = _get_session_model(session_name)
+    except Exception:
+        last = ""
+    if last.startswith("<"):  # "<synthetic>" transcript entries
+        last = ""
+    if not last:
+        return f" --model {shlex.quote(DEFAULT_MODEL)}" if DEFAULT_MODEL else ""
+    base = DEFAULT_MODEL.split("[", 1)[0]
+    if base and (last == base or last.startswith(base + "-")):
+        return f" --model {shlex.quote(DEFAULT_MODEL)}"
+    return f" --model {shlex.quote(last)}"
+
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, a shared Claude auth token, per-user context, OAuth connections,
@@ -260,8 +325,10 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
         # Relaunch Claude on the bare shell, resuming the prior conversation.
         resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
-        launch = ("NODE_OPTIONS=--max-old-space-size=8192 "
-                  f"claude --dangerously-skip-permissions {resume_flag}")
+        launch = ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
+                  "NODE_OPTIONS=--max-old-space-size=8192 "
+                  f"claude --dangerously-skip-permissions {resume_flag}"
+                  f"{_model_flag_for_relaunch(session_name)}")
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -333,6 +400,7 @@ async def lifespan(_app: FastAPI):
     logger.info("Auto-responder background task started")
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
+    _restore_default_model_setting()
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
     logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
@@ -5013,7 +5081,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
-        "model": _get_session_model(sess["name"]),
+        **_session_model_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
     }
 
@@ -5082,7 +5150,7 @@ async def api_sessions_fast(request: Request):
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
-            "model": _get_session_model(sess["name"]),
+            **_session_model_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
         })
     return JSONResponse(out)
@@ -5126,7 +5194,7 @@ async def api_status(request: Request):
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
-            "model": _get_session_model(sess["name"]),
+            **_session_model_fields(sess["name"]),
         })
     return JSONResponse(out)
 
@@ -5345,10 +5413,20 @@ async def api_create_session(request: Request, body: CreateSession):
         # per config dir (marker-guarded); first session per user waits ~10-20s.
         if _stored_anthropic_key:
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
-        # Optionally launch a command in the new session
+        # Optionally launch a command in the new session. Pin the default model
+        # unless the chosen profile pins its own via its settings.json.
         if NEW_SESSION_CMD:
+            _pin_model = True
+            try:
+                if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
+                    _prof = _find_profile(requested_profile, _load_roles())
+                    if _prof and (_prof.get("model") or "").strip():
+                        _pin_model = False
+            except Exception:
+                logger.debug("Profile model lookup failed on create", exc_info=True)
             subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l", NEW_SESSION_CMD],
+                ["tmux", "send-keys", "-t", created, "-l",
+                 _launch_claude_cmd(NEW_SESSION_CMD, pin_model=_pin_model)],
                 capture_output=True, text=True, timeout=5
             )
             subprocess.run(
@@ -7939,7 +8017,10 @@ async def api_session_relogin(session_name: str, request: Request):
         logger.debug("relogin: profile re-export failed", exc_info=True)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "-l",
-         "NODE_OPTIONS=--max-old-space-size=8192 claude --dangerously-skip-permissions --continue"],
+         "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
+         "NODE_OPTIONS=--max-old-space-size=8192 "
+         "claude --dangerously-skip-permissions --continue"
+         + _model_flag_for_relaunch(session_name)],
         capture_output=True, text=True, timeout=5)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -8414,6 +8495,23 @@ async def api_stats_usage():
 
 _session_stats_cache: Dict[str, dict] = {}
 _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+# Model switches requested via the header dropdown, not yet confirmed by the
+# transcript (the JSONL only shows the new model on the NEXT assistant reply).
+_session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+
+
+def _session_model_fields(session_name: str) -> dict:
+    """`model` + `model_pending` for API payloads. Clears the pending marker once
+    the transcript confirms the switch, or after 15 min (request abandoned)."""
+    model = _get_session_model(session_name)
+    pend = _session_model_pending.get(session_name)
+    if pend:
+        base = pend.get("model", "").split("[", 1)[0]
+        confirmed = bool(model and base and (model == base or model.startswith(base + "-")))
+        if confirmed or time.time() - pend.get("ts", 0) > 900:
+            _session_model_pending.pop(session_name, None)
+            pend = None
+    return {"model": model, "model_pending": (pend or {}).get("model", "")}
 
 
 def _get_session_model(session_name: str) -> str:
@@ -8895,6 +8993,61 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
             return JSONResponse({"error": "Invalid mode"}, status_code=400)
         _session_auth_mode[session_name] = body.mode
         return JSONResponse({"ok": True, "mode": body.mode, "session": session_name})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+class ModelBody(BaseModel):
+    model: str
+
+
+@app.post("/api/sessions/{session_name}/model")
+async def api_set_session_model(session_name: str, body: ModelBody):
+    """Switch a running session's Claude model from the header dropdown by typing
+    `/model <id>` into the pane composer — same as running the slash command.
+    Takes effect from the next reply; the badge shows a pending state until the
+    transcript confirms it."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    mid = (body.model or "").strip()
+    if mid not in ALLOWED_SESSION_MODELS:
+        return JSONResponse({"error": f"Unknown model: {mid}"}, status_code=400)
+    if not await _async_is_claude_running(session_name):
+        return JSONResponse(
+            {"error": "Claude isn't running in this session — restart it first"},
+            status_code=409)
+    try:
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", "/model " + mid],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.sleep(0.3)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True, text=True, timeout=5)
+        # Give the CLI a beat, then check the pane for a rejection message.
+        await asyncio.sleep(1.2)
+        try:
+            tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
+            low = tail.lower()
+            if "unknown model" in low or "not a valid model" in low or "invalid model" in low:
+                return JSONResponse(
+                    {"error": f"Claude rejected the model id '{mid}' — it may not be "
+                              "available on this plan or CLI version"},
+                    status_code=400)
+        except Exception:
+            logger.debug("Pane check after /model failed", exc_info=True)
+        _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
+        _session_model_cache.pop(session_name, None)
+        # /model persists the choice into settings.json as the default for NEW
+        # sessions ("saved as your default") — the exact drift that turned the
+        # default Sonnet 4.6. Undo that: the switch stays for THIS session, the
+        # global default stays DEFAULT_MODEL (dashboard launches pin --model
+        # explicitly anyway; this guards manual `claude` runs).
+        await asyncio.sleep(0.8)
+        _restore_default_model_setting()
+        logger.info("Session '%s' model switch requested -> %s", session_name, mid)
+        return JSONResponse({"ok": True, "model": mid, "pending": True})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -10073,7 +10226,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .badge{font-size:.7rem;padding:2px 8px;border-radius:12px;font-weight:500}
 .badge.attached{background:#238636;color:#fff}
 .badge.detached{background:#6e7681;color:#fff}
-.badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500}
+.badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500;cursor:pointer;user-select:none}
+.badge.model-badge:hover{background:#3c444d;color:#e6edf3}
+.badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
+.badge.model-badge.pending{opacity:.75;font-style:italic}
+.model-menu{position:fixed;z-index:3000;background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.55);padding:4px;min-width:172px}
+.model-menu .mm-title{padding:4px 10px 3px;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:#6e7681}
+.model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
+.model-menu .mm-item:hover{background:#21262d}
+.model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
+.tab-more-model-value{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
 .btn-danger:hover{background:#3d1214}
 
@@ -11300,18 +11462,99 @@ function esc(str){
 }
 function formatModelName(model){
   if(!model)return'';
-  // Strip claude- prefix
-  let m=model.replace(/^claude-/,'');
-  // Strip date suffix like -20251001
+  const oneM=/\[1m\]$/.test(model);
+  // Strip [1m] context suffix, claude- prefix, date suffix like -20251001
+  let m=model.replace(/\[1m\]$/,'').replace(/^claude-/,'');
   m=m.replace(/-\d{8}$/,'');
   // Extract family and version: e.g. "sonnet-4-6" -> "sonnet 4.6"
   const parts=m.match(/^([a-z]+)-(.+)$/);
   if(parts){
     const family=parts[1];
     const ver=parts[2].replace(/-/g,'.');
-    return family+' '+ver;
+    m=family+' '+ver;
   }
-  return m;
+  return m+(oneM?' · 1M':'');
+}
+// Keep in sync with ALLOWED_SESSION_MODELS in the Python backend.
+const MODEL_CHOICES=[
+  ['claude-opus-4-8[1m]','Opus 4.8 · 1M'],
+  ['claude-opus-4-8','Opus 4.8'],
+  ['claude-fable-5[1m]','Fable 5 · 1M'],
+  ['claude-fable-5','Fable 5'],
+  ['claude-sonnet-4-6[1m]','Sonnet 4.6 · 1M'],
+  ['claude-sonnet-4-6','Sonnet 4.6'],
+  ['claude-haiku-4-5','Haiku 4.5'],
+];
+function modelChoiceLabel(id){
+  const c=MODEL_CHOICES.find(c=>c[0]===id);
+  return c?c[1]:formatModelName(id);
+}
+function modelBadgeLabel(s){
+  if(s&&s.model_pending)return modelChoiceLabel(s.model_pending)+'…';
+  if(s&&s.model)return formatModelName(s.model);
+  return'model';
+}
+let _modelMenuEl=null;
+function closeModelMenu(){
+  if(_modelMenuEl){_modelMenuEl.remove();_modelMenuEl=null;
+    document.removeEventListener('click',_modelMenuDocClose,true);}
+}
+function _modelMenuDocClose(e){
+  if(_modelMenuEl&&!_modelMenuEl.contains(e.target))closeModelMenu();
+}
+function openModelMenu(name,anchor,ev){
+  if(ev){ev.stopPropagation();ev.preventDefault();}
+  if(_modelMenuEl){closeModelMenu();return;}
+  const s=sessions.find(x=>x.name===name)||{};
+  const cur=s.model_pending||s.model||'';
+  const curBase=cur.replace(/\[1m\]$/,'');
+  const menu=document.createElement('div');
+  menu.className='model-menu';
+  let html='<div class="mm-title">Model · applies from next reply</div>';
+  MODEL_CHOICES.forEach(([id,label])=>{
+    // Transcript-detected models carry no [1m]; treat the base-id match as
+    // current only when no exact [1m] choice matches.
+    const sel=cur&&(id===cur||(id===curBase&&!MODEL_CHOICES.some(c=>c[0]===cur)));
+    html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
+      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
+  });
+  menu.innerHTML=html;
+  document.body.appendChild(menu);
+  const r=anchor.getBoundingClientRect();
+  menu.style.top=Math.min(window.innerHeight-menu.offsetHeight-8,r.bottom+6)+'px';
+  menu.style.left=Math.max(8,Math.min(window.innerWidth-menu.offsetWidth-8,r.right-menu.offsetWidth))+'px';
+  _modelMenuEl=menu;
+  setTimeout(()=>document.addEventListener('click',_modelMenuDocClose,true),0);
+}
+function _paintModelBadge(name){
+  const s=sessions.find(x=>x.name===name);
+  const lbl=modelBadgeLabel(s);
+  const mb=document.getElementById('model-badge-'+name);
+  if(mb){
+    mb.classList.toggle('pending',!!(s&&s.model_pending));
+    mb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
+  }
+  const mm=document.getElementById('more-model-'+name);
+  if(mm)mm.textContent=lbl+' ▾';
+}
+async function setSessionModel(name,model){
+  closeModelMenu();
+  const si=sessions.findIndex(s=>s.name===name);
+  const prev=si>=0?(sessions[si].model_pending||''):'';
+  if(si>=0)sessions[si].model_pending=model;
+  _paintModelBadge(name);
+  try{
+    const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+' (applies from the next reply)';
+  }catch(e){
+    if(si>=0)sessions[si].model_pending=prev;
+    _paintModelBadge(name);
+    alert('Model switch failed: '+(e&&e.message?e.message:e));
+  }
 }
 function statusLabel(s){
   if(s==='busy')return'Working...';
@@ -11384,7 +11627,7 @@ function renderDetail(){
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
-          ${s.model?`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}">${formatModelName(s.model)}</span></div><div class="tab-more-model-sep"></div></div>`:''}
+          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
@@ -11407,7 +11650,7 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        ${s.model?'<span class="badge model-badge" id="model-badge-'+s.name+'">'+formatModelName(s.model)+'</span>':''}
+        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
@@ -12345,15 +12588,11 @@ async function pollStatus(){
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
-        if(st.model&&sessions[si].model!==st.model){
-          sessions[si].model=st.model;navChanged=true;
-          // Update detail model badge if visible
-          const mb=document.getElementById('model-badge-'+st.name);
-          if(mb)mb.textContent=formatModelName(st.model);
-          // Also update the model value shown in the mobile More dropdown
-          const mm=document.getElementById('more-model-'+st.name);
-          if(mm)mm.textContent=formatModelName(st.model);
-        }
+        let badgeChanged=false;
+        const pend=st.model_pending||'';
+        if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
+        if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
+        if(badgeChanged)_paintModelBadge(st.name);
         if(navChanged)renderNav();
       }
     }
