@@ -8663,34 +8663,43 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
             f"ws://127.0.0.1:{port}/websockify",
             subprotocols=["binary"], max_size=None, ping_interval=None,
         ) as up:
+            t_start = time.time()
+            ended = {}  # which direction ended first, and why
+
             async def c2u():
+                why = "clean"
                 try:
                     while True:
                         msg = await ws.receive()
                         if msg["type"] == "websocket.disconnect":
+                            why = f"client disconnect code={msg.get('code')}"
                             break
                         if msg.get("bytes") is not None:
                             await up.send(msg["bytes"])
                         elif msg.get("text") is not None:
                             await up.send(msg["text"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    why = f"{type(e).__name__}: {e}"
                 finally:
+                    ended.setdefault("first", ("client->upstream", why, time.time() - t_start))
                     try:
                         await up.close()
                     except Exception:
                         pass
 
             async def u2c():
+                why = "clean"
                 try:
                     async for message in up:
                         if isinstance(message, (bytes, bytearray)):
                             await ws.send_bytes(bytes(message))
                         else:
                             await ws.send_text(message)
-                except Exception:
-                    pass
+                    why = f"upstream closed code={up.close_code} reason={up.close_reason!r}"
+                except Exception as e:
+                    why = f"{type(e).__name__}: {e}"
                 finally:
+                    ended.setdefault("first", ("upstream->client", why, time.time() - t_start))
                     try:
                         await ws.close()
                     except Exception:
@@ -8698,6 +8707,9 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
 
             # return_exceptions: one side failing must not leave the other orphaned.
             await asyncio.gather(c2u(), u2c(), return_exceptions=True)
+            side, why, dur = ended.get("first", ("?", "?", time.time() - t_start))
+            logger.info("browser ws '%s' closed after %.1fs — %s ended first (%s)",
+                        sid, dur, side, why)
     except Exception as e:
         # WARNING, not debug: a silent drop here is exactly the "keeps logging
         # off" symptom, so make the cause visible in the log.
@@ -17087,10 +17099,21 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
 
 
 if __name__ == "__main__":
-    # ws_ping_timeout: uvicorn defaults to pinging every 20s and KILLING the
-    # socket if the pong doesn't come back within 20s. A long-lived noVNC viewer
-    # is then dropped by a brief stall (a slow poll, a laptop suspend, a wifi
-    # blip) — one of the "windows keep logging off" causes. Ping less often and
-    # be far more patient; the VNC stream itself proves liveness.
-    uvicorn.run(app, host="0.0.0.0", port=PORT,
-                ws_ping_interval=30, ws_ping_timeout=300)
+    # WebSocket keepalive — this is what stopped the noVNC viewers dropping every
+    # ~minute. A viewer watching a STATIC desktop sends/receives nothing, and
+    # uvicorn's default ws implementation on websockets>=14 ("websockets_sansio")
+    # implements no ping at all, so ws_ping_interval was silently ignored and the
+    # connection carried zero traffic — leaving it to be reaped by the first
+    # intermediary's idle timeout (nginx proxy_send_timeout, NAT, etc.). Pinning
+    # ws="websockets" selects the implementation that DOES honour ping_interval,
+    # so a Ping/Pong flows every 25s and every hop keeps the tunnel open. The
+    # generous ping_timeout avoids killing a healthy viewer over one late pong.
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=PORT,
+                    ws="websockets", ws_ping_interval=25, ws_ping_timeout=120)
+    except (ValueError, ImportError, KeyError):
+        # The legacy implementation is deprecated upstream; if a future uvicorn
+        # drops it, fall back to the default rather than failing to boot.
+        logger.warning("uvicorn ws='websockets' unavailable — falling back to the default "
+                       "implementation (WebSocket keepalive pings will be disabled)")
+        uvicorn.run(app, host="0.0.0.0", port=PORT)
