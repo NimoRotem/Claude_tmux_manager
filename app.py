@@ -990,15 +990,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .login-btn{width:100%;background:#1f6feb;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;font-size:.95rem;font-weight:500}
 .login-btn:hover{background:#388bfd}
 </style></head><body>
-<form class="login-box" method="POST" action="login">
+<!-- Root-absolute, not relative: this page is also served for deep links like
+     /browser/<sid>/vnc.html, where action="login" POSTed to
+     /browser/<sid>/login and the sign-in silently did nothing. -->
+<form class="login-box" method="POST" action="__ROOT_PATH__/login">
   <h2>__BRAND__ Dashboard</h2>
   <p>Enter credentials to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
   <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+  <input type="hidden" name="next" id="next">
   <button class="login-btn" type="submit">Log in</button>
 </form>
-<script>if(location.search.includes('err=1'))document.getElementById('err').style.display='block'</script>
+<script>
+if(location.search.includes('err=1'))document.getElementById('err').style.display='block';
+/* Carry the deep link through the login so signing in from e.g. a noVNC viewer
+   URL lands back on the viewer instead of the dashboard home. */
+document.getElementById('next').value=location.pathname+location.search;
+</script>
 </body></html>"""
 
 
@@ -1171,6 +1180,11 @@ async def do_login(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
+    # Where to land after a successful login. Only same-origin relative paths are
+    # honoured ("//host" would be an open redirect), and never /login itself.
+    nxt = (form.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = request.scope.get("root_path", "") + "/"
     # Legacy env-var path: if the credentials match TMUX_DASH_USER/TMUX_DASH_PASS,
     # accept and treat as the admin user. This keeps the dashboard reachable even
     # if users.json was deleted by hand.
@@ -1211,7 +1225,9 @@ async def do_login(request: Request):
     else:
         # The login form is served by GET "/" — there is no GET /login route, so
         # redirecting there on a bad password 405s instead of re-showing the form.
-        return RedirectResponse(url=request.scope.get("root_path", "") + "/?err=1", status_code=303)
+        # Any gated path re-serves the form, so bounce back to `next` and keep
+        # the deep link across a mistyped password.
+        return RedirectResponse(url=nxt + ("&" if "?" in nxt else "?") + "err=1", status_code=303)
 
     # Update last_login + capture IP / browser for the admin audit view
     ua = (request.headers.get("user-agent", "") or "")[:300]
@@ -1230,7 +1246,7 @@ async def do_login(request: Request):
         logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
 
     token = _make_token(target_user["id"])
-    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
+    resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
     return resp
@@ -8347,9 +8363,16 @@ def _ensure_browser_launcher():
             logger.info("Browser launcher script written to %s", p)
     except Exception:
         logger.debug("Failed to write browser launcher", exc_info=True)
+# The default session's ports are host-dependent: 5900/6080 is the convention,
+# but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
+# maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
+# viewer landed on UPS's RFB and hung on a VNC password prompt. There the
+# claude-vnc unit runs on 5902/6082 and these env vars point us at it.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
-    "rfb_port": 5900, "vnc_port": 6080, "cdp_port": 9222, "managed": False,
+    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
+    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
+    "cdp_port": 9222, "managed": False,
     "external_url": ("https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify"
                      "&autoconnect=true&resize=scale&shared=true"
                      "&reconnect=true&reconnect_delay=2000"),
