@@ -8492,7 +8492,9 @@ def _ensure_browser_launcher():
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": 5900, "vnc_port": 6080, "cdp_port": 9222, "managed": False,
-    "external_url": "https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify&autoconnect=true&resize=scale",
+    "external_url": ("https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify"
+                     "&autoconnect=true&resize=scale&shared=true"
+                     "&reconnect=true&reconnect_delay=2000"),
 }
 
 
@@ -8546,11 +8548,19 @@ def _next_browser_slot(sessions: list) -> int:
 def _browser_viewer_url(s: dict) -> str:
     """Same-origin noVNC URL for a session, proxied by this dashboard. The `path`
     param is host-absolute (incl. ROOT_PATH) so noVNC connects the websocket back
-    through the /browser/<id>/websockify proxy route."""
+    through the /browser/<id>/websockify proxy route.
+
+    `reconnect` is forced ON: noVNC defaults it to false, so ANY transient drop
+    (laptop sleep, wifi blip, proxy restart) left a dead "Disconnected" screen
+    that only a manual reload fixed — the "windows keep logging off" symptom.
+    `shared` keeps several viewers (inline preview + opened tab) on one session
+    instead of the newcomer kicking the others off."""
     sid = s.get("id")
     root = ROOT_PATH.strip("/")
     wspath = (root + "/" if root else "") + f"browser/{sid}/websockify"
-    return f"{ROOT_PATH}/browser/{sid}/vnc.html?path={wspath}&autoconnect=true&resize=scale"
+    return (f"{ROOT_PATH}/browser/{sid}/vnc.html?path={wspath}"
+            "&autoconnect=true&resize=scale&shared=true"
+            "&reconnect=true&reconnect_delay=2000")
 
 
 class BrowserCreateBody(BaseModel):
@@ -8686,9 +8696,12 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
                     except Exception:
                         pass
 
-            await asyncio.gather(c2u(), u2c())
+            # return_exceptions: one side failing must not leave the other orphaned.
+            await asyncio.gather(c2u(), u2c(), return_exceptions=True)
     except Exception as e:
-        logger.debug("browser ws proxy error for %s: %s", sid, e)
+        # WARNING, not debug: a silent drop here is exactly the "keeps logging
+        # off" symptom, so make the cause visible in the log.
+        logger.warning("browser ws proxy for '%s' ended: %s: %s", sid, type(e).__name__, e)
         try:
             await ws.close()
         except Exception:
@@ -17074,4 +17087,10 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # ws_ping_timeout: uvicorn defaults to pinging every 20s and KILLING the
+    # socket if the pong doesn't come back within 20s. A long-lived noVNC viewer
+    # is then dropped by a brief stall (a slow poll, a laptop suspend, a wifi
+    # blip) — one of the "windows keep logging off" causes. Ping less often and
+    # be far more patient; the VNC stream itself proves liveness.
+    uvicorn.run(app, host="0.0.0.0", port=PORT,
+                ws_ping_interval=30, ws_ping_timeout=300)
