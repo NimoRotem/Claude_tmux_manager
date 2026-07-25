@@ -6153,7 +6153,10 @@ def _context_file_entries():
         for p in sorted(_INFRA_DETAIL_DIR.glob("*.md")):
             entries.append({
                 "id": "infra-" + p.stem, "path": p, "load": "ondemand",
-                "note": "Per-host infrastructure detail, linked from the index.",
+                "label": "infra/" + p.name,
+                "note": ("One line per infrastructure change, newest first."
+                         if p.name == "CHANGELOG.md"
+                         else "Per-host infrastructure detail, linked from the index."),
             })
     except Exception:
         logger.debug("Failed to list infra detail files", exc_info=True)
