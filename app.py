@@ -8342,10 +8342,17 @@ async def api_auth_setup_submit(body: CodeBody, request: Request):
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
-# Auto-auth: when a session needs login, drive the OAuth click-through in the
-# designated login browser and type the code back, instead of leaving the
-# session parked at a prompt nobody is watching. TMUX_DASH_AUTO_AUTH=0 disables.
-AUTO_AUTH_ENABLED = os.environ.get("TMUX_DASH_AUTO_AUTH", "1") != "0"
+# Auto-auth: drive the OAuth click-through in the designated login browser and
+# type the code back.
+#
+# DEFAULT OFF for the watchdog. claude.ai's consent page stalls when the
+# Authorize button is driven programmatically (verified with a JS click, trusted
+# CDP mouse events and a real X11 click), so the automated path can never
+# actually finish a /login — it can only get in the way. Left on, the watchdog
+# saw a HUMAN's /login as "a login flow to finish", typed into their pane and
+# interrupted them. Set TMUX_DASH_AUTO_AUTH=1 to re-enable if claude.ai ever
+# stops blocking it. The manual button/endpoint works regardless.
+AUTO_AUTH_ENABLED = os.environ.get("TMUX_DASH_AUTO_AUTH", "0") == "1"
 
 # The launcher is self-bootstrapped (write-if-missing) so the feature is portable
 # and doesn't depend on a hand-placed file. Mirrors the pre-existing default
@@ -9018,8 +9025,17 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
     try:
         async with _browser_busy_ctx(sid, f"logging in '{session_name}'"):
             # 1. Get the session to a /login prompt (unless one is already up).
+            #    If a login flow is mid-flight but hasn't produced a URL yet, a
+            #    human is very likely typing it — sending another /login would
+            #    interrupt them, so back off instead.
             pane = await asyncio.to_thread(_pane_text, session_name)
             if not _scrape_authorize_url(pane):
+                low = pane.lower()
+                if "select login method" in low or "paste code here" in low:
+                    st.update({"running": False, "status": "a login is already in progress"})
+                    return {"ok": False,
+                            "error": "a login is already in progress in this session — "
+                                     "finish it, or press Esc first"}
                 st["status"] = "running /login"
                 await _send_line(session_name, "/login")
                 await asyncio.sleep(2.5)
@@ -10939,28 +10955,26 @@ async def _login_watchdog_loop():
                             llog.debug("login watchdog esc failed for '%s': %s", name, e)
                     continue
 
-                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
-                # A /login flow already parked on screen (URL / paste-code prompt) is
-                # exactly what auto-auth can finish — previously we just left it there
-                # for a human to notice.
-                if not needs_login and not login_flow_open:
+                if not recent or not _LOGIN_NEEDED_RE.search(recent):
+                    continue
+                # NEVER touch a session with a login flow already on screen: that is
+                # what a human typing /login looks like, and driving it (or typing
+                # into the pane) interrupts them mid-login. Only a session that is
+                # logged out with NO flow in progress is ours to act on.
+                if login_flow_open:
                     continue
 
-                # Preferred path: drive the OAuth click-through in the logged-in
-                # browser and type the code back, so the session recovers unattended.
+                # Optional: finish the login unattended via the signed-in browser.
+                # Off by default — see AUTO_AUTH_ENABLED.
                 if AUTO_AUTH_ENABLED and _pick_login_browser():
                     state["last_action"] = now
-                    llog.warning("Auto-auth starting for '%s' (%s)", name,
-                                 "login flow on screen" if login_flow_open else "login required")
+                    llog.warning("Auto-auth starting for '%s' (login required)", name)
                     res = await _auto_auth_session(name, reason="watchdog")
                     if res.get("ok"):
                         llog.warning("Auto-auth logged '%s' back in", name)
                     else:
                         llog.warning("Auto-auth for '%s' failed: %s", name, res.get("error"))
                     continue
-
-                if login_flow_open:
-                    continue    # can't finish it here; leave it for the human
                 try:
                     await asyncio.to_thread(
                         subprocess.run,
