@@ -8342,6 +8342,10 @@ async def api_auth_setup_submit(body: CodeBody, request: Request):
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+# Auto-auth: when a session needs login, drive the OAuth click-through in the
+# designated login browser and type the code back, instead of leaving the
+# session parked at a prompt nobody is watching. TMUX_DASH_AUTO_AUTH=0 disables.
+AUTO_AUTH_ENABLED = os.environ.get("TMUX_DASH_AUTO_AUTH", "1") != "0"
 
 # The launcher is self-bootstrapped (write-if-missing) so the feature is portable
 # and doesn't depend on a hand-placed file. Mirrors the pre-existing default
@@ -8580,6 +8584,7 @@ async def api_browser_delete(sid: str, request: Request):
 class BrowserPatchBody(BaseModel):
     name: Optional[str] = None
     notes: Optional[str] = None
+    use_for_login: Optional[bool] = None
 
 
 @app.patch("/api/browser/sessions/{sid}")
@@ -8599,13 +8604,503 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
         target["name"] = name[:80]
     if body.notes is not None:
         target["notes"] = body.notes.strip()[:2000]
+    if body.use_for_login is not None:
+        # Exactly one browser is the designated login browser.
+        for s in sessions:
+            s["use_for_login"] = False
+        target["use_for_login"] = bool(body.use_for_login)
     _save_browser_sessions(sessions)
+    _browser_auth_cache.pop(sid, None)   # re-check on next poll
     row = dict(target)
     row["running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
     row["viewer_url"] = _browser_viewer_url(target)
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
+
+
+# --- Driving a browser session over CDP -------------------------------------
+# Minimal Chrome DevTools Protocol client: open a tab, evaluate JS in it, close
+# it. Used to read a browser's claude.ai login state and to click through the
+# Claude Code OAuth authorize page automatically.
+_browser_busy: Dict[str, dict] = {}   # sid -> {"what": str, "since": float}
+
+
+@asynccontextmanager
+async def _browser_busy_ctx(sid: str, what: str):
+    """Mark a browser as driven programmatically (this is what spins the header icon)."""
+    _browser_busy[sid] = {"what": what, "since": time.time()}
+    try:
+        yield
+    finally:
+        _browser_busy.pop(sid, None)
+
+
+class _CdpTab:
+    """One CDP-attached tab."""
+
+    def __init__(self, ws):
+        self._ws = ws
+        self._n = 0
+        self.events: list = []      # CDP events seen (used to catch the code URL)
+
+    async def call(self, method: str, params: dict = None, timeout: float = 30):
+        self._n += 1
+        mid = self._n
+        await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=max(1, deadline - time.time()))
+            msg = json.loads(raw)
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"].get("message", "CDP error"))
+                return msg.get("result", {})
+            if msg.get("method"):
+                self.events.append(msg)     # don't drop events while awaiting a reply
+        raise TimeoutError(f"CDP {method} timed out")
+
+    async def drain(self, seconds: float):
+        """Collect events for a while (when nothing else is in flight)."""
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=max(0.2, end - time.time()))
+            except Exception:
+                break
+            msg = json.loads(raw)
+            if msg.get("method"):
+                self.events.append(msg)
+
+    def urls_seen(self) -> list:
+        """Every URL seen in a request/response/navigation event."""
+        out = []
+        for e in self.events:
+            p, meth = e.get("params", {}), e.get("method", "")
+            if meth == "Network.requestWillBeSent":
+                out.append(p.get("request", {}).get("url", ""))
+            elif meth == "Network.responseReceived":
+                out.append(p.get("response", {}).get("url", ""))
+            elif meth in ("Page.frameRequestedNavigation", "Page.navigatedWithinDocument"):
+                out.append(p.get("url", ""))
+        return [u for u in out if u]
+
+    async def eval(self, expression: str, timeout: float = 30):
+        """Evaluate JS (awaiting a promise if one is returned) and return the value."""
+        res = await self.call("Runtime.evaluate", {
+            "expression": expression, "returnByValue": True,
+            "awaitPromise": True, "userGesture": True,
+        }, timeout=timeout)
+        if res.get("exceptionDetails"):
+            raise RuntimeError(str(res["exceptionDetails"].get("text", "JS exception")))
+        return res.get("result", {}).get("value")
+
+    async def navigate(self, url: str, settle: float = 1.5):
+        await self.call("Page.navigate", {"url": url})
+        for _ in range(40):
+            await asyncio.sleep(0.5)
+            try:
+                if await self.eval("document.readyState") == "complete":
+                    break
+            except Exception:
+                continue
+        await asyncio.sleep(settle)   # let client-side rendering finish
+
+    async def wait_for(self, js_predicate: str, timeout: float = 30, interval: float = 0.5):
+        """Poll a JS expression until it returns truthy; returns the value or None."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                v = await self.eval(js_predicate)
+                if v:
+                    return v
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+        return None
+
+
+@asynccontextmanager
+async def _cdp_tab(cdp_port: int, url: str = "about:blank"):
+    """Open a throwaway tab on a browser session's CDP endpoint, yield it, close it."""
+    base = f"http://127.0.0.1:{cdp_port}"
+    quoted = urllib.parse.quote(url, safe="")
+    target = None
+    async with httpx.AsyncClient(timeout=20) as c:
+        # Chrome >=111 wants PUT for /json/new; older builds only allow GET.
+        try:
+            r = await c.put(f"{base}/json/new?{quoted}")
+            if r.status_code >= 400:
+                raise RuntimeError(str(r.status_code))
+            target = r.json()
+        except Exception:
+            r = await c.get(f"{base}/json/new?{quoted}")
+            r.raise_for_status()
+            target = r.json()
+    ws = await websockets.connect(target["webSocketDebuggerUrl"], max_size=None, ping_interval=None)
+    tab = _CdpTab(ws)
+    try:
+        await tab.call("Page.enable")
+        await tab.call("Runtime.enable")
+        yield tab
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.get(f"{base}/json/close/{target['id']}")
+        except Exception:
+            logger.debug("Failed to close CDP tab %s", target.get("id"), exc_info=True)
+
+
+# Capabilities that mean the account can actually authorize Claude Code. A free
+# account lists only ["chat"] and the authorize page answers "Claude Max or Pro
+# is required" — so cookies alone are NOT enough to call a browser login-ready.
+_PAID_CAPS = ("claude_pro", "claude_max", "pro", "max", "team", "enterprise", "raven")
+_browser_auth_cache: Dict[str, dict] = {}   # sid -> {"data": {...}, "ts": float}
+_BROWSER_AUTH_TTL = 120
+
+
+async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) -> dict:
+    """Is this browser signed into claude.ai, as whom, and can that account
+    authorize Claude Code? Reads claude.ai's own API in a background tab so the
+    session cookies are used. Cached, so the header poll stays cheap."""
+    cached = _browser_auth_cache.get(sid)
+    if cached and not force and time.time() - cached["ts"] < _BROWSER_AUTH_TTL:
+        return cached["data"]
+    out = {"logged_in": False, "email": "", "can_authorize": False,
+           "capabilities": [], "error": ""}
+    try:
+        async with _browser_busy_ctx(sid, "checking claude.ai login"):
+            async with _cdp_tab(cdp_port) as tab:
+                await tab.navigate("https://claude.ai/api/organizations", settle=0.8)
+                txt = ((await tab.eval("document.body ? document.body.innerText : ''")) or "").strip()
+                if txt.startswith("["):
+                    orgs = json.loads(txt)
+                    out["logged_in"] = True
+                    caps = []
+                    for o in orgs:
+                        caps += [str(x).lower() for x in (o.get("capabilities") or [])]
+                        nm = o.get("name") or ""
+                        if "@" in nm and not out["email"]:
+                            out["email"] = nm.split("'")[0]
+                    out["capabilities"] = sorted(set(caps))
+                    out["can_authorize"] = any(c in _PAID_CAPS for c in caps)
+                    if not out["can_authorize"]:
+                        out["error"] = "signed in, but this account has no Max/Pro plan"
+                elif "just a moment" in txt.lower() or "cloudflare" in txt.lower():
+                    out["error"] = "Cloudflare challenge — retry"
+                else:
+                    out["error"] = "not signed in to claude.ai"
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    _browser_auth_cache[sid] = {"data": out, "ts": time.time()}
+    return out
+
+
+def _pick_login_browser() -> dict:
+    """Which browser to click the OAuth flow through: one explicitly flagged
+    use_for_login, else one whose name/notes mention login/auth, else the only
+    running session. {} when there's nothing usable."""
+    sessions = _load_browser_sessions()
+    for s in sessions:
+        if s.get("use_for_login"):
+            return s
+    for s in sessions:
+        blob = f"{s.get('name','')} {s.get('notes','')}".lower()
+        if "login" in blob or "auth" in blob or "sign in" in blob:
+            return s
+    running = [s for s in sessions if _browser_port_alive(s.get("vnc_port", 0))]
+    return running[0] if len(running) == 1 else {}
+
+
+@app.get("/api/browser/auth-status")
+async def api_browser_auth_status(request: Request, refresh: int = 0):
+    """Header indicator state: is any browser signed into claude.ai with an
+    account that can authorize Claude Code, and is one being driven right now."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    sessions = _load_browser_sessions()
+    login_pick = _pick_login_browser()
+    out = []
+    for s in sessions:
+        sid = s.get("id")
+        alive = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        acct = {"logged_in": False, "email": "", "can_authorize": False,
+                "capabilities": [], "error": "not running"}
+        if alive:
+            cached = _browser_auth_cache.get(sid)
+            if refresh or not cached:
+                acct = await _browser_claude_account(sid, s.get("cdp_port", 0), force=bool(refresh))
+            else:
+                acct = cached["data"]
+        out.append({
+            "id": sid, "name": s.get("name", ""), "running": alive,
+            "use_for_login": bool(s.get("use_for_login")) or (login_pick.get("id") == sid),
+            "busy": sid in _browser_busy,
+            "busy_what": (_browser_busy.get(sid) or {}).get("what", ""),
+            **acct,
+        })
+    return JSONResponse({
+        "sessions": out,
+        "any_logged_in": any(x["logged_in"] for x in out),
+        "any_can_authorize": any(x["can_authorize"] for x in out),
+        "busy": bool(_browser_busy),
+        "busy_what": next((v.get("what", "") for v in _browser_busy.values()), ""),
+        "login_browser": login_pick.get("id", ""),
+        "auto_auth": AUTO_AUTH_ENABLED,
+        # Set only when auto-auth got everything ready but couldn't click the
+        # final consent through; the UI turns this into a one-click link.
+        "pending_auth": (_pending_auth
+                         if _pending_auth and time.time() - _pending_auth.get("ts", 0) < 1800
+                         else {}),
+    })
+
+
+# --- Auto-auth: complete a Claude Code login without a human ------------------
+# When a session is sitting at "please run /login" (or a fresh session needs its
+# first sign-in), we: start the /login flow, scrape the authorize URL out of the
+# pane, click it through in the designated login browser (which is already signed
+# in to claude.ai), read the resulting code, and type it back into the session.
+# The whole dance is deterministic Python + CDP — no second Claude session and no
+# metered API spend needed to log a session back in.
+_AUTH_URL_RE = re.compile(r"https://claude\.(?:ai|com)/[^\s\"'<>]*oauth/authorize\S*")
+# A URL continuation fragment: the TUI hard-wraps the authorize link across
+# several REAL lines (not soft-wrapped, so `capture-pane -J` won't rejoin them),
+# and any line made purely of URL characters is the next chunk of it.
+_URL_CONT_RE = re.compile(r"^[A-Za-z0-9%&=_+./:?#~\[\]@!$'()*,;-]+$")
+
+
+def _scrape_authorize_url(pane: str) -> str:
+    """Pull the full OAuth authorize URL out of a pane.
+
+    The full /login URL (six scopes) is ~380 chars and Claude Code renders it
+    over three lines, so a plain regex returns only the first ~200 chars — a
+    truncated link that loads an error page with no Authorize button. Stitch the
+    continuation lines back on.
+
+    Always returns the LAST link on screen: a session that has retried /login
+    has older, already-consumed URLs in its scrollback, and authorizing one of
+    those yields a code whose PKCE verifier no longer matches — the CLI answers
+    "Invalid code"."""
+    lines = pane.split("\n")
+    found = ""
+    for i, line in enumerate(lines):
+        m = _AUTH_URL_RE.search(line)
+        if not m:
+            continue
+        url = m.group(0).rstrip()
+        for nxt in lines[i + 1:]:
+            frag = nxt.strip()
+            if not frag or not _URL_CONT_RE.fullmatch(frag):
+                break          # blank line or prose -> the URL ended
+            url += frag
+        found = url.rstrip(".,)")   # keep the newest, don't return early
+    return found
+_auto_auth_state: Dict[str, dict] = {}   # session -> {"ts": float, "status": str}
+_AUTO_AUTH_COOLDOWN = 300
+_AUTO_AUTH_MAX_FAILS = 2
+# Last login that auto-auth couldn't finish by itself. Surfaced in the header so
+# the one human step left is a single click on a ready-made link, not a hunt
+# through a pane for a wrapped URL.
+_pending_auth: dict = {}
+
+
+def _pane_text(session_name: str, lines: int = 60) -> str:
+    """Pane text with wrapped lines joined (-J), so a long URL is captured whole."""
+    try:
+        return subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=10).stdout or ""
+    except Exception:
+        return ""
+
+
+async def _send_line(session_name: str, text: str):
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "-l", text],
+        capture_output=True, text=True, timeout=10)
+    await asyncio.sleep(0.3)
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        capture_output=True, text=True, timeout=10)
+
+
+def _code_from_urls(urls: list) -> str:
+    """Find an auth code in any URL we saw. Ignores the authorize link's own
+    `code=true` flag (that's 'give me a code', not the code)."""
+    for u in urls:
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+        except Exception:
+            continue
+        c = (q.get("code") or [""])[0]
+        if c and c != "true" and len(c) > 8:
+            s = (q.get("state") or [""])[0]
+            return c + ("#" + s if s else "")
+    return ""
+
+
+async def _extract_oauth_code(tab, authorize_url: str) -> dict:
+    """Drive the consent page to an auth code. Returns {code} or {error}."""
+    await tab.call("Network.enable")
+    # A background tab's renderer is throttled and the consent button does
+    # nothing at all, so the tab must be foregrounded before we touch it.
+    await tab.call("Page.bringToFront")
+    await tab.navigate(authorize_url, settle=2.5)
+    await tab.call("Page.bringToFront")
+    body = (await tab.eval("document.body ? document.body.innerText : ''")) or ""
+    # A free/no-plan account can't authorize Claude Code at all — say so plainly
+    # rather than waiting for a button that will never work.
+    if "Max or Pro is required" in body or "required to connect to Claude Code" in body:
+        return {"error": "the login browser's claude.ai account has no Max/Pro plan, "
+                         "so it cannot authorize Claude Code"}
+    if "just a moment" in body.lower():
+        return {"error": "Cloudflare challenge on the consent page — retry"}
+    if "sign in" in body.lower() and "authorize" not in body.lower():
+        return {"error": "the login browser is signed out of claude.ai"}
+    clicked = await tab.wait_for("""(() => {
+        const want = /^(authorize|allow|continue|approve)$/i;
+        const els = [...document.querySelectorAll('button, a[role=button], input[type=submit]')];
+        const b = els.find(e => want.test((e.innerText||e.value||'').trim()));
+        if (b) { b.click(); return true; }
+        return false;
+    })()""", timeout=25)
+    if not clicked:
+        return {"error": "no Authorize button appeared on the consent page"}
+    # The code can surface three ways, so watch all of them: the redirect to the
+    # callback (often ABORTED here, but the request event still carries the code),
+    # the address bar, or the code rendered on the page for copying.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        await tab.drain(3)
+        code = _code_from_urls(tab.urls_seen())
+        if code:
+            return {"code": code}
+        try:
+            onpage = await tab.eval("""(() => {
+                const p = new URLSearchParams(location.search);
+                const c = p.get('code');
+                if (c && c !== 'true') return c + (p.get('state') ? '#' + p.get('state') : '');
+                const t = document.body ? document.body.innerText : '';
+                const m = t.match(/[A-Za-z0-9_-]{20,}#[A-Za-z0-9_-]{10,}/);
+                return m ? m[0] : '';
+            })()""")
+        except Exception:
+            onpage = ""
+        if onpage:
+            return {"code": str(onpage).strip()}
+    return {"error": "clicked Authorize but claude.ai never returned a code "
+                     "(its consent page stalls when driven automatically)"}
+
+
+async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
+    """Log `session_name` back in using the designated login browser."""
+    alog = logging.getLogger("auto-auth")
+    st = _auto_auth_state.setdefault(session_name, {})
+    if time.time() - st.get("ts", 0) < _AUTO_AUTH_COOLDOWN and st.get("running"):
+        return {"ok": False, "error": "auto-auth already running for this session"}
+    # Give up after repeated failures rather than reopening browser tabs every
+    # cooldown forever. A manual trigger (or a success) clears the counter.
+    if reason != "manual" and st.get("fails", 0) >= _AUTO_AUTH_MAX_FAILS:
+        return {"ok": False, "error": "auto-auth gave up for this session after "
+                                      f"{st['fails']} attempts — finish the login manually"}
+    browser = _pick_login_browser()
+    if not browser:
+        return {"ok": False, "error": "no browser is marked for login — open Settings → "
+                                      "Browser and tick 'use for Claude login' on one"}
+    sid, cdp = browser.get("id"), browser.get("cdp_port", 0)
+    if not await asyncio.to_thread(_browser_port_alive, browser.get("vnc_port", 0)):
+        return {"ok": False, "error": f"the login browser '{browser.get('name')}' isn't running"}
+    st.update({"ts": time.time(), "running": True, "status": "starting"})
+    try:
+        async with _browser_busy_ctx(sid, f"logging in '{session_name}'"):
+            # 1. Get the session to a /login prompt (unless one is already up).
+            pane = await asyncio.to_thread(_pane_text, session_name)
+            if not _scrape_authorize_url(pane):
+                st["status"] = "running /login"
+                await _send_line(session_name, "/login")
+                await asyncio.sleep(2.5)
+                # Claude asks which method first — pick the subscription option.
+                pane = await asyncio.to_thread(_pane_text, session_name)
+                if re.search(r"select login method|subscription", pane, re.I):
+                    await asyncio.to_thread(subprocess.run,
+                        ["tmux", "send-keys", "-t", session_name, "Enter"],
+                        capture_output=True, text=True, timeout=10)
+                    await asyncio.sleep(2.5)
+            # 2. Scrape the authorize URL.
+            url = ""
+            for _ in range(20):
+                pane = await asyncio.to_thread(_pane_text, session_name)
+                url = _scrape_authorize_url(pane)
+                if url:
+                    break
+                await asyncio.sleep(1.5)
+            if not url:
+                st.update({"running": False, "status": "no authorize URL",
+                           "fails": st.get("fails", 0) + 1})
+                return {"ok": False, "error": "couldn't find an authorize URL in the session"}
+            alog.info("auto-auth '%s': authorizing via browser '%s'", session_name, sid)
+            # 3. Click it through in the logged-in browser.
+            st["status"] = "authorizing in browser"
+            async with _cdp_tab(cdp) as tab:
+                res = await _extract_oauth_code(tab, url)
+            if res.get("error"):
+                # Hand the blocker back with the exact link, so finishing it by
+                # hand is one click instead of a hunt through the pane.
+                st.update({"running": False, "status": res["error"], "url": url,
+                           "fails": st.get("fails", 0) + 1})
+                _pending_auth.update({"session": session_name, "url": url,
+                                      "why": res["error"], "ts": time.time()})
+                alog.warning("auto-auth '%s' failed: %s — finish manually: %s",
+                             session_name, res["error"], url)
+                return {"ok": False, "error": res["error"], "authorize_url": url}
+            # 4. Paste the code back into the waiting prompt.
+            st["status"] = "submitting code"
+            await _send_line(session_name, res["code"])
+            # Success = the paste prompt goes away with no error, not merely the
+            # absence of a "login required" string (which is briefly true while
+            # the CLI is still exchanging the code).
+            _pending_auth.clear()
+            ok, why = False, "timed out waiting for the login to settle"
+            for _ in range(12):
+                await asyncio.sleep(2)
+                pane = await asyncio.to_thread(_pane_text, session_name)
+                low = pane.lower()
+                if "invalid code" in low or "oauth error" in low or "authentication failed" in low:
+                    ok, why = False, "Claude rejected the code"
+                    break
+                if "login successful" in low or "logged in as" in low:
+                    ok, why = True, ""
+                    break
+                if "paste code here" not in low and not _LOGIN_NEEDED_RE.search(pane):
+                    ok, why = True, ""
+                    break
+            st.update({"running": False, "status": "logged in" if ok else why,
+                       "fails": 0 if ok else st.get("fails", 0) + 1})
+            _account_ident_cache.clear()
+            alog.info("auto-auth '%s': %s", session_name, st["status"])
+            return {"ok": ok, "browser": sid, "error": "" if ok else why}
+    except Exception as e:
+        st.update({"running": False, "status": f"error: {e}",
+                   "fails": st.get("fails", 0) + 1})
+        alog.warning("auto-auth '%s' crashed: %s", session_name, e, exc_info=True)
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/sessions/{session_name}/auto-auth")
+async def api_auto_auth(session_name: str, request: Request):
+    """Manually kick off the browser-driven login for a session (same routine the
+    watchdog runs automatically) — also the 'first sign-in' path."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    res = await _auto_auth_session(session_name, reason="manual")
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
 @app.websocket("/browser/{sid}/websockify")
@@ -10444,11 +10939,28 @@ async def _login_watchdog_loop():
                             llog.debug("login watchdog esc failed for '%s': %s", name, e)
                     continue
 
-                if not recent or not _LOGIN_NEEDED_RE.search(recent):
+                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
+                # A /login flow already parked on screen (URL / paste-code prompt) is
+                # exactly what auto-auth can finish — previously we just left it there
+                # for a human to notice.
+                if not needs_login and not login_flow_open:
                     continue
-                # A /login flow is already on screen (URL / paste-code prompt) — leave it.
+
+                # Preferred path: drive the OAuth click-through in the logged-in
+                # browser and type the code back, so the session recovers unattended.
+                if AUTO_AUTH_ENABLED and _pick_login_browser():
+                    state["last_action"] = now
+                    llog.warning("Auto-auth starting for '%s' (%s)", name,
+                                 "login flow on screen" if login_flow_open else "login required")
+                    res = await _auto_auth_session(name, reason="watchdog")
+                    if res.get("ok"):
+                        llog.warning("Auto-auth logged '%s' back in", name)
+                    else:
+                        llog.warning("Auto-auth for '%s' failed: %s", name, res.get("error"))
+                    continue
+
                 if login_flow_open:
-                    continue
+                    continue    # can't finish it here; leave it for the human
                 try:
                     await asyncio.to_thread(
                         subprocess.run,
@@ -11480,8 +11992,36 @@ body.member-simple .hide-in-simple{display:none!important}
 .settings-section .my-ctx-settings{min-height:120px}
 .settings-section .my-ctx-path{font-size:.7rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:2px}
 .settings-section .my-ctx-actions{display:flex;justify-content:flex-end;gap:8px}
+/* Header browser sign-in badge */
+.nav-browser-badge{display:inline-flex;align-items:center;gap:5px;cursor:pointer;padding:3px 7px;border-radius:12px;border:1px solid #30363d;background:#0d1117;user-select:none;line-height:1}
+.nav-browser-badge:hover{border-color:#58a6ff}
+.nav-browser-badge .nbb-glyph{font-size:.8rem;filter:grayscale(1) opacity(.75)}
+.nav-browser-badge .nbb-dot{width:8px;height:8px;border-radius:50%;background:#6e7681;flex:0 0 auto}
+.nav-browser-badge.ok .nbb-dot{background:#3fb950;box-shadow:0 0 6px #3fb95099}
+.nav-browser-badge.bad .nbb-dot{background:#f85149;box-shadow:0 0 6px #f8514999}
+.nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
+/* Action needed: auto-auth prepared everything, one human click left. */
+.nav-browser-badge.action{border-color:#d29922}
+.nav-browser-badge.action .nbb-dot{background:#d29922;animation:nbb-blink 1.1s ease-in-out infinite}
+.nav-browser-badge.action .nbb-glyph{filter:none}
+@keyframes nbb-blink{0%,100%{opacity:1}50%{opacity:.25}}
+.nav-browser-badge.ok .nbb-glyph{filter:none}
+/* Working: the dot becomes a spinning ring so background use is obvious. */
+.nav-browser-badge.busy{border-color:#58a6ff}
+.nav-browser-badge.busy .nbb-dot{background:transparent;border:2px solid #58a6ff;border-top-color:transparent;box-shadow:none;width:10px;height:10px;animation:nbb-spin .7s linear infinite}
+.nav-browser-badge.busy .nbb-glyph{filter:none;animation:nbb-pulse 1.4s ease-in-out infinite}
+@keyframes nbb-spin{to{transform:rotate(360deg)}}
+@keyframes nbb-pulse{0%,100%{opacity:1}50%{opacity:.45}}
 /* Browser tab */
 .bs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.bs-badges{display:flex;gap:5px;flex-wrap:wrap;padding:0 10px 8px}
+.bs-badge{font-size:.63rem;padding:2px 7px;border-radius:10px;border:1px solid #30363d;color:#8b949e;text-transform:uppercase;letter-spacing:.03em;font-weight:600}
+.bs-badge.ok{color:#3fb950;border-color:#238636}
+.bs-badge.bad{color:#f85149;border-color:#8b2c26}
+.bs-badge.warn{color:#d29922;border-color:#7a5c12}
+.bs-badge.login{color:#58a6ff;border-color:#1f6feb}
+.bs-loginrow{display:flex;align-items:center;gap:6px;font-size:.75rem;color:#c9d1d9;padding:2px 0}
+.bs-loginrow input{margin:0}
 .bs-card{border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;display:flex;flex-direction:column}
 .bs-head{display:flex;align-items:center;gap:6px;padding:8px 10px;flex-wrap:wrap}
 .bs-name{font-weight:600;color:#e6edf3;font-size:.85rem}
@@ -11684,6 +12224,12 @@ body.member-simple .hide-in-simple{display:none!important}
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <!-- Browser sign-in indicator: red = no browser can authorize Claude, green =
+       one can, spinning = Claude is driving a browser right now. -->
+  <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
+        title="Browser sign-in status" onclick="onBrowserBadgeClick()">
+    <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
+  </span>
   <div class="nav-tools-wrap">
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
@@ -15007,6 +15553,7 @@ async function applyRoleVisibility(){
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
   if(isAdmin){ refreshApprovalsBadge(); if(!window._apTimer) window._apTimer=setInterval(refreshApprovalsBadge,30000); }
+  if(isAdmin) startBrowserAuthPolling();
 }
 
 async function refreshApprovalsBadge(){
@@ -15104,6 +15651,66 @@ function renderSettingsContent(){
   }
 }
 
+// --- Header browser sign-in badge ------------------------------------------
+// red = no browser can authorize Claude, green = one can, spinner = Claude is
+// driving a browser right now (so background use is never invisible).
+let _browserAuth = null;
+let _browserAuthTimer = null;
+
+async function refreshBrowserAuthBadge(){
+  const el = document.getElementById('nav-browser-badge');
+  if(!el) return;
+  if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
+  let d;
+  try{
+    const r = await fetch(BASE+'/api/browser/auth-status');
+    if(!r.ok){ el.style.display='none'; return; }
+    d = await r.json();
+  }catch(e){ return; }
+  _browserAuth = d;
+  el.style.display = 'inline-flex';
+  el.classList.remove('ok','bad','warn','busy','unknown','action');
+  let title;
+  const pend = d.pending_auth && d.pending_auth.url ? d.pending_auth : null;
+  if(d.busy){
+    el.classList.add('busy');
+    title = 'Claude is using the browser: ' + (d.busy_what || 'working…');
+  }else if(pend){
+    el.classList.add('action');
+    title = "'"+pend.session+"' needs one click to finish signing in ("+(pend.why||'')+
+            ') — click to open the authorize page.';
+  }else if(d.any_can_authorize){
+    el.classList.add('ok');
+    const who = (d.sessions.find(s=>s.can_authorize)||{});
+    title = 'Browser signed in' + (who.email? ' as '+who.email : '') +
+            ' — Claude can log itself back in automatically. Click to manage.';
+  }else if(d.any_logged_in){
+    el.classList.add('warn');
+    const s = d.sessions.find(x=>x.logged_in)||{};
+    title = 'Browser signed in' + (s.email? ' as '+s.email : '') +
+            ", but that account has no Max/Pro plan — it can't authorize Claude Code. Click to fix.";
+  }else{
+    el.classList.add('bad');
+    title = 'No browser is signed in to claude.ai — Claude cannot log itself back in. Click to sign one in.';
+  }
+  el.title = title;
+}
+
+// Clicking the badge: finish a pending sign-in if there is one, else manage browsers.
+function onBrowserBadgeClick(){
+  const p = _browserAuth && _browserAuth.pending_auth;
+  if(p && p.url){
+    window.open(p.url, '_blank');
+    return;
+  }
+  openSettings('browser');
+}
+
+function startBrowserAuthPolling(){
+  refreshBrowserAuthBadge();
+  if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 20000);
+}
+
 // --- Browser tab (admin) — manage independent Claude browser sessions ---
 let _browserSessions = [];
 let _bsEditId = null;   // session id currently being renamed / annotated
@@ -15122,6 +15729,11 @@ async function loadBrowserTab(){
   _browserSessions = data.sessions||[];
   _bsData = data;
   renderBrowserTab(data);
+  // Sign-in state needs a live claude.ai check per browser, so fetch it after
+  // the cards are already on screen and repaint when it lands.
+  refreshBrowserAuthBadge().then(()=>{
+    if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{});
+  });
 }
 
 // Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY
@@ -15150,18 +15762,29 @@ function renderBrowserTab(data){
     const notesBlock = notes
       ? '<div class="bs-notes">'+esc(notes)+'</div>'
       : '<div class="bs-notes empty">No note — use Edit to say what this browser is for.</div>';
+    // Sign-in state for this browser (from /api/browser/auth-status).
+    const a = ((_browserAuth&&_browserAuth.sessions)||[]).find(x=>x.id===s.id) || {};
+    let badges = '';
+    if(a.busy) badges += '<span class="bs-badge login">⟳ '+esc(a.busy_what||'working')+'</span>';
+    if(a.can_authorize) badges += '<span class="bs-badge ok">✓ can log Claude in'+(a.email?' · '+esc(a.email):'')+'</span>';
+    else if(a.logged_in) badges += '<span class="bs-badge warn">signed in'+(a.email?' · '+esc(a.email):'')+' · no Max/Pro</span>';
+    else if(a.running) badges += '<span class="bs-badge bad">not signed in to claude.ai</span>';
+    if(a.use_for_login) badges += '<span class="bs-badge login">login browser</span>';
+    const badgeRow = badges ? '<div class="bs-badges">'+badges+'</div>' : '';
     const body = editing
       ? '<div class="bs-edit">'+
           '<label>Name</label>'+
           '<input id="bs-edit-name-'+id+'" value="'+esc(s.name)+'" placeholder="Browser name">'+
           '<label>What is this browser for?</label>'+
           '<textarea id="bs-edit-notes-'+id+'" placeholder="e.g. logged into the GRABO Google account — use for Ads/Analytics only">'+esc(notes)+'</textarea>'+
+          '<label class="bs-loginrow"><input type="checkbox" id="bs-edit-login-'+id+'"'+(s.use_for_login?' checked':'')+'> '+
+            'Use this browser to sign Claude in (auto-auth)</label>'+
           '<div class="bs-edit-actions">'+
             '<button class="btn btn-primary" onclick="saveBrowserEdit(\''+id+'\')">Save</button> '+
             '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
           '</div>'+
         '</div>'
-      : '<div class="bs-preview">'+preview+'</div>'+notesBlock;
+      : '<div class="bs-preview">'+preview+'</div>'+badgeRow+notesBlock;
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
         '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
@@ -15199,13 +15822,15 @@ function cancelBrowserEdit(){ _bsEditId=null; renderBrowserTab(_bsData||{}); }
 async function saveBrowserEdit(id){
   const nameEl=document.getElementById('bs-edit-name-'+id);
   const notesEl=document.getElementById('bs-edit-notes-'+id);
+  const loginEl=document.getElementById('bs-edit-login-'+id);
   const name=nameEl?nameEl.value.trim():'';
   const notes=notesEl?notesEl.value:'';
+  const use_for_login=loginEl?!!loginEl.checked:undefined;
   if(!name){ alert('Name cannot be empty'); return; }
   try{
     const r=await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{
       method:'PATCH', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, notes})
+      body: JSON.stringify({name, notes, use_for_login})
     });
     const d=await r.json();
     if(!r.ok){ alert(d.error||'Failed to save'); return; }
