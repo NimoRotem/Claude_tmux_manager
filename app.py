@@ -8506,6 +8506,17 @@ def _load_browser_sessions() -> list:
             if isinstance(sessions, list):
                 if not any(s.get("id") == "default" for s in sessions):
                     sessions = [dict(_DEFAULT_BROWSER_SESSION)] + sessions
+                else:
+                    # Refresh the default entry's derived fields (ports, and above
+                    # all external_url) from code — a copy persisted before those
+                    # changed would otherwise pin stale values forever. Only the
+                    # user-editable name/notes survive from disk.
+                    for s in sessions:
+                        if s.get("id") == "default":
+                            keep = {k: s[k] for k in ("name", "notes") if k in s}
+                            s.clear()
+                            s.update(_DEFAULT_BROWSER_SESSION)
+                            s.update(keep)
                 return sessions
     except Exception:
         logger.debug("Failed to load browser sessions", exc_info=True)
@@ -8641,6 +8652,37 @@ async def api_browser_delete(sid: str, request: Request):
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
     logger.info("Browser session '%s' stopped and removed", sid)
     return JSONResponse({"ok": True})
+
+
+class BrowserPatchBody(BaseModel):
+    name: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.patch("/api/browser/sessions/{sid}")
+async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request):
+    """Rename a browser session and/or set its note (what the browser is for).
+    Allowed for the default systemd browser too — it's only metadata."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    sessions = _load_browser_sessions()
+    target = next((s for s in sessions if s.get("id") == sid), None)
+    if not target:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            return JSONResponse({"error": "Name cannot be empty"}, status_code=400)
+        target["name"] = name[:80]
+    if body.notes is not None:
+        target["notes"] = body.notes.strip()[:2000]
+    _save_browser_sessions(sessions)
+    row = dict(target)
+    row["running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
+    row["viewer_url"] = _browser_viewer_url(target)
+    logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
+                sid, target.get("name"), len(target.get("notes", "")))
+    return JSONResponse({"ok": True, "session": row})
 
 
 @app.websocket("/browser/{sid}/websockify")
@@ -11528,6 +11570,14 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-preview iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 .bs-off{display:flex;align-items:center;justify-content:center;height:100%;color:#6e7681;font-size:.8rem}
 .bs-actions{display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap}
+.bs-notes{padding:8px 10px;font-size:.76rem;color:#c9d1d9;white-space:pre-wrap;word-break:break-word;border-bottom:1px solid #21262d;background:#0b1017}
+.bs-notes.empty{color:#6e7681;font-style:italic}
+.bs-edit{padding:10px;display:flex;flex-direction:column;gap:6px}
+.bs-edit label{font-size:.66rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.bs-edit input,.bs-edit textarea{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.82rem;outline:none;font-family:inherit;width:100%;box-sizing:border-box}
+.bs-edit textarea{min-height:80px;resize:vertical;line-height:1.45}
+.bs-edit input:focus,.bs-edit textarea:focus{border-color:#58a6ff}
+.bs-edit-actions{display:flex;gap:6px;justify-content:flex-end}
 .bs-add{display:flex;gap:8px;align-items:center;margin-top:4px}
 .bs-add input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none}
 .bs-add input:focus{border-color:#58a6ff}
@@ -15133,6 +15183,8 @@ function renderSettingsContent(){
 
 // --- Browser tab (admin) — manage independent Claude browser sessions ---
 let _browserSessions = [];
+let _bsEditId = null;   // session id currently being renamed / annotated
+let _bsData = null;     // last payload, so an edit toggle can re-render without refetching
 async function loadBrowserTab(){
   let data;
   try{
@@ -15145,27 +15197,53 @@ async function loadBrowserTab(){
     return;
   }
   _browserSessions = data.sessions||[];
+  _bsData = data;
   renderBrowserTab(data);
 }
 
+// Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY
+// value interpolated into inline handlers. Names/URLs are looked up from
+// _browserSessions inside the handler instead: esc() escapes &<> but NOT quotes,
+// and JSON.stringify emits double quotes — either one, dropped into a
+// double-quoted onclick="…", terminates the attribute and silently kills the
+// button (which is exactly how Remove and Direct came to do nothing).
 function renderBrowserTab(data){
   const sessions = _browserSessions||[];
   const atLimit = (data.extra_count||0) >= (data.max_extra||4);
   const cards = sessions.map(s=>{
+    const id = esc(s.id);
     const dot = s.running ? '<span class="bs-dot on"></span>' : '<span class="bs-dot off"></span>';
     const status = s.running ? 'running' : 'stopped';
+    const editing = _bsEditId === s.id;
     const openBtns =
-      '<button class="btn" onclick="openBrowserSession(\''+esc(s.id)+'\')">Open&nbsp;↗</button>'+
-      (s.external_url? ' <button class="btn btn-ghost" onclick="window.open('+JSON.stringify(s.external_url)+',\'_blank\')">Direct</button>':'');
-    const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+esc(s.id)+'\','+JSON.stringify(s.name)+')">Remove</button>' : '';
+      '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
+      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
+    const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
+    const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
     const preview = s.running
       ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
       : '<div class="bs-off">Session stopped</div>';
+    const notes = (s.notes||'').trim();
+    const notesBlock = notes
+      ? '<div class="bs-notes">'+esc(notes)+'</div>'
+      : '<div class="bs-notes empty">No note — use Edit to say what this browser is for.</div>';
+    const body = editing
+      ? '<div class="bs-edit">'+
+          '<label>Name</label>'+
+          '<input id="bs-edit-name-'+id+'" value="'+esc(s.name)+'" placeholder="Browser name">'+
+          '<label>What is this browser for?</label>'+
+          '<textarea id="bs-edit-notes-'+id+'" placeholder="e.g. logged into the GRABO Google account — use for Ads/Analytics only">'+esc(notes)+'</textarea>'+
+          '<div class="bs-edit-actions">'+
+            '<button class="btn btn-primary" onclick="saveBrowserEdit(\''+id+'\')">Save</button> '+
+            '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
+          '</div>'+
+        '</div>'
+      : '<div class="bs-preview">'+preview+'</div>'+notesBlock;
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
         '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
-      '<div class="bs-preview">'+preview+'</div>'+
-      '<div class="bs-actions">'+openBtns+rm+'</div>'+
+      body+
+      '<div class="bs-actions">'+openBtns+editBtn+rm+'</div>'+
     '</div>';
   }).join('');
   const addRow = atLimit
@@ -15179,10 +15257,38 @@ function renderBrowserTab(data){
     '</div>';
 }
 
+function _bsFind(id){ return (_browserSessions||[]).find(x=>x.id===id); }
+
 function openBrowserSession(id){
-  const s=(_browserSessions||[]).find(x=>x.id===id);
+  const s=_bsFind(id);
   if(!s) return;
   window.open(s.viewer_url, '_blank');
+}
+
+function openBrowserDirect(id){
+  const s=_bsFind(id);
+  if(s&&s.external_url) window.open(s.external_url, '_blank');
+}
+
+function startEditBrowser(id){ _bsEditId=id; renderBrowserTab(_bsData||{}); }
+function cancelBrowserEdit(){ _bsEditId=null; renderBrowserTab(_bsData||{}); }
+
+async function saveBrowserEdit(id){
+  const nameEl=document.getElementById('bs-edit-name-'+id);
+  const notesEl=document.getElementById('bs-edit-notes-'+id);
+  const name=nameEl?nameEl.value.trim():'';
+  const notes=notesEl?notesEl.value:'';
+  if(!name){ alert('Name cannot be empty'); return; }
+  try{
+    const r=await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, notes})
+    });
+    const d=await r.json();
+    if(!r.ok){ alert(d.error||'Failed to save'); return; }
+  }catch(e){ alert('Failed: '+e.message); return; }
+  _bsEditId=null;
+  loadBrowserTab();
 }
 
 async function createBrowserSession(){
@@ -15198,7 +15304,9 @@ async function createBrowserSession(){
   loadBrowserTab();
 }
 
-async function removeBrowserSession(id,name){
+async function removeBrowserSession(id){
+  const s=_bsFind(id);
+  const name=s?s.name:id;
   if(!confirm('Remove browser session "'+name+'"? This stops its Chrome and frees the memory.')) return;
   try{
     const r=await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{method:'DELETE'});
