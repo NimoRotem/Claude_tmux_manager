@@ -5937,37 +5937,8 @@ async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- Global CLAUDE.md (header button — no session needed) ---
-
-@app.get("/api/claude-md-global")
-async def api_get_claude_md_global():
-    """Read global CLAUDE.md from home dir."""
-    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
-    content = ""
-    exists = os.path.exists(home_md)
-    if exists:
-        try:
-            with open(home_md) as f:
-                content = f.read()
-        except Exception:
-            logger.debug("Failed to read global CLAUDE.md", exc_info=True)
-    return JSONResponse({"path": home_md, "content": content, "exists": exists})
-
-
-@app.post("/api/claude-md-global")
-async def api_save_claude_md_global(body: SaveClaudeMd):
-    """Save global CLAUDE.md."""
-    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
-    real_path = os.path.realpath(body.path)
-    if real_path != os.path.realpath(home_md):
-        return JSONResponse({"error": "Can only save to global CLAUDE.md"}, status_code=400)
-    try:
-        with open(real_path, "w") as f:
-            f.write(body.content)
-        return JSONResponse({"ok": True, "path": real_path})
-    except Exception:
-        logger.exception("Failed to save global CLAUDE.md")
-        return JSONResponse({"error": "Failed to save"}, status_code=500)
+# The global CLAUDE.md is edited through /api/context-files, alongside the
+# reference docs it links to, so the whole set is visible in one place.
 
 
 # --- Session-scoped auto-memory (project MEMORY.md + sibling topic files) ---
@@ -6133,82 +6104,103 @@ async def api_delete_session_memory_extra(session_name: str, filename: str):
     return JSONResponse({"ok": True})
 
 
-# --- Global extras: sidecar markdown files in ~/ matching CLAUDE*.md ---
-# (e.g. ~/CLAUDE_API_KEYS.md, ~/CLAUDE_GITHUB_RULES.md). The main CLAUDE.md
-# has its own dedicated editor and is excluded here.
-_GLOBAL_EXTRA_RE = re.compile(r"^CLAUDE[A-Za-z0-9._-]+\.md$")
+# --- Context files: the canonical set Claude Code reads on this host ---
+#
+# NB: this module uses `from __future__ import annotations`, so a body model must
+# be defined ABOVE the route that annotates it — otherwise FastAPI cannot resolve
+# the string annotation at registration time and silently demotes it to a query
+# parameter.
+class ContextFileBody(BaseModel):
+    name: str        # registry id, not a path
+    content: str
 
 
-def _sanitize_global_extra_filename(name: str) -> str:
-    name = os.path.basename(name or "")
-    if not _GLOBAL_EXTRA_RE.match(name):
-        return ""
-    if name.upper() == "CLAUDE.MD":
-        return ""
-    return name
+#
+# There is exactly ONE CLAUDE.md plus a handful of reference docs it points at.
+# This registry is fixed on purpose: the UI edits these files in place and offers
+# no way to create new sidecar CLAUDE_*.md files. Every extra file either costs
+# context on every session or quietly drifts because nothing ever reads it.
+#
+# "auto" files are injected into every session's context; "ondemand" files cost
+# nothing until CLAUDE.md sends a session to them.
+_CONTEXT_FILES = [
+    {"id": "claude-md", "path": Path.home() / "CLAUDE.md", "load": "auto",
+     "label": "~/CLAUDE.md",
+     "note": "Global rules. Auto-loaded for any session whose working directory is under ~."},
+    {"id": "claude-md-home", "path": Path.home() / ".claude" / "CLAUDE.md", "load": "auto",
+     "label": "~/.claude/CLAUDE.md",
+     "note": "One-line pointer so sessions started outside ~ (e.g. in /opt or /var/www) still find the rules."},
+    {"id": "github-rules", "path": Path.home() / "CLAUDE_GITHUB_RULES.md", "load": "ondemand",
+     "note": "Git and GitHub rules."},
+    {"id": "api-keys", "path": Path.home() / "CLAUDE_API_KEYS.md", "load": "ondemand",
+     "secret": True,
+     "note": "Raw API key file. Prefer Settings → APIs, which also shows live usage."},
+    {"id": "infra-index", "path": Path.home() / ".claude" / "vm_projects_dir.md", "load": "ondemand",
+     "note": "Infrastructure index: VMs, domains, and pointers to the per-host detail files."},
+    {"id": "droplets", "path": Path.home() / "claude_droplets_access.md", "load": "ondemand",
+     "note": "SSH access to the legacy DigitalOcean droplets."},
+    {"id": "infra-keeper", "path": MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
+     "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
+]
+
+_INFRA_DETAIL_DIR = Path.home() / ".claude" / "infra"
 
 
-@app.get("/api/global-extras")
-async def api_list_global_extras():
-    home = Path.home()
+def _context_file_entries():
+    """Registry entries plus the per-host infra detail files, existing ones only."""
+    entries = list(_CONTEXT_FILES)
+    try:
+        for p in sorted(_INFRA_DETAIL_DIR.glob("*.md")):
+            entries.append({
+                "id": "infra-" + p.stem, "path": p, "load": "ondemand",
+                "label": "infra/" + p.name,
+                "note": ("One line per infrastructure change, newest first."
+                         if p.name == "CHANGELOG.md"
+                         else "Per-host infrastructure detail, linked from the index."),
+            })
+    except Exception:
+        logger.debug("Failed to list infra detail files", exc_info=True)
+    return [e for e in entries if e["path"].exists()]
+
+
+@app.get("/api/context-files")
+async def api_list_context_files():
     files = []
+    for e in _context_file_entries():
+        p = e["path"]
+        try:
+            content = p.read_text(errors="replace")
+        except Exception:
+            logger.debug("Failed to read context file %s", p, exc_info=True)
+            continue
+        files.append({
+            "id": e["id"], "name": e.get("label") or p.name, "path": str(p),
+            "load": e["load"], "note": e["note"], "secret": bool(e.get("secret")),
+            "content": content, "size": p.stat().st_size,
+        })
+    auto = sum(f["size"] for f in files if f["load"] == "auto")
+    return JSONResponse({"files": files, "auto_bytes": auto})
+
+
+@app.post("/api/context-files")
+async def api_save_context_file(body: ContextFileBody):
+    """Save one registry file in place. `name` carries the registry id — the path
+    is never taken from the client, so there is nothing to traverse."""
+    entry = next((e for e in _context_file_entries() if e["id"] == body.name), None)
+    if entry is None:
+        return JSONResponse({"error": "Unknown context file"}, status_code=404)
+    p = entry["path"]
     try:
-        for p in sorted(home.iterdir()):
-            if not p.is_file():
-                continue
-            if not _GLOBAL_EXTRA_RE.match(p.name):
-                continue
-            if p.name.upper() == "CLAUDE.MD":
-                continue
+        p.write_text(body.content)
+        if entry.get("secret"):
             try:
-                files.append({"name": p.name, "content": p.read_text(),
-                              "size": p.stat().st_size})
+                os.chmod(p, 0o600)
             except Exception:
-                logger.debug("Failed to read global extra %s", p, exc_info=True)
+                logger.debug("chmod 600 failed for %s", p, exc_info=True)
+        return JSONResponse({"ok": True, "id": entry["id"], "size": p.stat().st_size})
     except Exception:
-        logger.exception("Failed to list global extras")
-    return JSONResponse({"files": files, "path": str(home)})
-
-
-@app.post("/api/global-extras")
-async def api_save_global_extra(body: SkillFileBody):
-    fname = _sanitize_global_extra_filename(body.name)
-    if not fname:
-        return JSONResponse({"error": "Filename must match CLAUDE_<something>.md (e.g. CLAUDE_API_KEYS.md)."}, status_code=400)
-    home = Path.home()
-    fpath = home / fname
-    if not str(fpath.resolve()).startswith(str(home.resolve()) + os.sep):
-        return JSONResponse({"error": "Invalid path"}, status_code=400)
-    try:
-        fpath.write_text(body.content)
-        # API-key-style files often need restrictive perms; we apply 600
-        # because these conventionally hold secrets and live next to CLAUDE.md.
-        try:
-            os.chmod(fpath, 0o600)
-        except Exception:
-            logger.debug("chmod 600 failed for %s", fpath, exc_info=True)
-        return JSONResponse({"ok": True, "name": fname})
-    except Exception:
-        logger.exception("Failed to save global extra")
+        logger.exception("Failed to save context file %s", p)
         return JSONResponse({"error": "Failed to save file"}, status_code=500)
-
-
-@app.delete("/api/global-extras/{filename}")
-async def api_delete_global_extra(filename: str):
-    fname = _sanitize_global_extra_filename(filename)
-    if not fname:
-        return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    home = Path.home()
-    fpath = home / fname
-    if not str(fpath.resolve()).startswith(str(home.resolve()) + os.sep):
-        return JSONResponse({"error": "Invalid path"}, status_code=400)
-    if fpath.exists():
-        try:
-            fpath.unlink()
-        except Exception:
-            logger.exception("Failed to delete global extra")
-            return JSONResponse({"error": "Failed to delete"}, status_code=500)
-    return JSONResponse({"ok": True})
 
 
 # --- Skills file management ---
@@ -7363,78 +7355,9 @@ async def api_delete_profile_skill(profile_id: str, filename: str):
     return JSONResponse({"ok": True})
 
 
-# Reserved names that the extras editor must NOT touch (these have their own
-# dedicated editors). Comparison is case-insensitive against the sanitized name.
-_EXTRAS_RESERVED_NAMES = {"claude.md", "memory.md", "settings.json"}
-
-
-@app.get("/api/profiles/{profile_id}/extras")
-async def api_list_profile_extras(profile_id: str):
-    """List user-added .md files at the profile root (excludes CLAUDE.md/MEMORY.md)."""
-    data = _load_roles()
-    if not _find_profile(profile_id, data):
-        return JSONResponse({"error": "Profile not found"}, status_code=404)
-    d = _profile_dir(profile_id)
-    d.mkdir(parents=True, exist_ok=True)
-    files = []
-    for p in sorted(d.iterdir()):
-        if not (p.suffix == ".md" and p.is_file()):
-            continue
-        if p.name.lower() in _EXTRAS_RESERVED_NAMES:
-            continue
-        try:
-            files.append({"name": p.name, "content": p.read_text(),
-                          "size": p.stat().st_size})
-        except Exception:
-            logger.debug("Failed to read profile extra %s", p, exc_info=True)
-    return JSONResponse({"files": files, "path": str(d)})
-
-
-@app.post("/api/profiles/{profile_id}/extras")
-async def api_save_profile_extra(profile_id: str, body: SkillFileBody):
-    """Create or update a sidecar .md file at the profile root."""
-    data = _load_roles()
-    if not _find_profile(profile_id, data):
-        return JSONResponse({"error": "Profile not found"}, status_code=404)
-    fname = _sanitize_skill_filename(body.name)
-    if not fname:
-        return JSONResponse({"error": "Invalid filename. Use alphanumeric, hyphens, underscores with .md extension."}, status_code=400)
-    if fname.lower() in _EXTRAS_RESERVED_NAMES:
-        return JSONResponse({"error": f"'{fname}' is reserved. Use the dedicated editor for it."}, status_code=400)
-    d = _profile_dir(profile_id)
-    d.mkdir(parents=True, exist_ok=True)
-    fpath = d / fname
-    if not str(fpath.resolve()).startswith(str(d.resolve())):
-        return JSONResponse({"error": "Invalid path"}, status_code=400)
-    try:
-        fpath.write_text(body.content)
-        return JSONResponse({"ok": True, "name": fname})
-    except Exception:
-        logger.exception("Failed to save profile extra")
-        return JSONResponse({"error": "Failed to save extra file"}, status_code=500)
-
-
-@app.delete("/api/profiles/{profile_id}/extras/{filename}")
-async def api_delete_profile_extra(profile_id: str, filename: str):
-    data = _load_roles()
-    if not _find_profile(profile_id, data):
-        return JSONResponse({"error": "Profile not found"}, status_code=404)
-    fname = _sanitize_skill_filename(filename)
-    if not fname:
-        return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    if fname.lower() in _EXTRAS_RESERVED_NAMES:
-        return JSONResponse({"error": "Reserved filename"}, status_code=400)
-    d = _profile_dir(profile_id)
-    fpath = d / fname
-    if not str(fpath.resolve()).startswith(str(d.resolve())):
-        return JSONResponse({"error": "Invalid path"}, status_code=400)
-    if fpath.exists():
-        try:
-            fpath.unlink()
-        except Exception:
-            logger.exception("Failed to delete profile extra")
-            return JSONResponse({"error": "Failed to delete extra file"}, status_code=500)
-    return JSONResponse({"ok": True})
+# Sidecar .md files at the profile root used to be creatable from the UI. They
+# were removed: a profile's persona belongs in its CLAUDE.md, and extra files
+# there were never referenced from it, so nothing ever read them.
 
 
 # --- Profile file browser (full ~/.claude-<id>/ contents) ---
@@ -11780,7 +11703,7 @@ body.member-simple .hide-in-simple{display:none!important}
       </div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openTeamWorkspace();closeToolsMenu()"><span class="icon">&#x1F465;</span> Team &amp; Workspace</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Global Files (CLAUDE.md + sidecars)</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Context Files</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
       <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
@@ -11851,21 +11774,21 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- CLAUDE.md editor overlay -->
+<!-- Context files overlay -->
 <div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
   <div class="claudemd-panel" id="claudemd-panel">
-    <h3>Global Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">Files in your home directory loaded by every Claude Code session. <code>CLAUDE.md</code> is loaded automatically; sidecar <code>CLAUDE_*.md</code> files (like <code>CLAUDE_API_KEYS.md</code>) are loaded on demand when referenced from <code>CLAUDE.md</code>.</div>
-    <label class="claudemd-label">CLAUDE.md</label>
-    <div class="claudemd-path" id="claudemd-path"></div>
-    <textarea class="claudemd-editor" id="claudemd-editor" spellcheck="false"></textarea>
+    <h3>Context Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
+    <div class="profiles-hint" style="margin-bottom:10px">
+      Every file Claude Code reads for context on this host. <b>Always loaded</b> files are injected into
+      each session's context window — keep them tight. <b>On demand</b> files cost nothing until
+      <code>CLAUDE.md</code> sends a session to them, so detail belongs there.
+      <span id="ctxfiles-budget"></span>
+    </div>
+    <div class="extras-section claudemd-extras" id="context-files">
+      <div class="extras-empty">Loading...</div>
+    </div>
     <div class="claudemd-actions">
       <button class="btn" onclick="closeClaudeMd()">Close</button>
-      <button class="btn btn-full" onclick="saveClaudeMd()">Save CLAUDE.md</button>
-    </div>
-    <label class="claudemd-label" style="margin-top:14px">Additional <code>CLAUDE_*.md</code> files in <code>~/</code></label>
-    <div class="extras-section claudemd-extras" id="global-extras">
-      <div class="extras-empty">Loading...</div>
     </div>
   </div>
 </div>
@@ -16109,7 +16032,6 @@ const _PROFILE_TABS = [
   {id:'agents',   label:'Agents'},
   {id:'commands', label:'Commands'},
   {id:'plugins',  label:'Plugins'},
-  {id:'extras',   label:'Extras'},
 ];
 
 function renderProfileEdit(){
@@ -16228,13 +16150,6 @@ function renderProfileEdit(){
       <div id="pf-plugins-list">Loading...</div>
     </div>
 
-    <div class="pf-section${_profileActiveTab==='extras'?' active':''}" id="pf-section-extras">
-      <div class="pf-banner">Sidecar markdown files at the profile root (e.g. <code>CLAUDE_API_KEYS.md</code>) referenced from CLAUDE.md.</div>
-      <div class="extras-section" id="ed-extras">
-        <div class="extras-empty">Loading...</div>
-      </div>
-    </div>
-
     <div class="profile-edit-actions">
       ${deleteBtn || '<span></span>'}
       <div style="display:flex;gap:8px">
@@ -16243,7 +16158,6 @@ function renderProfileEdit(){
       </div>
     </div>
   `;
-  loadProfileExtras(p.id);
   loadProfileSectionData(p.id, _profileActiveTab);
 }
 
@@ -16479,107 +16393,8 @@ async function loadProfilePluginsList(pid){
   }catch(e){ container.innerHTML='<div class="pf-empty">Failed to load</div>'; }
 }
 
-let _profileExtras = {profileId:'', files:[], editing:''};
-
-async function loadProfileExtras(profileId){
-  _profileExtras = {profileId, files:[], editing:''};
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId)+'/extras');
-    const data = await resp.json();
-    if(!resp.ok){ throw new Error(data.error||'load failed'); }
-    _profileExtras.files = data.files || [];
-  }catch(e){
-    _profileExtras.files = [];
-  }
-  renderProfileExtras();
-}
-
-function renderProfileExtras(){
-  const el = document.getElementById('ed-extras');
-  if(!el) return;
-  const files = _profileExtras.files || [];
-  let html = '';
-  if(!files.length){
-    html += '<div class="extras-empty">No extra files yet. Add one — e.g. <code>CLAUDE_API_KEYS.md</code> — and reference it from CLAUDE.md.</div>';
-  } else {
-    files.forEach(f => {
-      const isEditing = _profileExtras.editing === f.name;
-      html += `<div class="extras-row">
-        <span class="extras-name" onclick="toggleExtraEditor('${esc(f.name)}')">${esc(f.name)}</span>
-        <span class="extras-meta">${f.size} bytes</span>
-        <button class="extras-btn" onclick="toggleExtraEditor('${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
-        <button class="extras-del" onclick="deleteProfileExtra('${esc(f.name)}')" title="Delete">&times;</button>
-      </div>
-      <div class="extras-editor${isEditing?' active':''}" id="extras-editor-${esc(f.name)}">
-        <textarea spellcheck="false" data-extra-name="${esc(f.name)}">${esc(f.content||'')}</textarea>
-        <div style="display:flex;gap:6px;justify-content:flex-end">
-          <button class="extras-btn" onclick="saveProfileExtra('${esc(f.name)}')">Save changes</button>
-        </div>
-      </div>`;
-    });
-  }
-  html += `<div class="extras-actions">
-    <button class="extras-btn" onclick="addProfileExtra()">+ Add markdown file</button>
-  </div>`;
-  el.innerHTML = html;
-}
-
-function toggleExtraEditor(name){
-  _profileExtras.editing = (_profileExtras.editing === name) ? '' : name;
-  renderProfileExtras();
-}
-
-async function addProfileExtra(){
-  const raw = window.prompt('New filename (must end in .md):', 'CLAUDE_API_KEYS.md');
-  if(raw === null) return;
-  let name = (raw||'').trim();
-  if(!name) return;
-  if(!name.toLowerCase().endsWith('.md')) name += '.md';
-  if(['claude.md','memory.md'].includes(name.toLowerCase())){
-    alert("'"+name+"' has a dedicated editor above — pick a different name.");
-    return;
-  }
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, content: ''})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create file'); return; }
-    _profileExtras.editing = data.name;
-    await loadProfileExtras(_profileExtras.profileId);
-  }catch(e){ alert('Failed to create file.'); }
-}
-
-async function saveProfileExtra(name){
-  const ta = document.querySelector('textarea[data-extra-name="'+CSS.escape(name)+'"]');
-  if(!ta) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, content: ta.value})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
-    // Update in-memory copy without re-rendering (preserves cursor)
-    const f = (_profileExtras.files || []).find(x => x.name === name);
-    if(f){ f.content = ta.value; f.size = new Blob([ta.value]).size; }
-    // Visual flash
-    ta.style.borderColor = '#3fb950';
-    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
-  }catch(e){ alert('Failed to save.'); }
-}
-
-async function deleteProfileExtra(name){
-  if(!confirm('Delete '+name+'?')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(_profileExtras.profileId)+'/extras/'+encodeURIComponent(name), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    if(_profileExtras.editing === name) _profileExtras.editing = '';
-    await loadProfileExtras(_profileExtras.profileId);
-  }catch(e){ alert('Failed to delete.'); }
-}
+// Sidecar .md files at the profile root were removed from the UI: a profile's
+// persona belongs in its CLAUDE.md, and extra files there were never referenced.
 
 async function saveProfile(){
   const p = _profilesEditing;
@@ -16875,136 +16690,82 @@ async function deleteSessionMemoryExtra(name){
   }catch(e){ alert('Failed to delete.'); }
 }
 
-// ── CLAUDE.md Editor (global only) ──
-let _claudeMdGlobal={path:'',content:'',exists:false};
-let _globalExtras={files:[], editing:''};
+// ── Context Files editor ──
+// A fixed registry of the files Claude Code actually reads. Read/edit only —
+// creating new sidecar CLAUDE_*.md files was removed on purpose.
+let _ctxFiles={files:[], editing:''};
 
 async function openClaudeMd(){
-  const overlay=document.getElementById('claudemd-overlay');
-  overlay.classList.add('active');
-  document.getElementById('claudemd-editor').value='Loading...';
-  document.getElementById('claudemd-path').textContent='';
+  document.getElementById('claudemd-overlay').classList.add('active');
+  document.getElementById('context-files').innerHTML='<div class="extras-empty">Loading...</div>';
+  document.getElementById('ctxfiles-budget').textContent='';
+  await loadContextFiles();
+}
+
+async function loadContextFiles(){
   try{
-    const resp=await fetch(BASE+'/api/claude-md-global');
+    const resp=await fetch(BASE+'/api/context-files');
     const data=await resp.json();
-    _claudeMdGlobal=data;
-    document.getElementById('claudemd-editor').value=data.content||'';
-    document.getElementById('claudemd-path').textContent=data.path;
-  }catch(e){
-    document.getElementById('claudemd-editor').value='Error loading CLAUDE.md';
-  }
-  loadGlobalExtras();
-}
-
-async function loadGlobalExtras(){
-  _globalExtras = {files:[], editing:_globalExtras.editing||''};
-  try{
-    const resp = await fetch(BASE+'/api/global-extras');
-    const data = await resp.json();
     if(!resp.ok) throw new Error(data.error||'load failed');
-    _globalExtras.files = data.files || [];
+    _ctxFiles.files=data.files||[];
+    const kb=(data.auto_bytes/1024).toFixed(1), tok=Math.round(data.auto_bytes/4);
+    document.getElementById('ctxfiles-budget').innerHTML=
+      ' Always-loaded total: <b>'+kb+' KB</b> (~'+tok.toLocaleString()+' tokens per session).';
   }catch(e){
-    _globalExtras.files = [];
+    _ctxFiles.files=[];
+    document.getElementById('context-files').innerHTML='<div class="extras-empty">Failed to load context files.</div>';
+    return;
   }
-  renderGlobalExtras();
+  renderContextFiles();
 }
 
-function renderGlobalExtras(){
-  const el = document.getElementById('global-extras');
+function renderContextFiles(){
+  const el=document.getElementById('context-files');
   if(!el) return;
-  const files = _globalExtras.files || [];
-  let html = '';
-  if(!files.length){
-    html += '<div class="extras-empty">No additional files. Add e.g. <code>CLAUDE_API_KEYS.md</code> and reference it from <code>CLAUDE.md</code>.</div>';
-  } else {
-    files.forEach(f => {
-      const isEditing = _globalExtras.editing === f.name;
-      html += `<div class="extras-row">
-        <span class="extras-name" onclick="toggleGlobalExtra('${esc(f.name)}')">${esc(f.name)}</span>
-        <span class="extras-meta">${f.size} bytes</span>
-        <button class="extras-btn" onclick="toggleGlobalExtra('${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
-        <button class="extras-del" onclick="deleteGlobalExtra('${esc(f.name)}')" title="Delete">&times;</button>
-      </div>
-      <div class="extras-editor${isEditing?' active':''}">
-        <textarea spellcheck="false" data-global-extra="${esc(f.name)}">${esc(f.content||'')}</textarea>
-        <div style="display:flex;gap:6px;justify-content:flex-end">
-          <button class="extras-btn" onclick="saveGlobalExtra('${esc(f.name)}')">Save changes</button>
-        </div>
-      </div>`;
-    });
-  }
-  html += `<div class="extras-actions">
-    <button class="extras-btn" onclick="addGlobalExtra()">+ Add CLAUDE_*.md file</button>
-  </div>`;
-  el.innerHTML = html;
+  const files=_ctxFiles.files||[];
+  if(!files.length){ el.innerHTML='<div class="extras-empty">No context files found.</div>'; return; }
+  el.innerHTML=files.map(f=>{
+    const isEditing=_ctxFiles.editing===f.id;
+    const auto=f.load==='auto';
+    const badge='<span style="font-size:.62rem;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:3px;color:#fff;background:'
+      +(auto?'#d29922':'#1f6feb')+'">'+(auto?'ALWAYS':'ON DEMAND')+'</span>';
+    const lock=f.secret?' <span title="contains secrets" style="color:#f0883e">&#128274;</span>':'';
+    return '<div class="extras-row">'
+      + badge
+      + '<span class="extras-name" onclick="toggleContextFile(\''+esc(f.id)+'\')">'+esc(f.name)+lock+'</span>'
+      + '<span class="extras-meta">'+f.size+' B &middot; ~'+Math.round(f.size/4)+' tok</span>'
+      + '<button class="extras-btn" onclick="toggleContextFile(\''+esc(f.id)+'\')">'+(isEditing?'Hide':'Edit')+'</button>'
+      + '</div>'
+      + '<div class="extras-row" style="border:none;padding:0 0 4px 0"><span class="extras-meta" style="flex:1">'
+      + esc(f.path)+' — '+esc(f.note)+'</span></div>'
+      + '<div class="extras-editor'+(isEditing?' active':'')+'">'
+      + '<textarea spellcheck="false" data-ctx-file="'+esc(f.id)+'">'+esc(f.content||'')+'</textarea>'
+      + '<div style="display:flex;gap:6px;justify-content:flex-end">'
+      + '<button class="extras-btn" onclick="saveContextFile(\''+esc(f.id)+'\')">Save changes</button>'
+      + '</div></div>';
+  }).join('');
 }
 
-function toggleGlobalExtra(name){
-  _globalExtras.editing = (_globalExtras.editing === name) ? '' : name;
-  renderGlobalExtras();
+function toggleContextFile(id){
+  _ctxFiles.editing=(_ctxFiles.editing===id)?'':id;
+  renderContextFiles();
 }
 
-async function addGlobalExtra(){
-  const raw = window.prompt('New filename (must start with CLAUDE_ and end in .md):', 'CLAUDE_GITHUB_RULES.md');
-  if(raw === null) return;
-  let name = (raw||'').trim();
-  if(!name) return;
-  if(!name.toLowerCase().endsWith('.md')) name += '.md';
-  if(name.toUpperCase()==='CLAUDE.MD'){ alert('CLAUDE.md has a dedicated editor above.'); return; }
-  try{
-    const resp = await fetch(BASE+'/api/global-extras', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, content: ''})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create file'); return; }
-    _globalExtras.editing = data.name;
-    await loadGlobalExtras();
-  }catch(e){ alert('Failed to create file.'); }
-}
-
-async function saveGlobalExtra(name){
-  const ta = document.querySelector('textarea[data-global-extra="'+CSS.escape(name)+'"]');
+async function saveContextFile(id){
+  const ta=document.querySelector('textarea[data-ctx-file="'+CSS.escape(id)+'"]');
   if(!ta) return;
   try{
-    const resp = await fetch(BASE+'/api/global-extras', {
+    const resp=await fetch(BASE+'/api/context-files',{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, content: ta.value})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
-    const f = (_globalExtras.files || []).find(x => x.name === name);
-    if(f){ f.content = ta.value; f.size = new Blob([ta.value]).size; }
-    ta.style.borderColor = '#3fb950';
-    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
-  }catch(e){ alert('Failed to save.'); }
-}
-
-async function deleteGlobalExtra(name){
-  if(!confirm('Delete '+name+'?')) return;
-  try{
-    const resp = await fetch(BASE+'/api/global-extras/'+encodeURIComponent(name), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    if(_globalExtras.editing === name) _globalExtras.editing = '';
-    await loadGlobalExtras();
-  }catch(e){ alert('Failed to delete.'); }
-}
-
-async function saveClaudeMd(){
-  const content=document.getElementById('claudemd-editor').value;
-  try{
-    const resp=await fetch(BASE+'/api/claude-md-global',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path:_claudeMdGlobal.path,content})
+      body:JSON.stringify({name:id, content:ta.value})
     });
     const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to save');return}
-    _claudeMdGlobal.content=content;
-    _claudeMdGlobal.exists=true;
-    closeClaudeMd();
-  }catch(e){alert('Failed to save CLAUDE.md')}
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    const f=(_ctxFiles.files||[]).find(x=>x.id===id);
+    if(f){ f.content=ta.value; f.size=data.size; }
+    ta.style.borderColor='#3fb950';
+    setTimeout(()=>{ta.style.borderColor='';},600);
+  }catch(e){ alert('Failed to save.'); }
 }
 
 function closeClaudeMd(){
