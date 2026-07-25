@@ -24,11 +24,13 @@ import glob as globmod
 logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
+from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
 from pydantic import BaseModel
 import openai
 import uvicorn
+import httpx
+import websockets
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
@@ -39,19 +41,222 @@ NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claud
 # flag at launch so the default can't drift when Claude Code persists a /model
 # choice — or a new release's auto-default — into ~/.claude/settings.json (that
 # drift is how default sessions silently became Sonnet 4.6, then Fable 5).
-DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-4-8[1m]")
+DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
 
-# Models offered in the session header dropdown (keep in sync with
-# MODEL_CHOICES in the frontend JS).
-ALLOWED_SESSION_MODELS = [
-    "claude-opus-4-8[1m]",
-    "claude-opus-4-8",
-    "claude-fable-5[1m]",
-    "claude-fable-5",
-    "claude-sonnet-4-6[1m]",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
+# --- Model catalog (session header dropdown) --------------------------------
+# The models offered in the per-session dropdown. Seeded with the current
+# line-up and then AUTO-GROWN: a once-per-24h background check (below) queries
+# the Anthropic /v1/models API and appends any newly-released model family or
+# generation (e.g. a future Opus 6) so the dropdown picks up new models without
+# a redeploy. Persisted to models.json; the backend validation allowlist
+# (ALLOWED_SESSION_MODELS) and the frontend dropdown both derive from it.
+MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+# Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
+_ONE_M_FAMILIES = ("opus", "sonnet", "fable")
+_SEED_MODEL_CATALOG = [
+    ["claude-opus-5[1m]", "Opus 5 · 1M"],
+    ["claude-opus-5", "Opus 5"],
+    ["claude-sonnet-5[1m]", "Sonnet 5 · 1M"],
+    ["claude-sonnet-5", "Sonnet 5"],
+    ["claude-opus-4-8[1m]", "Opus 4.8 · 1M"],
+    ["claude-opus-4-8", "Opus 4.8"],
+    ["claude-fable-5[1m]", "Fable 5 · 1M"],
+    ["claude-fable-5", "Fable 5"],
+    ["claude-sonnet-4-6[1m]", "Sonnet 4.6 · 1M"],
+    ["claude-sonnet-4-6", "Sonnet 4.6"],
+    ["claude-haiku-4-5", "Haiku 4.5"],
 ]
+
+
+def _model_base_id(model_id: str) -> str:
+    """Strip the '[1m]' 1M-context suffix to get the bare model id."""
+    return model_id[:-4] if model_id.endswith("[1m]") else model_id
+
+
+def _normalize_model_alias(model_id: str) -> str:
+    """Map an API model id to its Claude Code CLI alias by dropping a trailing
+    -YYYYMMDD date (claude-haiku-4-5-20251001 -> claude-haiku-4-5)."""
+    return re.sub(r"-\d{8}$", "", model_id)
+
+
+def _model_family_ver(alias: str):
+    """(family, version_tuple) for a bare alias, else None.
+    claude-opus-4-8 -> ('opus', (4, 8)); claude-opus-5 -> ('opus', (5,))."""
+    m = re.match(r"^claude-(" + "|".join(_MODEL_FAMILIES) + r")-([0-9]+(?:-[0-9]+)*)$", alias)
+    if not m:
+        return None
+    return m.group(1), tuple(int(x) for x in m.group(2).split("-"))
+
+
+def _model_label(alias: str) -> str:
+    """Friendly dropdown label for a bare alias. claude-opus-5 -> 'Opus 5'."""
+    fv = _model_family_ver(alias)
+    if not fv:
+        return alias
+    fam, ver = fv
+    return fam.capitalize() + " " + ".".join(str(x) for x in ver)
+
+
+def _catalog_row(model_id: str) -> list:
+    """Build a [id, label] row, appending ' · 1M' for [1m] ids."""
+    base = _model_base_id(model_id)
+    return [model_id, _model_label(base) + (" · 1M" if model_id.endswith("[1m]") else "")]
+
+
+def _merge_new_models(catalog: list, api_ids: list) -> list:
+    """Prepend any genuinely-NEW model — a higher generation than we already list
+    for its family, or a brand-new family — newest-first. Existing/older ids are
+    never re-added, so the dropdown doesn't fill up with legacy dated models."""
+    present = {row[0] for row in catalog}
+    known_max = {}
+    for row in catalog:
+        fv = _model_family_ver(_model_base_id(row[0]))
+        if fv:
+            fam, ver = fv
+            if ver > known_max.get(fam, ()):
+                known_max[fam] = ver
+    additions = {}  # family -> newest new version tuple
+    for mid in api_ids:
+        fv = _model_family_ver(_normalize_model_alias(mid))
+        if not fv:
+            continue
+        fam, ver = fv
+        if (fam not in known_max or ver > known_max[fam]) and ver > additions.get(fam, ()):
+            additions[fam] = ver
+    if not additions:
+        return catalog
+    new_rows = []
+    for fam, ver in sorted(additions.items(), key=lambda kv: kv[1], reverse=True):
+        alias = "claude-" + fam + "-" + "-".join(str(x) for x in ver)
+        if fam in _ONE_M_FAMILIES and (alias + "[1m]") not in present:
+            new_rows.append(_catalog_row(alias + "[1m]"))
+        if alias not in present:
+            new_rows.append(_catalog_row(alias))
+    if new_rows:
+        logger.info("Model auto-detect: added %s", [r[0] for r in new_rows])
+    return new_rows + catalog
+
+
+def _load_model_catalog() -> list:
+    """Load the persisted catalog, or seed it. Always returns a non-empty list."""
+    try:
+        if MODELS_FILE.exists():
+            data = json.loads(MODELS_FILE.read_text())
+            rows = data.get("models") if isinstance(data, dict) else data
+            rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
+            if rows:
+                return rows
+    except Exception:
+        logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
+    return [list(r) for r in _SEED_MODEL_CATALOG]
+
+
+def _save_model_catalog(catalog: list, last_check: float = 0.0):
+    try:
+        MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MODELS_FILE.write_text(json.dumps({"models": catalog, "last_check": last_check}, indent=2))
+    except Exception:
+        logger.debug("Failed to save %s", MODELS_FILE, exc_info=True)
+
+
+MODEL_CATALOG = _load_model_catalog()
+# Backend allowlist for /api/sessions/{name}/model validation (ids only).
+ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+# The configured default must always be selectable.
+for _dm in (DEFAULT_MODEL, _model_base_id(DEFAULT_MODEL)):
+    if _dm and _dm not in ALLOWED_SESSION_MODELS:
+        MODEL_CATALOG.insert(0, _catalog_row(_dm))
+        ALLOWED_SESSION_MODELS.insert(0, _dm)
+
+
+def _anthropic_api_key() -> str:
+    """A usable Anthropic API key for the model-catalog check: env first, then
+    the API registry, then ~/CLAUDE_API_KEYS.md."""
+    k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if k.startswith("sk-ant-"):
+        return k
+    try:
+        reg = json.loads((Path.home() / ".tmux-dashboard" / "api_registry.json").read_text())
+        items = reg if isinstance(reg, list) else (reg.get("apis") or reg.get("keys") or [])
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            prov = (it.get("provider") or it.get("name") or "").lower()
+            if "anthropic" in prov or "claude" in prov:
+                key = (it.get("key") or it.get("api_key") or "").strip()
+                if key.startswith("sk-ant-"):
+                    return key
+    except Exception:
+        logger.debug("No anthropic key in api_registry", exc_info=True)
+    try:
+        m = re.search(r"sk-ant-[A-Za-z0-9_-]{20,}", (Path.home() / "CLAUDE_API_KEYS.md").read_text())
+        if m:
+            return m.group(0)
+    except Exception:
+        logger.debug("No anthropic key in CLAUDE_API_KEYS.md", exc_info=True)
+    return ""
+
+
+def _fetch_anthropic_model_ids() -> list:
+    """GET /v1/models -> list of model-id strings (blocking; run in a thread)."""
+    import urllib.request
+    key = _anthropic_api_key()
+    if not key:
+        return []
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=1000",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+
+
+MODEL_CHECK_INTERVAL = 24 * 3600  # once per 24h
+
+
+async def _refresh_model_catalog(force: bool = False) -> bool:
+    """If due (>=24h since last check) or forced, query the Anthropic models API
+    and merge any newly-released models into the catalog. Returns True on change."""
+    global MODEL_CATALOG, ALLOWED_SESSION_MODELS
+    try:
+        last = 0.0
+        try:
+            if MODELS_FILE.exists():
+                last = float(json.loads(MODELS_FILE.read_text()).get("last_check", 0))
+        except Exception:
+            last = 0.0
+        now = time.time()
+        if not force and now - last < MODEL_CHECK_INTERVAL:
+            return False
+        api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
+        if not api_ids:
+            # Couldn't reach the API — don't stamp last_check, so we retry sooner.
+            logger.info("Model auto-detect: no models returned (auth/network?) — will retry")
+            return False
+        merged = _merge_new_models([list(r) for r in MODEL_CATALOG], api_ids)
+        changed = [r[0] for r in merged] != [r[0] for r in MODEL_CATALOG]
+        MODEL_CATALOG = merged
+        ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+        _save_model_catalog(MODEL_CATALOG, now)
+        return changed
+    except Exception:
+        logger.debug("Model catalog refresh failed", exc_info=True)
+        return False
+
+
+async def _model_refresh_loop():
+    """Background: keep the model dropdown current. Re-checks hourly whether a
+    24h refresh is due, so a long-lived process still picks up new models daily."""
+    await asyncio.sleep(20)  # let startup settle
+    while True:
+        try:
+            if await _refresh_model_catalog():
+                logger.info("Model catalog updated: %s", [r[0] for r in MODEL_CATALOG])
+        except Exception:
+            logger.debug("model refresh loop iteration failed", exc_info=True)
+        await asyncio.sleep(3600)
 
 
 def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
@@ -63,7 +268,7 @@ def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
     out = cmd
     if pin_model and DEFAULT_MODEL and "claude" in cmd and "--model" not in cmd:
         out = f"{cmd} --model {shlex.quote(DEFAULT_MODEL)}"
-    return "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; " + out
+    return _claude_launch_env_prefix() + out
 
 
 def _restore_default_model_setting():
@@ -133,6 +338,44 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
 _stored_anthropic_key: str = ""
+
+# --- Long-lived (non-rotating) Claude auth token ----------------------------
+# A token minted with `claude setup-token` (subscription-backed, ~1yr, does NOT
+# rotate). When present we export it as CLAUDE_CODE_OAUTH_TOKEN into every
+# launched session so they all authenticate with the SAME static token instead
+# of sharing the rotating ~/.claude/.credentials.json — whose refresh-token
+# rotation across concurrent sessions is what caused intermittent
+# "401 OAuth access token has been revoked" and headless /login hangs. Billing
+# still runs on the plan (ANTHROPIC_API_KEY stays unset). Delete the file to
+# revert to the previous behavior.
+LONGLIVED_TOKEN_FILE = MESSAGES_DIR / "claude_oauth_token"
+
+
+def _load_longlived_token() -> str:
+    """Read the stored long-lived token (fresh each call so edits apply at once)."""
+    try:
+        if LONGLIVED_TOKEN_FILE.exists():
+            return LONGLIVED_TOKEN_FILE.read_text().strip()
+    except Exception:
+        logger.debug("Failed to read long-lived token", exc_info=True)
+    return ""
+
+
+def _save_longlived_token(token: str):
+    MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+    LONGLIVED_TOKEN_FILE.write_text(token.strip())
+    LONGLIVED_TOKEN_FILE.chmod(0o600)
+
+
+def _claude_launch_env_prefix() -> str:
+    """Shell env prefix for launching `claude`. Exports a stored long-lived token
+    when present (so sessions stop rotating the shared credential and never get
+    revoked); otherwise falls back to unsetting both auth vars. ANTHROPIC_API_KEY
+    is always unset so inference stays on the plan, never the metered API."""
+    tok = _load_longlived_token()
+    if tok:
+        return "export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok) + "; unset ANTHROPIC_API_KEY; "
+    return "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
 
 
 def _load_anthropic_key() -> str:
@@ -325,7 +568,7 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
         # Relaunch Claude on the bare shell, resuming the prior conversation.
         resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
-        launch = ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
+        launch = (_claude_launch_env_prefix() +
                   "NODE_OPTIONS=--max-old-space-size=8192 "
                   f"claude --dangerously-skip-permissions {resume_flag}"
                   f"{_model_flag_for_relaunch(session_name)}")
@@ -416,6 +659,10 @@ async def lifespan(_app: FastAPI):
     crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
     _background_tasks.append(crash_recovery_task)
     logger.info("Crash-recovery watchdog started")
+
+    model_refresh_task = asyncio.create_task(_model_refresh_loop())
+    _background_tasks.append(model_refresh_task)
+    logger.info("Model auto-detect started (default=%s, %d models)", DEFAULT_MODEL, len(MODEL_CATALOG))
 
     yield  # Application is running
 
@@ -7990,6 +8237,485 @@ async def api_login_health():
     return JSONResponse(data)
 
 
+# --- Long-lived login token (never-revoke auth) -----------------------------
+# Endpoints to mint / store / clear the non-rotating `claude setup-token`. The
+# interactive flow drives `claude setup-token` in a tracked tmux session: it
+# returns the authorize URL (which the admin opens in THEIR OWN browser, since
+# this GCP box is Cloudflare-blocked from claude.ai), then accepts the pasted
+# code and captures the resulting token.
+_OAT_RE = re.compile(r"sk-ant-oat[0-9A-Za-z._-]{20,}")
+_AUTH_SETUP_TMUX = "_authsetup"
+_LL_META_FILE = MESSAGES_DIR / "claude_oauth_token.meta.json"
+
+
+def _auth_status_dict() -> dict:
+    now_ms = int(time.time() * 1000)
+    try:
+        o = json.loads((Path.home() / ".claude" / ".credentials.json").read_text()).get("claudeAiOauth", {})
+        plan = {"present": bool(o), "valid": int(o.get("expiresAt") or 0) > now_ms,
+                "expiresAt": int(o.get("expiresAt") or 0), "subscriptionType": o.get("subscriptionType", "")}
+    except Exception:
+        plan = {"present": False, "valid": False, "expiresAt": 0, "subscriptionType": ""}
+    tok = _load_longlived_token()
+    meta = {}
+    try:
+        if _LL_META_FILE.exists():
+            meta = json.loads(_LL_META_FILE.read_text())
+    except Exception:
+        meta = {}
+    return {
+        "longlived": {"present": bool(tok), "prefix": (tok[:14] + "…") if tok else "",
+                      "saved_at": meta.get("saved_at", 0)},
+        "plan": plan,
+        "injecting": bool(tok),
+    }
+
+
+def _auth_admin_ok(request: Request) -> bool:
+    user = _current_user(request)
+    return not TEAM_MODE or bool(user and _is_admin(user))
+
+
+class TokenBody(BaseModel):
+    token: str
+
+
+class CodeBody(BaseModel):
+    code: str
+
+
+@app.get("/api/auth/status")
+async def api_auth_status(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    return JSONResponse(_auth_status_dict())
+
+
+@app.post("/api/auth/token")
+async def api_auth_set_token(body: TokenBody, request: Request):
+    """Store a long-lived token the admin already minted (paste-in path)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    tok = (body.token or "").strip()
+    if not tok.startswith("sk-ant-oat"):
+        return JSONResponse({"error": "That doesn't look like a setup-token (expected sk-ant-oat…)."}, status_code=400)
+    try:
+        _save_longlived_token(tok)
+        _LL_META_FILE.write_text(json.dumps({"saved_at": time.time()}))
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to store token: {e}"}, status_code=500)
+    logger.info("Long-lived Claude token stored (%d chars); sessions inject it on next launch", len(tok))
+    return JSONResponse({"ok": True, "status": _auth_status_dict()})
+
+
+@app.delete("/api/auth/token")
+async def api_auth_clear_token(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    try:
+        if LONGLIVED_TOKEN_FILE.exists():
+            LONGLIVED_TOKEN_FILE.unlink()
+        if _LL_META_FILE.exists():
+            _LL_META_FILE.unlink()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    logger.info("Long-lived Claude token cleared; sessions revert to the shared plan credential")
+    return JSONResponse({"ok": True, "status": _auth_status_dict()})
+
+
+def _authsetup_capture() -> str:
+    try:
+        return subprocess.run(["tmux", "capture-pane", "-t", _AUTH_SETUP_TMUX, "-p", "-J"],
+                              capture_output=True, text=True, timeout=5).stdout or ""
+    except Exception:
+        return ""
+
+
+@app.post("/api/auth/setup/start")
+async def api_auth_setup_start(request: Request):
+    """Start `claude setup-token` in a tracked tmux session; return the authorize
+    URL for the admin to approve in their own browser."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+
+    def _start():
+        subprocess.run(["tmux", "kill-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True)
+        # Wide window so the long authorize URL never wraps in the capture.
+        subprocess.run(["tmux", "new-session", "-d", "-s", _AUTH_SETUP_TMUX, "-x", "520", "-y", "50"],
+                       capture_output=True, text=True, timeout=10)
+        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "-l",
+                        "unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; claude setup-token"],
+                       capture_output=True, text=True, timeout=10)
+        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "Enter"],
+                       capture_output=True, text=True, timeout=10)
+
+    await asyncio.to_thread(_start)
+    url = ""
+    for _ in range(25):
+        await asyncio.sleep(1)
+        pane = await asyncio.to_thread(_authsetup_capture)
+        m = re.search(r"https://claude\.(?:ai|com)/[^\s]*oauth/authorize\S+", pane)
+        if not m:
+            m = re.search(r"https://claude\.(?:ai|com)/cai/oauth/authorize\S+state=[A-Za-z0-9_-]+",
+                          pane.replace("\n", ""))
+        if m:
+            url = m.group(0)
+            break
+    if not url:
+        return JSONResponse({"error": "Could not read the authorize URL — try again."}, status_code=504)
+    return JSONResponse({"ok": True, "url": url})
+
+
+@app.post("/api/auth/setup/submit")
+async def api_auth_setup_submit(body: CodeBody, request: Request):
+    """Feed the approval code back to the waiting `claude setup-token` process and
+    capture + store the minted long-lived token."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    code = (body.code or "").strip()
+    if not code:
+        return JSONResponse({"error": "No code provided."}, status_code=400)
+    alive = await asyncio.to_thread(lambda: subprocess.run(
+        ["tmux", "has-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True).returncode)
+    if alive != 0:
+        return JSONResponse({"error": "The setup session expired — start again."}, status_code=409)
+
+    def _submit():
+        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "-l", code],
+                       capture_output=True, text=True, timeout=10)
+        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "Enter"],
+                       capture_output=True, text=True, timeout=10)
+
+    await asyncio.to_thread(_submit)
+    token = ""
+    for _ in range(25):
+        await asyncio.sleep(1)
+        pane = await asyncio.to_thread(_authsetup_capture)
+        m = _OAT_RE.search(pane) or _OAT_RE.search(pane.replace("\n", ""))
+        if m:
+            token = m.group(0)
+            break
+        low = pane.lower()
+        if ("invalid" in low or "error" in low) and "code" in low:
+            return JSONResponse({"error": "Claude rejected the code — start again and re-approve."}, status_code=400)
+    if not token:
+        return JSONResponse({"error": "Didn't capture a token (the code may have expired). Start again."}, status_code=504)
+    try:
+        _save_longlived_token(token)
+        _LL_META_FILE.write_text(json.dumps({"saved_at": time.time()}))
+    finally:
+        await asyncio.to_thread(lambda: subprocess.run(
+            ["tmux", "kill-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True))
+    logger.info("Long-lived Claude token minted via setup-token flow and stored")
+    return JSONResponse({"ok": True, "status": _auth_status_dict()})
+
+
+# ============================ Browser sessions ==============================
+# Manage one or more independent "Claude browser" backends (each its own Xvfb
+# display + x11vnc + websockify + headful Chrome/CDP) and expose their noVNC
+# viewers SAME-ORIGIN through this dashboard, so extra sessions are reachable
+# without touching the builder's nginx. The DEFAULT session is the pre-existing
+# systemd browser on display :99 / port 6080 (also public at rotem.ai/browsertool).
+BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
+BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
+BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+
+# The launcher is self-bootstrapped (write-if-missing) so the feature is portable
+# and doesn't depend on a hand-placed file. Mirrors the pre-existing default
+# browser's start scripts, parameterized per session (display/ports/profile).
+_BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
+# Parameterized EXTRA "Claude browser" session — a second/third independent
+# browser alongside the default one (display :99). Each gets its OWN Xvfb
+# display, fluxbox, x11vnc, websockify (localhost — reached via the tmux-dashboard
+# reverse proxy) and a persistent headful Chrome with its own CDP + profile.
+#   start:  browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport>
+#   stop:   browser-session.sh stop  <id>
+set -uo pipefail
+export HOME=/home/nimrod_rotem
+ACTION="${1:-}"; ID="${2:-}"
+[ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop <id> ..."; exit 2; }
+BASE="$HOME/.claude-browser/sessions/$ID"
+LOGS="$BASE/logs"; PROFILE="$BASE/profile"; PIDS="$BASE/pids"
+
+if [ "$ACTION" = "stop" ]; then
+  if [ -f "$PIDS" ]; then
+    while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$PIDS"
+    sleep 1
+    while read -r p; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done < "$PIDS"
+  fi
+  pkill -f "\.claude-browser/sessions/$ID/" 2>/dev/null || true
+  rm -f "$PIDS"
+  echo "stopped session $ID"
+  exit 0
+fi
+
+DISP="${3:?display}"; RFB="${4:?rfbport}"; VNC="${5:?vncport}"; CDP="${6:?cdpport}"
+mkdir -p "$LOGS" "$PROFILE"
+export DISPLAY=":$DISP"
+: > "$PIDS"
+rm -f "/tmp/.X${DISP}-lock" 2>/dev/null || true
+
+Xvfb ":$DISP" -screen 0 1600x900x24 -nolisten tcp -ac >"$LOGS/xvfb.log" 2>&1 & echo $! >> "$PIDS"
+for i in $(seq 1 50); do [ -S "/tmp/.X11-unix/X${DISP}" ] && break; sleep 0.2; done
+fluxbox >"$LOGS/fluxbox.log" 2>&1 & echo $! >> "$PIDS"
+
+x11vnc -display ":$DISP" -localhost -rfbport "$RFB" -nopw -forever -shared -noxdamage \
+  >"$LOGS/x11vnc.log" 2>&1 & echo $! >> "$PIDS"
+websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
+  >"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
+
+dbus-run-session -- google-chrome-stable \
+  --user-data-dir="$PROFILE" \
+  --remote-debugging-port="$CDP" \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --no-first-run --no-default-browser-check --no-sandbox \
+  --password-store=basic --disable-gpu --disable-dev-shm-usage \
+  --disable-features=Translate \
+  --window-position=0,0 --window-size=1600,900 --start-maximized \
+  "about:blank" >"$LOGS/chrome.log" 2>&1 & echo $! >> "$PIDS"
+
+echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
+'''
+
+
+def _ensure_browser_launcher():
+    """Write the launcher script if it's missing, so the feature is self-contained."""
+    p = Path(BROWSER_LAUNCHER)
+    try:
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_BROWSER_LAUNCHER_SCRIPT)
+            p.chmod(0o755)
+    except Exception:
+        logger.debug("Failed to write browser launcher", exc_info=True)
+_DEFAULT_BROWSER_SESSION = {
+    "id": "default", "name": "Main browser", "slot": 0, "display": 99,
+    "rfb_port": 5900, "vnc_port": 6080, "cdp_port": 9222, "managed": False,
+    "external_url": "https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify&autoconnect=true&resize=scale",
+}
+
+
+def _load_browser_sessions() -> list:
+    try:
+        if BROWSER_SESSIONS_FILE.exists():
+            d = json.loads(BROWSER_SESSIONS_FILE.read_text())
+            sessions = d.get("sessions") if isinstance(d, dict) else d
+            if isinstance(sessions, list):
+                if not any(s.get("id") == "default" for s in sessions):
+                    sessions = [dict(_DEFAULT_BROWSER_SESSION)] + sessions
+                return sessions
+    except Exception:
+        logger.debug("Failed to load browser sessions", exc_info=True)
+    return [dict(_DEFAULT_BROWSER_SESSION)]
+
+
+def _save_browser_sessions(sessions: list):
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        BROWSER_SESSIONS_FILE.write_text(json.dumps({"sessions": sessions}, indent=2))
+    except Exception:
+        logger.debug("Failed to save browser sessions", exc_info=True)
+
+
+def _browser_session_by_id(sid: str) -> dict:
+    for s in _load_browser_sessions():
+        if s.get("id") == sid:
+            return s
+    return {}
+
+
+def _browser_port_alive(port: int) -> bool:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            return s.connect_ex(("127.0.0.1", int(port))) == 0
+    except Exception:
+        return False
+
+
+def _next_browser_slot(sessions: list) -> int:
+    used = {int(s.get("slot", 0)) for s in sessions}
+    k = 1
+    while k in used:
+        k += 1
+    return k
+
+
+def _browser_viewer_url(s: dict) -> str:
+    """Same-origin noVNC URL for a session, proxied by this dashboard. The `path`
+    param is host-absolute (incl. ROOT_PATH) so noVNC connects the websocket back
+    through the /browser/<id>/websockify proxy route."""
+    sid = s.get("id")
+    root = ROOT_PATH.strip("/")
+    wspath = (root + "/" if root else "") + f"browser/{sid}/websockify"
+    return f"{ROOT_PATH}/browser/{sid}/vnc.html?path={wspath}&autoconnect=true&resize=scale"
+
+
+class BrowserCreateBody(BaseModel):
+    name: str = ""
+
+
+@app.get("/api/browser/sessions")
+async def api_browser_sessions(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    sessions = _load_browser_sessions()
+    out = []
+    for s in sessions:
+        row = dict(s)
+        row["running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        row["viewer_url"] = _browser_viewer_url(s)
+        out.append(row)
+    extra = sum(1 for s in sessions if s.get("managed"))
+    return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
+                         "extra_count": extra, "root_path": ROOT_PATH})
+
+
+@app.post("/api/browser/sessions")
+async def api_browser_create(body: BrowserCreateBody, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    sessions = _load_browser_sessions()
+    if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
+        return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
+    slot = _next_browser_slot(sessions)
+    sid = "s%d" % slot
+    disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
+    name = (body.name or "").strip() or f"Browser {slot + 1}"
+    _ensure_browser_launcher()
+
+    def _spawn():
+        subprocess.Popen(
+            ["setsid", "bash", BROWSER_LAUNCHER, "start", sid,
+             str(disp), str(rfb), str(vnc), str(cdp)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    await asyncio.to_thread(_spawn)
+    ok = False
+    for _ in range(25):
+        await asyncio.sleep(1)
+        if await asyncio.to_thread(_browser_port_alive, vnc):
+            ok = True
+            break
+    entry = {"id": sid, "name": name, "slot": slot, "display": disp, "rfb_port": rfb,
+             "vnc_port": vnc, "cdp_port": cdp, "managed": True, "created_at": time.time()}
+    sessions.append(entry)
+    _save_browser_sessions(sessions)
+    row = dict(entry)
+    row["running"] = ok
+    row["viewer_url"] = _browser_viewer_url(entry)
+    logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
+                sid, disp, vnc, cdp, ok)
+    return JSONResponse({"ok": True, "session": row, "started": ok})
+
+
+@app.delete("/api/browser/sessions/{sid}")
+async def api_browser_delete(sid: str, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    sessions = _load_browser_sessions()
+    target = next((s for s in sessions if s.get("id") == sid), None)
+    if not target:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not target.get("managed"):
+        return JSONResponse({"error": "The default browser is managed by systemd and can't be removed here."},
+                            status_code=400)
+
+    def _stop():
+        subprocess.run(["bash", BROWSER_LAUNCHER, "stop", sid],
+                       capture_output=True, text=True, timeout=30)
+
+    await asyncio.to_thread(_stop)
+    _save_browser_sessions([s for s in sessions if s.get("id") != sid])
+    logger.info("Browser session '%s' stopped and removed", sid)
+    return JSONResponse({"ok": True})
+
+
+@app.websocket("/browser/{sid}/websockify")
+async def browser_proxy_ws(ws: WebSocket, sid: str):
+    """Reverse-proxy the noVNC WebSocket to the session's local websockify. The
+    HTTP auth middleware doesn't run for websockets, so re-check the cookie here."""
+    if AUTH_PASS and not _check_token(ws.cookies.get("tmux_auth")):
+        await ws.close(code=1008)
+        return
+    s = _browser_session_by_id(sid)
+    if not s:
+        await ws.close(code=1011)
+        return
+    port = int(s.get("vnc_port") or 0)
+    offered = ws.scope.get("subprotocols") or []
+    accept_sub = "binary" if "binary" in offered else None
+    await ws.accept(subprotocol=accept_sub)
+    try:
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}/websockify",
+            subprotocols=["binary"], max_size=None, ping_interval=None,
+        ) as up:
+            async def c2u():
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            break
+                        if msg.get("bytes") is not None:
+                            await up.send(msg["bytes"])
+                        elif msg.get("text") is not None:
+                            await up.send(msg["text"])
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        await up.close()
+                    except Exception:
+                        pass
+
+            async def u2c():
+                try:
+                    async for message in up:
+                        if isinstance(message, (bytes, bytearray)):
+                            await ws.send_bytes(bytes(message))
+                        else:
+                            await ws.send_text(message)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+
+            await asyncio.gather(c2u(), u2c())
+    except Exception as e:
+        logger.debug("browser ws proxy error for %s: %s", sid, e)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
+async def browser_proxy_http(sid: str, path: str, request: Request):
+    """Reverse-proxy noVNC static assets (vnc.html + app/core/vendor) to the
+    session's local websockify, so the viewer is same-origin with the dashboard."""
+    s = _browser_session_by_id(sid)
+    if not s:
+        return Response("unknown browser session", status_code=404)
+    port = int(s.get("vnc_port") or 0)
+    target = f"http://127.0.0.1:{port}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            up = await c.request(request.method, target, params=dict(request.query_params))
+    except Exception as e:
+        return Response(f"browser session unreachable ({e})", status_code=502)
+    headers = {}
+    for h in ("content-type", "cache-control", "last-modified", "etag"):
+        if h in up.headers:
+            headers[h] = up.headers[h]
+    return Response(content=up.content, status_code=up.status_code, headers=headers)
+
+
 @app.post("/api/sessions/{session_name}/relogin")
 async def api_session_relogin(session_name: str, request: Request):
     """Gracefully exit Claude and relaunch it on the CURRENT login, preserving
@@ -8017,7 +8743,7 @@ async def api_session_relogin(session_name: str, request: Request):
         logger.debug("relogin: profile re-export failed", exc_info=True)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "-l",
-         "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
+         _claude_launch_env_prefix() +
          "NODE_OPTIONS=--max-old-space-size=8192 "
          "claude --dangerously-skip-permissions --continue"
          + _model_flag_for_relaunch(session_name)],
@@ -8999,6 +9725,24 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
 
 class ModelBody(BaseModel):
     model: str
+
+
+@app.get("/api/models")
+async def api_models():
+    """The model dropdown catalog ([id, label] rows) + the launch default. Kept
+    current by the 24h auto-detect; the frontend fetches this on load so newly
+    released models appear without a redeploy."""
+    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL})
+
+
+@app.post("/api/models/refresh")
+async def api_models_refresh(request: Request):
+    """Force an immediate model-catalog check against the Anthropic API (admin)."""
+    user = _current_user(request)
+    if TEAM_MODE and not (user and _is_admin(user)):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    changed = await _refresh_model_catalog(force=True)
+    return JSONResponse({"ok": True, "changed": changed, "models": MODEL_CATALOG})
 
 
 @app.post("/api/sessions/{session_name}/model")
@@ -10746,6 +11490,25 @@ body.member-simple .hide-in-simple{display:none!important}
 .settings-section .my-ctx-settings{min-height:120px}
 .settings-section .my-ctx-path{font-size:.7rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:2px}
 .settings-section .my-ctx-actions{display:flex;justify-content:flex-end;gap:8px}
+/* Browser tab */
+.bs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.bs-card{border:1px solid #30363d;border-radius:8px;background:#0d1117;overflow:hidden;display:flex;flex-direction:column}
+.bs-head{display:flex;align-items:center;gap:6px;padding:8px 10px;flex-wrap:wrap}
+.bs-name{font-weight:600;color:#e6edf3;font-size:.85rem}
+.bs-meta{font-size:.66rem;color:#6e7681;margin-left:auto}
+.bs-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
+.bs-dot.on{background:#3fb950;box-shadow:0 0 6px #3fb95088}
+.bs-dot.off{background:#6e7681}
+.bs-preview{aspect-ratio:16/9;background:#010409;border-top:1px solid #21262d;border-bottom:1px solid #21262d;position:relative}
+.bs-preview iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.bs-off{display:flex;align-items:center;justify-content:center;height:100%;color:#6e7681;font-size:.8rem}
+.bs-actions{display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap}
+.bs-add{display:flex;gap:8px;align-items:center;margin-top:4px}
+.bs-add input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none}
+.bs-add input:focus{border-color:#58a6ff}
+.btn-primary{background:#238636;border-color:#238636;color:#fff}
+.btn-primary:hover{background:#2ea043}
+.btn-ghost{background:transparent}
 .settings-section .pf-banner{font-size:.72rem;color:#6e7681;padding:6px 8px;background:#0d1117;border:1px dashed #21262d;border-radius:6px;line-height:1.4}
 .history-list{display:flex;flex-direction:column;gap:8px}
 .history-row{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px 12px;cursor:pointer;display:flex;flex-direction:column;gap:5px}
@@ -10947,6 +11710,8 @@ body.member-simple .hide-in-simple{display:none!important}
       <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openSettings('apis');closeToolsMenu()"><span class="icon">&#x1F511;</span> API Keys &amp; Usage</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('browser');closeToolsMenu()"><span class="icon">&#x1F310;</span> Browser Sessions</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('login');closeToolsMenu()"><span class="icon">&#x1F510;</span> Claude Login</div>
       <div class="nav-tools-item" onclick="openSettings('mycontext');closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-item" onclick="openSettings('history');closeToolsMenu()"><span class="icon">&#x1F4C5;</span> History</div>
       <div class="nav-tools-divider"></div>
@@ -11508,7 +12273,13 @@ function formatModelName(model){
   return m+(oneM?' · 1M':'');
 }
 // Keep in sync with ALLOWED_SESSION_MODELS in the Python backend.
-const MODEL_CHOICES=[
+// Seed list; refreshed from /api/models on load so newly-released models
+// (added by the 24h auto-detect) appear in the dropdown without a redeploy.
+let MODEL_CHOICES=[
+  ['claude-opus-5[1m]','Opus 5 · 1M'],
+  ['claude-opus-5','Opus 5'],
+  ['claude-sonnet-5[1m]','Sonnet 5 · 1M'],
+  ['claude-sonnet-5','Sonnet 5'],
   ['claude-opus-4-8[1m]','Opus 4.8 · 1M'],
   ['claude-opus-4-8','Opus 4.8'],
   ['claude-fable-5[1m]','Fable 5 · 1M'],
@@ -11517,6 +12288,15 @@ const MODEL_CHOICES=[
   ['claude-sonnet-4-6','Sonnet 4.6'],
   ['claude-haiku-4-5','Haiku 4.5'],
 ];
+(function loadModelChoices(){
+  try{
+    fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
+      if(d&&Array.isArray(d.models)&&d.models.length){
+        MODEL_CHOICES=d.models.filter(m=>Array.isArray(m)&&m.length===2);
+      }
+    }).catch(()=>{});
+  }catch(e){}
+})();
 function modelChoiceLabel(id){
   const c=MODEL_CHOICES.find(c=>c[0]===id);
   return c?c[1]:formatModelName(id);
@@ -14285,6 +15065,8 @@ function renderSettingsTabs(){
   ];
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
+  if(isAdmin) tabs.push({id:'browser', label:'Browser'});
+  if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
@@ -14315,7 +15097,164 @@ function renderSettingsContent(){
   }else if(_settingsActiveTab === 'apis'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading APIs...</div></div>';
     loadApisAdmin();
+  }else if(_settingsActiveTab === 'browser'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading browser sessions…</div></div>';
+    loadBrowserTab();
+  }else if(_settingsActiveTab === 'login'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading login status…</div></div>';
+    loadLoginTab();
   }
+}
+
+// --- Browser tab (admin) — manage independent Claude browser sessions ---
+let _browserSessions = [];
+async function loadBrowserTab(){
+  let data;
+  try{
+    const r = await fetch(BASE+'/api/browser/sessions');
+    data = await r.json();
+    if(!r.ok) throw new Error(data.error||'Failed');
+  }catch(e){
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load browser sessions: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  _browserSessions = data.sessions||[];
+  renderBrowserTab(data);
+}
+
+function renderBrowserTab(data){
+  const sessions = _browserSessions||[];
+  const atLimit = (data.extra_count||0) >= (data.max_extra||4);
+  const cards = sessions.map(s=>{
+    const dot = s.running ? '<span class="bs-dot on"></span>' : '<span class="bs-dot off"></span>';
+    const status = s.running ? 'running' : 'stopped';
+    const openBtns =
+      '<button class="btn" onclick="openBrowserSession(\''+esc(s.id)+'\')">Open&nbsp;↗</button>'+
+      (s.external_url? ' <button class="btn btn-ghost" onclick="window.open('+JSON.stringify(s.external_url)+',\'_blank\')">Direct</button>':'');
+    const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+esc(s.id)+'\','+JSON.stringify(s.name)+')">Remove</button>' : '';
+    const preview = s.running
+      ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
+      : '<div class="bs-off">Session stopped</div>';
+    return '<div class="bs-card">'+
+      '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
+        '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
+      '<div class="bs-preview">'+preview+'</div>'+
+      '<div class="bs-actions">'+openBtns+rm+'</div>'+
+    '</div>';
+  }).join('');
+  const addRow = atLimit
+    ? '<div class="pf-banner">Reached the max of '+(data.max_extra||4)+' extra browser sessions. Remove one to add another.</div>'
+    : '<div class="bs-add"><input id="bs-new-name" placeholder="New session name (optional)"><button class="btn btn-primary" onclick="createBrowserSession()">+ New browser session</button></div>';
+  document.getElementById('settings-content').innerHTML =
+    '<div class="settings-section">'+
+      '<div class="pf-banner">Independent browsers you (or Claude) can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
+      '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
+      addRow+
+    '</div>';
+}
+
+function openBrowserSession(id){
+  const s=(_browserSessions||[]).find(x=>x.id===id);
+  if(!s) return;
+  window.open(s.viewer_url, '_blank');
+}
+
+async function createBrowserSession(){
+  const el=document.getElementById('bs-new-name');
+  const name=el?el.value:'';
+  const host=document.querySelector('.bs-add');
+  if(host) host.innerHTML='<div class="pf-banner">Starting a new browser… spinning up Chrome + noVNC (~10s).</div>';
+  try{
+    const r=await fetch(BASE+'/api/browser/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+    const d=await r.json();
+    if(!r.ok) alert(d.error||'Failed to create');
+  }catch(e){ alert('Failed: '+e.message); }
+  loadBrowserTab();
+}
+
+async function removeBrowserSession(id,name){
+  if(!confirm('Remove browser session "'+name+'"? This stops its Chrome and frees the memory.')) return;
+  try{
+    const r=await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok) alert(d.error||'Failed to remove');
+  }catch(e){ alert('Failed: '+e.message); }
+  loadBrowserTab();
+}
+
+// --- Login tab (admin) — long-lived never-revoke auth token ---
+let _authStatus = null;
+function _fmtTs(ms){ if(!ms) return '—'; try{ return new Date(ms).toLocaleString(); }catch(e){ return String(ms); } }
+async function loadLoginTab(){
+  let d;
+  try{ const r=await fetch(BASE+'/api/auth/status'); d=await r.json(); if(!r.ok) throw new Error(d.error||'Failed'); }
+  catch(e){ document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load: '+esc(e.message||e)+'</div></div>'; return; }
+  _authStatus=d; renderLoginTab();
+}
+function renderLoginTab(){
+  const d=_authStatus||{}; const ll=d.longlived||{}; const plan=d.plan||{};
+  const active=!!d.injecting;
+  const statusLine = active
+    ? '<span class="bs-dot on"></span> <b>Never-revoke mode is ON.</b> Sessions launch with a stored long-lived token ('+esc(ll.prefix||'')+'), so concurrent sessions no longer rotate the shared credential.'
+    : '<span class="bs-dot off"></span> <b>Using the rotating plan credential.</b> Add a long-lived token to stop intermittent “OAuth access token revoked”.';
+  const planLine = 'Plan token: '+(plan.valid?'valid':'expired/absent')+(plan.subscriptionType?(' · '+esc(plan.subscriptionType)):'')+' · expires '+_fmtTs(plan.expiresAt);
+  document.getElementById('settings-content').innerHTML =
+    '<div class="settings-section">'+
+      '<div class="pf-banner">'+statusLine+'<br><span style="color:#8b949e">'+esc(planLine)+'</span></div>'+
+      '<label>Option A — generate from the dashboard</label>'+
+      '<div class="pf-banner">Click Start, open the link in <b>your own browser</b> (this server is Cloudflare-blocked from claude.ai), approve, then paste the code back.</div>'+
+      '<div id="login-setup-area"><button class="btn btn-primary" onclick="startSetupToken()">Start setup-token</button></div>'+
+      '<label style="margin-top:14px">Option B — paste a token you minted with <code>claude setup-token</code></label>'+
+      '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-ant-oat01-…" style="min-height:56px"></textarea>'+
+      '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save token</button></div>'+
+      (active? '<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Turn off (remove token)</button></div>':'')+
+      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">Note: with a token, sessions show a “· Claude API” label in their header — cosmetic; billing stays on your plan.</div>'+
+    '</div>';
+}
+async function startSetupToken(){
+  const area=document.getElementById('login-setup-area');
+  area.innerHTML='<div class="pf-banner">Starting… generating the authorize link (~10s).</div>';
+  try{
+    const r=await fetch(BASE+'/api/auth/setup/start',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){ area.innerHTML='<div class="pf-banner">Failed: '+esc(d.error||'')+'</div><button class="btn" onclick="startSetupToken()">Retry</button>'; return; }
+    area.innerHTML=
+      '<div class="pf-banner">1) Open this link in <b>your own browser</b> and approve:</div>'+
+      '<div class="my-ctx-path" style="word-break:break-all"><a href="'+esc(d.url)+'" target="_blank" rel="noopener">'+esc(d.url)+'</a></div>'+
+      '<div class="my-ctx-actions"><button class="btn btn-ghost" onclick="navigator.clipboard&&navigator.clipboard.writeText('+JSON.stringify(d.url)+')">Copy link</button></div>'+
+      '<div class="pf-banner">2) Paste the code it gives you:</div>'+
+      '<input id="setup-code" placeholder="paste approval code" style="width:100%;box-sizing:border-box">'+
+      '<div class="my-ctx-actions"><button class="btn btn-primary" onclick="submitSetupCode()">Submit code</button></div>';
+  }catch(e){ area.innerHTML='<div class="pf-banner">Failed: '+esc(e.message)+'</div>'; }
+}
+async function submitSetupCode(){
+  const el=document.getElementById('setup-code');
+  const code=el?el.value.trim():'';
+  if(!code){ alert('Paste the code first'); return; }
+  const area=document.getElementById('login-setup-area');
+  area.innerHTML='<div class="pf-banner">Exchanging code for a long-lived token…</div>';
+  try{
+    const r=await fetch(BASE+'/api/auth/setup/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+    const d=await r.json();
+    if(!r.ok){ area.innerHTML='<div class="pf-banner">Failed: '+esc(d.error||'')+'</div><button class="btn" onclick="startSetupToken()">Start again</button>'; return; }
+    loadLoginTab();
+  }catch(e){ area.innerHTML='<div class="pf-banner">Failed: '+esc(e.message)+'</div>'; }
+}
+async function saveLoginToken(){
+  const el=document.getElementById('login-token');
+  const t=el?el.value.trim():'';
+  if(!t){ alert('Paste a token'); return; }
+  try{
+    const r=await fetch(BASE+'/api/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+    const d=await r.json();
+    if(!r.ok){ alert(d.error||'Failed'); return; }
+    loadLoginTab();
+  }catch(e){ alert('Failed: '+e.message); }
+}
+async function clearLoginToken(){
+  if(!confirm('Remove the long-lived token? Sessions revert to the rotating plan credential.')) return;
+  try{ const r=await fetch(BASE+'/api/auth/token',{method:'DELETE'}); const d=await r.json(); if(!r.ok){ alert(d.error||'Failed'); return; } loadLoginTab(); }catch(e){ alert('Failed: '+e.message); }
 }
 
 // --- My Context tab ---
