@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import mimetypes
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -9630,6 +9631,89 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 _ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
 _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after": 0}
 
+# --- Dedicated credential for the usage bars -------------------------------
+#
+# The 5h/7d bars read https://api.anthropic.com/api/oauth/usage, which requires
+# account scope (`any_of(user:profile, user:office)`). The box authenticates
+# Claude Code with a long-lived `claude setup-token` credential, and that token
+# type is inference-only: it *lists* `user:profile` in the local `scopes` field
+# but the real grant does not include it, so the account endpoints answer
+#     403 permission_error: OAuth token does not meet scope requirement
+# regardless of how recently the setup-token was minted.
+#
+# We cannot simply log in interactively instead: a cron runs
+# ~/.claude/ensure-longlived-token.sh every 10 minutes and forces
+# ~/.claude/.credentials.json back to the long-lived token. That cron is
+# deliberate — it is the cure for the parallel-session OAuth rotation war.
+#
+# So the usage fetcher gets its own credential, written by
+# `usage_oauth_login.py` and living OUTSIDE ~/.claude/ where the healing cron
+# never looks. Claude Code keeps the stable long-lived token; the dashboard gets
+# account scope; neither disturbs the other.
+_USAGE_OAUTH_FILE = MESSAGES_DIR / "usage_oauth.json"
+_USAGE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_usage_oauth_lock = threading.Lock()
+
+
+def _usage_oauth_refresh(cred: dict) -> str:
+    """Refresh the dedicated usage credential in place. Returns the new token."""
+    import urllib.request
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": cred.get("refreshToken", ""),
+        "client_id": _USAGE_OAUTH_CLIENT_ID,
+    }).encode()
+    last = None
+    for url in ("https://console.anthropic.com/v1/oauth/token",
+                "https://platform.claude.com/v1/oauth/token"):
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                r = json.loads(resp.read().decode("utf-8"))
+            cred["accessToken"] = r.get("access_token", "")
+            # The refresh token rotates; keep the newest or we lock ourselves out.
+            if r.get("refresh_token"):
+                cred["refreshToken"] = r["refresh_token"]
+            cred["expiresAt"] = int((time.time() + int(r.get("expires_in") or 3600)) * 1000)
+            _USAGE_OAUTH_FILE.write_text(json.dumps(cred))
+            os.chmod(_USAGE_OAUTH_FILE, 0o600)
+            logger.info("Refreshed the dedicated usage-bars OAuth credential")
+            return cred["accessToken"]
+        except Exception as e:
+            last = e
+    logger.warning("Usage-bars credential refresh failed: %s", last)
+    return ""
+
+
+def _usage_access_token() -> tuple[str, str]:
+    """Token for the usage API, plus which source it came from.
+
+    Prefers the dedicated account-scoped credential; falls back to the shared
+    Claude Code credential so nothing breaks before that file is set up (the
+    fallback will 403 on a setup-token, which the caller reports as such).
+    """
+    with _usage_oauth_lock:
+        try:
+            cred = json.loads(_USAGE_OAUTH_FILE.read_text())
+            tok = cred.get("accessToken", "") or ""
+            # Refresh a minute before expiry rather than after a failed call.
+            if tok and int(cred.get("expiresAt") or 0) > (time.time() + 60) * 1000:
+                return tok, "dedicated"
+            if cred.get("refreshToken"):
+                tok = _usage_oauth_refresh(cred)
+                if tok:
+                    return tok, "dedicated"
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("Unusable dedicated usage credential", exc_info=True)
+    try:
+        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        return (creds.get("claudeAiOauth", {}).get("accessToken", "") or ""), "shared"
+    except Exception:
+        return "", "none"
+
 
 def _load_anthropic_limits_cache():
     try:
@@ -9718,13 +9802,7 @@ async def api_anthropic_usage_limits():
     """
     now = time.time()
     now_dt = datetime.now(timezone.utc)
-    creds_file = Path.home() / ".claude" / ".credentials.json"
-    token = ""
-    try:
-        creds = json.loads(creds_file.read_text())
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "") or ""
-    except Exception:
-        pass
+    token, token_source = _usage_access_token()
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
     fp = hashlib.sha1(token.encode()).hexdigest()[:16]
@@ -9787,6 +9865,19 @@ async def api_anthropic_usage_limits():
                 pass
             _anthropic_limits_cache["retry_after"] = now + delay
             logger.warning("Anthropic usage API rate-limited; backing off %ss", delay)
+        elif status == 403:
+            # Wrong credential *type*, not a transient failure. A setup-token is
+            # inference-only, so re-minting one changes nothing — retrying just
+            # burns into the shared rate limit. Back off hard and say why.
+            _anthropic_limits_cache["retry_after"] = now + 3600
+            logger.warning(
+                "Usage API 403 (needs account scope). Token source: %s. "
+                "Run usage_oauth_login.py to grant the dashboard its own "
+                "account-scoped credential.", token_source)
+            if not _anthropic_limits_cache["data"]:
+                return JSONResponse(
+                    {"error": "needs_account_scope", "token_source": token_source},
+                    status_code=403)
         else:
             logger.warning("Anthropic OAuth usage fetch failed: %s", e)
         return _stale_or_error()
