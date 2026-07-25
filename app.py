@@ -1209,7 +1209,9 @@ async def do_login(request: Request):
             target_user["password_hash"] = _hash_password(password, salt)
         _save_users(users)
     else:
-        return RedirectResponse(url=request.scope.get("root_path", "") + "/login?err=1", status_code=303)
+        # The login form is served by GET "/" — there is no GET /login route, so
+        # redirecting there on a bad password 405s instead of re-showing the form.
+        return RedirectResponse(url=request.scope.get("root_path", "") + "/?err=1", status_code=303)
 
     # Update last_login + capture IP / browser for the admin audit view
     ua = (request.headers.get("user-agent", "") or "")[:300]
@@ -6141,6 +6143,8 @@ _CONTEXT_FILES = [
      "note": "SSH access to the legacy DigitalOcean droplets."},
     {"id": "infra-keeper", "path": MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
      "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
+    {"id": "browser-qa", "path": MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
+     "load": "ondemand", "note": "agent-browser QA procedure to run after a large change."},
 ]
 
 _INFRA_DETAIL_DIR = Path.home() / ".claude" / "infra"
