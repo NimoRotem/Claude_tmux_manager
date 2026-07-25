@@ -308,8 +308,8 @@ def _model_flag_for_relaunch(session_name: str) -> str:
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, a shared Claude auth token, per-user context, OAuth connections,
-# and a soft sandbox (cross-server actions are blocked + sent to the admin for
-# approval). Gated behind env so the shared codebase is unchanged for the personal
+# and a soft sandbox (cross-server actions are blocked and logged). Gated behind
+# env so the shared codebase is unchanged for the personal
 # single-admin dashboards (instance-3, builder) that never set these vars.
 TEAM_MODE = os.environ.get("TMUX_DASH_TEAM_MODE", "") == "1"
 BRAND_NAME = os.environ.get("TMUX_DASH_BRAND", "tmux")
@@ -2305,8 +2305,8 @@ async def api_me(request: Request):
 
 
 # ===========================================================================
-# Team mode: shared auth, global context, soft sandbox, approvals,
-# Google connections. All gated behind TEAM_MODE; no effect on personal boxes.
+# Team mode: shared auth, global context, soft sandbox, Google connections.
+# All gated behind TEAM_MODE; no effect on personal boxes.
 # ===========================================================================
 import base64
 import urllib.request
@@ -2315,7 +2315,6 @@ import urllib.parse
 SHARED_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
 SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
-APPROVALS_FILE = MESSAGES_DIR / "approvals.json"
 CONNECTIONS_DIR = MESSAGES_DIR / "connections"
 GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
 
@@ -2331,11 +2330,11 @@ own private workspace, memory, and context below this block.
 - You may freely read, create, and change files and run services **on this server only**.
 - Do **NOT** modify, deploy to, SSH into, or change configuration on any OTHER
   server or cloud resource (other GCP VMs, other hosts, production systems, buckets).
-- Reaching sensitive data on other servers is blocked by a guard. If you truly need
-  it, the block automatically emails the admin for approval — do not try to work
-  around it (no obfuscation, no alternate tooling).
+- Reaching sensitive data on other servers is blocked by a guard. The block is
+  final — ask the admin directly rather than trying to work around it (no
+  obfuscation, no alternate tooling).
 - Remote/cloud tools (`gcloud`, `gsutil`, `bq`, `ssh`, `scp`, `kubectl`, `aws`, the
-  GCP metadata server, …) are restricted; expect them to be denied unless approved.
+  GCP metadata server, …) are restricted; expect them to be denied.
 
 ## Projects & working folder
 - Unless told otherwise, publish every project you build at __PUBURL__/<username>/<project>.
@@ -2761,7 +2760,7 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
 _SANDBOX_HOOK_SCRIPT = r'''#!/usr/bin/env python3
 # Soft-sandbox guard (auto-generated; do not edit).
 # PreToolUse hook: blocks actions that touch OTHER servers / cloud resources and
-# routes them to the admin for approval. Local changes on this server are allowed.
+# logs them on the dashboard. Local changes on this server are allowed.
 import sys, json, os, re, urllib.request
 
 DASH_URL = os.environ.get("DASH_URL", "__DASH_URL__")
@@ -2811,15 +2810,15 @@ def main():
         with urllib.request.urlopen(req, timeout=8) as r:
             resp = json.load(r)
     except Exception:
-        print("__BRAND__ sandbox: cross-server action blocked (approval service "
+        print("__BRAND__ sandbox: cross-server action blocked (guard service "
               "unreachable). This server only — other servers are off-limits.",
               file=sys.stderr)
         sys.exit(2)
     if resp.get("decision") == "allow":
         sys.exit(0)
     print(resp.get("reason") or
-          "__BRAND__ sandbox: this targets another server and is blocked; the admin "
-          "was asked to approve. Do not attempt to bypass it.", file=sys.stderr)
+          "__BRAND__ sandbox: this targets another server and is blocked. "
+          "Do not attempt to bypass it.", file=sys.stderr)
     sys.exit(2)
 
 
@@ -2890,121 +2889,30 @@ def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
         return False
 
 
-# --- approval store --------------------------------------------------------
-def _load_approvals() -> dict:
-    try:
-        d = json.loads(APPROVALS_FILE.read_text())
-        return d if isinstance(d, dict) else {"requests": {}}
-    except Exception:
-        return {"requests": {}}
-
-
-def _save_approvals(data: dict):
-    try:
-        APPROVALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        APPROVALS_FILE.write_text(json.dumps(data, indent=2))
-    except Exception:
-        logger.exception("Failed to save approvals")
-
-
-def _approval_key(user_id: str, command: str) -> str:
-    norm = re.sub(r"\s+", " ", (command or "").strip())
-    return hashlib.sha256((str(user_id) + "|" + norm).encode()).hexdigest()[:16]
-
-
-def _notify_admin_approval(rec: dict):
-    base = PUB_URL
-    who = rec.get("username") or rec.get("user_id") or "a user"
-    subj = f"[{BRAND_NAME}] Approval needed: " + who + " requested cross-server access"
-    html = (
-        '<div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:640px">'
-        f"<h2>{_html_escape(BRAND_NAME)} — cross-server action blocked</h2>"
-        "<p>A team member's Claude session tried something that reaches another "
-        "server. It was blocked and is awaiting your approval.</p>"
-        "<p><b>User:</b> " + _html_escape(who) + " (" + _html_escape(rec.get("user_id", "")) + ")<br>"
-        "<b>Tool:</b> " + _html_escape(rec.get("tool", "")) + "<br>"
-        "<b>Working dir:</b> " + _html_escape(rec.get("cwd", "")) + "</p>"
-        "<p><b>Command:</b></p><pre style=\"background:#f4f4f4;padding:10px;border-radius:6px;"
-        "white-space:pre-wrap;word-break:break-all\">" + _html_escape((rec.get("command") or "")[:2000]) + "</pre>"
-        '<p>Log in to <a href="' + (base or "#") + '">' + _html_escape(BRAND_NAME) + '</a> and open the '
-        "<b>Approvals</b> panel (gear menu) to approve or deny.</p></div>"
-    )
-    _send_email(subj, html)
-
-
 @app.post("/api/sandbox/check")
 async def api_sandbox_check(request: Request):
-    """Called by the per-user PreToolUse guard hook (localhost only). Records the
-    blocked attempt, notifies the admin once, and reports allow/deny."""
+    """Called by the per-user PreToolUse guard hook (localhost only).
+
+    The sandbox block itself is a security control and stays. The approval queue
+    that used to sit behind it (a pending/approve/deny store plus an admin panel
+    and notification email) was removed: it was never used — no approvals file
+    was ever written — and it granted a 1-hour bypass of a boundary that should
+    not be bypassable from a web UI.
+    """
     if request.client and request.client.host not in ("127.0.0.1", "::1", "localhost"):
         return JSONResponse({"decision": "deny", "reason": "forbidden"}, status_code=403)
     try:
         body = await request.json()
     except Exception:
         body = {}
-    user_id = (body.get("user_id") or "").strip()
-    command = body.get("command") or ""
-    cwd = body.get("cwd") or ""
-    tool = body.get("tool") or ""
-    key = _approval_key(user_id, command)
-    data = _load_approvals()
-    reqs = data.setdefault("requests", {})
-    rec = reqs.get(key)
-    now = time.time()
-    if rec and rec.get("status") == "approved" and now - rec.get("decided_at", 0) < 3600:
-        return JSONResponse({"decision": "allow"})
-    if rec and rec.get("status") == "denied" and now - rec.get("decided_at", 0) < 600:
-        return JSONResponse({"decision": "deny",
-                             "reason": f"{BRAND_NAME}: the admin denied this cross-server action."})
-    u = _find_user_by_id(user_id) if user_id else None
-    is_new = rec is None
-    reqs[key] = {
-        "key": key, "user_id": user_id,
-        "username": (u or {}).get("username", "") if u else "",
-        "tool": tool, "command": command[:4000], "cwd": cwd,
-        "status": "pending",
-        "created_at": rec.get("created_at", now) if rec else now,
-        "last_seen": now,
-        "count": (rec.get("count", 0) + 1) if rec else 1,
-    }
-    _save_approvals(data)
-    if is_new:
-        try:
-            _notify_admin_approval(reqs[key])
-        except Exception:
-            logger.exception("Failed to notify admin of approval request")
+    logger.warning(
+        "sandbox: blocked cross-server action user=%s tool=%s cwd=%s cmd=%s",
+        (body.get("user_id") or "").strip(), body.get("tool") or "",
+        body.get("cwd") or "", (body.get("command") or "")[:400],
+    )
     return JSONResponse({"decision": "deny", "reason":
-        f"{BRAND_NAME} sandbox: this action targets another server and is blocked. A "
-        "request was sent to the admin (" + ADMIN_APPROVAL_EMAIL + ") for approval. "
+        f"{BRAND_NAME} sandbox: this action targets another server and is blocked. "
         "Keep working on things that stay on this server; do not try to bypass."})
-
-
-@app.get("/api/approvals")
-async def api_list_approvals(request: Request):
-    user = _current_user(request)
-    if not _is_admin(user):
-        return JSONResponse({"error": "Admin only"}, status_code=403)
-    reqs = list(_load_approvals().get("requests", {}).values())
-    reqs.sort(key=lambda r: r.get("last_seen", 0), reverse=True)
-    return JSONResponse({"requests": reqs})
-
-
-@app.post("/api/approvals/{key}/{action}")
-async def api_decide_approval(request: Request, key: str, action: str):
-    user = _current_user(request)
-    if not _is_admin(user):
-        return JSONResponse({"error": "Admin only"}, status_code=403)
-    if action not in ("approve", "deny"):
-        return JSONResponse({"error": "Bad action"}, status_code=400)
-    data = _load_approvals()
-    rec = data.get("requests", {}).get(key)
-    if not rec:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    rec["status"] = "approved" if action == "approve" else "denied"
-    rec["decided_at"] = time.time()
-    rec["decided_by"] = user.get("username", "admin")
-    _save_approvals(data)
-    return JSONResponse({"ok": True, "status": rec["status"]})
 
 
 # --- Google connections (Drive / Gmail / Calendar) -------------------------
@@ -9378,7 +9286,42 @@ async def api_claude_auth_logout():
 
 
 _usage_cache: dict = {"ts": 0, "data": {}}
-_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": ""}
+
+# Last-good Anthropic limits payload. Persisted to disk because it is the only
+# thing standing between an upstream hiccup and empty 5h/7d bars: the usage API
+# rate-limits aggressively, and an in-memory-only cache is wiped by every
+# dashboard restart, so a restart that lands on a 429 used to blank the bars for
+# an hour. `retry_after` holds a backoff deadline so we stop hammering upstream.
+_ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
+_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after": 0}
+
+
+def _load_anthropic_limits_cache():
+    try:
+        d = json.loads(_ANTHROPIC_LIMITS_CACHE_FILE.read_text())
+        if isinstance(d, dict) and d.get("data"):
+            _anthropic_limits_cache.update({
+                "ts": float(d.get("ts") or 0),
+                "data": d.get("data"),
+                "fp": str(d.get("fp") or ""),
+            })
+    except Exception:
+        logger.debug("No usable persisted usage-limits cache", exc_info=True)
+
+
+def _persist_anthropic_limits_cache():
+    try:
+        _ANTHROPIC_LIMITS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ANTHROPIC_LIMITS_CACHE_FILE.write_text(json.dumps({
+            "ts": _anthropic_limits_cache["ts"],
+            "data": _anthropic_limits_cache["data"],
+            "fp": _anthropic_limits_cache["fp"],
+        }))
+    except Exception:
+        logger.debug("Failed to persist usage-limits cache", exc_info=True)
+
+
+_load_anthropic_limits_cache()
 
 
 def _usage_reset_passed(block: object, now_dt: datetime) -> bool:
@@ -9459,6 +9402,26 @@ async def api_anthropic_usage_limits():
             and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
         return JSONResponse(_anthropic_limits_cache["data"])
 
+    def _stale_or_error():
+        """Serve the last good payload rather than an error whenever we have one.
+
+        A 502 here makes the frontend drop the `has-data` class and the bars
+        disappear entirely, which is far worse than showing a slightly old
+        number — so an error is only returned when we have literally nothing.
+        """
+        if _anthropic_limits_cache["data"]:
+            # Zero any window that has since reset so we never show a stale
+            # maxed bar; the true value is unknown but a fresh window is ~0.
+            out = _sanitize_expired_windows(_anthropic_limits_cache["data"], now_dt)
+            if isinstance(out, dict):
+                out = {**out, "stale": True}
+            return JSONResponse(out)
+        return JSONResponse({"error": "fetch_failed"}, status_code=502)
+
+    # Upstream told us to back off — don't re-hit it until the deadline passes.
+    if now < _anthropic_limits_cache.get("retry_after", 0):
+        return _stale_or_error()
+
     def _fetch():
         import urllib.request
         req = urllib.request.Request(
@@ -9475,17 +9438,30 @@ async def api_anthropic_usage_limits():
     try:
         data = await asyncio.to_thread(_fetch)
     except Exception as e:
-        logger.warning("Anthropic OAuth usage fetch failed: %s", e)
-        if _anthropic_limits_cache["data"]:
-            # Serve last good payload, but zero out any window that has since
-            # reset so we never show a stale maxed bar on upstream failure.
-            return JSONResponse(_sanitize_expired_windows(_anthropic_limits_cache["data"], now_dt))
-        return JSONResponse({"error": "fetch_failed"}, status_code=502)
+        status = getattr(e, "code", None)
+        if status == 429:
+            # Honour Retry-After when present, else back off 15 minutes. Without
+            # this, every page load and every restart re-hits a rate-limited
+            # endpoint and keeps it rate-limited.
+            delay = 900
+            try:
+                hdr = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+                if hdr:
+                    delay = max(60, min(3600, int(float(hdr))))
+            except Exception:
+                pass
+            _anthropic_limits_cache["retry_after"] = now + delay
+            logger.warning("Anthropic usage API rate-limited; backing off %ss", delay)
+        else:
+            logger.warning("Anthropic OAuth usage fetch failed: %s", e)
+        return _stale_or_error()
 
     payload = {"fetched_at": now, **data}
     _anthropic_limits_cache["ts"] = now
     _anthropic_limits_cache["data"] = payload
     _anthropic_limits_cache["fp"] = fp
+    _anthropic_limits_cache["retry_after"] = 0
+    _persist_anthropic_limits_cache()
     return JSONResponse(payload)
 
 
@@ -11826,7 +11802,6 @@ body.member-simple .nav-server-stats{display:none}
 body.member-simple .nav-usage{display:none}
 body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
 body.member-simple .hide-in-simple{display:none!important}
-.approvals-badge{background:#f85149;color:#fff;border-radius:10px;padding:0 6px;font-size:.65rem;font-weight:600;margin-left:4px}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
 .conn-row .conn-ico{font-size:1.15rem}
@@ -12261,17 +12236,16 @@ body.member-simple .hide-in-simple{display:none!important}
         </div>
         <div class="nav-tools-usage-divider"></div>
       </div>
+      <!-- Each entry below opens its OWN window. Everything that lives as a tab
+           inside the Settings modal (My Context, History, Users, APIs, Browser,
+           Claude Login) is reached through the single Settings entry — listing
+           those tabs here as well is what made this menu a settings menu
+           containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openTeamWorkspace();closeToolsMenu()"><span class="icon">&#x1F465;</span> Team &amp; Workspace</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Context Files</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
-      <div class="nav-tools-item nav-tools-admin" id="nav-tools-approvals" onclick="openApprovals();closeToolsMenu()"><span class="icon">&#x1F6E1;&#xFE0F;</span> Approvals <span class="approvals-badge" id="approvals-badge" style="display:none"></span></div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('apis');closeToolsMenu()"><span class="icon">&#x1F511;</span> API Keys &amp; Usage</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('browser');closeToolsMenu()"><span class="icon">&#x1F310;</span> Browser Sessions</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('login');closeToolsMenu()"><span class="icon">&#x1F510;</span> Claude Login</div>
-      <div class="nav-tools-item" onclick="openSettings('mycontext');closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
-      <div class="nav-tools-item" onclick="openSettings('history');closeToolsMenu()"><span class="icon">&#x1F4C5;</span> History</div>
+      <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
       <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
@@ -14026,10 +14000,13 @@ async function refreshUsageLimits(){
   };
   try{
     const resp=await fetch(BASE+'/api/usage/limits');
-    if(!resp.ok){setHasData(false);return}
+    // Only blank the bars if we have never had data. Once they are showing,
+    // a transient failure should leave the last known values on screen.
+    if(!resp.ok){if(!wrap.classList.contains('has-data'))setHasData(false);_scheduleUsageRetry();return}
     const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false);return}
+    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false);_scheduleUsageRetry();return}
     setHasData(true);
+    if(data.stale)_scheduleUsageRetry();
     const fh=data.five_hour||{};
     const sd=data.seven_day||{};
     const fhPct=Math.round(Number(fh.utilization)||0);
@@ -14055,6 +14032,14 @@ async function refreshUsageLimits(){
   }catch(e){
     /* keep last known display */
   }
+}
+// When the backend has no fresh number (upstream down or rate-limited) retry in
+// 5 minutes instead of waiting out the full hourly tick, so the bars fill in as
+// soon as upstream recovers. Single-shot; the hourly timer keeps running.
+let _usageRetryTimer=null;
+function _scheduleUsageRetry(){
+  if(_usageRetryTimer)return;
+  _usageRetryTimer=setTimeout(()=>{_usageRetryTimer=null;refreshUsageLimits()},5*60*1000);
 }
 function startUsageLimitsPolling(){
   if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
@@ -14211,38 +14196,6 @@ function connectService(svc){ window.location.href=BASE+'/api/connections/'+svc+
 async function disconnectService(svc){
   try{ await fetch(BASE+'/api/connections/'+svc,{method:'DELETE'}); }catch(e){}
   openConnections();
-}
-
-// ── Approvals (admin: review blocked cross-server actions) ──
-async function openApprovals(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">Loading…</p>`;
-  document.getElementById('modal-overlay').classList.add('active');
-  try{
-    const r=await fetch(BASE+'/api/approvals'); const d=await r.json();
-    const reqs=d.requests||[];
-    if(!reqs.length){
-      modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">No cross-server requests.</p>
-        <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
-      return;
-    }
-    const rows=reqs.map(x=>{
-      const cls={pending:'pill-pending',approved:'pill-approved',denied:'pill-denied'}[x.status]||'';
-      const act=x.status==='pending'
-        ?`<div class="approval-actions"><button class="btn-approve" onclick="decideApproval('${x.key}','approve')">Approve (1h)</button><button class="btn-deny" onclick="decideApproval('${x.key}','deny')">Deny</button></div>`:'';
-      return `<div class="approval-row"><div class="approval-meta"><b>${esc(x.username||x.user_id||'?')}</b> &middot; <span class="${cls}">${esc(x.status)}</span> &middot; ${esc(x.cwd||'')}</div><pre>${esc(x.command||'')}</pre>${act}</div>`;
-    }).join('');
-    modal.innerHTML=`<h3>Approvals</h3>
-      <p class="conn-note">Cross-server actions a member's Claude tried and the sandbox blocked. Approving allows that exact command for ~1 hour.</p>
-      ${rows}<div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
-  }catch(e){
-    modal.innerHTML=`<h3>Approvals</h3><p class="conn-note">Failed to load.</p>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
-  }
-}
-async function decideApproval(key,action){
-  try{ await fetch(BASE+'/api/approvals/'+key+'/'+action,{method:'POST'}); }catch(e){}
-  refreshApprovalsBadge(); openApprovals();
 }
 
 // ── Global context (admin) ──
@@ -15566,18 +15519,7 @@ async function applyRoleVisibility(){
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
-  if(isAdmin){ refreshApprovalsBadge(); if(!window._apTimer) window._apTimer=setInterval(refreshApprovalsBadge,30000); }
   if(isAdmin) startBrowserAuthPolling();
-}
-
-async function refreshApprovalsBadge(){
-  try{
-    const r=await fetch(BASE+'/api/approvals'); if(!r.ok)return;
-    const d=await r.json();
-    const pending=(d.requests||[]).filter(x=>x.status==='pending').length;
-    const b=document.getElementById('approvals-badge');
-    if(b){ b.textContent=pending?String(pending):''; b.style.display=pending?'':'none'; }
-  }catch(e){}
 }
 
 async function doLogout(){
@@ -15610,10 +15552,6 @@ function closeSettings(){
   _settingsHistoryDetail = null;
 }
 
-// Admin shortcut: jump straight to the Users/Workspace management tab.
-async function openTeamWorkspace(){
-  await openSettings('users');
-}
 
 function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
