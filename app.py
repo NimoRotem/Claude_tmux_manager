@@ -8365,14 +8365,17 @@ _BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
 # Parameterized EXTRA "Claude browser" session — a second/third independent
 # browser alongside the default one (display :99). Each gets its OWN Xvfb
 # display, fluxbox, x11vnc, websockify (localhost — reached via the tmux-dashboard
-# reverse proxy) and a persistent headful Chrome with its own CDP + profile.
+# reverse proxy) and a persistent headful Chrome with its own CDP + profile,
+# and its own proxy identity (its own residential exit IP).
 #   start:  browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport>
 #   stop:   browser-session.sh stop  <id>
 set -uo pipefail
 export HOME=/home/nimrod_rotem
+# shellcheck source=/home/nimrod_rotem/.claude-browser/bin/chrome-common.sh
+source "$HOME/.claude-browser/bin/chrome-common.sh"
 ACTION="${1:-}"; ID="${2:-}"
 [ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop <id> ..."; exit 2; }
-BASE="$HOME/.claude-browser/sessions/$ID"
+BASE="$CB_ROOT/sessions/$ID"
 LOGS="$BASE/logs"; PROFILE="$BASE/profile"; PIDS="$BASE/pids"
 
 if [ "$ACTION" = "stop" ]; then
@@ -8393,7 +8396,14 @@ export DISPLAY=":$DISP"
 : > "$PIDS"
 rm -f "/tmp/.X${DISP}-lock" 2>/dev/null || true
 
-Xvfb ":$DISP" -screen 0 1600x900x24 -nolisten tcp -ac >"$LOGS/xvfb.log" 2>&1 & echo $! >> "$PIDS"
+# Own loopback proxy port => own sticky residential IP, so two browsers look
+# like two different people to any site they both visit.
+if [ -x "$CB_BIN/proxy-ctl.py" ]; then
+  python3 "$CB_BIN/proxy-ctl.py" session add "$ID" --port "$((3128 + DISP - 99))" >>"$LOGS/proxy.log" 2>&1 || true
+  sleep 6   # let the relay notice the config change and bind the port
+fi
+
+Xvfb ":$DISP" -screen 0 "${CB_SCREEN_W}x${CB_SCREEN_H}x24" -nolisten tcp -ac >"$LOGS/xvfb.log" 2>&1 & echo $! >> "$PIDS"
 for i in $(seq 1 50); do [ -S "/tmp/.X11-unix/X${DISP}" ] && break; sleep 0.2; done
 fluxbox >"$LOGS/fluxbox.log" 2>&1 & echo $! >> "$PIDS"
 
@@ -8402,15 +8412,10 @@ x11vnc -display ":$DISP" -localhost -rfbport "$RFB" -nopw -forever -shared -noxd
 websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
   >"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
 
-dbus-run-session -- google-chrome-stable \
-  --user-data-dir="$PROFILE" \
-  --remote-debugging-port="$CDP" \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-allow-origins=* \
-  --no-first-run --no-default-browser-check --no-sandbox \
-  --password-store=basic --disable-gpu --disable-dev-shm-usage \
-  --disable-features=Translate \
-  --window-position=0,0 --window-size=1600,900 --start-maximized \
+cb_chrome_env "$ID"
+mapfile -t FLAGS < <(cb_chrome_flags "$PROFILE" "$CDP" "$ID")
+printf '[%s] %s\n' "$(date -Is)" "${FLAGS[*]}" >>"$LOGS/chrome-flags.log"
+dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
   "about:blank" >"$LOGS/chrome.log" 2>&1 & echo $! >> "$PIDS"
 
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
@@ -8418,13 +8423,20 @@ echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
 
 
 def _ensure_browser_launcher():
-    """Write the launcher script if it's missing, so the feature is self-contained."""
+    """Keep the on-disk launcher in sync with the copy above.
+
+    It used to be write-if-missing, which meant a launcher written before the
+    anti-fingerprinting work stayed frozen at the old flags forever — new
+    browsers would still start with --no-sandbox/--disable-gpu and no proxy.
+    Rewrite whenever the content differs instead (it's ours; nothing else
+    edits it)."""
     p = Path(BROWSER_LAUNCHER)
     try:
-        if not p.exists():
+        if not p.exists() or p.read_text() != _BROWSER_LAUNCHER_SCRIPT:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(_BROWSER_LAUNCHER_SCRIPT)
             p.chmod(0o755)
+            logger.info("Browser launcher script written to %s", p)
     except Exception:
         logger.debug("Failed to write browser launcher", exc_info=True)
 _DEFAULT_BROWSER_SESSION = {
@@ -8588,6 +8600,14 @@ async def api_browser_delete(sid: str, request: Request):
 
     await asyncio.to_thread(_stop)
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
+    # Give its proxy port + sticky identity back, so a later browser reusing the
+    # slot doesn't inherit a stranger's exit IP or its bandwidth counter.
+    try:
+        conf = _proxy_conf()
+        if (conf.get("sessions") or {}).pop(sid, None) is not None:
+            _proxy_save(conf)
+    except Exception:
+        logger.debug("Failed to drop proxy session for %s", sid, exc_info=True)
     logger.info("Browser session '%s' stopped and removed", sid)
     return JSONResponse({"ok": True})
 
@@ -8628,6 +8648,221 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
+
+
+# --- Residential proxy + fingerprint ----------------------------------------
+# Every browser goes out through a loopback port served by the proxy relay
+# (~/.claude-browser/bin/proxy_relay.py), which attaches the residential
+# provider's credentials. Each browser has its OWN port => its own sticky exit
+# IP, so two browsers look like two different people. Config + credentials live
+# in ~/.claude-browser/proxy.json (mode 600); this dashboard only edits it.
+CB_ROOT = Path.home() / ".claude-browser"
+BROWSER_PROXY_CONF = CB_ROOT / "proxy.json"
+BROWSER_PROXY_USAGE = CB_ROOT / "state" / "proxy-usage.json"
+BROWSER_FINGERPRINT_TOOL = CB_ROOT / "bin" / "fingerprint-audit.py"
+
+
+def _proxy_presets() -> dict:
+    """Provider credential templates, from the relay (the schema owner)."""
+    try:
+        import sys as _sys
+        p = str(CB_ROOT / "bin")
+        if p not in _sys.path:
+            _sys.path.insert(0, p)
+        import proxy_relay  # type: ignore
+        return proxy_relay.PRESETS
+    except Exception:
+        return {}
+
+
+def _proxy_conf() -> dict:
+    try:
+        return json.loads(BROWSER_PROXY_CONF.read_text())
+    except Exception:
+        return {}
+
+
+def _proxy_save(conf: dict):
+    CB_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = BROWSER_PROXY_CONF.with_suffix(".tmp")
+    tmp.write_text(json.dumps(conf, indent=2))
+    os.chmod(tmp, 0o600)          # provider credentials live in here
+    tmp.replace(BROWSER_PROXY_CONF)
+    os.chmod(BROWSER_PROXY_CONF, 0o600)
+
+
+def _proxy_usage() -> dict:
+    try:
+        return json.loads(BROWSER_PROXY_USAGE.read_text()).get("sessions", {})
+    except Exception:
+        return {}
+
+
+async def _proxy_exit_info(local_port: int, timeout: float = 20) -> dict:
+    """What the outside world sees for a browser — fetched THROUGH its own
+    loopback port, so it reflects exactly what that browser's traffic does."""
+    url = _proxy_conf().get("verify_url") or "https://ipinfo.io/json"
+    proxy = f"http://127.0.0.1:{int(local_port)}"
+    try:
+        try:
+            client = httpx.AsyncClient(proxy=proxy, timeout=timeout)
+        except TypeError:                      # httpx < 0.28
+            client = httpx.AsyncClient(proxies=proxy, timeout=timeout)
+        async with client as c:
+            r = await c.get(url)
+            if r.status_code != 200:
+                return {"error": f"HTTP {r.status_code}"}
+            d = r.json()
+            org = str(d.get("org", ""))
+            d["datacenter"] = any(k in org.lower() for k in (
+                "google", "amazon", "microsoft", "digitalocean", "ovh", "hetzner",
+                "linode", "oracle", "contabo"))
+            return d
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+@app.get("/api/browser/proxy")
+async def api_browser_proxy_get(request: Request, check: int = 0):
+    """Proxy config (password never leaves the box), per-browser identity and
+    the bandwidth each browser has burned — residential traffic is billed per GB."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    conf = _proxy_conf()
+    usage = _proxy_usage()
+    rows = []
+    for s in _load_browser_sessions():
+        sid = s.get("id")
+        sess = (conf.get("sessions") or {}).get(sid) or {}
+        u = usage.get(sid) or {}
+        row = {
+            "id": sid, "name": s.get("name", ""),
+            "local_port": sess.get("local_port"),
+            "session_id": sess.get("session_id", ""),
+            "country": sess.get("country") or conf.get("country") or "",
+            "enabled": bool(sess.get("enabled", True)) and bool(sess.get("local_port")),
+            "bytes": int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)),
+            "conns": int(u.get("conns", 0)),
+            "last_error": u.get("last_error", ""),
+        }
+        if check and sess.get("local_port"):
+            row["exit"] = await _proxy_exit_info(sess["local_port"])
+        rows.append(row)
+    total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
+    return JSONResponse({
+        "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
+        "enabled": bool(conf.get("enabled")),
+        "provider": conf.get("provider", ""),
+        "host": conf.get("host", ""), "port": conf.get("port", 0),
+        "username": conf.get("username", ""), "zone": conf.get("zone", ""),
+        "password_set": bool(conf.get("password")),
+        "country": conf.get("country", ""),
+        "providers": sorted(_proxy_presets().keys()),
+        "browsers": rows, "total_bytes": total,
+    })
+
+
+class BrowserProxyBody(BaseModel):
+    enabled: Optional[bool] = None
+    provider: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    zone: Optional[str] = None
+    country: Optional[str] = None
+
+
+@app.post("/api/browser/proxy")
+async def api_browser_proxy_set(body: BrowserProxyBody, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    conf = _proxy_conf()
+    presets = _proxy_presets()
+    if body.provider and body.provider in presets:
+        p = presets[body.provider]
+        conf["provider"] = body.provider
+        conf["host"] = body.host or p["host"]
+        conf["port"] = body.port or p["port"]
+        for k in ("username_template", "password_template", "rotating_template"):
+            conf[k] = p[k]
+    if body.host:
+        conf["host"] = body.host
+    if body.port:
+        conf["port"] = body.port
+    if body.username is not None:
+        conf["username"] = body.username.strip()
+    if body.password:                       # blank => keep the stored one
+        conf["password"] = body.password
+    if body.zone is not None:
+        conf["zone"] = body.zone.strip()
+    if body.country is not None:
+        conf["country"] = body.country.strip().lower()
+    if body.enabled is not None:
+        conf["enabled"] = bool(body.enabled)
+        # The cached exit-IP timezone belongs to the old route.
+        for f in (CB_ROOT / "state").glob("*.geo.json"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    _proxy_save(conf)
+    logger.info("Browser proxy config updated (enabled=%s provider=%s user=%s)",
+                conf.get("enabled"), conf.get("provider"), conf.get("username"))
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/browser/proxy/{sid}/rotate")
+async def api_browser_proxy_rotate(sid: str, request: Request):
+    """New sticky session id => the provider hands this browser a new exit IP."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    conf = _proxy_conf()
+    sess = (conf.get("sessions") or {}).get(sid)
+    if not sess:
+        return JSONResponse({"error": "this browser has no proxy port yet"}, status_code=404)
+    sess["session_id"] = secrets.token_hex(5)   # lowercase alnum: valid for every provider
+    _proxy_save(conf)
+    try:
+        (CB_ROOT / "state" / f"{sid}.geo.json").unlink()
+    except Exception:
+        pass
+    await asyncio.sleep(6)      # let the relay pick the config change up
+    info = await _proxy_exit_info(sess.get("local_port", 0))
+    logger.info("Browser '%s' rotated to sticky session %s (exit %s)",
+                sid, sess["session_id"], info.get("ip", "?"))
+    return JSONResponse({"ok": True, "session_id": sess["session_id"], "exit": info})
+
+
+@app.get("/api/browser/fingerprint/{sid}")
+async def api_browser_fingerprint(sid: str, request: Request):
+    """Run the fingerprint audit against one browser: what a bot-detection
+    vendor would see (webdriver flag, WebGL renderer, WebRTC leak, timezone vs
+    exit IP, fonts, media devices …)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = _browser_session_by_id(sid)
+    if not s:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not BROWSER_FINGERPRINT_TOOL.exists():
+        return JSONResponse({"error": "fingerprint-audit.py is not installed"}, status_code=501)
+
+    def _run():
+        return subprocess.run(
+            ["python3", str(BROWSER_FINGERPRINT_TOOL), "--cdp", str(s.get("cdp_port", 0)), "--json"],
+            capture_output=True, text=True, timeout=180)
+
+    async with _browser_busy_ctx(sid, "fingerprint check"):
+        try:
+            r = await asyncio.to_thread(_run)
+        except Exception as e:
+            return JSONResponse({"error": str(e)[:300]}, status_code=500)
+    if r.returncode != 0:
+        return JSONResponse({"error": (r.stderr or "audit failed").strip()[:300]}, status_code=502)
+    try:
+        return JSONResponse(json.loads(r.stdout))
+    except Exception:
+        return JSONResponse({"error": "could not parse audit output"}, status_code=502)
 
 
 # --- Driving a browser session over CDP -------------------------------------
@@ -8811,6 +9046,22 @@ async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) 
     return out
 
 
+def _display_idle_ms(display: int) -> int:
+    """Milliseconds since the last real input (mouse/keyboard) on an X display.
+    Drives the 'browser is being used right now' state — this is what catches a
+    human clicking around over noVNC, which no amount of CDP polling would see."""
+    try:
+        out = subprocess.run(["xprintidle"], env={"DISPLAY": f":{display}", "PATH": "/usr/bin:/bin"},
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return int(out) if out.isdigit() else -1
+    except Exception:
+        return -1
+
+
+# Below this, the browser counts as actively in use (blinking indicator).
+BROWSER_ACTIVE_IDLE_MS = 15000
+
+
 def _pick_login_browser() -> dict:
     """Which browser to click the OAuth flow through: one explicitly flagged
     use_for_login, else one whose name/notes mention login/auth, else the only
@@ -8847,17 +9098,28 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
                 acct = await _browser_claude_account(sid, s.get("cdp_port", 0), force=bool(refresh))
             else:
                 acct = cached["data"]
+        # "In use" = real input on its X display (someone driving it over noVNC)
+        # OR us driving it over CDP right now.
+        idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0)) if alive else -1
+        driven = sid in _browser_busy
+        active = driven or (0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS)
         out.append({
             "id": sid, "name": s.get("name", ""), "running": alive,
             "use_for_login": bool(s.get("use_for_login")) or (login_pick.get("id") == sid),
-            "busy": sid in _browser_busy,
+            "busy": driven,
             "busy_what": (_browser_busy.get(sid) or {}).get("what", ""),
+            "idle_ms": idle_ms, "active": active,
             **acct,
         })
     return JSONResponse({
         "sessions": out,
         "any_logged_in": any(x["logged_in"] for x in out),
         "any_can_authorize": any(x["can_authorize"] for x in out),
+        # A signed-in browser is being used right now (by a person over noVNC or
+        # by us) -> the indicator blinks.
+        "active": any(x["active"] and x["logged_in"] for x in out),
+        "active_what": next((x["busy_what"] or ("in use: " + x["name"])
+                             for x in out if x["active"] and x["logged_in"]), ""),
         "busy": bool(_browser_busy),
         "busy_what": next((v.get("what", "") for v in _browser_busy.values()), ""),
         "login_browser": login_pick.get("id", ""),
@@ -9007,6 +9269,71 @@ async def _extract_oauth_code(tab, authorize_url: str) -> dict:
                      "(its consent page stalls when driven automatically)"}
 
 
+async def _auto_fix_login(session_name: str) -> dict:
+    """Silently get a logged-out session back to work — no OAuth, no clicks.
+
+    Almost every "please run /login" here is NOT a missing credential: the box
+    holds a valid Max token (or a stored long-lived one) and only this session's
+    claude process lost it (rotation race, stale process, a config dir with no
+    creds). So: clear whatever login prompt is stranded on screen, make sure the
+    session's config dir has the good credential, and relaunch on --continue.
+    Takes ~15s and the user does nothing.
+
+    This is the primary recovery path. Driving the OAuth consent page in a
+    browser is NOT usable — claude.ai blocks it (see _extract_oauth_code)."""
+    alog = logging.getLogger("auto-auth")
+    token = _load_longlived_token()
+    creds_ok = _subscription_token_valid()
+    if not token and not creds_ok:
+        return {"ok": False, "error": "no valid credential on this machine to restore — "
+                                      "mint a long-lived token in Settings → Login"}
+    # 1. Clear a stranded /login (menu -> URL -> paste-code all cancel on Esc).
+    for _ in range(3):
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Escape"],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.sleep(0.4)
+    # 2. Make sure this session's config dir actually has the good credential.
+    try:
+        cfg = _session_config_base(session_name)
+        if creds_ok and cfg != (Path.home() / ".claude"):
+            dst = cfg / ".credentials.json"
+            if not dst.exists() or dst.read_text() != SHARED_CREDENTIALS.read_text():
+                cfg.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SHARED_CREDENTIALS, dst)
+                os.chmod(dst, 0o600)
+                alog.info("auto-fix '%s': restored credentials into %s", session_name, cfg)
+    except Exception:
+        alog.debug("auto-fix: could not sync credentials for '%s'", session_name, exc_info=True)
+    # 3. Relaunch on the restored credential, keeping the conversation.
+    if await _async_is_claude_running(session_name):
+        await _send_line(session_name, "/exit")
+        for _ in range(12):
+            await asyncio.sleep(1)
+            if not await _async_is_claude_running(session_name):
+                break
+    await asyncio.to_thread(subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "C-u"],
+        capture_output=True, text=True, timeout=5)
+    await _send_line(session_name,
+                     _claude_launch_env_prefix() +
+                     "NODE_OPTIONS=--max-old-space-size=8192 "
+                     "claude --dangerously-skip-permissions --continue" +
+                     _model_flag_for_relaunch(session_name))
+    # 4. Confirm it came back authenticated.
+    for _ in range(20):
+        await asyncio.sleep(2)
+        pane = await asyncio.to_thread(_pane_text, session_name, 25)
+        if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
+            continue
+        if await _async_is_claude_running(session_name):
+            _account_ident_cache.clear()
+            alog.info("auto-fix '%s': logged back in via %s", session_name,
+                      "stored token" if token else "shared plan credentials")
+            return {"ok": True, "via": "token" if token else "credentials"}
+    return {"ok": False, "error": "relaunched but the session still looks logged out"}
+
+
 async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
     """Log `session_name` back in using the designated login browser."""
     alog = logging.getLogger("auto-auth")
@@ -9119,6 +9446,10 @@ async def api_auto_auth(session_name: str, request: Request):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    # Fast path first: restore the machine's credential and relaunch (no clicks).
+    res = await _auto_fix_login(session_name)
+    if res.get("ok") or not _pick_login_browser():
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
     res = await _auto_auth_session(session_name, reason="manual")
     return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
@@ -10897,6 +11228,9 @@ _LOGIN_NEEDED_RE = re.compile(
 )
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
+# A login prompt must sit unchanged this long before we treat it as abandoned and
+# clear it — otherwise we'd interrupt someone typing /login by hand.
+_LOGIN_FLOW_STALE_AFTER = 45
 _login_watchdog_state: Dict[str, dict] = {}
 
 
@@ -10959,26 +11293,45 @@ async def _login_watchdog_loop():
                             llog.debug("login watchdog esc failed for '%s': %s", name, e)
                     continue
 
-                if not recent or not _LOGIN_NEEDED_RE.search(recent):
-                    continue
-                # NEVER touch a session with a login flow already on screen: that is
-                # what a human typing /login looks like, and driving it (or typing
-                # into the pane) interrupts them mid-login. Only a session that is
-                # logged out with NO flow in progress is ours to act on.
-                if login_flow_open:
+                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
+                if not needs_login and not login_flow_open:
+                    state.pop("flow_since", None)
                     continue
 
-                # Optional: finish the login unattended via the signed-in browser.
-                # Off by default — see AUTO_AUTH_ENABLED.
-                if AUTO_AUTH_ENABLED and _pick_login_browser():
-                    state["last_action"] = now
-                    llog.warning("Auto-auth starting for '%s' (login required)", name)
-                    res = await _auto_auth_session(name, reason="watchdog")
-                    if res.get("ok"):
-                        llog.warning("Auto-auth logged '%s' back in", name)
-                    else:
-                        llog.warning("Auto-auth for '%s' failed: %s", name, res.get("error"))
+                # A login prompt on screen might be a HUMAN typing /login right
+                # now — never yank that out from under them. Only once the same
+                # prompt has sat unchanged for a while is it stale and ours.
+                if login_flow_open:
+                    since = state.get("flow_since")
+                    if not since:
+                        state["flow_since"] = now
+                        continue
+                    if now - since < _LOGIN_FLOW_STALE_AFTER:
+                        continue
+                else:
+                    state.pop("flow_since", None)
+
+                # Primary recovery: restore the machine's valid credential and
+                # relaunch. No OAuth, no browser, no clicks — a stranded /login
+                # clears itself within ~15s.
+                state["last_action"] = now
+                state.pop("flow_since", None)
+                llog.warning("Auto-fixing login for '%s' (%s)", name,
+                             "stale login prompt" if login_flow_open else "login required")
+                res = await _auto_fix_login(name)
+                if res.get("ok"):
+                    llog.warning("Session '%s' logged back in automatically (via %s)",
+                                 name, res.get("via"))
                     continue
+                llog.warning("Auto-fix for '%s' failed: %s", name, res.get("error"))
+
+                # Optional fallback: drive the OAuth consent in the signed-in
+                # browser. Off by default — claude.ai blocks it.
+                if AUTO_AUTH_ENABLED and _pick_login_browser():
+                    res = await _auto_auth_session(name, reason="watchdog")
+                    llog.warning("Auto-auth for '%s': %s", name,
+                                 "ok" if res.get("ok") else res.get("error"))
+                continue
                 try:
                     await asyncio.to_thread(
                         subprocess.run,
@@ -12018,11 +12371,12 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.ok .nbb-dot{background:#3fb950;box-shadow:0 0 6px #3fb95099}
 .nav-browser-badge.bad .nbb-dot{background:#f85149;box-shadow:0 0 6px #f8514999}
 .nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
-/* Action needed: auto-auth prepared everything, one human click left. */
-.nav-browser-badge.action{border-color:#d29922}
-.nav-browser-badge.action .nbb-dot{background:#d29922;animation:nbb-blink 1.1s ease-in-out infinite}
-.nav-browser-badge.action .nbb-glyph{filter:none}
-@keyframes nbb-blink{0%,100%{opacity:1}50%{opacity:.25}}
+/* Blinking green: the signed-in browser is being used right now (a person over
+   noVNC, or Claude driving it in the background). */
+.nav-browser-badge.ok.active{border-color:#3fb950}
+.nav-browser-badge.ok.active .nbb-dot{animation:nbb-blink 1s ease-in-out infinite}
+.nav-browser-badge.ok.active .nbb-glyph{animation:nbb-pulse 1.6s ease-in-out infinite}
+@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #3fb950}50%{opacity:.3;box-shadow:none}}
 .nav-browser-badge.ok .nbb-glyph{filter:none}
 /* Working: the dot becomes a spinning ring so background use is obvious. */
 .nav-browser-badge.busy{border-color:#58a6ff}
@@ -12062,6 +12416,17 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-add{display:flex;gap:8px;align-items:center;margin-top:4px}
 .bs-add input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none}
 .bs-add input:focus{border-color:#58a6ff}
+.bs-proxy{border:1px solid #30363d;border-radius:8px;background:#0d1117;padding:10px 12px;margin-bottom:12px}
+.bs-proxy-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.bs-proxy-title{font-weight:600;color:#e6edf3;font-size:.85rem}
+.bs-proxy-sub{font-size:.7rem;color:#6e7681;margin-left:auto}
+.bs-proxy-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:10px}
+.bs-proxy-form label{font-size:.63rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;display:block;margin-bottom:3px}
+.bs-proxy-form input,.bs-proxy-form select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 8px;font-size:.8rem;outline:none;width:100%;box-sizing:border-box;font-family:inherit}
+.bs-proxy-form input:focus,.bs-proxy-form select:focus{border-color:#58a6ff}
+.bs-proxy-actions{display:flex;gap:6px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.bs-fp{padding:8px 10px;font-size:.7rem;color:#c9d1d9;border-bottom:1px solid #21262d;background:#0b1017;line-height:1.5}
+.bs-fp .fp-fail{color:#f85149}.bs-fp .fp-warn{color:#d29922}.bs-fp .fp-ok{color:#3fb950}
 .btn-primary{background:#238636;border-color:#238636;color:#fff}
 .btn-primary:hover{background:#2ea043}
 .btn-ghost{background:transparent}
@@ -15687,29 +16052,29 @@ async function refreshBrowserAuthBadge(){
   }catch(e){ return; }
   _browserAuth = d;
   el.style.display = 'inline-flex';
-  el.classList.remove('ok','bad','warn','busy','unknown','action');
+  el.classList.remove('ok','bad','active','unknown');
   let title;
-  const pend = d.pending_auth && d.pending_auth.url ? d.pending_auth : null;
-  if(d.busy){
-    el.classList.add('busy');
-    title = 'Claude is using the browser: ' + (d.busy_what || 'working…');
-  }else if(pend){
-    el.classList.add('action');
-    title = "'"+pend.session+"' needs one click to finish signing in ("+(pend.why||'')+
-            ') — click to open the authorize page.';
-  }else if(d.any_can_authorize){
-    el.classList.add('ok');
-    const who = (d.sessions.find(s=>s.can_authorize)||{});
-    title = 'Browser signed in' + (who.email? ' as '+who.email : '') +
-            ' — Claude can log itself back in automatically. Click to manage.';
-  }else if(d.any_logged_in){
-    el.classList.add('warn');
-    const s = d.sessions.find(x=>x.logged_in)||{};
-    title = 'Browser signed in' + (s.email? ' as '+s.email : '') +
-            ", but that account has no Max/Pro plan — it can't authorize Claude Code. Click to fix.";
-  }else{
+  if(!d.any_logged_in){
+    // red — nothing signed in
     el.classList.add('bad');
-    title = 'No browser is signed in to claude.ai — Claude cannot log itself back in. Click to sign one in.';
+    title = 'No signed-in browser session. Click to open one and sign in to claude.ai.';
+  }else{
+    const who = d.sessions.find(s=>s.logged_in && s.active) ||
+                d.sessions.find(s=>s.can_authorize) ||
+                d.sessions.find(s=>s.logged_in) || {};
+    const whoTxt = who.email ? ' ('+who.email+')' : '';
+    if(d.active){
+      // blinking green — someone/something is using it right now
+      el.classList.add('ok','active');
+      title = 'Browser in use right now'+whoTxt+' — '+(d.active_what||'activity detected')+'. Click to watch.';
+    }else{
+      // steady green — signed in and idle
+      el.classList.add('ok');
+      title = 'Browser signed in'+whoTxt+' and idle. Click to manage.';
+    }
+    if(!d.any_can_authorize){
+      title += ' Note: no signed-in account has a Max/Pro plan.';
+    }
   }
   el.title = title;
 }
@@ -15726,13 +16091,18 @@ function onBrowserBadgeClick(){
 
 function startBrowserAuthPolling(){
   refreshBrowserAuthBadge();
-  if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 20000);
+  // 6s: idle/active has to react quickly enough that the blink actually tracks
+  // someone using the browser. The claude.ai login check behind it is cached.
+  if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 6000);
 }
 
 // --- Browser tab (admin) — manage independent Claude browser sessions ---
 let _browserSessions = [];
 let _bsEditId = null;   // session id currently being renamed / annotated
 let _bsData = null;     // last payload, so an edit toggle can re-render without refetching
+let _bsProxy = null;    // /api/browser/proxy payload (config + per-browser exit IP + GB used)
+let _bsProxyEdit = false;
+let _bsFp = {};         // sid -> last fingerprint audit result
 async function loadBrowserTab(){
   let data;
   try{
@@ -15747,6 +16117,9 @@ async function loadBrowserTab(){
   _browserSessions = data.sessions||[];
   _bsData = data;
   renderBrowserTab(data);
+  // Proxy state second: the exit-IP lookups go out over the network, so let the
+  // cards paint first and fill the badges in when they land.
+  loadBrowserProxy(true);
   // Sign-in state needs a live claude.ai check per browser, so fetch it after
   // the cards are already on screen and repaint when it lands.
   refreshBrowserAuthBadge().then(()=>{
@@ -15788,7 +16161,26 @@ function renderBrowserTab(data){
     else if(a.logged_in) badges += '<span class="bs-badge warn">signed in'+(a.email?' · '+esc(a.email):'')+' · no Max/Pro</span>';
     else if(a.running) badges += '<span class="bs-badge bad">not signed in to claude.ai</span>';
     if(a.use_for_login) badges += '<span class="bs-badge login">login browser</span>';
+    // What this browser looks like from outside: its own exit IP + what it has
+    // spent of the (per-GB billed) residential quota.
+    const px = ((_bsProxy&&_bsProxy.browsers)||[]).find(x=>x.id===s.id) || null;
+    if(px && px.enabled && _bsProxy.enabled){
+      const ex = px.exit||null;
+      if(ex && ex.ip && !ex.error){
+        badges += '<span class="bs-badge '+(ex.datacenter?'bad':'ok')+'">'+
+          (ex.datacenter?'⚠ datacenter ':'🏠 ')+esc(ex.ip)+' · '+esc((ex.org||'').replace(/^AS\d+\s*/,'').slice(0,22))+'</span>';
+      }else if(ex && ex.error){
+        badges += '<span class="bs-badge bad">proxy error</span>';
+      }else{
+        badges += '<span class="bs-badge">checking exit IP…</span>';
+      }
+      if(px.bytes) badges += '<span class="bs-badge">'+_fmtBytes(px.bytes)+' used</span>';
+    }else if(px && _bsProxy && _bsProxy.installed && !_bsProxy.enabled){
+      badges += '<span class="bs-badge warn">direct — no proxy</span>';
+    }
     const badgeRow = badges ? '<div class="bs-badges">'+badges+'</div>' : '';
+    const fp = _bsFp[s.id];
+    const fpBlock = fp ? '<div class="bs-fp">'+fp+'</div>' : '';
     const body = editing
       ? '<div class="bs-edit">'+
           '<label>Name</label>'+
@@ -15802,12 +16194,15 @@ function renderBrowserTab(data){
             '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
           '</div>'+
         '</div>'
-      : '<div class="bs-preview">'+preview+'</div>'+badgeRow+notesBlock;
+      : '<div class="bs-preview">'+preview+'</div>'+badgeRow+fpBlock+notesBlock;
+    const fpBtn = s.running ? ' <button class="btn btn-ghost" onclick="checkBrowserFingerprint(\''+id+'\')">Fingerprint</button>' : '';
+    const ipBtn = (_bsProxy&&_bsProxy.enabled)
+      ? ' <button class="btn btn-ghost" onclick="rotateBrowserIp(\''+id+'\')">New IP</button>' : '';
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
         '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
       body+
-      '<div class="bs-actions">'+openBtns+editBtn+rm+'</div>'+
+      '<div class="bs-actions">'+openBtns+editBtn+fpBtn+ipBtn+rm+'</div>'+
     '</div>';
   }).join('');
   const addRow = atLimit
@@ -15816,9 +16211,138 @@ function renderBrowserTab(data){
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
       '<div class="pf-banner">Independent browsers you (or Claude) can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
+      renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
     '</div>';
+}
+
+function _fmtBytes(n){
+  n = Number(n)||0;
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while(n >= 1024 && i < u.length-1){ n /= 1024; i++; }
+  return n.toFixed(n<10&&i>0?1:0)+u[i];
+}
+
+// --- Residential proxy panel -------------------------------------------------
+// Every browser exits through its own loopback port, so each has its own sticky
+// residential IP. Sites see a home ISP instead of this box's Google Cloud ASN,
+// which is the single loudest "you are a bot" signal there is.
+function renderBrowserProxyPanel(){
+  const p = _bsProxy;
+  if(!p) return '<div class="bs-proxy"><div class="bs-proxy-head"><span class="bs-proxy-title">Residential proxy</span>'+
+                '<span class="bs-proxy-sub">loading…</span></div></div>';
+  if(!p.installed) return '<div class="bs-proxy"><div class="bs-proxy-head">'+
+      '<span class="bs-proxy-title">Residential proxy</span>'+
+      '<span class="bs-proxy-sub">relay not installed (~/.claude-browser/bin/proxy_relay.py)</span></div></div>';
+  const on = !!p.enabled;
+  const dot = '<span class="bs-dot '+(on?'on':'off')+'"></span>';
+  const who = p.username ? esc(p.provider)+' · '+esc(p.username) : 'no account configured';
+  const head = '<div class="bs-proxy-head">'+dot+
+    '<span class="bs-proxy-title">Residential proxy</span>'+
+    '<span class="bs-badge '+(on?'ok':'warn')+'">'+(on?'ON':'direct')+'</span>'+
+    '<span class="bs-proxy-sub">'+who+' · '+_fmtBytes(p.total_bytes||0)+' used'+
+      (p.country?' · '+esc(p.country.toUpperCase()):'')+'</span></div>';
+  if(!_bsProxyEdit){
+    return '<div class="bs-proxy">'+head+
+      '<div class="bs-proxy-actions">'+
+        '<button class="btn" onclick="toggleBrowserProxy('+(on?'false':'true')+')">'+(on?'Turn off':'Turn on')+'</button> '+
+        '<button class="btn btn-ghost" onclick="editBrowserProxy()">Settings</button> '+
+        '<button class="btn btn-ghost" onclick="loadBrowserProxy(true)">Re-check exit IPs</button>'+
+      '</div></div>';
+  }
+  const opts = (p.providers||[]).map(x=>'<option value="'+esc(x)+'"'+(x===p.provider?' selected':'')+'>'+esc(x)+'</option>').join('');
+  return '<div class="bs-proxy">'+head+
+    '<div class="bs-proxy-form">'+
+      '<div><label>Provider</label><select id="bs-px-provider">'+opts+'</select></div>'+
+      '<div><label>Username</label><input id="bs-px-user" value="'+esc(p.username||'')+'" placeholder="account user"></div>'+
+      '<div><label>Password</label><input id="bs-px-pass" type="password" placeholder="'+(p.password_set?'unchanged':'account password')+'"></div>'+
+      '<div><label>Zone (Bright Data)</label><input id="bs-px-zone" value="'+esc(p.zone||'')+'" placeholder="optional"></div>'+
+      '<div><label>Country</label><input id="bs-px-country" value="'+esc(p.country||'')+'" placeholder="us — blank = any"></div>'+
+    '</div>'+
+    '<div class="bs-proxy-actions">'+
+      '<button class="btn btn-primary" onclick="saveBrowserProxy()">Save</button> '+
+      '<button class="btn btn-ghost" onclick="cancelBrowserProxyEdit()">Cancel</button>'+
+      '<span class="bs-proxy-sub">Credentials are stored on the server in ~/.claude-browser/proxy.json (mode 600) and never sent back to this page.</span>'+
+    '</div></div>';
+}
+
+async function loadBrowserProxy(check){
+  try{
+    const r = await fetch(BASE+'/api/browser/proxy'+(check?'?check=1':''));
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'failed');
+    _bsProxy = d;
+  }catch(e){ _bsProxy = {installed:false}; }
+  if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{});
+}
+
+function editBrowserProxy(){ _bsProxyEdit = true; renderBrowserTab(_bsData||{}); }
+function cancelBrowserProxyEdit(){ _bsProxyEdit = false; renderBrowserTab(_bsData||{}); }
+
+async function saveBrowserProxy(){
+  const g = id => { const el=document.getElementById(id); return el?el.value.trim():''; };
+  const body = {provider:g('bs-px-provider'), username:g('bs-px-user'),
+                zone:g('bs-px-zone'), country:g('bs-px-country')};
+  const pw = g('bs-px-pass');
+  if(pw) body.password = pw;      // blank keeps the stored one
+  try{
+    const r = await fetch(BASE+'/api/browser/proxy',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok){ alert(d.error||'Failed to save'); return; }
+  }catch(e){ alert('Failed: '+e.message); return; }
+  _bsProxyEdit = false;
+  loadBrowserProxy(true);
+}
+
+async function toggleBrowserProxy(on){
+  try{
+    const r = await fetch(BASE+'/api/browser/proxy',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:!!on})});
+    const d = await r.json();
+    if(!r.ok){ alert(d.error||'Failed'); return; }
+  }catch(e){ alert('Failed: '+e.message); return; }
+  // The relay re-reads its config within ~5s; no browser restart needed for the
+  // route itself, only for the clock to re-match the new exit IP.
+  setTimeout(()=>loadBrowserProxy(true), 6000);
+  _bsProxy = Object.assign({}, _bsProxy||{}, {enabled:!!on});
+  renderBrowserTab(_bsData||{});
+}
+
+async function rotateBrowserIp(id){
+  const s=_bsFind(id);
+  if(!confirm('Give "'+(s?s.name:id)+'" a new residential IP? Sites it is signed into may ask it to log in again.')) return;
+  try{
+    const r = await fetch(BASE+'/api/browser/proxy/'+encodeURIComponent(id)+'/rotate',{method:'POST'});
+    const d = await r.json();
+    if(!r.ok){ alert(d.error||'Failed'); return; }
+    const ex = d.exit||{};
+    alert(ex.ip ? ('New exit IP: '+ex.ip+' — '+(ex.org||'')+' ('+(ex.city||'')+', '+(ex.country||'')+')')
+                : ('Rotated, but the exit check failed: '+(ex.error||'unknown')));
+  }catch(e){ alert('Failed: '+e.message); return; }
+  loadBrowserProxy(true);
+}
+
+async function checkBrowserFingerprint(id){
+  _bsFp[id] = 'Running fingerprint audit…';
+  renderBrowserTab(_bsData||{});
+  try{
+    const r = await fetch(BASE+'/api/browser/fingerprint/'+encodeURIComponent(id));
+    const d = await r.json();
+    if(!r.ok){ _bsFp[id] = '<span class="fp-fail">Audit failed: '+esc(d.error||'error')+'</span>'; }
+    else{
+      const rows = (d.score||[]);
+      const fails = rows.filter(x=>x.level!=='ok');
+      const n = rows.length - fails.length;
+      _bsFp[id] = '<b>'+n+'/'+rows.length+' checks pass</b>'+
+        (fails.length? '<br>'+fails.map(x=>'<span class="fp-'+(x.level==='fail'?'fail':'warn')+'">'+
+            esc(x.check)+': '+esc(String(x.detail).slice(0,80))+'</span>').join('<br>')
+          : ' <span class="fp-ok">— looks like a normal desktop browser</span>');
+    }
+  }catch(e){ _bsFp[id] = '<span class="fp-fail">Audit failed: '+esc(e.message)+'</span>'; }
+  renderBrowserTab(_bsData||{});
 }
 
 function _bsFind(id){ return (_browserSessions||[]).find(x=>x.id===id); }
