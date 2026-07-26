@@ -986,6 +986,36 @@ class TestApiKeyShellQuoting:
         assert "subprocess" not in source
 
 
+# ─── Codex detached-session trust ───
+
+
+class TestCodexProjectTrust:
+    def test_adds_native_trust_and_preserves_other_sections(self):
+        from app import _ensure_codex_project_trust, tomllib
+
+        original = (
+            'model = "gpt-5.6-sol"\n\n'
+            '[mcp_servers.google]\ncommand = "uvx"\n'
+        )
+        result = _ensure_codex_project_trust(original, "/srv/grabo")
+        parsed = tomllib.loads(result)
+        assert parsed["projects"]["/srv/grabo"]["trust_level"] == "trusted"
+        assert parsed["mcp_servers"]["google"]["command"] == "uvx"
+
+    def test_replaces_untrusted_marker_idempotently(self):
+        from app import _ensure_codex_project_trust
+
+        original = (
+            '[projects."/srv/grabo"]\n'
+            'trust_level = "untrusted"\n'
+            'trust_level = "untrusted"\n'
+        )
+        result = _ensure_codex_project_trust(original, "/srv/grabo")
+        assert result.count('trust_level = "trusted"') == 1
+        assert "untrusted" not in result
+        assert _ensure_codex_project_trust(result, "/srv/grabo") == result
+
+
 # ─── Atomic JSON Write Tests ───
 
 

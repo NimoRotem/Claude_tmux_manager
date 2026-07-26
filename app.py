@@ -247,6 +247,7 @@ def _restore_default_model_setting():
             "approval_policy": "never",
         }
         merged = _merge_top_level_toml_keys(existing, managed)
+        merged = _ensure_codex_project_trust(merged, os.getcwd())
         if merged != existing:
             _backup_before_dashboard_write(cfg)
             cfg.write_text(merged)
@@ -948,13 +949,20 @@ def _ensure_user_codex_config_dir(user: dict):
     if not memory_md.exists():
         memory_md.write_text(f"# {user.get('username', user['id'])}'s Memory Index\n")
     config_toml = d / "config.toml"
-    if not config_toml.exists():
-        config_toml.write_text(
+    existing_config = config_toml.read_text() if config_toml.exists() else ""
+    if existing_config:
+        desired_config = existing_config
+    else:
+        desired_config = (
             f'model = "{_CODEX_DEFAULT_MODEL}"\n'
             f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
             'sandbox_mode = "danger-full-access"\n'
             'approval_policy = "never"\n'
         )
+    desired_config = _ensure_codex_project_trust(desired_config, os.getcwd())
+    if desired_config != existing_config:
+        _backup_before_dashboard_write(config_toml)
+        config_toml.write_text(desired_config)
     key = _active_openai_key()
     if key and not (d / "auth.json").exists():
         try:
@@ -3078,6 +3086,7 @@ def _set_team_model_effort(cfg_dir: Path):
             "sandbox_mode": "workspace-write",
             "approval_policy": "never",
         })
+        merged = _ensure_codex_project_trust(merged, os.getcwd())
         if merged != existing:
             _backup_before_dashboard_write(sp)
             sp.parent.mkdir(parents=True, exist_ok=True)
@@ -7432,6 +7441,53 @@ def _merge_top_level_toml_keys(existing: str, managed: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def _ensure_codex_project_trust(existing: str, project_dir: str) -> str:
+    """Persist Codex's native trust marker for the detached-session workdir.
+
+    Interactive Codex asks whether a directory is trusted before showing its
+    prompt. Detached tmux sessions cannot safely complete that onboarding flow,
+    so every dashboard-managed CODEX_HOME explicitly trusts the directory from
+    which the dashboard launches Codex. Other project and MCP sections remain
+    untouched.
+    """
+    project = str(Path(project_dir).expanduser().resolve())
+    header = f'[projects."{_toml_escape(project)}"]'
+    lines = existing.splitlines()
+    section_start = next(
+        (index for index, line in enumerate(lines) if line.strip() == header),
+        None,
+    )
+    if section_start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend((header, 'trust_level = "trusted"'))
+        return "\n".join(lines).rstrip() + "\n"
+
+    section_end = next(
+        (
+            index
+            for index in range(section_start + 1, len(lines))
+            if lines[index].strip().startswith("[")
+            and lines[index].strip().endswith("]")
+        ),
+        len(lines),
+    )
+    trust_line = re.compile(r"^\s*trust_level\s*=")
+    matches = [
+        index
+        for index in range(section_start + 1, section_end)
+        if trust_line.match(lines[index])
+    ]
+    if matches:
+        first = matches[0]
+        lines[first] = 'trust_level = "trusted"'
+        for duplicate in reversed(matches[1:]):
+            del lines[duplicate]
+    else:
+        lines.insert(section_start + 1, 'trust_level = "trusted"')
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _materialize_profile(profile: dict):
     """Write config.toml, AGENTS.md, MEMORY.md, and ensure skills/ exists.
 
@@ -7469,11 +7525,13 @@ def _materialize_profile(profile: dict):
         if is_default:
             existing = config_path.read_text() if config_path.exists() else ""
             merged = _merge_top_level_toml_keys(existing, managed)
+            merged = _ensure_codex_project_trust(merged, os.getcwd())
             if merged != existing:
                 _backup_before_dashboard_write(config_path)
                 config_path.write_text(merged)
         else:
             rendered = _render_codex_config_toml(managed)
+            rendered = _ensure_codex_project_trust(rendered, os.getcwd())
             existing = config_path.read_text() if config_path.exists() else ""
             if rendered != existing:
                 _backup_before_dashboard_write(config_path)
