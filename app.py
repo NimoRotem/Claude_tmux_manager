@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import mimetypes
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -663,6 +664,11 @@ async def lifespan(_app: FastAPI):
     model_refresh_task = asyncio.create_task(_model_refresh_loop())
     _background_tasks.append(model_refresh_task)
     logger.info("Model auto-detect started (default=%s, %d models)", DEFAULT_MODEL, len(MODEL_CATALOG))
+
+    autopark_task = asyncio.create_task(browser_autopark_watchdog())
+    _background_tasks.append(autopark_task)
+    logger.info("Browser auto-park watchdog started (idle %.0fmin + >%.0f%% CPU)",
+                BROWSER_AUTOPARK_IDLE_S / 60, BROWSER_BUSY_CPU_PCT)
 
     yield  # Application is running
 
@@ -5255,6 +5261,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
         **_session_model_fields(sess["name"]),
+        **_session_auth_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
     }
 
@@ -5324,6 +5331,7 @@ async def api_sessions_fast(request: Request):
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             **_session_model_fields(sess["name"]),
+            **_session_auth_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
         })
     return JSONResponse(out)
@@ -5368,6 +5376,7 @@ async def api_status(request: Request):
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             **_session_model_fields(sess["name"]),
+            **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
 
@@ -8368,14 +8377,22 @@ def _ensure_browser_launcher():
 # maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
 # viewer landed on UPS's RFB and hung on a VNC password prompt. There the
 # claude-vnc unit runs on 5902/6082 and these env vars point us at it.
+#
+# external_url is host-dependent for the same reason and MUST NOT be hardwired:
+# rotem.ai/browsertool is nginx on builder reverse-proxying to *instance-3's*
+# noVNC (10.128.0.5:6080). Baking it in here made builder's own dashboard offer
+# a "Direct" link to a different machine's browser — so the header sign-in dot
+# (which reads the LOCAL Chrome on CDP 9222) said "signed out" while the link
+# right next to it showed instance-3's signed-in Chrome. Set
+# CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
+# everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
+# only correct way in.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
     "cdp_port": 9222, "managed": False,
-    "external_url": ("https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify"
-                     "&autoconnect=true&resize=scale&shared=true"
-                     "&reconnect=true&reconnect_delay=2000"),
+    "external_url": os.environ.get("CB_DEFAULT_EXTERNAL_URL", ""),
 }
 
 
@@ -8939,6 +8956,50 @@ _PAID_CAPS = ("claude_pro", "claude_max", "pro", "max", "team", "enterprise", "r
 _browser_auth_cache: Dict[str, dict] = {}   # sid -> {"data": {...}, "ts": float}
 _BROWSER_AUTH_TTL = 120
 
+# Last probe that positively saw a signed-in account, per browser. A single
+# failed probe must NOT flip the header dot to red: these browsers egress
+# through a rotating residential proxy (~30-min sticky sessions), and when the
+# exit IP changes claude.ai answers one round of `account_session_invalid` /
+# bounces to `/login?from=logout` before the SPA re-establishes. Treated as
+# ground truth that showed the dot red while the browser was plainly signed in.
+# Within the grace window a negative probe is reported as "unconfirmed", and the
+# last known-good account is kept, so only a *sustained* signed-out state reds
+# the dot.
+_browser_auth_good: Dict[str, dict] = {}    # sid -> {"data": {...}, "ts": float}
+_BROWSER_AUTH_GRACE = 1800
+
+# Probe bodies that mean "ask again", not "signed out".
+_AUTH_TRANSIENT = ("account_session_invalid", "just a moment", "cloudflare",
+                   "checking your browser", "rate_limit", "overloaded")
+
+
+async def _probe_claude_account(tab) -> dict:
+    """One read of claude.ai's org list in an already-open tab."""
+    out = {"logged_in": False, "email": "", "can_authorize": False,
+           "capabilities": [], "error": "", "transient": False}
+    await tab.navigate("https://claude.ai/api/organizations", settle=0.8)
+    txt = ((await tab.eval("document.body ? document.body.innerText : ''")) or "").strip()
+    low = txt.lower()
+    if txt.startswith("["):
+        orgs = json.loads(txt)
+        out["logged_in"] = True
+        caps = []
+        for o in orgs:
+            caps += [str(x).lower() for x in (o.get("capabilities") or [])]
+            nm = o.get("name") or ""
+            if "@" in nm and not out["email"]:
+                out["email"] = nm.split("'")[0]
+        out["capabilities"] = sorted(set(caps))
+        out["can_authorize"] = any(c in _PAID_CAPS for c in caps)
+        if not out["can_authorize"]:
+            out["error"] = "signed in, but this account has no Max/Pro plan"
+    elif any(m in low for m in _AUTH_TRANSIENT) or not txt:
+        out["error"] = "claude.ai did not answer cleanly — retrying"
+        out["transient"] = True
+    else:
+        out["error"] = "not signed in to claude.ai"
+    return out
+
 
 async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) -> dict:
     """Is this browser signed into claude.ai, as whom, and can that account
@@ -8952,27 +9013,33 @@ async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) 
     try:
         async with _browser_busy_ctx(sid, "checking claude.ai login"):
             async with _cdp_tab(cdp_port) as tab:
-                await tab.navigate("https://claude.ai/api/organizations", settle=0.8)
-                txt = ((await tab.eval("document.body ? document.body.innerText : ''")) or "").strip()
-                if txt.startswith("["):
-                    orgs = json.loads(txt)
-                    out["logged_in"] = True
-                    caps = []
-                    for o in orgs:
-                        caps += [str(x).lower() for x in (o.get("capabilities") or [])]
-                        nm = o.get("name") or ""
-                        if "@" in nm and not out["email"]:
-                            out["email"] = nm.split("'")[0]
-                    out["capabilities"] = sorted(set(caps))
-                    out["can_authorize"] = any(c in _PAID_CAPS for c in caps)
-                    if not out["can_authorize"]:
-                        out["error"] = "signed in, but this account has no Max/Pro plan"
-                elif "just a moment" in txt.lower() or "cloudflare" in txt.lower():
-                    out["error"] = "Cloudflare challenge — retry"
-                else:
-                    out["error"] = "not signed in to claude.ai"
+                out = await _probe_claude_account(tab)
+                # One immediate retry: a proxy rotation costs exactly one round
+                # trip, and re-reading is far cheaper than a wrong red dot.
+                if not out["logged_in"]:
+                    await asyncio.sleep(2)
+                    retry = await _probe_claude_account(tab)
+                    if retry["logged_in"] or not out.get("transient"):
+                        out = retry
     except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
+        out = {"logged_in": False, "email": "", "can_authorize": False,
+               "capabilities": [], "error": f"{type(e).__name__}: {e}", "transient": True}
+    out.pop("transient", None)
+    if out["logged_in"]:
+        _browser_auth_good[sid] = {"data": dict(out), "ts": time.time()}
+    else:
+        good = _browser_auth_good.get(sid)
+        if good and time.time() - good["ts"] < _BROWSER_AUTH_GRACE:
+            logger.info("claude.ai probe for browser '%s' failed (%s) — keeping the "
+                        "last known-good sign-in (%s, %.0fs old)",
+                        sid, out["error"], good["data"].get("email") or "?",
+                        time.time() - good["ts"])
+            out = dict(good["data"])
+            out["unconfirmed"] = True
+            out["error"] = "last check did not reach claude.ai — showing the last known state"
+        else:
+            logger.warning("Browser '%s' reads as signed out of claude.ai: %s",
+                           sid, out["error"])
     _browser_auth_cache[sid] = {"data": out, "ts": time.time()}
     return out
 
@@ -9009,6 +9076,190 @@ def _pick_login_browser() -> dict:
     return running[0] if len(running) == 1 else {}
 
 
+# --- Is a browser actually *doing* something? -------------------------------
+# xprintidle only sees a human at the virtual display and _browser_busy only
+# sees us driving over CDP. Neither notices the third case, which is the one
+# that hurts: a tab left open rendering an animation. Chrome here runs on
+# SwiftShader (software GL) over Xvfb, so that rasterises on the CPU forever —
+# a MetaMask onboarding tab took the GPU process to 230% and the 4-vCPU box to
+# load 4+ while every indicator on the dashboard said "idle". So measure CPU.
+_browser_cpu_sample: Dict[str, dict] = {}   # sid -> {"ticks": int, "ts": float}
+# Above this the browser counts as working (amber, flashing).
+BROWSER_BUSY_CPU_PCT = float(os.environ.get("CB_BUSY_CPU_PCT") or 25)
+# Auto-park a browser burning CPU with nobody driving it, after this long idle.
+BROWSER_AUTOPARK_IDLE_S = float(os.environ.get("CB_AUTOPARK_IDLE_S") or 600)
+_CLK_TCK = float(os.sysconf("SC_CLK_TCK") or 100)
+
+
+def _browser_pids(cdp_port: int) -> list:
+    """Every process in the tree of the Chrome serving this CDP port."""
+    root = 0
+    try:
+        for line in subprocess.run(["pgrep", "-af", f"remote-debugging-port={cdp_port}"],
+                                   capture_output=True, text=True, timeout=5).stdout.splitlines():
+            pid, _, cmd = line.partition(" ")
+            # The browser process, not a --type=renderer child that inherited the flag.
+            if pid.isdigit() and "--type=" not in cmd:
+                root = int(pid)
+                break
+    except Exception:
+        return []
+    if not root:
+        return []
+    pids, frontier = [root], [root]
+    while frontier:
+        try:
+            kids = subprocess.run(["pgrep", "-P", ",".join(str(p) for p in frontier)],
+                                  capture_output=True, text=True, timeout=5).stdout.split()
+        except Exception:
+            break
+        frontier = [int(k) for k in kids if k.isdigit() and int(k) not in pids]
+        pids.extend(frontier)
+    return pids
+
+
+def _browser_cpu_pct(sid: str, cdp_port: int) -> float:
+    """CPU% of a browser's whole process tree since the previous call.
+
+    Percent of ONE core, so a 4-thread SwiftShader rasteriser reads as ~400.
+    First call for a session returns -1 (no baseline yet).
+    """
+    total = 0
+    for pid in _browser_pids(cdp_port):
+        try:
+            f = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+            total += int(f[11]) + int(f[12])      # utime + stime
+        except Exception:
+            continue
+    now = time.time()
+    prev = _browser_cpu_sample.get(sid)
+    _browser_cpu_sample[sid] = {"ticks": total, "ts": now}
+    if not prev or now <= prev["ts"]:
+        return -1.0
+    elapsed = now - prev["ts"]
+    if elapsed < 1.5:                     # too short to be meaningful; reuse last
+        _browser_cpu_sample[sid] = prev
+        return prev.get("pct", -1.0)
+    pct = (total - prev["ticks"]) / _CLK_TCK / elapsed * 100
+    _browser_cpu_sample[sid]["pct"] = max(0.0, pct)
+    return max(0.0, pct)
+
+
+async def _browser_park(sid: str, cdp_port: int) -> dict:
+    """Close every tab, leaving one about:blank.
+
+    This is the whole "pause" story: Chrome keeps running, and the profile —
+    cookies, the claude.ai session, extension state — is on disk and untouched,
+    so nothing has to sign in again. Only the rendering work goes away.
+    """
+    base = f"http://127.0.0.1:{cdp_port}"
+    closed = 0
+    async with httpx.AsyncClient(timeout=20) as c:
+        try:
+            targets = (await c.get(f"{base}/json/list")).json()
+        except Exception as e:
+            return {"ok": False, "error": f"CDP unreachable: {e}"}
+        pages = [t for t in targets if t.get("type") == "page"]
+        keep = ""
+        for t in pages:
+            if t.get("url", "").startswith("about:blank") and not keep:
+                keep = t["id"]
+                continue
+            try:
+                await c.get(f"{base}/json/close/{t['id']}")
+                closed += 1
+            except Exception:
+                logger.debug("Park: failed to close tab %s", t.get("id"), exc_info=True)
+        if not keep:
+            # Chrome exits when its last tab closes; always leave one behind.
+            try:
+                await c.put(f"{base}/json/new?about:blank")
+            except Exception:
+                logger.debug("Park: failed to open the placeholder tab", exc_info=True)
+    _browser_parked[sid] = time.time()
+    logger.info("Parked browser '%s': closed %d tab(s); profile and sign-in untouched",
+                sid, closed)
+    return {"ok": True, "closed": closed}
+
+
+_browser_parked: Dict[str, float] = {}      # sid -> when we parked it
+_browser_calm_since: Dict[str, float] = {}  # sid -> since when nobody has driven it
+
+
+@app.post("/api/browser/{sid}/park")
+async def api_browser_park(sid: str, request: Request):
+    """Manually park a browser (close its tabs, keep it signed in)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = next((x for x in _load_browser_sessions() if x.get("id") == sid), None)
+    if not s:
+        return JSONResponse({"error": "unknown browser session"}, status_code=404)
+    res = await _browser_park(sid, s.get("cdp_port", 0))
+    return JSONResponse(res, status_code=200 if res.get("ok") else 502)
+
+
+@app.post("/api/browser/{sid}/autopark")
+async def api_browser_set_autopark(sid: str, request: Request):
+    """Toggle the idle auto-park lock for one browser."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled", True))
+    sessions = _load_browser_sessions()
+    if not any(x.get("id") == sid for x in sessions):
+        return JSONResponse({"error": "unknown browser session"}, status_code=404)
+    for x in sessions:
+        if x.get("id") == sid:
+            x["auto_park"] = enabled
+    _save_browser_sessions(sessions)
+    return JSONResponse({"ok": True, "auto_park": enabled})
+
+
+async def browser_autopark_watchdog():
+    """Park a browser that is burning CPU with nobody driving it.
+
+    Deliberately conservative: only fires when the browser is *both* idle (no
+    input at its display, no CDP work from us) for BROWSER_AUTOPARK_IDLE_S
+    *and* still above the busy threshold — i.e. exactly the runaway-animation
+    case. An agent that is actively using the browser keeps _browser_busy set,
+    which resets the calm clock, so its tabs are never pulled out from under it.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            for s in _load_browser_sessions():
+                sid = s.get("id")
+                if s.get("auto_park") is False:
+                    _browser_calm_since.pop(sid, None)
+                    continue
+                cdp = s.get("cdp_port", 0)
+                if not await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0)):
+                    continue
+                idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0))
+                driven = sid in _browser_busy
+                human = 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS
+                now = time.time()
+                if driven or human:
+                    _browser_calm_since[sid] = now
+                    _browser_parked.pop(sid, None)
+                    continue
+                calm_from = _browser_calm_since.setdefault(sid, now)
+                if now - calm_from < BROWSER_AUTOPARK_IDLE_S:
+                    continue
+                pct = await asyncio.to_thread(_browser_cpu_pct, sid, cdp)
+                if pct >= BROWSER_BUSY_CPU_PCT:
+                    logger.warning("Browser '%s' idle for %.0fmin but still at %.0f%% CPU "
+                                   "— parking it", sid, (now - calm_from) / 60, pct)
+                    await _browser_park(sid, cdp)
+                    _browser_calm_since[sid] = now
+        except Exception:
+            logger.debug("browser_autopark_watchdog cycle failed", exc_info=True)
+        await asyncio.sleep(60)
+
+
 @app.get("/api/browser/auth-status")
 async def api_browser_auth_status(request: Request, refresh: int = 0):
     """Header indicator state: is any browser signed into claude.ai with an
@@ -9029,28 +9280,41 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
                 acct = await _browser_claude_account(sid, s.get("cdp_port", 0), force=bool(refresh))
             else:
                 acct = cached["data"]
-        # "In use" = real input on its X display (someone driving it over noVNC)
-        # OR us driving it over CDP right now.
+        # "In use" = real input on its X display (someone driving it over noVNC),
+        # OR us driving it over CDP right now, OR the browser burning CPU on its
+        # own — a background tab rendering something is work, and work the box is
+        # paying for, so it has to light the indicator like any other use.
         idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0)) if alive else -1
         driven = sid in _browser_busy
-        active = driven or (0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS)
+        human = 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS
+        cpu_pct = await asyncio.to_thread(_browser_cpu_pct, sid, s.get("cdp_port", 0)) if alive else -1
+        rendering = cpu_pct >= BROWSER_BUSY_CPU_PCT
+        active = driven or human or rendering
+        why = ((_browser_busy.get(sid) or {}).get("what", "")
+               or ("someone is using it over noVNC" if human else "")
+               or (f"rendering in the background ({cpu_pct:.0f}% CPU)" if rendering else ""))
         out.append({
             "id": sid, "name": s.get("name", ""), "running": alive,
             "use_for_login": bool(s.get("use_for_login")) or (login_pick.get("id") == sid),
             "busy": driven,
             "busy_what": (_browser_busy.get(sid) or {}).get("what", ""),
             "idle_ms": idle_ms, "active": active,
+            "cpu_pct": round(cpu_pct, 1), "rendering": rendering, "why": why,
+            "auto_park": s.get("auto_park", True) is not False,
+            "parked_ago": (round(time.time() - _browser_parked[sid])
+                           if sid in _browser_parked else None),
             **acct,
         })
     return JSONResponse({
         "sessions": out,
         "any_logged_in": any(x["logged_in"] for x in out),
         "any_can_authorize": any(x["can_authorize"] for x in out),
-        # A signed-in browser is being used right now (by a person over noVNC or
-        # by us) -> the indicator blinks.
+        # A signed-in browser is being used right now (by a person over noVNC, by
+        # us, or by a tab of its own that is still rendering) -> amber, flashing.
         "active": any(x["active"] and x["logged_in"] for x in out),
-        "active_what": next((x["busy_what"] or ("in use: " + x["name"])
+        "active_what": next((x["why"] or ("in use: " + x["name"])
                              for x in out if x["active"] and x["logged_in"]), ""),
+        "busy_cpu_pct": BROWSER_BUSY_CPU_PCT,
         "busy": bool(_browser_busy),
         "busy_what": next((v.get("what", "") for v in _browser_busy.values()), ""),
         "login_browser": login_pick.get("id", ""),
@@ -9653,6 +9917,89 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 _ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
 _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after": 0}
 
+# --- Dedicated credential for the usage bars -------------------------------
+#
+# The 5h/7d bars read https://api.anthropic.com/api/oauth/usage, which requires
+# account scope (`any_of(user:profile, user:office)`). The box authenticates
+# Claude Code with a long-lived `claude setup-token` credential, and that token
+# type is inference-only: it *lists* `user:profile` in the local `scopes` field
+# but the real grant does not include it, so the account endpoints answer
+#     403 permission_error: OAuth token does not meet scope requirement
+# regardless of how recently the setup-token was minted.
+#
+# We cannot simply log in interactively instead: a cron runs
+# ~/.claude/ensure-longlived-token.sh every 10 minutes and forces
+# ~/.claude/.credentials.json back to the long-lived token. That cron is
+# deliberate — it is the cure for the parallel-session OAuth rotation war.
+#
+# So the usage fetcher gets its own credential, written by
+# `usage_oauth_login.py` and living OUTSIDE ~/.claude/ where the healing cron
+# never looks. Claude Code keeps the stable long-lived token; the dashboard gets
+# account scope; neither disturbs the other.
+_USAGE_OAUTH_FILE = MESSAGES_DIR / "usage_oauth.json"
+_USAGE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_usage_oauth_lock = threading.Lock()
+
+
+def _usage_oauth_refresh(cred: dict) -> str:
+    """Refresh the dedicated usage credential in place. Returns the new token."""
+    import urllib.request
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": cred.get("refreshToken", ""),
+        "client_id": _USAGE_OAUTH_CLIENT_ID,
+    }).encode()
+    last = None
+    for url in ("https://console.anthropic.com/v1/oauth/token",
+                "https://platform.claude.com/v1/oauth/token"):
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                r = json.loads(resp.read().decode("utf-8"))
+            cred["accessToken"] = r.get("access_token", "")
+            # The refresh token rotates; keep the newest or we lock ourselves out.
+            if r.get("refresh_token"):
+                cred["refreshToken"] = r["refresh_token"]
+            cred["expiresAt"] = int((time.time() + int(r.get("expires_in") or 3600)) * 1000)
+            _USAGE_OAUTH_FILE.write_text(json.dumps(cred))
+            os.chmod(_USAGE_OAUTH_FILE, 0o600)
+            logger.info("Refreshed the dedicated usage-bars OAuth credential")
+            return cred["accessToken"]
+        except Exception as e:
+            last = e
+    logger.warning("Usage-bars credential refresh failed: %s", last)
+    return ""
+
+
+def _usage_access_token() -> tuple[str, str]:
+    """Token for the usage API, plus which source it came from.
+
+    Prefers the dedicated account-scoped credential; falls back to the shared
+    Claude Code credential so nothing breaks before that file is set up (the
+    fallback will 403 on a setup-token, which the caller reports as such).
+    """
+    with _usage_oauth_lock:
+        try:
+            cred = json.loads(_USAGE_OAUTH_FILE.read_text())
+            tok = cred.get("accessToken", "") or ""
+            # Refresh a minute before expiry rather than after a failed call.
+            if tok and int(cred.get("expiresAt") or 0) > (time.time() + 60) * 1000:
+                return tok, "dedicated"
+            if cred.get("refreshToken"):
+                tok = _usage_oauth_refresh(cred)
+                if tok:
+                    return tok, "dedicated"
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("Unusable dedicated usage credential", exc_info=True)
+    try:
+        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        return (creds.get("claudeAiOauth", {}).get("accessToken", "") or ""), "shared"
+    except Exception:
+        return "", "none"
+
 
 def _load_anthropic_limits_cache():
     try:
@@ -9741,13 +10088,7 @@ async def api_anthropic_usage_limits():
     """
     now = time.time()
     now_dt = datetime.now(timezone.utc)
-    creds_file = Path.home() / ".claude" / ".credentials.json"
-    token = ""
-    try:
-        creds = json.loads(creds_file.read_text())
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "") or ""
-    except Exception:
-        pass
+    token, token_source = _usage_access_token()
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
     fp = hashlib.sha1(token.encode()).hexdigest()[:16]
@@ -9810,6 +10151,19 @@ async def api_anthropic_usage_limits():
                 pass
             _anthropic_limits_cache["retry_after"] = now + delay
             logger.warning("Anthropic usage API rate-limited; backing off %ss", delay)
+        elif status == 403:
+            # Wrong credential *type*, not a transient failure. A setup-token is
+            # inference-only, so re-minting one changes nothing — retrying just
+            # burns into the shared rate limit. Back off hard and say why.
+            _anthropic_limits_cache["retry_after"] = now + 3600
+            logger.warning(
+                "Usage API 403 (needs account scope). Token source: %s. "
+                "Run usage_oauth_login.py to grant the dashboard its own "
+                "account-scoped credential.", token_source)
+            if not _anthropic_limits_cache["data"]:
+                return JSONResponse(
+                    {"error": "needs_account_scope", "token_source": token_source},
+                    status_code=403)
         else:
             logger.warning("Anthropic OAuth usage fetch failed: %s", e)
         return _stale_or_error()
@@ -10059,6 +10413,111 @@ _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 # Model switches requested via the header dropdown, not yet confirmed by the
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
 _session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+
+
+# --- How is each session actually signed in? --------------------------------
+# Three credential shapes reach a `claude` process and they behave differently
+# enough that you need to see which one a session got:
+#
+#   Claude Max(S)  short-lived interactive OAuth from ~/.claude/.credentials.json.
+#                  Auto-refreshes, and account endpoints (the 5h/7d usage API)
+#                  accept it.
+#   Claude Max(L)  long-lived `claude setup-token` exported as
+#                  CLAUDE_CODE_OAUTH_TOKEN. Stable across parallel sessions (no
+#                  refresh-token rotation war) but inference-only: it cannot
+#                  read /api/oauth/usage, which is why a host running on (L)
+#                  needs the separate usage credential.
+#   API sk-…XXXX   metered ANTHROPIC_API_KEY. Bills per token, not the plan.
+#
+# Read from the live process environment rather than from what we *intended* at
+# launch: sessions outlive credential changes, and the env is the ground truth.
+_session_auth_label_cache: Dict[str, dict] = {}
+_AUTH_LABEL_TTL = 60
+
+
+def _plan_name(sub_type: str) -> str:
+    st = (sub_type or "").lower()
+    if "max" in st:
+        return "Claude Max"
+    if "pro" in st:
+        return "Claude Pro"
+    if "team" in st or "enterprise" in st:
+        return "Claude Team"
+    return "Claude"
+
+
+def _creds_plan(config_dir: str = "") -> str:
+    """Plan name from a credentials file (defaults to the shared one)."""
+    base = Path(config_dir) if config_dir else (Path.home() / ".claude")
+    try:
+        d = json.loads((base / ".credentials.json").read_text())
+        return _plan_name(d.get("claudeAiOauth", {}).get("subscriptionType", ""))
+    except Exception:
+        return "Claude"
+
+
+def _session_claude_env(session_name: str) -> dict:
+    """Environment of the `claude` process running in a session's first pane."""
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=5).stdout.split()
+    except Exception:
+        return {}
+    pids = [p for p in out if p.isdigit()]
+    # The pane's own pid is a shell; `claude` is a descendant of it.
+    for pid in pids:
+        try:
+            kids = subprocess.run(["pgrep", "-P", pid], capture_output=True,
+                                  text=True, timeout=5).stdout.split()
+        except Exception:
+            kids = []
+        for cand in [*kids, pid]:
+            try:
+                if "claude" not in Path(f"/proc/{cand}/cmdline").read_bytes().decode(
+                        "utf-8", "replace"):
+                    continue
+                raw = Path(f"/proc/{cand}/environ").read_bytes().decode("utf-8", "replace")
+            except Exception:
+                continue
+            env = {}
+            for item in raw.split("\0"):
+                k, _, v = item.partition("=")
+                if k:
+                    env[k] = v
+            return env
+    return {}
+
+
+def _session_auth_fields(session_name: str) -> dict:
+    """`auth_label` / `auth_kind` for API payloads (see the block comment above)."""
+    now = time.time()
+    cached = _session_auth_label_cache.get(session_name)
+    if cached and now - cached["ts"] < _AUTH_LABEL_TTL:
+        return cached["data"]
+    env = _session_claude_env(session_name)
+    key = (env.get("ANTHROPIC_API_KEY") or "").strip()
+    tok = (env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    cfg = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if key:
+        data = {"auth_kind": "api",
+                "auth_label": "API " + (key[:2] + "…" + key[-4:] if len(key) > 8 else "key"),
+                "auth_detail": "Metered ANTHROPIC_API_KEY — billed per token, not on the plan."}
+    elif tok:
+        data = {"auth_kind": "longlived",
+                "auth_label": _creds_plan(cfg) + "(L)",
+                "auth_detail": "Long-lived setup-token (CLAUDE_CODE_OAUTH_TOKEN): stable "
+                               "across parallel sessions, but inference-only — it cannot "
+                               "read the 5h/7d usage API."}
+    elif env:
+        data = {"auth_kind": "shortlived",
+                "auth_label": _creds_plan(cfg) + "(S)",
+                "auth_detail": "Short-lived interactive OAuth credential — auto-refreshes, "
+                               "and account endpoints accept it."}
+    else:
+        data = {"auth_kind": "", "auth_label": "", "auth_detail": ""}
+    _session_auth_label_cache[session_name] = {"data": data, "ts": now}
+    return data
 
 
 def _session_model_fields(session_name: str) -> dict:
@@ -11875,6 +12334,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .badge.attached{background:#238636;color:#fff}
 .badge.detached{background:#6e7681;color:#fff}
 .badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500;cursor:pointer;user-select:none}
+/* How the session is signed in. Colour-coded because the difference matters:
+   plan-billed short-lived (blue), plan-billed long-lived (purple), metered API
+   key (amber — money leaves the plan). */
+.badge.auth-badge{font-size:.65rem;font-weight:600;letter-spacing:.02em;cursor:help;border:1px solid transparent}
+.badge.auth-badge.shortlived{background:#1f6feb22;color:#79c0ff;border-color:#1f6feb55}
+.badge.auth-badge.longlived{background:#8957e522;color:#d2a8ff;border-color:#8957e555}
+.badge.auth-badge.api{background:#d2992222;color:#e3b341;border-color:#d2992255}
 .badge.model-badge:hover{background:#3c444d;color:#e6edf3}
 .badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
 .badge.model-badge.pending{opacity:.75;font-style:italic}
@@ -12371,10 +12837,17 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
 /* Blinking green: the signed-in browser is being used right now (a person over
    noVNC, or Claude driving it in the background). */
-.nav-browser-badge.ok.active{border-color:#3fb950}
-.nav-browser-badge.ok.active .nbb-dot{animation:nbb-blink 1s ease-in-out infinite}
+/* In use / doing work = AMBER and flashing, not green. Green means "signed in
+   and quiet"; a browser that is rendering something in the background is
+   spending this box's CPU, and that has to be visible at a glance — an idle-
+   looking green dot is exactly how a runaway tab pinned 230% CPU unnoticed. */
+.nav-browser-badge.ok.active{border-color:#d29922}
+.nav-browser-badge.ok.active .nbb-dot{background:#d29922;animation:nbb-blink 1s ease-in-out infinite}
 .nav-browser-badge.ok.active .nbb-glyph{animation:nbb-pulse 1.6s ease-in-out infinite}
-@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #3fb950}50%{opacity:.3;box-shadow:none}}
+@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #d29922}50%{opacity:.3;box-shadow:none}}
+/* Parked: tabs closed to free the CPU, profile (and the claude.ai session) intact. */
+.nav-browser-badge.parked .nbb-dot{background:#6e7681;box-shadow:none}
+.nav-browser-badge.parked .nbb-glyph{filter:grayscale(1) opacity(.5)}
 .nav-browser-badge.ok .nbb-glyph{filter:none}
 /* Working: the dot becomes a spinning ring so background use is obvious. */
 .nav-browser-badge.busy{border-color:#58a6ff}
@@ -12746,6 +13219,16 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+
+// Transient one-line feedback in the header. There is no toast system here and
+// one line beats a modal for "done, here's what happened".
+let _toastTimer=null;
+function showToast(msg, ms){
+  if(!statusInfoEl) return;
+  statusInfoEl.textContent = msg;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(()=>{ statusInfoEl.textContent='Watching for changes...'; }, ms||6000);
+}
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
@@ -13298,6 +13781,16 @@ function statusLabel(s){
   return'...';
 }
 
+// How this session authenticates, shown beside the idle/working pill. (S) is a
+// short-lived auto-refreshing OAuth credential, (L) a long-lived setup-token
+// (stable across parallel sessions but inference-only), "API sk-…" a metered
+// key. Which one a session got changes both billing and what it can read.
+function authBadge(s){
+  if(!s.auth_label)return'';
+  return '<span class="badge auth-badge '+esc(s.auth_kind||'')+'" title="'+
+         esc(s.auth_detail||'')+'">'+esc(s.auth_label)+'</span>';
+}
+
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   const brand=navEl.querySelector('.nav-brand');
@@ -13386,6 +13879,7 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
+        ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
@@ -16036,6 +16530,12 @@ async function refreshBrowserAuthBadge(){
     if(!d.any_can_authorize){
       title += ' Note: no signed-in account has a Max/Pro plan.';
     }
+    // Stayed green off the last known-good check because claude.ai did not
+    // answer this round (rotating-proxy exit IP change). Say so rather than
+    // implying the state was just verified.
+    if(d.sessions.some(s=>s.logged_in && s.unconfirmed)){
+      title += ' (Last check did not reach claude.ai — showing the last known state.)';
+    }
   }
   el.title = title;
 }
@@ -16104,7 +16604,10 @@ function renderBrowserTab(data){
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
-      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
+      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'')+
+      (s.running? ' <button class="btn btn-ghost" onclick="parkBrowser(\''+id+'\')"'+
+        ' title="Close this browser\'s tabs to stop it burning CPU. The profile — cookies, the'+
+        ' claude.ai session, extension state — is untouched, so nothing signs in again.">Park</button>':'');
     const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
     const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
     const preview = s.running
@@ -16122,6 +16625,21 @@ function renderBrowserTab(data){
     else if(a.logged_in) badges += '<span class="bs-badge warn">signed in'+(a.email?' · '+esc(a.email):'')+' · no Max/Pro</span>';
     else if(a.running) badges += '<span class="bs-badge bad">not signed in to claude.ai</span>';
     if(a.use_for_login) badges += '<span class="bs-badge login">login browser</span>';
+    // What it is costing right now, and whether the idle auto-park is armed.
+    if(a.running && typeof a.cpu_pct === 'number' && a.cpu_pct >= 0){
+      badges += '<span class="bs-badge '+(a.rendering?'warn':'')+'" title="CPU used by this '+
+        'browser\'s whole process tree, as a percentage of one core.">'+a.cpu_pct.toFixed(0)+'% CPU</span>';
+    }
+    if(a.running){
+      badges += '<span class="bs-badge'+(a.auto_park?'':' warn')+'" style="cursor:pointer" '+
+        'onclick="toggleAutoPark(\''+id+'\','+(a.auto_park?'false':'true')+')" '+
+        'title="When armed, a browser left idle with tabs still burning CPU gets parked '+
+        'automatically. Turn it off to keep long-running background pages alive.">'+
+        (a.auto_park?'🔓 auto-park on':'🔒 auto-park off')+'</span>';
+    }
+    if(a.parked_ago!=null && !a.rendering){
+      badges += '<span class="bs-badge">parked '+(a.parked_ago<90?a.parked_ago+'s':Math.round(a.parked_ago/60)+'m')+' ago</span>';
+    }
     // What this browser looks like from outside: its own exit IP + what it has
     // spent of the (per-GB billed) residential quota.
     const px = ((_bsProxy&&_bsProxy.browsers)||[]).find(x=>x.id===s.id) || null;
@@ -16317,6 +16835,31 @@ function openBrowserSession(id){
 function openBrowserDirect(id){
   const s=_bsFind(id);
   if(s&&s.external_url) window.open(s.external_url, '_blank');
+}
+
+// Park = close the tabs, keep the browser (and its claude.ai session) alive.
+// The profile lives on disk, so this costs nothing but the open pages.
+async function parkBrowser(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/park',{method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'park failed');
+    showToast('Parked — closed '+(d.closed||0)+' tab(s). Still signed in.');
+  }catch(e){ showToast('Park failed: '+(e.message||e)); }
+  refreshBrowserAuthBadge();
+  loadBrowserTab();
+}
+
+async function toggleAutoPark(id, enabled){
+  try{
+    await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/autopark',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: enabled})});
+    showToast(enabled? 'Auto-park armed for this browser.'
+                     : 'Auto-park off — idle tabs will be left running.');
+  }catch(e){ showToast('Could not change auto-park: '+(e.message||e)); }
+  refreshBrowserAuthBadge();
+  loadBrowserTab();
 }
 
 function startEditBrowser(id){ _bsEditId=id; renderBrowserTab(_bsData||{}); }
