@@ -1536,14 +1536,17 @@ class TestSendCommandEndpoint:
     def test_send_short_command_success(self, mock_run, mock_sessions, authed_client):
         """Short commands (<=200 chars) should be sent via send-keys and return ok=True."""
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        resp = authed_client.post(
-            "/api/sessions/test-session/send",
-            json={"command": "echo hello"},
-        )
+        with patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            resp = authed_client.post(
+                "/api/sessions/test-session/send",
+                json={"command": "echo hello"},
+            )
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
+        mock_sleep.assert_awaited_once_with(0.25)
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")

@@ -10994,11 +10994,14 @@ async def api_send_command(session_name: str, body: SendCommand):
             except Exception:
                 logger.debug("Post-paste verification failed", exc_info=True)
         else:
-            # Short messages: send-keys -l is fine
+            # Short messages: send-keys -l is fine, but Codex's TUI needs one
+            # render tick before Enter. Sending text and Enter back-to-back can
+            # leave the text visibly parked in the input box without submitting.
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
+            await asyncio.sleep(0.25)
             # Press Enter as a separate key event
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
