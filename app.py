@@ -22,6 +22,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 import glob as globmod
 
+import browser_resource_guard
+
 logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
@@ -664,6 +666,11 @@ async def lifespan(_app: FastAPI):
     model_refresh_task = asyncio.create_task(_model_refresh_loop())
     _background_tasks.append(model_refresh_task)
     logger.info("Model auto-detect started (default=%s, %d models)", DEFAULT_MODEL, len(MODEL_CATALOG))
+
+    resource_guard_task = asyncio.create_task(browser_resource_guard.watchdog(logger=logger))
+    _background_tasks.append(resource_guard_task)
+    logger.info("Unmanaged-browser resource guard started (shared CPU cap %.2f cores)",
+                browser_resource_guard.cpu_quota_percent() / 100.0)
 
     yield  # Application is running
 
@@ -5616,33 +5623,17 @@ async def api_delete_session(request: Request, session_name: str):
                 capture_output=True, text=True, timeout=5
             )
             if pane_result.returncode == 0:
-                for pid_str in pane_result.stdout.strip().split("\n"):
-                    pid_str = pid_str.strip()
-                    if not pid_str:
-                        continue
-                    # Kill the entire process group rooted at this pane's shell
-                    # This catches Claude Code (node), any background tasks, etc.
-                    try:
-                        subprocess.run(
-                            ["pkill", "-TERM", "-P", pid_str],
-                            capture_output=True, text=True, timeout=3
-                        )
-                    except Exception:
-                        logger.debug("pkill -TERM failed for pid %s", pid_str, exc_info=True)
-                # Brief pause to let processes handle SIGTERM
-                await asyncio.sleep(0.5)
-                # Force-kill any remaining children
-                for pid_str in pane_result.stdout.strip().split("\n"):
-                    pid_str = pid_str.strip()
-                    if not pid_str:
-                        continue
-                    try:
-                        subprocess.run(
-                            ["pkill", "-KILL", "-P", pid_str],
-                            capture_output=True, text=True, timeout=3
-                        )
-                    except Exception:
-                        logger.debug("pkill -KILL failed for pid %s", pid_str, exc_info=True)
+                pane_pids = [int(pid) for pid in pane_result.stdout.split() if pid.isdigit()]
+                if pane_pids:
+                    cleanup = await asyncio.to_thread(
+                        browser_resource_guard.terminate_descendants, pane_pids
+                    )
+                    if not cleanup.get("ok"):
+                        logger.warning("Session '%s' descendant cleanup left pids %s",
+                                       session_name, cleanup.get("remaining", []))
+                    else:
+                        logger.info("Session '%s' descendant cleanup targeted %d process(es)",
+                                    session_name, cleanup.get("targeted", 0))
         except Exception:
             logger.debug("Process cleanup failed for session '%s' — kill-session will still clean up", session_name, exc_info=True)
 
@@ -8451,6 +8442,49 @@ async def api_browser_sessions(request: Request):
     extra = sum(1 for s in sessions if s.get("managed"))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
+
+
+@app.get("/api/browser/workloads")
+async def api_browser_workloads(request: Request):
+    """Host browsers outside the dashboard-managed profile set."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    snapshot = await asyncio.to_thread(browser_resource_guard.snapshot_processes)
+    roots = await asyncio.to_thread(browser_resource_guard.browser_roots, snapshot)
+    rows = [{
+        "pid": item.process.pid,
+        "start_ticks": item.process.start_ticks,
+        "uid": item.process.uid,
+        "profile": item.profile,
+        "cdp_port": item.cdp_port,
+        "headless": item.headless,
+        "resource_limited": browser_resource_guard.is_limited(item.process.pid),
+    } for item in roots if not item.protected]
+    return JSONResponse({
+        "workloads": rows,
+        "guard": browser_resource_guard.guard_status(),
+        "privileged_control": browser_resource_guard.can_control_privileged_processes(),
+    })
+
+
+@app.delete("/api/browser/workloads/{pid}")
+async def api_browser_workload_stop(pid: int, request: Request, start_ticks: int = 0):
+    """Stop one validated unmanaged browser and its dedicated runner tree."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if start_ticks <= 0:
+        return JSONResponse({"error": "start_ticks from the workload listing is required"},
+                            status_code=400)
+    result = await asyncio.to_thread(
+        browser_resource_guard.stop_browser_workload,
+        pid,
+        expected_start_ticks=start_ticks,
+    )
+    if result.get("ok"):
+        logger.warning("Stopped unmanaged browser workload: browser pid %d, root pid %s, "
+                       "%s process(es) targeted", pid, result.get("workload_root"),
+                       result.get("targeted"))
+    return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
 
 @app.post("/api/browser/sessions")
