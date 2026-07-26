@@ -9,10 +9,12 @@ import mimetypes
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -364,6 +366,37 @@ def _claude_launch_env_prefix() -> str:
 # Track auth mode per session: "subscription" or "api"
 _session_auth_mode: dict[str, str] = {}
 
+
+def _codex_home_auth_mode(codex_home: Path) -> str:
+    """Return the UI auth label for the credential Codex will actually read."""
+    try:
+        creds = json.loads((codex_home / "auth.json").read_text())
+        mode = creds.get("auth_mode")
+        tokens = creds.get("tokens")
+        if (
+            mode == "chatgpt"
+            and isinstance(tokens, dict)
+            and tokens.get("access_token")
+            and tokens.get("refresh_token")
+        ):
+            return "subscription"
+        if mode == "apikey" and creds.get("OPENAI_API_KEY"):
+            return "api"
+    except Exception:
+        pass
+    return "unconfigured"
+
+
+def _session_real_auth_mode(session_name: str) -> str:
+    """Resolve live per-session auth instead of trusting the process-local cache."""
+    try:
+        resolved = _codex_home_auth_mode(_session_config_base(session_name))
+        if resolved != "unconfigured":
+            return resolved
+    except Exception:
+        logger.debug("Failed to resolve auth mode for '%s'", session_name, exc_info=True)
+    return _session_auth_mode.get(session_name, "unconfigured")
+
 # Away mode state per session
 _away_mode_state: dict[str, dict] = {}
 # Per-session structure when active:
@@ -568,6 +601,14 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
                     _apply_member_auth(_user_codex_config_dir(_owner))
         except Exception:
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
+        try:
+            await asyncio.to_thread(
+                _ensure_codex_auth_with_fallback,
+                _session_config_base(session_name),
+                True,
+            )
+        except Exception:
+            logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
         # Codex stores local threads under CODEX_HOME. Resume the newest thread
         # for this working directory instead of opening the interactive picker.
         launch_base = _session_launch_base(session_name)
@@ -727,6 +768,10 @@ async def lifespan(_app: FastAPI):
         if state.get("task") and not state["task"].done():
             state["task"].cancel()
             logger.info("Cancelled go-nuts-mode worker for '%s'", name)
+    try:
+        _cancel_codex_chatgpt_login()
+    except Exception:
+        logger.debug("Failed to stop pending Codex login during shutdown", exc_info=True)
     logger.info("Shutdown complete")
 
 
@@ -5739,7 +5784,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "activity_status": activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
-        "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
+        "auth_mode": _session_real_auth_mode(sess["name"]),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
         **_session_model_fields(sess["name"]),
@@ -5808,7 +5853,7 @@ async def api_sessions_fast(request: Request):
             "activity_status": activity["status"],
             "activity_command": activity.get("command", ""),
             "activity_detail": activity.get("detail", ""),
-            "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
+            "auth_mode": _session_real_auth_mode(sess["name"]),
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             **_session_model_fields(sess["name"]),
@@ -5977,6 +6022,7 @@ async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
     user = _current_user(request)
     name = body.name.strip()
+    requested_profile = (body.profile_id or "").strip() or DEFAULT_PROFILE_ID
     if name:
         # Validate name: alphanumeric, dash, underscore only
         if not _is_valid_session_name(name):
@@ -5987,6 +6033,16 @@ async def api_create_session(request: Request, body: CreateSession):
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
             return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+    # A stored API key is the recovery credential when a managed ChatGPT token
+    # can no longer be refreshed. Validate/switch before launching the new pane.
+    auth_home = CODEX_HOME
+    if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
+        try:
+            if _find_profile(requested_profile, _load_roles()):
+                auth_home = _profile_dir(requested_profile)
+        except Exception:
+            logger.debug("Could not resolve requested profile auth", exc_info=True)
+    await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
     ready, reason, details = await asyncio.to_thread(_codex_cli_readiness)
     if not ready:
         return JSONResponse(
@@ -6066,12 +6122,15 @@ async def api_create_session(request: Request, body: CreateSession):
                 mode = json.loads((CODEX_HOME / "auth.json").read_text()).get("auth_mode")
             except Exception:
                 mode = ""
-            _session_auth_mode[created] = "subscription" if mode == "chatgpt" else "api"
+            _session_auth_mode[created] = (
+                "subscription" if mode == "chatgpt"
+                else "api" if mode == "apikey"
+                else "unconfigured"
+            )
         # Apply profile (CODEX_HOME) if requested. For non-admin users the
         # per-user dir we exported above takes precedence; honoring profile_id
         # would let one user point at another's profile, so we ignore it for
         # non-admins. Admins keep the existing behavior.
-        requested_profile = (body.profile_id or "").strip() or DEFAULT_PROFILE_ID
         if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
             roles = _load_roles()
             if _find_profile(requested_profile, roles):
@@ -6551,38 +6610,67 @@ class ContextFileBody(BaseModel):
 # "auto" files are injected into every session's context; "ondemand" files cost
 # nothing until AGENTS.md sends a session to them.
 _CONTEXT_FILES = [
-    {"id": "codex-agents", "path": CODEX_HOME / "AGENTS.md", "load": "auto",
+    {"id": "codex-agents", "paths": [CODEX_HOME / "AGENTS.md"], "load": "auto",
      "label": "$CODEX_HOME/AGENTS.md",
      "note": "Global Codex instructions loaded for every session using the default profile."},
-    {"id": "home-agents", "path": Path.home() / "AGENTS.md", "load": "auto",
+    {"id": "home-agents", "paths": [Path.home() / "AGENTS.md"], "load": "auto",
      "label": "~/AGENTS.md",
      "note": "Project-tree instructions for sessions whose working directory is under home."},
-    {"id": "github-rules", "path": Path.home() / "CODEX_GITHUB_RULES.md", "load": "ondemand",
+    {"id": "github-rules", "paths": [
+        Path.home() / "CODEX_GITHUB_RULES.md",
+        Path.home() / "CLAUDE_GITHUB_RULES.md",
+    ], "load": "ondemand",
      "note": "Git and GitHub rules."},
-    {"id": "api-keys", "path": Path.home() / "CODEX_API_KEYS.md", "load": "ondemand",
+    {"id": "api-keys", "paths": [
+        Path.home() / "CODEX_API_KEYS.md",
+        Path.home() / "CLAUDE_API_KEYS.md",
+    ], "load": "ondemand",
      "secret": True,
      "note": "Raw API key file. Prefer Settings → APIs, which also shows live usage."},
-    {"id": "infra-index", "path": CODEX_HOME / "vm_projects_dir.md", "load": "ondemand",
+    {"id": "full-context", "paths": [
+        Path.home() / "CODEX_FULL_CONTEXT.md",
+        Path.home() / "CLAUDE_FULL_CONTEXT.md",
+    ], "load": "ondemand", "secret": True,
+     "note": "Complete generated environment, development-system, and settings snapshot."},
+    {"id": "infra-index", "paths": [
+        CODEX_HOME / "vm_projects_dir.md",
+        Path.home() / ".claude" / "vm_projects_dir.md",
+    ], "load": "ondemand",
      "note": "Infrastructure index: VMs, domains, and pointers to the per-host detail files."},
-    {"id": "droplets", "path": Path.home() / "claude_droplets_access.md", "load": "ondemand",
+    {"id": "droplets", "paths": [Path.home() / "claude_droplets_access.md"], "load": "ondemand",
      "note": "SSH access to the legacy DigitalOcean droplets."},
-    {"id": "infra-keeper", "path": MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
+    {"id": "infra-keeper", "paths": [
+        MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
+    ],
      "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
-    {"id": "browser-qa", "path": MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
+    {"id": "browser-qa", "paths": [
+        MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
+    ],
      "load": "ondemand", "note": "agent-browser QA procedure to run after a large change."},
-    {"id": "legacy-claude", "path": Path.home() / "CLAUDE.md", "load": "legacy",
+    {"id": "legacy-claude", "paths": [Path.home() / "CLAUDE.md"], "load": "legacy",
      "label": "~/CLAUDE.md (legacy)",
      "note": "Legacy Claude context retained for migration reference; Codex does not auto-load it."},
 ]
 
-_INFRA_DETAIL_DIR = CODEX_HOME / "infra"
+_INFRA_DETAIL_DIRS = [CODEX_HOME / "infra", Path.home() / ".claude" / "infra"]
+
+
+def _first_existing_path(paths: list[Path]) -> Path:
+    """Return the first existing candidate, or the preferred path if none exist."""
+    return next((path for path in paths if path.exists()), paths[0])
 
 
 def _context_file_entries():
-    """Registry entries plus the per-host infra detail files, existing ones only."""
-    entries = list(_CONTEXT_FILES)
+    """Resolve fixed registry candidates plus existing per-host infra details."""
+    entries = []
+    for configured in _CONTEXT_FILES:
+        entry = dict(configured)
+        candidates = list(entry.pop("paths"))
+        entry["path"] = _first_existing_path(candidates)
+        entries.append(entry)
     try:
-        for p in sorted(_INFRA_DETAIL_DIR.glob("*.md")):
+        infra_dir = _first_existing_path(list(_INFRA_DETAIL_DIRS))
+        for p in sorted(infra_dir.glob("*.md")):
             entries.append({
                 "id": "infra-" + p.stem, "path": p, "load": "ondemand",
                 "label": "infra/" + p.name,
@@ -6592,7 +6680,7 @@ def _context_file_entries():
             })
     except Exception:
         logger.debug("Failed to list infra detail files", exc_info=True)
-    return [e for e in entries if e["path"].exists()]
+    return entries
 
 
 @app.get("/api/context-files")
@@ -6601,14 +6689,16 @@ async def api_list_context_files():
     for e in _context_file_entries():
         p = e["path"]
         try:
-            content = p.read_text(errors="replace")
+            exists = p.exists()
+            content = p.read_text(errors="replace") if exists else ""
+            size = p.stat().st_size if exists else 0
         except Exception:
             logger.debug("Failed to read context file %s", p, exc_info=True)
             continue
         files.append({
             "id": e["id"], "name": e.get("label") or p.name, "path": str(p),
             "load": e["load"], "note": e["note"], "secret": bool(e.get("secret")),
-            "content": content, "size": p.stat().st_size,
+            "content": content, "size": size, "exists": exists,
         })
     auto = sum(f["size"] for f in files if f["load"] == "auto")
     return JSONResponse({"files": files, "auto_bytes": auto})
@@ -7557,10 +7647,23 @@ def _materialize_profile(profile: dict):
                 logger.debug("Failed to mirror auth.json into profile %s", pid, exc_info=True)
         codex_content = profile.get("codex_md") or ""
         memory_content = profile.get("memory_md") or ""
-        if not codexmd_path.exists() or codexmd_path.read_text() != codex_content:
+        # The default profile lives directly in ~/.codex, where AGENTS.md and
+        # MEMORY.md are global user-owned context.  Built-in role records carry
+        # empty placeholders for these fields, so treating an empty placeholder
+        # as authoritative would erase the global files during an unrelated
+        # model/effort change.  A non-empty value is still an explicit dashboard
+        # edit; isolated profiles remain fully owned and therefore keep the
+        # existing empty-file behaviour.
+        write_codex_context = not is_default or bool(codex_content)
+        write_memory_context = not is_default or bool(memory_content)
+        if write_codex_context and (
+            not codexmd_path.exists() or codexmd_path.read_text() != codex_content
+        ):
             _backup_before_dashboard_write(codexmd_path)
             codexmd_path.write_text(codex_content)
-        if not memorymd_path.exists() or memorymd_path.read_text() != memory_content:
+        if write_memory_context and (
+            not memorymd_path.exists() or memorymd_path.read_text() != memory_content
+        ):
             _backup_before_dashboard_write(memorymd_path)
             memorymd_path.write_text(memory_content)
         # Seed initial skill files only when they are missing -- never overwrite,
@@ -8828,8 +8931,8 @@ async def api_legacy_claude_auth_removed(request: Request):
 # Manage one or more independent "Claude browser" backends (each its own Xvfb
 # display + x11vnc + websockify + headful Chrome/CDP) and expose their noVNC
 # viewers SAME-ORIGIN through this dashboard, so extra sessions are reachable
-# without touching the builder's nginx. The DEFAULT session is the pre-existing
-# systemd browser on display :99 / port 6080 (also public at rotem.ai/browsertool).
+# without needing a separate public browser host. The DEFAULT session is the
+# pre-existing systemd browser on display :99 / port 6080.
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
@@ -8936,9 +9039,6 @@ _DEFAULT_BROWSER_SESSION = {
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
     "cdp_port": 9222, "managed": False,
-    "external_url": ("https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify"
-                     "&autoconnect=true&resize=scale&shared=true"
-                     "&reconnect=true&reconnect_delay=2000"),
 }
 
 
@@ -8951,8 +9051,8 @@ def _load_browser_sessions() -> list:
                 if not any(s.get("id") == "default" for s in sessions):
                     sessions = [dict(_DEFAULT_BROWSER_SESSION)] + sessions
                 else:
-                    # Refresh the default entry's derived fields (ports, and above
-                    # all external_url) from code — a copy persisted before those
+                    # Refresh the default entry's derived fields (especially ports)
+                    # from code — a copy persisted before those
                     # changed would otherwise pin stale values forever. Only the
                     # user-editable name/notes survive from disk.
                     for s in sessions:
@@ -9018,6 +9118,24 @@ def _browser_viewer_url(s: dict) -> str:
             "&reconnect=true&reconnect_delay=2000")
 
 
+def _browser_external_url(s: dict) -> str:
+    """Public Direct-link URL for this dashboard host, when one is configured."""
+    base = PUBLIC_BASE_URL.rstrip("/")
+    return base + _browser_viewer_url(s) if base else ""
+
+
+def _browser_response_row(s: dict) -> dict:
+    """Add request-independent viewer links without persisting derived URLs."""
+    row = dict(s)
+    row["viewer_url"] = _browser_viewer_url(s)
+    external_url = _browser_external_url(s)
+    if external_url:
+        row["external_url"] = external_url
+    else:
+        row.pop("external_url", None)
+    return row
+
+
 class BrowserCreateBody(BaseModel):
     name: str = ""
 
@@ -9029,9 +9147,8 @@ async def api_browser_sessions(request: Request):
     sessions = _load_browser_sessions()
     out = []
     for s in sessions:
-        row = dict(s)
+        row = _browser_response_row(s)
         row["running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
-        row["viewer_url"] = _browser_viewer_url(s)
         out.append(row)
     extra = sum(1 for s in sessions if s.get("managed"))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
@@ -9068,9 +9185,8 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
              "vnc_port": vnc, "cdp_port": cdp, "managed": True, "created_at": time.time()}
     sessions.append(entry)
     _save_browser_sessions(sessions)
-    row = dict(entry)
+    row = _browser_response_row(entry)
     row["running"] = ok
-    row["viewer_url"] = _browser_viewer_url(entry)
     logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
                 sid, disp, vnc, cdp, ok)
     return JSONResponse({"ok": True, "session": row, "started": ok})
@@ -9136,9 +9252,8 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
         target["use_for_login"] = bool(body.use_for_login)
     _save_browser_sessions(sessions)
     _browser_auth_cache.pop(sid, None)   # re-check on next poll
-    row = dict(target)
+    row = _browser_response_row(target)
     row["running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
-    row["viewer_url"] = _browser_viewer_url(target)
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
@@ -9786,67 +9901,39 @@ async def _extract_oauth_code(tab, authorize_url: str) -> dict:
 
 
 async def _auto_fix_login(session_name: str) -> dict:
-    """Silently get a logged-out session back to work — no OAuth, no clicks.
-
-    Almost every "please run /login" here is NOT a missing credential: the box
-    holds a valid Max token (or a stored long-lived one) and only this session's
-    claude process lost it (rotation race, stale process, a config dir with no
-    creds). So: clear whatever login prompt is stranded on screen, make sure the
-    session's config dir has the good credential, and relaunch on --continue.
-    Takes ~15s and the user does nothing.
-
-    This is the primary recovery path. Driving the OAuth consent page in a
-    browser is NOT usable — claude.ai blocks it (see _extract_oauth_code)."""
+    """Validate Codex auth, activate the API fallback, and relaunch the pane."""
     alog = logging.getLogger("auto-auth")
-    token = _load_longlived_token()
-    creds_ok = _subscription_token_valid()
-    if not token and not creds_ok:
-        return {"ok": False, "error": "no valid credential on this machine to restore — "
-                                      "mint a long-lived token in Settings → Login"}
-    # 1. Clear a stranded /login (menu -> URL -> paste-code all cancel on Esc).
+    config_home = _session_config_base(session_name)
+    auth_state = await asyncio.to_thread(
+        _ensure_codex_auth_with_fallback, config_home, True
+    )
+    if not auth_state.get("loggedIn"):
+        return {
+            "ok": False,
+            "error": "no valid ChatGPT credential or stored OpenAI API key is available",
+        }
+    # Clear a stranded interactive login before restarting Codex.
     for _ in range(3):
         await asyncio.to_thread(subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "Escape"],
             capture_output=True, text=True, timeout=5)
         await asyncio.sleep(0.4)
-    # 2. Make sure this session's config dir actually has the good credential.
-    try:
-        cfg = _session_config_base(session_name)
-        if creds_ok and cfg != (Path.home() / ".claude"):
-            dst = cfg / ".credentials.json"
-            if not dst.exists() or dst.read_text() != SHARED_CREDENTIALS.read_text():
-                cfg.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(SHARED_CREDENTIALS, dst)
-                os.chmod(dst, 0o600)
-                alog.info("auto-fix '%s': restored credentials into %s", session_name, cfg)
-    except Exception:
-        alog.debug("auto-fix: could not sync credentials for '%s'", session_name, exc_info=True)
-    # 3. Relaunch on the restored credential, keeping the conversation.
-    if await _async_is_claude_running(session_name):
-        await _send_line(session_name, "/exit")
-        for _ in range(12):
-            await asyncio.sleep(1)
-            if not await _async_is_claude_running(session_name):
-                break
-    await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "C-u"],
-        capture_output=True, text=True, timeout=5)
-    await _send_line(session_name,
-                     _claude_launch_env_prefix() +
-                     "NODE_OPTIONS=--max-old-space-size=8192 "
-                     "claude --dangerously-skip-permissions --continue" +
-                     _model_flag_for_relaunch(session_name))
-    # 4. Confirm it came back authenticated.
+    profile_id = _get_session_profile_id(session_name)
+    _exported, restarted = await _restart_codex_with_active_profile(
+        session_name, profile_id
+    )
+    if not restarted:
+        return {"ok": False, "error": "Codex could not be relaunched after auth recovery"}
     for _ in range(20):
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         pane = await asyncio.to_thread(_pane_text, session_name, 25)
         if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
             continue
-        if await _async_is_claude_running(session_name):
+        if await _async_is_codex_running(session_name):
             _account_ident_cache.clear()
-            alog.info("auto-fix '%s': logged back in via %s", session_name,
-                      "stored token" if token else "shared plan credentials")
-            return {"ok": True, "via": "token" if token else "credentials"}
+            via = "api-key-fallback" if auth_state.get("fallbackActive") else auth_state["activeMode"]
+            alog.info("auto-fix '%s': logged back in via %s", session_name, via)
+            return {"ok": True, "via": via}
     return {"ok": False, "error": "relaunched but the session still looks logged out"}
 
 
@@ -10112,6 +10199,340 @@ async def api_transcribe(audio: UploadFile = File(...)):
 # --- Codex auth management ---
 
 _codex_auth_cache: dict = {"ts": 0, "data": {}}
+_codex_auth_validation_lock = threading.Lock()
+_codex_auth_fallback_state: dict = {"path": "", "reason": "", "ts": 0.0}
+_codex_login_lock = threading.Lock()
+_codex_login_process = None
+_codex_login_state: dict = {
+    "status": "idle",
+    "verificationUrl": "",
+    "userCode": "",
+    "loginId": "",
+    "expiresAt": 0,
+    "error": "",
+}
+
+
+def _codex_app_server_process(codex_home: Path):
+    """Start the official Codex app-server with file-backed credentials."""
+    codex_home.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(codex_home)
+    return subprocess.Popen(
+        [
+            "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
+            "--stdio",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+
+def _codex_app_server_send(process, message: dict):
+    if process.stdin is None:
+        raise RuntimeError("Codex app-server stdin is unavailable")
+    process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+
+
+def _codex_app_server_wait(process, request_id: int, timeout: float = 15.0) -> dict:
+    """Read JSONL until the requested response arrives, with a hard deadline."""
+    if process.stdout is None:
+        raise RuntimeError("Codex app-server stdout is unavailable")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Codex app-server exited before responding")
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([process.stdout], [], [], min(0.5, remaining))
+        if not ready:
+            continue
+        line = process.stdout.readline()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") == request_id:
+            return message
+    raise TimeoutError("Codex app-server did not respond in time")
+
+
+def _codex_app_server_initialize(process):
+    _codex_app_server_send(process, {
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {
+                "name": "grabo_dashboard",
+                "title": "Grabo Codex Dashboard",
+                "version": "1",
+            },
+        },
+    })
+    response = _codex_app_server_wait(process, 0)
+    if response.get("error"):
+        raise RuntimeError("Codex app-server initialization failed")
+    _codex_app_server_send(process, {"method": "initialized", "params": {}})
+
+
+def _terminate_codex_app_server(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=3)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _codex_app_server_account_read(codex_home: Path, refresh_token: bool = True) -> dict:
+    """Ask Codex itself to validate (and, for ChatGPT, refresh) its credential."""
+    process = _codex_app_server_process(codex_home)
+    try:
+        _codex_app_server_initialize(process)
+        _codex_app_server_send(process, {
+            "method": "account/read",
+            "id": 1,
+            "params": {"refreshToken": refresh_token},
+        })
+        response = _codex_app_server_wait(process, 1, timeout=20)
+        if response.get("error"):
+            error = response.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else ""
+            return {"ok": False, "error": str(message or "credential refresh failed")[:300]}
+        result = response.get("result") or {}
+        account = result.get("account")
+        if not isinstance(account, dict):
+            return {"ok": False, "error": "Codex reported no active account"}
+        return {"ok": True, "account": account}
+    except Exception as exc:
+        logger.warning("Codex credential validation failed: %s", type(exc).__name__)
+        return {"ok": False, "error": "Codex could not validate the ChatGPT credential"}
+    finally:
+        _terminate_codex_app_server(process)
+
+
+def _ensure_codex_auth_with_fallback(
+    codex_home: Path = CODEX_HOME,
+    validate_chatgpt: bool = True,
+) -> dict:
+    """Validate ChatGPT auth and activate the stored API key when it is unusable."""
+    with _codex_auth_validation_lock:
+        auth_path = codex_home / "auth.json"
+        creds: dict = {}
+        parse_error = False
+        try:
+            loaded = json.loads(auth_path.read_text())
+            creds = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            parse_error = True
+        configured_mode = str(creds.get("auth_mode") or "unknown")
+        active_mode = "unknown"
+        reason = ""
+        account: dict = {}
+
+        if configured_mode == "apikey" and creds.get("OPENAI_API_KEY"):
+            active_mode = "apikey"
+        elif configured_mode == "chatgpt":
+            tokens = creds.get("tokens")
+            if not isinstance(tokens, dict) or not all(
+                tokens.get(name) for name in ("access_token", "refresh_token")
+            ):
+                reason = "ChatGPT credential is missing required tokens"
+            elif validate_chatgpt:
+                probe = _codex_app_server_account_read(codex_home, refresh_token=True)
+                account = probe.get("account") if isinstance(probe.get("account"), dict) else {}
+                if probe.get("ok") and account.get("type") == "chatgpt":
+                    active_mode = "chatgpt"
+                else:
+                    reason = "ChatGPT credential is expired, revoked, or could not be refreshed"
+            else:
+                active_mode = "chatgpt"
+        elif parse_error:
+            reason = "Codex credential file is missing or unreadable"
+        else:
+            reason = "Codex credential is not usable"
+
+        stored_key = _active_openai_key()
+        fallback_active = False
+        if active_mode == "unknown" and reason and stored_key:
+            _write_codex_api_auth(codex_home, stored_key)
+            active_mode = "apikey"
+            fallback_active = True
+            _codex_auth_fallback_state.update({
+                "path": str(auth_path), "reason": reason, "ts": time.time(),
+            })
+            logger.warning("Activated stored OpenAI API-key fallback for %s", codex_home)
+        elif (
+            active_mode == "apikey"
+            and _codex_auth_fallback_state.get("path") == str(auth_path)
+            and _codex_auth_fallback_state.get("reason")
+        ):
+            fallback_active = True
+            reason = str(_codex_auth_fallback_state["reason"])
+
+        return {
+            "configuredMode": configured_mode,
+            "activeMode": active_mode,
+            "loggedIn": active_mode in ("apikey", "chatgpt"),
+            "fallbackActive": fallback_active,
+            "fallbackReason": reason if fallback_active else "",
+            "account": account,
+        }
+
+
+def _public_codex_login_state() -> dict:
+    with _codex_login_lock:
+        return dict(_codex_login_state)
+
+
+def _set_codex_login_state(**changes):
+    with _codex_login_lock:
+        _codex_login_state.update(changes)
+
+
+def _monitor_codex_chatgpt_login(process, login_id: str):
+    """Wait for the official app-server completion notification."""
+    global _codex_login_process
+    completed = False
+    try:
+        if process.stdout is None:
+            raise RuntimeError("Codex app-server stdout is unavailable")
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("method") != "account/login/completed":
+                continue
+            params = message.get("params") or {}
+            if params.get("loginId") not in (None, login_id):
+                continue
+            completed = True
+            if params.get("success"):
+                _codex_auth_fallback_state.update({"path": "", "reason": "", "ts": 0.0})
+                _set_codex_login_state(status="succeeded", error="")
+            else:
+                _set_codex_login_state(
+                    status="failed",
+                    error=str(params.get("error") or "ChatGPT sign-in failed")[:300],
+                )
+            break
+    except Exception:
+        logger.warning("ChatGPT device login monitor failed", exc_info=True)
+    finally:
+        _terminate_codex_app_server(process)
+        with _codex_login_lock:
+            if _codex_login_process is process:
+                _codex_login_process = None
+            if not completed and _codex_login_state.get("status") not in ("cancelled", "failed"):
+                _codex_login_state.update({
+                    "status": "failed",
+                    "error": "Codex login ended before authorization completed",
+                })
+        _codex_auth_cache["ts"] = 0
+
+
+def _start_codex_chatgpt_login() -> dict:
+    """Start Codex's managed device-code login and return its URL/code."""
+    global _codex_login_process
+    with _codex_login_lock:
+        if (
+            _codex_login_process is not None
+            and _codex_login_process.poll() is None
+            and _codex_login_state.get("status") in ("starting", "pending")
+        ):
+            return dict(_codex_login_state)
+        _codex_login_state.update({
+            "status": "starting",
+            "verificationUrl": "",
+            "userCode": "",
+            "loginId": "",
+            "expiresAt": 0,
+            "error": "",
+        })
+        auth_path = CODEX_HOME / "auth.json"
+        if auth_path.exists():
+            _backup_before_dashboard_write(auth_path)
+        process = _codex_app_server_process(CODEX_HOME)
+        _codex_login_process = process
+    try:
+        _codex_app_server_initialize(process)
+        _codex_app_server_send(process, {
+            "method": "account/login/start",
+            "id": 4,
+            "params": {"type": "chatgptDeviceCode"},
+        })
+        response = _codex_app_server_wait(process, 4, timeout=20)
+        if response.get("error"):
+            raise RuntimeError("Codex rejected the ChatGPT device login request")
+        result = response.get("result") or {}
+        verification_url = str(result.get("verificationUrl") or "")
+        user_code = str(result.get("userCode") or "")
+        login_id = str(result.get("loginId") or "")
+        if not verification_url.startswith("https://") or not user_code or not login_id:
+            raise RuntimeError("Codex returned an incomplete device login response")
+        _set_codex_login_state(
+            status="pending",
+            verificationUrl=verification_url,
+            userCode=user_code,
+            loginId=login_id,
+            expiresAt=int(time.time()) + 15 * 60,
+            error="",
+        )
+        monitor = threading.Thread(
+            target=_monitor_codex_chatgpt_login,
+            args=(process, login_id),
+            name="codex-chatgpt-login",
+            daemon=True,
+        )
+        monitor.start()
+        return _public_codex_login_state()
+    except Exception as exc:
+        logger.warning("Unable to start ChatGPT device login: %s", exc)
+        _terminate_codex_app_server(process)
+        with _codex_login_lock:
+            if _codex_login_process is process:
+                _codex_login_process = None
+            _codex_login_state.update({
+                "status": "failed",
+                "error": str(exc)[:300],
+            })
+        return _public_codex_login_state()
+
+
+def _cancel_codex_chatgpt_login() -> bool:
+    global _codex_login_process
+    with _codex_login_lock:
+        process = _codex_login_process
+        login_id = str(_codex_login_state.get("loginId") or "")
+        _codex_login_state.update({"status": "cancelled", "error": ""})
+    if process is None or process.poll() is not None:
+        return False
+    try:
+        if login_id:
+            _codex_app_server_send(process, {
+                "method": "account/login/cancel",
+                "id": 5,
+                "params": {"loginId": login_id},
+            })
+    except Exception:
+        pass
+    _terminate_codex_app_server(process)
+    with _codex_login_lock:
+        if _codex_login_process is process:
+            _codex_login_process = None
+    return True
 
 
 def _jwt_claims(token: object) -> dict:
@@ -10128,20 +10549,24 @@ def _jwt_claims(token: object) -> dict:
 
 
 def _codex_auth_display() -> dict:
+    auth_state = _ensure_codex_auth_with_fallback(CODEX_HOME, True)
     result: dict = {
-        "loggedIn": bool(_active_openai_key()),
+        "loggedIn": auth_state["loggedIn"],
         "hasApiKey": bool(_active_openai_key()),
-        "authMode": "apikey" if _active_openai_key() else "unknown",
+        "authMode": auth_state["activeMode"],
+        "activeMode": auth_state["activeMode"],
+        "configuredMode": auth_state["configuredMode"],
+        "fallbackActive": auth_state["fallbackActive"],
+        "fallbackReason": auth_state["fallbackReason"],
         "model": "",
     }
     try:
         creds = json.loads((CODEX_HOME / "auth.json").read_text())
-        mode = str(creds.get("auth_mode") or "unknown")
-        result["authMode"] = mode
+        mode = auth_state["activeMode"]
+        result["hasApiKey"] = bool(_active_openai_key() or creds.get("OPENAI_API_KEY"))
         if mode == "apikey" and creds.get("OPENAI_API_KEY"):
             result.update({
                 "loggedIn": True,
-                "hasApiKey": True,
                 "subscriptionType": "API key",
                 "email": "OpenAI API",
             })
@@ -10157,8 +10582,14 @@ def _codex_auth_display() -> dict:
             )
             result.update({
                 "loggedIn": True,
-                "subscriptionType": str(plan),
-                "email": str(claims.get("email") or "ChatGPT user"),
+                "subscriptionType": str(
+                    auth_state["account"].get("planType") or plan
+                ),
+                "email": str(
+                    auth_state["account"].get("email")
+                    or claims.get("email")
+                    or "ChatGPT user"
+                ),
             })
     except Exception:
         logger.debug("Could not read Codex auth status", exc_info=True)
@@ -10178,9 +10609,33 @@ async def api_codex_auth_status():
     now = time.time()
     if now - _codex_auth_cache["ts"] < 60 and _codex_auth_cache["data"]:
         return JSONResponse(dict(_codex_auth_cache["data"]))
-    result = _codex_auth_display()
+    result = await asyncio.to_thread(_codex_auth_display)
     _codex_auth_cache.update({"ts": now, "data": result})
     return JSONResponse(result)
+
+
+@app.post("/api/auth/chatgpt/start")
+async def api_start_codex_chatgpt_login(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    result = await asyncio.to_thread(_start_codex_chatgpt_login)
+    status_code = 200 if result.get("status") in ("pending", "succeeded") else 502
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.get("/api/auth/chatgpt/status")
+async def api_codex_chatgpt_login_status(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    return JSONResponse(_public_codex_login_state())
+
+
+@app.post("/api/auth/chatgpt/cancel")
+async def api_cancel_codex_chatgpt_login(request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    cancelled = await asyncio.to_thread(_cancel_codex_chatgpt_login)
+    return JSONResponse({"ok": True, "cancelled": cancelled})
 
 
 class SetApiKey(BaseModel):
@@ -10197,10 +10652,12 @@ async def api_set_codex_key(body: SetApiKey):
                 status_code=400,
             )
         _save_openai_key(key)
+        _codex_auth_fallback_state.update({"path": "", "reason": "", "ts": 0.0})
         _codex_auth_cache["ts"] = 0
         return JSONResponse({"ok": True, "message": "OpenAI API key stored for Codex."})
     else:
         _clear_openai_key()
+        _codex_auth_fallback_state.update({"path": "", "reason": "", "ts": 0.0})
         _codex_auth_cache["ts"] = 0
         return JSONResponse({"ok": True, "message": "API key cleared."})
 
@@ -10223,6 +10680,7 @@ async def api_codex_auth_logout():
         logger.warning("Unable to run codex logout", exc_info=True)
         errors.append("Codex logout command could not be run")
     _clear_openai_key()
+    _codex_auth_fallback_state.update({"path": "", "reason": "", "ts": 0.0})
     _codex_auth_cache["ts"] = 0
     if errors:
         return JSONResponse({"ok": True, "warnings": errors})
@@ -11878,31 +12336,27 @@ async def _login_watchdog_loop():
                     or ("press enter to retry" in low and "esc to cancel" in low)
                 )
 
-                # Shared API-key (team) mode: /login is HARMFUL here. It writes OAuth
-                # creds that override the working apiKeyHelper key and 401 ("Invalid
-                # bearer token"), which then reads as "login required" and would
-                # retrigger this watchdog forever — the loop members actually hit. So
-                # in key mode we NEVER run /login; instead, if a stray /login flow is
-                # stuck on screen we cancel it (Esc) so the session falls back to the
-                # shared key. An un-completed /login writes no creds, so Esc fully
-                # restores key auth.
-                if _stored_anthropic_key:
-                    if login_flow_open:
-                        try:
-                            for _ in range(2):  # menu -> cancel needs two Escapes
-                                await asyncio.to_thread(
-                                    subprocess.run,
-                                    ["tmux", "send-keys", "-t", name, "Escape"],
-                                    capture_output=True, text=True, timeout=5,
-                                )
-                                await asyncio.sleep(0.4)
-                            state["last_action"] = now
-                            llog.warning("Cancelled stray /login in '%s' (key mode — restored shared-key auth)", name)
-                        except Exception as e:
-                            llog.debug("login watchdog esc failed for '%s': %s", name, e)
+                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
+                # A stored OpenAI key is the non-interactive recovery path. If the
+                # active ChatGPT refresh token was revoked, _auto_fix_login asks
+                # Codex to validate it, writes API-key auth on failure, and relaunches.
+                if _active_openai_key():
+                    if not needs_login and not login_flow_open:
+                        state.pop("flow_since", None)
+                        continue
+                    state["last_action"] = now
+                    state.pop("flow_since", None)
+                    res = await _auto_fix_login(name)
+                    if res.get("ok"):
+                        llog.warning(
+                            "Session '%s' recovered automatically (via %s)",
+                            name,
+                            res.get("via"),
+                        )
+                    else:
+                        llog.warning("API fallback recovery for '%s' failed: %s", name, res.get("error"))
                     continue
 
-                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
                 if not needs_login and not login_flow_open:
                     state.pop("flow_since", None)
                     continue
@@ -18388,12 +18842,37 @@ async function removeBrowserSession(id){
 
 // --- Codex login tab (admin) ---
 let _authStatus = null;
+let _chatgptLoginStatus = null;
+let _chatgptLoginPoll = null;
 function _fmtTs(ms){ if(!ms) return '—'; try{ return new Date(ms).toLocaleString(); }catch(e){ return String(ms); } }
 async function loadLoginTab(){
   let d;
   try{ const r=await fetch(BASE+'/api/auth/codex-status'); d=await r.json(); if(!r.ok) throw new Error(d.error||'Failed'); }
   catch(e){ document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load: '+esc(e.message||e)+'</div></div>'; return; }
-  _authStatus=d; renderLoginTab();
+  _authStatus=d;
+  try{
+    const lr=await fetch(BASE+'/api/auth/chatgpt/status');
+    if(lr.ok) _chatgptLoginStatus=await lr.json();
+  }catch(e){}
+  renderLoginTab();
+  if(_chatgptLoginStatus&&_chatgptLoginStatus.status==='pending') beginChatgptLoginPoll();
+}
+function chatgptLoginHtml(){
+  const l=_chatgptLoginStatus||{};
+  if(l.status==='pending'){
+    return '<div class="pf-banner" style="margin-top:10px">'+
+      '<b>Complete sign-in in your browser.</b><br>'+
+      '<a href="'+esc(l.verificationUrl||'')+'" target="_blank" rel="noopener">'+esc(l.verificationUrl||'Open authorization page')+'</a><br>'+
+      '<span style="color:#8b949e">Enter this one-time code:</span> '+
+      '<code style="font-size:1.15rem;color:#79c0ff">'+esc(l.userCode||'')+'</code><br>'+
+      '<span style="color:#8b949e">Expires '+esc(_fmtTs((l.expiresAt||0)*1000))+'</span>'+
+      '<div class="my-ctx-actions"><button class="btn btn-ghost" onclick="copyChatgptLogin()">Copy code</button>'+
+      '<button class="btn btn-danger" onclick="cancelChatgptLogin()">Cancel</button></div></div>';
+  }
+  if(l.status==='succeeded') return '<div class="pf-banner" style="margin-top:10px;color:#3fb950">ChatGPT sign-in completed.</div>';
+  if(l.status==='failed') return '<div class="pf-banner" style="margin-top:10px">Sign-in failed: '+esc(l.error||'Unknown error')+'</div>';
+  if(l.status==='cancelled') return '<div class="pf-banner" style="margin-top:10px;color:#8b949e">ChatGPT sign-in was cancelled.</div>';
+  return '';
 }
 function renderLoginTab(){
   const d=_authStatus||{};
@@ -18402,16 +18881,63 @@ function renderLoginTab(){
     ? '<span class="bs-dot on"></span> <b>Codex is connected.</b> '+esc(d.email||'')+(d.subscriptionType?' · '+esc(d.subscriptionType):'')
     : '<span class="bs-dot off"></span> <b>Codex is not connected.</b>';
   const detail='Auth mode: '+esc(d.authMode||'unknown')+(d.model?' · model '+esc(d.model):'');
+  const fallback=d.fallbackActive
+    ? '<div class="pf-banner" style="margin-top:10px;color:#d29922"><b>API-key fallback is active.</b> '+esc(d.fallbackReason||'The ChatGPT credential could not be refreshed.')+'</div>'
+    : '';
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
       '<div class="pf-banner">'+statusLine+'<br><span style="color:#8b949e">'+detail+'</span></div>'+
+      fallback+
+      '<label>ChatGPT subscription</label>'+
+      '<div class="my-ctx-actions"><button class="btn btn-primary btn-full" onclick="startChatgptLogin()">Sign in with ChatGPT</button></div>'+
+      chatgptLoginHtml()+
+      '<hr class="auth-divider">'+
       '<label>OpenAI API key</label>'+
       '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-…" style="min-height:56px"></textarea>'+
       '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save API key</button></div>'+
       (d.hasApiKey?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Clear dashboard API key</button></div>':'')+
       (active?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="logoutCodex()">Log Codex out</button></div>':'')+
-      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">For ChatGPT subscription login, run <code>codex login</code> on the server. New sessions inherit the server login automatically.</div>'+
+      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">The stored API key remains available as an automatic fallback if ChatGPT authorization expires or is revoked.</div>'+
     '</div>';
+}
+async function startChatgptLogin(){
+  _chatgptLoginStatus={status:'starting'}; renderLoginTab();
+  try{
+    const r=await fetch(BASE+'/api/auth/chatgpt/start',{method:'POST'});
+    const d=await r.json();
+    _chatgptLoginStatus=d;
+    if(!r.ok&&!d.error) d.error='Could not start ChatGPT sign-in';
+    renderLoginTab();
+    if(d.status==='pending'){
+      if(d.verificationUrl) window.open(d.verificationUrl,'_blank','noopener');
+      beginChatgptLoginPoll();
+    }
+  }catch(e){ _chatgptLoginStatus={status:'failed',error:e.message}; renderLoginTab(); }
+}
+function beginChatgptLoginPoll(){
+  if(_chatgptLoginPoll) return;
+  _chatgptLoginPoll=setInterval(pollChatgptLogin,2000);
+}
+async function pollChatgptLogin(){
+  try{
+    const r=await fetch(BASE+'/api/auth/chatgpt/status');
+    const d=await r.json();
+    if(!r.ok) return;
+    _chatgptLoginStatus=d; renderLoginTab();
+    if(d.status!=='pending'&&d.status!=='starting'){
+      clearInterval(_chatgptLoginPoll); _chatgptLoginPoll=null;
+      if(d.status==='succeeded'){ await checkCodexAuth(); await loadLoginTab(); }
+    }
+  }catch(e){}
+}
+function copyChatgptLogin(){
+  const code=(_chatgptLoginStatus&&_chatgptLoginStatus.userCode)||'';
+  if(code&&navigator.clipboard) navigator.clipboard.writeText(code);
+}
+async function cancelChatgptLogin(){
+  try{ await fetch(BASE+'/api/auth/chatgpt/cancel',{method:'POST'}); }catch(e){}
+  if(_chatgptLoginPoll){clearInterval(_chatgptLoginPoll);_chatgptLoginPoll=null;}
+  _chatgptLoginStatus={status:'cancelled'}; renderLoginTab();
 }
 async function startSetupToken(){
   const area=document.getElementById('login-setup-area');

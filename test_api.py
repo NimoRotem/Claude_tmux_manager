@@ -14,10 +14,10 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-real")
 
 from fastapi.testclient import TestClient
 
-from app import AUTH_PASS, AUTH_USER, _make_token, app
+from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, _make_token, app
 
-# Auth cookie for authenticated requests
-AUTH_TOKEN = _make_token(AUTH_USER)
+# Auth cookies carry the stable user id, not the configurable display/login name.
+AUTH_TOKEN = _make_token("admin")
 AUTH_COOKIES = {"tmux_auth": AUTH_TOKEN}
 
 # Mock session data
@@ -80,7 +80,7 @@ class TestAuthMiddleware:
             follow_redirects=False,
         )
         assert resp.status_code == 303
-        assert "tmux_auth" in resp.cookies
+        assert AUTH_COOKIE in resp.cookies
 
     def test_login_failure_redirects_with_error(self, client):
         resp = client.post(
@@ -134,6 +134,25 @@ class TestSessionListEndpoints:
         data = resp.json()
         assert len(data) == 2
         assert all(s["activity_status"] == "idle" for s in data)
+
+    def test_session_response_reads_real_apikey_auth_mode(self, tmp_path):
+        import app as app_module
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(json.dumps({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-test-not-real",
+        }))
+        session = {
+            "name": "test-session",
+            "windows": "1",
+            "attached": False,
+        }
+        activity = {"status": "idle", "command": "", "detail": ""}
+        with patch("app._session_config_base", return_value=codex_home):
+            result = app_module.build_session_response(session, {}, activity)
+        assert result["auth_mode"] == "api"
 
 
 # ─── Session-Specific Endpoint Tests ───
@@ -361,6 +380,31 @@ class TestStatsEndpoint:
 
 
 class TestCodexAuthEndpoints:
+    @pytest.fixture(autouse=True)
+    def _isolated_codex_auth(self, tmp_path):
+        """Credential endpoint tests must never touch the developer's real home."""
+        import app as app_module
+
+        codex_home = tmp_path / ".codex"
+        key_file = tmp_path / "state" / "openai_api_key"
+        previous_cache = dict(app_module._codex_auth_cache)
+        previous_fallback = dict(app_module._codex_auth_fallback_state)
+        with (
+            patch.object(app_module, "CODEX_HOME", codex_home),
+            patch.object(app_module, "MESSAGES_DIR", tmp_path / "state"),
+            patch.object(app_module, "OPENAI_KEY_FILE", key_file),
+            patch.object(app_module, "_stored_openai_key", ""),
+        ):
+            app_module._codex_auth_cache.update({"ts": 0, "data": {}})
+            app_module._codex_auth_fallback_state.update({
+                "path": "", "reason": "", "ts": 0.0,
+            })
+            yield
+        app_module._codex_auth_cache.clear()
+        app_module._codex_auth_cache.update(previous_cache)
+        app_module._codex_auth_fallback_state.clear()
+        app_module._codex_auth_fallback_state.update(previous_fallback)
+
     def test_codex_status(self, authed_client):
         resp = authed_client.get("/api/auth/codex-status")
         assert resp.status_code == 200
@@ -402,7 +446,118 @@ class TestCodexAuthEndpoints:
         data = resp.json()
         assert "hasApiKey" in data
         assert "authMode" in data
+        assert "activeMode" in data
         assert "loggedIn" in data
+
+    def test_missing_chatgpt_tokens_activate_stored_api_fallback(self, tmp_path):
+        import app as app_module
+
+        codex_home = tmp_path / "fallback-home"
+        codex_home.mkdir()
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {}}))
+        with patch("app._active_openai_key", return_value="sk-fallback-not-real"):
+            state = app_module._ensure_codex_auth_with_fallback(codex_home, True)
+
+        assert state["activeMode"] == "apikey"
+        assert state["fallbackActive"] is True
+        assert "missing" in state["fallbackReason"].lower()
+        assert json.loads(auth_path.read_text()) == {
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-fallback-not-real",
+        }
+
+    def test_status_payload_reports_active_api_fallback(self):
+        import app as app_module
+
+        app_module.CODEX_HOME.mkdir(parents=True)
+        (app_module.CODEX_HOME / "auth.json").write_text(json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {},
+        }))
+        with patch("app._active_openai_key", return_value="sk-fallback-not-real"):
+            status = app_module._codex_auth_display()
+        assert status["authMode"] == "apikey"
+        assert status["activeMode"] == "apikey"
+        assert status["fallbackActive"] is True
+        assert status["loggedIn"] is True
+
+    def test_revoked_chatgpt_token_uses_stored_api_fallback(self, tmp_path):
+        import app as app_module
+
+        codex_home = tmp_path / "revoked-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "expired-access",
+                "refresh_token": "revoked-refresh",
+                "id_token": "not-a-jwt",
+            },
+        }))
+        with (
+            patch("app._active_openai_key", return_value="sk-fallback-not-real"),
+            patch(
+                "app._codex_app_server_account_read",
+                return_value={"ok": False, "error": "refresh rejected"},
+            ),
+        ):
+            state = app_module._ensure_codex_auth_with_fallback(codex_home, True)
+
+        assert state["activeMode"] == "apikey"
+        assert state["fallbackActive"] is True
+        assert "revoked" in state["fallbackReason"].lower()
+
+    def test_valid_chatgpt_refresh_remains_active(self, tmp_path):
+        import app as app_module
+
+        codex_home = tmp_path / "valid-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "valid-access",
+                "refresh_token": "valid-refresh",
+                "id_token": "not-a-jwt",
+            },
+        }))
+        with (
+            patch("app._active_openai_key", return_value="sk-fallback-not-real"),
+            patch(
+                "app._codex_app_server_account_read",
+                return_value={
+                    "ok": True,
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "person@example.com",
+                        "planType": "pro",
+                    },
+                },
+            ),
+            patch("app._write_codex_api_auth") as write_fallback,
+        ):
+            state = app_module._ensure_codex_auth_with_fallback(codex_home, True)
+
+        assert state["activeMode"] == "chatgpt"
+        assert state["fallbackActive"] is False
+        write_fallback.assert_not_called()
+
+    @patch("app._start_codex_chatgpt_login")
+    def test_chatgpt_device_login_endpoint_surfaces_url_and_code(
+        self, mock_start, authed_client
+    ):
+        mock_start.return_value = {
+            "status": "pending",
+            "verificationUrl": "https://auth.openai.com/codex/device",
+            "userCode": "ABCD-1234",
+            "loginId": "login-1",
+            "expiresAt": 123456,
+            "error": "",
+        }
+        resp = authed_client.post("/api/auth/chatgpt/start")
+        assert resp.status_code == 200
+        assert resp.json()["verificationUrl"] == "https://auth.openai.com/codex/device"
+        assert resp.json()["userCode"] == "ABCD-1234"
 
 
 # ─── AGENTS.md Path Traversal Protection ───
@@ -488,6 +643,61 @@ class TestClaudeMdSaveEndpoint:
             )
         assert resp.status_code == 500
         assert "error" in resp.json()
+
+
+class TestContextFileRegistry:
+    def test_candidate_registry_prefers_existing_codex_then_claude(self, tmp_path):
+        import app as app_module
+
+        preferred = tmp_path / "CODEX_GITHUB_RULES.md"
+        fallback = tmp_path / "CLAUDE_GITHUB_RULES.md"
+        fallback.write_text("legacy rules")
+        configured = [{
+            "id": "github-rules",
+            "paths": [preferred, fallback],
+            "load": "ondemand",
+            "note": "Git rules",
+        }]
+        with (
+            patch.object(app_module, "_CONTEXT_FILES", configured),
+            patch.object(app_module, "_INFRA_DETAIL_DIRS", [tmp_path / "no-infra"]),
+        ):
+            entries = app_module._context_file_entries()
+            assert entries[0]["path"] == fallback
+
+            preferred.write_text("codex rules")
+            entries = app_module._context_file_entries()
+            assert entries[0]["path"] == preferred
+
+    def test_registry_contains_secret_full_context(self):
+        import app as app_module
+
+        entry = next(e for e in app_module._CONTEXT_FILES if e["id"] == "full-context")
+        assert entry["load"] == "ondemand"
+        assert entry["secret"] is True
+        assert entry["paths"][-1].name == "CLAUDE_FULL_CONTEXT.md"
+
+
+class TestBrowserExternalUrl:
+    def test_direct_url_uses_this_dashboard_host_and_root_path(self):
+        import app as app_module
+
+        session = {"id": "default"}
+        with (
+            patch.object(app_module, "PUBLIC_BASE_URL", "https://grabo.tech/"),
+            patch.object(app_module, "ROOT_PATH", "/codex"),
+        ):
+            url = app_module._browser_external_url(session)
+        assert url.startswith("https://grabo.tech/codex/browser/default/vnc.html?")
+        assert "path=codex/browser/default/websockify" in url
+        assert "rotem.ai" not in url
+
+    def test_direct_url_is_omitted_without_public_base(self):
+        import app as app_module
+
+        with patch.object(app_module, "PUBLIC_BASE_URL", ""):
+            row = app_module._browser_response_row({"id": "default"})
+        assert "external_url" not in row
 
 
 # ─── Auth Mode Endpoint ───
@@ -1359,9 +1569,15 @@ class TestGoNutsModeToggle:
 class TestCreateSession:
     @pytest.fixture(autouse=True)
     def _codex_cli_is_ready(self):
-        with patch(
-            "app._codex_cli_readiness",
-            return_value=(True, "ready", {"version": "0.145.0"}),
+        with (
+            patch(
+                "app._codex_cli_readiness",
+                return_value=(True, "ready", {"version": "0.145.0"}),
+            ),
+            patch(
+                "app._ensure_codex_auth_with_fallback",
+                return_value={"activeMode": "apikey", "loggedIn": True},
+            ),
         ):
             yield
 
@@ -1443,6 +1659,48 @@ class TestCreateSession:
         resp = authed_client.post("/api/sessions/create", json={"name": "crash-session"})
         assert resp.status_code == 500
         assert "error" in resp.json()
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_default_profile_model_change_preserves_global_agents(
+        self, mock_sessions, authed_client, tmp_path
+    ):
+        """An empty built-in profile field must never erase ~/.codex/AGENTS.md."""
+        import app as app_module
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        agents_path = codex_home / "AGENTS.md"
+        original = b"# Global Codex instructions\n\nKeep this context byte-identical.\n"
+        agents_path.write_bytes(original)
+        profile = {
+            "id": app_module.DEFAULT_PROFILE_ID,
+            "name": "Default",
+            "model": app_module.DEFAULT_MODEL,
+            "effort": "max",
+            "codex_md": "",
+            "memory_md": "",
+            "env": {},
+        }
+        roles = {"profiles": [profile], "session_profiles": {}}
+
+        with (
+            patch("app._load_roles", return_value=roles),
+            patch("app._save_roles"),
+            patch("app._profile_dir", return_value=codex_home),
+            patch(
+                "app._get_session_profile_id",
+                return_value=app_module.DEFAULT_PROFILE_ID,
+            ),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch("app._send_profile_export", return_value=True),
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-5.6-sol", "restart": False},
+            )
+
+        assert resp.status_code == 200
+        assert agents_path.read_bytes() == original
 
 
 # ─── Delete Session Tests ───
