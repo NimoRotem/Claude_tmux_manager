@@ -675,8 +675,9 @@ class TestDetectActivityHysteresis:
 
 
 class TestBuildSessionResponse:
+    @patch("app._session_real_auth_mode", return_value="api")
     @patch("app.detect_activity")
-    def test_builds_complete_response(self, mock_activity):
+    def test_builds_complete_response(self, mock_activity, mock_auth_mode):
         mock_activity.return_value = {"status": "idle", "command": "codex", "detail": "Waiting"}
         sess = {"name": "test", "windows": "2", "attached": True}
         data = {
@@ -700,7 +701,7 @@ class TestBuildSessionResponse:
         assert result["activity_status"] == "idle"
         assert result["activity_command"] == "codex"
         assert result["activity_detail"] == "Waiting"
-        assert result["auth_mode"] == "subscription"  # default
+        assert result["auth_mode"] == "api"
         assert result["autopush_mode"] == "basic"
         assert result["simple_watchdog"] is False
 
