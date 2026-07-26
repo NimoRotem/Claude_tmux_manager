@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -14,142 +13,90 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-import mimetypes
 import time
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional
-import glob as globmod
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
-logger = logging.getLogger("tmux-dashboard")
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9/3.10 production hosts
+    import tomli as tomllib
+import glob as globmod
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+logger = logging.getLogger("codex-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
-from pydantic import BaseModel
+import httpx
 import openai
 import uvicorn
-import httpx
 import websockets
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
-ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
-NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
+PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
+ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
+# Default launch command for codex sessions. config.toml already sets
+# sandbox_mode=danger-full-access and approval_policy=never so bare `codex`
+# is non-interactive; we still pass the explicit flag for safety on hosts that
+# haven't been pre-configured.
+NEW_SESSION_CMD = os.environ.get(
+    "TMUX_DASH_NEW_SESSION_CMD",
+    "codex --dangerously-bypass-approvals-and-sandbox",
+)
+# Where the codex CLI keeps its state. Mirrors $CODEX_HOME.
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+# Codex runtime, model, and reasoning defaults.
+_CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
+_CODEX_DEFAULT_MODEL = os.environ.get(
+    "TMUX_DASH_DEFAULT_MODEL",
+    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6"),
+).strip() or "gpt-5.6"
+_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+_CODEX_REASONING_EFFORT_ALIASES = {
+    "ultra": "max",
+    "extra-high": "xhigh",
+    "extra_high": "xhigh",
+}
+_CODEX_DEFAULT_REASONING_EFFORT = os.environ.get(
+    "TMUX_DASH_DEFAULT_REASONING_EFFORT",
+    os.environ.get("CODEX_DEFAULT_REASONING_EFFORT", "max"),
+).strip().lower()
+_CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
+    _CODEX_DEFAULT_REASONING_EFFORT,
+    _CODEX_DEFAULT_REASONING_EFFORT,
+)
+if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
+    _CODEX_DEFAULT_REASONING_EFFORT = "max"
 
-# Default model for dashboard-launched sessions. Passed as an explicit `--model`
-# flag at launch so the default can't drift when Claude Code persists a /model
-# choice — or a new release's auto-default — into ~/.claude/settings.json (that
-# drift is how default sessions silently became Sonnet 4.6, then Fable 5).
-DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
-
-# --- Model catalog (session header dropdown) --------------------------------
-# The models offered in the per-session dropdown. Seeded with the current
-# line-up and then AUTO-GROWN: a once-per-24h background check (below) queries
-# the Anthropic /v1/models API and appends any newly-released model family or
-# generation (e.g. a future Opus 6) so the dropdown picks up new models without
-# a redeploy. Persisted to models.json; the backend validation allowlist
-# (ALLOWED_SESSION_MODELS) and the frontend dropdown both derive from it.
-MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
-_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
-# Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
-_ONE_M_FAMILIES = ("opus", "sonnet", "fable")
+# Compatibility name retained for the newer Grabo frontend and API payloads.
+DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
+MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
 _SEED_MODEL_CATALOG = [
-    ["claude-opus-5[1m]", "Opus 5 · 1M"],
-    ["claude-opus-5", "Opus 5"],
-    ["claude-sonnet-5[1m]", "Sonnet 5 · 1M"],
-    ["claude-sonnet-5", "Sonnet 5"],
-    ["claude-opus-4-8[1m]", "Opus 4.8 · 1M"],
-    ["claude-opus-4-8", "Opus 4.8"],
-    ["claude-fable-5[1m]", "Fable 5 · 1M"],
-    ["claude-fable-5", "Fable 5"],
-    ["claude-sonnet-4-6[1m]", "Sonnet 4.6 · 1M"],
-    ["claude-sonnet-4-6", "Sonnet 4.6"],
-    ["claude-haiku-4-5", "Haiku 4.5"],
+    ["gpt-5.6-sol", "GPT-5.6 Sol"],
+    ["gpt-5.6", "GPT-5.6 (Sol alias)"],
+    ["gpt-5.6-terra", "GPT-5.6 Terra"],
+    ["gpt-5.6-luna", "GPT-5.6 Luna"],
+    ["gpt-5.5", "GPT-5.5"],
+    ["gpt-5.4", "GPT-5.4"],
 ]
 
 
-def _model_base_id(model_id: str) -> str:
-    """Strip the '[1m]' 1M-context suffix to get the bare model id."""
-    return model_id[:-4] if model_id.endswith("[1m]") else model_id
-
-
-def _normalize_model_alias(model_id: str) -> str:
-    """Map an API model id to its Claude Code CLI alias by dropping a trailing
-    -YYYYMMDD date (claude-haiku-4-5-20251001 -> claude-haiku-4-5)."""
-    return re.sub(r"-\d{8}$", "", model_id)
-
-
-def _model_family_ver(alias: str):
-    """(family, version_tuple) for a bare alias, else None.
-    claude-opus-4-8 -> ('opus', (4, 8)); claude-opus-5 -> ('opus', (5,))."""
-    m = re.match(r"^claude-(" + "|".join(_MODEL_FAMILIES) + r")-([0-9]+(?:-[0-9]+)*)$", alias)
-    if not m:
-        return None
-    return m.group(1), tuple(int(x) for x in m.group(2).split("-"))
-
-
-def _model_label(alias: str) -> str:
-    """Friendly dropdown label for a bare alias. claude-opus-5 -> 'Opus 5'."""
-    fv = _model_family_ver(alias)
-    if not fv:
-        return alias
-    fam, ver = fv
-    return fam.capitalize() + " " + ".".join(str(x) for x in ver)
-
-
-def _catalog_row(model_id: str) -> list:
-    """Build a [id, label] row, appending ' · 1M' for [1m] ids."""
-    base = _model_base_id(model_id)
-    return [model_id, _model_label(base) + (" · 1M" if model_id.endswith("[1m]") else "")]
-
-
-def _merge_new_models(catalog: list, api_ids: list) -> list:
-    """Prepend any genuinely-NEW model — a higher generation than we already list
-    for its family, or a brand-new family — newest-first. Existing/older ids are
-    never re-added, so the dropdown doesn't fill up with legacy dated models."""
-    present = {row[0] for row in catalog}
-    known_max = {}
-    for row in catalog:
-        fv = _model_family_ver(_model_base_id(row[0]))
-        if fv:
-            fam, ver = fv
-            if ver > known_max.get(fam, ()):
-                known_max[fam] = ver
-    additions = {}  # family -> newest new version tuple
-    for mid in api_ids:
-        fv = _model_family_ver(_normalize_model_alias(mid))
-        if not fv:
-            continue
-        fam, ver = fv
-        if (fam not in known_max or ver > known_max[fam]) and ver > additions.get(fam, ()):
-            additions[fam] = ver
-    if not additions:
-        return catalog
-    new_rows = []
-    for fam, ver in sorted(additions.items(), key=lambda kv: kv[1], reverse=True):
-        alias = "claude-" + fam + "-" + "-".join(str(x) for x in ver)
-        if fam in _ONE_M_FAMILIES and (alias + "[1m]") not in present:
-            new_rows.append(_catalog_row(alias + "[1m]"))
-        if alias not in present:
-            new_rows.append(_catalog_row(alias))
-    if new_rows:
-        logger.info("Model auto-detect: added %s", [r[0] for r in new_rows])
-    return new_rows + catalog
-
-
 def _load_model_catalog() -> list:
-    """Load the persisted catalog, or seed it. Always returns a non-empty list."""
     try:
-        if MODELS_FILE.exists():
-            data = json.loads(MODELS_FILE.read_text())
-            rows = data.get("models") if isinstance(data, dict) else data
-            rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
-            if rows:
-                return rows
+        data = json.loads(MODELS_FILE.read_text())
+        rows = data.get("models") if isinstance(data, dict) else data
+        rows = [list(row) for row in (rows or [])
+                if isinstance(row, (list, tuple)) and len(row) == 2]
+        if rows:
+            return rows
     except Exception:
-        logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
-    return [list(r) for r in _SEED_MODEL_CATALOG]
+        logger.debug("No usable Codex model catalog at %s", MODELS_FILE, exc_info=True)
+    return [list(row) for row in _SEED_MODEL_CATALOG]
 
 
 def _save_model_catalog(catalog: list, last_check: float = 0.0):
@@ -160,154 +107,163 @@ def _save_model_catalog(catalog: list, last_check: float = 0.0):
         logger.debug("Failed to save %s", MODELS_FILE, exc_info=True)
 
 
-MODEL_CATALOG = _load_model_catalog()
-# Backend allowlist for /api/sessions/{name}/model validation (ids only).
-ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
-# The configured default must always be selectable.
-for _dm in (DEFAULT_MODEL, _model_base_id(DEFAULT_MODEL)):
-    if _dm and _dm not in ALLOWED_SESSION_MODELS:
-        MODEL_CATALOG.insert(0, _catalog_row(_dm))
-        ALLOWED_SESSION_MODELS.insert(0, _dm)
-
-
-def _anthropic_api_key() -> str:
-    """A usable Anthropic API key for the model-catalog check: env first, then
-    the API registry, then ~/CLAUDE_API_KEYS.md."""
-    k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if k.startswith("sk-ant-"):
-        return k
-    try:
-        reg = json.loads((Path.home() / ".tmux-dashboard" / "api_registry.json").read_text())
-        items = reg if isinstance(reg, list) else (reg.get("apis") or reg.get("keys") or [])
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            prov = (it.get("provider") or it.get("name") or "").lower()
-            if "anthropic" in prov or "claude" in prov:
-                key = (it.get("key") or it.get("api_key") or "").strip()
-                if key.startswith("sk-ant-"):
-                    return key
-    except Exception:
-        logger.debug("No anthropic key in api_registry", exc_info=True)
-    try:
-        m = re.search(r"sk-ant-[A-Za-z0-9_-]{20,}", (Path.home() / "CLAUDE_API_KEYS.md").read_text())
-        if m:
-            return m.group(0)
-    except Exception:
-        logger.debug("No anthropic key in CLAUDE_API_KEYS.md", exc_info=True)
-    return ""
-
-
-def _fetch_anthropic_model_ids() -> list:
-    """GET /v1/models -> list of model-id strings (blocking; run in a thread)."""
-    import urllib.request
-    key = _anthropic_api_key()
-    if not key:
-        return []
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/models?limit=1000",
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+def _fetch_codex_model_catalog() -> list:
+    """Read the model catalog bundled with the installed Codex CLI."""
+    result = subprocess.run(
+        ["codex", "debug", "models", "--bundled"],
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+    if result.returncode != 0:
+        return []
+    data = json.loads(result.stdout or "{}")
+    rows = []
+    for model in data.get("models", []):
+        if not isinstance(model, dict) or model.get("visibility") == "hide":
+            continue
+        slug = str(model.get("slug") or "").strip()
+        if not slug:
+            continue
+        label = str(model.get("display_name") or slug).strip()
+        rows.append([slug, label])
+    return rows
 
 
-MODEL_CHECK_INTERVAL = 24 * 3600  # once per 24h
+MODEL_CATALOG = _load_model_catalog()
+ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+if DEFAULT_MODEL not in ALLOWED_SESSION_MODELS:
+    MODEL_CATALOG.insert(0, [DEFAULT_MODEL, DEFAULT_MODEL])
+    ALLOWED_SESSION_MODELS.insert(0, DEFAULT_MODEL)
+
+MODEL_CHECK_INTERVAL = 24 * 3600
+
+
+def _codex_cli_readiness() -> tuple[bool, str, dict]:
+    """Check that a compatible Codex CLI is available before starting a pane."""
+    binary = shutil.which("codex")
+    details = {"binary": binary or "", "minimum": _CODEX_MIN_CLI_VERSION, "version": ""}
+    if not binary:
+        return False, "the codex CLI is not installed", details
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        )
+        text = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        match = re.search(r"(\d+\.\d+\.\d+)", text)
+        version = match.group(1) if match else ""
+        details["version"] = version
+        if result.returncode != 0 or not version:
+            return False, "the codex CLI version could not be determined", details
+        current = tuple(int(part) for part in version.split("."))
+        minimum = tuple(int(part) for part in _CODEX_MIN_CLI_VERSION.split("."))
+        if current < minimum:
+            return False, f"codex {version} is older than required {_CODEX_MIN_CLI_VERSION}", details
+    except Exception as exc:
+        return False, f"codex CLI check failed: {type(exc).__name__}", details
+    return True, "ready", details
 
 
 async def _refresh_model_catalog(force: bool = False) -> bool:
-    """If due (>=24h since last check) or forced, query the Anthropic models API
-    and merge any newly-released models into the catalog. Returns True on change."""
     global MODEL_CATALOG, ALLOWED_SESSION_MODELS
     try:
-        last = 0.0
+        last_check = 0.0
         try:
-            if MODELS_FILE.exists():
-                last = float(json.loads(MODELS_FILE.read_text()).get("last_check", 0))
+            last_check = float(json.loads(MODELS_FILE.read_text()).get("last_check", 0))
         except Exception:
-            last = 0.0
+            pass
         now = time.time()
-        if not force and now - last < MODEL_CHECK_INTERVAL:
+        if not force and now - last_check < MODEL_CHECK_INTERVAL:
             return False
-        api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
-        if not api_ids:
-            # Couldn't reach the API — don't stamp last_check, so we retry sooner.
-            logger.info("Model auto-detect: no models returned (auth/network?) — will retry")
+        detected = await asyncio.to_thread(_fetch_codex_model_catalog)
+        if not detected:
             return False
-        merged = _merge_new_models([list(r) for r in MODEL_CATALOG], api_ids)
-        changed = [r[0] for r in merged] != [r[0] for r in MODEL_CATALOG]
+        seen = set()
+        merged = []
+        for row in detected + _SEED_MODEL_CATALOG:
+            if row[0] not in seen:
+                seen.add(row[0])
+                merged.append(list(row))
+        changed = merged != MODEL_CATALOG
         MODEL_CATALOG = merged
         ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
         _save_model_catalog(MODEL_CATALOG, now)
         return changed
     except Exception:
-        logger.debug("Model catalog refresh failed", exc_info=True)
+        logger.debug("Codex model catalog refresh failed", exc_info=True)
         return False
 
 
 async def _model_refresh_loop():
-    """Background: keep the model dropdown current. Re-checks hourly whether a
-    24h refresh is due, so a long-lived process still picks up new models daily."""
-    await asyncio.sleep(20)  # let startup settle
+    await asyncio.sleep(20)
     while True:
         try:
-            if await _refresh_model_catalog():
-                logger.info("Model catalog updated: %s", [r[0] for r in MODEL_CATALOG])
+            await _refresh_model_catalog()
         except Exception:
-            logger.debug("model refresh loop iteration failed", exc_info=True)
+            logger.debug("Codex model refresh loop failed", exc_info=True)
         await asyncio.sleep(3600)
 
 
+def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) -> str:
+    """Build a Codex launch command using the selected profile configuration."""
+    out = cmd.strip() or NEW_SESSION_CMD
+    if resume:
+        out = "codex resume --last"
+        if "--dangerously-bypass-approvals-and-sandbox" in cmd:
+            out += " --dangerously-bypass-approvals-and-sandbox"
+        elif "--sandbox" in cmd or " -s " in f" {cmd} ":
+            out += " --sandbox workspace-write --ask-for-approval never"
+    if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
+        out += " --model " + shlex.quote(DEFAULT_MODEL)
+    return out
+
+
+def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
+    """Use a sandboxed launch for team members; admins keep the configured command."""
+    try:
+        owner = user or (_user_for_session(session_name) if session_name else None)
+        if TEAM_MODE and owner and not _is_admin(owner):
+            return "codex --sandbox workspace-write --ask-for-approval never"
+    except Exception:
+        pass
+    return NEW_SESSION_CMD
+
+
+# Compatibility aliases used by newer Grabo paths while the implementation is Codex.
 def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
-    """Build the pane launch line: force plan auth via ~/.claude/.credentials.json
-    (a stray ANTHROPIC_API_KEY would bill the metered API; a CLAUDE_CODE_OAUTH_TOKEN
-    env var makes claude brand itself "Claude API" even on the plan token) and pin
-    an explicit --model unless the command already carries one or the caller opts
-    out (profiles that pin their own model via settings.json)."""
-    out = cmd
-    if pin_model and DEFAULT_MODEL and "claude" in cmd and "--model" not in cmd:
-        out = f"{cmd} --model {shlex.quote(DEFAULT_MODEL)}"
-    return _claude_launch_env_prefix() + out
+    return _launch_codex_cmd(cmd, pin_model=pin_model)
 
 
 def _restore_default_model_setting():
-    """Keep ~/.claude/settings.json `model` pinned to DEFAULT_MODEL. Claude Code
-    rewrites it whenever anyone runs /model (and on new-model releases, e.g. the
-    Fable 5 auto-switch) — this heals the default so new sessions stay on it."""
-    if not DEFAULT_MODEL:
-        return
-    sp = Path.home() / ".claude" / "settings.json"
+    """Keep the default Codex config aligned with the dashboard selection."""
     try:
-        s = json.loads(sp.read_text()) if sp.exists() else {}
-        if isinstance(s, dict) and s.get("model") != DEFAULT_MODEL:
-            s["model"] = DEFAULT_MODEL
-            sp.write_text(json.dumps(s, indent=2))
-            logger.info("Restored default model in %s -> %s", sp, DEFAULT_MODEL)
+        CODEX_HOME.mkdir(parents=True, exist_ok=True)
+        cfg = CODEX_HOME / "config.toml"
+        existing = cfg.read_text() if cfg.exists() else ""
+        managed = {
+            "model": DEFAULT_MODEL,
+            "model_reasoning_effort": _CODEX_DEFAULT_REASONING_EFFORT,
+            "sandbox_mode": "danger-full-access",
+            "approval_policy": "never",
+        }
+        merged = _merge_top_level_toml_keys(existing, managed)
+        if merged != existing:
+            _backup_before_dashboard_write(cfg)
+            cfg.write_text(merged)
     except Exception:
-        logger.debug("Failed to restore default model in %s", sp, exc_info=True)
+        logger.debug("Failed to align default Codex config", exc_info=True)
 
 
 def _model_flag_for_relaunch(session_name: str) -> str:
-    """` --model <id>` for a crash/relogin relaunch: preserve the session's
-    last-used model (so a deliberate /model switch survives a restart), mapping
-    the default family back to DEFAULT_MODEL to keep its [1m] context flag."""
     try:
-        last = _get_session_model(session_name)
+        model = _get_session_model(session_name) or DEFAULT_MODEL
     except Exception:
-        last = ""
-    if last.startswith("<"):  # "<synthetic>" transcript entries
-        last = ""
-    if not last:
-        return f" --model {shlex.quote(DEFAULT_MODEL)}" if DEFAULT_MODEL else ""
-    base = DEFAULT_MODEL.split("[", 1)[0]
-    if base and (last == base or last.startswith(base + "-")):
-        return f" --model {shlex.quote(DEFAULT_MODEL)}"
-    return f" --model {shlex.quote(last)}"
+        model = DEFAULT_MODEL
+    return f" --model {shlex.quote(model)}" if model else ""
 
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
-# simplified UI, a shared Claude auth token, per-user context, OAuth connections,
+# simplified UI, shared Codex authentication, per-user context, OAuth connections,
 # and a soft sandbox (cross-server actions are blocked and logged). Gated behind
 # env so the shared codebase is unchanged for the personal
 # single-admin dashboards (instance-3, builder) that never set these vars.
@@ -320,117 +276,155 @@ PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dia
 PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
-TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
+TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", _CODEX_DEFAULT_MODEL)
 TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
 GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "dianaotech.com")
 
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
-# Removed/disabled by default: it issued a continuous stream of gpt-4o-mini calls,
-# re-summarizing actively-changing sessions on every poll (high CPU + token cost).
-# Re-enable with TMUX_DASH_AUTO_SUMMARY=1 if ever wanted again.
 AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() in ("1", "true", "yes")
 
-# --- Claude Code API key storage ---
+# Keep Grabo's established dashboard state directory so users, history, browser
+# sessions, and settings survive the runtime migration.
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
-ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
-_stored_anthropic_key: str = ""
-
-# --- Long-lived (non-rotating) Claude auth token ----------------------------
-# A token minted with `claude setup-token` (subscription-backed, ~1yr, does NOT
-# rotate). When present we export it as CLAUDE_CODE_OAUTH_TOKEN into every
-# launched session so they all authenticate with the SAME static token instead
-# of sharing the rotating ~/.claude/.credentials.json — whose refresh-token
-# rotation across concurrent sessions is what caused intermittent
-# "401 OAuth access token has been revoked" and headless /login hangs. Billing
-# still runs on the plan (ANTHROPIC_API_KEY stays unset). Delete the file to
-# revert to the previous behavior.
-LONGLIVED_TOKEN_FILE = MESSAGES_DIR / "claude_oauth_token"
+OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
+_stored_openai_key: str = ""
 
 
-def _load_longlived_token() -> str:
-    """Read the stored long-lived token (fresh each call so edits apply at once)."""
+def _load_openai_key() -> str:
+    global _stored_openai_key
     try:
-        if LONGLIVED_TOKEN_FILE.exists():
-            return LONGLIVED_TOKEN_FILE.read_text().strip()
+        if OPENAI_KEY_FILE.exists():
+            _stored_openai_key = OPENAI_KEY_FILE.read_text().strip()
     except Exception:
-        logger.debug("Failed to read long-lived token", exc_info=True)
+        logger.debug("Failed to load OpenAI API key", exc_info=True)
+    return _stored_openai_key
+
+
+def _write_codex_api_auth(codex_home: Path, key: str):
+    """Write file-backed Codex API authentication without logging the secret."""
+    if not key:
+        return
+    codex_home.mkdir(parents=True, exist_ok=True)
+    auth_path = codex_home / "auth.json"
+    if auth_path.exists():
+        _backup_before_dashboard_write(auth_path)
+    auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key}, indent=2))
+    auth_path.chmod(0o600)
+
+
+def _save_openai_key(key: str):
+    global _stored_openai_key
+    _stored_openai_key = key
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        OPENAI_KEY_FILE.write_text(key)
+        OPENAI_KEY_FILE.chmod(0o600)
+        _write_codex_api_auth(CODEX_HOME, key)
+    except Exception:
+        logger.debug("Failed to save OpenAI API key", exc_info=True)
+
+
+def _clear_openai_key():
+    global _stored_openai_key
+    _stored_openai_key = ""
+    try:
+        if OPENAI_KEY_FILE.exists():
+            OPENAI_KEY_FILE.unlink()
+    except Exception:
+        logger.debug("Failed to clear OpenAI API key", exc_info=True)
+
+
+_load_openai_key()
+
+
+def _active_openai_key() -> str:
+    return _stored_openai_key or OPENAI_API_KEY
+
+
+def _codex_launch_env_prefix() -> str:
     return ""
 
 
-def _save_longlived_token(token: str):
-    MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-    LONGLIVED_TOKEN_FILE.write_text(token.strip())
-    LONGLIVED_TOKEN_FILE.chmod(0o600)
+# Compatibility aliases for inactive legacy team/browser paths. They point at
+# the Codex key store and never expose a key in logs or API responses.
+ANTHROPIC_API_KEY_FILE = OPENAI_KEY_FILE
+_stored_anthropic_key = _stored_openai_key
+_save_anthropic_key = _save_openai_key
+_clear_anthropic_key = _clear_openai_key
 
 
 def _claude_launch_env_prefix() -> str:
-    """Shell env prefix for launching `claude`. Exports a stored long-lived token
-    when present (so sessions stop rotating the shared credential and never get
-    revoked); otherwise falls back to unsetting both auth vars. ANTHROPIC_API_KEY
-    is always unset so inference stays on the plan, never the metered API."""
-    tok = _load_longlived_token()
-    if tok:
-        return "export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok) + "; unset ANTHROPIC_API_KEY; "
-    return "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
-
-
-def _load_anthropic_key() -> str:
-    global _stored_anthropic_key
-    try:
-        if ANTHROPIC_API_KEY_FILE.exists():
-            _stored_anthropic_key = ANTHROPIC_API_KEY_FILE.read_text().strip()
-    except Exception:
-        logger.debug("Failed to load Anthropic API key from %s", ANTHROPIC_API_KEY_FILE, exc_info=True)
-    return _stored_anthropic_key
-
-
-def _save_anthropic_key(key: str):
-    global _stored_anthropic_key
-    _stored_anthropic_key = key
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        ANTHROPIC_API_KEY_FILE.write_text(key)
-        ANTHROPIC_API_KEY_FILE.chmod(0o600)
-    except Exception:
-        logger.debug("Failed to save Anthropic API key", exc_info=True)
-
-
-def _clear_anthropic_key():
-    global _stored_anthropic_key
-    _stored_anthropic_key = ""
-    try:
-        if ANTHROPIC_API_KEY_FILE.exists():
-            ANTHROPIC_API_KEY_FILE.unlink()
-    except Exception:
-        logger.debug("Failed to clear Anthropic API key", exc_info=True)
-
-
-_load_anthropic_key()
+    return _codex_launch_env_prefix()
 
 # Track auth mode per session: "subscription" or "api"
-_session_auth_mode: Dict[str, str] = {}
+_session_auth_mode: dict[str, str] = {}
 
+# Away mode state per session
+_away_mode_state: dict[str, dict] = {}
+# Per-session structure when active:
+# {
+#   "enabled": bool,
+#   "phase": int (1-5),
+#   "phase_name": str,
+#   "step": int,
+#   "step_name": str,
+#   "started_at": float,
+#   "log": [{"ts": float, "phase": int, "step": int, "action": str}],
+#   "report": str,
+#   "task": asyncio.Task | None,
+# }
+
+# Go Nuts mode state per session (same structure as away mode)
+_go_nuts_state: dict[str, dict] = {}
 
 # Flag to prevent CancelledError handlers from wiping persisted state during shutdown.
 # When True, worker cancel handlers skip setting enabled=False and re-saving to disk.
 _shutting_down = False
 
+# --- Persistent autonomous mode state ---
+# Survives restarts: stores which sessions had away/go-nuts mode enabled.
+AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
+
+def _save_autonomous_state():
+    """Persist which sessions have away/go-nuts mode enabled to disk."""
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        state = {}
+        for name, s in _away_mode_state.items():
+            if s.get("enabled"):
+                state.setdefault(name, {})["away_mode"] = True
+        for name, s in _go_nuts_state.items():
+            if s.get("enabled"):
+                state.setdefault(name, {})["go_nuts_mode"] = True
+        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
+    except Exception:
+        logger.debug("Failed to save autonomous mode state", exc_info=True)
+
+def _load_autonomous_state() -> dict[str, dict]:
+    """Load persisted autonomous mode state from disk."""
+    try:
+        if AUTONOMOUS_STATE_FILE.exists():
+            return json.loads(AUTONOMOUS_STATE_FILE.read_text())
+    except Exception:
+        logger.debug("Failed to load autonomous mode state", exc_info=True)
+    return {}
+
 
 # --- Simple Watchdog ---
-# Default-ON, lightweight watchdog that auto-replies "continue" when Claude is
+# Default-ON, lightweight watchdog that auto-replies "continue" when Codex is
 # idle waiting for the user to confirm whether to keep working on the current
 # task. Does NOT take initiative on truly finished work — only resolves the
 # "shall I continue?" pause case. Per-session opt-out persisted to disk.
 SIMPLE_WATCHDOG_DISABLED_FILE = MESSAGES_DIR / "simple-watchdog-disabled.json"
 _simple_watchdog_disabled: set = set()
 # Per-session log of recent "continue" sends, capped at 20 entries.
-_simple_watchdog_log: Dict[str, list] = {}
+_simple_watchdog_log: dict[str, list] = {}
 # Per-session bookkeeping: {"idle_since": float, "last_action": float, "last_hash": str}
-_simple_watchdog_state: Dict[str, dict] = {}
+_simple_watchdog_state: dict[str, dict] = {}
 
 
 def _save_simple_watchdog_disabled():
@@ -454,20 +448,20 @@ def _load_simple_watchdog_disabled():
 
 # --- Auto-push mode (per session): "off" | "basic" | "full" ---
 # Governs how much the dashboard is allowed to type into a session's terminal on
-# the user's behalf when Claude stops or waits:
+# the user's behalf when Codex stops or waits:
 #   off   — never write anything at all (no option-picking, no Enter on prompts,
 #           no auto /login, no free-form "keep going" messages).
-#   basic — auto-pick from Claude's option menus and confirm permission/plan
+#   basic — auto-pick from Codex's option menus and confirm permission/plan
 #           prompts (press Enter), and keep the session logged in. Does NOT type
 #           any free-form instructions.
 #   full  — everything in "basic" PLUS the autopilot watchdog that composes and
-#           types a "keep going" message when Claude pauses waiting on the user
+#           types a "keep going" message when Codex pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
 # New sessions default to "basic". Persisted per session to disk.
 AUTOPUSH_MODES = ("off", "basic", "full")
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
-_autopush_mode: Dict[str, str] = {}
+_autopush_mode: dict[str, str] = {}
 
 
 def _get_autopush_mode(session_name: str) -> str:
@@ -496,58 +490,65 @@ def _load_autopush_mode():
         logger.debug("Failed to load autopush-mode map", exc_info=True)
 
 
-def _is_claude_running(session_name: str) -> bool:
-    """Check if Claude Code process is running in the session (not just a bare shell).
-
-    When Claude Code OOMs or crashes, the tmux pane falls back to the parent
-    shell (bash/zsh). This function distinguishes that from Claude Code running.
-    Returns True if Claude (node) is the foreground process, False if bare shell.
-    """
+def _is_codex_running(session_name: str) -> bool:
+    """Return True only when the tmux pane has a live Codex descendant."""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p",
-             "#{pane_current_command}"],
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_pid}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return False
-        cmd = result.stdout.strip().lower()
-        # Claude Code runs as 'node' or sometimes 'claude'. A bare shell is bash/zsh/sh/fish.
-        shell_commands = {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
-        if cmd in shell_commands:
+        pane_pid = (result.stdout or "").strip()
+        if not pane_pid.isdigit():
             return False
-        # If it's node, claude, or anything else non-shell, Claude is likely running
-        return True
+        pending = [pane_pid]
+        seen = {pane_pid}
+        for _ in range(64):
+            if not pending:
+                break
+            parent = pending.pop(0)
+            children = subprocess.run(
+                ["pgrep", "-P", parent], capture_output=True, text=True, timeout=2
+            )
+            for child in (children.stdout or "").split():
+                if child in seen:
+                    continue
+                seen.add(child)
+                pending.append(child)
+                try:
+                    comm = Path(f"/proc/{child}/comm").read_text().strip().lower()
+                    argv = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+                        errors="replace"
+                    ).lower()
+                except Exception:
+                    continue
+                if comm == "codex" or re.search(r"(?:^|[/\s])codex(?:\s|$)", argv):
+                    return True
+        return False
     except Exception:
         return False
 
 
-async def _async_is_claude_running(session_name: str) -> bool:
-    """Non-blocking version of _is_claude_running."""
-    return await asyncio.to_thread(_is_claude_running, session_name)
+async def _async_is_codex_running(session_name: str) -> bool:
+    """Non-blocking version of _is_codex_running."""
+    return await asyncio.to_thread(_is_codex_running, session_name)
 
 
-async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None,
-                                 resume_uuid: str = None) -> bool:
-    """Check if Claude Code is running; if not, restart it. Returns True if Claude is running after check.
-
-    This handles OOM crashes where Claude dies and the pane falls back to bash.
-    The relaunch reattaches to the crashed conversation so the task continues:
-    `--resume <uuid>` when the exact conversation is known (preferred — sessions
-    can share a cwd, which makes plain --continue grab the wrong one), otherwise
-    `--continue`. A larger Node heap is set to reduce repeat OOMs.
-    """
+async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = None,
+                                resume_uuid: str = None) -> bool:
+    """Restart a crashed Codex pane and resume its most recent local thread."""
     alog = logging.getLogger("autonomous")
-    if await _async_is_claude_running(session_name):
+    if await _async_is_codex_running(session_name):
         return True
 
-    msg = f"Claude Code not running in '{session_name}' — restarting it"
+    msg = f"Codex not running in '{session_name}' — restarting it"
     alog.warning(msg)
     if log_fn and state:
         log_fn(state, msg)
 
     try:
-        # Re-export the active profile's CLAUDE_CONFIG_DIR before launching, in
+        # Re-export the active profile's CODEX_HOME before launching, in
         # case the shell was respawned (env vars don't survive a fresh bash).
         try:
             pid = _get_session_profile_id(session_name)
@@ -563,15 +564,13 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             if TEAM_MODE:
                 _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
                 if _owner and not _is_admin(_owner):
-                    _apply_member_auth(_user_claude_config_dir(_owner))
+                    _apply_member_auth(_user_codex_config_dir(_owner))
         except Exception:
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
-        # Relaunch Claude on the bare shell, resuming the prior conversation.
-        resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
-        launch = (_claude_launch_env_prefix() +
-                  "NODE_OPTIONS=--max-old-space-size=8192 "
-                  f"claude --dangerously-skip-permissions {resume_flag}"
-                  f"{_model_flag_for_relaunch(session_name)}")
+        # Codex stores local threads under CODEX_HOME. Resume the newest thread
+        # for this working directory instead of opening the interactive picker.
+        launch_base = _session_launch_base(session_name)
+        launch = _launch_codex_cmd(launch_base, pin_model=True, resume=True)
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -584,24 +583,30 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5)
 
-        # Wait for Claude Code to start (up to 30s)
+        # Wait for codex to start (up to 30s)
         for _ in range(15):
             await asyncio.sleep(2)
-            if await _async_is_claude_running(session_name):
-                alog.info(f"Claude Code restarted successfully in '{session_name}'")
+            if await _async_is_codex_running(session_name):
+                alog.info(f"Codex restarted successfully in '{session_name}'")
                 if log_fn and state:
-                    log_fn(state, "Claude Code restarted successfully")
+                    log_fn(state, "Codex restarted successfully")
                 # Give it a moment to fully initialize
                 await asyncio.sleep(5)
                 return True
 
-        alog.error(f"Failed to restart Claude Code in '{session_name}' after 30s")
+        alog.error(f"Failed to restart Codex in '{session_name}' after 30s")
         if log_fn and state:
-            log_fn(state, "Failed to restart Claude Code after 30s")
+            log_fn(state, "Failed to restart Codex after 30s")
         return False
     except Exception as e:
-        alog.error(f"Error restarting Claude Code in '{session_name}': {e}")
+        alog.error(f"Error restarting Codex in '{session_name}': {e}")
         return False
+
+
+# Backwards-compatible internal names used by newer Grabo browser/recovery code.
+_is_claude_running = _is_codex_running
+_async_is_claude_running = _async_is_codex_running
+_ensure_claude_running = _ensure_codex_running
 
 
 _background_tasks: list = []
@@ -609,11 +614,11 @@ _background_tasks: list = []
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Manage startup and shutdown for the tmux Dashboard FastAPI application."""
+    """Manage startup and shutdown for the Codex Dashboard FastAPI application."""
     # --- Startup ---
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=20))
-    logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
+    logger.info("Codex Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
                 PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
                 "configured" if OPENAI_API_KEY else "missing")
@@ -634,13 +639,17 @@ async def lifespan(_app: FastAPI):
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
     # Auto-responder: presses Enter ONLY when the visible pane shows a
-    # Claude Code selection prompt with ❯ directly on a numbered option.
+    # Codex selection prompt with ❯ directly on a numbered option.
     # The detection refuses to fire when ❯ is followed by free text — that
     # is the user input box and Enter would submit it (the "phantom
     # message" bug). Approves plan/permission prompts hands-free.
     task = asyncio.create_task(_auto_responder_loop())
     _background_tasks.append(task)
     logger.info("Auto-responder background task started")
+    watchdog_task = asyncio.create_task(_watchdog_loop())
+    _background_tasks.append(watchdog_task)
+    logger.info("Autonomous mode watchdog started")
+
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
@@ -652,9 +661,40 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(tmp_watchdog_task)
     logger.info("Tmp watchdog started")
 
-    login_watchdog_task = asyncio.create_task(_login_watchdog_loop())
-    _background_tasks.append(login_watchdog_task)
-    logger.info("Login watchdog started")
+    # Restore persistent autonomous mode state from disk
+    saved = _load_autonomous_state()
+    if saved:
+        session_names = {s["name"] for s in sessions}
+        for name, modes in saved.items():
+            if name not in session_names:
+                logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
+                continue
+            if modes.get("away_mode"):
+                logger.info("Restoring Away Mode for '%s' (was active before restart)", name)
+                state = {
+                    "enabled": True, "phase": 4, "phase_name": "Continuous (restored)",
+                    "step": 0, "step_name": "Restored after restart",
+                    "started_at": time.time(), "log": [], "report": "", "task": None,
+                }
+                _away_mode_state[name] = state
+                _away_log(state, "Away mode restored after server restart")
+                t = asyncio.create_task(_restore_autonomous_mode(name, state, "away"))
+                state["task"] = t
+            elif modes.get("go_nuts_mode"):
+                logger.info("Restoring Go Nuts Mode for '%s' (was active before restart)", name)
+                state = {
+                    "enabled": True, "phase": 4, "phase_name": "Continuous Build (restored)",
+                    "step": 0, "step_name": "Restored after restart",
+                    "started_at": time.time(), "log": [], "report": "", "task": None,
+                }
+                _go_nuts_state[name] = state
+                _go_nuts_log(state, "Go Nuts mode restored after server restart")
+                t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
+                state["task"] = t
+
+    # Clean up orphaned entries (sessions that no longer exist were skipped above
+    # but file still has their old state). Re-save now based on in-memory dicts only.
+    _save_autonomous_state()
 
     crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
     _background_tasks.append(crash_recovery_task)
@@ -669,19 +709,48 @@ async def lifespan(_app: FastAPI):
     # --- Shutdown ---
     global _shutting_down
     _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
-    logger.info("tmux Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
+    logger.info("Codex Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
+    # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
+    _save_autonomous_state()
+    logger.info("Autonomous mode state saved to disk for restore on next startup")
     for t in _background_tasks:
         if not t.done():
             t.cancel()
+    # Cancel any running away-mode workers
+    for name, state in _away_mode_state.items():
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
+            logger.info("Cancelled away-mode worker for '%s'", name)
+    # Cancel any running go-nuts-mode workers
+    for name, state in _go_nuts_state.items():
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
+            logger.info("Cancelled go-nuts-mode worker for '%s'", name)
     logger.info("Shutdown complete")
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(_request: Request, exc: RequestValidationError):
+    """Keep API validation errors compatible with the dashboard's JS client.
+
+    Do not serialize Pydantic's full error structure here: it can include the
+    submitted value, which is especially undesirable on credential routes.
+    """
+    errors = exc.errors()
+    message = errors[0].get("msg", "Invalid request") if errors else "Invalid request"
+    return JSONResponse({"error": message}, status_code=422)
+
 # --- Auth ---
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
 AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
 AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
+# Cookie name must be UNIQUE per dashboard instance, else two dashboards on the
+# same domain (e.g. knowva.ai/tmux + /codex) collide: both set "tmux_auth" at
+# Path=/, so logging into one overwrites/invalidates the other's cookie.
+AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
 
 
 def _make_token(user_id: str) -> str:
@@ -704,8 +773,8 @@ def _check_token(token: str) -> bool:
 # Admin (id="admin") is bootstrapped from TMUX_DASH_USER / TMUX_DASH_PASS env vars
 # on first run, then writable via the admin UI. Per-user data lives at
 # ~/.tmux-dashboard/users/<id>/  (the admin keeps the legacy paths to preserve
-# existing messages.json / notes.json / uploads). Per-user Claude config lives
-# at ~/.claude-user-<id>/ for non-admin users; admin still uses ~/.claude.
+# existing messages.json / notes.json / uploads). Per-user Codex config lives
+# at ~/.codex-user-<id>/ for non-admin users; admin still uses ~/.codex.
 USERS_FILE = MESSAGES_DIR / "users.json"
 
 
@@ -758,14 +827,14 @@ def _save_users(users: list):
         logger.exception("Failed to save users to %s", USERS_FILE)
 
 
-def _find_user_by_id(user_id: str) -> Optional[dict]:
+def _find_user_by_id(user_id: str) -> dict | None:
     for u in _load_users():
         if u.get("id") == user_id:
             return u
     return None
 
 
-def _find_user_by_username(username: str) -> Optional[dict]:
+def _find_user_by_username(username: str) -> dict | None:
     for u in _load_users():
         if u.get("username") == username:
             return u
@@ -779,7 +848,7 @@ def _verify_password(user: dict, password: str) -> bool:
     return bool(expected) and hmac.compare_digest(candidate, expected)
 
 
-def _user_from_token(token: Optional[str]) -> Optional[dict]:
+def _user_from_token(token: str | None) -> dict | None:
     """Validate token signature AND look up the user. Returns user dict or None."""
     if not token or not _check_token(token):
         return None
@@ -787,7 +856,7 @@ def _user_from_token(token: Optional[str]) -> Optional[dict]:
     return _find_user_by_id(user_id)
 
 
-def _current_user(request: Request) -> Optional[dict]:
+def _current_user(request: Request) -> dict | None:
     """Resolve the user for an HTTP request via the tmux_auth cookie.
 
     When AUTH_PASS is empty (auth disabled), behave as if the admin is logged
@@ -806,12 +875,12 @@ def _current_user(request: Request) -> Optional[dict]:
     cached = getattr(request.state, "_current_user", None)
     if cached is not None:
         return cached or None  # explicit None vs sentinel
-    user = _user_from_token(request.cookies.get("tmux_auth"))
+    user = _user_from_token(request.cookies.get(AUTH_COOKIE))
     request.state._current_user = user or {}
     return user
 
 
-def _is_admin(user: Optional[dict]) -> bool:
+def _is_admin(user: dict | None) -> bool:
     return bool(user) and user.get("role") == "admin"
 
 
@@ -826,7 +895,7 @@ except Exception:
 # Admin keeps the legacy ~/.tmux-dashboard/ root for backwards compatibility
 # with existing messages.json / notes.json / uploads/ on disk. Non-admin users
 # are isolated under ~/.tmux-dashboard/users/<user_id>/.
-def _user_data_dir(user: Optional[dict]) -> Path:
+def _user_data_dir(user: dict | None) -> Path:
     if not user or user.get("id") == "admin":
         return MESSAGES_DIR
     d = MESSAGES_DIR / "users" / user["id"]
@@ -834,85 +903,92 @@ def _user_data_dir(user: Optional[dict]) -> Path:
     return d
 
 
-def _user_messages_file(user: Optional[dict]) -> Path:
+def _user_messages_file(user: dict | None) -> Path:
     return _user_data_dir(user) / "messages.json"
 
 
-def _user_notes_file(user: Optional[dict]) -> Path:
+def _user_notes_file(user: dict | None) -> Path:
     return _user_data_dir(user) / "notes.json"
 
 
-def _user_uploads_dir(user: Optional[dict]) -> Path:
+def _user_uploads_dir(user: dict | None) -> Path:
     return _user_data_dir(user) / "uploads"
 
 
-def _user_claude_config_dir(user: Optional[dict]) -> Path:
-    """Where Claude Code reads CLAUDE.md / MEMORY.md / settings.json / skills/
-    / projects/ / memory/ for this user. Admin uses ~/.claude (the global root,
+def _user_autonomous_file(user: dict | None) -> Path:
+    return _user_data_dir(user) / "autonomous-modes.json"
+
+
+def _user_codex_config_dir(user: dict | None) -> Path:
+    """Where Codex reads AGENTS.md / MEMORY.md / config.toml / skills/
+    / projects/ / memory/ for this user. Admin uses ~/.codex (the global root,
     profiles still apply). Non-admin users get a fully isolated dir.
     """
     if not user or user.get("id") == "admin":
-        return Path.home() / ".claude"
-    return Path.home() / f".claude-user-{user['id']}"
+        return Path.home() / ".codex"
+    return Path.home() / f".codex-user-{user['id']}"
 
 
-def _ensure_user_claude_config_dir(user: dict):
-    """Create + seed a fresh Claude config dir for a non-admin user."""
+def _ensure_user_codex_config_dir(user: dict):
+    """Create + seed a fresh Codex config dir for a non-admin user."""
     if not user or user.get("id") == "admin":
         return
-    d = _user_claude_config_dir(user)
+    d = _user_codex_config_dir(user)
     d.mkdir(parents=True, exist_ok=True)
     for sub in ("skills", "projects", "memory", "agents", "commands"):
         (d / sub).mkdir(parents=True, exist_ok=True)
-    # Seed minimal files so Claude Code has something to read.
-    claude_md = d / "CLAUDE.md"
-    if not claude_md.exists():
-        claude_md.write_text(
-            f"# {user.get('username', user['id'])}'s CLAUDE.md\n"
+    # Seed minimal files so Codex has something to read.
+    codex_md = d / "AGENTS.md"
+    if not codex_md.exists():
+        codex_md.write_text(
+            f"# {user.get('username', user['id'])}'s AGENTS.md\n"
             "Personal notes and project context for this user.\n"
         )
     memory_md = d / "MEMORY.md"
     if not memory_md.exists():
         memory_md.write_text(f"# {user.get('username', user['id'])}'s Memory Index\n")
-    settings = d / "settings.json"
-    if not settings.exists():
-        settings.write_text(json.dumps({
-            "permissions": {},
-            "env": {},
-        }, indent=2))
-    # Stub .claude.json so first launch doesn't spam the onboarding prompts.
-    claude_json = d / ".claude.json"
-    if not claude_json.exists():
-        claude_json.write_text(json.dumps({
-            "hasCompletedOnboarding": True,
-            "numStartups": 1,
-        }, indent=2))
-    # Team mode: shared Claude auth token, managed global context block,
+    config_toml = d / "config.toml"
+    if not config_toml.exists():
+        config_toml.write_text(
+            f'model = "{_CODEX_DEFAULT_MODEL}"\n'
+            f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
+            'sandbox_mode = "danger-full-access"\n'
+            'approval_policy = "never"\n'
+        )
+    key = _active_openai_key()
+    if key and not (d / "auth.json").exists():
+        try:
+            _write_codex_api_auth(d, key)
+        except Exception:
+            logger.debug("Failed to seed Codex auth for user %s", user.get("id"), exc_info=True)
+    # Team mode: shared Codex auth, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
     if TEAM_MODE:
         try:
-            # Prefer the subscription PLAN; fall back to the shared API key only if
-            # there's no live plan token.
             _apply_member_auth(d)
-            _sync_global_context_into(claude_md)
-            _sync_group_context_into(claude_md, user.get("group", ""))
+            _sync_global_context_into(codex_md)
+            _sync_group_context_into(codex_md, user.get("group", ""))
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
-            _disable_claude_ai_connectors(d)
             _set_team_model_effort(d)
-            _sync_git_rules_into(claude_md)
+            _sync_git_rules_into(codex_md)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
 
 
+# Compatibility aliases used throughout the newer Grabo team/admin code.
+_user_claude_config_dir = _user_codex_config_dir
+_ensure_user_claude_config_dir = _ensure_user_codex_config_dir
+
+
 # --- Session ownership ---
 SESSION_OWNERS_FILE = MESSAGES_DIR / "session_owners.json"
-_session_owners_cache: Optional[Dict[str, str]] = None
+_session_owners_cache: dict[str, str] | None = None
 
 
-def _load_session_owners() -> Dict[str, str]:
+def _load_session_owners() -> dict[str, str]:
     global _session_owners_cache
     if _session_owners_cache is not None:
         return _session_owners_cache
@@ -956,14 +1032,14 @@ def _clear_session_owner(session_name: str):
         _save_session_owners()
 
 
-def _user_for_session(session_name: str) -> Optional[dict]:
+def _user_for_session(session_name: str) -> dict | None:
     """Find the user record that owns this session, falling back to admin."""
     owner_id = _session_owner_id(session_name)
     user = _find_user_by_id(owner_id) or _find_user_by_id("admin")
     return user
 
 
-def _user_can_access_session(user: Optional[dict], session_name: str) -> bool:
+def _user_can_access_session(user: dict | None, session_name: str) -> bool:
     """Admins see everything. Regular users only see sessions they own."""
     if _is_admin(user):
         return True
@@ -1061,6 +1137,13 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if (
+        request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower() == "https"
+        or request.url.scheme == "https"
+    ):
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     # CSP: allow inline scripts/styles (needed for the embedded single-page HTML) and blob: for xterm.js
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
@@ -1084,7 +1167,7 @@ _SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)(?:/.*)?$")
 _ADMIN_ONLY_PREFIXES = (
     "/api/profiles",
     "/api/skill-library",
-    "/api/global-claude",
+    "/api/global-codex",
     "/api/global",
     "/api/all-sessions",
 )
@@ -1107,7 +1190,7 @@ async def session_ownership_middleware(request: Request, call_next):
     else:
         rel = path
     user = _current_user(request)
-    # Admin-only routes (Profiles, global CLAUDE.md, etc.)
+    # Admin-only routes (Profiles, global AGENTS.md, etc.)
     for prefix in _ADMIN_ONLY_PREFIXES:
         if rel == prefix or rel.startswith(prefix + "/"):
             if not _is_admin(user):
@@ -1197,7 +1280,7 @@ async def api_auth_verify(request: Request):
 
 
 # Simple in-memory login rate limiter: (ip, window_start_minute) -> attempt_count
-_login_attempts: Dict[str, int] = {}
+_login_attempts: dict[str, int] = {}
 _LOGIN_MAX_ATTEMPTS = 10  # per IP per minute
 _LOGIN_WINDOW = 60        # seconds
 
@@ -1294,14 +1377,14 @@ async def do_login(request: Request):
     token = _make_token(target_user["id"])
     resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
     return resp
 
 
 @app.post("/logout")
 async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
-    resp.delete_cookie("tmux_auth")
+    resp.delete_cookie(AUTH_COOKIE)
     return resp
 
 
@@ -1379,7 +1462,7 @@ def _decode_id_token(id_token: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(payload.encode()))
 
 
-def _google_login_user(email: str, name: str) -> Optional[dict]:
+def _google_login_user(email: str, name: str) -> dict | None:
     """Find (or provision) the account for a verified Google address.
 
     Explicit bindings win over the domain allowlist so a personal address can be
@@ -1467,8 +1550,9 @@ async def google_login_start(request: Request):
     nxt = (request.query_params.get("next") or "").strip()
     if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
         nxt = rp + "/"
-    state = _sign_state("glogin:%d:%s" % (
-        int(time.time()), base64.urlsafe_b64encode(nxt.encode()).decode()))
+    state = _sign_state(
+        f"glogin:{int(time.time())}:{base64.urlsafe_b64encode(nxt.encode()).decode()}"
+    )
     params = urllib.parse.urlencode({
         "client_id": cid,
         "redirect_uri": _google_login_redirect_uri(request),
@@ -1566,12 +1650,12 @@ class CreateUserBody(BaseModel):
 
 
 class UpdateUserBody(BaseModel):
-    password: Optional[str] = None
-    role: Optional[str] = None
-    username: Optional[str] = None
-    group: Optional[str] = None
-    google_email: Optional[str] = None
-    sso: Optional[bool] = None
+    password: str | None = None
+    role: str | None = None
+    username: str | None = None
+    group: str | None = None
+    google_email: str | None = None
+    sso: bool | None = None
 
 
 def _public_user(u: dict) -> dict:
@@ -1640,10 +1724,10 @@ async def api_admin_create_user(request: Request, body: CreateUserBody):
     }
     users.append(new_user)
     _save_users(users)
-    # Seed the user's data + Claude config dirs so they're ready to use.
+    # Seed the user's data + Codex config dirs so they're ready to use.
     try:
         _user_data_dir(new_user)
-        _ensure_user_claude_config_dir(new_user)
+        _ensure_user_codex_config_dir(new_user)
     except Exception:
         logger.exception("Failed to seed dirs for new user %s", new_user["id"])
     logger.info("Admin '%s' created user '%s' (role=%s)", user["username"], username, role)
@@ -1738,7 +1822,7 @@ async def api_admin_delete_user(request: Request, user_id: str):
     # Remove the user record.
     users = [u for u in users if u["id"] != user_id]
     _save_users(users)
-    # Tear down per-user data + Claude config dirs.
+    # Tear down per-user data + Codex config dirs.
     try:
         data_dir = MESSAGES_DIR / "users" / user_id
         if data_dir.exists():
@@ -1746,11 +1830,11 @@ async def api_admin_delete_user(request: Request, user_id: str):
     except Exception:
         logger.debug("Failed to remove user data dir for %s", user_id, exc_info=True)
     try:
-        cfg_dir = Path.home() / f".claude-user-{user_id}"
+        cfg_dir = Path.home() / f".codex-user-{user_id}"
         if cfg_dir.exists():
             shutil.rmtree(cfg_dir, ignore_errors=True)
     except Exception:
-        logger.debug("Failed to remove user claude config for %s", user_id, exc_info=True)
+        logger.debug("Failed to remove user codex config for %s", user_id, exc_info=True)
     logger.info("Admin '%s' deleted user '%s' (and %d sessions)",
                 user["username"], target.get("username", user_id), len(owned))
     return JSONResponse({"ok": True})
@@ -2106,7 +2190,8 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
             st, body, _ = _api_http("https://serpapi.com/account?api_key=" + urllib.parse.quote(key))
             if st == 200:
                 d = json.loads(body)
-                limit = d.get("searches_per_month"); used = d.get("this_month_usage")
+                limit = d.get("searches_per_month")
+                used = d.get("this_month_usage")
                 left = d.get("total_searches_left")
                 pct = (used / limit * 100) if (limit and used is not None) else None
                 return {"ok": True, "status": _pct_status(pct),
@@ -2119,7 +2204,8 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
             st, body, _ = _api_http("https://app.scrapingbee.com/api/v1/usage?api_key=" + urllib.parse.quote(key))
             if st == 200:
                 d = json.loads(body)
-                limit = d.get("max_api_credit"); used = d.get("used_api_credit")
+                limit = d.get("max_api_credit")
+                used = d.get("used_api_credit")
                 rem = (limit - used) if (limit is not None and used is not None) else None
                 pct = (used / limit * 100) if limit else None
                 return {"ok": True, "status": _pct_status(pct),
@@ -2133,7 +2219,8 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
                                     headers={"Authorization": "Bearer " + key})
             if st == 200:
                 d = (json.loads(body) or {}).get("data", {}) or {}
-                limit = d.get("plan_credits"); rem = d.get("remaining_credits")
+                limit = d.get("plan_credits")
+                rem = d.get("remaining_credits")
                 used = (limit - rem) if (limit is not None and rem is not None) else None
                 pct = (used / limit * 100) if limit else None
                 return {"ok": True, "status": _pct_status(pct),
@@ -2150,7 +2237,8 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
             def _last(s):
                 parts = [p.strip() for p in (s or "").split(",") if p.strip() != ""]
                 return parts[-1] if parts else ""
-            lim = hdrs.get("x-ratelimit-limit", ""); rem = hdrs.get("x-ratelimit-remaining", "")
+            lim = hdrs.get("x-ratelimit-limit", "")
+            rem = hdrs.get("x-ratelimit-remaining", "")
             mlim, mrem = _last(lim), _last(rem)
             if st == 402:
                 return {"ok": True, "status": "err",
@@ -2159,7 +2247,9 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
                         "detail": f"monthly limit {mlim or '?'} · remaining {mrem or '?'}"}
             if st == 200:
                 try:
-                    L = int(mlim); R = int(mrem); U = L - R
+                    L = int(mlim)
+                    R = int(mrem)
+                    U = L - R
                     pct = (U / L * 100) if L else None
                     return {"ok": True, "status": _pct_status(pct),
                             "summary": (f"{U:,} / {L:,} used this month · {R:,} left" if L else "Key valid"),
@@ -2202,7 +2292,9 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
                                     headers={"Authorization": "Bearer " + key})
             if st == 200:
                 try:
-                    d = json.loads(body); acct = d.get("account", {}) or {}; k = d.get("key", {}) or {}
+                    d = json.loads(body)
+                    acct = d.get("account", {}) or {}
+                    k = d.get("key", {}) or {}
                     limit = acct.get("plan_limit") or k.get("limit")
                     used = acct.get("plan_usage") if acct.get("plan_usage") is not None else k.get("usage")
                     if limit and used is not None:
@@ -2301,20 +2393,20 @@ def _fetch_api_usage_sync(entry: dict) -> dict:
 
 
 class ApiEntryBody(BaseModel):
-    name: Optional[str] = None
-    provider: Optional[str] = None
-    category: Optional[str] = None
-    key: Optional[str] = None
-    env_var: Optional[str] = None
-    key_label: Optional[str] = None
-    plan: Optional[str] = None
-    limits: Optional[str] = None
-    costs: Optional[str] = None
-    notes: Optional[str] = None
-    docs_url: Optional[str] = None
-    dashboard_url: Optional[str] = None
-    usage_provider: Optional[str] = None
-    status: Optional[str] = None
+    name: str | None = None
+    provider: str | None = None
+    category: str | None = None
+    key: str | None = None
+    env_var: str | None = None
+    key_label: str | None = None
+    plan: str | None = None
+    limits: str | None = None
+    costs: str | None = None
+    notes: str | None = None
+    docs_url: str | None = None
+    dashboard_url: str | None = None
+    usage_provider: str | None = None
+    status: str | None = None
 
 
 @app.get("/api/admin/apis")
@@ -2442,10 +2534,10 @@ class SaveMyContextBody(BaseModel):
     content: str
 
 
-def _my_context_path(user: dict, filename: str) -> Optional[Path]:
+def _my_context_path(user: dict, filename: str) -> Path | None:
     """Resolve a writable per-user context file. Returns None for paths that
-    would escape the user's Claude config dir."""
-    base = _user_claude_config_dir(user)
+    would escape the user's Codex config dir."""
+    base = _user_codex_config_dir(user)
     base.mkdir(parents=True, exist_ok=True)
     target = (base / filename).resolve()
     try:
@@ -2455,19 +2547,19 @@ def _my_context_path(user: dict, filename: str) -> Optional[Path]:
     return target
 
 
-_MY_CONTEXT_ALLOWED = {"CLAUDE.md", "MEMORY.md", "settings.json"}
+_MY_CONTEXT_ALLOWED = {"AGENTS.md", "MEMORY.md", "config.toml"}
 
 
 @app.get("/api/my/context")
 async def api_my_context(request: Request):
-    """Return current user's CLAUDE.md / MEMORY.md / settings.json contents."""
+    """Return current user's AGENTS.md / MEMORY.md / config.toml contents."""
     user = _current_user(request)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     if not _is_admin(user):
-        _ensure_user_claude_config_dir(user)
-    out = {"dir": str(_user_claude_config_dir(user)), "files": []}
-    for name in ("CLAUDE.md", "MEMORY.md", "settings.json"):
+        _ensure_user_codex_config_dir(user)
+    out = {"dir": str(_user_codex_config_dir(user)), "files": []}
+    for name in ("AGENTS.md", "MEMORY.md", "config.toml"):
         p = _my_context_path(user, name)
         content = ""
         exists = False
@@ -2489,18 +2581,17 @@ async def api_my_context_save(request: Request, filename: str, body: SaveMyConte
     if filename not in _MY_CONTEXT_ALLOWED:
         return JSONResponse({"error": "Not editable from this endpoint"}, status_code=400)
     if not _is_admin(user):
-        _ensure_user_claude_config_dir(user)
+        _ensure_user_codex_config_dir(user)
     p = _my_context_path(user, filename)
     if p is None:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
-        # Validate settings.json before writing — Claude Code crashes hard
-        # on invalid JSON in this file.
-        if filename == "settings.json":
+        # Validate config.toml before writing; Codex expects valid TOML.
+        if filename == "config.toml":
             try:
-                json.loads(body.content or "{}")
-            except json.JSONDecodeError as e:
-                return JSONResponse({"error": f"Invalid JSON: {e.msg}"}, status_code=400)
+                tomllib.loads(body.content or "")
+            except tomllib.TOMLDecodeError as e:
+                return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
         p.write_text(body.content or "")
         return JSONResponse({"ok": True, "path": str(p)})
     except Exception:
@@ -2644,10 +2735,11 @@ async def api_me(request: Request):
 # All gated behind TEAM_MODE; no effect on personal boxes.
 # ===========================================================================
 import base64
-import urllib.request
 import urllib.parse
+import urllib.request
 
 SHARED_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+SHARED_CODEX_AUTH = CODEX_HOME / "auth.json"
 GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
 SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
 CONNECTIONS_DIR = MESSAGES_DIR / "connections"
@@ -2705,14 +2797,14 @@ def _read_global_context() -> str:
         return ""
 
 
-def _sync_global_context_into(claude_md: Path):
-    """Keep a managed global-context block at the TOP of a user's CLAUDE.md,
+def _sync_global_context_into(codex_md: Path):
+    """Keep a managed global-context block at the top of a user's AGENTS.md,
     preserving the user's own content below the END marker."""
     block = _GLOBAL_CTX_BEGIN + "\n" + _read_global_context().rstrip() + "\n" + _GLOBAL_CTX_END + "\n"
     existing = ""
-    if claude_md.exists():
+    if codex_md.exists():
         try:
-            existing = claude_md.read_text()
+            existing = codex_md.read_text()
         except Exception:
             existing = ""
     if _GLOBAL_CTX_BEGIN in existing and _GLOBAL_CTX_END in existing:
@@ -2721,7 +2813,10 @@ def _sync_global_context_into(claude_md: Path):
         user_part = (pre + post).lstrip("\n")
     else:
         user_part = existing.lstrip("\n")
-    claude_md.write_text(block + "\n" + user_part)
+    updated = block + "\n" + user_part
+    if updated != existing:
+        _backup_before_dashboard_write(codex_md)
+        codex_md.write_text(updated)
 
 
 _PROJ_NOTE_BEGIN = "<!-- TEAM PROJECTS CONVENTION (managed) -->"
@@ -2732,10 +2827,11 @@ _PROJ_NOTE = """## Projects & working folder
 - This session: user `$DASH_USER`, link `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
 
 
-def _sync_projects_note_into(claude_md: Path):
-    """Add a managed projects-convention block at the top of a config's CLAUDE.md
+def _sync_projects_note_into(codex_md: Path):
+    """Add a managed projects-convention block at the top of AGENTS.md
     (used for admins, who don't receive the member global block)."""
-    existing = claude_md.read_text() if claude_md.exists() else ""
+    original = codex_md.read_text() if codex_md.exists() else ""
+    existing = original
     if _PROJ_NOTE_BEGIN in existing and _PROJ_NOTE_END in existing:
         pre = existing.split(_PROJ_NOTE_BEGIN, 1)[0]
         post = existing.split(_PROJ_NOTE_END, 1)[1]
@@ -2744,10 +2840,13 @@ def _sync_projects_note_into(claude_md: Path):
         existing = existing.lstrip("\n")
     block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE.replace("__PUBURL__", PUB_URL) + "\n" + _PROJ_NOTE_END + "\n"
     try:
-        claude_md.parent.mkdir(parents=True, exist_ok=True)
-        claude_md.write_text(block + "\n" + existing)
+        codex_md.parent.mkdir(parents=True, exist_ok=True)
+        updated = block + "\n" + existing
+        if updated != original:
+            _backup_before_dashboard_write(codex_md)
+            codex_md.write_text(updated)
     except Exception:
-        logger.debug("Failed to sync projects note into %s", claude_md, exc_info=True)
+        logger.debug("Failed to sync projects note into %s", codex_md, exc_info=True)
 
 
 _GIT_RULES_BEGIN = "<!-- TEAM GIT RULES (managed) -->"
@@ -2763,10 +2862,11 @@ Several teammates work on this server as the same OS user, so be disciplined:
 - **Never commit secrets** (.env, tokens, keys). Check `git status` before committing."""
 
 
-def _sync_git_rules_into(claude_md: Path):
-    """Maintain a managed GIT RULES block in a CLAUDE.md (members + admins). Placed
+def _sync_git_rules_into(codex_md: Path):
+    """Maintain a managed GIT RULES block in AGENTS.md (members + admins). Placed
     just under the projects note / top so it's always current regardless of edits."""
-    existing = claude_md.read_text() if claude_md.exists() else ""
+    original = codex_md.read_text() if codex_md.exists() else ""
+    existing = original
     if _GIT_RULES_BEGIN in existing and _GIT_RULES_END in existing:
         pre = existing.split(_GIT_RULES_BEGIN, 1)[0]
         post = existing.split(_GIT_RULES_END, 1)[1]
@@ -2774,14 +2874,17 @@ def _sync_git_rules_into(claude_md: Path):
     block = _GIT_RULES_BEGIN + "\n" + _GIT_RULES + "\n" + _GIT_RULES_END + "\n"
     # Insert after the projects-note block if present, else prepend.
     try:
-        claude_md.parent.mkdir(parents=True, exist_ok=True)
+        codex_md.parent.mkdir(parents=True, exist_ok=True)
         if _PROJ_NOTE_END in existing:
             head, tail = existing.split(_PROJ_NOTE_END, 1)
-            claude_md.write_text(head + _PROJ_NOTE_END + "\n\n" + block + tail.lstrip("\n"))
+            updated = head + _PROJ_NOTE_END + "\n\n" + block + tail.lstrip("\n")
         else:
-            claude_md.write_text(block + "\n" + existing.lstrip("\n"))
+            updated = block + "\n" + existing.lstrip("\n")
+        if updated != original:
+            _backup_before_dashboard_write(codex_md)
+            codex_md.write_text(updated)
     except Exception:
-        logger.debug("Failed to sync git rules into %s", claude_md, exc_info=True)
+        logger.debug("Failed to sync git rules into %s", codex_md, exc_info=True)
 
 
 def _setup_shared_git_config():
@@ -2962,41 +3065,52 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
 
 
 def _set_team_model_effort(cfg_dir: Path):
-    """Pin the team default model + reasoning effort (Opus 4.8, max effort) into a
-    config dir's settings.json so every session launches on it. Claude Code reads
-    `model` from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`."""
-    sp = cfg_dir / "settings.json"
+    """Pin the team model and reasoning effort in Codex config.toml."""
+    sp = cfg_dir / "config.toml"
     try:
-        s = json.loads(sp.read_text()) if sp.exists() else {}
-        if not isinstance(s, dict):
-            s = {}
-    except Exception:
-        s = {}
-    changed = False
-    if TEAM_MODEL and s.get("model") != TEAM_MODEL:
-        s["model"] = TEAM_MODEL
-        changed = True
-    if TEAM_EFFORT:
-        env = s.get("env") if isinstance(s.get("env"), dict) else {}
-        if env.get("CLAUDE_CODE_EFFORT_LEVEL") != TEAM_EFFORT:
-            env["CLAUDE_CODE_EFFORT_LEVEL"] = TEAM_EFFORT
-            s["env"] = env
-            changed = True
-    if changed:
-        try:
+        existing = sp.read_text() if sp.exists() else ""
+        merged = _merge_top_level_toml_keys(existing, {
+            "model": TEAM_MODEL or _CODEX_DEFAULT_MODEL,
+            "model_reasoning_effort": (
+                _normalize_reasoning_effort(TEAM_EFFORT)
+                or _CODEX_DEFAULT_REASONING_EFFORT
+            ),
+            "sandbox_mode": "workspace-write",
+            "approval_policy": "never",
+        })
+        if merged != existing:
+            _backup_before_dashboard_write(sp)
             sp.parent.mkdir(parents=True, exist_ok=True)
-            sp.write_text(json.dumps(s, indent=2))
-        except Exception:
-            logger.debug("Failed to set team model/effort in %s", sp, exc_info=True)
+            sp.write_text(merged)
+    except Exception:
+        logger.debug("Failed to set team Codex model/effort in %s", sp, exc_info=True)
 
 
 def _apply_member_auth(cfg_dir: Path) -> str:
-    """Member auth = the shared subscription PLAN, always (per Nimo: use the plan,
-    never the metered API). Symlinks .credentials.json to the admin's plan token and
-    strips any apiKeyHelper so we can't accidentally fall back to the API key. The
-    metered-API path is intentionally NOT used here."""
-    _apply_subscription_auth(cfg_dir)
-    return "subscription"
+    """Share the admin Codex login with an isolated member CODEX_HOME."""
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    target = cfg_dir / "auth.json"
+    try:
+        if cfg_dir.resolve() == CODEX_HOME.resolve():
+            source = SHARED_CODEX_AUTH
+        else:
+            source = SHARED_CODEX_AUTH
+            if source.exists():
+                if target.is_symlink() and target.resolve() == source.resolve():
+                    pass
+                else:
+                    _backup_before_dashboard_write(target)
+                    if target.is_symlink() or target.exists():
+                        target.unlink()
+                    target.symlink_to(source)
+            elif _active_openai_key():
+                _backup_before_dashboard_write(target)
+                _write_codex_api_auth(cfg_dir, _active_openai_key())
+        data = json.loads(source.read_text()) if source.exists() else {}
+        return "subscription" if data.get("auth_mode") == "chatgpt" else "api"
+    except Exception:
+        logger.debug("Failed to share Codex auth into %s", cfg_dir, exc_info=True)
+        return "api" if _active_openai_key() else "unconfigured"
 
 
 def _seed_trust(cfg_dir: Path, cwd: str):
@@ -3173,33 +3287,17 @@ def _write_sandbox_hook_script():
 
 
 def _install_sandbox_hook(cfg_dir: Path, user: dict):
-    """Register the guard as a PreToolUse(Bash) hook in the user's settings.json."""
-    _write_sandbox_hook_script()
-    settings_path = cfg_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-        if not isinstance(settings, dict):
-            settings = {}
-    except Exception:
-        settings = {}
-    hook_cmd = "python3 " + shlex.quote(str(SANDBOX_HOOK_PATH))
-    entry = {"matcher": "Bash|WebFetch", "hooks": [{"type": "command", "command": hook_cmd}]}
-    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
-    pre = hooks.get("PreToolUse")
-    if not isinstance(pre, list):
-        pre = []
-    pre = [h for h in pre if "sandbox_guard" not in json.dumps(h)]
-    pre.append(entry)
-    hooks["PreToolUse"] = pre
-    settings["hooks"] = hooks
-    try:
-        settings_path.write_text(json.dumps(settings, indent=2))
-    except Exception:
-        logger.debug("Failed to install sandbox hook into %s", settings_path, exc_info=True)
+    """Apply Codex's workspace sandbox for a non-admin team member.
+
+    Claude's PreToolUse hook format is not read by Codex. The dashboard instead
+    launches these sessions without the dangerous bypass flag and pins
+    workspace-write + never-ask behavior in config.toml.
+    """
+    _set_team_model_effort(cfg_dir)
 
 
 # --- email (Resend) --------------------------------------------------------
-def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
+def _send_email(subject: str, html_body: str, to: str | None = None) -> bool:
     to = to or ADMIN_APPROVAL_EMAIL
     if not RESEND_API_KEY:
         logger.warning("Email not sent (no RESEND_API_KEY): %s", subject)
@@ -3282,7 +3380,7 @@ def _sign_state(payload: str) -> str:
     return base64.urlsafe_b64encode((payload + "|" + sig).encode()).decode()
 
 
-def _verify_state(state: str) -> Optional[str]:
+def _verify_state(state: str) -> str | None:
     try:
         raw = base64.urlsafe_b64decode(state.encode()).decode()
         payload, sig = raw.rsplit("|", 1)
@@ -3300,40 +3398,52 @@ def _callback_uri(request: Request) -> str:
 
 
 def _ensure_google_mcp(cfg_dir: Path, user: dict):
-    """Register the single `google` MCP server (Drive/Gmail/Calendar) in this user's
-    .claude.json so their Claude has the tools. The server reads the user's per-user
-    OAuth tokens at call time; tools return a friendly 'connect first' message until
-    the user connects a service. No-op if GOOGLE_MCP_COMMAND isn't configured."""
+    """Register Grabo's Google MCP server in this user's Codex config.toml."""
     cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
     if not cmd or not user or not user.get("id"):
         return
-    cj = cfg_dir / ".claude.json"
+    cfg = cfg_dir / "config.toml"
+    begin = "# BEGIN GRABO GOOGLE MCP (managed)"
+    end = "# END GRABO GOOGLE MCP"
     try:
-        data = json.loads(cj.read_text()) if cj.exists() else {}
-        if not isinstance(data, dict):
-            data = {}
+        parts = shlex.split(cmd)
+        if not parts:
+            return
+        existing = cfg.read_text() if cfg.exists() else ""
+        if begin in existing and end in existing:
+            existing = re.sub(
+                rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?",
+                "\n",
+                existing,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+        elif re.search(r"^\s*\[mcp_servers\.google\]\s*$", existing, re.MULTILINE):
+            logger.warning("Leaving user-managed mcp_servers.google unchanged in %s", cfg)
+            return
+        args = ", ".join(f'"{_toml_escape(value)}"' for value in parts[1:])
+        credentials_dir = _toml_escape(str(CONNECTIONS_DIR / user["id"]))
+        client_file = _toml_escape(str(GOOGLE_OAUTH_CLIENT_FILE))
+        block = (
+            f"{begin}\n"
+            "[mcp_servers.google]\n"
+            f'command = "{_toml_escape(parts[0])}"\n'
+            f"args = [{args}]\n"
+            "\n[mcp_servers.google.env]\n"
+            f'GOOGLE_MCP_CREDENTIALS_DIR = "{credentials_dir}"\n'
+            f'GOOGLE_OAUTH_CLIENT_FILE = "{client_file}"\n'
+            f"{end}\n"
+        )
+        updated = existing.rstrip() + "\n\n" + block if existing.strip() else block
+        _backup_before_dashboard_write(cfg)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(updated)
     except Exception:
-        data = {}
-    parts = shlex.split(cmd)
-    servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
-    servers["google"] = {
-        "command": parts[0],
-        "args": parts[1:],
-        "env": {
-            "GOOGLE_MCP_CREDENTIALS_DIR": str(CONNECTIONS_DIR / user["id"]),
-            "GOOGLE_OAUTH_CLIENT_FILE": str(GOOGLE_OAUTH_CLIENT_FILE),
-        },
-    }
-    data["mcpServers"] = servers
-    try:
-        cj.write_text(json.dumps(data, indent=2))
-    except Exception:
-        logger.debug("Failed to write google MCP entry into %s", cj, exc_info=True)
+        logger.debug("Failed to write Google MCP entry into %s", cfg, exc_info=True)
 
 
 def _write_google_mcp(user: dict, service: str):
     """Called after a successful connect; ensures the google MCP server is registered."""
-    _ensure_google_mcp(_user_claude_config_dir(user), user)
+    _ensure_google_mcp(_user_codex_config_dir(user), user)
 
 
 @app.get("/api/connections")
@@ -3455,16 +3565,20 @@ async def api_save_global_context(request: Request):
     except Exception:
         body = {}
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    GLOBAL_CONTEXT_FILE.write_text(body.get("content", "") or "")
-    # Re-sync the managed block into every existing member's CLAUDE.md immediately.
+    content = body.get("content", "") or ""
+    existing = GLOBAL_CONTEXT_FILE.read_text() if GLOBAL_CONTEXT_FILE.exists() else None
+    if existing != content:
+        _backup_before_dashboard_write(GLOBAL_CONTEXT_FILE)
+        GLOBAL_CONTEXT_FILE.write_text(content)
+    # Re-sync the managed block into every existing member's AGENTS.md immediately.
     synced = 0
     for u in _load_users():
         if u.get("role") == "admin":
             continue
         try:
-            d = _user_claude_config_dir(u)
+            d = _user_codex_config_dir(u)
             d.mkdir(parents=True, exist_ok=True)
-            _sync_global_context_into(d / "CLAUDE.md")
+            _sync_global_context_into(d / "AGENTS.md")
             synced += 1
         except Exception:
             logger.debug("Failed to re-sync global context for %s", u.get("id"), exc_info=True)
@@ -3474,9 +3588,6 @@ async def api_save_global_context(request: Request):
 # ===========================================================================
 # Work groups · admin context-file editor · admin user history · projects
 # ===========================================================================
-import mimetypes
-from starlette.responses import Response
-
 GROUPS_FILE = MESSAGES_DIR / "groups.json"
 GROUPS_DIR = MESSAGES_DIR / "groups"
 PROJECTS_ROOT = Path.home() / "web-projects"
@@ -3511,32 +3622,38 @@ def _ensure_group_dir(group_id: str):
     d = _group_dir(group_id)
     d.mkdir(parents=True, exist_ok=True)
     (d / "skills").mkdir(parents=True, exist_ok=True)
-    if not (d / "CLAUDE.md").exists():
-        (d / "CLAUDE.md").write_text("# Group context\nShared rules and context for everyone in this work group.\n")
+    if not (d / "AGENTS.md").exists():
+        (d / "AGENTS.md").write_text("# Group context\nShared rules and context for everyone in this work group.\n")
     if not (d / "MEMORY.md").exists():
         (d / "MEMORY.md").write_text("# Group memory\n")
-    if not (d / "settings.json").exists():
-        (d / "settings.json").write_text(json.dumps({"permissions": {}, "env": {}}, indent=2))
+    if not (d / "config.toml").exists():
+        (d / "config.toml").write_text(
+            f'model = "{_CODEX_DEFAULT_MODEL}"\n'
+            f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
+        )
 
 
 def _read_group_context(group_id: str) -> str:
-    p = _group_dir(group_id) / "CLAUDE.md"
+    p = _group_dir(group_id) / "AGENTS.md"
     try:
         return p.read_text() if p.exists() else ""
     except Exception:
         return ""
 
 
-def _sync_group_context_into(claude_md: Path, group_id: str):
-    """Maintain a managed GROUP CONTEXT block in a member's CLAUDE.md (below the
+def _sync_group_context_into(codex_md: Path, group_id: str):
+    """Maintain a managed GROUP CONTEXT block in a member's AGENTS.md (below the
     global block). Removes it when the user has no group."""
-    existing = claude_md.read_text() if claude_md.exists() else ""
+    original = codex_md.read_text() if codex_md.exists() else ""
+    existing = original
     if _GROUP_CTX_BEGIN in existing and _GROUP_CTX_END in existing:
         pre = existing.split(_GROUP_CTX_BEGIN, 1)[0]
         post = existing.split(_GROUP_CTX_END, 1)[1]
         existing = pre.rstrip("\n") + "\n" + post.lstrip("\n")
     if not group_id:
-        claude_md.write_text(existing)
+        if existing != original:
+            _backup_before_dashboard_write(codex_md)
+            codex_md.write_text(existing)
         return
     block = _GROUP_CTX_BEGIN + "\n" + _read_group_context(group_id).rstrip() + "\n" + _GROUP_CTX_END + "\n"
     if _GLOBAL_CTX_END in existing:
@@ -3544,7 +3661,9 @@ def _sync_group_context_into(claude_md: Path, group_id: str):
         existing = head + _GLOBAL_CTX_END + "\n\n" + block + tail.lstrip("\n")
     else:
         existing = block + "\n" + existing.lstrip("\n")
-    claude_md.write_text(existing)
+    if existing != original:
+        _backup_before_dashboard_write(codex_md)
+        codex_md.write_text(existing)
 
 
 def _sync_group_skills_into(cfg_dir: Path, group_id: str):
@@ -3574,7 +3693,7 @@ def _sync_group_skills_into(cfg_dir: Path, group_id: str):
 
 
 # --- admin context-file editor (per user / per group) ---------------------
-_CONTEXT_TOP_FILES = ["CLAUDE.md", "MEMORY.md", "settings.json", ".claude.json", ".mcp.json"]
+_CONTEXT_TOP_FILES = ["AGENTS.md", "MEMORY.md", "config.toml", ".mcp.json"]
 _CONTEXT_DIRS = ["skills", "agents", "commands"]
 
 
@@ -3583,9 +3702,9 @@ def _context_root(scope: str, ident: str):
         u = _find_user_by_id(ident)
         if not u:
             return None
-        d = _user_claude_config_dir(u)
+        d = _user_codex_config_dir(u)
         if not _is_admin(u):
-            _ensure_user_claude_config_dir(u)
+            _ensure_user_codex_config_dir(u)
         return d
     if scope == "group":
         if not any(g.get("id") == ident for g in _load_groups().get("groups", [])):
@@ -3671,17 +3790,26 @@ async def api_admin_context_write(request: Request, scope: str, ident: str, body
             json.loads(body.content or "{}")
         except json.JSONDecodeError as e:
             return JSONResponse({"error": "Invalid JSON: " + e.msg}, status_code=400)
+    if body.path.endswith(".toml") and body.content.strip():
+        try:
+            tomllib.loads(body.content)
+        except tomllib.TOMLDecodeError as e:
+            return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body.content or "")
+        content = body.content or ""
+        existing = target.read_text() if target.exists() else None
+        if existing != content:
+            _backup_before_dashboard_write(target)
+            target.write_text(content)
     except Exception:
         return JSONResponse({"error": "Write failed"}, status_code=500)
-    # Group CLAUDE.md edit → re-sync that group's members immediately.
-    if scope == "group" and target.name == "CLAUDE.md":
+    # Group AGENTS.md edit → re-sync that group's members immediately.
+    if scope == "group" and target.name == "AGENTS.md":
         for u in _load_users():
             if u.get("group") == ident and u.get("role") != "admin":
                 try:
-                    _ensure_user_claude_config_dir(u)
+                    _ensure_user_codex_config_dir(u)
                 except Exception:
                     pass
     return JSONResponse({"ok": True})
@@ -3698,7 +3826,13 @@ async def api_admin_context_delete(request: Request, scope: str, ident: str, pat
     if target is None or not target.exists():
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
-        shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink()
+        if target.is_dir():
+            backup = target.with_name(f"{target.name}.bak-dashboard-{int(time.time() * 1000)}")
+            shutil.copytree(str(target), str(backup), symlinks=True)
+            shutil.rmtree(target)
+        else:
+            _backup_before_dashboard_write(target)
+            target.unlink()
     except Exception:
         return JSONResponse({"error": "Delete failed"}, status_code=500)
     return JSONResponse({"ok": True})
@@ -3831,7 +3965,7 @@ def _is_public_project_request(rel: str) -> bool:
 
 
 async def _proxy_to_port(request: Request, port: int, subpath: str):
-    url = "http://127.0.0.1:%d/%s" % (port, subpath)
+    url = f"http://127.0.0.1:{port}/{subpath}"
     if request.url.query:
         url += "?" + request.url.query
     body = await request.body()
@@ -3851,7 +3985,10 @@ async def _proxy_to_port(request: Request, port: int, subpath: str):
         return Response(content=e.read(), status_code=e.code,
                         media_type=e.headers.get("Content-Type", "text/plain"))
     except Exception:
-        return HTMLResponse("Project server isn't reachable on port %d (is it running?)." % port, status_code=502)
+        return HTMLResponse(
+            f"Project server isn't reachable on port {port} (is it running?).",
+            status_code=502,
+        )
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -3908,7 +4045,7 @@ _DEFAULT_URL_REDIRECT_MAP = {
 }
 
 
-def _load_url_redirect_map() -> Dict[str, str]:
+def _load_url_redirect_map() -> dict[str, str]:
     raw = os.environ.get("TMUX_DASHBOARD_URL_REDIRECT_MAP", "").strip()
     if not raw:
         return dict(_DEFAULT_URL_REDIRECT_MAP)
@@ -3928,7 +4065,7 @@ def _load_url_redirect_map() -> Dict[str, str]:
 _URL_REDIRECT_MAP = _load_url_redirect_map()
 
 
-def _upstream_url_for_path(path: str) -> Optional[str]:
+def _upstream_url_for_path(path: str) -> str | None:
     """Return upstream URL if `path` is a known dashboard URL slug, else None."""
     if not path.startswith("/"):
         return None
@@ -4159,7 +4296,7 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
 
 
 # Three-tier cache per session
-cache: Dict[str, dict] = {}
+cache: dict[str, dict] = {}
 
 # Persistent message storage
 # NOTE: messages + notes are now scoped per-user. The legacy
@@ -4180,15 +4317,39 @@ def _read_json_file(path: Path) -> dict:
     return {}
 
 
+def _atomic_write_json(path: Path, data):
+    """Write JSON privately, then atomically replace the destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            fd = -1
+            json.dump(data, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+        path.chmod(0o600)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _write_json_file(path: Path, data: dict):
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data))
+        _atomic_write_json(path, data)
     except Exception:
         logger.debug("Failed to write %s", path, exc_info=True)
 
 
-def _load_all_notes(user: Optional[dict] = None) -> Dict[str, str]:
+def _load_all_notes(user: dict | None = None) -> dict[str, str]:
     """Load all session notes for a given user from disk. Falls back to admin
     file if `user` is None (matches legacy single-user behaviour)."""
     return _read_json_file(_user_notes_file(user))
@@ -4197,7 +4358,7 @@ def _load_all_notes(user: Optional[dict] = None) -> Dict[str, str]:
 def _save_notes():
     """Persist all session notes to per-user files based on session ownership."""
     # Group cache entries by owning user
-    by_user: Dict[str, Dict[str, str]] = {}
+    by_user: dict[str, dict[str, str]] = {}
     for name, entry in cache.items():
         notes = entry.get("notes")
         if not notes:
@@ -4206,7 +4367,6 @@ def _save_notes():
         by_user.setdefault(owner_id, {})[name] = notes
 
     # Write each user's file, merged with any sessions not currently in cache.
-    user_ids = set(by_user.keys())
     # Also touch files for users whose cache is empty but who have existing notes
     # so we don't accidentally drop them: just don't write empty files.
     for uid, updates in by_user.items():
@@ -4223,14 +4383,14 @@ def _load_session_notes(session_name: str) -> str:
     return _load_all_notes(owner).get(session_name, "")
 
 
-def _load_messages(user: Optional[dict] = None) -> Dict[str, list]:
+def _load_messages(user: dict | None = None) -> dict[str, list]:
     """Load all session messages for a given user from disk."""
     return _read_json_file(_user_messages_file(user))
 
 
 def _save_messages():
     """Persist all session messages to per-user files based on session ownership."""
-    by_user: Dict[str, Dict[str, list]] = {}
+    by_user: dict[str, dict[str, list]] = {}
     for name, entry in cache.items():
         msgs = entry.get("messages")
         if not msgs:
@@ -4258,21 +4418,22 @@ REALTIME_TTL = 15      # 15 seconds — text extraction is cheap (no LLM call us
 NOTES_TTL = 600        # 10 minutes
 
 
-# Sessions whose pane is running OpenAI codex belong to the codax dashboard,
-# not the claude tmux dashboard. Filter them out by walking pane descendants
-# and checking /proc/<pid>/comm for the codex/claude executable names.
-_CLAUDE_DASH_VISIBILITY_CACHE: Dict[str, tuple] = {}
-_CLAUDE_DASH_VISIBILITY_TTL = 5.0
+# Sessions whose pane is running Codex belong in this dashboard. Bare shells are
+# also shown so a crashed/exited Codex session can be restarted from the UI.
+_CODEX_DASH_VISIBILITY_CACHE: dict[str, tuple] = {}
+_CODEX_DASH_VISIBILITY_TTL = 5.0
 
 
-def _session_is_claude(name: str) -> bool:
-    """Return True if this tmux session belongs to the claude dashboard.
+def _session_is_codex(name: str) -> bool:
+    """Return True if this tmux session belongs to the codex dashboard.
 
-    Mirrors the heuristic in codax-dashboard but flips the verdict.
+    A codex process means show it here. A bare shell is also shown because it is
+    the state left behind after Codex exits or crashes. Other active foreground
+    programs are hidden.
     """
     now = time.time()
-    cached = _CLAUDE_DASH_VISIBILITY_CACHE.get(name)
-    if cached and now - cached[1] < _CLAUDE_DASH_VISIBILITY_TTL:
+    cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
+    if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
         return cached[0]
     try:
         pp = subprocess.run(
@@ -4280,11 +4441,11 @@ def _session_is_claude(name: str) -> bool:
             capture_output=True, text=True, timeout=3,
         )
         if pp.returncode != 0:
-            _CLAUDE_DASH_VISIBILITY_CACHE[name] = (False, now)
+            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
         pane_pid = (pp.stdout or "").strip()
         if not pane_pid.isdigit():
-            _CLAUDE_DASH_VISIBILITY_CACHE[name] = (False, now)
+            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
         to_check = [pane_pid]
         seen = {pane_pid}
@@ -4306,27 +4467,27 @@ def _session_is_claude(name: str) -> bool:
                     descendants.append(pid)
                     to_check.append(pid)
         has_codex = False
-        has_claude = False
         for pid in descendants:
             try:
-                with open(f"/proc/{pid}/comm", "r") as f:
+                with open(f"/proc/{pid}/comm") as f:
                     comm = f.read().strip().lower()
             except Exception:
                 continue
             if comm == "codex":
                 has_codex = True
                 break
-            if comm == "claude":
-                has_claude = True
         if has_codex:
-            decision = False
-        elif has_claude:
             decision = True
         else:
-            decision = True  # bare shell or unknown -> allow on the claude dashboard
+            cmd_res = subprocess.run(
+                ["tmux", "display-message", "-t", name, "-p", "#{pane_current_command}"],
+                capture_output=True, text=True, timeout=2,
+            )
+            cmd = (cmd_res.stdout or "").strip().lower() if cmd_res.returncode == 0 else ""
+            decision = cmd in {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
     except Exception:
         decision = False
-    _CLAUDE_DASH_VISIBILITY_CACHE[name] = (decision, now)
+    _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
     return decision
 
 
@@ -4347,8 +4508,8 @@ def get_tmux_sessions() -> list[dict]:
             name = parts[0]
             if name.startswith("__") and name.endswith("__"):
                 continue  # Skip internal sessions (e.g. __auth_login_tmp__)
-            if not _session_is_claude(name):
-                continue  # Hide codex sessions from the claude tmux dashboard
+            if not _session_is_codex(name):
+                continue  # Hide non-Codex tmux sessions from the codex dashboard
             sessions.append({
                 "name": name,
                 "windows": parts[1] if len(parts) > 1 else "?",
@@ -4365,6 +4526,9 @@ def _find_session(session_name: str) -> tuple:
 
     Returns (sessions_list, session_dict) if found, or (sessions_list, None) if not.
     """
+    # Reject control characters and tmux target syntax before invoking tmux.
+    if not _is_valid_session_name(session_name):
+        return [], None
     sessions = get_tmux_sessions()
     for s in sessions:
         if s["name"] == session_name:
@@ -4372,7 +4536,7 @@ def _find_session(session_name: str) -> tuple:
     return sessions, None
 
 
-def _filter_sessions_for_user(sessions: list, user: Optional[dict]) -> list:
+def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
     """Restrict a session list to the ones the given user is allowed to see."""
     if _is_admin(user):
         return sessions
@@ -4383,7 +4547,7 @@ def _filter_sessions_for_user(sessions: list, user: Optional[dict]) -> list:
     return [s for s in sessions if owners.get(s["name"], "admin") == uid]
 
 
-def _find_session_for_user(session_name: str, user: Optional[dict]) -> tuple:
+def _find_session_for_user(session_name: str, user: dict | None) -> tuple:
     """Same as _find_session but enforces user ownership. Returns
     (sessions, session_dict) on success or (sessions, None) if missing OR not
     owned by `user` (admins bypass)."""
@@ -4457,15 +4621,15 @@ def get_pane_position(session_name: str) -> dict:
 
 
 # Track auto-approve state to avoid re-triggering
-_auto_approve_sent: Dict[str, float] = {}
+_auto_approve_sent: dict[str, float] = {}
 
 # Content stability tracking for idle detection
 # Stores (hash, first_seen_time, consecutive_count) per session
-_pane_stability: Dict[str, tuple] = {}
+_pane_stability: dict[str, tuple] = {}
 
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
 # Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
-_activity_state: Dict[str, dict] = {}
+_activity_state: dict[str, dict] = {}
 # Require N consecutive idle readings before switching from busy → idle.
 # At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
 IDLE_CONFIRM_COUNT = 3
@@ -4482,7 +4646,7 @@ _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
-_RE_TIP_CLAUDE = re.compile(r'Tip:.*claude')
+_RE_TIP_CODEX = re.compile(r'Tip:.*codex')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
 
 
@@ -4496,7 +4660,7 @@ _AUTONOMOUS_KEYWORDS = [
 
 
 def _check_auto_approve(session_name: str, visible: str):
-    """Detect Claude Code permission prompts and numbered question prompts,
+    """Detect Codex permission prompts and numbered question prompts,
     then auto-select the most autonomous / 'just do it' option."""
     # Don't re-trigger within 10 seconds
     last = _auto_approve_sent.get(session_name, 0)
@@ -4522,7 +4686,7 @@ def _check_auto_approve(session_name: str, visible: str):
             return
 
     # --- Strategy 2: Numbered question prompt (1. / 2. / 3. style) ---
-    # Claude sometimes asks the user to pick from numbered options after planning.
+    # Codex sometimes asks the user to pick from numbered options after planning.
     # We look for a list of numbered options and pick the most autonomous one.
     numbered_options = {}  # line_index -> (number, text)
     for i, line in enumerate(lines):
@@ -4564,7 +4728,7 @@ def _check_auto_approve(session_name: str, visible: str):
             return
 
     # --- Strategy 3: AskUserQuestion with labeled options (cursor-based) ---
-    # Claude Code sometimes presents options where ❯ is the selector and
+    # Codex sometimes presents options where ❯ is the selector and
     # options contain labels. Pick the one with autonomous keywords.
     if selected_line >= 0:
         option_lines = []
@@ -4575,7 +4739,7 @@ def _check_auto_approve(session_name: str, visible: str):
                 option_lines.append((i, stripped.lstrip('❯> ')))
         if len(option_lines) >= 2:
             autonomous_target = None
-            for idx, (line_i, text) in enumerate(option_lines):
+            for _, (line_i, text) in enumerate(option_lines):
                 lower = text.lower()
                 for kw in _AUTONOMOUS_KEYWORDS:
                     if kw in lower:
@@ -4648,11 +4812,11 @@ def _detect_activity_raw(session_name: str) -> dict:
         bottom_text = "\n".join(bottom)
 
         # --- Step 1: Check "esc to interrupt" — strongest busy signal ---
-        # This appears in Claude Code's status bar when a task is actively running.
+        # This appears in Codex's status bar when a task is actively running.
         has_esc_to_interrupt = "esc to interrupt" in bottom_text
 
         # --- Step 2: Check for idle prompt indicators in bottom area ---
-        idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
+        idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CODEX, _RE_COMPLETION_MSG]
         # Lines containing these phrases override idle — session is still working
         busy_overrides = [
             "still running",
@@ -4675,10 +4839,10 @@ def _detect_activity_raw(session_name: str) -> dict:
                 break
 
         # --- Step 3: Check for active spinners/progress ---
-        # Scan a wider window (bottom 25 lines) because Claude Code's
+        # Scan a wider window (bottom 25 lines) because Codex's
         # spinners and task indicators appear in the content area
         # *above* the bottom chrome.  This MUST run before we return
-        # idle — the ❯ prompt is always visible even while Claude is
+        # idle — the ❯ prompt is always visible even while Codex is
         # executing tools / thinking / streaming.
         window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
 
@@ -4757,9 +4921,9 @@ def _detect_activity_raw(session_name: str) -> dict:
 
         # --- Step 6: Static content override ---
         # If the terminal hasn't changed in 20+ seconds and the foreground
-        # command is claude/node, it's almost certainly idle — the text-based
+        # command is codex/node, it's almost certainly idle — the text-based
         # checks above may have missed it or the output just looks ambiguous.
-        if content_is_static and cmd.lower() in ("claude", "node"):
+        if content_is_static and cmd.lower() in ("codex", "codex", "node"):
             info["status"] = "idle"
             info["detail"] = ""
             return info
@@ -4774,8 +4938,8 @@ def _detect_activity_raw(session_name: str) -> dict:
             else:
                 info["status"] = "busy"
                 info["detail"] = cmd
-        elif cmd.lower() in ("claude", "node"):
-            # Claude Code with no spinner + no "esc to interrupt" = idle
+        elif cmd.lower() in ("codex", "codex", "node"):
+            # Codex with no spinner + no "esc to interrupt" = idle
             info["status"] = "idle"
             info["detail"] = ""
         else:
@@ -4792,7 +4956,7 @@ def detect_activity(session_name: str) -> dict:
     - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
     - idle → busy: immediate (1 reading)
 
-    This prevents flickering when Claude Code briefly shows no spinner
+    This prevents flickering when Codex briefly shows no spinner
     between tool calls or streaming chunks.
     """
     raw = _detect_activity_raw(session_name)
@@ -4881,11 +5045,18 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
         )
         if response_format:
             kwargs["response_format"] = response_format
-        resp = await client.chat.completions.create(**kwargs)
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(**kwargs),
+            timeout=45,
+        )
         duration = time.time() - start
         tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
         logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
         return resp.choices[0].message.content.strip()
+    except asyncio.TimeoutError:
+        duration = time.time() - start
+        logger.error("LLM call timed out after %.1fs", duration)
+        return ""
     except Exception as e:
         duration = time.time() - start
         logger.error("LLM call failed after %.1fs: %s", duration, e)
@@ -4923,11 +5094,11 @@ async def get_title_and_description(session_name: str, full_output: str) -> tupl
             "what it does or where it runs if you can tell. "
             "Write like a human would casually describe it to a colleague.\n"
             "GOOD examples:\n"
-            "- 'Claude Code working on the product monitoring app at monitor.grabo.cc'\n"
+            "- 'Codex working on the product monitoring app at monitor.grabo.cc'\n"
             "- 'Building and testing the tmux-dashboard FastAPI service'\n"
             "- 'Running a data migration script for the user database'\n"
             "BAD examples (too verbose/robotic):\n"
-            "- 'This tmux session is for the Claude Code AI assistant working on...'\n"
+            "- 'This tmux session is for the Codex AI assistant working on...'\n"
             "- 'The session involves running and debugging an LLM-based...'\n"
             "Keep it under 20 words. No filler phrases. No 'This session is for...'."
         ),
@@ -5030,11 +5201,11 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
     )
 
 
-def _extract_claude_text(terminal_output: str) -> str:
-    """Extract Claude's human-readable text from terminal output.
+def _extract_codex_text(terminal_output: str) -> str:
+    """Extract Codex's human-readable text from terminal output.
 
-    Claude's terminal output uses these patterns:
-    - '● Text here...' = Claude's spoken text (INCLUDE)
+    Codex's terminal output uses these patterns:
+    - '● Text here...' = Codex's spoken text (INCLUDE)
     - '● ToolName(args...)' = Tool call (EXCLUDE)
     - '  ⎿ ...' = Tool output / indented continuation (EXCLUDE)
     - '✻ ...' = Status line (EXCLUDE)
@@ -5057,7 +5228,7 @@ def _extract_claude_text(terminal_output: str) -> str:
 
     for line in lines:
         stripped = line.strip()
-        # Detect start of a Claude text block (● followed by text, not a tool)
+        # Detect start of a Codex text block (● followed by text, not a tool)
         if stripped.startswith("●"):
             content_after = stripped[1:].strip()
             # Check if this is a tool call
@@ -5070,7 +5241,7 @@ def _extract_claude_text(terminal_output: str) -> str:
                 in_text_block = False
                 in_tool_block = True
             else:
-                # This is Claude's spoken text
+                # This is Codex's spoken text
                 if current_block:
                     text_blocks.append("\n".join(current_block))
                     current_block = []
@@ -5100,8 +5271,8 @@ def _extract_claude_text(terminal_output: str) -> str:
                     current_block = []
                     in_text_block = False
         elif in_text_block:
-            # Continuation of Claude's text (indented lines under ●)
-            # Claude indents continuation lines with 2 spaces
+            # Continuation of Codex's text (indented lines under ●)
+            # Codex indents continuation lines with 2 spaces
             current_block.append(stripped)
         elif in_tool_block:
             # Skip tool output continuation
@@ -5113,11 +5284,11 @@ def _extract_claude_text(terminal_output: str) -> str:
     return "\n\n".join(b for b in text_blocks if b.strip())
 
 
-def _extract_claude_response_since_last_user(terminal_output: str) -> str:
-    """Extract Claude's text response since the last user message (❯ prompt).
+def _extract_codex_response_since_last_user(terminal_output: str) -> str:
+    """Extract Codex's text response since the last user message (❯ prompt).
 
     Scans backward from the end of terminal output to find the last ❯ prompt,
-    then extracts all Claude text blocks after it.
+    then extracts all Codex text blocks after it.
     """
     lines = terminal_output.split("\n")
     # Find the last user prompt line (❯)
@@ -5134,18 +5305,21 @@ def _extract_claude_response_since_last_user(terminal_output: str) -> str:
     else:
         section = "\n".join(lines[last_prompt_idx + 1:])
 
-    return _extract_claude_text(section)
+    return _extract_codex_text(section)
+
+
+_extract_claude_response_since_last_user = _extract_codex_response_since_last_user
 
 
 async def get_realtime(session_name: str) -> str:
-    """Extract Claude's human-readable text from recent terminal output.
+    """Extract Codex's human-readable text from recent terminal output.
 
-    Instead of LLM summarization, directly parses Claude's text output.
+    Instead of LLM summarization, directly parses Codex's text output.
     Only falls back to LLM summarization if extracted text is very long (>500 words).
     """
     recent = await asyncio.to_thread(capture_pane_recent, session_name, 150)
 
-    extracted = _extract_claude_response_since_last_user(recent)
+    extracted = _extract_codex_response_since_last_user(recent)
 
     if not extracted.strip():
         return ""
@@ -5158,11 +5332,11 @@ async def get_realtime(session_name: str) -> str:
     # Text is very long — summarize it
     return await llm_call(
         system_prompt=(
-            "Summarize Claude's response text into a concise message (2-4 sentences). "
+            "Summarize Codex's response text into a concise message (2-4 sentences). "
             "Keep concrete details: file paths, URLs, numbers, outcomes. "
-            "Write in first person as Claude would. Under 80 words."
+            "Write in first person as Codex would. Under 80 words."
         ),
-        user_content=f"Claude's response text:\n\n{extracted[:4000]}",
+        user_content=f"Codex's response text:\n\n{extracted[:4000]}",
         max_tokens=200,
     )
 
@@ -5246,7 +5420,7 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
         tasks["realtime"] = get_realtime(session_name)
 
-    # Simplified Chat tab: when Claude is idle, (re)generate ONE plain-language
+    # Simplified Chat tab: when Codex is idle, (re)generate ONE plain-language
     # recap of its whole last turn. Triggered promptly on the busy->idle edge,
     # then at most every REALTIME_TTL; the signature gate inside get_chat_summary
     # skips the LLM call when the turn output hasn't changed.
@@ -5319,11 +5493,11 @@ def _msg_similarity(a: str, b: str) -> float:
 
 
 def _append_assistant_msg(entry: dict, text: str, ts: float):
-    """Update or append an assistant message for the current Claude response.
+    """Update or append an assistant message for the current Codex response.
 
     Instead of appending multiple assistant messages per response, we maintain
     a single assistant message after the last user message that gets updated
-    as Claude produces more text. This keeps the chat clean:
+    as Codex produces more text. This keeps the chat clean:
     user → single assistant response → user → single assistant response.
     """
     if not text or not text.strip():
@@ -5360,12 +5534,12 @@ def _append_assistant_msg(entry: dict, text: str, ts: float):
     _save_messages()
 
 
-# --- Simplified Chat tab: one plain-language recap per completed Claude turn ---
+# --- Simplified Chat tab: one plain-language recap per completed Codex turn ---
 #
 # The Chat tab is for non-developer users who shouldn't see raw terminal/tool
-# output. Instead of streaming Claude's live text into the chat, we wait until
-# Claude goes idle and then post ONE short summary of everything it produced
-# that turn. The clean source of "everything Claude output" is the session's
+# output. Instead of streaming Codex's live text into the chat, we wait until
+# Codex goes idle and then post ONE short summary of everything it produced
+# that turn. The clean source of "everything Codex output" is the session's
 # JSONL transcript (assistant `text` blocks since the last genuine user
 # message) — far cleaner than scraping the pane. We fall back to the pane scrape
 # when no transcript exists.
@@ -5384,18 +5558,15 @@ def _read_jsonl_tail(path: str, max_bytes: int = 1_500_000) -> list:
         return []
 
 
-def _is_genuine_user_content(cont) -> bool:
-    """True for a real human prompt, False for a tool_result (also role=user)."""
-    if isinstance(cont, str):
-        return bool(cont.strip())
-    if isinstance(cont, list):
-        has_text = any(
-            isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
-            for b in cont
-        )
-        has_tool = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in cont)
-        return has_text and not has_tool
-    return False
+def _codex_event_payload(event: dict, event_type: str) -> dict | None:
+    payload = event.get("payload")
+    if (
+        event.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == event_type
+    ):
+        return payload
+    return None
 
 
 def _norm_text(s: str) -> str:
@@ -5403,7 +5574,7 @@ def _norm_text(s: str) -> str:
 
 
 def _last_genuine_user_text(path: str) -> str:
-    """The most recent genuine human prompt recorded in a transcript file."""
+    """The most recent Codex user_message recorded in a rollout file."""
     last = ""
     for ln in _read_jsonl_tail(path):
         ln = ln.strip()
@@ -5413,24 +5584,17 @@ def _last_genuine_user_text(path: str) -> str:
             o = json.loads(ln)
         except Exception:
             continue
-        m = o.get("message")
-        if o.get("type") == "user" and isinstance(m, dict) and _is_genuine_user_content(m.get("content")):
-            c = m.get("content")
-            if isinstance(c, str):
-                last = c
-            elif isinstance(c, list):
-                last = " ".join(
-                    (b.get("text") or "") for b in c
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
+        payload = _codex_event_payload(o, "user_message")
+        if payload and isinstance(payload.get("message"), str):
+            last = payload["message"]
     return last.strip()
 
 
 def _resolve_session_transcript(session_name: str, last_user_text: str):
     """Pick the transcript that belongs to THIS tmux session.
 
-    Several sessions can share one cwd (hence one Claude `projects/<dir>` with
-    many JSONL files), so newest-mtime is NOT a reliable per-session signal — it
+    Several Codex sessions can share one cwd, so newest-mtime is not a reliable
+    per-session signal — it
     can point at a sibling session that happened to write more recently. Instead
     match on content: the transcript whose latest human prompt equals the command
     the dashboard last sent to this session. Returns None when it can't be
@@ -5452,8 +5616,8 @@ def _resolve_session_transcript(session_name: str, last_user_text: str):
 
 
 def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") -> str:
-    """Clean text of Claude's most recent turn: every assistant `text` block
-    since the last genuine user message in the transcript. Thinking and tool
+    """Clean text of Codex's most recent turn: every agent_message event
+    since the last user_message in the rollout. Reasoning and tool
     calls/results are excluded. Falls back to this session's terminal pane when
     the transcript can't be unambiguously matched to this session."""
     path = _resolve_session_transcript(session_name, last_user_text)
@@ -5468,19 +5632,14 @@ def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") ->
                     o = json.loads(ln)
                 except Exception:
                     continue
-                msg = o.get("message")
-                if not isinstance(msg, dict):
+                if _codex_event_payload(o, "user_message"):
+                    texts = []
                     continue
-                t = o.get("type")
-                if t == "user":
-                    if _is_genuine_user_content(msg.get("content")):
-                        texts = []  # a new human turn begins — drop prior text
-                elif t == "assistant":
-                    for b in (msg.get("content") or []):
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            tx = (b.get("text") or "").strip()
-                            if tx:
-                                texts.append(tx)
+                payload = _codex_event_payload(o, "agent_message")
+                if payload:
+                    text = payload.get("message")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text.strip())
             if texts:
                 return "\n\n".join(texts).strip()
         except Exception:
@@ -5488,7 +5647,7 @@ def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") ->
     # Fallback: scrape the visible terminal.
     try:
         recent = capture_pane_recent(session_name, 200)
-        return _extract_claude_response_since_last_user(recent).strip()
+        return _extract_codex_response_since_last_user(recent).strip()
     except Exception:
         return ""
 
@@ -5712,7 +5871,7 @@ async def api_raw_output(session_name: str):
 def _visible_pane_hash(session_name: str) -> str:
     """Cheap fingerprint of the visible tmux pane (alternate-screen aware).
 
-    capture-pane without -S only returns the visible area, which Claude Code
+    capture-pane without -S only returns the visible area, which Codex
     redraws into via its TUI even when history_size never grows. We hash that
     so the client can detect TUI redraws as content changes.
     """
@@ -5732,7 +5891,7 @@ def _visible_pane_hash(session_name: str) -> str:
 async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str = ""):
     """Return delta output since the client's last known line count.
 
-    Also detects in-place TUI redraws (Claude Code's alternate screen) by
+    Also detects in-place TUI redraws (Codex's alternate screen) by
     hashing the visible pane — a hash mismatch forces a full capture even when
     scrollback length is unchanged.
     """
@@ -5797,6 +5956,10 @@ class CreateSession(BaseModel):
     profile_id: str = ""
 
 
+def _is_valid_session_name(name: str) -> bool:
+    return bool(name and len(name) <= 128 and re.fullmatch(r"[A-Za-z0-9_.-]+", name))
+
+
 @app.post("/api/sessions/create")
 async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
@@ -5804,11 +5967,20 @@ async def api_create_session(request: Request, body: CreateSession):
     name = body.name.strip()
     if name:
         # Validate name: alphanumeric, dash, underscore only
-        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-            return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
+        if not _is_valid_session_name(name):
+            return JSONResponse(
+                {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
+                status_code=400,
+            )
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
             return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+    ready, reason, details = await asyncio.to_thread(_codex_cli_readiness)
+    if not ready:
+        return JSONResponse(
+            {"error": f"Codex launch blocked: {reason}", "codex": details},
+            status_code=503,
+        )
     try:
         cmd = ["tmux", "new-session", "-d"]
         if name:
@@ -5825,7 +5997,7 @@ async def api_create_session(request: Request, body: CreateSession):
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
-        # Export project-publishing convention env vars so Claude can publish to
+        # Export project-publishing convention env vars so Codex can publish to
         # https://dianaotech.com/<username>/<session> reliably (see global context).
         try:
             _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
@@ -5834,11 +6006,11 @@ async def api_create_session(request: Request, body: CreateSession):
             # Per-user git identity: every member shares ONE OS user, so set the
             # commit author/committer per session → commits are attributed to the
             # right person. Push still uses the box's shared GitHub creds.
-            _git_email = "%s@%s" % (_owner_name, GIT_EMAIL_DOMAIN)
-            _exports = ("export DASH_USER=%s DASH_SESSION=%s DASH_PROJECT_DIR=%s DASH_PROJECT_URL=%s "
-                        "GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s" % (
+            _git_email = f"{_owner_name}@{GIT_EMAIL_DOMAIN}"
+            _exports = ("export DASH_USER={} DASH_SESSION={} DASH_PROJECT_DIR={} DASH_PROJECT_URL={} "
+                        "GIT_AUTHOR_NAME={} GIT_AUTHOR_EMAIL={} GIT_COMMITTER_NAME={} GIT_COMMITTER_EMAIL={}".format(
                 shlex.quote(_owner_name), shlex.quote(created),
-                shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created)),
+                shlex.quote(_proj_dir), shlex.quote(f"{_pub_base}/{_owner_name}/{created}"),
                 shlex.quote(_owner_name), shlex.quote(_git_email),
                 shlex.quote(_owner_name), shlex.quote(_git_email)))
             subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
@@ -5849,25 +6021,22 @@ async def api_create_session(request: Request, body: CreateSession):
         # convention directly (members already have it in their global context).
         try:
             if TEAM_MODE and _is_admin(user):
-                acfg = _user_claude_config_dir(user)
-                _sync_projects_note_into(acfg / "CLAUDE.md")
-                # Disable the shared-account claude.ai connectors for admins too (same
-                # leak/expiry issue) and give them our per-identity google MCP instead.
-                _disable_claude_ai_connectors(acfg)
+                acfg = _user_codex_config_dir(user)
+                _sync_projects_note_into(acfg / "AGENTS.md")
                 _ensure_google_mcp(acfg, user)
                 _set_team_model_effort(acfg)
-                _sync_git_rules_into(acfg / "CLAUDE.md")
+                _sync_git_rules_into(acfg / "AGENTS.md")
         except Exception:
             logger.debug("Failed to harden admin team config", exc_info=True)
-        # For non-admin users, force their isolated CLAUDE_CONFIG_DIR so any
-        # `claude` invocation in this pane reads from the user's private config.
+        # For non-admin users, force their isolated CODEX_HOME so every Codex
+        # invocation in this pane reads from the user's private config.
         if user and not _is_admin(user):
             try:
-                _ensure_user_claude_config_dir(user)
-                user_cfg = _user_claude_config_dir(user)
+                _ensure_user_codex_config_dir(user)
+                user_cfg = _user_codex_config_dir(user)
                 subprocess.run(
                     ["tmux", "send-keys", "-t", created, "-l",
-                     f"export CLAUDE_CONFIG_DIR={shlex.quote(str(user_cfg))}"],
+                     f"export CODEX_HOME={shlex.quote(str(user_cfg))}"],
                     capture_output=True, text=True, timeout=5
                 )
                 subprocess.run(
@@ -5875,16 +6044,18 @@ async def api_create_session(request: Request, body: CreateSession):
                     capture_output=True, text=True, timeout=5
                 )
             except Exception:
-                logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
-        # Authenticate the session. Prefer the subscription PLAN (symlink to the
-        # admin's live token); fall back to the shared API key (settings.json
-        # `apiKeyHelper`, since interactive claude ignores a bare env var) only when
-        # there's no live plan token. Admins use ~/.claude directly (their own login).
+                logger.exception("Failed to set per-user CODEX_HOME for '%s'", created)
+        # Authenticate non-admin sessions from the shared Codex auth file.
+        # Admin sessions use the default ~/.codex login directly.
         if user and not _is_admin(user):
-            _session_auth_mode[created] = _apply_member_auth(_user_claude_config_dir(user))
+            _session_auth_mode[created] = _apply_member_auth(_user_codex_config_dir(user))
         else:
-            _session_auth_mode[created] = "subscription"
-        # Apply profile (CLAUDE_CONFIG_DIR) if requested. For non-admin users the
+            try:
+                mode = json.loads((CODEX_HOME / "auth.json").read_text()).get("auth_mode")
+            except Exception:
+                mode = ""
+            _session_auth_mode[created] = "subscription" if mode == "chatgpt" else "api"
+        # Apply profile (CODEX_HOME) if requested. For non-admin users the
         # per-user dir we exported above takes precedence; honoring profile_id
         # would let one user point at another's profile, so we ignore it for
         # non-admins. Admins keep the existing behavior.
@@ -5897,16 +6068,10 @@ async def api_create_session(request: Request, body: CreateSession):
                 _send_profile_export(created, requested_profile)
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
-        # When authenticating via a shared API key, prime the config dir's one-time
-        # bypass-permissions acceptance BEFORE launching, or the detached session's
-        # claude would hit the warning with no attached client and exit. Runs once
-        # per config dir (marker-guarded); first session per user waits ~10-20s.
-        if _stored_anthropic_key:
-            await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session. Pin the default model
-        # unless the chosen profile pins its own via its settings.json.
+        # unless the chosen profile or isolated member config pins its own.
         if NEW_SESSION_CMD:
-            _pin_model = True
+            _pin_model = not (user and not _is_admin(user))
             try:
                 if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
                     _prof = _find_profile(requested_profile, _load_roles())
@@ -5916,7 +6081,7 @@ async def api_create_session(request: Request, body: CreateSession):
                 logger.debug("Profile model lookup failed on create", exc_info=True)
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
-                 _launch_claude_cmd(NEW_SESSION_CMD, pin_model=_pin_model)],
+                 _launch_codex_cmd(_session_launch_base(created, user), pin_model=_pin_model)],
                 capture_output=True, text=True, timeout=5
             )
             subprocess.run(
@@ -5939,7 +6104,7 @@ async def api_delete_session(request: Request, session_name: str):
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         # First, find and kill all processes in the session's panes.
-        # This ensures Claude Code (node) processes are terminated cleanly
+        # This ensures Codex (node) processes are terminated cleanly
         # before the tmux session is destroyed.
         try:
             # Get all pane PIDs in this session
@@ -5953,7 +6118,7 @@ async def api_delete_session(request: Request, session_name: str):
                     if not pid_str:
                         continue
                     # Kill the entire process group rooted at this pane's shell
-                    # This catches Claude Code (node), any background tasks, etc.
+                    # This catches Codex (node), any background tasks, etc.
                     try:
                         subprocess.run(
                             ["pkill", "-TERM", "-P", pid_str],
@@ -5992,6 +6157,12 @@ async def api_delete_session(request: Request, session_name: str):
         _session_stats_cache.pop(session_name, None)
         _auto_respond_cooldown.pop(session_name, None)
         _session_auth_mode.pop(session_name, None)
+        _away_mode_state.pop(session_name, None)
+        # Cancel go-nuts worker if running
+        gn_state = _go_nuts_state.get(session_name, {})
+        if gn_state.get("task") and not gn_state["task"].done():
+            gn_state["task"].cancel()
+        _go_nuts_state.pop(session_name, None)
         _simple_watchdog_state.pop(session_name, None)
         _simple_watchdog_log.pop(session_name, None)
         _crash_recovery_state.pop(session_name, None)
@@ -6057,7 +6228,7 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
         with open(dest, "wb") as f:
             f.write(content)
-        # Per-session record only — never touch the project CLAUDE.md, which is
+        # Per-session record only — never touch the project AGENTS.md, which is
         # shared across every session running in the same cwd.
         size_kb = len(content) / 1024
         note = f"Uploaded {filename} ({size_kb:.1f} KB) to {dest}"
@@ -6117,11 +6288,11 @@ async def api_delete_upload(session_name: str, filename: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- CLAUDE.md viewer/editor ---
+# --- AGENTS.md viewer/editor ---
 
-@app.get("/api/sessions/{session_name}/claude-md")
-async def api_get_claude_md(session_name: str):
-    """Read CLAUDE.md from the session's working directory and home dir."""
+@app.get("/api/sessions/{session_name}/codex-md")
+async def api_get_codex_md(session_name: str):
+    """Read AGENTS.md from the session's working directory and home dir."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -6129,50 +6300,51 @@ async def api_get_claude_md(session_name: str):
     results = []
     # Check session CWD
     if cwd:
-        md_path = os.path.join(cwd, "CLAUDE.md")
+        md_path = os.path.join(cwd, "AGENTS.md")
         content = ""
         if os.path.exists(md_path):
             try:
                 with open(md_path) as f:
                     content = f.read()
             except Exception:
-                logger.debug("Failed to read CLAUDE.md at %s", md_path, exc_info=True)
+                logger.debug("Failed to read AGENTS.md at %s", md_path, exc_info=True)
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
     # Check home dir
-    home_md = os.path.join(str(Path.home()), "CLAUDE.md")
+    home_md = os.path.join(str(Path.home()), "AGENTS.md")
     home_content = ""
     if os.path.exists(home_md):
         try:
             with open(home_md) as f:
                 home_content = f.read()
         except Exception:
-            logger.debug("Failed to read global CLAUDE.md at %s", home_md, exc_info=True)
+            logger.debug("Failed to read global AGENTS.md at %s", home_md, exc_info=True)
     results.append({"path": home_md, "content": home_content, "exists": os.path.exists(home_md), "label": "Global"})
     return JSONResponse({"files": results, "cwd": cwd or ""})
 
 
-class SaveClaudeMd(BaseModel):
+class SaveCodexMd(BaseModel):
     path: str
     content: str
 
 
-@app.post("/api/sessions/{session_name}/claude-md")
-async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
-    """Save CLAUDE.md to the specified path."""
+@app.post("/api/sessions/{session_name}/codex-md")
+async def api_save_codex_md(session_name: str, body: SaveCodexMd):
+    """Save AGENTS.md to the specified path."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    # Safety: only allow writing CLAUDE.md files within home directory
-    if not body.path.endswith("CLAUDE.md"):
-        return JSONResponse({"error": "Can only write CLAUDE.md files"}, status_code=400)
+    # Safety: only allow writing AGENTS.md files within home directory
+    if not body.path.endswith("AGENTS.md"):
+        return JSONResponse({"error": "Can only write AGENTS.md files"}, status_code=400)
     real_path = os.path.realpath(body.path)
     home_dir = str(Path.home())
     if not real_path.startswith(home_dir + "/") and real_path != home_dir:
         return JSONResponse({"error": "Path must be within home directory"}, status_code=403)
-    if not real_path.endswith("/CLAUDE.md"):
+    if not real_path.endswith("/AGENTS.md"):
         return JSONResponse({"error": "Invalid path after resolution"}, status_code=400)
     try:
         os.makedirs(os.path.dirname(real_path), exist_ok=True)
+        _backup_before_dashboard_write(Path(real_path))
         with open(real_path, "w") as f:
             f.write(body.content)
         return JSONResponse({"ok": True, "path": real_path})
@@ -6180,29 +6352,29 @@ async def api_save_claude_md(session_name: str, body: SaveClaudeMd):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# The global CLAUDE.md is edited through /api/context-files, alongside the
+# The global AGENTS.md is edited through /api/context-files, alongside the
 # reference docs it links to, so the whole set is visible in one place.
 
 
 # --- Session-scoped auto-memory (project MEMORY.md + sibling topic files) ---
-# Claude Code reads MEMORY.md from `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/memory/MEMORY.md`,
+# Codex reads MEMORY.md from `<CODEX_HOME>/projects/<encoded-cwd>/memory/MEMORY.md`,
 # where the encoded path replaces `/` and `_` with `-`. We mirror that here.
 
 def _encode_project_path(cwd: str) -> str:
-    """Mirror Claude Code's project-dir encoding: replace `/` and `_` with `-`."""
+    """Mirror Codex's project-dir encoding: replace `/` and `_` with `-`."""
     return (cwd or "").replace("/", "-").replace("_", "-")
 
 
 def _session_config_base(session_name: str) -> Path:
-    """Resolve the CLAUDE_CONFIG_DIR a session actually uses.
+    """Resolve the CODEX_HOME a session actually uses.
 
-    Non-admin users always use their isolated ``~/.claude-user-<id>/`` dir,
+    Non-admin users always use their isolated ``~/.codex-user-<id>/`` dir,
     overriding any profile_id that may have been recorded. Admin sessions fall
     back to the normal profile resolver.
     """
     owner = _user_for_session(session_name)
     if owner and not _is_admin(owner):
-        return _user_claude_config_dir(owner)
+        return _user_codex_config_dir(owner)
     return _profile_dir(_get_session_profile_id(session_name))
 
 
@@ -6251,7 +6423,7 @@ async def api_get_session_memory_md(session_name: str):
 
 
 @app.post("/api/sessions/{session_name}/memory-md")
-async def api_save_session_memory_md(session_name: str, body: SaveClaudeMd):
+async def api_save_session_memory_md(session_name: str, body: SaveCodexMd):
     """Save the auto-memory MEMORY.md (creates dir if missing)."""
     _, sess = _find_session(session_name)
     if not sess:
@@ -6347,7 +6519,7 @@ async def api_delete_session_memory_extra(session_name: str, filename: str):
     return JSONResponse({"ok": True})
 
 
-# --- Context files: the canonical set Claude Code reads on this host ---
+# --- Context files: the canonical set Codex reads on this host ---
 #
 # NB: this module uses `from __future__ import annotations`, so a body model must
 # be defined ABOVE the route that annotates it — otherwise FastAPI cannot resolve
@@ -6359,26 +6531,26 @@ class ContextFileBody(BaseModel):
 
 
 #
-# There is exactly ONE CLAUDE.md plus a handful of reference docs it points at.
+# There is one primary AGENTS.md plus a handful of reference docs it points at.
 # This registry is fixed on purpose: the UI edits these files in place and offers
-# no way to create new sidecar CLAUDE_*.md files. Every extra file either costs
+# no way to create arbitrary sidecar context files. Every extra file either costs
 # context on every session or quietly drifts because nothing ever reads it.
 #
 # "auto" files are injected into every session's context; "ondemand" files cost
-# nothing until CLAUDE.md sends a session to them.
+# nothing until AGENTS.md sends a session to them.
 _CONTEXT_FILES = [
-    {"id": "claude-md", "path": Path.home() / "CLAUDE.md", "load": "auto",
-     "label": "~/CLAUDE.md",
-     "note": "Global rules. Auto-loaded for any session whose working directory is under ~."},
-    {"id": "claude-md-home", "path": Path.home() / ".claude" / "CLAUDE.md", "load": "auto",
-     "label": "~/.claude/CLAUDE.md",
-     "note": "One-line pointer so sessions started outside ~ (e.g. in /opt or /var/www) still find the rules."},
-    {"id": "github-rules", "path": Path.home() / "CLAUDE_GITHUB_RULES.md", "load": "ondemand",
+    {"id": "codex-agents", "path": CODEX_HOME / "AGENTS.md", "load": "auto",
+     "label": "$CODEX_HOME/AGENTS.md",
+     "note": "Global Codex instructions loaded for every session using the default profile."},
+    {"id": "home-agents", "path": Path.home() / "AGENTS.md", "load": "auto",
+     "label": "~/AGENTS.md",
+     "note": "Project-tree instructions for sessions whose working directory is under home."},
+    {"id": "github-rules", "path": Path.home() / "CODEX_GITHUB_RULES.md", "load": "ondemand",
      "note": "Git and GitHub rules."},
-    {"id": "api-keys", "path": Path.home() / "CLAUDE_API_KEYS.md", "load": "ondemand",
+    {"id": "api-keys", "path": Path.home() / "CODEX_API_KEYS.md", "load": "ondemand",
      "secret": True,
      "note": "Raw API key file. Prefer Settings → APIs, which also shows live usage."},
-    {"id": "infra-index", "path": Path.home() / ".claude" / "vm_projects_dir.md", "load": "ondemand",
+    {"id": "infra-index", "path": CODEX_HOME / "vm_projects_dir.md", "load": "ondemand",
      "note": "Infrastructure index: VMs, domains, and pointers to the per-host detail files."},
     {"id": "droplets", "path": Path.home() / "claude_droplets_access.md", "load": "ondemand",
      "note": "SSH access to the legacy DigitalOcean droplets."},
@@ -6386,9 +6558,12 @@ _CONTEXT_FILES = [
      "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
     {"id": "browser-qa", "path": MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
      "load": "ondemand", "note": "agent-browser QA procedure to run after a large change."},
+    {"id": "legacy-claude", "path": Path.home() / "CLAUDE.md", "load": "legacy",
+     "label": "~/CLAUDE.md (legacy)",
+     "note": "Legacy Claude context retained for migration reference; Codex does not auto-load it."},
 ]
 
-_INFRA_DETAIL_DIR = Path.home() / ".claude" / "infra"
+_INFRA_DETAIL_DIR = CODEX_HOME / "infra"
 
 
 def _context_file_entries():
@@ -6436,7 +6611,11 @@ async def api_save_context_file(body: ContextFileBody):
         return JSONResponse({"error": "Unknown context file"}, status_code=404)
     p = entry["path"]
     try:
-        p.write_text(body.content)
+        existing = p.read_text() if p.exists() else None
+        if existing != body.content:
+            _backup_before_dashboard_write(p)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body.content)
         if entry.get("secret"):
             try:
                 os.chmod(p, 0o600)
@@ -6454,12 +6633,12 @@ async def api_save_context_file(body: ContextFileBody):
 #   1. Library:  ~/.tmux-dashboard/skill-library/<name>/SKILL.md
 #                Canonical user-authored skills with YAML frontmatter
 #                (name + description). This is the source of truth.
-#   2. Profile:  ~/.claude-<profile_id>/skills/<name>/SKILL.md
-#                Per-profile skills directory that Claude Code reads when
-#                CLAUDE_CONFIG_DIR is set. Library skills are *symlinked* in
+#   2. Profile:  ~/.codex-<profile_id>/skills/<name>/SKILL.md
+#                Per-profile skills directory that Codex reads when
+#                CODEX_HOME is set. Library skills are *symlinked* in
 #                here on a per-profile basis, so the same library entry can
 #                be enabled in some profiles and disabled in others.
-#   3. Built-ins: bundled into the Claude Code binary itself. Always present,
+#   3. Built-ins: bundled into the Codex binary itself. Always present,
 #                not configurable per profile. Listed via /api/builtin-skills
 #                so the UI can surface them as read-only.
 
@@ -6469,19 +6648,15 @@ SKILL_LIBRARY_DIR = MESSAGES_DIR / "skill-library"
 _SKILL_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_-]+\.md$")
 _SKILL_DIR_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
-# Built-in skills bundled with Claude Code itself. Always available; cannot be
+# Built-in skills bundled with Codex itself. Always available; cannot be
 # disabled per profile. Surfaced to the UI as a read-only "Built-in" section
 # so users understand which skills are available without any configuration.
 _BUILTIN_SKILLS = [
-    {"name": "update-config", "description": "Configure Claude Code via settings.json (hooks, permissions, env)."},
-    {"name": "keybindings-help", "description": "Customize keyboard shortcuts in ~/.claude/keybindings.json."},
-    {"name": "simplify", "description": "Review changed code for reuse, quality, and efficiency, then fix issues."},
-    {"name": "fewer-permission-prompts", "description": "Allowlist common read-only Bash/MCP calls to reduce prompts."},
-    {"name": "loop", "description": "Run a prompt or slash command on a recurring interval."},
-    {"name": "claude-api", "description": "Build, debug, and optimize Claude API / Anthropic SDK apps."},
-    {"name": "init", "description": "Initialize a new CLAUDE.md file with codebase documentation."},
-    {"name": "review", "description": "Review a pull request."},
-    {"name": "security-review", "description": "Complete a security review of pending changes on the current branch."},
+    {"name": "imagegen", "description": "Generate and edit images with OpenAI image models."},
+    {"name": "openai-docs", "description": "Look up OpenAI / Codex documentation."},
+    {"name": "plugin-creator", "description": "Scaffold a new Codex plugin."},
+    {"name": "skill-creator", "description": "Create a new Codex skill (SKILL.md) interactively."},
+    {"name": "skill-installer", "description": "Install or manage Codex skills."},
 ]
 
 
@@ -6535,7 +6710,7 @@ def _parse_skill_frontmatter(skill_md_path: Path) -> dict:
     return out
 
 
-def _read_skill_dir(d: Path) -> Optional[dict]:
+def _read_skill_dir(d: Path) -> dict | None:
     """Read a skill directory; return metadata dict or None if not a valid skill."""
     if not d.is_dir():
         return None
@@ -6756,13 +6931,13 @@ async def api_delete_library_skill(skill_name: str):
 
 @app.get("/api/builtin-skills")
 async def api_list_builtin_skills():
-    """Return the list of skills bundled with Claude Code itself (read-only)."""
+    """Return the list of skills bundled with Codex itself (read-only)."""
     return JSONResponse({"skills": list(_BUILTIN_SKILLS)})
 
 
-# --- Claude Code role profiles (per-role isolated configs via CLAUDE_CONFIG_DIR) ---
+# --- Codex role profiles (per-role isolated configs via CODEX_HOME) ---
 
-ROLES_FILE = MESSAGES_DIR / "claude-roles.json"
+ROLES_FILE = MESSAGES_DIR / "codex-roles.json"
 DEFAULT_PROFILE_ID = "default"
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _RESERVED_PROFILE_IDS = {DEFAULT_PROFILE_ID}
@@ -6776,23 +6951,22 @@ _COMMON_PERMISSIONS = {
     "deny": [],
 }
 _COMMON_ENV = {
-    "CLAUDE_CODE_PERMISSION_MODE": "bypassPermissions",
     "DISABLE_AUTOUPDATER": "0",
     "DISABLE_TELEMETRY": "1",
     "BASH_DEFAULT_TIMEOUT_MS": "120000",
     "BASH_MAX_TIMEOUT_MS": "600000",
 }
 
-# Built-in role presets seeded on first run. Each becomes ~/.claude-<id>/
-# with settings.json, CLAUDE.md, and an empty skills/ dir. The user can edit
-# any of these via the Profiles editor in Settings.
+# Built-in role presets seeded on first run. Each becomes ~/.codex-<id>/
+# with config.toml, AGENTS.md, and an empty skills/ dir. The user can edit
+# any of these via the Profiles editor in Config.
 _PROFILE_PRESETS = [
     {
         "id": "ui-expert", "name": "UI Expert",
-        "model": "claude-sonnet-4-6", "effort": "medium",
+        "model": "gpt-5.4-mini", "effort": "medium",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# UI Expert\n\n"
             "## Verify visually\n"
             "After every UI change: run dev server, screenshot the affected viewport at 375/768/1280/1920px. "
@@ -6810,10 +6984,10 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "ux-expert", "name": "UX Expert",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "gpt-5.4", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# UX Expert\n\n"
             "## Process discipline\n"
             "Problem -> user -> JTBD -> flow -> wireframe -> copy -> test plan. "
@@ -6832,10 +7006,10 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "qa-agent", "name": "QA Agent",
-        "model": "claude-sonnet-4-6", "effort": "medium",
+        "model": "gpt-5.4-mini", "effort": "medium",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# QA Agent\n\n"
             "## Test pyramid targets\n"
             "70% unit, 20% integration, 10% e2e. Question any PR that inverts this.\n\n"
@@ -6986,10 +7160,10 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "researcher", "name": "Researcher",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "gpt-5.4", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# Researcher\n\n"
             "## Output format (always)\n"
             "1. Executive summary (<=150 words)\n"
@@ -7014,10 +7188,10 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "security-expert", "name": "Security Expert",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "gpt-5.4", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# Security Expert\n\n"
             "## Default posture: read-only\n"
             "I review, report, and recommend. I do not patch unless explicitly asked "
@@ -7044,10 +7218,10 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "optimizer", "name": "Optimizer",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "gpt-5.4", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
-        "claude_md": (
+        "codex_md": (
             "# Optimizer\n\n"
             "## Measure first, always\n"
             "No optimization without a baseline number. Format every proposal as:\n"
@@ -7085,7 +7259,7 @@ def _default_profile_record() -> dict:
             "effort": "",
             "permissions": dict(_COMMON_PERMISSIONS),
             "env": dict(_COMMON_ENV),
-            "claude_md": "", "memory_md": "", "builtin": True}
+            "codex_md": "", "memory_md": "", "builtin": True}
 
 
 def _save_roles(data: dict):
@@ -7096,7 +7270,7 @@ def _save_roles(data: dict):
         logger.exception("Failed to save %s", ROLES_FILE)
 
 
-_PRESET_FIELDS = ("model", "effort", "permissions", "env", "claude_md", "memory_md", "seed_skills")
+_PRESET_FIELDS = ("model", "effort", "permissions", "env", "codex_md", "memory_md", "seed_skills")
 
 
 def _refresh_builtin_presets(data: dict) -> bool:
@@ -7165,22 +7339,108 @@ def _load_roles() -> dict:
 
 
 def _profile_dir(profile_id: str) -> Path:
-    """Filesystem path used for CLAUDE_CONFIG_DIR for a given profile id."""
+    """Filesystem path used for CODEX_HOME for a given profile id."""
     if profile_id == DEFAULT_PROFILE_ID:
-        return Path.home() / ".claude"
-    return Path.home() / f".claude-{profile_id}"
+        return Path.home() / ".codex"
+    return Path.home() / f".codex-{profile_id}"
+
+
+def _toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _render_codex_config_toml(managed: dict) -> str:
+    """Render the dashboard-managed slice of a codex config.toml.
+
+    Codex's config.toml uses TOML, not JSON. We only manage the keys we own
+    (model, model_reasoning_effort, sandbox_mode, approval_policy) plus a
+    [shell_environment_policy.env]
+    table for env vars. The top-level [projects.*] tables are user-managed and
+    are NOT touched here.
+    """
+    lines = ["# Managed by codex-dashboard. Edits to keys below may be overwritten."]
+    if managed.get("model"):
+        lines.append(f'model = "{_toml_escape(managed["model"])}"')
+    if managed.get("model_reasoning_effort"):
+        lines.append(
+            f'model_reasoning_effort = "{_toml_escape(managed["model_reasoning_effort"])}"'
+        )
+    if managed.get("sandbox_mode"):
+        lines.append(f'sandbox_mode = "{_toml_escape(managed["sandbox_mode"])}"')
+    if managed.get("approval_policy"):
+        lines.append(f'approval_policy = "{_toml_escape(managed["approval_policy"])}"')
+    env = managed.get("env") or {}
+    if env:
+        lines.append("")
+        lines.append("[shell_environment_policy.env]")
+        for k, v in env.items():
+            lines.append(f'{_toml_escape(k)} = "{_toml_escape(str(v))}"')
+    return "\n".join(lines) + "\n"
+
+
+def _backup_before_dashboard_write(path: Path):
+    """Back up an existing file before the dashboard overwrites it."""
+    if not path.exists():
+        return
+    try:
+        backup = path.with_name(f"{path.name}.bak-dashboard-{int(time.time() * 1000)}")
+        shutil.copy2(path, backup)
+    except Exception:
+        logger.debug("Failed to back up %s before dashboard write", path, exc_info=True)
+
+
+def _merge_top_level_toml_keys(existing: str, managed: dict) -> str:
+    """Merge dashboard-managed top-level TOML keys without touching sections."""
+    managed_keys = ("model", "model_reasoning_effort", "sandbox_mode", "approval_policy")
+    updates = {key: str(managed[key]) for key in managed_keys if managed.get(key)}
+    if not updates:
+        return existing if existing.endswith("\n") else existing + "\n"
+
+    def render_line(key: str) -> str:
+        return f'{key} = "{_toml_escape(updates[key])}"'
+
+    out: list[str] = []
+    written: set[str] = set()
+    in_section = False
+    inserted_before_sections = False
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if not inserted_before_sections:
+                for key in managed_keys:
+                    if key in updates and key not in written:
+                        out.append(render_line(key))
+                        written.add(key)
+                inserted_before_sections = True
+            in_section = True
+            out.append(line)
+            continue
+        if not in_section and "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                out.append(render_line(key))
+                written.add(key)
+                continue
+        out.append(line)
+    if not inserted_before_sections:
+        if out and out[-1].strip():
+            out.append("")
+        for key in managed_keys:
+            if key in updates and key not in written:
+                out.append(render_line(key))
+                written.add(key)
+    return "\n".join(out).rstrip() + "\n"
 
 
 def _materialize_profile(profile: dict):
-    """Write settings.json, CLAUDE.md, and ensure skills/ exists.
+    """Write config.toml, AGENTS.md, MEMORY.md, and ensure skills/ exists.
 
-    For non-default profiles: settings.json is fully owned by the dashboard and
-    overwritten with the profile content (we created the dir).
+    For non-default profiles: config.toml is fully owned by the dashboard and
+    the current OpenAI key is mirrored into the profile's auth.json so codex
+    authenticates when CODEX_HOME points here.
 
-    For the default profile (~/.claude): MERGE settings.json so we only touch
-    `model`, `env`, `permissions` -- preserving any other keys the user has
-    (e.g. `preferences`, `spinnerTipsEnabled`). On first write we back up the
-    existing settings.json once.
+    For the default profile (~/.codex): merge only dashboard-managed top-level
+    keys, preserving project/MCP sections. Back up before every managed write.
     """
     pid = profile["id"]
     d = _profile_dir(pid)
@@ -7188,53 +7448,60 @@ def _materialize_profile(profile: dict):
     (d / "skills").mkdir(parents=True, exist_ok=True)
     is_default = (pid == DEFAULT_PROFILE_ID)
 
-    settings_path = d / "settings.json"
-    claudemd_path = d / "CLAUDE.md"
+    config_path = d / "config.toml"
+    codexmd_path = d / "AGENTS.md"
     memorymd_path = d / "MEMORY.md"
 
     # Compose the dashboard-managed slice
     managed: dict = {}
     if profile.get("model"):
         managed["model"] = profile["model"]
-    env = dict(profile.get("env") or {})
     if profile.get("effort"):
-        env.setdefault("CLAUDE_CODE_EFFORT_LEVEL", profile["effort"])
+        managed["model_reasoning_effort"] = profile["effort"]
+    # Sensible codex defaults for unattended use.
+    managed["sandbox_mode"] = profile.get("sandbox_mode") or "danger-full-access"
+    managed["approval_policy"] = profile.get("approval_policy") or "never"
+    env = dict(profile.get("env") or {})
     if env:
         managed["env"] = env
-    if profile.get("permissions"):
-        managed["permissions"] = profile["permissions"]
 
     try:
         if is_default:
-            # Merge: preserve user's existing keys outside our managed slice
-            existing: dict = {}
-            if settings_path.exists():
-                try:
-                    existing = json.loads(settings_path.read_text())
-                    if not isinstance(existing, dict):
-                        existing = {}
-                except Exception:
-                    logger.warning("~/.claude/settings.json was not valid JSON; will rewrite")
-                    existing = {}
-                # One-time backup before our first write
-                bak = settings_path.with_suffix(".json.bak-pre-dashboard")
-                if not bak.exists():
-                    try:
-                        bak.write_text(settings_path.read_text())
-                    except Exception:
-                        logger.debug("Failed to back up ~/.claude/settings.json", exc_info=True)
-            merged = dict(existing)
-            for key in ("model", "env", "permissions"):
-                if key in managed:
-                    merged[key] = managed[key]
-                # If user blanked the field via the editor, drop it from settings
-                elif key in merged and not profile.get(key) and key in ("model",):
-                    merged.pop(key, None)
-            settings_path.write_text(json.dumps(merged, indent=2))
+            existing = config_path.read_text() if config_path.exists() else ""
+            merged = _merge_top_level_toml_keys(existing, managed)
+            if merged != existing:
+                _backup_before_dashboard_write(config_path)
+                config_path.write_text(merged)
         else:
-            settings_path.write_text(json.dumps(managed, indent=2))
-        claudemd_path.write_text(profile.get("claude_md") or "")
-        memorymd_path.write_text(profile.get("memory_md") or "")
+            rendered = _render_codex_config_toml(managed)
+            existing = config_path.read_text() if config_path.exists() else ""
+            if rendered != existing:
+                _backup_before_dashboard_write(config_path)
+                config_path.write_text(rendered)
+            # Mirror the current OpenAI key so codex authenticates in this
+            # isolated CODEX_HOME (it reads <dir>/auth.json).
+            try:
+                key = _stored_openai_key or OPENAI_API_KEY
+                src_auth = CODEX_HOME / "auth.json"
+                if not key and src_auth.exists():
+                    try:
+                        key = json.loads(src_auth.read_text()).get("OPENAI_API_KEY", "")
+                    except Exception:
+                        key = ""
+                if key:
+                    auth_path = d / "auth.json"
+                    auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key}, indent=2))
+                    auth_path.chmod(0o600)
+            except Exception:
+                logger.debug("Failed to mirror auth.json into profile %s", pid, exc_info=True)
+        codex_content = profile.get("codex_md") or ""
+        memory_content = profile.get("memory_md") or ""
+        if not codexmd_path.exists() or codexmd_path.read_text() != codex_content:
+            _backup_before_dashboard_write(codexmd_path)
+            codexmd_path.write_text(codex_content)
+        if not memorymd_path.exists() or memorymd_path.read_text() != memory_content:
+            _backup_before_dashboard_write(memorymd_path)
+            memorymd_path.write_text(memory_content)
         # Seed initial skill files only when they are missing -- never overwrite,
         # so the user (or a fresh `agent-browser skills get` pull) can edit them.
         seed_skills = profile.get("seed_skills") or []
@@ -7292,23 +7559,43 @@ def _profile_summary(p: dict) -> dict:
     }
 
 
+def _normalize_reasoning_effort(effort: str | None) -> str | None:
+    value = (effort or "").strip().lower()
+    if not value:
+        return ""
+    value = _CODEX_REASONING_EFFORT_ALIASES.get(value, value)
+    if value not in _CODEX_REASONING_EFFORTS:
+        return None
+    return value
+
+
 class CreateProfileBody(BaseModel):
     name: str
     from_preset: str = ""
 
 
 class UpdateProfileBody(BaseModel):
-    name: Optional[str] = None
-    model: Optional[str] = None
-    effort: Optional[str] = None
-    claude_md: Optional[str] = None
-    memory_md: Optional[str] = None
-    permissions: Optional[dict] = None
-    env: Optional[dict] = None
+    name: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    codex_md: str | None = None
+    memory_md: str | None = None
+    permissions: dict | None = None
+    env: dict | None = None
 
 
 class SetSessionProfileBody(BaseModel):
     profile_id: str
+    restart: bool = False
+
+
+class SetSessionEffortBody(BaseModel):
+    effort: str
+    restart: bool = False
+
+
+class SetSessionModelBody(BaseModel):
+    model: str
     restart: bool = False
 
 
@@ -7348,7 +7635,7 @@ async def api_create_profile(body: CreateProfileBody):
         "effort": (base or {}).get("effort", ""),
         "permissions": (base or {}).get("permissions", {}),
         "env": (base or {}).get("env", {}),
-        "claude_md": (base or {}).get("claude_md", ""),
+        "codex_md": (base or {}).get("codex_md", ""),
         "memory_md": (base or {}).get("memory_md", ""),
         "builtin": False,
     }
@@ -7370,8 +7657,8 @@ async def api_update_profile(profile_id: str, body: UpdateProfileBody):
         p["model"] = body.model
     if body.effort is not None:
         p["effort"] = body.effort
-    if body.claude_md is not None:
-        p["claude_md"] = body.claude_md
+    if body.codex_md is not None:
+        p["codex_md"] = body.codex_md
     if body.memory_md is not None:
         p["memory_md"] = body.memory_md
     if body.permissions is not None:
@@ -7398,16 +7685,16 @@ async def api_delete_profile(profile_id: str):
         if pid == profile_id:
             data["session_profiles"].pop(sname, None)
     _save_roles(data)
-    # Note: ~/.claude-<id>/ is intentionally NOT removed automatically. It may
+    # Note: ~/.codex-<id>/ is intentionally NOT removed automatically. It may
     # contain history/credentials the user wants. They can `rm -rf` manually.
     return JSONResponse({"ok": True})
 
 
 @app.get("/api/profiles/{profile_id}/skills")
 async def api_list_profile_skills(profile_id: str):
-    """List the skills currently installed under ~/.claude-<profile>/skills/.
+    """List the skills currently installed under ~/.codex-<profile>/skills/.
 
-    Each entry is a directory containing SKILL.md (the format Claude Code reads).
+    Each entry is a directory containing SKILL.md (the format Codex reads).
     Library symlinks are flagged with `from_library: true`. Any leftover flat .md
     files are surfaced under `legacy_files` so the UI can warn the user.
     """
@@ -7547,7 +7834,7 @@ async def api_promote_profile_skill(profile_id: str, skill_name: str):
 async def api_save_profile_skill(profile_id: str, body: SkillFileBody):
     """Legacy: write a flat .md file at the profile root skills/ dir.
 
-    Kept so existing tooling doesn't break. Claude Code does NOT load these as
+    Kept so existing tooling doesn't break. Codex does NOT load these as
     Skills (they're not in the `<name>/SKILL.md` directory format). Prefer the
     library + per-profile toggle endpoints for new content.
     """
@@ -7605,26 +7892,26 @@ async def api_delete_profile_skill(profile_id: str, filename: str):
 # there were never referenced from it, so nothing ever read them.
 
 
-# --- Profile file browser (full ~/.claude-<id>/ contents) ---
-# Lets the Profiles editor expose every file Claude Code actually loads from the
-# config dir: settings.json (full), .claude.json (MCP/projects), agents/, commands/,
-# plus a credentials.json status read (we never expose the token contents).
+# --- Profile file browser (full ~/.codex-<id>/ contents) ---
+# Lets the Profiles editor expose every file Codex actually loads from the
+# config dir: config.toml (full), .codex.json (MCP/projects), agents/, commands/,
+# plus an auth.json status read (we never expose tokens or API keys).
 
 # Categories the UI surfaces. The first element of each tuple is the relative path
 # under the profile dir; the second is the kind ("json", "md", "binary").
 _PROFILE_FILE_CATEGORIES = {
-    "settings": [("settings.json", "json")],
-    "mcp":      [(".claude.json", "json")],
+    "config": [("config.toml", "toml")],
+    "mcp":      [(".codex.json", "json")],
     "agents":   "agents",       # directory: list *.md
     "commands": "commands",     # directory: list *.md or *.json
     "plugins":  "plugins",      # directory: list top-level entries (read-only)
 }
 
 # Files we refuse to surface for editing under the generic file API.
-_PROFILE_FILE_BLOCKLIST = {".credentials.json"}
+_PROFILE_FILE_BLOCKLIST = {"auth.json"}
 
 
-def _safe_profile_path(profile_id: str, rel: str) -> Optional[Path]:
+def _safe_profile_path(profile_id: str, rel: str) -> Path | None:
     """Return an absolute Path inside the profile dir, or None if rel escapes it."""
     rel = (rel or "").lstrip("/").replace("\\", "/")
     if not rel or ".." in rel.split("/"):
@@ -7677,7 +7964,7 @@ async def api_list_profile_files(profile_id: str):
     inv: dict = {"dir": str(base), "categories": {}}
 
     # Top-level singletons
-    for cat, items in (("settings", _PROFILE_FILE_CATEGORIES["settings"]),
+    for cat, items in (("config", _PROFILE_FILE_CATEGORIES["config"]),
                        ("mcp", _PROFILE_FILE_CATEGORIES["mcp"])):
         files = []
         for rel, kind in items:
@@ -7756,9 +8043,17 @@ async def api_save_profile_file(profile_id: str, body: ProfileFileBody):
             json.loads(body.content)
         except Exception as e:
             return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
+    if target.suffix.lower() == ".toml" and body.content.strip():
+        try:
+            tomllib.loads(body.content)
+        except tomllib.TOMLDecodeError as e:
+            return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body.content)
+        existing = target.read_text() if target.exists() else None
+        if existing != body.content:
+            _backup_before_dashboard_write(target)
+            target.write_text(body.content)
         return JSONResponse({"ok": True, "path": body.path,
                              "size": target.stat().st_size})
     except Exception:
@@ -7774,8 +8069,8 @@ async def api_delete_profile_file(profile_id: str, path: str):
     target = _safe_profile_path(profile_id, path)
     if target is None:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
-    # Refuse to delete the singletons settings.json / .claude.json — they're
-    # managed by Claude Code itself. Only files inside agents/ or commands/ are
+    # Refuse to delete the singletons config.toml / .codex.json — they're
+    # managed by Codex itself. Only files inside agents/ or commands/ are
     # safely deletable here.
     rel_parts = path.split("/")
     if rel_parts[0] not in ("agents", "commands"):
@@ -7784,8 +8079,13 @@ async def api_delete_profile_file(profile_id: str, path: str):
     if target.exists():
         try:
             if target.is_file() or target.is_symlink():
+                _backup_before_dashboard_write(target)
                 target.unlink()
             else:
+                backup = target.with_name(
+                    f"{target.name}.bak-dashboard-{int(time.time() * 1000)}"
+                )
+                shutil.copytree(str(target), str(backup), symlinks=True)
                 shutil.rmtree(str(target))
         except Exception:
             logger.exception("Failed to delete profile file %s", target)
@@ -7795,64 +8095,76 @@ async def api_delete_profile_file(profile_id: str, path: str):
 
 @app.get("/api/profiles/{profile_id}/credentials")
 async def api_profile_credentials_status(profile_id: str):
-    """Read login status from .credentials.json -- never returns the token."""
+    """Read login status from auth.json -- never returns tokens or keys."""
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    creds_path = _profile_dir(profile_id) / ".credentials.json"
-    out = {"loggedIn": False, "path": str(creds_path), "exists": creds_path.exists()}
-    if not creds_path.exists():
+    auth_path = _profile_dir(profile_id) / "auth.json"
+    out = {"loggedIn": False, "path": str(auth_path), "exists": auth_path.exists(), "authMode": "unknown"}
+    if not auth_path.exists():
         return JSONResponse(out)
     try:
-        creds = json.loads(creds_path.read_text())
-        oauth = creds.get("claudeAiOauth") or {}
-        expires_at = int(oauth.get("expiresAt") or 0)
-        now_ms = int(time.time() * 1000)
-        out["loggedIn"] = bool(oauth and expires_at > now_ms)
-        out["subscriptionType"] = oauth.get("subscriptionType", "")
-        out["expiresAt"] = expires_at
-        out["expiresInDays"] = max(0, (expires_at - now_ms) // 86400000) if expires_at else 0
+        creds = json.loads(auth_path.read_text())
+        mode = creds.get("auth_mode", "unknown")
+        out["authMode"] = mode
+        if mode == "apikey" and creds.get("OPENAI_API_KEY"):
+            out["loggedIn"] = True
+            out["subscriptionType"] = "API key"
+        elif mode == "chatgpt" and creds.get("tokens"):
+            tokens = creds.get("tokens") or {}
+            id_token = _jwt_claims(tokens.get("id_token"))
+            auth_claims = id_token.get("https://api.openai.com/auth")
+            if not isinstance(auth_claims, dict):
+                auth_claims = {}
+            out["loggedIn"] = True
+            out["subscriptionType"] = (
+                id_token.get("chatgpt_plan_type")
+                or auth_claims.get("chatgpt_plan_type")
+                or "ChatGPT"
+            )
+            out["email"] = id_token.get("email", "")
     except Exception:
-        logger.debug("Failed to parse %s", creds_path, exc_info=True)
-        out["error"] = "Credentials file is unreadable"
+        logger.debug("Failed to parse %s", auth_path, exc_info=True)
+        out["error"] = "auth.json is unreadable"
     return JSONResponse(out)
 
 
 @app.delete("/api/profiles/{profile_id}/credentials")
 async def api_profile_logout(profile_id: str):
-    """Remove .credentials.json for this profile (forces /login on next run)."""
+    """Remove auth.json for this profile."""
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
-    creds_path = _profile_dir(profile_id) / ".credentials.json"
-    if creds_path.exists():
+    auth_path = _profile_dir(profile_id) / "auth.json"
+    if auth_path.exists():
         try:
-            creds_path.unlink()
+            _backup_before_dashboard_write(auth_path)
+            auth_path.unlink()
         except Exception:
-            logger.exception("Failed to delete %s", creds_path)
-            return JSONResponse({"error": "Failed to delete credentials"}, status_code=500)
+            logger.exception("Failed to delete %s", auth_path)
+            return JSONResponse({"error": "Failed to delete auth.json"}, status_code=500)
     return JSONResponse({"ok": True})
 
 
 # --- Project-scope (per-session, cwd-bound) file management ---
-# Claude Code loads these on top of the active profile, regardless of which profile
-# the session uses: <cwd>/CLAUDE.md, <cwd>/.claude/settings.local.json, <cwd>/.mcp.json.
+# Codex loads these on top of the active profile, regardless of which profile
+# the session uses: <cwd>/AGENTS.md, <cwd>/.codex/config.toml, <cwd>/.mcp.json.
 # Surface them in the session's "More" dropdown so the user can edit per-project
 # rules without leaving the dashboard.
 
 _PROJECT_FILES = [
-    ("CLAUDE.md", "md",
-     "Project rules loaded on top of the profile's CLAUDE.md."),
-    (".claude/settings.json", "json",
-     "Project settings (model, env, hooks) loaded on top of profile settings."),
-    (".claude/settings.local.json", "json",
-     "Project-local settings (not committed). Loaded last; wins over everything."),
+    ("AGENTS.md", "md",
+     "Project rules loaded on top of the profile's AGENTS.md."),
+    (".codex/config.toml", "toml",
+     "Project config (model, env, hooks) loaded on top of profile config."),
+    (".codex/config.local.toml", "toml",
+     "Project-local config (not committed). Loaded last; wins over everything."),
     (".mcp.json", "json",
      "Project-scope MCP servers (added to profile MCP servers)."),
 ]
 
 
-def _safe_project_path(cwd: str, rel: str) -> Optional[Path]:
+def _safe_project_path(cwd: str, rel: str) -> Path | None:
     """Confine writes to known per-project files under cwd."""
     if not cwd:
         return None
@@ -7934,6 +8246,11 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
             json.loads(body.content)
         except Exception as e:
             return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
+    if target.suffix.lower() == ".toml" and body.content.strip():
+        try:
+            tomllib.loads(body.content)
+        except tomllib.TOMLDecodeError as e:
+            return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body.content)
@@ -7946,11 +8263,11 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
 
 
 def _send_profile_export(session_name: str, profile_id: str):
-    """Send `export CLAUDE_CONFIG_DIR=...` (or unset) to the tmux pane shell."""
+    """Send `export CODEX_HOME=...` (or unset) to the tmux pane shell."""
     if profile_id == DEFAULT_PROFILE_ID:
-        cmd = "unset CLAUDE_CONFIG_DIR"
+        cmd = "unset CODEX_HOME"
     else:
-        cmd = f"export CLAUDE_CONFIG_DIR={shlex.quote(str(_profile_dir(profile_id)))}"
+        cmd = f"export CODEX_HOME={shlex.quote(str(_profile_dir(profile_id)))}"
     try:
         subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", cmd],
                        capture_output=True, text=True, timeout=5)
@@ -7978,38 +8295,18 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
         data["session_profiles"][session_name] = pid
     _save_roles(data)
 
-    claude_running = await _async_is_claude_running(session_name)
+    codex_running = await _async_is_codex_running(session_name)
     exported = False
     restarted = False
-    if not claude_running:
-        # Shell is exposed -- export immediately so the next `claude` invocation picks it up
+    if not codex_running:
+        # Shell is exposed -- export immediately so the next `codex` invocation picks it up
         exported = _send_profile_export(session_name, pid)
     elif body.restart:
-        # Send /exit to Claude, wait for shell, export, relaunch
-        try:
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
-                capture_output=True, text=True, timeout=5)
-            for _ in range(15):
-                await asyncio.sleep(1)
-                if not await _async_is_claude_running(session_name):
-                    break
-            exported = _send_profile_export(session_name, pid)
-            await asyncio.sleep(0.3)
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 "claude --dangerously-skip-permissions"],
-                capture_output=True, text=True, timeout=5)
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5)
-            restarted = True
-        except Exception:
-            logger.exception("Failed to restart Claude with new profile")
+        exported, restarted = await _restart_codex_with_active_profile(session_name, pid)
 
     return JSONResponse({
         "ok": True, "profile_id": pid,
-        "claude_was_running": claude_running,
+        "codex_was_running": codex_running,
         "exported": exported, "restarted": restarted,
     })
 
@@ -8018,7 +8315,7 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
 
 @app.get("/api/stats")
 async def api_stats():
-    """System stats: CPU, disk, memory, tmux sessions, Claude processes."""
+    """System stats: CPU, disk, memory, tmux sessions, Codex processes."""
     stats = {}
     # CPU load
     try:
@@ -8067,28 +8364,28 @@ async def api_stats():
         stats["disk"] = {}
     # tmux sessions
     stats["tmux_sessions"] = get_tmux_sessions()
-    # Claude processes
+    # Codex processes
     try:
         result = subprocess.run(
-            ["pgrep", "-a", "claude"],
+            ["pgrep", "-a", "codex"],
             capture_output=True, text=True, timeout=5
         )
-        stats["claude_processes"] = [
-            l.strip() for l in result.stdout.strip().split("\n") if l.strip()
+        stats["codex_processes"] = [
+            line.strip() for line in result.stdout.strip().split("\n") if line.strip()
         ]
     except Exception:
-        stats["claude_processes"] = []
-    # Node processes (Claude Code runs as node)
+        stats["codex_processes"] = []
+    # Codex-related processes
     try:
         result = subprocess.run(
-            ["pgrep", "-a", "-f", "claude"],
+            ["pgrep", "-a", "-f", "codex"],
             capture_output=True, text=True, timeout=5
         )
-        stats["claude_related"] = len([
-            l for l in result.stdout.strip().split("\n") if l.strip()
+        stats["codex_related"] = len([
+            line for line in result.stdout.strip().split("\n") if line.strip()
         ])
     except Exception:
-        stats["claude_related"] = 0
+        stats["codex_related"] = 0
     # Uptime
     try:
         with open('/proc/uptime') as f:
@@ -8103,8 +8400,17 @@ async def api_stats():
 
 @app.get("/api/health")
 async def api_health():
-    """Lightweight health check — verifies tmux is accessible."""
-    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_API_KEY)}
+    """Lightweight health check for tmux, Codex CLI, and authentication."""
+    checks = {
+        "status": "ok",
+        "tmux": False,
+        "openai": bool(_active_openai_key() or (CODEX_HOME / "auth.json").exists()),
+        "data_dir": False,
+    }
+    try:
+        checks["data_dir"] = MESSAGES_DIR.is_dir() and os.access(MESSAGES_DIR, os.W_OK)
+    except Exception:
+        checks["data_dir"] = False
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -8113,7 +8419,9 @@ async def api_health():
         checks["tmux"] = result.returncode == 0 or "no server running" in result.stderr
     except Exception:
         checks["tmux"] = False
-    if not checks["tmux"]:
+    codex_ready, codex_reason, codex_details = await asyncio.to_thread(_codex_cli_readiness)
+    checks["codex_cli"] = {"ready": codex_ready, "reason": codex_reason, **codex_details}
+    if not checks["tmux"] or not codex_ready or not checks["data_dir"]:
         checks["status"] = "degraded"
     return JSONResponse(checks)
 
@@ -8405,177 +8713,54 @@ async def api_login_health():
     return JSONResponse(data)
 
 
-# --- Long-lived login token (never-revoke auth) -----------------------------
-# Endpoints to mint / store / clear the non-rotating `claude setup-token`. The
-# interactive flow drives `claude setup-token` in a tracked tmux session: it
-# returns the authorize URL (which the admin opens in THEIR OWN browser, since
-# this GCP box is Cloudflare-blocked from claude.ai), then accepts the pasted
-# code and captures the resulting token.
-_OAT_RE = re.compile(r"sk-ant-oat[0-9A-Za-z._-]{20,}")
-_AUTH_SETUP_TMUX = "_authsetup"
-_LL_META_FILE = MESSAGES_DIR / "claude_oauth_token.meta.json"
-
-
-def _auth_status_dict() -> dict:
-    now_ms = int(time.time() * 1000)
-    try:
-        o = json.loads((Path.home() / ".claude" / ".credentials.json").read_text()).get("claudeAiOauth", {})
-        plan = {"present": bool(o), "valid": int(o.get("expiresAt") or 0) > now_ms,
-                "expiresAt": int(o.get("expiresAt") or 0), "subscriptionType": o.get("subscriptionType", "")}
-    except Exception:
-        plan = {"present": False, "valid": False, "expiresAt": 0, "subscriptionType": ""}
-    tok = _load_longlived_token()
-    meta = {}
-    try:
-        if _LL_META_FILE.exists():
-            meta = json.loads(_LL_META_FILE.read_text())
-    except Exception:
-        meta = {}
-    return {
-        "longlived": {"present": bool(tok), "prefix": (tok[:14] + "…") if tok else "",
-                      "saved_at": meta.get("saved_at", 0)},
-        "plan": plan,
-        "injecting": bool(tok),
-    }
-
-
+# --- Codex authentication status --------------------------------------------
 def _auth_admin_ok(request: Request) -> bool:
     user = _current_user(request)
     return not TEAM_MODE or bool(user and _is_admin(user))
 
 
-class TokenBody(BaseModel):
-    token: str
+def _load_longlived_token() -> str:
+    """Compatibility shim for retired Claude browser-auth paths."""
+    return ""
 
 
-class CodeBody(BaseModel):
-    code: str
+def _codex_auth_status_dict(codex_home: Path = CODEX_HOME) -> dict:
+    auth_path = codex_home / "auth.json"
+    mode = "unknown"
+    has_api_key = False
+    try:
+        data = json.loads(auth_path.read_text())
+        mode = str(data.get("auth_mode") or "unknown")
+        has_api_key = bool(data.get("OPENAI_API_KEY"))
+    except Exception:
+        pass
+    return {
+        "loggedIn": auth_path.exists() and (has_api_key or mode in ("chatgpt", "apikey")),
+        "authMode": mode,
+        "hasApiKey": has_api_key or bool(_active_openai_key()),
+        "credentialsFile": auth_path.exists(),
+    }
 
 
 @app.get("/api/auth/status")
 async def api_auth_status(request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    return JSONResponse(_auth_status_dict())
+    return JSONResponse(_codex_auth_status_dict())
 
 
 @app.post("/api/auth/token")
-async def api_auth_set_token(body: TokenBody, request: Request):
-    """Store a long-lived token the admin already minted (paste-in path)."""
-    if not _auth_admin_ok(request):
-        return JSONResponse({"error": "admin only"}, status_code=403)
-    tok = (body.token or "").strip()
-    if not tok.startswith("sk-ant-oat"):
-        return JSONResponse({"error": "That doesn't look like a setup-token (expected sk-ant-oat…)."}, status_code=400)
-    try:
-        _save_longlived_token(tok)
-        _LL_META_FILE.write_text(json.dumps({"saved_at": time.time()}))
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to store token: {e}"}, status_code=500)
-    logger.info("Long-lived Claude token stored (%d chars); sessions inject it on next launch", len(tok))
-    return JSONResponse({"ok": True, "status": _auth_status_dict()})
-
-
 @app.delete("/api/auth/token")
-async def api_auth_clear_token(request: Request):
-    if not _auth_admin_ok(request):
-        return JSONResponse({"error": "admin only"}, status_code=403)
-    try:
-        if LONGLIVED_TOKEN_FILE.exists():
-            LONGLIVED_TOKEN_FILE.unlink()
-        if _LL_META_FILE.exists():
-            _LL_META_FILE.unlink()
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-    logger.info("Long-lived Claude token cleared; sessions revert to the shared plan credential")
-    return JSONResponse({"ok": True, "status": _auth_status_dict()})
-
-
-def _authsetup_capture() -> str:
-    try:
-        return subprocess.run(["tmux", "capture-pane", "-t", _AUTH_SETUP_TMUX, "-p", "-J"],
-                              capture_output=True, text=True, timeout=5).stdout or ""
-    except Exception:
-        return ""
-
-
 @app.post("/api/auth/setup/start")
-async def api_auth_setup_start(request: Request):
-    """Start `claude setup-token` in a tracked tmux session; return the authorize
-    URL for the admin to approve in their own browser."""
-    if not _auth_admin_ok(request):
-        return JSONResponse({"error": "admin only"}, status_code=403)
-
-    def _start():
-        subprocess.run(["tmux", "kill-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True)
-        # Wide window so the long authorize URL never wraps in the capture.
-        subprocess.run(["tmux", "new-session", "-d", "-s", _AUTH_SETUP_TMUX, "-x", "520", "-y", "50"],
-                       capture_output=True, text=True, timeout=10)
-        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "-l",
-                        "unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; claude setup-token"],
-                       capture_output=True, text=True, timeout=10)
-        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "Enter"],
-                       capture_output=True, text=True, timeout=10)
-
-    await asyncio.to_thread(_start)
-    url = ""
-    for _ in range(25):
-        await asyncio.sleep(1)
-        pane = await asyncio.to_thread(_authsetup_capture)
-        m = re.search(r"https://claude\.(?:ai|com)/[^\s]*oauth/authorize\S+", pane)
-        if not m:
-            m = re.search(r"https://claude\.(?:ai|com)/cai/oauth/authorize\S+state=[A-Za-z0-9_-]+",
-                          pane.replace("\n", ""))
-        if m:
-            url = m.group(0)
-            break
-    if not url:
-        return JSONResponse({"error": "Could not read the authorize URL — try again."}, status_code=504)
-    return JSONResponse({"ok": True, "url": url})
-
-
 @app.post("/api/auth/setup/submit")
-async def api_auth_setup_submit(body: CodeBody, request: Request):
-    """Feed the approval code back to the waiting `claude setup-token` process and
-    capture + store the minted long-lived token."""
+async def api_legacy_claude_auth_removed(request: Request):
+    """Retire Claude's setup-token flow; Codex uses login or API-key auth."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    code = (body.code or "").strip()
-    if not code:
-        return JSONResponse({"error": "No code provided."}, status_code=400)
-    alive = await asyncio.to_thread(lambda: subprocess.run(
-        ["tmux", "has-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True).returncode)
-    if alive != 0:
-        return JSONResponse({"error": "The setup session expired — start again."}, status_code=409)
-
-    def _submit():
-        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "-l", code],
-                       capture_output=True, text=True, timeout=10)
-        subprocess.run(["tmux", "send-keys", "-t", _AUTH_SETUP_TMUX, "Enter"],
-                       capture_output=True, text=True, timeout=10)
-
-    await asyncio.to_thread(_submit)
-    token = ""
-    for _ in range(25):
-        await asyncio.sleep(1)
-        pane = await asyncio.to_thread(_authsetup_capture)
-        m = _OAT_RE.search(pane) or _OAT_RE.search(pane.replace("\n", ""))
-        if m:
-            token = m.group(0)
-            break
-        low = pane.lower()
-        if ("invalid" in low or "error" in low) and "code" in low:
-            return JSONResponse({"error": "Claude rejected the code — start again and re-approve."}, status_code=400)
-    if not token:
-        return JSONResponse({"error": "Didn't capture a token (the code may have expired). Start again."}, status_code=504)
-    try:
-        _save_longlived_token(token)
-        _LL_META_FILE.write_text(json.dumps({"saved_at": time.time()}))
-    finally:
-        await asyncio.to_thread(lambda: subprocess.run(
-            ["tmux", "kill-session", "-t", _AUTH_SETUP_TMUX], capture_output=True, text=True))
-    logger.info("Long-lived Claude token minted via setup-token flow and stored")
-    return JSONResponse({"ok": True, "status": _auth_status_dict()})
+    return JSONResponse(
+        {"error": "Claude setup-token auth was removed. Use Codex login or the OpenAI API key control."},
+        status_code=410,
+    )
 
 
 # ============================ Browser sessions ==============================
@@ -8800,7 +8985,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
     slot = _next_browser_slot(sessions)
-    sid = "s%d" % slot
+    sid = f"s{slot}"
     disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
     name = (body.name or "").strip() or f"Browser {slot + 1}"
     _ensure_browser_launcher()
@@ -8861,9 +9046,9 @@ async def api_browser_delete(sid: str, request: Request):
 
 
 class BrowserPatchBody(BaseModel):
-    name: Optional[str] = None
-    notes: Optional[str] = None
-    use_for_login: Optional[bool] = None
+    name: str | None = None
+    notes: str | None = None
+    use_for_login: bool | None = None
 
 
 @app.patch("/api/browser/sessions/{sid}")
@@ -9011,14 +9196,14 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
 
 
 class BrowserProxyBody(BaseModel):
-    enabled: Optional[bool] = None
-    provider: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    zone: Optional[str] = None
-    country: Optional[str] = None
+    enabled: bool | None = None
+    provider: str | None = None
+    host: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
+    zone: str | None = None
+    country: str | None = None
 
 
 @app.post("/api/browser/proxy")
@@ -9117,7 +9302,7 @@ async def api_browser_fingerprint(sid: str, request: Request):
 # Minimal Chrome DevTools Protocol client: open a tab, evaluate JS in it, close
 # it. Used to read a browser's claude.ai login state and to click through the
 # Claude Code OAuth authorize page automatically.
-_browser_busy: Dict[str, dict] = {}   # sid -> {"what": str, "since": float}
+_browser_busy: dict[str, dict] = {}   # sid -> {"what": str, "since": float}
 
 
 @asynccontextmanager
@@ -9253,7 +9438,7 @@ async def _cdp_tab(cdp_port: int, url: str = "about:blank"):
 # account lists only ["chat"] and the authorize page answers "Claude Max or Pro
 # is required" — so cookies alone are NOT enough to call a browser login-ready.
 _PAID_CAPS = ("claude_pro", "claude_max", "pro", "max", "team", "enterprise", "raven")
-_browser_auth_cache: Dict[str, dict] = {}   # sid -> {"data": {...}, "ts": float}
+_browser_auth_cache: dict[str, dict] = {}   # sid -> {"data": {...}, "ts": float}
 _BROWSER_AUTH_TTL = 120
 
 
@@ -9328,10 +9513,32 @@ def _pick_login_browser() -> dict:
 
 @app.get("/api/browser/auth-status")
 async def api_browser_auth_status(request: Request, refresh: int = 0):
-    """Header indicator state: is any browser signed into claude.ai with an
-    account that can authorize Claude Code, and is one being driven right now."""
+    """Compatibility endpoint for the retired Claude browser-auth integration."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    generic = []
+    for session in _load_browser_sessions():
+        running = await asyncio.to_thread(_browser_port_alive, session.get("vnc_port", 0))
+        generic.append({
+            "id": session.get("id"),
+            "name": session.get("name", ""),
+            "running": running,
+            "logged_in": False,
+            "can_authorize": False,
+            "active": False,
+            "busy": False,
+        })
+    return JSONResponse({
+        "sessions": generic,
+        "any_logged_in": False,
+        "any_can_authorize": False,
+        "active": False,
+        "busy": False,
+        "auto_auth": False,
+        "pending_auth": {},
+        "retired": True,
+    })
+    # Legacy implementation retained below for rollback archaeology; unreachable.
     sessions = _load_browser_sessions()
     login_pick = _pick_login_browser()
     out = []
@@ -9420,7 +9627,7 @@ def _scrape_authorize_url(pane: str) -> str:
             url += frag
         found = url.rstrip(".,)")   # keep the newest, don't return early
     return found
-_auto_auth_state: Dict[str, dict] = {}   # session -> {"ts": float, "status": str}
+_auto_auth_state: dict[str, dict] = {}   # session -> {"ts": float, "status": str}
 _AUTO_AUTH_COOLDOWN = 300
 _AUTO_AUTH_MAX_FAILS = 2
 # Last login that auto-auth couldn't finish by itself. Surfaced in the header so
@@ -9687,19 +9894,13 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
 
 @app.post("/api/sessions/{session_name}/auto-auth")
 async def api_auto_auth(session_name: str, request: Request):
-    """Manually kick off the browser-driven login for a session (same routine the
-    watchdog runs automatically) — also the 'first sign-in' path."""
+    """The Claude browser-driven login flow is not applicable to Codex."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    # Fast path first: restore the machine's credential and relaunch (no clicks).
-    res = await _auto_fix_login(session_name)
-    if res.get("ok") or not _pick_login_browser():
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
-    res = await _auto_auth_session(session_name, reason="manual")
-    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    return JSONResponse(
+        {"error": "Browser auto-auth was retired. Use `codex login` or configure an OpenAI API key."},
+        status_code=410,
+    )
 
 
 @app.websocket("/browser/{sid}/websockify")
@@ -9802,42 +10003,18 @@ async def browser_proxy_http(sid: str, path: str, request: Request):
 
 @app.post("/api/sessions/{session_name}/relogin")
 async def api_session_relogin(session_name: str, request: Request):
-    """Gracefully exit Claude and relaunch it on the CURRENT login, preserving
-    the conversation via --continue. Fixes a session stuck on a previous account."""
+    """Restart Codex with the active CODEX_HOME and resume its latest thread."""
     user = _current_user(request)
     if not _user_can_access_session(user, session_name):
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    running = await _async_is_claude_running(session_name)
-    if running:
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
-            capture_output=True, text=True, timeout=5)
-        for _ in range(20):
-            await asyncio.sleep(1)
-            if not await _async_is_claude_running(session_name):
-                break
-    # Re-export the session's profile CLAUDE_CONFIG_DIR (non-default) before the
-    # relaunch, in case the shell was respawned and lost the env var.
-    try:
-        pid = _get_session_profile_id(session_name)
-        if pid != DEFAULT_PROFILE_ID:
-            await asyncio.to_thread(_send_profile_export, session_name, pid)
-            await asyncio.sleep(0.3)
-    except Exception:
-        logger.debug("relogin: profile re-export failed", exc_info=True)
-    await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l",
-         _claude_launch_env_prefix() +
-         "NODE_OPTIONS=--max-old-space-size=8192 "
-         "claude --dangerously-skip-permissions --continue"
-         + _model_flag_for_relaunch(session_name)],
-        capture_output=True, text=True, timeout=5)
-    await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
-        capture_output=True, text=True, timeout=5)
-    # Invalidate caches so the next poll reflects the relaunch immediately.
-    _account_ident_cache.clear()
-    return JSONResponse({"ok": True, "relaunched": True, "claude_was_running": running})
+    running = await _async_is_codex_running(session_name)
+    profile_id = _get_session_profile_id(session_name)
+    _exported, restarted = await _restart_codex_with_active_profile(session_name, profile_id)
+    return JSONResponse({
+        "ok": restarted,
+        "relaunched": restarted,
+        "codex_was_running": running,
+    }, status_code=200 if restarted else 500)
 
 
 @app.post("/api/transcribe")
@@ -9871,321 +10048,296 @@ async def api_transcribe(audio: UploadFile = File(...)):
     return JSONResponse({"text": text})
 
 
-# --- Claude Code auth management ---
+# --- Codex auth management ---
 
-_claude_auth_cache: dict = {"ts": 0, "data": {}}
+_codex_auth_cache: dict = {"ts": 0, "data": {}}
 
-@app.get("/api/auth/claude-status")
-async def api_claude_auth_status():
+
+def _jwt_claims(token: object) -> dict:
+    """Decode non-secret display claims from a JWT without validating it."""
+    if not isinstance(token, str) or token.count(".") < 2:
+        return token if isinstance(token, dict) else {}
+    try:
+        payload = token.split(".", 2)[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _codex_auth_display() -> dict:
+    result: dict = {
+        "loggedIn": bool(_active_openai_key()),
+        "hasApiKey": bool(_active_openai_key()),
+        "authMode": "apikey" if _active_openai_key() else "unknown",
+        "model": "",
+    }
+    try:
+        creds = json.loads((CODEX_HOME / "auth.json").read_text())
+        mode = str(creds.get("auth_mode") or "unknown")
+        result["authMode"] = mode
+        if mode == "apikey" and creds.get("OPENAI_API_KEY"):
+            result.update({
+                "loggedIn": True,
+                "hasApiKey": True,
+                "subscriptionType": "API key",
+                "email": "OpenAI API",
+            })
+        elif mode == "chatgpt" and isinstance(creds.get("tokens"), dict):
+            claims = _jwt_claims(creds["tokens"].get("id_token"))
+            auth_claims = claims.get("https://api.openai.com/auth")
+            if not isinstance(auth_claims, dict):
+                auth_claims = {}
+            plan = (
+                claims.get("chatgpt_plan_type")
+                or auth_claims.get("chatgpt_plan_type")
+                or "ChatGPT"
+            )
+            result.update({
+                "loggedIn": True,
+                "subscriptionType": str(plan),
+                "email": str(claims.get("email") or "ChatGPT user"),
+            })
+    except Exception:
+        logger.debug("Could not read Codex auth status", exc_info=True)
+    try:
+        cfg = (CODEX_HOME / "config.toml").read_text()
+        match = re.search(r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE)
+        if match:
+            result["model"] = match.group(1)
+    except Exception:
+        pass
+    return result
+
+
+@app.get("/api/auth/codex-status")
+@app.get("/api/auth/claude-status", include_in_schema=False)
+async def api_codex_auth_status():
     now = time.time()
-    if now - _claude_auth_cache["ts"] < 60 and _claude_auth_cache["data"]:
-        cached = dict(_claude_auth_cache["data"])
-        cached["hasApiKey"] = bool(_stored_anthropic_key)
-        return JSONResponse(cached)
-
-    result_data: dict = {"loggedIn": False, "hasApiKey": bool(_stored_anthropic_key)}
-
-    # Try reading credentials file directly (instant vs ~25s subprocess)
-    creds_file = Path.home() / ".claude" / ".credentials.json"
-    try:
-        creds = json.loads(creds_file.read_text())
-        oauth = creds.get("claudeAiOauth", {})
-        if oauth and oauth.get("expiresAt", 0) > now * 1000:  # expiresAt is millis
-            result_data["loggedIn"] = True
-            result_data["subscriptionType"] = oauth.get("subscriptionType", "")
-            ident = _account_identity(Path.home() / ".claude")
-            result_data["rateLimitTier"] = oauth.get("rateLimitTier", "") or ident.get("tier", "")
-            result_data["plan"] = ident.get("plan") or _friendly_plan(
-                oauth.get("subscriptionType", ""), oauth.get("rateLimitTier", ""))
-            result_data["email"] = ident.get("email") or "Claude Code"
-            _claude_auth_cache["ts"] = now
-            _claude_auth_cache["data"] = result_data
-            return JSONResponse(result_data)
-    except Exception:
-        logger.debug("Could not read credentials file, falling back to subprocess")
-
-    # Fallback: subprocess with generous timeout
-    try:
-        result = await asyncio.to_thread(subprocess.run,
-            ["claude", "auth", "status", "--json"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            auth_info = json.loads(result.stdout.strip())
-            auth_info["hasApiKey"] = bool(_stored_anthropic_key)
-            _claude_auth_cache["ts"] = now
-            _claude_auth_cache["data"] = auth_info
-            return JSONResponse(auth_info)
-    except Exception:
-        logger.debug("Claude auth subprocess fallback also failed", exc_info=True)
-
-    return JSONResponse(result_data)
+    if now - _codex_auth_cache["ts"] < 60 and _codex_auth_cache["data"]:
+        return JSONResponse(dict(_codex_auth_cache["data"]))
+    result = _codex_auth_display()
+    _codex_auth_cache.update({"ts": now, "data": result})
+    return JSONResponse(result)
 
 
 class SetApiKey(BaseModel):
-    apiKey: str
+    apiKey: str = Field(max_length=500)
 
 
 @app.post("/api/auth/api-key")
-async def api_set_claude_key(body: SetApiKey):
+async def api_set_codex_key(body: SetApiKey):
     key = body.apiKey.strip()
     if key:
-        if not key.startswith(("sk-ant-", "sk-")):
+        if not key.startswith("sk-"):
             return JSONResponse(
-                {"error": "Invalid API key format. Expected key starting with sk-ant- or sk-."},
+                {"error": "Invalid API key format. Expected an OpenAI key starting with sk-."},
                 status_code=400,
             )
-        _save_anthropic_key(key)
-        return JSONResponse({"ok": True, "message": "API key stored."})
+        _save_openai_key(key)
+        _codex_auth_cache["ts"] = 0
+        return JSONResponse({"ok": True, "message": "OpenAI API key stored for Codex."})
     else:
-        _clear_anthropic_key()
+        _clear_openai_key()
+        _codex_auth_cache["ts"] = 0
         return JSONResponse({"ok": True, "message": "API key cleared."})
 
 
 @app.post("/api/auth/logout")
-async def api_claude_auth_logout():
+async def api_codex_auth_logout():
+    """Back up the current credential file, then run `codex logout`."""
     errors = []
+    auth_path = CODEX_HOME / "auth.json"
+    if auth_path.exists():
+        _backup_before_dashboard_write(auth_path)
     try:
         result = subprocess.run(
-            ["claude", "auth", "logout"],
+            ["codex", "logout"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
-            errors.append(result.stderr.strip() or "OAuth logout failed")
-    except Exception as e:
-        errors.append(str(e))
-    _clear_anthropic_key()
+            errors.append(result.stderr.strip() or "codex logout failed")
+    except Exception:
+        logger.warning("Unable to run codex logout", exc_info=True)
+        errors.append("Codex logout command could not be run")
+    _clear_openai_key()
+    _codex_auth_cache["ts"] = 0
     if errors:
         return JSONResponse({"ok": True, "warnings": errors})
     return JSONResponse({"ok": True})
 
 
 _usage_cache: dict = {"ts": 0, "data": {}}
-
-# Last-good Anthropic limits payload. Persisted to disk because it is the only
-# thing standing between an upstream hiccup and empty 5h/7d bars: the usage API
-# rate-limits aggressively, and an in-memory-only cache is wiped by every
-# dashboard restart, so a restart that lands on a 429 used to blank the bars for
-# an hour. `retry_after` holds a backoff deadline so we stop hammering upstream.
-_ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
-_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after": 0}
+_openai_limits_cache: dict = {"ts": 0, "data": None}
 
 
-def _load_anthropic_limits_cache():
+def _codex_session_dirs() -> list[Path]:
+    """Return known session roots for the default, profile, and member homes."""
+    homes = {CODEX_HOME}
     try:
-        d = json.loads(_ANTHROPIC_LIMITS_CACHE_FILE.read_text())
-        if isinstance(d, dict) and d.get("data"):
-            _anthropic_limits_cache.update({
-                "ts": float(d.get("ts") or 0),
-                "data": d.get("data"),
-                "fp": str(d.get("fp") or ""),
-            })
+        homes.update(_profile_dir(p["id"]) for p in _load_roles().get("profiles", []))
     except Exception:
-        logger.debug("No usable persisted usage-limits cache", exc_info=True)
-
-
-def _persist_anthropic_limits_cache():
+        pass
     try:
-        _ANTHROPIC_LIMITS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _ANTHROPIC_LIMITS_CACHE_FILE.write_text(json.dumps({
-            "ts": _anthropic_limits_cache["ts"],
-            "data": _anthropic_limits_cache["data"],
-            "fp": _anthropic_limits_cache["fp"],
-        }))
+        homes.update(
+            _user_codex_config_dir(user)
+            for user in _load_users()
+            if user and not _is_admin(user)
+        )
     except Exception:
-        logger.debug("Failed to persist usage-limits cache", exc_info=True)
+        pass
+    return [home / "sessions" for home in homes if (home / "sessions").exists()]
 
 
-_load_anthropic_limits_cache()
-
-
-def _usage_reset_passed(block: object, now_dt: datetime) -> bool:
-    """True if this usage window's ``resets_at`` is already in the past.
-
-    Once a window resets, its cached ``utilization`` is stale — the window has
-    rolled over to a fresh one (utilization ~0). Serving the old value shows a
-    maxed (e.g. 100%) bar for a window that no longer applies.
-    """
-    if not isinstance(block, dict):
-        return False
-    ra = block.get("resets_at")
-    if not ra:
-        return False
-    try:
-        rt = datetime.fromisoformat(str(ra).replace("Z", "+00:00"))
-        if rt.tzinfo is None:
-            rt = rt.replace(tzinfo=timezone.utc)
-        return rt <= now_dt
-    except Exception:
-        return False
-
-
-def _usage_windows_expired(data: object, now_dt: datetime) -> bool:
-    """True if any known usage window in the payload has already reset."""
-    if not isinstance(data, dict):
-        return False
-    return any(_usage_reset_passed(data.get(k), now_dt)
-               for k in ("five_hour", "seven_day"))
-
-
-def _sanitize_expired_windows(data: object, now_dt: datetime) -> object:
-    """Return a copy with utilization zeroed for any window that has reset.
-
-    Used only on the stale-cache fallback (upstream fetch failed) so a rolled-
-    over window never keeps showing its pre-reset peak (e.g. 100%). The real
-    value is unknown but a just-reset window is ~0, never maxed.
-    """
-    if not isinstance(data, dict):
-        return data
-    out = dict(data)
-    for key in ("five_hour", "seven_day"):
-        blk = out.get(key)
-        if isinstance(blk, dict) and _usage_reset_passed(blk, now_dt):
-            nb = dict(blk)
-            nb["utilization"] = 0
-            out[key] = nb
-    return out
+def _all_codex_rollouts() -> list[Path]:
+    files: list[Path] = []
+    for sessions_dir in _codex_session_dirs():
+        files.extend(sessions_dir.rglob("rollout-*.jsonl"))
+    return files
 
 
 @app.get("/api/usage/limits")
-async def api_anthropic_usage_limits():
-    """Fetch live 5h + 7-day rate-limit utilization from Anthropic OAuth usage API.
+async def api_openai_usage_limits():
+    """Codex/OpenAI usage limits surface.
 
-    Cached for 1 hour per the user-facing requirement (poll hourly while
-    sessions are active). On upstream failure, returns the last good payload.
-    The cache is keyed on the current token, so a login switch busts it at once
-    instead of showing a previous account's usage for up to an hour.
+    In api-key mode, OpenAI bills by spend rather than 5h/7d rate buckets, so
+    there is no live 5h/7d quota endpoint. We instead aggregate token_count
+    events from ~/.codex/sessions/**/*.jsonl over the last 5 hours and last
+    7 days and report them as utilisation indicators against soft thresholds.
     """
     now = time.time()
-    now_dt = datetime.now(timezone.utc)
-    creds_file = Path.home() / ".claude" / ".credentials.json"
-    token = ""
-    try:
-        creds = json.loads(creds_file.read_text())
-        token = creds.get("claudeAiOauth", {}).get("accessToken", "") or ""
-    except Exception:
-        pass
-    if not token:
-        return JSONResponse({"error": "not_authenticated"}, status_code=401)
-    fp = hashlib.sha1(token.encode()).hexdigest()[:16]
-    # Serve cache only if fresh (<1h), same token, AND none of its windows have
-    # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
-    # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
-    if (now - _anthropic_limits_cache["ts"] < 3600
-            and _anthropic_limits_cache["data"]
-            and _anthropic_limits_cache.get("fp") == fp
-            and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
-        return JSONResponse(_anthropic_limits_cache["data"])
+    if now - _openai_limits_cache["ts"] < 600 and _openai_limits_cache["data"]:
+        return JSONResponse(_openai_limits_cache["data"])
 
-    def _stale_or_error():
-        """Serve the last good payload rather than an error whenever we have one.
-
-        A 502 here makes the frontend drop the `has-data` class and the bars
-        disappear entirely, which is far worse than showing a slightly old
-        number — so an error is only returned when we have literally nothing.
-        """
-        if _anthropic_limits_cache["data"]:
-            # Zero any window that has since reset so we never show a stale
-            # maxed bar; the true value is unknown but a fresh window is ~0.
-            out = _sanitize_expired_windows(_anthropic_limits_cache["data"], now_dt)
-            if isinstance(out, dict):
-                out = {**out, "stale": True}
-            return JSONResponse(out)
-        return JSONResponse({"error": "fetch_failed"}, status_code=502)
-
-    # Upstream told us to back off — don't re-hit it until the deadline passes.
-    if now < _anthropic_limits_cache.get("retry_after", 0):
-        return _stale_or_error()
-
-    def _fetch():
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "tmux-dashboard/1.0",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    try:
-        data = await asyncio.to_thread(_fetch)
-    except Exception as e:
-        status = getattr(e, "code", None)
-        if status == 429:
-            # Honour Retry-After when present, else back off 15 minutes. Without
-            # this, every page load and every restart re-hits a rate-limited
-            # endpoint and keeps it rate-limited.
-            delay = 900
+    def _scan() -> dict:
+        cutoff_5h = now - 5 * 3600
+        cutoff_7d = now - 7 * 86400
+        total_5h = 0
+        total_7d = 0
+        cache_5h = 0
+        cache_7d = 0
+        cost_5h = 0.0
+        cost_7d = 0.0
+        seen_5h = set()
+        seen_7d = set()
+        files = _all_codex_rollouts()
+        if not files:
+            return {}
+        for fpath in files:
             try:
-                hdr = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
-                if hdr:
-                    delay = max(60, min(3600, int(float(hdr))))
+                mtime = fpath.stat().st_mtime
+                if mtime < cutoff_7d:
+                    continue
+                model = "gpt-5.4"
+                sid = fpath.name
+                with open(fpath) as f:
+                    for line in f:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        if d.get("type") == "turn_context":
+                            m = d.get("payload", {}).get("model")
+                            if m:
+                                model = m
+                        if d.get("type") != "event_msg":
+                            continue
+                        pl = d.get("payload", {})
+                        if pl.get("type") != "token_count":
+                            continue
+                        info = pl.get("info", {}) or {}
+                        last = info.get("last_token_usage", {}) or {}
+                        last_total = last.get("total_tokens", 0)
+                        last_cache = last.get("cached_input_tokens", 0)
+                        last_in = last.get("input_tokens", 0)
+                        last_out = last.get("output_tokens", 0)
+                        last_reason = last.get("reasoning_output_tokens", 0)
+                        ts_str = d.get("timestamp", "")
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            ts = mtime
+                        c_in, c_out, c_cached = 1.25, 10.0, 0.125
+                        if "o3" in model.lower():
+                            c_in, c_out, c_cached = 2.0, 8.0, 0.5
+                        cost = (last_in * c_in + (last_out + last_reason) * c_out + last_cache * c_cached) / 1e6
+                        if ts >= cutoff_5h:
+                            total_5h += last_total
+                            cache_5h += last_cache
+                            cost_5h += cost
+                            seen_5h.add(sid)
+                        if ts >= cutoff_7d:
+                            total_7d += last_total
+                            cache_7d += last_cache
+                            cost_7d += cost
+                            seen_7d.add(sid)
             except Exception:
-                pass
-            _anthropic_limits_cache["retry_after"] = now + delay
-            logger.warning("Anthropic usage API rate-limited; backing off %ss", delay)
-        else:
-            logger.warning("Anthropic OAuth usage fetch failed: %s", e)
-        return _stale_or_error()
+                logger.debug("Failed to scan rollout %s", fpath, exc_info=True)
+        soft_5h = 5_000_000
+        soft_7d = 50_000_000
+        return {
+            "fetched_at": now,
+            "five_hour": {
+                "tokens": total_5h,
+                "cached_tokens": cache_5h,
+                "sessions": len(seen_5h),
+                "soft_limit": soft_5h,
+                "utilization": round(total_5h / soft_5h * 100, 1) if soft_5h else 0,
+                "estimated_cost_usd": round(cost_5h, 2),
+            },
+            "seven_day": {
+                "tokens": total_7d,
+                "cached_tokens": cache_7d,
+                "sessions": len(seen_7d),
+                "soft_limit": soft_7d,
+                "utilization": round(total_7d / soft_7d * 100, 1) if soft_7d else 0,
+                "estimated_cost_usd": round(cost_7d, 2),
+            },
+        }
 
-    payload = {"fetched_at": now, **data}
-    _anthropic_limits_cache["ts"] = now
-    _anthropic_limits_cache["data"] = payload
-    _anthropic_limits_cache["fp"] = fp
-    _anthropic_limits_cache["retry_after"] = 0
-    _persist_anthropic_limits_cache()
-    return JSONResponse(payload)
+    try:
+        data = await asyncio.to_thread(_scan)
+    except Exception as e:
+        logger.warning("Codex usage scan failed: %s", e)
+        if _openai_limits_cache["data"]:
+            return JSONResponse(_openai_limits_cache["data"])
+        return JSONResponse({"error": "scan_failed"}, status_code=502)
+
+    if not data:
+        return JSONResponse({"error": "no_data"}, status_code=204)
+    _openai_limits_cache["ts"] = now
+    _openai_limits_cache["data"] = data
+    return JSONResponse(data)
 
 
 @app.get("/api/auth/usage")
-async def api_claude_usage():
-    """Token usage for today, parsed from Claude Code session JSONL files."""
+async def api_codex_usage():
+    """Token usage for today, parsed from codex session rollout JSONL files."""
     now = time.time()
     if now - _usage_cache["ts"] < 60:
         return JSONResponse(_usage_cache["data"])
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    home = str(Path.home())
-    patterns = [
-        f"{home}/.claude/projects/*/*.jsonl",
-        f"{home}/.claude/projects/*/subagents/*.jsonl",
-        f"{home}/.claude/projects/*/*/subagents/*.jsonl",
-    ]
-    files: set = set()
-    for p in patterns:
-        files.update(globmod.glob(p))
+    files = _all_codex_rollouts()
 
     input_tok = 0
     output_tok = 0
     cache_read = 0
-    cache_create = 0
+    reasoning_tok = 0
     msg_count = 0
 
     for fpath in files:
         try:
-            mtime = os.path.getmtime(fpath)
+            mtime = fpath.stat().st_mtime
             if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
                 continue
-            with open(fpath) as f:
-                for line in f:
-                    d = json.loads(line)
-                    if d.get("type") != "assistant":
-                        continue
-                    ts = d.get("timestamp", "")
-                    if not ts.startswith(today):
-                        continue
-                    msg = d if "usage" in d else d.get("message", {})
-                    usage = msg.get("usage")
-                    if not usage:
-                        continue
-                    input_tok += usage.get("input_tokens", 0)
-                    output_tok += usage.get("output_tokens", 0)
-                    cache_read += usage.get("cache_read_input_tokens", 0)
-                    cache_create += usage.get("cache_creation_input_tokens", 0)
-                    msg_count += 1
+            inp, out, cached, reasoning, messages = _parse_usage_file(fpath, today)
+            input_tok += inp
+            output_tok += out
+            cache_read += cached
+            reasoning_tok += reasoning
+            msg_count += messages
         except Exception:
             logger.debug("Failed to parse usage JSONL for '%s'", fpath, exc_info=True)
 
@@ -10195,154 +10347,173 @@ async def api_claude_usage():
         "inputTokens": input_tok,
         "outputTokens": output_tok,
         "cacheReadTokens": cache_read,
-        "cacheCreateTokens": cache_create,
-        "totalTokens": input_tok + output_tok + cache_read + cache_create,
+        "cacheCreateTokens": reasoning_tok,
+        "reasoningTokens": reasoning_tok,
+        "totalTokens": input_tok + output_tok + cache_read + reasoning_tok,
     }
     _usage_cache["ts"] = now
     _usage_cache["data"] = data
     return JSONResponse(data)
 
 
+def _parse_usage_file(path: str | Path, date_prefix: str) -> tuple[int, int, int, int, int]:
+    """Parse one Codex rollout's token deltas and assistant-message count.
+
+    ``token_count`` events contain both cumulative totals and the last turn's
+    delta; only ``last_token_usage`` is summed so repeated snapshots do not
+    inflate usage.
+    """
+    input_tok = output_tok = cache_read = reasoning_tok = msg_count = 0
+    with open(path) as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if not str(event.get("timestamp", "")).startswith(date_prefix):
+                continue
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload", {}) or {}
+            if payload.get("type") == "agent_message":
+                msg_count += 1
+                continue
+            if payload.get("type") != "token_count":
+                continue
+            last = (payload.get("info", {}) or {}).get("last_token_usage", {}) or {}
+            input_tok += int(last.get("input_tokens", 0) or 0)
+            output_tok += int(last.get("output_tokens", 0) or 0)
+            cache_read += int(last.get("cached_input_tokens", 0) or 0)
+            reasoning_tok += int(last.get("reasoning_output_tokens", 0) or 0)
+    return input_tok, output_tok, cache_read, reasoning_tok, msg_count
+
+
 _stats_usage_cache: dict = {"ts": 0, "data": {}}
 
 def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
-    """Estimate cost in USD from token counts and model name."""
-    if "opus" in model:
-        ci, co, ccr, ccc = 15.0, 75.0, 1.5, 18.75
-    elif "haiku" in model:
-        ci, co, ccr, ccc = 1.0, 5.0, 0.1, 1.25
-    else:  # sonnet or unknown
-        ci, co, ccr, ccc = 3.0, 15.0, 0.3, 3.75
-    return inp * ci / 1e6 + out * co / 1e6 + cr * ccr / 1e6 + cc * ccc / 1e6
+    """Estimate cost in USD from token counts for codex/OpenAI models.
+
+    cr = cached_input_tokens (treated like cache-read), cc = reasoning_output
+    tokens (billed at output rate). Rates are public list prices per 1M tokens.
+    """
+    m = (model or "").lower()
+    ci, co, ccr = 1.25, 10.0, 0.125
+    if "o3" in m and "mini" not in m:
+        ci, co, ccr = 2.0, 8.0, 0.5
+    elif "o3-mini" in m or "o4-mini" in m or "gpt-5-mini" in m or "gpt-5.4-mini" in m:
+        ci, co, ccr = 0.25, 2.0, 0.025
+    elif "gpt-4o-mini" in m:
+        ci, co, ccr = 0.15, 0.6, 0.075
+    elif "gpt-4o" in m:
+        ci, co, ccr = 2.5, 10.0, 1.25
+    elif "gpt-5" in m or "5.4" in m or "5.3" in m:
+        ci, co, ccr = 1.25, 10.0, 0.125
+    return inp * ci / 1e6 + (out + cc) * co / 1e6 + cr * ccr / 1e6
 
 
 @app.get("/api/stats/usage")
 async def api_stats_usage():
-    """Aggregated token usage across all sessions: 5h window + this week."""
+    """Aggregated token usage across all codex sessions: 5h window + this week."""
     now = time.time()
     if now - _stats_usage_cache["ts"] < 120 and _stats_usage_cache["data"]:
         return JSONResponse(_stats_usage_cache["data"])
 
     now_dt = datetime.now(timezone.utc)
     cutoff_5h = (now_dt - timedelta(hours=5)).isoformat()
-    # Monday 00:00 UTC of current week
     week_start = (now_dt - timedelta(days=now_dt.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     ).isoformat()
 
-    home = str(Path.home())
-    patterns = [
-        f"{home}/.claude/projects/*/*.jsonl",
-        f"{home}/.claude/projects/*/subagents/*.jsonl",
-        f"{home}/.claude/projects/*/*/subagents/*.jsonl",
-    ]
-    all_files: set = set()
-    for p in patterns:
-        all_files.update(globmod.glob(p))
-
-    # Build mapping: project_dir -> list of (timestamp, inp, out, cr, cc, model)
-    dir_entries: dict = {}  # project_dir -> entries list
+    all_files = _all_codex_rollouts()
     week_start_date = week_start[:10]
+
+    # Build mapping: cwd -> list of (timestamp, inp, out, cr, reasoning, model)
+    cwd_entries: dict = {}
 
     for fpath in all_files:
         try:
-            mtime = os.path.getmtime(fpath)
+            mtime = fpath.stat().st_mtime
             if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < week_start_date:
                 continue
-            # Derive project dir (strip subagents/ if present)
-            pdir = os.path.dirname(fpath)
-            if os.path.basename(pdir) == "subagents":
-                pdir = os.path.dirname(pdir)
-            if pdir not in dir_entries:
-                dir_entries[pdir] = []
+            session_cwd = ""
+            model = "gpt-5.4"
             with open(fpath) as f:
                 for line in f:
-                    d = json.loads(line)
-                    if d.get("type") != "assistant":
+                    try:
+                        d = json.loads(line)
+                    except Exception:
                         continue
-                    ts = d.get("timestamp", "")
-                    if ts < week_start:
-                        continue
-                    msg = d if "usage" in d else d.get("message", {})
-                    usage = msg.get("usage")
-                    if not usage:
-                        continue
-                    inp = usage.get("input_tokens", 0)
-                    out = usage.get("output_tokens", 0)
-                    cr = usage.get("cache_read_input_tokens", 0)
-                    cc = usage.get("cache_creation_input_tokens", 0)
-                    model = msg.get("model", d.get("message", {}).get("model", "unknown"))
-                    dir_entries[pdir].append((ts, inp, out, cr, cc, model))
+                    if d.get("type") == "session_meta":
+                        session_cwd = d.get("payload", {}).get("cwd", "") or session_cwd
+                    elif d.get("type") == "turn_context":
+                        m = d.get("payload", {}).get("model")
+                        if m:
+                            model = m
+                    elif d.get("type") == "event_msg":
+                        pl = d.get("payload", {})
+                        if pl.get("type") != "token_count":
+                            continue
+                        ts = d.get("timestamp", "")
+                        if ts < week_start:
+                            continue
+                        last = (pl.get("info", {}) or {}).get("last_token_usage", {}) or {}
+                        inp = last.get("input_tokens", 0)
+                        out = last.get("output_tokens", 0)
+                        cr = last.get("cached_input_tokens", 0)
+                        reason = last.get("reasoning_output_tokens", 0)
+                        key = session_cwd or str(fpath.parent)
+                        cwd_entries.setdefault(key, []).append((ts, inp, out, cr, reason, model))
         except Exception:
             logger.debug("Failed to parse stats usage JSONL '%s'", fpath, exc_info=True)
 
-    # Map tmux sessions to project dirs
+    # Map tmux sessions to cwd
     tmux_sessions = get_tmux_sessions()
-    session_dirs: dict = {}  # project_dir -> session_name
+    session_cwd_to_name: dict = {}
     for s in tmux_sessions:
         cwd = get_session_cwd(s["name"])
-        if not cwd:
-            continue
-        sanitized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-        projects_base = str(Path.home() / ".claude" / "projects")
-        for candidate in [
-            os.path.join(projects_base, sanitized),
-            os.path.join(projects_base, "-" + sanitized.lstrip("-")),
-        ]:
-            if candidate in dir_entries:
-                session_dirs[candidate] = s["name"]
-                break
-        else:
-            last_part = cwd.rstrip("/").rsplit("/", 1)[-1]
-            for pdir in dir_entries:
-                if last_part in os.path.basename(pdir):
-                    session_dirs[pdir] = s["name"]
-                    break
+        if cwd:
+            session_cwd_to_name[cwd] = s["name"]
 
-    # Aggregate per project dir
     g5h = {"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreateTokens": 0, "totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
     gweek = {"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreateTokens": 0, "totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
     session_list = []
 
-    for pdir, entries in dir_entries.items():
+    for cwd, entries in cwd_entries.items():
         if not entries:
             continue
-        sname = session_dirs.get(pdir, os.path.basename(pdir).split("-")[-1] or os.path.basename(pdir))
+        sname = session_cwd_to_name.get(cwd, os.path.basename(cwd.rstrip("/")) or cwd)
         s5h = {"totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
         sweek = {"totalTokens": 0, "messages": 0, "estimatedCost": 0.0}
         latest_ts = ""
-        latest_model = "unknown"
+        latest_model = "gpt-5.4"
 
-        for ts, inp, out, cr, cc, model in entries:
-            total = inp + out + cr + cc
-            # This week
+        for ts, inp, out, cr, reason, model in entries:
+            total = inp + out + cr + reason
             sweek["totalTokens"] += total
             sweek["messages"] += 1
-            sweek["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+            sweek["estimatedCost"] += _estimate_cost(inp, out, cr, reason, model)
             gweek["inputTokens"] += inp
             gweek["outputTokens"] += out
             gweek["cacheReadTokens"] += cr
-            gweek["cacheCreateTokens"] += cc
+            gweek["cacheCreateTokens"] += reason
             gweek["totalTokens"] += total
             gweek["messages"] += 1
-            gweek["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+            gweek["estimatedCost"] += _estimate_cost(inp, out, cr, reason, model)
             if ts > latest_ts:
                 latest_ts = ts
                 latest_model = model
-            # 5h window
             if ts >= cutoff_5h:
                 s5h["totalTokens"] += total
                 s5h["messages"] += 1
-                s5h["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+                s5h["estimatedCost"] += _estimate_cost(inp, out, cr, reason, model)
                 g5h["inputTokens"] += inp
                 g5h["outputTokens"] += out
                 g5h["cacheReadTokens"] += cr
-                g5h["cacheCreateTokens"] += cc
+                g5h["cacheCreateTokens"] += reason
                 g5h["totalTokens"] += total
                 g5h["messages"] += 1
-                g5h["estimatedCost"] += _estimate_cost(inp, out, cr, cc, model)
+                g5h["estimatedCost"] += _estimate_cost(inp, out, cr, reason, model)
 
-        # Round costs
         s5h["estimatedCost"] = round(s5h["estimatedCost"], 2)
         sweek["estimatedCost"] = round(sweek["estimatedCost"], 2)
 
@@ -10354,7 +10525,6 @@ async def api_stats_usage():
             "lastActive": latest_ts,
         })
 
-    # Sort by most recently active
     session_list.sort(key=lambda x: x["lastActive"], reverse=True)
     g5h["estimatedCost"] = round(g5h["estimatedCost"], 2)
     gweek["estimatedCost"] = round(gweek["estimatedCost"], 2)
@@ -10371,15 +10541,15 @@ async def api_stats_usage():
 
 # --- Per-session token stats & rate tracking ---
 
-_session_stats_cache: Dict[str, dict] = {}
-_session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+_session_stats_cache: dict[str, dict] = {}
+_session_model_cache: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 # Model switches requested via the header dropdown, not yet confirmed by the
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
-_session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+_session_model_pending: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 
 
 def _session_model_fields(session_name: str) -> dict:
-    """`model` + `model_pending` for API payloads. Clears the pending marker once
+    """Model, effort, and pending model for session API payloads. Clears pending once
     the transcript confirms the switch, or after 15 min (request abandoned)."""
     model = _get_session_model(session_name)
     pend = _session_model_pending.get(session_name)
@@ -10389,20 +10559,39 @@ def _session_model_fields(session_name: str) -> dict:
         if confirmed or time.time() - pend.get("ts", 0) > 900:
             _session_model_pending.pop(session_name, None)
             pend = None
-    return {"model": model, "model_pending": (pend or {}).get("model", "")}
+    effort = _CODEX_DEFAULT_REASONING_EFFORT
+    try:
+        profile = _find_profile(_get_session_profile_id(session_name), _load_roles())
+        if profile and profile.get("effort"):
+            effort = profile["effort"]
+    except Exception:
+        pass
+    return {
+        "model": model,
+        "model_pending": (pend or {}).get("model", ""),
+        "effort": effort,
+    }
 
 
 def _get_session_model(session_name: str) -> str:
-    """Detect the current model for a session by reading the latest JSONL entries."""
+    """Detect the current model for a session by reading its latest codex rollout."""
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
         return cached.get("model", "")
     files = _find_session_jsonl_files(session_name)
     if not files:
+        # Fall back to the model from codex config.toml
+        try:
+            cfg = (CODEX_HOME / "config.toml").read_text()
+            m = re.search(r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE)
+            if m:
+                _session_model_cache[session_name] = {"model": m.group(1), "ts": now}
+                return m.group(1)
+        except Exception:
+            pass
         _session_model_cache[session_name] = {"model": "", "ts": now}
         return ""
-    # Find newest file by mtime
     newest = max(files, key=lambda f: os.path.getmtime(f), default=None)
     if not newest:
         _session_model_cache[session_name] = {"model": "", "ts": now}
@@ -10410,20 +10599,20 @@ def _get_session_model(session_name: str) -> str:
     model = ""
     try:
         with open(newest, "rb") as f:
-            # Read last ~32KB to find recent model entries
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - 32768))
+            f.seek(max(0, size - 65536))
             tail = f.read().decode("utf-8", errors="replace")
         for line in reversed(tail.strip().split("\n")):
             try:
                 d = json.loads(line)
-                if d.get("type") == "assistant":
-                    msg = d if "model" in d else d.get("message", {})
-                    m = msg.get("model", "")
+                if d.get("type") == "turn_context":
+                    m = d.get("payload", {}).get("model", "")
                     if m:
                         model = m
                         break
+                if d.get("type") == "session_meta":
+                    pass
             except (json.JSONDecodeError, KeyError):
                 continue
     except Exception:
@@ -10433,36 +10622,50 @@ def _get_session_model(session_name: str) -> str:
 
 
 def _find_session_jsonl_files(session_name: str) -> list:
-    """Find Claude Code JSONL files for a tmux session based on its working directory."""
+    """Find codex rollout JSONL files whose recorded cwd matches the tmux session's cwd.
+
+    Codex sessions are stored at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+    and the cwd is recorded in the session_meta event at line 1.
+    """
     cwd = get_session_cwd(session_name)
     if not cwd:
         return []
-    # Claude Code sanitizes paths: replaces all non-alphanumeric chars with hyphens
-    sanitized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-    # Use the session's OWN config dir as the transcript root. Team members run
-    # in an isolated ~/.claude-user-<id>/ where their Claude writes transcripts;
-    # the admin's ~/.claude would surface a different user's transcripts (or none),
-    # which is why member Chat tabs showed no summary. Admin sessions resolve to
-    # ~/.claude, so this is a no-op on non-team hosts.
-    projects_base = _session_config_base(session_name) / "projects"
-    # Try exact match first, then fallback to glob match
-    project_dir = str(projects_base / sanitized)
-    if not os.path.isdir(project_dir):
-        # Try with leading dash (common pattern)
-        alt = str(projects_base / ("-" + sanitized.lstrip("-")))
-        if os.path.isdir(alt):
-            project_dir = alt
+    cwd_norm = cwd.rstrip("/")
+    sessions_home = CODEX_HOME
+    try:
+        owner = _user_for_session(session_name)
+        if owner and not _is_admin(owner):
+            sessions_home = _user_codex_config_dir(owner)
         else:
-            # Glob fallback: match any dir containing the last path component
-            last_part = cwd.rstrip("/").rsplit("/", 1)[-1]
-            candidates = globmod.glob(str(projects_base / f"*{last_part}*"))
-            if candidates:
-                project_dir = candidates[0]
-            else:
-                return []
-    files = globmod.glob(os.path.join(project_dir, "*.jsonl"))
-    files += globmod.glob(os.path.join(project_dir, "subagents", "*.jsonl"))
-    return files
+            sessions_home = _profile_dir(_get_session_profile_id(session_name))
+    except Exception:
+        pass
+    sessions_dir = sessions_home / "sessions"
+    if not sessions_dir.exists():
+        return []
+    matches = []
+    # Look back up to 30 days for performance.
+    for fpath in sessions_dir.rglob("rollout-*.jsonl"):
+        try:
+            mtime = fpath.stat().st_mtime
+            if time.time() - mtime > 30 * 86400:
+                continue
+            with open(fpath) as f:
+                first = f.readline()
+            if not first:
+                continue
+            try:
+                meta = json.loads(first)
+            except Exception:
+                continue
+            if meta.get("type") != "session_meta":
+                continue
+            mcwd = (meta.get("payload", {}) or {}).get("cwd", "").rstrip("/")
+            if mcwd == cwd_norm:
+                matches.append(str(fpath))
+        except Exception:
+            logger.debug("Failed to peek rollout %s", fpath, exc_info=True)
+    return matches
 
 
 def _parse_session_stats(session_name: str) -> dict:
@@ -10491,29 +10694,40 @@ def _parse_session_stats(session_name: str) -> dict:
     models_seen = {}
     latest_model = "unknown"  # Track the most recently used model
     latest_model_ts = ""
+    latest_input_tokens = 0
+    latest_context_tokens = 0
+    latest_context_window = 0
+    estimated_cost = 0.0
 
     for fpath in files:
         try:
             mtime = os.path.getmtime(fpath)
             if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
                 continue
+            current_model = _CODEX_DEFAULT_MODEL
             with open(fpath) as f:
                 for line in f:
                     d = json.loads(line)
-                    if d.get("type") != "assistant":
+                    if d.get("type") == "turn_context":
+                        current_model = d.get("payload", {}).get("model") or current_model
+                        continue
+                    if d.get("type") != "event_msg":
+                        continue
+                    payload = d.get("payload", {}) or {}
+                    if payload.get("type") != "token_count":
                         continue
                     ts_str = d.get("timestamp", "")
                     if not ts_str.startswith(today):
                         continue
-                    msg = d if "usage" in d else d.get("message", {})
-                    usage = msg.get("usage")
+                    usage = (payload.get("info", {}) or {}).get("last_token_usage", {}) or {}
                     if not usage:
                         continue
+                    info = payload.get("info", {}) or {}
                     inp = usage.get("input_tokens", 0)
                     out = usage.get("output_tokens", 0)
-                    cr = usage.get("cache_read_input_tokens", 0)
-                    cc = usage.get("cache_creation_input_tokens", 0)
-                    model = msg.get("model", d.get("message", {}).get("model", "unknown"))
+                    cr = usage.get("cached_input_tokens", 0)
+                    cc = usage.get("reasoning_output_tokens", 0)
+                    model = current_model
 
                     total_input += inp
                     total_output += out
@@ -10521,9 +10735,14 @@ def _parse_session_stats(session_name: str) -> dict:
                     total_cache_create += cc
                     msg_count += 1
                     models_seen[model] = models_seen.get(model, 0) + 1
+                    estimated_cost += _estimate_cost(inp, out, cr, cc, model)
                     if ts_str >= latest_model_ts:
                         latest_model_ts = ts_str
                         latest_model = model
+                        latest_input_tokens = int(usage.get("input_tokens", 0) or 0)
+                        total_usage = info.get("total_token_usage", {}) or {}
+                        latest_context_tokens = int(total_usage.get("total_tokens", 0) or 0)
+                        latest_context_window = int(info.get("model_context_window", 0) or 0)
 
                     # Parse timestamp to epoch for rate calc
                     try:
@@ -10543,25 +10762,8 @@ def _parse_session_stats(session_name: str) -> dict:
     # Sort by timestamp
     entries.sort(key=lambda e: e[0])
 
-    # Cost estimation (per 1M tokens)
-    # Use the most recently used model (not the most frequent — user may have switched mid-session)
+    # Use the most recently used model for display (cost was accumulated per event).
     primary_model = latest_model if latest_model != "unknown" else (max(models_seen, key=models_seen.get) if models_seen else "unknown")
-    if "opus" in primary_model:
-        cost_input, cost_output = 15.0, 75.0
-        cost_cache_read, cost_cache_create = 1.5, 18.75
-    elif "haiku" in primary_model:
-        cost_input, cost_output = 1.0, 5.0
-        cost_cache_read, cost_cache_create = 0.1, 1.25
-    else:  # sonnet or unknown
-        cost_input, cost_output = 3.0, 15.0
-        cost_cache_read, cost_cache_create = 0.3, 3.75
-
-    estimated_cost = (
-        total_input * cost_input / 1_000_000
-        + total_output * cost_output / 1_000_000
-        + total_cache_read * cost_cache_read / 1_000_000
-        + total_cache_create * cost_cache_create / 1_000_000
-    )
 
     # Rate calculation: bucket into 1-minute windows
     # Only consider windows with meaningful output (> 10 output tokens = actually streaming)
@@ -10637,6 +10839,12 @@ def _parse_session_stats(session_name: str) -> dict:
         "sessionDurationMin": session_duration_min,
         "secsSinceLastActivity": secs_since_last,
         "modelsUsed": models_seen,
+        "contextPct": (
+            round(latest_context_tokens / latest_context_window * 100, 1)
+            if latest_context_window else 0
+        ),
+        "lastInputTokens": latest_input_tokens,
+        "ctxWindowSize": latest_context_window,
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -10654,10 +10862,17 @@ class SendCommand(BaseModel):
     command: str
 
 class SendKeys(BaseModel):
-    keys: list  # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"]
+    # List of tmux key names, e.g. ["Escape"], ["C-c"], ["q", "Enter"].
+    keys: list[str] = Field(max_length=50)
 
 class AuthModeBody(BaseModel):
     mode: str  # "api" or "subscription"
+
+class AwayModeBody(BaseModel):
+    enabled: bool
+
+class GoNutsModeBody(BaseModel):
+    enabled: bool
 
 
 @app.post("/api/sessions/{session_name}/send")
@@ -10670,7 +10885,7 @@ async def api_send_command(session_name: str, body: SendCommand):
         cmd_text = body.command
         if len(cmd_text) > 200:
             # For long messages, use tmux load-buffer + paste-buffer.
-            # Claude Code's bracketed paste mode shows "[Pasted text +N lines]"
+            # Codex's bracketed paste mode shows "[Pasted text +N lines]"
             # as a preview and often swallows the Enter that follows, leaving
             # the paste stuck until the user sends a second message. We defeat
             # this by sending the \e[?2004l escape sequence first (disables
@@ -10696,7 +10911,7 @@ async def api_send_command(session_name: str, body: SendCommand):
                 )
             finally:
                 os.unlink(tmp_path)
-            # Wait long enough for Claude Code to render the pasted content
+            # Wait long enough for Codex to render the pasted content
             # before pressing Enter. Scale with length; cap at 5s.
             wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
             await asyncio.sleep(wait_secs)
@@ -10745,9 +10960,10 @@ async def api_send_command(session_name: str, body: SendCommand):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+
 @app.post("/api/sessions/{session_name}/interrupt")
 async def api_interrupt_session(session_name: str):
-    """Send Escape key to interrupt a running Claude Code session."""
+    """Send Escape key to interrupt a running Codex session."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -10823,60 +11039,28 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
 
 @app.post("/api/sessions/{session_name}/set-auth-mode")
 async def api_set_auth_mode(session_name: str, body: AuthModeBody):
-    """Toggle between API key and subscription auth for a specific session."""
+    """Reject the legacy per-pane auth toggle.
+
+    Codex credentials belong to CODEX_HOME. Mutating a shell variable in an
+    already-running pane neither switches the active Codex process nor safely
+    isolates one session from another profile, and sending a key through tmux
+    would expose it in pane history. Authentication is therefore managed in
+    Settings or on the profile itself.
+    """
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    try:
-        if body.mode == "api":
-            key = _stored_anthropic_key
-            if not key:
-                # Fallback: try to extract from ~/CLAUDE.md
-                try:
-                    claude_md = (Path.home() / "CLAUDE.md").read_text()
-                    for line in claude_md.splitlines():
-                        line = line.strip()
-                        if line.startswith("sk-ant-"):
-                            key = line.split()[0].rstrip(",;")
-                            break
-                        elif "sk-ant-" in line:
-                            m = re.search(r'(sk-ant-\S+)', line)
-                            if m:
-                                key = m.group(1).rstrip(",;")
-                                break
-                except Exception:
-                    logger.debug("Failed to scan credentials file for API key", exc_info=True)
-            if not key:
-                return JSONResponse({"error": "No API key found"}, status_code=400)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 f"export ANTHROPIC_API_KEY={key}"],
-                capture_output=True, text=True, timeout=5
+    if body.mode not in ("api", "subscription"):
+        return JSONResponse({"error": "Invalid mode"}, status_code=400)
+    return JSONResponse(
+        {
+            "error": (
+                "Codex authentication is configured per profile. "
+                "Use Settings → Login or the profile credentials panel."
             )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        elif body.mode == "subscription":
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 "unset ANTHROPIC_API_KEY"],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        else:
-            return JSONResponse({"error": "Invalid mode"}, status_code=400)
-        _session_auth_mode[session_name] = body.mode
-        return JSONResponse({"ok": True, "mode": body.mode, "session": session_name})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-class ModelBody(BaseModel):
-    model: str
+        },
+        status_code=409,
+    )
 
 
 @app.get("/api/models")
@@ -10884,12 +11068,17 @@ async def api_models():
     """The model dropdown catalog ([id, label] rows) + the launch default. Kept
     current by the 24h auto-detect; the frontend fetches this on load so newly
     released models appear without a redeploy."""
-    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL})
+    return JSONResponse({
+        "models": MODEL_CATALOG,
+        "default": DEFAULT_MODEL,
+        "efforts": list(_CODEX_REASONING_EFFORTS),
+        "default_effort": _CODEX_DEFAULT_REASONING_EFFORT,
+    })
 
 
 @app.post("/api/models/refresh")
 async def api_models_refresh(request: Request):
-    """Force an immediate model-catalog check against the Anthropic API (admin)."""
+    """Force an immediate refresh from the installed Codex CLI (admin)."""
     user = _current_user(request)
     if TEAM_MODE and not (user and _is_admin(user)):
         return JSONResponse({"error": "admin only"}, status_code=403)
@@ -10897,102 +11086,137 @@ async def api_models_refresh(request: Request):
     return JSONResponse({"ok": True, "changed": changed, "models": MODEL_CATALOG})
 
 
-@app.post("/api/sessions/{session_name}/model")
-async def api_set_session_model(session_name: str, body: ModelBody):
-    """Switch a running session's Claude model from the header dropdown by typing
-    `/model <id>` into the pane composer — same as running the slash command.
-    Takes effect from the next reply; the badge shows a pending state until the
-    transcript confirms it."""
+async def _restart_codex_with_active_profile(session_name: str, profile_id: str) -> tuple[bool, bool]:
+    """Exit Codex, export the selected CODEX_HOME, and resume its latest thread."""
+    exported = False
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "/quit", "Enter"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if not await _async_is_codex_running(session_name):
+                break
+        exported = _send_profile_export(session_name, profile_id)
+        await asyncio.sleep(0.3)
+        launch = _launch_codex_cmd(
+            _session_launch_base(session_name), pin_model=False, resume=True
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", launch],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if await _async_is_codex_running(session_name):
+                return exported, True
+    except Exception:
+        logger.exception("Failed to restart Codex in '%s'", session_name)
+    return exported, False
+
+
+@app.post("/api/sessions/{session_name}/effort")
+async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    mid = (body.model or "").strip()
-    if mid not in ALLOWED_SESSION_MODELS:
-        return JSONResponse({"error": f"Unknown model: {mid}"}, status_code=400)
-    if not await _async_is_claude_running(session_name):
-        return JSONResponse(
-            {"error": "Claude isn't running in this session — restart it first"},
-            status_code=409)
-    try:
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", "/model " + mid],
-            capture_output=True, text=True, timeout=5)
-        await asyncio.sleep(0.3)
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5)
-        # Give the CLI a beat, then check the pane for a rejection message.
-        await asyncio.sleep(1.2)
-        downgraded = False
-        try:
-            tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
-            low = tail.lower()
-            if "unknown model" in low or "not a valid model" in low or "invalid model" in low:
-                return JSONResponse(
-                    {"error": f"Claude rejected the model id '{mid}' — it may not be "
-                              "available on this plan or CLI version"},
-                    status_code=400)
-            if "not available for your account" in low:
-                # Some sessions run on accounts without the 1M-context tier —
-                # fall back to the base model instead of leaving a dead switch.
-                if not mid.endswith("[1m]"):
-                    return JSONResponse(
-                        {"error": f"'{mid}' isn't available for this session's account"},
-                        status_code=400)
-                base = mid[: -len("[1m]")]
-                await asyncio.to_thread(subprocess.run,
-                    ["tmux", "send-keys", "-t", session_name, "-l", "/model " + base],
-                    capture_output=True, text=True, timeout=5)
-                await asyncio.sleep(0.3)
-                await asyncio.to_thread(subprocess.run,
-                    ["tmux", "send-keys", "-t", session_name, "Enter"],
-                    capture_output=True, text=True, timeout=5)
-                ok2 = False
-                for _ in range(7):  # the confirm line can take a few seconds to render
-                    await asyncio.sleep(0.7)
-                    tail2 = await asyncio.to_thread(capture_pane_recent, session_name, 10)
-                    if "set model to" in tail2.lower():
-                        ok2 = True
-                        break
-                if not ok2:
-                    return JSONResponse(
-                        {"error": f"Neither '{mid}' nor '{base}' is available for "
-                                  "this session's account"},
-                        status_code=400)
-                mid = base
-                downgraded = True
-        except Exception:
-            logger.debug("Pane check after /model failed", exc_info=True)
-        _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
-        _session_model_cache.pop(session_name, None)
-        # /model persists the choice into settings.json as the default for NEW
-        # sessions ("saved as your default") — the exact drift that turned the
-        # default Sonnet 4.6. Undo that: the switch stays for THIS session, the
-        # global default stays DEFAULT_MODEL (dashboard launches pin --model
-        # explicitly anyway; this guards manual `claude` runs).
-        await asyncio.sleep(0.8)
-        _restore_default_model_setting()
-        logger.info("Session '%s' model switch requested -> %s%s",
-                    session_name, mid, " (downgraded from 1M)" if downgraded else "")
-        return JSONResponse({"ok": True, "model": mid, "pending": True,
-                             "downgraded": downgraded})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    effort = _normalize_reasoning_effort(body.effort)
+    if effort is None or effort == "":
+        allowed = ", ".join(_CODEX_REASONING_EFFORTS)
+        return JSONResponse({"error": f"Invalid effort. Use {allowed}."}, status_code=400)
+    data = _load_roles()
+    profile_id = _get_session_profile_id(session_name)
+    profile = _find_profile(profile_id, data)
+    if not profile:
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    profile["effort"] = effort
+    if not (profile_id == DEFAULT_PROFILE_ID and effort == _CODEX_DEFAULT_REASONING_EFFORT):
+        profile["edited"] = True
+    _save_roles(data)
+    _materialize_profile(profile)
+    running = await _async_is_codex_running(session_name)
+    exported = restarted = False
+    if not running:
+        exported = _send_profile_export(session_name, profile_id)
+    elif body.restart:
+        exported, restarted = await _restart_codex_with_active_profile(session_name, profile_id)
+    return JSONResponse({
+        "ok": True,
+        "profile_id": profile_id,
+        "effort": effort,
+        "codex_was_running": running,
+        "exported": exported,
+        "restarted": restarted,
+    })
 
 
-# --- Auto-responder for Claude Code interactive prompts ---
-# Automatically detects when Claude Code is waiting for user input
+@app.post("/api/sessions/{session_name}/model")
+async def api_set_session_model(session_name: str, body: SetSessionModelBody):
+    """Persist a profile's Codex model and optionally restart the live pane."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    model = (body.model or "").strip()
+    if not re.match(r"^[A-Za-z0-9._:/-]{2,80}$", model):
+        return JSONResponse({"error": "Invalid model id."}, status_code=400)
+    data = _load_roles()
+    profile_id = _get_session_profile_id(session_name)
+    profile = _find_profile(profile_id, data)
+    if not profile:
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    profile["model"] = model
+    if not (profile_id == DEFAULT_PROFILE_ID and model == _CODEX_DEFAULT_MODEL):
+        profile["edited"] = True
+    _save_roles(data)
+    _materialize_profile(profile)
+    _session_model_cache.pop(session_name, None)
+    running = await _async_is_codex_running(session_name)
+    exported = restarted = False
+    if not running:
+        exported = _send_profile_export(session_name, profile_id)
+    elif body.restart:
+        exported, restarted = await _restart_codex_with_active_profile(session_name, profile_id)
+    if running and not restarted:
+        _session_model_pending[session_name] = {"model": model, "ts": time.time()}
+    else:
+        _session_model_pending.pop(session_name, None)
+    return JSONResponse({
+        "ok": True,
+        "profile_id": profile_id,
+        "model": model,
+        "codex_was_running": running,
+        "exported": exported,
+        "restarted": restarted,
+    })
+
+
+# --- Auto-responder for Codex interactive prompts ---
+# Automatically detects when Codex is waiting for user input
 # (plan approval, questions, permission prompts) and sends Enter
 # to select the default/first option — keeps sessions unblocked.
 
-_auto_respond_cooldown: Dict[str, float] = {}
+_auto_respond_cooldown: dict[str, float] = {}
 _AUTO_RESPOND_INTERVAL = 3      # seconds between checks
 _AUTO_RESPOND_COOLDOWN = 10     # min seconds between auto-responds per session
 _auto_respond_log: list = []    # recent auto-respond events (for debugging)
 
 
 def _detect_interactive_prompt(visible_text: str) -> str | None:
-    """Check if visible terminal shows a Claude Code interactive prompt.
+    """Check if visible terminal shows a Codex interactive prompt.
 
     Returns a description of the detected prompt, or None.
 
@@ -11029,7 +11253,7 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     if selector_followed_by_text and not has_selector_on_option:
         return None
 
-    # Strong signal: specific Claude Code prompt keywords
+    # Strong signal: specific Codex prompt keywords
     strong_keywords = [
         "bypass permissions",
         "manually approve edits",
@@ -11044,7 +11268,7 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     if has_strong and has_selector_on_option and numbered >= 2:
         return "plan_approval"
 
-    # Generic Claude Code selection prompt: ❯ on a numbered option + 2+ options
+    # Generic Codex selection prompt: ❯ on a numbered option + 2+ options
     if has_selector_on_option and numbered >= 2:
         return "selection_prompt"
 
@@ -11052,7 +11276,7 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
 
 
 _MENU_PICK_SYSTEM_PROMPT = (
-    "A Claude Code agent is showing a numbered selection menu and THE USER IS AWAY and will "
+    "A Codex agent is showing a numbered selection menu and THE USER IS AWAY and will "
     "not answer. Pick the option number that best lets the agent CONTINUE and COMPLETE the work "
     "on its own.\n"
     "- Strongly prefer options that proceed / do the work / say Yes / auto-accept / "
@@ -11067,7 +11291,7 @@ _MENU_PICK_SYSTEM_PROMPT = (
 
 
 def _parse_menu_options(visible_text: str):
-    """Parse a Claude Code numbered menu. Returns (options, selected_idx) where
+    """Parse a Codex numbered menu. Returns (options, selected_idx) where
     options = [(number, label), ...] in visual order and selected_idx is the
     0-based position of the ❯-highlighted option (0 if none found)."""
     options = []
@@ -11121,12 +11345,12 @@ async def _select_menu_option(name: str, options: list, selected_idx: int, targe
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", name, "Enter"],
         capture_output=True, text=True, timeout=3)
-    label = next((l for n, l in options if n == target_num), "")
+    label = next((option_label for n, option_label in options if n == target_num), "")
     return f"option {target_num} ({label[:40]})" if label else f"option {target_num}"
 
 
 async def _auto_responder_loop():
-    """Background loop that auto-responds to Claude Code interactive prompts."""
+    """Background loop that auto-responds to Codex interactive prompts."""
     log = logging.getLogger("auto-responder")
     await asyncio.sleep(5)  # initial delay after startup
     while True:
@@ -11198,13 +11422,13 @@ async def api_auto_respond_log():
 
 
 # --- Autopilot Watchdog Loop (formerly "simple watchdog") ---
-# Always-on smart supervisor. When a session goes idle because Claude stopped and
+# Always-on smart supervisor. When a session goes idle because Codex stopped and
 # is waiting on the user in ANY way — a question, a choice, a confirmation, work
 # it deferred ("left for phase 2", "out of scope", "next steps", "we could
 # also…"), or just a soft pause — it reads the screen, asks an LLM what reply
 # keeps the work moving on its own, and types that reply back. The user is usually
 # away, so the bias is: ALWAYS find a way to continue autonomously. It only holds
-# off (WAIT) when Claude is still actively working, when the only next action is
+# off (WAIT) when Codex is still actively working, when the only next action is
 # genuinely destructive/irreversible (needs a human), or when the task is truly
 # 100% complete with nothing deferred or optional left.
 
@@ -11215,7 +11439,7 @@ _SIMPLE_WATCHDOG_MAX_LOG = 20
 _SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
 
 _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
-    "You are an autonomous operator keeping a Claude Code agent moving while THE USER IS AWAY. "
+    "You are an autonomous operator keeping a Codex agent moving while THE USER IS AWAY. "
     "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
     "and is in ANY way waiting on the user before it can keep working, write the exact message to "
     "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
@@ -11362,19 +11586,19 @@ def _simple_watchdog_record(session_name: str, action: str):
 
 
 async def _simple_watchdog_send_continue(session_name: str) -> bool:
-    """Send 'continue' to the session's Claude Code prompt. Returns True on send."""
+    """Send 'continue' to the session's Codex prompt. Returns True on send."""
     return await _simple_watchdog_send_text(session_name, "continue")
 
 
 async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
-    """Type a composed reply into the session's Claude Code input box and submit.
+    """Type a composed reply into the session's Codex input box and submit.
     Collapses to a single line so Enter submits the whole message at once."""
     text = " ".join((text or "").split())
     if not text:
         return False
     try:
         # -l sends the text literally (so it isn't interpreted as tmux key names);
-        # a separate Enter then submits it to Claude.
+        # a separate Enter then submits it to Codex.
         await asyncio.to_thread(
             subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "-l", text],
@@ -11409,8 +11633,13 @@ async def _simple_watchdog_loop():
                 if _get_autopush_mode(name) != "full":
                     _simple_watchdog_state.pop(name, None)
                     continue
-                # Don't fire if Claude isn't even running
-                if not await _async_is_claude_running(name):
+                # Don't fight the autonomous-mode watchdog — those modes have their own loop
+                if _away_mode_state.get(name, {}).get("enabled"):
+                    continue
+                if _go_nuts_state.get(name, {}).get("enabled"):
+                    continue
+                # Don't fire if Codex isn't even running
+                if not await _async_is_codex_running(name):
                     _simple_watchdog_state.pop(name, None)
                     continue
                 # Cooldown
@@ -11441,12 +11670,12 @@ async def _simple_watchdog_loop():
                 # Skip if there's an interactive selection prompt — auto-responder owns it
                 if _detect_interactive_prompt(visible):
                     continue
-                # Never type "continue" into a bare shell. If Claude crashed to bash
+                # Never type "continue" into a bare shell. If Codex crashed to bash
                 # between the is-running check above and now, the crash-recovery loop
                 # owns relaunching it — typing here would just spam the shell.
                 if _looks_like_bare_shell(visible):
                     continue
-                # Never act on a brand-new Claude session that hasn't started work yet
+                # Never act on a brand-new Codex session that hasn't started work yet
                 # (welcome splash + empty prompt, no conversation). There is nothing to
                 # "continue", so nudging only makes the LLM fabricate a first instruction
                 # and type it into an untouched session.
@@ -11515,7 +11744,7 @@ async def _simple_watchdog_loop():
                               name, (msg if len(msg) <= 120 else msg[:117] + "..."))
                     _simple_watchdog_record(name, f"rewrote completion claim: {msg[:80]}")
                     msg = _WATCHDOG_SAFE_CONTINUE
-                # One more guard: re-check Claude is still running before sending
+                # One more guard: re-check Codex is still running before sending
                 if not await _async_is_claude_running(name):
                     continue
                 ok = await _simple_watchdog_send_text(name, msg)
@@ -11533,7 +11762,7 @@ async def _simple_watchdog_loop():
             logger.debug("Simple watchdog iteration failed", exc_info=True)
 
 
-# --- Auto /login watchdog: re-authenticate a session when Claude asks for login ---
+# --- Auto /login watchdog: re-authenticate a session when Codex asks for login ---
 
 _LOGIN_NEEDED_RE = re.compile(
     r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
@@ -11547,11 +11776,11 @@ _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
 # clear it — otherwise we'd interrupt someone typing /login by hand.
 _LOGIN_FLOW_STALE_AFTER = 45
-_login_watchdog_state: Dict[str, dict] = {}
+_login_watchdog_state: dict[str, dict] = {}
 
 
 async def _login_watchdog_loop():
-    """If a session's Claude shows a login-required message, auto-run /login once
+    """If a session's Codex shows a login-required message, auto-run /login once
     (per cooldown) so the user doesn't have to notice and type it themselves."""
     llog = logging.getLogger("login-watchdog")
     await asyncio.sleep(10)  # let startup settle
@@ -11575,7 +11804,7 @@ async def _login_watchdog_loop():
                 except Exception:
                     continue
                 low = (recent or "").lower()
-                # Is a Claude /login flow currently on screen? (auth-method menu,
+                # Is a Codex /login flow currently on screen? (auth-method menu,
                 # OAuth URL, paste-code prompt, or the "invalid code — retry" error).
                 login_flow_open = bool(recent) and (
                     ("paste" in low and "code" in low)
@@ -11665,27 +11894,27 @@ async def _login_watchdog_loop():
             logger.debug("Login watchdog iteration failed", exc_info=True)
 
 
-# --- Crash-recovery watchdog: relaunch Claude when a session OOM/crashes to a shell ---
-# When Claude Code exhausts the V8 heap it prints "Aborted" (SIGABRT) — or the OS
+# --- Crash-recovery watchdog: relaunch Codex when a session OOM/crashes to a shell ---
+# When Codex exhausts the V8 heap it prints "Aborted" (SIGABRT) — or the OS
 # OOM killer prints "Killed", or V8 prints "JavaScript heap out of memory" — and
 # the tmux pane drops back to the parent bash. At that point nothing on screen is
-# a live Claude prompt, so the auto-responder and simple-watchdog can't help: the
+# a live Codex prompt, so the auto-responder and simple-watchdog can't help: the
 # session just sits dead at a shell forever (the exact "stuck" symptom reported).
-# This loop detects that state and relaunches Claude, resuming the crashed
+# This loop detects that state and relaunches Codex, resuming the crashed
 # conversation so the task continues where it left off.
 
 _CRASH_RECOVERY_INTERVAL = 20          # poll every 20s
 _CRASH_RECOVERY_COOLDOWN = 120         # min seconds between restart attempts per session
 _CRASH_RECOVERY_MAX_ATTEMPTS = 3       # give up after this many consecutive failed restarts
 _CRASH_RECOVERY_MAX_TRANSCRIPT = 60_000_000   # don't scan transcripts larger than this (bytes)
-_crash_recovery_state: Dict[str, dict] = {}
-_seen_claude_running: set = set()       # sessions observed running Claude this process
+_crash_recovery_state: dict[str, dict] = {}
+_seen_claude_running: set = set()       # sessions observed running Codex this process
 
-# Crash signatures that mean Claude (node) died and the pane fell back to a shell.
+# Crash signatures that mean Codex (node) died and the pane fell back to a shell.
 # Only ever evaluated once the pane is already a bare shell, so false positives are
 # very unlikely. libc/kernel messages are matched as exact-case substrings (NOT
 # anchored to line-end) because on an OOM the "Aborted" is printed OVER leftover
-# TUI text — e.g. it lands mid-line as "Abortedn GRPO…" when Claude's alternate
+# TUI text — e.g. it lands mid-line as "Abortedn GRPO…" when Codex's alternate
 # screen wasn't cleared. Case-sensitivity still avoids matching a lowercase
 # "aborted"/"killed" sitting in prose above the shell.
 _CRASH_SIGNATURE_RE = re.compile(
@@ -11710,7 +11939,7 @@ _SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
 
 
 def _looks_like_bare_shell(visible: str) -> bool:
-    """True if the LAST non-empty line looks like a bash/zsh prompt (no Claude TUI)."""
+    """True if the LAST non-empty line looks like a bash/zsh prompt (no Codex TUI)."""
     for line in reversed(visible.split("\n")):
         if not line.strip():
             continue
@@ -11731,7 +11960,7 @@ def _shell_has_pending_input(visible: str) -> bool:
     return False
 
 
-def _project_dir_for_cwd(cwd: str) -> Optional[Path]:
+def _project_dir_for_cwd(cwd: str) -> Path | None:
     """Map a working directory to its ~/.claude/projects/<encoded> transcript dir.
     Claude encodes the path by replacing '/', '_' and '.' with '-'."""
     base = Path.home() / ".claude" / "projects"
@@ -11749,67 +11978,13 @@ def _project_dir_for_cwd(cwd: str) -> Optional[Path]:
     return None
 
 
-def _find_session_transcript_uuid(session_name: str) -> Optional[str]:
-    """Best-effort: identify the exact conversation UUID a crashed session was
-    running, by matching distinctive lines still visible on the pane against the
-    project's *frozen* transcripts. Returns None when not confident, so the caller
-    falls back to --continue. This disambiguates the common case where several
-    sessions share one cwd and plain --continue would resume the wrong one."""
-    try:
-        cwd = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-    except Exception:
-        return None
-    if not cwd:
-        return None
-    proj = _project_dir_for_cwd(cwd)
-    if not proj:
-        return None
-    scroll = capture_pane_recent(session_name, 200)
-    if not scroll.strip():
-        return None
-    # Distinctive lines: long enough, contain real words, not prompts/box-drawing.
-    cand = []
-    for ln in scroll.split("\n"):
-        s = ln.strip().strip("│┃─ \t")
-        if len(s) < 20 or _SHELL_PROMPT_RE.search(s) or not re.search(r"[A-Za-z]{4,}", s):
-            continue
-        cand.append(s)
-    cand = sorted(dict.fromkeys(cand), key=len, reverse=True)[:8]
-    if not cand:
-        return None
-    now = time.time()
-    best_uuid, best_score = None, 0
-    try:
-        files = list(proj.glob("*.jsonl"))
-    except Exception:
-        return None
-    for f in files:
-        if f.name.startswith("agent-"):
-            continue
-        try:
-            st = f.stat()
-        except Exception:
-            continue
-        age = now - st.st_mtime
-        # Skip actively-written transcripts (owned by a live session), stale ones,
-        # and anything too large to scan cheaply.
-        if age < 45 or age > 86400 or st.st_size > _CRASH_RECOVERY_MAX_TRANSCRIPT:
-            continue
-        try:
-            text = f.read_text(errors="ignore")
-        except Exception:
-            continue
-        score = sum(1 for c in cand if c in text)
-        if score > best_score:
-            best_score, best_uuid = score, f.stem
-    return best_uuid if best_score >= 2 else None
+def _find_session_transcript_uuid(session_name: str) -> str | None:
+    """Codex recovery uses `resume --last`; no Claude transcript UUID lookup."""
+    return None
 
 
 async def _crash_recovery_loop():
-    """Relaunch Claude in sessions that have crashed/OOM'd to a bare shell."""
+    """Relaunch Codex in sessions that have crashed/OOM'd to a bare shell."""
     rlog = logging.getLogger("crash-recovery")
     await asyncio.sleep(12)  # let startup settle
     while True:
@@ -11827,7 +12002,7 @@ async def _crash_recovery_loop():
                         st["attempts"] = 0
                         st["gave_up"] = False
                     continue
-                # Pane is a bare shell. Only touch sessions we manage / have seen run Claude.
+                # Pane is a bare shell. Only touch sessions we manage / have seen run Codex.
                 if name not in owners and name not in _seen_claude_running:
                     continue
                 state = _crash_recovery_state.setdefault(name, {"attempts": 0, "last_action": 0})
@@ -11851,17 +12026,16 @@ async def _crash_recovery_loop():
                                    "manual restart needed", name, state["attempts"])
                         state["gave_up"] = True
                     continue
-                uuid = await asyncio.to_thread(_find_session_transcript_uuid, name)
                 state["attempts"] = state.get("attempts", 0) + 1
                 state["last_action"] = now
-                rlog.warning("Session '%s' crashed to shell — relaunching Claude (%s), attempt %d/%d",
-                             name, ("--resume " + uuid) if uuid else "--continue",
+                rlog.warning("Session '%s' crashed to shell — resuming Codex, attempt %d/%d",
+                             name,
                              state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
-                ok = await _ensure_claude_running(name, resume_uuid=uuid)
+                ok = await _ensure_codex_running(name)
                 if ok:
                     _seen_claude_running.add(name)
                     _crash_recovery_state[name] = {"attempts": 0, "last_action": now, "gave_up": False}
-                    rlog.info("Recovered '%s' — Claude is running again", name)
+                    rlog.info("Recovered '%s' — Codex is running again", name)
         except asyncio.CancelledError:
             rlog.info("Crash recovery cancelled")
             raise
@@ -11891,31 +12065,27 @@ def _has_pending_user_input(visible: str) -> bool:
     return False
 
 
-# Markers that render ONLY after a conversation has begun in the Claude Code TUI:
-# the ⏺ assistant bullet and the ⎿ tool-result tree branch (and the streaming
-# "esc to interrupt" footer). None appear on the fresh welcome splash — whose only
-# fancy glyphs are the logo block and an ✻/✶ welcome star — so they cleanly tell
-# "work has started" apart from "brand-new session". (✻/✶/✳ are deliberately NOT
-# here: they also head the welcome banner in some versions.)
-_CLAUDE_CONVERSATION_RE = re.compile(r"⏺|⎿|esc to interrupt")
-# The welcome splash: the "Claude Code v<n>" line or the logo block glyphs. Only
-# rendered before the first turn — a real conversation scrolls it off the pane.
-_CLAUDE_WELCOME_RE = re.compile(r"Claude Code v\d|[▐▛▜▌▝▘█]{2,}")
+# Codex TUI markers used only by the opt-in full auto-push guard.
+_CODEX_CONVERSATION_RE = re.compile(
+    r"esc to interrupt|Worked for \d|tokens used|You have \d+ weighted tokens left",
+    re.I,
+)
+_CODEX_WELCOME_RE = re.compile(r"OpenAI Codex|Codex CLI|gpt-5\.", re.I)
 
 
 def _looks_like_fresh_claude_session(visible: str) -> bool:
-    """True if the pane shows a brand-new Claude session that hasn't started any
+    """True if the pane shows a brand-new Codex session that hasn't started any
     work: the welcome splash is on screen, the ❯ box is empty, and there is no
     conversation below it. Such a session has nothing to 'continue' — without this
     guard the autopilot LLM (hard-biased to keep going) fabricates a first
     instruction out of nothing and types it into an idle, untouched session."""
     if not visible:
         return False
-    if not _CLAUDE_WELCOME_RE.search(visible):
+    if not _CODEX_WELCOME_RE.search(visible):
         return False
     # Any sign a turn has happened (even one short exchange) → not fresh; the
     # watchdog should handle it normally (e.g. answer a trailing question).
-    if _CLAUDE_CONVERSATION_RE.search(visible):
+    if _CODEX_CONVERSATION_RE.search(visible):
         return False
     # An empty input box confirms the user hasn't even begun a first prompt.
     return not _has_pending_user_input(visible)
@@ -11942,7 +12112,7 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
     basic — auto-pick option menus + confirm permission/plan prompts + keep the
             session logged in (no free-form messages).
     full  — everything in basic, plus auto-compose a "keep going" nudge when
-            Claude pauses waiting on the user before a task is finished.
+            Codex pauses waiting on the user before a task is finished.
     """
     mode = (body.mode or "").strip().lower()
     if mode not in AUTOPUSH_MODES:
@@ -11992,6 +12162,120 @@ async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody
     })
 
 
+# --- Autonomous Mode Watchdog ---
+# Monitors all active away-mode and go-nuts-mode sessions.
+# Detects stalls (no terminal change for too long) and unsticks them.
+
+_watchdog_snapshots: dict[str, dict] = {}
+# Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
+
+_WATCHDOG_INTERVAL = 30         # Check every 30 seconds
+_STALL_THRESHOLD = 600          # 10 minutes of identical terminal = stalled
+_NUDGE_COOLDOWN = 180           # Wait 3 minutes between nudge attempts
+_MAX_NUDGES_BEFORE_RESTART = 3  # After 3 failed nudges, hard-restart the mode
+
+_NUDGE_PROMPT = """You appear to be idle or stuck. The user is not present — you are in autonomous mode.
+
+If you just finished a task: pick the next one and start working. Check your skill files and backlog.
+If you're waiting for something: cancel the wait (Ctrl+C if needed) and move to a different task.
+If you encountered an error: log it, revert if needed, and continue with the next item.
+
+Do NOT say "standing by" or ask for instructions. Take action NOW."""
+
+_UNSTICK_PROMPT_AWAY = """You are in Away Mode. The system detected you were stuck and restarted your task loop.
+
+Your previous work is preserved on the current branch. Pick up where you left off:
+1. Run `pwd` to confirm you are in the correct project directory
+2. Check git log to see what you've already done
+3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
+4. Pick the next most valuable skill to execute
+
+IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
+
+Available skills are at: {skills_dir}/
+Read a SKILL.md file and execute its tasks. Take action immediately."""
+
+_UNSTICK_PROMPT_GONUTS = """You are in Go Nuts Mode. The system detected you were stuck and restarted your task loop.
+
+Your previous work is preserved on the current branch. Pick up where you left off:
+1. Run `pwd` to confirm you are in the correct project directory
+2. Check git log to see what you've already built
+3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
+4. Pick the next feature to build or generate new ideas
+
+IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
+
+Available skills are at: {skills_dir}/
+Read a SKILL.md file and execute its tasks. Build something NOW."""
+
+
+async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
+    """Restore an autonomous mode after server restart: wait for session, send prompt, launch loop."""
+    rlog = logging.getLogger("restore")
+    rlog.info(f"Restoring {mode} mode for '{session_name}' — waiting 15s for tmux to stabilize")
+    log_fn = _away_log if mode == "away" else _go_nuts_log
+
+    try:
+        # Give tmux and Codex a moment to settle after server restart
+        await asyncio.sleep(15)
+
+        if not state.get("enabled"):
+            return
+
+        # Check the session still exists
+        try:
+            activity = await async_detect_activity(session_name)
+        except Exception:
+            log_fn(state, "Session not found during restore — stopping")
+            state["enabled"] = False
+            _save_autonomous_state()
+            return
+
+        # Wait for session to be idle before sending prompt (max 10 min)
+        if activity.get("status") == "busy":
+            log_fn(state, "Session is busy — waiting for it to finish current task")
+            await _away_wait_for_idle(session_name, timeout=600)
+
+        if not state.get("enabled"):
+            return
+
+        # Ensure Codex is actually running (handles OOM/crash during server downtime)
+        codex_ok = await _ensure_codex_running(session_name, log_fn, state)
+        if not codex_ok:
+            log_fn(state, "Could not restart Codex during restore — stopping")
+            state["enabled"] = False
+            _save_autonomous_state()
+            return
+
+        # Send the appropriate unstick/resume prompt (with project isolation)
+        skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
+        unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
+        log_fn(state, "Sending resume prompt to session")
+        await _away_send_prompt(session_name, unstick_prompt)
+        await asyncio.sleep(2)
+
+        # Now enter the continuous monitoring loop
+        if mode == "away":
+            await _away_mode_continuous_loop(session_name)
+        else:
+            await _go_nuts_continuous_loop(session_name)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            log_fn(state, f"{mode} restore cancelled (server shutdown — will restore)")
+        else:
+            log_fn(state, f"{mode} restore cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
+        raise
+    except Exception as e:
+        log_fn(state, f"{mode} restore error: {e}")
+        rlog.error(f"Restore {mode} for '{session_name}' failed: {e}")
+        # Don't set enabled=False — watchdog zombie detection will restart us
+    finally:
+        state["task"] = None
+
+
 _TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
 _TMP_WATCHDOG_WARN_PCT = 75             # start cleaning at 75% full
 _TMP_WATCHDOG_CRITICAL_PCT = 90         # aggressive clean at 90% full
@@ -11999,7 +12283,7 @@ _TMP_WATCHDOG_SAFE_AGE_NORMAL = 3600    # delete files older than 1h at warn lev
 _TMP_WATCHDOG_SAFE_AGE_CRITICAL = 600   # delete files older than 10m at critical
 _TMP_WATCHDOG_PROTECTED_PREFIXES = (
     ".",                # .X11-unix, .ICE-unix, dotfiles
-    "claude-",          # active Claude CLI cache
+    "codex-",          # active Codex CLI cache
     "tsx-",             # active tsx cache
     "tmux-",            # tmux server sockets
     "systemd-",         # systemd runtime
@@ -12115,6 +12399,1359 @@ def _tmp_watchdog_size(path: str) -> int:
     return total
 
 
+async def _watchdog_loop():
+    """Background watchdog: detects stalled autonomous sessions and unsticks them."""
+    wlog = logging.getLogger("watchdog")
+    wlog.info("Autonomous mode watchdog started")
+    while True:
+        try:
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            # Collect all active autonomous sessions
+            active_sessions: list[tuple[str, dict, str]] = []  # (name, state, mode)
+            for name, state in _away_mode_state.items():
+                if state.get("enabled") and state.get("task") and not state["task"].done():
+                    active_sessions.append((name, state, "away"))
+            for name, state in _go_nuts_state.items():
+                if state.get("enabled") and state.get("task") and not state["task"].done():
+                    active_sessions.append((name, state, "gonuts"))
+
+            if not active_sessions:
+                if _watchdog_snapshots:
+                    _watchdog_snapshots.clear()
+                continue
+
+            for session_name, state, mode in active_sessions:
+                try:
+                    await _watchdog_check_session(session_name, state, mode, wlog)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
+
+            # Also check for zombie states: enabled=True but task is dead
+            for name, state in list(_away_mode_state.items()):
+                if state.get("enabled") and (not state.get("task") or state["task"].done()):
+                    wlog.warning(f"Away mode zombie detected for '{name}' — restarting worker")
+                    await _watchdog_restart_mode(name, state, "away", wlog)
+            for name, state in list(_go_nuts_state.items()):
+                if state.get("enabled") and (not state.get("task") or state["task"].done()):
+                    wlog.warning(f"Go Nuts mode zombie detected for '{name}' — restarting worker")
+                    await _watchdog_restart_mode(name, state, "gonuts", wlog)
+
+        except asyncio.CancelledError:
+            wlog.info("Watchdog cancelled")
+            raise
+        except Exception as e:
+            wlog.error(f"Watchdog loop error: {e}")
+            await asyncio.sleep(60)
+
+
+async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
+    """Check a single session for stalls."""
+    import hashlib
+    now = time.time()
+
+    # Capture recent terminal content (non-blocking)
+    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
+    if not recent.strip():
+        return  # Empty pane, can't assess
+
+    content_hash = hashlib.md5(recent.encode()).hexdigest()
+    snap = _watchdog_snapshots.get(session_name)
+
+    if snap is None or snap["content_hash"] != content_hash:
+        # Terminal content changed — session is making progress
+        _watchdog_snapshots[session_name] = {
+            "content_hash": content_hash,
+            "first_seen": now,
+            "nudge_count": 0,
+            "last_nudge": 0,
+        }
+        return
+
+    # Terminal content is UNCHANGED since last check
+    stall_duration = now - snap["first_seen"]
+
+    if stall_duration < _STALL_THRESHOLD:
+        return  # Not stalled yet — could be processing
+
+    # Terminal has been identical for >10 minutes. Check if there's a good reason.
+    log_fn = _away_log if mode == "away" else _go_nuts_log
+
+    # Check if Codex has crashed (OOM, etc) — if so, restart immediately
+    if not await _async_is_codex_running(session_name):
+        wlog.warning(f"Codex not running in '{session_name}' — OOM/crash detected, restarting")
+        log_fn(state, "Watchdog: Codex crashed (OOM?) — restarting")
+        _watchdog_snapshots.pop(session_name, None)
+        await _watchdog_restart_mode(session_name, state, mode, wlog)
+        return
+
+    # First stall detection — use LLM to check if it's a legitimate long operation
+    if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
+        wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
+        try:
+            assessment = await llm_call(
+                system_prompt=(
+                    "You are monitoring an autonomous AI coding session. The terminal output has not changed "
+                    "for over 10 minutes. Assess whether this is:\n"
+                    "1. LEGITIMATE: downloading large files, compiling a big project, running extensive tests, "
+                    "waiting for a deployment, or any operation that genuinely takes >10 minutes\n"
+                    "2. STUCK: the agent said 'standing by', asked a question, hit an error and stopped, "
+                    "is waiting for user input, or simply finished and didn't continue\n\n"
+                    "Reply with ONLY one word: LEGITIMATE or STUCK"
+                ),
+                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
+                max_tokens=10,
+            )
+            assessment = assessment.strip().upper()
+        except Exception:
+            assessment = "STUCK"  # If we can't assess, assume stuck
+
+        if "LEGITIMATE" in assessment:
+            wlog.info(f"Session '{session_name}' stall assessed as LEGITIMATE — skipping for now")
+            log_fn(state, f"Watchdog: stall detected ({stall_duration:.0f}s) but appears legitimate — waiting")
+            # Push out the first_seen so we re-check in another 10 minutes
+            snap["first_seen"] = now - _STALL_THRESHOLD + 300  # Re-check in 5 min
+            return
+
+        wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
+
+    # Session is stuck. Try nudging.
+    if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
+        return  # Wait for cooldown between nudges
+
+    if snap["nudge_count"] < _MAX_NUDGES_BEFORE_RESTART:
+        # Gentle nudge: send continuation prompt
+        snap["nudge_count"] += 1
+        snap["last_nudge"] = now
+        log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
+        wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
+
+        # Ensure Codex is running before nudging
+        if not await _async_is_codex_running(session_name):
+            wlog.warning(f"Codex not running in '{session_name}' during nudge — restarting mode")
+            log_fn(state, "Watchdog: Codex not running during nudge — restarting")
+            _watchdog_snapshots.pop(session_name, None)
+            await _watchdog_restart_mode(session_name, state, mode, wlog)
+            return
+
+        # If session appears to be waiting for input or truly idle, just send the nudge
+        try:
+            activity = await async_detect_activity(session_name)
+        except Exception:
+            activity = {"status": "unknown"}
+
+        if activity["status"] == "busy":
+            # Session claims busy but terminal hasn't changed — might be truly stuck
+            # Send Ctrl+C first to break out of whatever it's doing
+            log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+            await asyncio.sleep(5)
+
+        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
+        return
+
+    # Nudges exhausted — hard restart
+    log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
+    wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
+    await _watchdog_restart_mode(session_name, state, mode, wlog)
+    # Reset snapshot
+    _watchdog_snapshots.pop(session_name, None)
+
+
+async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
+    """Gracefully restart an autonomous mode session, preserving history."""
+    log_fn = _away_log if mode == "away" else _go_nuts_log
+
+    # 1. Cancel existing task
+    old_task = state.get("task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+
+    # 2. Send Ctrl+C to break any stuck process in the terminal
+    try:
+        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+        await asyncio.sleep(3)
+        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+        await asyncio.sleep(2)
+    except Exception:
+        pass
+
+    # 2b. Ensure Codex is actually running (handles OOM/crash recovery)
+    codex_ok = await _ensure_codex_running(session_name, log_fn, state)
+    if not codex_ok:
+        log_fn(state, "Watchdog: could not restart Codex — aborting restart")
+        state["enabled"] = False
+        _save_autonomous_state()
+        return
+
+    # 3. Preserve the log history, reset state for fresh loop
+    old_log = state.get("log", [])
+    old_started = state.get("started_at", time.time())
+    old_step = state.get("step", 0)
+
+    log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
+
+    # 4. Re-initialize state
+    state.update({
+        "enabled": True,
+        "phase": 4,
+        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
+        "step": old_step,
+        "step_name": "Watchdog restart",
+        "started_at": old_started,  # Keep original start time
+        "log": old_log,  # Keep full log history
+        "task": None,
+    })
+    _save_autonomous_state()
+
+    # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
+    skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
+    unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
+
+    await _away_send_prompt(session_name, unstick_prompt)
+    await asyncio.sleep(2)
+
+    # 6. Launch fresh worker that skips to continuous loop
+    if mode == "away":
+        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
+        state["task"] = task
+    else:
+        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
+        state["task"] = task
+
+    wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
+
+
+async def _away_mode_continuous_loop(session_name: str):
+    """Standalone continuous loop for away mode (used by watchdog restart)."""
+    log = logging.getLogger("away-mode")
+    state = _away_mode_state[session_name]
+    try:
+        # Wait for the unstick prompt to be processed
+        await _away_wait_for_idle(session_name, timeout=600)
+
+        cycle = state.get("step", 0) + 1
+        consecutive_errors = 0
+        while state.get("enabled"):
+            try:
+                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
+                idle_since = None
+                while state.get("enabled"):
+                    await asyncio.sleep(10)
+                    try:
+                        activity = await async_detect_activity(session_name)
+                    except Exception:
+                        activity = {"status": "unknown"}
+                    if activity["status"] == "idle":
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 90:
+                            break
+                    else:
+                        idle_since = None
+
+                if not state.get("enabled"):
+                    return
+
+                # Ensure Codex is running before sending prompt (OOM recovery)
+                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
+                if not codex_ok:
+                    _away_log(state, "Codex dead and couldn't restart — stopping away mode")
+                    state["enabled"] = False
+                    _save_autonomous_state()
+                    return
+
+                state["step"] = cycle
+                state["step_name"] = f"Ping cycle {cycle}"
+                _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
+                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
+                                           f"Task ping cycle {cycle}", timeout=900)
+                cycle += 1
+                consecutive_errors = 0
+                _save_autonomous_state()  # Periodic save after each successful cycle
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Away mode cycle error for '{session_name}': {e}")
+                if consecutive_errors >= 5:
+                    await asyncio.sleep(300)
+                    consecutive_errors = 0
+                else:
+                    await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _away_log(state, "Away mode (restarted) cancelled (server shutdown — will restore)")
+        else:
+            _away_log(state, "Away mode (restarted) cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
+        raise
+    except Exception as e:
+        _away_log(state, f"Away mode (restarted) error: {e}")
+        log.error(f"Away mode restarted loop error for '{session_name}': {e}")
+        _save_autonomous_state()  # Save state so watchdog can recover
+        # Don't set enabled=False — let watchdog zombie detection restart us
+    finally:
+        state["task"] = None
+
+
+async def _go_nuts_continuous_loop(session_name: str):
+    """Standalone continuous loop for go-nuts mode (used by watchdog restart)."""
+    log = logging.getLogger("go-nuts-mode")
+    state = _go_nuts_state[session_name]
+    try:
+        await _away_wait_for_idle(session_name, timeout=600)
+
+        cycle = state.get("step", 0) + 1
+        consecutive_errors = 0
+        while state.get("enabled"):
+            try:
+                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
+                idle_since = None
+                while state.get("enabled"):
+                    await asyncio.sleep(10)
+                    try:
+                        activity = await async_detect_activity(session_name)
+                    except Exception:
+                        activity = {"status": "unknown"}
+                    if activity["status"] == "idle":
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 90:
+                            break
+                    else:
+                        idle_since = None
+
+                if not state.get("enabled"):
+                    return
+
+                # Ensure Codex is running before sending prompt (OOM recovery)
+                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
+                if not codex_ok:
+                    _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
+                    state["enabled"] = False
+                    _save_autonomous_state()
+                    return
+
+                state["step"] = cycle
+                state["step_name"] = f"Build cycle {cycle}"
+                _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
+                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
+                                              f"Build cycle {cycle}", timeout=900)
+                cycle += 1
+                consecutive_errors = 0
+                _save_autonomous_state()  # Periodic save after each successful cycle
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Go Nuts cycle error for '{session_name}': {e}")
+                if consecutive_errors >= 5:
+                    await asyncio.sleep(300)
+                    consecutive_errors = 0
+                else:
+                    await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled (server shutdown — will restore)")
+        else:
+            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
+            state["enabled"] = False
+            _save_autonomous_state()
+        raise
+    except Exception as e:
+        _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
+        log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
+        _save_autonomous_state()  # Save state so watchdog can recover
+        # Don't set enabled=False — let watchdog zombie detection restart us
+    finally:
+        state["task"] = None
+
+
+# --- Away Mode ---
+# Autonomous mode: sends structured prompts to a Codex session,
+# waits for idle, captures output, summarizes, advances to next phase.
+
+def _away_log(state: dict, action: str):
+    """Append a log entry to the away-mode state."""
+    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
+    state.setdefault("log", []).append(entry)
+    if len(state["log"]) > 200:
+        state["log"] = state["log"][-200:]
+
+
+def _away_state_summary(state: dict) -> dict:
+    """Return a JSON-safe summary of away-mode state (no asyncio.Task)."""
+    return {
+        "enabled": state.get("enabled", False),
+        "phase": state.get("phase", 0),
+        "phase_name": state.get("phase_name", ""),
+        "step": state.get("step", 0),
+        "step_name": state.get("step_name", ""),
+        "started_at": state.get("started_at", 0),
+        "log": state.get("log", [])[-30:],
+        "report": state.get("report", ""),
+    }
+
+
+async def _away_send_prompt(session_name: str, prompt: str):
+    """Send a long prompt to a Codex session via tmux paste-buffer.
+
+    Two-phase approach to defeat the bracketed paste "[Pasted text +N lines]" hang:
+    Phase 1: Write prompt to a temp file, then send a short shell-pipe command that
+             reads the file and feeds it to the Codex prompt via xdotool-style
+             keyboard simulation. This avoids bracketed paste entirely.
+    Phase 2 (fallback): If Phase 1 fails or Codex is truly at its ❯ prompt
+             (not a shell), use paste-buffer with aggressive Enter retries.
+    """
+    log = logging.getLogger("away-mode")
+    prompt_text = prompt.rstrip("\n\r ")  # Strip trailing whitespace/newlines
+    prompt_file = None
+    try:
+        fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
+        os.close(fd)
+        Path(prompt_file).write_text(prompt_text)
+
+        # Capture terminal state before paste to detect changes later
+        pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
+
+        # --- Strategy: Disable bracketed paste, then paste raw ---
+        # Send \e[?2004l escape sequence directly to the terminal to disable
+        # bracketed paste mode. tmux send-keys -H sends raw hex bytes.
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-H",
+             "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
+            capture_output=True, text=True, timeout=5,
+        )
+        await asyncio.sleep(0.2)
+
+        # Load file into tmux buffer and paste
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "load-buffer", prompt_file],
+            capture_output=True, text=True, timeout=5,
+        )
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "paste-buffer", "-t", session_name],
+            capture_output=True, text=True, timeout=10,
+        )
+
+        # Scale wait time with prompt size
+        wait_secs = max(2.0, min(8.0, len(prompt_text) / 1500))
+        await asyncio.sleep(wait_secs)
+
+        # Send Enter to submit
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True, text=True, timeout=5,
+        )
+        log.info(f"Sent prompt to '{session_name}' ({len(prompt_text)} chars, waited {wait_secs:.1f}s)")
+
+        # Note: we do NOT re-enable bracketed paste (\e[?2004h) here.
+        # Bracketed paste causes "[Pasted text +N lines]" previews that hang.
+        # Users can toggle it back on from the Keys bar if they want it.
+
+        # --- Verify submission with retries ---
+        for attempt in range(3):
+            await asyncio.sleep(3)
+            try:
+                activity = await async_detect_activity(session_name)
+            except Exception:
+                activity = {"status": "unknown"}
+
+            if activity["status"] == "busy":
+                log.info(f"Session '{session_name}' is busy — prompt accepted")
+                return  # Success — session started processing
+
+            # Check if terminal output changed (even if still "idle" per detection)
+            post_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
+            if post_snapshot != pre_snapshot:
+                log.info(f"Session '{session_name}' terminal changed — prompt likely accepted")
+                return  # Terminal content changed, prompt was received
+
+            # Still showing the same content — try Enter again
+            log.warning(f"Session '{session_name}' still idle after paste (attempt {attempt+1}/3) — retrying Enter")
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5,
+            )
+
+        # All Enter retries failed. Check if there's a bracketed paste preview stuck.
+        recent = await asyncio.to_thread(capture_pane_recent, session_name, 10)
+        if "Pasted text" in recent or "pasted" in recent.lower():
+            # Bracketed paste preview is stuck — Escape to cancel it, then re-send
+            log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
+            await asyncio.sleep(0.5)
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+            await asyncio.sleep(1)
+            # Re-send the prompt, this time relying on bracketed paste disabled earlier
+            await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
+            await asyncio.to_thread(subprocess.run, ["tmux", "paste-buffer", "-t", session_name], capture_output=True, text=True, timeout=10)
+            await asyncio.sleep(wait_secs)
+            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Enter"], capture_output=True, text=True, timeout=5)
+            log.info(f"Re-sent prompt to '{session_name}' after clearing stuck paste")
+
+    except Exception as e:
+        log.error(f"Failed to send prompt to '{session_name}': {e}")
+    finally:
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except (OSError, UnboundLocalError):
+                pass
+
+
+async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
+    """Wait for a session to become busy then return to idle. Returns True on success."""
+    log = logging.getLogger("away-mode")
+
+    # Phase A: wait for session to become busy (max 30s)
+    start = time.time()
+    became_busy = False
+    while time.time() - start < 30:
+        await asyncio.sleep(2)
+        activity = await async_detect_activity(session_name)
+        if activity["status"] == "busy":
+            became_busy = True
+            break
+
+    if not became_busy:
+        log.warning(f"Session '{session_name}' never became busy, proceeding anyway")
+
+    # Phase B: wait for session to return to idle (up to timeout)
+    idle_count = 0
+    while time.time() - start < timeout:
+        await asyncio.sleep(5)
+        activity = await async_detect_activity(session_name)
+        if activity["status"] == "idle":
+            idle_count += 1
+            if idle_count >= 2:  # 2 consecutive idle readings = confirmed idle
+                return True
+        else:
+            idle_count = 0
+
+    log.warning(f"Session '{session_name}' timed out after {timeout}s")
+    return False
+
+
+def _build_project_isolation_preamble(session_name: str) -> str:
+    """Build a preamble that anchors the autonomous mode to the correct project."""
+    cwd = get_session_cwd(session_name)
+    return f"""PROJECT ISOLATION — READ THIS FIRST:
+You are working in tmux session "{session_name}".
+Your project directory is: {cwd or '(unknown — run pwd to confirm)'}
+
+STRICT RULES:
+- ONLY modify files inside your project directory ({cwd or 'current working directory'}).
+- NEVER cd into, read from, or write to other project directories on this server.
+- NEVER modify files under /var/www/, /opt/, or ~/  that belong to other projects.
+- Write all reports and temp files to /tmp/ using your session name as prefix: /tmp/{session_name}-*.md
+- Do NOT write to generic paths like /tmp/away-mode-*.md or /tmp/go-nuts-*.md — always include the session name.
+- If you need to check infrastructure context, read ~/.codex/vm_projects_dir.md (read-only, never modify during autonomous mode).
+- If a skill or task does not apply to THIS project, skip it entirely.
+- Do NOT restart, modify configs for, or interact with services belonging to other projects.
+
+"""
+
+
+async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
+                               step_name: str, timeout: int = 900) -> str:
+    """Send prompt, wait for completion, capture and summarize output."""
+    state["step_name"] = step_name
+    _away_log(state, f"Sending: {step_name}")
+
+    prompt = _build_project_isolation_preamble(session_name) + prompt
+    await _away_send_prompt(session_name, prompt)
+    completed = await _away_wait_for_idle(session_name, timeout=timeout)
+
+    if not completed:
+        _away_log(state, f"Timeout on: {step_name}")
+        # Send Ctrl+C to unstick if needed
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
+        await asyncio.sleep(2)
+
+    # Capture output and summarize
+    output = capture_pane_full(session_name)
+    try:
+        summary = await llm_call(
+            system_prompt=(
+                "Summarize what the agent accomplished in this terminal output. "
+                "Focus on concrete actions: files created/modified, tests run, errors, "
+                "branches created, findings. Be specific and concise. Under 80 words."
+            ),
+            user_content=f"Away mode step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
+            max_tokens=200,
+        )
+    except Exception:
+        summary = "(summary unavailable)"
+
+    _away_log(state, f"Done: {summary[:200]}")
+    state["step"] += 1
+    return summary
+
+
+# --- Phase implementations ---
+# Skills are installed at ~/.codex/away-mode-skills/XX-name/SKILL.md
+_SKILLS_DIR = str(Path.home() / ".codex" / "away-mode-skills")
+
+_PHASE1_PROMPT = f"""I'm putting you in Away Mode. You are autonomous — the user is not present. Every action must be safe, verifiable, and revertible. You cannot ask questions — make decisions and document reasoning.
+
+IMPORTANT: Detailed skill instructions are available as files on disk at:
+  {_SKILLS_DIR}/
+Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
+
+PHASE 1: Study the Project
+
+1. Read the project root directory structure
+2. Examine root config files (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, docker-compose.yml, .env.example, etc.)
+3. Examine source directories (src/, app/, lib/, components/, routes/, api/)
+4. Check test directories (test/, tests/, __tests__/, spec/, e2e/)
+5. Check git history: recent commits, active areas of development
+6. Create a project profile at /tmp/<SESSION_NAME>-away-mode-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above) covering:
+   - Project name, type, primary languages, frameworks
+   - Architecture: frontend, backend, database, external services
+   - Current state: can it build? tests? linting?
+   - Development patterns, known issues from TODOs
+7. Establish baseline:
+   - Record git status and recent commits
+   - Create safety branch: git checkout -b away-mode/session-$(date +%Y%m%d-%H%M%S)
+   - Run existing tests if available, record results
+   - Run linter if configured, record results
+
+CRITICAL: Never commit to main/master. Work on the away-mode branch.
+CRITICAL: If tests fail at baseline, note which tests fail — do NOT introduce NEW failures.
+
+When done with this phase, immediately continue to the next task without waiting."""
+
+_PHASE2_PROMPT = f"""PHASE 2: Select Applicable Skills
+
+Review the project profile you created. The following skills are available on disk. For each, read its SKILL.md to understand its scope, then decide if it applies to THIS project.
+
+Available skills (read the SKILL.md inside each directory):
+ 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing (ALWAYS applicable)
+ 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage (ALWAYS applicable)
+ 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring (ALWAYS applicable)
+ 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
+ 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
+ 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
+ 7. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
+ 8. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
+ 9. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing (if web app)
+10. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed (if web app/API)
+11. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
+12. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards (if public web pages)
+13. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility (if UI exists)
+14. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish (if UI)
+15. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
+16. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
+17. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements (if UI)
+18. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
+19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
+20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
+
+For each skill, read the SKILL.md, then decide: applicable? priority? risk level?
+
+Write selection to /tmp/<SESSION_NAME>-away-mode-skills-selected.md (use your session name) with selected skills in priority order.
+
+When done, immediately continue to executing skills — do not wait."""
+
+_PHASE3_ROUND1_PROMPT = f"""PHASE 3, ROUND 1: Observe and Audit (NO code changes)
+
+Read these skill files and execute their AUDIT tasks. Do NOT modify code — observe and report only.
+
+1. Read {_SKILLS_DIR}/05-security/SKILL.md — execute all security scan tasks
+2. Read {_SKILLS_DIR}/06-content-integrity/SKILL.md — execute content integrity checks
+3. Read {_SKILLS_DIR}/21-codebase-audit/SKILL.md — execute codebase audit tasks
+
+For EVERY finding, log it in /tmp/<SESSION_NAME>-away-mode-audit.md (use your session name) with:
+- Category | Severity (critical/high/medium/low) | Description | File:Line
+
+When done, immediately continue to the next round."""
+
+_PHASE3_ROUND2_PROMPT = f"""PHASE 3, ROUND 2: Safe Mechanical Fixes
+
+Read these skill files and execute their FIX tasks — only safe, deterministic changes:
+
+1. Read {_SKILLS_DIR}/07-dependencies/SKILL.md — apply patch updates (semver-safe only)
+2. Read {_SKILLS_DIR}/22-config-hardening/SKILL.md — tighten configs, fix .gitignore
+3. Read {_SKILLS_DIR}/23-git-hygiene/SKILL.md — clean up git state
+
+EXECUTION WRAPPER for every change:
+1. Record current git SHA
+2. Make ONE logical change
+3. Run full test suite + build
+4. ALL GREEN → commit: [away-mode][category] description
+5. ANY RED → git checkout . to fully revert
+
+When done, immediately continue to the next round."""
+
+_PHASE3_ROUND3_PROMPT = f"""PHASE 3, ROUND 3: Test-Gated Improvements
+
+Read these skill files and execute their tasks:
+
+1. Read {_SKILLS_DIR}/08-testing/SKILL.md — generate tests for untested code (HIGHEST PRIORITY)
+2. Read {_SKILLS_DIR}/09-code-quality/SKILL.md — refactor, remove dead code, simplify
+3. Read {_SKILLS_DIR}/10-error-handling/SKILL.md — fix empty catches, add error handlers
+
+EXECUTION WRAPPER: one commit per change, test after each, revert on failure.
+
+When done, immediately continue to the next task."""
+
+async def _away_phase_study(session_name: str, state: dict):
+    """Phase 1: Study the project."""
+    state["phase"] = 1
+    state["phase_name"] = "Study Project"
+    state["step"] = 1
+    _away_log(state, "Starting Phase 1: Study the Project")
+    await _away_send_and_wait(session_name, _PHASE1_PROMPT, state,
+                               "Study project structure & establish baseline", timeout=600)
+
+
+async def _away_phase_select(session_name: str, state: dict):
+    """Phase 2: Select applicable skills."""
+    state["phase"] = 2
+    state["phase_name"] = "Select Skills"
+    state["step"] = 1
+    _away_log(state, "Starting Phase 2: Select Applicable Skills")
+    await _away_send_and_wait(session_name, _PHASE2_PROMPT, state,
+                               "Evaluate and select skills", timeout=300)
+
+
+async def _away_phase_execute(session_name: str, state: dict):
+    """Phase 3: Execute skills in rounds."""
+    state["phase"] = 3
+    state["phase_name"] = "Execute Skills"
+    state["step"] = 1
+
+    rounds = [
+        ("Round 1: Audit (read-only)", _PHASE3_ROUND1_PROMPT, 600),
+        ("Round 2: Safe fixes", _PHASE3_ROUND2_PROMPT, 900),
+        ("Round 3: Test-gated improvements", _PHASE3_ROUND3_PROMPT, 900),
+    ]
+
+    for round_name, prompt, timeout in rounds:
+        if not state.get("enabled"):
+            return
+        _away_log(state, f"Starting {round_name}")
+        await _away_send_and_wait(session_name, prompt, state, round_name, timeout=timeout)
+        # Brief pause between rounds
+        await asyncio.sleep(5)
+
+
+_AWAY_PING_PROMPT = f"""You are in Away Mode. The user is not present. You are autonomous.
+
+You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do. Choose a skill you haven't fully completed yet, or revisit one that could be improved.
+
+STEP 1: Pick a skill from the list below.
+STEP 2: Read the SKILL.md file for that skill — it contains detailed tasks and instructions.
+STEP 3: Execute the tasks described in the SKILL.md.
+
+Available skills (each has a SKILL.md with full instructions):
+ 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing & Hardening
+ 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage
+ 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring
+ 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
+ 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
+ 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
+ 7. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed
+ 8. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
+ 9. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
+10. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
+11. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish
+12. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
+13. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
+14. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements
+15. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
+16. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing
+17. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards
+18. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility
+19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
+20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
+21. {_SKILLS_DIR}/24-cost-optimization/SKILL.md — Cost Optimization
+22. {_SKILLS_DIR}/25-migration-readiness/SKILL.md — Migration Readiness
+23. {_SKILLS_DIR}/26-email-notifications/SKILL.md — Email & Notifications
+24. {_SKILLS_DIR}/27-mobile-pwa/SKILL.md — Mobile & PWA
+25. {_SKILLS_DIR}/28-asset-pipeline/SKILL.md — Asset Pipeline
+26. {_SKILLS_DIR}/29-developer-tooling/SKILL.md — Developer Tooling
+27. {_SKILLS_DIR}/30-disaster-recovery/SKILL.md — Disaster Recovery
+
+Rules:
+- Work on the away-mode branch (create one if not already on it)
+- Never commit to main/master
+- One logical change per commit: [away-mode][category] description
+- Run tests after every change — revert immediately on new failures
+- READ the SKILL.md first, then execute its specific tasks
+- Take concrete action — don't just plan or summarize
+
+Pick a skill, read its SKILL.md, and execute it now."""
+
+
+async def _away_mode_worker(session_name: str):
+    """Main away-mode coroutine. Runs initial phases then loops forever, pinging when idle."""
+    log = logging.getLogger("away-mode")
+    state = _away_mode_state[session_name]
+    log.info(f"Away mode started for session '{session_name}'")
+    try:
+        # --- Initial setup phases (run once, errors skip to continuous loop) ---
+        try:
+            await _away_phase_study(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _away_log(state, f"Phase 1 error (skipping): {e}")
+            log.error(f"Away mode phase 1 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        try:
+            await _away_phase_select(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _away_log(state, f"Phase 2 error (skipping): {e}")
+            log.error(f"Away mode phase 2 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        try:
+            await _away_phase_execute(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _away_log(state, f"Phase 3 error (skipping): {e}")
+            log.error(f"Away mode phase 3 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        # --- Continuous loop: monitor idle, ping with next task ---
+        # This loop NEVER exits unless cancelled or disabled by user.
+        state["phase"] = 4
+        state["phase_name"] = "Continuous"
+        cycle = 1
+        consecutive_errors = 0
+        while state.get("enabled"):
+            try:
+                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
+                # Wait for confirmed idle: 90 seconds of consecutive idle readings
+                idle_since = None
+                while state.get("enabled"):
+                    await asyncio.sleep(10)
+                    try:
+                        activity = await async_detect_activity(session_name)
+                    except Exception:
+                        activity = {"status": "unknown"}
+                    if activity["status"] == "idle":
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 90:
+                            break  # Confirmed idle for 90s
+                    else:
+                        idle_since = None  # Reset — session is busy
+
+                if not state.get("enabled"):
+                    return
+
+                # Ensure Codex is running before sending prompt (OOM recovery)
+                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
+                if not codex_ok:
+                    _away_log(state, "Codex dead and couldn't restart — stopping away mode")
+                    state["enabled"] = False
+                    _save_autonomous_state()
+                    return
+
+                # Session has been idle for 90s — send ping prompt
+                state["step"] = cycle
+                state["step_name"] = f"Ping cycle {cycle}"
+                _away_log(state, f"Session idle for 90s — sending task ping (cycle {cycle})")
+                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
+                                           f"Task ping cycle {cycle}", timeout=900)
+                cycle += 1
+                consecutive_errors = 0
+                _save_autonomous_state()  # Periodic save after each successful cycle
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Away mode cycle {cycle} error for '{session_name}': {e}")
+                if consecutive_errors >= 5:
+                    _away_log(state, "Too many consecutive errors, pausing 5 minutes...")
+                    await asyncio.sleep(300)
+                    consecutive_errors = 0
+                else:
+                    await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _away_log(state, "Away mode cancelled (server shutdown — will restore)")
+        else:
+            _away_log(state, "Away mode cancelled by user")
+            state["enabled"] = False
+            _save_autonomous_state()
+        log.info(f"Away mode cancelled for '{session_name}'")
+        raise
+    except Exception as e:
+        _away_log(state, f"Away mode fatal error: {e}")
+        log.error(f"Away mode fatal error for '{session_name}': {e}")
+        _save_autonomous_state()  # Save state so watchdog can recover
+        # Don't set enabled=False — let watchdog zombie detection restart us
+    finally:
+        state["task"] = None
+        log.info(f"Away mode finished for '{session_name}'")
+
+
+@app.post("/api/sessions/{session_name}/away-mode")
+async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
+    """Toggle away mode on or off for a session."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    if body.enabled:
+        # Don't allow both away mode and go-nuts mode at the same time on same session
+        if _go_nuts_state.get(session_name, {}).get("enabled"):
+            return JSONResponse({"error": "Go Nuts Mode is active on this session. Disable it first."}, status_code=409)
+
+        # Check if already running for this session
+        if _away_mode_state.get(session_name, {}).get("enabled"):
+            return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
+
+        # Initialize and launch
+        state = {
+            "enabled": True,
+            "phase": 0,
+            "phase_name": "Initializing",
+            "step": 0,
+            "step_name": "",
+            "started_at": time.time(),
+            "log": [],
+            "report": "",
+            "task": None,
+        }
+        _away_mode_state[session_name] = state
+        _away_log(state, "Away mode enabled")
+        task = asyncio.create_task(_away_mode_worker(session_name))
+        state["task"] = task
+        _save_autonomous_state()
+        return JSONResponse(_away_state_summary(state))
+    else:
+        # Disable
+        state = _away_mode_state.get(session_name, {})
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
+        state["enabled"] = False
+        state["task"] = None
+        _away_log(state, "Away mode disabled by user")
+        _save_autonomous_state()
+        return JSONResponse(_away_state_summary(state))
+
+
+@app.get("/api/sessions/{session_name}/away-mode")
+async def api_away_mode_status(session_name: str):
+    """Get current away-mode state for a session."""
+    state = _away_mode_state.get(session_name, {})
+    return JSONResponse(_away_state_summary(state))
+
+
+# --- Go Nuts Mode ---
+# Autonomous feature-building mode: discovers the project, generates a feature backlog,
+# then continuously builds features, tests, and improves the project in a loop.
+
+_GO_NUTS_SKILLS_DIR = str(Path.home() / ".codex" / "go-nuts-mode-skills")
+_GO_NUTS_LOG_CAP = 200
+
+def _go_nuts_log(state: dict, action: str):
+    """Append a log entry to the go-nuts-mode state."""
+    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
+    state.setdefault("log", []).append(entry)
+    if len(state["log"]) > _GO_NUTS_LOG_CAP:
+        state["log"] = state["log"][-_GO_NUTS_LOG_CAP:]
+
+
+def _go_nuts_state_summary(state: dict) -> dict:
+    """Return a JSON-safe summary of go-nuts-mode state (no asyncio.Task)."""
+    return {
+        "enabled": state.get("enabled", False),
+        "phase": state.get("phase", 0),
+        "phase_name": state.get("phase_name", ""),
+        "step": state.get("step", 0),
+        "step_name": state.get("step_name", ""),
+        "started_at": state.get("started_at", 0),
+        "log": state.get("log", [])[-30:],
+        "report": state.get("report", ""),
+    }
+
+
+async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
+                                  step_name: str, timeout: int = 900) -> str:
+    """Send prompt, wait for completion, capture and summarize output."""
+    state["step_name"] = step_name
+    _go_nuts_log(state, f"Sending: {step_name}")
+
+    prompt = _build_project_isolation_preamble(session_name) + prompt
+    # Reuse the same send/wait infrastructure as away mode
+    await _away_send_prompt(session_name, prompt)
+    completed = await _away_wait_for_idle(session_name, timeout=timeout)
+
+    if not completed:
+        _go_nuts_log(state, f"Timeout on: {step_name}")
+        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
+        await asyncio.sleep(2)
+
+    output = capture_pane_full(session_name)
+    try:
+        summary = await llm_call(
+            system_prompt=(
+                "Summarize what the agent accomplished in this terminal output. "
+                "Focus on concrete actions: features built, files created/modified, tests run, errors. "
+                "Be specific and concise. Under 80 words."
+            ),
+            user_content=f"Go Nuts step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
+            max_tokens=200,
+        )
+    except Exception:
+        summary = "(summary unavailable)"
+
+    _go_nuts_log(state, f"Done: {summary[:200]}")
+    state["step"] += 1
+    return summary
+
+
+# --- Go Nuts Phase Prompts ---
+
+_GN_PHASE1_PROMPT = f"""I'm putting you in Go Nuts Mode. You are autonomous — the user is not present. Your job is to BUILD FEATURES and IMPROVE this project as aggressively as possible.
+
+IMPORTANT: Detailed skill instructions are available as files on disk at:
+  {_GO_NUTS_SKILLS_DIR}/
+Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
+
+PHASE 1: Discover the Project
+
+Read {_GO_NUTS_SKILLS_DIR}/01-project-discovery/SKILL.md and execute ALL tasks described in it.
+
+Key objectives:
+1. Map every route, endpoint, model, dependency, and feature
+2. Understand the product vision — who uses this, what does "done" look like?
+3. Assess maturity level (skeleton/prototype/MVP/early product/established)
+4. Map constraints — what can and can't we build?
+5. Write the product profile to /tmp/<SESSION_NAME>-go-nuts-product-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above)
+
+Then immediately read {_GO_NUTS_SKILLS_DIR}/02-product-gap-analysis/SKILL.md and execute it:
+1. Compare what exists vs what users of this product type expect
+2. Identify every missing feature and gap
+3. Write the gap analysis to /tmp/<SESSION_NAME>-go-nuts-gap-analysis.md (use your session name)
+
+CRITICAL: Create a working branch: git checkout -b go-nuts/session-$(date +%Y%m%d-%H%M%S)
+CRITICAL: Never commit to main/master. All work on the go-nuts branch.
+CRITICAL: After EVERY feature you build, run tests + build to verify nothing broke.
+
+When done, immediately continue to the next task without waiting."""
+
+_GN_PHASE2_PROMPT = f"""PHASE 2: Generate Feature Backlog
+
+Read {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md and execute ALL tasks:
+1. Use the brainstorming frameworks (What If, Adjacent Feature, Delight, Productization)
+2. Research competitors if possible (use web search)
+3. Score each feature on Impact/Feasibility/Independence/Novelty
+4. Write the prioritized backlog to /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name)
+
+Then pick the TOP 3 highest-priority features from the backlog and start building them.
+
+For EACH feature:
+1. Create a git checkpoint (read {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md)
+2. Build the complete feature — not a stub, not a placeholder, the REAL thing
+3. Match existing code style, design language, and patterns
+4. Handle all states: loading, empty, error, populated
+5. Run tests + build after completion
+6. If tests pass → commit: [go-nuts][feature] description
+7. If tests fail → revert and move to next feature
+
+When done, immediately continue to the next task without waiting."""
+
+_GN_PHASE3_PROMPT = f"""PHASE 3: Build Features (Batch)
+
+Continue building features from the backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name from the PROJECT ISOLATION preamble).
+
+For each feature, use the relevant skill file:
+- UI/pages → Read {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md
+- API/backend → Read {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md
+- Auth/users → Read {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md
+- Navigation → Read {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md
+- Data/state → Read {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md
+- Search → Read {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md
+- Notifications → Read {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md
+- Config → Read {_GO_NUTS_SKILLS_DIR}/11-config-preferences/SKILL.md
+- Content pages → Read {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md
+- Dashboard → Read {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md
+- Import/Export → Read {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md
+
+EXECUTION WRAPPER for every feature:
+1. Checkpoint (git stash or note SHA)
+2. Build the COMPLETE feature
+3. Run tests + build
+4. ALL GREEN → commit: [go-nuts][feature] description
+5. ANY RED → full revert, log why it failed, move on
+
+Build as many features as you can. Prioritize high-impact, high-feasibility items.
+
+When done, immediately continue to the next task without waiting."""
+
+_GN_PING_PROMPT = f"""You are in Go Nuts Mode. The user is not present. You are autonomous. Your mission: BUILD FEATURES and IMPROVE the project.
+
+You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do.
+
+STEP 1: Check your backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name) — any features left to build?
+STEP 2: If backlog is empty or low, generate new ideas using {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md
+STEP 3: Pick a skill and execute it.
+
+Available skills (each has a SKILL.md with full instructions):
+ 1. {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md — Build UI Pages & Components
+ 2. {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md — Build API & Backend Features
+ 3. {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md — Auth & User System
+ 4. {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md — Navigation & Routing
+ 5. {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md — Data & State Management
+ 6. {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md — Search & Filtering
+ 7. {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md — Notifications & Realtime
+ 8. {_GO_NUTS_SKILLS_DIR}/11-config-preferences/SKILL.md — Config & Preferences
+ 9. {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md — Content Pages
+10. {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md — Dashboard & Analytics
+11. {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md — Import & Export
+12. {_GO_NUTS_SKILLS_DIR}/15-social-collaboration/SKILL.md — Social & Collaboration
+13. {_GO_NUTS_SKILLS_DIR}/16-onboarding-empty-states/SKILL.md — Onboarding & Empty States
+14. {_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md — QA & Stability Audit
+15. {_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md — Security Sweep
+16. {_GO_NUTS_SKILLS_DIR}/19-web-research/SKILL.md — Web Research & Inspiration
+17. {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md — Feature Ideation & Brainstorming
+18. {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md — Backup & Checkpoint Manager
+
+Rules:
+- Work on the go-nuts branch (create one if not already on it)
+- Never commit to main/master
+- One feature per commit: [go-nuts][feature] description
+- Run tests + build after every change — revert immediately on new failures
+- READ the SKILL.md first, then execute its specific tasks
+- Build COMPLETE features, not stubs or placeholders
+- Every 5th cycle, run QA audit ({_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md) and security sweep ({_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md)
+
+Pick a skill, read its SKILL.md, and execute it now."""
+
+
+async def _go_nuts_phase_discover(session_name: str, state: dict):
+    """Phase 1: Discover the project and analyze gaps."""
+    state["phase"] = 1
+    state["phase_name"] = "Discover Project"
+    state["step"] = 1
+    _go_nuts_log(state, "Starting Phase 1: Project Discovery & Gap Analysis")
+    await _go_nuts_send_and_wait(session_name, _GN_PHASE1_PROMPT, state,
+                                  "Discover project & analyze gaps", timeout=600)
+
+
+async def _go_nuts_phase_backlog(session_name: str, state: dict):
+    """Phase 2: Generate feature backlog and start building."""
+    state["phase"] = 2
+    state["phase_name"] = "Feature Backlog"
+    state["step"] = 1
+    _go_nuts_log(state, "Starting Phase 2: Generate Feature Backlog & Build Top Features")
+    await _go_nuts_send_and_wait(session_name, _GN_PHASE2_PROMPT, state,
+                                  "Generate backlog & build top features", timeout=900)
+
+
+async def _go_nuts_phase_build(session_name: str, state: dict):
+    """Phase 3: Build features from backlog."""
+    state["phase"] = 3
+    state["phase_name"] = "Build Features"
+    state["step"] = 1
+    _go_nuts_log(state, "Starting Phase 3: Build Features Batch")
+    await _go_nuts_send_and_wait(session_name, _GN_PHASE3_PROMPT, state,
+                                  "Build features from backlog", timeout=900)
+
+
+async def _go_nuts_mode_worker(session_name: str):
+    """Main go-nuts-mode coroutine. Runs discovery phases then loops forever, building features."""
+    log = logging.getLogger("go-nuts-mode")
+    state = _go_nuts_state[session_name]
+    log.info(f"Go Nuts mode started for session '{session_name}'")
+    try:
+        # --- Initial setup phases (run once, errors skip to continuous loop) ---
+        try:
+            await _go_nuts_phase_discover(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _go_nuts_log(state, f"Phase 1 error (skipping): {e}")
+            log.error(f"Go Nuts phase 1 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        try:
+            await _go_nuts_phase_backlog(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _go_nuts_log(state, f"Phase 2 error (skipping): {e}")
+            log.error(f"Go Nuts phase 2 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        try:
+            await _go_nuts_phase_build(session_name, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _go_nuts_log(state, f"Phase 3 error (skipping): {e}")
+            log.error(f"Go Nuts phase 3 error for '{session_name}': {e}")
+
+        if not state.get("enabled"):
+            return
+
+        # --- Continuous loop: monitor idle, ping with next feature task ---
+        # This loop NEVER exits unless cancelled or disabled by user.
+        state["phase"] = 4
+        state["phase_name"] = "Continuous Build"
+        cycle = 1
+        consecutive_errors = 0
+        while state.get("enabled"):
+            try:
+                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
+                idle_since = None
+                while state.get("enabled"):
+                    await asyncio.sleep(10)
+                    try:
+                        activity = await async_detect_activity(session_name)
+                    except Exception:
+                        activity = {"status": "unknown"}
+                    if activity["status"] == "idle":
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since >= 90:
+                            break
+                    else:
+                        idle_since = None
+
+                if not state.get("enabled"):
+                    return
+
+                # Ensure Codex is running before sending prompt (OOM recovery)
+                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
+                if not codex_ok:
+                    _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
+                    state["enabled"] = False
+                    _save_autonomous_state()
+                    return
+
+                state["step"] = cycle
+                state["step_name"] = f"Build cycle {cycle}"
+                _go_nuts_log(state, f"Session idle for 90s — sending build ping (cycle {cycle})")
+                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
+                                              f"Build cycle {cycle}", timeout=900)
+                cycle += 1
+                consecutive_errors = 0
+                _save_autonomous_state()  # Periodic save after each successful cycle
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
+                log.error(f"Go Nuts cycle {cycle} error for '{session_name}': {e}")
+                if consecutive_errors >= 5:
+                    _go_nuts_log(state, "Too many consecutive errors, pausing 5 minutes...")
+                    await asyncio.sleep(300)
+                    consecutive_errors = 0
+                else:
+                    await asyncio.sleep(30)
+
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _go_nuts_log(state, "Go Nuts mode cancelled (server shutdown — will restore)")
+        else:
+            _go_nuts_log(state, "Go Nuts mode cancelled by user")
+            state["enabled"] = False
+            _save_autonomous_state()
+        log.info(f"Go Nuts mode cancelled for '{session_name}'")
+        raise
+    except Exception as e:
+        _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
+        log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
+        _save_autonomous_state()  # Save state so watchdog can recover
+        # Don't set enabled=False — let watchdog zombie detection restart us
+    finally:
+        state["task"] = None
+        log.info(f"Go Nuts mode finished for '{session_name}'")
+
+
+@app.post("/api/sessions/{session_name}/go-nuts-mode")
+async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
+    """Toggle go-nuts mode on or off for a session."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    if body.enabled:
+        # Don't allow both away mode and go-nuts mode at the same time on same session
+        if _away_mode_state.get(session_name, {}).get("enabled"):
+            return JSONResponse({"error": "Away Mode is active on this session. Disable it first."}, status_code=409)
+
+        if _go_nuts_state.get(session_name, {}).get("enabled"):
+            return JSONResponse(_go_nuts_state_summary(_go_nuts_state[session_name]))
+
+        state = {
+            "enabled": True,
+            "phase": 0,
+            "phase_name": "Initializing",
+            "step": 0,
+            "step_name": "",
+            "started_at": time.time(),
+            "log": [],
+            "report": "",
+            "task": None,
+        }
+        _go_nuts_state[session_name] = state
+        _go_nuts_log(state, "Go Nuts mode enabled")
+        task = asyncio.create_task(_go_nuts_mode_worker(session_name))
+        state["task"] = task
+        _save_autonomous_state()
+        return JSONResponse(_go_nuts_state_summary(state))
+    else:
+        state = _go_nuts_state.get(session_name, {})
+        if state.get("task") and not state["task"].done():
+            state["task"].cancel()
+        state["enabled"] = False
+        state["task"] = None
+        _go_nuts_log(state, "Go Nuts mode disabled by user")
+        _save_autonomous_state()
+        return JSONResponse(_go_nuts_state_summary(state))
+
+
+@app.get("/api/sessions/{session_name}/go-nuts-mode")
+async def api_go_nuts_mode_status(session_name: str):
+    """Get current go-nuts-mode state for a session."""
+    state = _go_nuts_state.get(session_name, {})
+    return JSONResponse(_go_nuts_state_summary(state))
+
+
 HTML_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -12152,14 +13789,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
-.nav-usage{display:none;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage{display:none;flex-direction:column;justify-content:center;gap:3px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
 .nav-usage.has-data{display:flex}
 .nav-usage-item{display:flex;align-items:center;gap:5px;cursor:default;line-height:1}
-.nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
-.nav-usage-bar{position:relative;width:96px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-usage-label{color:#8b949e;font-weight:700;font-size:.58rem;letter-spacing:.04em;width:16px;text-transform:uppercase}
+.nav-usage-bar{position:relative;width:84px;height:5px;background:#21262d;border-radius:3px;overflow:hidden}
 .nav-usage-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
+.nav-usage-pct{color:#e6edf3;font-size:.62rem;font-weight:700;font-family:'SF Mono','Fira Code',Consolas,monospace;width:34px;text-align:right}
+.nav-usage-meta{color:#6e7681;font-size:.58rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:92px}
 .nav-usage.disabled{display:none}
 /* Usage bars mirrored into tools dropdown (mobile only) */
 .nav-tools-usage{display:none;padding:8px 14px 4px 14px}
@@ -12253,15 +13892,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
-.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
+.cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
-.cmd-send.is-mic{color:#8b949e}
-.cmd-send.is-send{color:#3fb950}
-.cmd-send.is-recording{color:#f85149;animation:composer-pulse 1s ease-in-out infinite}
-.cmd-send svg{display:block}
-@keyframes composer-pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.composer-spin{display:inline-block;width:15px;height:15px;border:2px solid #484f58;border-top-color:#c9d1d9;border-radius:50%;animation:composer-spin .7s linear infinite}
-@keyframes composer-spin{to{transform:rotate(360deg)}}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -12392,7 +14024,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
-/* Watchdog toggle */
+/* Away mode toggle */
+.away-toggle{position:relative;display:inline-block;width:44px;height:24px}
+.away-toggle input{opacity:0;width:0;height:0}
+.away-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
+.away-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
+.away-toggle input:checked+.away-toggle-slider{background:#238636}
+.away-toggle input:checked+.away-toggle-slider:before{transform:translateX(20px);background:#fff}
+.away-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
+.away-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
+.away-log-entry .away-ts{color:#58a6ff}
+.nav-away{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#3d1f6d;color:#d2a8ff}
+
+/* Go Nuts mode toggle */
+.gonuts-toggle{position:relative;display:inline-block;width:44px;height:24px}
+.gonuts-toggle input{opacity:0;width:0;height:0}
+.gonuts-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
+.gonuts-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
+.gonuts-toggle input:checked+.gonuts-toggle-slider{background:#da3633}
+.gonuts-toggle input:checked+.gonuts-toggle-slider:before{transform:translateX(20px);background:#fff}
 .watchdog-toggle{position:relative;display:inline-block;width:44px;height:24px}
 .watchdog-toggle input{opacity:0;width:0;height:0}
 .watchdog-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
@@ -12449,13 +14099,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .empty{text-align:center;color:#8b949e;padding:60px 20px;font-size:1.1rem}
 @keyframes pulse-glow{0%,100%{opacity:1}50%{opacity:.5}}
 
-/* Claude auth indicator */
-.claude-auth{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;border-radius:6px;transition:background .15s;user-select:none;flex-shrink:0;margin-right:4px}
-.claude-auth:hover{background:#1c2128}
-.claude-auth-label{font-size:.75rem;color:#c9d1d9;white-space:nowrap}
-.claude-auth .status-dot.idle{background:#3fb950}
-.claude-auth .status-dot.busy{background:#f85149}
-.claude-auth .status-dot.unknown{background:#6e7681}
+/* Codex auth indicator */
+.codex-auth{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;border-radius:6px;transition:background .15s;user-select:none;flex-shrink:0;margin-right:4px}
+.codex-auth:hover{background:#1c2128}
+.codex-auth-label{font-size:.75rem;color:#c9d1d9;white-space:nowrap}
+.codex-auth .status-dot.idle{background:#3fb950}
+.codex-auth .status-dot.busy{background:#f85149}
+.codex-auth .status-dot.unknown{background:#6e7681}
 
 /* Auth dropdown */
 .auth-dropdown{display:none;position:fixed;top:46px;right:24px;z-index:100;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;min-width:310px;max-width:420px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
@@ -12494,7 +14144,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .member-only{display:none}
 body.member-simple .member-only{display:inline-flex;align-items:center;justify-content:center}
 body.member-simple .nav-tools-wrap{display:none}
-body.member-simple .claude-auth{display:none}
+body.member-simple .codex-auth{display:none}
 body.member-simple .nav-server-stats{display:none}
 body.member-simple .nav-usage{display:none}
 body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
@@ -12557,7 +14207,7 @@ body.member-simple .hide-in-simple{display:none!important}
 .stats-usage-table tr.stats-totals-row td{color:#f0f6fc;padding-top:6px}
 .stats-usage-table .model-tag{font-size:.65rem;padding:1px 5px;background:#30363d;border-radius:3px;color:#c9d1d9;display:inline-block}
 
-/* CLAUDE.md editor modal */
+/* AGENTS.md editor modal */
 /* Skills tab */
 .skills-panel{display:flex;flex-direction:column;height:100%;gap:10px;padding:12px 0}
 .skills-meta{font-size:.78rem;color:#8b949e;padding:6px 10px;background:#0d1117;border:1px solid #21262d;border-radius:6px}
@@ -12617,7 +14267,7 @@ body.member-simple .hide-in-simple{display:none!important}
 .profile-edit input,.profile-edit textarea,.profile-edit select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace}
 .profile-edit input:focus,.profile-edit textarea:focus,.profile-edit select:focus{border-color:#58a6ff}
 .profile-edit textarea{resize:vertical;line-height:1.5}
-.profile-edit .ed-claude{min-height:200px}
+.profile-edit .ed-codex{min-height:200px}
 .profile-edit .ed-memory{min-height:120px}
 .profile-edit .ed-permissions{min-height:80px}
 .profile-edit .extras-section{border:1px solid #21262d;border-radius:6px;padding:8px;background:#0d1117}
@@ -12687,7 +14337,7 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.bad .nbb-dot{background:#f85149;box-shadow:0 0 6px #f8514999}
 .nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
 /* Blinking green: the signed-in browser is being used right now (a person over
-   noVNC, or Claude driving it in the background). */
+   noVNC, or Codex driving it in the background). */
 .nav-browser-badge.ok.active{border-color:#3fb950}
 .nav-browser-badge.ok.active .nbb-dot{animation:nbb-blink 1s ease-in-out infinite}
 .nav-browser-badge.ok.active .nbb-glyph{animation:nbb-pulse 1.6s ease-in-out infinite}
@@ -12838,31 +14488,31 @@ body.member-simple .hide-in-simple{display:none!important}
 .api-edit-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
 .nav-tools-divider{height:1px;background:#21262d;margin:4px 0}
 
-.claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
-.claudemd-overlay.active{display:flex}
-.claudemd-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
-.claudemd-panel h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
-.claudemd-editor{width:100%;min-height:350px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
-.claudemd-editor:focus{border-color:#58a6ff}
-.claudemd-path{font-size:.7rem;color:#6e7681;margin-bottom:8px;font-family:'SF Mono','Fira Code',Consolas,monospace}
-.claudemd-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
-.claudemd-label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:4px;display:block}
-.claudemd-extras{padding:8px;border:1px solid #21262d;border-radius:6px;background:#0d1117}
-.claudemd-extras .extras-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #161b22}
-.claudemd-extras .extras-row:last-child{border-bottom:none}
-.claudemd-extras .extras-name{flex:1;color:#c9d1d9;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;cursor:pointer}
-.claudemd-extras .extras-name:hover{color:#58a6ff}
-.claudemd-extras .extras-meta{color:#6e7681;font-size:.68rem}
-.claudemd-extras .extras-empty{color:#6e7681;font-size:.78rem;font-style:italic;padding:4px 0}
-.claudemd-extras .extras-actions{display:flex;gap:6px;margin-top:6px}
-.claudemd-extras .extras-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:5px;font-size:.72rem;cursor:pointer}
-.claudemd-extras .extras-btn:hover{background:#30363d}
-.claudemd-extras .extras-del{color:#f85149;background:transparent;border:none;cursor:pointer;font-size:.95rem;padding:0 4px}
-.claudemd-extras .extras-del:hover{color:#ff7b72}
-.claudemd-extras .extras-editor{display:none;flex-direction:column;gap:6px;margin-top:6px;padding-top:6px;border-top:1px dashed #30363d}
-.claudemd-extras .extras-editor.active{display:flex}
-.claudemd-extras .extras-editor textarea{min-height:160px;width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
-.claudemd-extras .extras-editor textarea:focus{border-color:#58a6ff}
+.codexmd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
+.codexmd-overlay.active{display:flex}
+.codexmd-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.codexmd-panel h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center}
+.codexmd-editor{width:100%;min-height:350px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
+.codexmd-editor:focus{border-color:#58a6ff}
+.codexmd-path{font-size:.7rem;color:#6e7681;margin-bottom:8px;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.codexmd-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.codexmd-label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-bottom:4px;display:block}
+.codexmd-extras{padding:8px;border:1px solid #21262d;border-radius:6px;background:#0d1117}
+.codexmd-extras .extras-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #161b22}
+.codexmd-extras .extras-row:last-child{border-bottom:none}
+.codexmd-extras .extras-name{flex:1;color:#c9d1d9;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;cursor:pointer}
+.codexmd-extras .extras-name:hover{color:#58a6ff}
+.codexmd-extras .extras-meta{color:#6e7681;font-size:.68rem}
+.codexmd-extras .extras-empty{color:#6e7681;font-size:.78rem;font-style:italic;padding:4px 0}
+.codexmd-extras .extras-actions{display:flex;gap:6px;margin-top:6px}
+.codexmd-extras .extras-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:5px;font-size:.72rem;cursor:pointer}
+.codexmd-extras .extras-btn:hover{background:#30363d}
+.codexmd-extras .extras-del{color:#f85149;background:transparent;border:none;cursor:pointer;font-size:.95rem;padding:0 4px}
+.codexmd-extras .extras-del:hover{color:#ff7b72}
+.codexmd-extras .extras-editor{display:none;flex-direction:column;gap:6px;margin-top:6px;padding-top:6px;border-top:1px dashed #30363d}
+.codexmd-extras .extras-editor.active{display:flex}
+.codexmd-extras .extras-editor textarea{min-height:160px;width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
+.codexmd-extras .extras-editor textarea:focus{border-color:#58a6ff}
 
 /* Mobile */
 @media(max-width:768px){
@@ -12876,9 +14526,9 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-status-text{display:none}
   .nav-usage.has-data{display:none}
   .nav-tools-usage.has-data{display:block}
-  .claude-auth-label{display:none}
-  .claude-auth{padding:8px 10px}
-  .claude-auth .status-dot{width:10px;height:10px}
+  .codex-auth-label{display:none}
+  .codex-auth{padding:8px 10px}
+  .codex-auth .status-dot{width:10px;height:10px}
   .auth-dropdown{right:8px;min-width:270px;max-width:calc(100vw - 16px)}
   .nav-refresh-btn{padding:5px 10px;font-size:.75rem}
   .nav-new-btn{width:28px;height:28px;font-size:1rem;margin-right:4px}
@@ -12915,15 +14565,18 @@ body.member-simple .hide-in-simple{display:none!important}
     <span class="nav-usage-item" id="nav-usage-5h-wrap" title="">
       <span class="nav-usage-label">5h</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-5h-pct">--</span>
+      <span class="nav-usage-meta" id="nav-usage-5h-meta">no data</span>
     </span>
     <span class="nav-usage-item" id="nav-usage-7d-wrap" title="">
       <span class="nav-usage-label">7d</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-7d-pct">--</span>
+      <span class="nav-usage-meta" id="nav-usage-7d-meta">no data</span>
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <!-- Browser sign-in indicator: red = no browser can authorize Claude, green =
-       one can, spinning = Claude is driving a browser right now. -->
+  <!-- Generic browser-session status. Codex auto-auth is retired. -->
   <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
         title="Browser sign-in status" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
@@ -12932,22 +14585,24 @@ body.member-simple .hide-in-simple{display:none!important}
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
       <div class="nav-tools-usage" id="nav-tools-usage">
-        <div class="nav-tools-usage-title">Anthropic limits</div>
+        <div class="nav-tools-usage-title">OpenAI limits</div>
         <div class="nav-tools-usage-row" id="tools-usage-5h-wrap" title="">
           <span class="nav-tools-usage-label">5h</span>
           <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-5h-fill" style="width:0%"></span></span>
           <span class="nav-tools-usage-pct" id="tools-usage-5h-pct">&mdash;</span>
+          <span class="nav-tools-usage-pct" id="tools-usage-5h-meta">&mdash;</span>
         </div>
         <div class="nav-tools-usage-row" id="tools-usage-7d-wrap" title="">
           <span class="nav-tools-usage-label">7d</span>
           <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-7d-fill" style="width:0%"></span></span>
           <span class="nav-tools-usage-pct" id="tools-usage-7d-pct">&mdash;</span>
+          <span class="nav-tools-usage-pct" id="tools-usage-7d-meta">&mdash;</span>
         </div>
         <div class="nav-tools-usage-divider"></div>
       </div>
       <!-- Each entry below opens its OWN window. Everything that lives as a tab
            inside the Settings modal (My Context, History, Users, APIs, Browser,
-           Claude Login) is reached through the single Settings entry — listing
+           Codex Login) is reached through the single Settings entry — listing
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
@@ -12963,9 +14618,9 @@ body.member-simple .hide-in-simple{display:none!important}
   <!-- Member-only nav controls (shown only in simplified team mode) -->
   <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
-  <div class="claude-auth" id="claude-auth" onclick="toggleAuthPanel(event)">
-    <span class="status-dot unknown" id="claude-auth-dot"></span>
-    <span class="claude-auth-label" id="claude-auth-label">...</span>
+  <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
+    <span class="status-dot unknown" id="codex-auth-dot"></span>
+    <span class="codex-auth-label" id="codex-auth-label">...</span>
   </div>
 </div>
 </div>
@@ -12984,14 +14639,14 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 <!-- Project-scope (cwd-bound) file editor overlay -->
-<div class="claudemd-overlay" id="projfile-overlay" onclick="if(event.target===this)closeProjectFile()">
-  <div class="claudemd-panel">
+<div class="codexmd-overlay" id="projfile-overlay" onclick="if(event.target===this)closeProjectFile()">
+  <div class="codexmd-panel">
     <h3 id="projfile-title">Project file <button class="stats-close" onclick="closeProjectFile()">&times;</button></h3>
     <div class="profiles-hint" style="margin-bottom:10px" id="projfile-banner"></div>
-    <label class="claudemd-label" id="projfile-label">File</label>
-    <div class="claudemd-path" id="projfile-path"></div>
-    <textarea class="claudemd-editor" id="projfile-editor" spellcheck="false"></textarea>
-    <div class="claudemd-actions">
+    <label class="codexmd-label" id="projfile-label">File</label>
+    <div class="codexmd-path" id="projfile-path"></div>
+    <textarea class="codexmd-editor" id="projfile-editor" spellcheck="false"></textarea>
+    <div class="codexmd-actions">
       <button class="btn" onclick="closeProjectFile()">Close</button>
       <button class="btn btn-full" onclick="saveProjectFile()">Save</button>
     </div>
@@ -12999,19 +14654,19 @@ body.member-simple .hide-in-simple{display:none!important}
 </div>
 
 <!-- Session MEMORY.md editor overlay -->
-<div class="claudemd-overlay" id="memorymd-overlay" onclick="if(event.target===this)closeSessionMemory()">
-  <div class="claudemd-panel">
+<div class="codexmd-overlay" id="memorymd-overlay" onclick="if(event.target===this)closeSessionMemory()">
+  <div class="codexmd-panel">
     <h3>MEMORY.md <span id="memorymd-session-tag" style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px"></span> <button class="stats-close" onclick="closeSessionMemory()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Claude Code in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair. <span style="color:#e3b341">Note:</span> two tmux sessions on the same profile + cwd share this file. To isolate, put each session on its own profile.</div>
-    <label class="claudemd-label">MEMORY.md (index)</label>
-    <div class="claudemd-path" id="memorymd-path"></div>
-    <textarea class="claudemd-editor" id="memorymd-editor" spellcheck="false"></textarea>
-    <div class="claudemd-actions">
+    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Codex in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair. <span style="color:#e3b341">Note:</span> two tmux sessions on the same profile + cwd share this file. To isolate, put each session on its own profile.</div>
+    <label class="codexmd-label">MEMORY.md (index)</label>
+    <div class="codexmd-path" id="memorymd-path"></div>
+    <textarea class="codexmd-editor" id="memorymd-editor" spellcheck="false"></textarea>
+    <div class="codexmd-actions">
       <button class="btn" onclick="closeSessionMemory()">Close</button>
       <button class="btn btn-full" onclick="saveSessionMemory()">Save MEMORY.md</button>
     </div>
-    <label class="claudemd-label" style="margin-top:14px">Topic files in same directory</label>
-    <div class="extras-section claudemd-extras" id="memorymd-extras">
+    <label class="codexmd-label" style="margin-top:14px">Topic files in same directory</label>
+    <div class="extras-section codexmd-extras" id="memorymd-extras">
       <div class="extras-empty">Loading...</div>
     </div>
   </div>
@@ -13022,9 +14677,9 @@ body.member-simple .hide-in-simple{display:none!important}
   <div class="claudemd-panel" id="claudemd-panel">
     <h3>Context Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
     <div class="profiles-hint" style="margin-bottom:10px">
-      Every file Claude Code reads for context on this host. <b>Always loaded</b> files are injected into
+      Every registered file Codex reads for context on this host. <b>Always loaded</b> files are injected into
       each session's context window — keep them tight. <b>On demand</b> files cost nothing until
-      <code>CLAUDE.md</code> sends a session to them, so detail belongs there.
+      <code>AGENTS.md</code> sends a session to them, so detail belongs there.
       <span id="ctxfiles-budget"></span>
     </div>
     <div class="extras-section claudemd-extras" id="context-files">
@@ -13038,8 +14693,8 @@ body.member-simple .hide-in-simple{display:none!important}
 <!-- Profiles editor overlay -->
 <div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
   <div class="profiles-panel">
-    <h3>Claude Profiles <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
-    <div class="profiles-hint">Each profile is a fully isolated Claude Code config (settings.json, CLAUDE.md, MEMORY.md, skills/, plus any extra <code>.md</code> sidecar files you add) under <code>~/.claude-&lt;id&gt;/</code> selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>. The <strong>Default</strong> profile uses the standard <code>~/.claude</code>.</div>
+    <h3>Codex Profiles <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
+    <div class="profiles-hint">Each profile is a fully isolated Codex config (config.toml, AGENTS.md, MEMORY.md, skills/, plus any extra <code>.md</code> sidecar files you add) under <code>~/.codex-&lt;id&gt;/</code> selected per tmux session via <code>CODEX_HOME</code>. The <strong>Default</strong> profile uses the standard <code>~/.codex</code>.</div>
     <div class="profiles-body">
       <div class="profiles-list" id="profiles-list">Loading...</div>
       <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
@@ -13047,13 +14702,13 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- Settings overlay (My Context / History / Users) -->
-<div class="profiles-overlay" id="settings-overlay" onclick="if(event.target===this)closeSettings()">
+<!-- Config overlay (My Context / History / Users) -->
+<div class="profiles-overlay" id="config-overlay" onclick="if(event.target===this)closeConfig()">
   <div class="profiles-panel" style="width:980px">
-    <h3>Settings <button class="stats-close" onclick="closeSettings()">&times;</button></h3>
-    <div class="settings-tabs" id="settings-tabs"></div>
-    <div class="settings-body" id="settings-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
-      <div id="settings-content" style="flex:1;min-height:0;overflow-y:auto;padding-top:8px"></div>
+    <h3>Config <button class="stats-close" onclick="closeConfig()">&times;</button></h3>
+    <div class="config-tabs" id="config-tabs"></div>
+    <div class="config-body" id="config-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
+      <div id="config-content" style="flex:1;min-height:0;overflow-y:auto;padding-top:8px"></div>
     </div>
   </div>
 </div>
@@ -13080,14 +14735,14 @@ function setHideBashPref(v){
 }
 // Independently hide tool OUTPUT — the `⎿ …` result blocks (file dumps, command
 // output, "Shell cwd was reset…") plus their indented continuation rows — so the
-// terminal shows only Claude's spoken text, not the plumbing. Default on.
+// terminal shows only Codex's spoken text, not the plumbing. Default on.
 function getHideOutputPref(){
   try{const v=localStorage.getItem('hideOutputLines');return v===null?true:v==='true'}catch(e){return true}
 }
 function setHideOutputPref(v){
   try{localStorage.setItem('hideOutputLines',v?'true':'false')}catch(e){}
 }
-// Claude Code's TUI lays out tool calls like:
+// Codex's TUI lays out tool calls like:
 //   ● Bash(sleep 540 && gcloud ...
 //         --command="date; ...")        <- wrap continuation, indented, no marker
 //     ⎿  Mon May 11 ...                 <- output
@@ -13096,7 +14751,7 @@ function setHideOutputPref(v){
 // hide the bullet header line AND its wrap-continuation lines (indented, no
 // bullet/output marker). We KEEP the `⎿` output lines so the user can still
 // see what the command produced.
-// Tool-call headers Claude Code renders as "● ToolName(args)". We require the
+// Tool-call headers Codex renders as "● ToolName(args)". We require the
 // "(" so we never hide ordinary prose that happens to start with a word like
 // "Read"/"Write"/"Update"/"Add"/"Task". Covers file ops (Write/Edit/Read/...),
 // shell, web, search and mcp__ tools so the terminal shows the conversation, not
@@ -13108,30 +14763,6 @@ const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+
 function _isBashFetchHeader(line){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   return _BASH_FILTER_RE.test(stripped);
-}
-// Part 5: also hide noisy "update" output (claude/npm self-update logs). These are
-// long, low-value, and clutter the terminal. Folded into the same Hide toggle.
-const _UPDATE_NOISE_RES=[
-  /^checking for updates?/i,
-  /^installing\b.*\b(claude|update|npm|node|package|version|v?\d)/i,
-  /^downloading\b.*\b(claude|update|npm|version|package|v?\d)/i,
-  /\b(update (installed|complete|available)|successfully updated|already up to date|claude code v?\d[\d.]* installed)\b/i,
-  /^npm\b/i,
-  /\bnpm (warn|notice|info|err|http|verb|sill|deprecated|audit|fund)\b/i,
-  /^(added|changed|removed|audited)\s+\d+\s+packages?\b/i,
-  /\bpackages?\b[^\n]*\blooking for funding\b/i,
-  /^found \d+ vulnerabilit/i,
-  /\bnpm audit\b/i,
-  /\bto (apply|finish|complete) the update\b/i,
-  /^restart claude\b/i,
-  /^[\[(][#=>\-.\s]{3,}[\])]/,
-];
-function _isUpdateNoise(line){
-  if(!line)return false;
-  const s=line.replace(/^[\s⎿●⏺•·>*\-]+/,'').trim();
-  if(!s)return false;
-  for(let i=0;i<_UPDATE_NOISE_RES.length;i++){if(_UPDATE_NOISE_RES[i].test(s))return true;}
-  return false;
 }
 function applyRawFilter(text){
   const hideBash=getHideBashPref();
@@ -13146,7 +14777,7 @@ function applyRawFilter(text){
   //   'output' — a hidden `⎿ …` result block and its indented continuation rows
   //              (file dumps, "Shell cwd was reset…", "… +N lines" markers).
   // Suppression ends at the next bullet, blank line, another ⎿, or a column-0
-  // line — so Claude's spoken text and paragraph breaks are always kept.
+  // line — so Codex's spoken text and paragraph breaks are always kept.
   let mode='';
   for(const line of lines){
     if(hideBash&&_isUpdateNoise(line))continue;
@@ -13160,7 +14791,7 @@ function applyRawFilter(text){
     if(hideBash&&isBullet&&_isBashFetchHeader(line)){
       mode='call';continue;
     }
-    // A different bullet (Claude's spoken text) — always kept, ends suppression.
+    // A different bullet (Codex's spoken text) — always kept, ends suppression.
     if(isBullet){mode='';out.push(line);continue;}
     // Blank line — keep so paragraph breaks stay intact, ends suppression.
     if(line.trim()===''){mode='';out.push(line);continue;}
@@ -13178,7 +14809,7 @@ function _escTermHtml(s){
 // Linkify http(s):// URLs and absolute file paths in raw terminal output.
 // URL handling:
 //  (1) URL on one logical line — escape, trim trailing punctuation, wrap in <a>.
-//  (2) URL split across multiple rows by Claude Code's alt-screen TUI — when a
+//  (2) URL split across multiple rows by Codex's alt-screen TUI — when a
 //      whitespace/newline appears at column ≥ paneWidth-4 followed by row
 //      padding and a URL-valid char on the next row, treat as a soft wrap:
 //      strip padding+newline from href but emit per-chunk <a> tags so the
@@ -13187,7 +14818,7 @@ function _escTermHtml(s){
 //  Absolute paths like /home/foo/bar.md become <BASE>/file?path=... links so
 //  the user can open the file in a new tab. Paths inside URLs are skipped
 //  because the URL match is preferred at any tied position.
-//  Like URLs, a path that Claude Code's TUI soft-wraps across rows (breaking at
+//  Like URLs, a path that Codex's TUI soft-wraps across rows (breaking at
 //  the pane width, often with a leading indent on the continuation row) is
 //  rejoined into one href — see _renderPathSpan for the wrap heuristic.
 const _RAW_URL_TRAIL_RE=/[.,;:!?)\]}>'"]/;
@@ -13284,11 +14915,11 @@ function _renderPathSpan(text,start,paneWidth){
   const MAX_WRAP_LINES=20;
   // Greedily consume path chars. When we hit whitespace, decide whether it's the
   // end of the path or a soft wrap of one long path across TUI rows — the same
-  // situation _renderUrlSpan handles for URLs. Long deliverable paths Claude
+  // situation _renderUrlSpan handles for URLs. Long deliverable paths Codex
   // prints — e.g. …/GRABO_Schmalz_ ⏎  GRIPSTER_…_2026-07-10.pdf — break this way,
   // and the file only carries its .ext on the last row.
   //
-  // Two wrap signals, because Claude Code doesn't always draw to the full pane
+  // Two wrap signals, because Codex doesn't always draw to the full pane
   // width — inside a bordered/indented box the content wraps at a narrower width
   // than pane_width reports, which used to leave the tail row linked on its own
   // (a truncated /GRABO_Schmalz_…pdf pointing at nothing):
@@ -13385,35 +15016,10 @@ function _linkifyTerminalText(text,paneWidth){
   }
   return out;
 }
-function _hasSelectionWithin(el){
-  const sel=window.getSelection?window.getSelection():null;
-  if(!sel||sel.isCollapsed||sel.rangeCount===0)return false;
-  for(let i=0;i<sel.rangeCount;i++){
-    const r=sel.getRangeAt(i);
-    if(el.contains(r.startContainer)||el.contains(r.endContainer)||el.contains(r.commonAncestorContainer))return true;
-  }
-  return false;
-}
-// Part 4: once the user clears a terminal selection, flush any render we deferred
-// while they were highlighting text to copy.
-document.addEventListener('selectionchange',()=>{
-  if(typeof rawState!=='object'||!rawState)return;
-  for(const n in rawState){
-    const st=rawState[n];
-    if(st&&st._pendingRender){
-      const el=document.getElementById('raw-'+n);
-      if(el&&!_hasSelectionWithin(el))renderRawText(n);
-    }
-  }
-});
 function renderRawText(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
-  // Part 4: don't clobber an active text selection inside the terminal — defer the
-  // re-render so the user can highlight & copy while output keeps streaming.
-  if(_hasSelectionWithin(rawEl)){st._pendingRender=true;return;}
-  st._pendingRender=false;
   const wasAtBottom=!st.userScrolledUp;
   const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
   const filtered=applyRawFilter(st.fullText);
@@ -13434,7 +15040,7 @@ function rerenderAllRaw(){
 function toggleHideBash(name,checked){
   setHideBashPref(checked);
   const lbl=document.getElementById('hidebash-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool calls + update logs':'Off — showing all output';
+  if(lbl)lbl.textContent=checked?'On — hiding tool calls':'Off — showing all output';
   rerenderAllRaw();
 }
 function toggleHideOutput(name,checked){
@@ -13466,7 +15072,7 @@ function restoreDrafts(){
     sessions.forEach(s=>{
       const key=tab+'-'+s.name;
       const el=document.getElementById('cmd-'+tab+'-'+s.name);
-      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el);updateComposerBtn(key)}
+      if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
     });
   });
 }
@@ -13500,41 +15106,27 @@ function esc(str){
 }
 function formatModelName(model){
   if(!model)return'';
-  const oneM=/\[1m\]$/.test(model);
-  // Strip [1m] context suffix, claude- prefix, date suffix like -20251001
-  let m=model.replace(/\[1m\]$/,'').replace(/^claude-/,'');
-  m=m.replace(/-\d{8}$/,'');
-  // Extract family and version: e.g. "sonnet-4-6" -> "sonnet 4.6"
-  const parts=m.match(/^([a-z]+)-(.+)$/);
-  if(parts){
-    const family=parts[1];
-    const ver=parts[2].replace(/-/g,'.');
-    m=family+' '+ver;
-  }
-  return m+(oneM?' · 1M':'');
+  return model.replace(/-\d{8}$/,'');
 }
-// Keep in sync with ALLOWED_SESSION_MODELS in the Python backend.
-// Seed list; refreshed from /api/models on load so newly-released models
-// (added by the 24h auto-detect) appear in the dropdown without a redeploy.
+// Seed list; refreshed from the installed Codex CLI through /api/models.
 let MODEL_CHOICES=[
-  ['claude-opus-5[1m]','Opus 5 · 1M'],
-  ['claude-opus-5','Opus 5'],
-  ['claude-sonnet-5[1m]','Sonnet 5 · 1M'],
-  ['claude-sonnet-5','Sonnet 5'],
-  ['claude-opus-4-8[1m]','Opus 4.8 · 1M'],
-  ['claude-opus-4-8','Opus 4.8'],
-  ['claude-fable-5[1m]','Fable 5 · 1M'],
-  ['claude-fable-5','Fable 5'],
-  ['claude-sonnet-4-6[1m]','Sonnet 4.6 · 1M'],
-  ['claude-sonnet-4-6','Sonnet 4.6'],
-  ['claude-haiku-4-5','Haiku 4.5'],
+  ['gpt-5.6-sol','GPT-5.6 Sol'],
+  ['gpt-5.6','GPT-5.6 (Sol alias)'],
+  ['gpt-5.6-terra','GPT-5.6 Terra'],
+  ['gpt-5.6-luna','GPT-5.6 Luna'],
+  ['gpt-5.5','GPT-5.5'],
+  ['gpt-5.4','GPT-5.4'],
 ];
+let EFFORT_CHOICES=['none','low','medium','high','xhigh','max'];
+let DEFAULT_EFFORT='max';
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
       if(d&&Array.isArray(d.models)&&d.models.length){
         MODEL_CHOICES=d.models.filter(m=>Array.isArray(m)&&m.length===2);
       }
+      if(d&&Array.isArray(d.efforts)&&d.efforts.length)EFFORT_CHOICES=d.efforts;
+      if(d&&d.default_effort)DEFAULT_EFFORT=d.default_effort;
     }).catch(()=>{});
   }catch(e){}
 })();
@@ -13560,15 +15152,20 @@ function openModelMenu(name,anchor,ev){
   if(_modelMenuEl){closeModelMenu();return;}
   const s=sessions.find(x=>x.name===name)||{};
   const cur=s.model_pending||s.model||'';
-  const curBase=cur.replace(/\[1m\]$/,'');
   const menu=document.createElement('div');
   menu.className='model-menu';
-  let html='<div class="mm-title">Model · applies from next reply</div>';
+  let html='<div class="mm-title">Codex model · applies after restart</div>';
   MODEL_CHOICES.forEach(([id,label])=>{
-    // Transcript-detected models carry no [1m]; treat the base-id match as
-    // current only when no exact [1m] choice matches.
-    const sel=cur&&(id===cur||(id===curBase&&!MODEL_CHOICES.some(c=>c[0]===cur)));
+    const sel=cur&&id===cur;
     html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
+      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
+  });
+  const effort=(s.effort||DEFAULT_EFFORT).toLowerCase();
+  html+='<div class="mm-title" style="border-top:1px solid #30363d;margin-top:4px">Reasoning effort</div>';
+  EFFORT_CHOICES.forEach(id=>{
+    const sel=id===effort;
+    const label=id==='xhigh'?'Extra high':id.charAt(0).toUpperCase()+id.slice(1);
+    html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionEffort(\''+esc(name)+'\',\''+id+'\')">'
       +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
   });
   menu.innerHTML=html;
@@ -13597,16 +15194,53 @@ async function setSessionModel(name,model){
   if(si>=0)sessions[si].model_pending=model;
   _paintModelBadge(name);
   try{
-    const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
+    let r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model})});
-    const d=await r.json().catch(()=>({}));
+      body:JSON.stringify({model,restart:false})});
+    let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
-    if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+' (applies from the next reply)';
+    if(d.codex_was_running){
+      const restart=confirm('Model saved as "'+model+'". Restart Codex now and resume the latest conversation?');
+      if(restart){
+        r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({model,restart:true})});
+        d=await r.json().catch(()=>({}));
+        if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+        if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
+      }else if(si>=0){sessions[si].model_pending=model;}
+    }else if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
+    _paintModelBadge(name);
+    if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+(d.restarted?' · restarted':' · saved');
   }catch(e){
     if(si>=0)sessions[si].model_pending=prev;
     _paintModelBadge(name);
     alert('Model switch failed: '+(e&&e.message?e.message:e));
+  }
+}
+
+async function setSessionEffort(name,effort){
+  closeModelMenu();
+  const s=sessions.find(x=>x.name===name);
+  const previous=s?s.effort:'';
+  try{
+    let r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({effort,restart:false})});
+    let d=await r.json().catch(()=>({}));
+    if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    if(s)s.effort=effort;
+    if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart Codex now and resume the latest conversation?')){
+      r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({effort,restart:true})});
+      d=await r.json().catch(()=>({}));
+      if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+    }
+    if(statusInfoEl)statusInfoEl.textContent='Reasoning effort → '+effort+(d.restarted?' · restarted':' · saved');
+  }catch(e){
+    if(s)s.effort=previous;
+    alert('Effort switch failed: '+(e&&e.message?e.message:e));
   }
 }
 function statusLabel(s){
@@ -13627,6 +15261,8 @@ function renderNav(){
       <span class="nav-session-id">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
+        ${s.away_mode?'<span class="nav-away">AW</span>':''}
+        ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
     brand.after(item);
   });
@@ -13637,7 +15273,7 @@ function renderNav(){
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Claude — each reply shows up here as a short summary.</div>';
+    return '<div class="chat-empty">No messages yet. Type below to talk to Codex — each reply shows up here as a short summary.</div>';
   }
   return msgs.map(m=>`
     <div class="chat-msg ${m.role}">
@@ -13691,10 +15327,11 @@ function renderDetail(){
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','CLAUDE.md');closeTabMore()">Project CLAUDE.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.json');closeTabMore()">Project settings.json</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.local.json');closeTabMore()">Project settings.local.json</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>`}
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.toml');closeTabMore()">Project config.toml</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.local.toml');closeTabMore()">Project config.local.toml</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>
+          `}
         </div>
       </div>
       <div class="detail-badges">
@@ -13703,9 +15340,9 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
-        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
@@ -13713,7 +15350,7 @@ function renderDetail(){
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
         <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
         </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
@@ -13724,9 +15361,9 @@ function renderDetail(){
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
+            oninput="autoGrow(this)"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
+          <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
@@ -13737,19 +15374,19 @@ function renderDetail(){
       <div class="raw-controls">
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
         <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
+      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a message or command…"
+          placeholder="Type a command and press Enter..."
           onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
+          oninput="autoGrow(this)"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send is-mic" id="cmd-send-raw-${s.name}" onclick="composerAction('raw-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
+        <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
       ${buildKeyBar(s.name,'raw')}
@@ -13763,7 +15400,7 @@ function renderDetail(){
           <button class="btn" onclick="loadProfileSkills('${s.name}')">Refresh</button>
         </div>
         <div class="skills-section">
-          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Claude in this profile)</span></div>
+          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Codex in this profile)</span></div>
           <div class="skills-list" id="skills-active-${s.name}"></div>
         </div>
         <div class="skills-section">
@@ -13771,13 +15408,13 @@ function renderDetail(){
           <div class="skills-list" id="skills-library-${s.name}"></div>
         </div>
         <div class="skills-section">
-          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with Claude Code; always available)</span></div>
+          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with Codex; always available)</span></div>
           <div class="skills-list" id="skills-builtin-${s.name}"></div>
         </div>
         <div class="skills-editor-wrap" id="skills-editor-wrap-${s.name}" style="display:none">
           <div class="skills-editor-header">
             <input id="skills-filename-${s.name}" placeholder="skill-name (e.g. my-skill)">
-            <input id="skills-description-${s.name}" placeholder="One-line description (used by Claude to discover the skill)">
+            <input id="skills-description-${s.name}" placeholder="One-line description (used by Codex to discover the skill)">
             <button class="btn" onclick="saveLibrarySkill('${s.name}')">Save</button>
             <button class="btn" onclick="closeSkillEditor('${s.name}')">Cancel</button>
           </div>
@@ -13801,23 +15438,11 @@ function renderDetail(){
       </div>
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="subscription"
-              onchange="setAuthMode('${s.name}','subscription')"
-              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
-            Subscription
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="api"
-              onchange="setAuthMode('${s.name}','api')"
-              ${s.auth_mode==='api'?'checked':''}>
-            API Key
-          </label>
-          <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
+        <div style="font-size:.85rem;color:#c9d1d9;margin-top:6px">
+          ${s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
+          <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed per Codex profile in Settings</span>
         </div>
       </div>
-      <div id="login-health-${s.name}"></div>
       <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
@@ -13831,7 +15456,7 @@ function renderDetail(){
               ${getHideBashPref()?'checked':''}>
             <span class="watchdog-toggle-slider"></span>
           </label>
-          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
+          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls':'Off — showing all output'}</span>
         </div>
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Use <b>Hide tool output</b> below to also drop the <code style="color:#79c0ff">⎿</code> result blocks. Setting is shared across all sessions.</div>
       </div>
@@ -13846,7 +15471,7 @@ function renderDetail(){
           </label>
           <span id="hideoutput-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideOutputPref()?'On — hiding tool output (⎿ …)':'Off — showing tool output'}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Claude's spoken text. Setting is shared across all sessions.</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Codex's spoken text. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
@@ -13854,10 +15479,37 @@ function renderDetail(){
         <div id="autopush-status-${s.name}" style="font-size:.82rem;color:#8b949e;margin-top:8px">${autopushDesc(s.autopush_mode)}</div>
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.5">
           <b style="color:#8b949e">Off</b> — the dashboard never types into this terminal.<br>
-          <b style="color:#79c0ff">Basic</b> — auto-selects from Claude's option menus and confirms permission/plan prompts (presses Enter), and keeps the session logged in. No free-form messages.<br>
-          <b style="color:#56d364">Full</b> — everything in Basic, plus it writes a "keep going" instruction when Claude pauses or seems to stop before the task is 100% finished.
+          <b style="color:#79c0ff">Basic</b> — auto-selects from Codex's option menus and confirms permission/plan prompts (presses Enter), and keeps the session logged in. No free-form messages.<br>
+          <b style="color:#56d364">Full</b> — everything in Basic, plus it writes a "keep going" instruction when Codex pauses or seems to stop before the task is 100% finished.
         </div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Codex is paused waiting for confirmation to keep going on the current task.</div>
         <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
+      </div>
+      <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label class="away-toggle">
+            <input type="checkbox" id="away-toggle-${s.name}"
+              onchange="toggleAwayMode('${esc(s.name)}',this.checked)"
+              ${s.away_mode?'checked':''}>
+            <span class="away-toggle-slider"></span>
+          </label>
+          <span id="away-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.away_mode?'Running...':'Off'}</span>
+        </div>
+        <div class="away-log" id="away-log-${s.name}"></div>
+      </div>
+      <div class="tier" style="margin-top:12px" id="gonuts-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Go Nuts Mode</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+          <label class="gonuts-toggle">
+            <input type="checkbox" id="gonuts-toggle-${s.name}"
+              onchange="toggleGoNutsMode('${esc(s.name)}',this.checked)"
+              ${s.go_nuts_mode?'checked':''}>
+            <span class="gonuts-toggle-slider"></span>
+          </label>
+          <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
+        </div>
+        <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
       </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
@@ -13946,6 +15598,8 @@ function switchTab(name,tab){
   if(target)target.classList.add('active');
   stopAllRawPolling();
   stopStatsPolling();
+  stopAllAwayPolling();
+  stopAllGoNutsPolling();
   stopAllWatchdogPolling();
   if(tab==='raw')startRawPolling(name);
   if(tab==='info'){
@@ -14192,7 +15846,7 @@ async function sendChat(name){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-    input.value='';input.style.height='auto';updateComposerBtn('chat-'+name);
+    input.value='';input.style.height='auto';
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
@@ -14361,7 +16015,7 @@ async function sendCmd(name,source){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-    input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
+    input.value='';input.style.height='auto';
     delete draftText[source+'-'+name];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
@@ -14381,7 +16035,7 @@ function startRawPolling(name){
   if(st.polling)return;
   st.polling=true;
   pollRawDelta(name);
-  // Poll fast (300ms) for the first ~6s while Claude Code's TUI is booting,
+  // Poll fast (300ms) for the first ~6s while Codex's TUI is booting,
   // then drop to 1s steady-state polling.
   let ticks=0;
   st.timer=setInterval(()=>{
@@ -14490,7 +16144,7 @@ async function loadRaw(name){
   st.firstLoad=true;
   st.fullText='';
   const rawEl=document.getElementById('raw-'+name);
-  if(rawEl)rawEl.textContent='Loading Claude Code...';
+  if(rawEl)rawEl.textContent='Loading Codex...';
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
   await pollRawDelta(name);
@@ -14510,7 +16164,7 @@ function updateStatusPill(name,status,detail){
 
 function updateCard(s){
   // Sync messages from server. The server keeps ONE assistant summary per turn,
-  // updated in place as Claude's output settles, so mirror that: refresh the
+  // updated in place as Codex's output settles, so mirror that: refresh the
   // latest assistant bubble when its text changes, append it when it's new —
   // never duplicate it.
   if(s.messages&&s.messages.length){
@@ -14637,7 +16291,7 @@ async function pollStatus(){
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update model badge in nav
+      // Update away_mode, go_nuts_mode, and model badges in nav
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
@@ -14652,7 +16306,7 @@ async function pollStatus(){
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
   _authPollCount++;
-  if(_authPollCount%5===0)checkClaudeAuth();
+  if(_authPollCount%5===0)checkCodexAuth();
   // Refresh inline server stats every 3rd poll (~30s)
   if(_authPollCount%3===0)refreshNavStats();
 }
@@ -14674,7 +16328,7 @@ async function refreshNavStats(){
 }
 refreshNavStats();
 
-// --- Anthropic OAuth usage limits (5h + 7d) in nav header ---
+// --- OpenAI/Codex usage indicators (5h + 7d) in nav header ---
 let _usageLimitsTimer=null;
 function _fmtResetTime(iso){
   if(!iso)return'';
@@ -14698,6 +16352,23 @@ function _applyUsageStyle(fillEl,pctNum){
   else if(pctNum>=70)cls='warn';
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
+function _fmtUsageTokens(n){
+  n=Number(n)||0;
+  if(n>=1e9)return(n/1e9).toFixed(1)+'B';
+  if(n>=1e6)return(n/1e6).toFixed(1)+'M';
+  if(n>=1e3)return(n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+function _fmtUsageCost(n){
+  n=Number(n)||0;
+  return '$'+n.toFixed(n>=10?0:2);
+}
+function _usageMetaText(windowData){
+  const used=_fmtUsageTokens(windowData.tokens||0);
+  const limit=_fmtUsageTokens(windowData.soft_limit||0);
+  const cost=_fmtUsageCost(windowData.estimated_cost_usd||0);
+  return used+'/'+limit+' · '+cost;
+}
 async function refreshUsageLimits(){
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
@@ -14720,16 +16391,30 @@ async function refreshUsageLimits(){
     const sd=data.seven_day||{};
     const fhPct=Math.round(Number(fh.utilization)||0);
     const sdPct=Math.round(Number(sd.utilization)||0);
+    const fhMeta=_usageMetaText(fh);
+    const sdMeta=_usageMetaText(sd);
     _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
     _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
     _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
     _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
+    const navPct5h=document.getElementById('nav-usage-5h-pct');
+    const navPct7d=document.getElementById('nav-usage-7d-pct');
+    const navMeta5h=document.getElementById('nav-usage-5h-meta');
+    const navMeta7d=document.getElementById('nav-usage-7d-meta');
+    if(navPct5h)navPct5h.textContent=fhPct+'%';
+    if(navPct7d)navPct7d.textContent=sdPct+'%';
+    if(navMeta5h)navMeta5h.textContent=fhMeta;
+    if(navMeta7d)navMeta7d.textContent=sdMeta;
     const pct5h=document.getElementById('tools-usage-5h-pct');
     const pct7d=document.getElementById('tools-usage-7d-pct');
+    const meta5h=document.getElementById('tools-usage-5h-meta');
+    const meta7d=document.getElementById('tools-usage-7d-meta');
     if(pct5h)pct5h.textContent=fhPct+'%';
     if(pct7d)pct7d.textContent=sdPct+'%';
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at);
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at);
+    if(meta5h)meta5h.textContent=fhMeta;
+    if(meta7d)meta7d.textContent=sdMeta;
+    const fhTitle='OpenAI 5-hour usage · '+fhPct+'% · '+fhMeta;
+    const sdTitle='OpenAI 7-day usage · '+sdPct+'% · '+sdMeta;
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
     if(fhWrap)fhWrap.title=fhTitle;
@@ -14758,7 +16443,8 @@ function startUsageLimitsPolling(){
 }
 startUsageLimitsPolling();
 
-// ── Login health: detect sessions whose Claude is on a previous login ──
+// Codex reads auth from CODEX_HOME when it starts. Profile/model restarts use
+// `codex resume --last`, so the retired Codex stale-login poll is intentionally off.
 let _loginHealth={account:null,stale_count:0,sessions:[]};
 let _loginHealthTimer=null;
 async function refreshLoginHealth(){
@@ -14780,8 +16466,8 @@ function renderLoginHealth(){
     if(s&&s.stale){
       const curAcct=acct.email?(esc(acct.email)+(acct.plan?' · '+esc(acct.plan):'')):'the current login';
       el.innerHTML='<div style="margin-top:12px;background:#3d1d1d;border:1px solid #f85149;border-radius:8px;padding:10px 12px;color:#ffdcd6;font-size:.82rem;display:flex;flex-direction:column;gap:8px">'
-        +'<span>⚠ This session\'s Claude started on a <b>previous login</b> and is still using it. Its in-terminal 5-hour usage bar reflects that older account — not the current login ('+curAcct+'). Restart to move it onto the current account (the conversation is preserved via --continue).</span>'
-        +'<button onclick="reloginSession(\''+esc(name)+'\')" style="align-self:flex-start;background:#da3633;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:.8rem;cursor:pointer">Restart Claude on current login</button>'
+        +'<span>⚠ This session\'s Codex started on a <b>previous login</b> and is still using it. Its in-terminal 5-hour usage bar reflects that older account — not the current login ('+curAcct+'). Restart to move it onto the current account (the conversation is preserved via --continue).</span>'
+        +'<button onclick="reloginSession(\''+esc(name)+'\')" style="align-self:flex-start;background:#da3633;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:.8rem;cursor:pointer">Restart Codex on current login</button>'
         +'</div>';
     }else{
       el.innerHTML='';
@@ -14789,20 +16475,18 @@ function renderLoginHealth(){
   });
 }
 async function reloginSession(name){
-  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch with --continue to preserve the conversation.'))return;
+  if(!confirm('Restart Codex in "'+name+'" on the current login?\n\nIt will exit and relaunch with --continue to preserve the conversation.'))return;
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/relogin',{method:'POST'});
     const data=await resp.json();
     if(!resp.ok){alert(data.error||'Failed to restart');return}
     const el=document.getElementById('login-health-'+name);
-    if(el)el.innerHTML='<div style="margin-top:12px;color:#8b949e;font-size:.82rem">Restarting Claude on the current login…</div>';
+    if(el)el.innerHTML='<div style="margin-top:12px;color:#8b949e;font-size:.82rem">Restarting Codex on the current login…</div>';
     setTimeout(refreshLoginHealth,9000);
-  }catch(e){alert('Failed to restart Claude.')}
+  }catch(e){alert('Failed to restart Codex.')}
 }
 function startLoginHealthPolling(){
   if(_loginHealthTimer)clearInterval(_loginHealthTimer);
-  refreshLoginHealth();
-  _loginHealthTimer=setInterval(refreshLoginHealth,60000);
 }
 startLoginHealthPolling();
 
@@ -14891,9 +16575,9 @@ async function openConnections(){
       </div>`).join('');
     const note = !d.configured
       ? 'Google connections aren’t configured yet — ask the admin to add the OAuth client.'
-      : (d.mcp_ready ? '' : 'Connected accounts are saved securely; Claude’s live access turns on once the admin enables the Google tool.');
+      : (d.mcp_ready ? '' : 'Connected accounts are saved securely; Codex’s live access turns on once the admin enables the Google tool.');
     modal.innerHTML=`<h3>Connect data sources</h3>
-      <p class="conn-note">Give Claude access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
+      <p class="conn-note">Give Codex access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
       ${rows}${note?`<p class="conn-note">${note}</p>`:''}
       <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
   }catch(e){
@@ -14914,8 +16598,8 @@ async function openGlobalContext(){
   document.getElementById('modal-overlay').classList.add('active');
   try{
     const r=await fetch(BASE+'/api/global-context'); const d=await r.json();
-    modal.innerHTML=`<h3>Global Context — every member's Claude</h3>
-      <p class="conn-note">Prepended as a managed block to each member's CLAUDE.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
+    modal.innerHTML=`<h3>Global Context — every member's Codex</h3>
+      <p class="conn-note">Prepended as a managed block to each member's AGENTS.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
       <textarea id="gctx-ta" class="modal-input" style="height:320px;font-family:monospace;white-space:pre;width:100%">${esc(d.content||'')}</textarea>
       <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" onclick="saveGlobalContext()">Save &amp; sync</button></div>`;
@@ -14973,15 +16657,15 @@ async function deleteSession(name){
   }catch(e){alert('Failed to kill session.')}
 }
 
-// ── Claude Auth ──
+// ── Codex Auth ──
 let _authCache=null;
 let _usageCache=null;
 let _authPollCount=0;
 
-async function checkClaudeAuth(){
+async function checkCodexAuth(){
   // Fetch auth and usage independently so one failure doesn't break the other
   try{
-    const authResp=await fetch(BASE+'/api/auth/claude-status');
+    const authResp=await fetch(BASE+'/api/auth/codex-status');
     if(authResp.ok){
       const data=await authResp.json();
       _authCache=data;
@@ -15001,8 +16685,8 @@ async function checkClaudeAuth(){
 }
 
 function renderAuthIndicator(){
-  const dot=document.getElementById('claude-auth-dot');
-  const label=document.getElementById('claude-auth-label');
+  const dot=document.getElementById('codex-auth-dot');
+  const label=document.getElementById('codex-auth-label');
   if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
   if(_authCache.hasApiKey&&!_authCache.loggedIn){
     dot.className='status-dot';dot.style.background='#d2a8ff';
@@ -15011,10 +16695,8 @@ function renderAuthIndicator(){
   if(_authCache.loggedIn){
     dot.className='status-dot idle';dot.style.background='';
     const email=_authCache.email||'';
-    const plan=_authCache.plan||(_authCache.subscriptionType?_authCache.subscriptionType.charAt(0).toUpperCase()+_authCache.subscriptionType.slice(1):'');
-    const stale=(_loginHealth&&_loginHealth.stale_count)||0;
-    label.textContent=(stale>0?'⚠ '+stale+' on old login · ':'')+email+(plan?' · '+plan:'');
-    if(stale>0){dot.className='status-dot';dot.style.background='#f85149';}
+    const plan=_authCache.subscriptionType||'';
+    label.textContent=email+(plan?' · '+plan.charAt(0).toUpperCase()+plan.slice(1):'');
   }else{
     dot.className='status-dot busy';dot.style.background='';
     label.textContent='Not connected';
@@ -15071,24 +16753,23 @@ function renderAuthPanel(){
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
-    const planLabel=_authCache.plan||(plan.charAt(0).toUpperCase()+plan.slice(1));
     el.innerHTML=`
-      <div class="auth-title">Claude Code Connected</div>
+      <div class="auth-title">Codex Connected</div>
       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
-      <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(planLabel)}</span></span></div>
-      <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMethod||'—')}</span></div>
+      <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
+      <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMode||'—')}</span></div>
       ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">API Key</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
       ${usageHtml}
       <hr class="auth-divider">
       ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
-      <button class="auth-btn auth-btn-danger" onclick="claudeLogout()">Sign out of Claude</button>
+      <button class="auth-btn auth-btn-danger" onclick="codexLogout()">Sign out of Codex</button>
     `;
   }else{
     el.innerHTML=`
-      <div class="auth-title">Claude Code — Not Connected</div>
-      <p class="auth-hint">Set an Anthropic API key to authenticate Claude Code for new sessions:</p>
+      <div class="auth-title">Codex — Not Connected</div>
+      <p class="auth-hint">Set an OpenAI API key to authenticate Codex for new sessions:</p>
       <input type="password" class="auth-api-input" id="auth-api-key-input"
-        placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false"
+        placeholder="sk-..." autocomplete="off" spellcheck="false"
         value="${_authCache.hasApiKey?'••••••••••••••••':''}">
       <div style="display:flex;gap:8px;margin-top:10px">
         <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
@@ -15096,7 +16777,7 @@ function renderAuthPanel(){
       </div>
       ${usageHtml}
       <hr class="auth-divider">
-      <p class="auth-hint">Or authenticate via OAuth by running <code style="color:#79c0ff">claude auth login</code> in a terminal session.</p>
+      <p class="auth-hint">Or sign in to ChatGPT by running <code style="color:#79c0ff">codex login</code> in a terminal session.</p>
     `;
   }
 }
@@ -15112,8 +16793,8 @@ async function saveApiKey(){
       body:JSON.stringify({apiKey:key})
     });
     const data=await resp.json();
-    if(!resp.ok){alert(data.detail||'Failed to save');return}
-    await checkClaudeAuth();
+    if(!resp.ok){alert(data.error||data.detail||'Failed to save');return}
+    await checkCodexAuth();
     renderAuthPanel();
   }catch(e){alert('Failed to save API key.')}
 }
@@ -15125,17 +16806,17 @@ async function clearApiKey(){
       body:JSON.stringify({apiKey:''})
     });
     await resp.json();
-    await checkClaudeAuth();
+    await checkCodexAuth();
     renderAuthPanel();
   }catch(e){alert('Failed to clear API key.')}
 }
 
-async function claudeLogout(){
-  if(!confirm('Sign out of Claude Code?'))return;
+async function codexLogout(){
+  if(!confirm('Sign out of Codex?'))return;
   try{
     const resp=await fetch(BASE+'/api/auth/logout',{method:'POST'});
     await resp.json();
-    await checkClaudeAuth();
+    await checkCodexAuth();
     renderAuthPanel();
   }catch(e){alert('Failed to sign out.')}
 }
@@ -15143,7 +16824,7 @@ async function claudeLogout(){
 // Close auth dropdown on outside click
 document.addEventListener('click',function(e){
   const dd=document.getElementById('auth-dropdown');
-  const trigger=document.getElementById('claude-auth');
+  const trigger=document.getElementById('codex-auth');
   if(dd.classList.contains('active')&&!dd.contains(e.target)&&!trigger.contains(e.target)){
     dd.classList.remove('active');
   }
@@ -15276,7 +16957,7 @@ async function loadSessionStats(name){
     const resp=await fetch(BASE+'/api/sessions/'+name+'/stats');
     const st=await resp.json();
     if(!st.available){
-      panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Claude Code activity.</span>';
+      panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Codex activity.</span>';
       return;
     }
     const rateCls=st.rateStatus;
@@ -15327,7 +17008,7 @@ let _watchdogTimers={};
 const AUTOPUSH_TITLES={
   off:'Off — the dashboard never types into this terminal',
   basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
-  full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
+  full:'Full — Basic, plus write a "keep going" instruction when Codex pauses before finishing'
 };
 function autopushDesc(mode){
   return ({off:'Off — no auto-typing',
@@ -15442,7 +17123,7 @@ function buildKeyBar(name,tab){
     <span class="key-bar-label">Keys:</span>
     <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Claude Code's input buffer without interrupting the running task)">Clear Input</button>
+    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Codex's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
@@ -15457,14 +17138,13 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/new')" title="New conversation">/new</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/status')" title="Session status & usage">/status</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/diff')" title="Show working-tree diff">/diff</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4')" title="Switch to GPT-5.4">/model 5.4</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4-mini')" title="Switch to GPT-5.4-mini">/model mini</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/approvals')" title="Approvals mode">/approvals</button>
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Opts:</span>
     <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
@@ -15828,10 +17508,10 @@ async function sendSlashCommand(name,cmd){
 
 // ── Skills Tab ──
 // Per-profile skills UI:
-//   • Active section: what Claude actually loads from ~/.claude-<profile>/skills/
+//   • Active section: what Codex actually loads from ~/.codex-<profile>/skills/
 //   • Library section: toggle-on/off canonical skills from ~/.tmux-dashboard/skill-library/
 //     (enabling = symlink into the profile's skills dir; disabling = unlink)
-//   • Built-in section: read-only list of skills bundled with Claude Code
+//   • Built-in section: read-only list of skills bundled with Codex
 //
 // The session's profile_id (set per tmux session) determines the scope.
 let _builtinSkillsCache=null;
@@ -15911,7 +17591,7 @@ function _renderActiveSkills(name,pid,data){
       <div class="skills-row disabled-row">
         <div class="skills-row-body">
           <div class="skills-row-name custom-name">${esc(fname)}</div>
-          <div class="skills-row-desc">Legacy flat file. Claude Code does not load this format — wrap it in a <code>${esc(fname.replace(/\.md$/,''))}/SKILL.md</code> directory with frontmatter to load.</div>
+          <div class="skills-row-desc">Legacy flat file. Codex does not load this format — wrap it in a <code>${esc(fname.replace(/\.md$/,''))}/SKILL.md</code> directory with frontmatter to load.</div>
         </div>
       </div>`);
   }
@@ -16071,7 +17751,7 @@ async function saveLibrarySkill(sessionName){
   }
   const description=descEl?descEl.value.trim():'';
   if(!description){
-    if(!confirm('No description set. Claude Code uses the description to discover skills — without one, this skill may never trigger automatically. Save anyway?'))return;
+    if(!confirm('No description set. Codex uses the description to discover skills — without one, this skill may never trigger automatically. Save anyway?'))return;
   }
   try{
     const resp=await fetch(BASE+'/api/skill-library/'+encodeURIComponent(skillName),{
@@ -16103,7 +17783,7 @@ function closeSkillEditor(name){
   _editingSkillName=null;
 }
 
-// ── Claude profiles ──
+// ── Codex profiles ──
 let _profilesCache = null;        // [{id,name,model,effort,builtin}, ...]
 let _profilesEditing = null;       // currently-edited full profile object
 let _profilePending = {};          // sessionName -> "pending restart" flag
@@ -16128,9 +17808,9 @@ function renderProfileDropdown(s){
     : `<option value="default" selected>Default</option>`;
   const pending = _profilePending[s.name] ? ' pending' : '';
   const restartTitle = _profilePending[s.name]
-    ? 'Restart Claude to apply the new profile'
-    : 'Restart Claude with this profile';
-  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)">
+    ? 'Restart Codex to apply the new profile'
+    : 'Restart Codex with this profile';
+  return `<div class="profile-wrap" title="Codex profile (CODEX_HOME)">
     <span class="profile-label">Profile</span>
     <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
     <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
@@ -16138,10 +17818,10 @@ function renderProfileDropdown(s){
 }
 
 async function onProfileChange(sessionName, profileId){
-  // First call: probe whether Claude is currently running in this session
+  // First call: probe whether Codex is currently running in this session
   // (we pass restart:false so we get back the running state). If it IS running,
   // ask the user whether to restart now; otherwise the new profile won't take
-  // effect until Claude is next launched and the user's memory will appear to
+  // effect until Codex is next launched and the user's memory will appear to
   // "spill" from the previous profile.
   try{
     let resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
@@ -16153,12 +17833,12 @@ async function onProfileChange(sessionName, profileId){
     const sess = sessions.find(x=>x.name===sessionName);
     if(sess) sess.profile_id = profileId;
 
-    if(data.claude_was_running && !data.restarted){
+    if(data.codex_was_running && !data.restarted){
       const wantRestart = confirm(
         'Profile switched to "' + profileId + '".\n\n' +
-        'Claude is still running with the previous profile and will keep using it ' +
+        'Codex is still running with the previous profile and will keep using it ' +
         '(including its memory) until you restart it.\n\n' +
-        'Restart Claude now?'
+        'Restart Codex now?'
       );
       if(wantRestart){
         resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
@@ -16184,7 +17864,7 @@ async function onProfileChange(sessionName, profileId){
 async function restartWithProfile(sessionName){
   const sess = sessions.find(x=>x.name===sessionName);
   const pid = (sess && sess.profile_id) || 'default';
-  if(!confirm('Exit Claude in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Claude state will be lost.')) return;
+  if(!confirm('Exit Codex in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Codex state will be lost.')) return;
   try{
     const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -16194,7 +17874,7 @@ async function restartWithProfile(sessionName){
     if(!resp.ok){ alert(data.error||'Failed to restart'); return; }
     delete _profilePending[sessionName];
     if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to restart Claude.'); }
+  }catch(e){ alert('Failed to restart Codex.'); }
 }
 
 // ── Current-user awareness ──────────────────────────────────────────────────
@@ -16242,23 +17922,23 @@ async function doLogout(){
   }catch(e){ alert('Logout failed'); }
 }
 
-// ── Settings modal (My Context / History / Users) ───────────────────────────
-let _settingsActiveTab = 'mycontext';
-let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
+// ── Config modal (My Context / History / Users) ───────────────────────────
+let _configActiveTab = 'mycontext';
+let _configHistoryDetail = null; // {session_name, ...} or null when showing list
 
-async function openSettings(tab){
+async function openConfig(tab){
   await loadCurrentUser();
-  _settingsActiveTab = tab || 'mycontext';
-  _settingsHistoryDetail = null;
-  const overlay = document.getElementById('settings-overlay');
+  _configActiveTab = tab || 'mycontext';
+  _configHistoryDetail = null;
+  const overlay = document.getElementById('config-overlay');
   overlay.classList.add('active');
-  renderSettingsTabs();
-  renderSettingsContent();
+  renderConfigTabs();
+  renderConfigContent();
 }
 
-function closeSettings(){
-  document.getElementById('settings-overlay').classList.remove('active');
-  _settingsHistoryDetail = null;
+function closeConfig(){
+  document.getElementById('config-overlay').classList.remove('active');
+  _configHistoryDetail = null;
 }
 
 
@@ -16274,31 +17954,31 @@ function renderSettingsTabs(){
   if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
-    `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
+    `<div class="config-tab${_configActiveTab===t.id?' active':''}" onclick="switchConfigTab('${t.id}')">${t.label}</div>`
   ).join('');
 }
 
-function switchSettingsTab(tab){
-  _settingsActiveTab = tab;
-  _settingsHistoryDetail = null;
-  renderSettingsTabs();
-  renderSettingsContent();
+function switchConfigTab(tab){
+  _configActiveTab = tab;
+  _configHistoryDetail = null;
+  renderConfigTabs();
+  renderConfigContent();
 }
 
-function renderSettingsContent(){
-  const el = document.getElementById('settings-content');
-  if(_settingsActiveTab === 'mycontext'){
-    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
+function renderConfigContent(){
+  const el = document.getElementById('config-content');
+  if(_configActiveTab === 'mycontext'){
+    el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
-  }else if(_settingsActiveTab === 'history'){
-    if(_settingsHistoryDetail){
+  }else if(_configActiveTab === 'history'){
+    if(_configHistoryDetail){
       renderHistoryDetail();
     }else{
-      el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading your past sessions...</div></div>';
+      el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading your past sessions...</div></div>';
       loadHistory();
     }
-  }else if(_settingsActiveTab === 'users'){
-    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading users...</div></div>';
+  }else if(_configActiveTab === 'users'){
+    el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading users...</div></div>';
     loadUsersAdmin();
   }else if(_settingsActiveTab === 'apis'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading APIs...</div></div>';
@@ -16312,9 +17992,7 @@ function renderSettingsContent(){
   }
 }
 
-// --- Header browser sign-in badge ------------------------------------------
-// red = no browser can authorize Claude, green = one can, spinner = Claude is
-// driving a browser right now (so background use is never invisible).
+// --- Header browser-session badge ------------------------------------------
 let _browserAuth = null;
 let _browserAuthTimer = null;
 
@@ -16324,57 +18002,30 @@ async function refreshBrowserAuthBadge(){
   if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
   let d;
   try{
-    const r = await fetch(BASE+'/api/browser/auth-status');
+    const r = await fetch(BASE+'/api/browser/sessions');
     if(!r.ok){ el.style.display='none'; return; }
     d = await r.json();
   }catch(e){ return; }
   _browserAuth = d;
   el.style.display = 'inline-flex';
   el.classList.remove('ok','bad','active','unknown');
-  let title;
-  if(!d.any_logged_in){
-    // red — nothing signed in
-    el.classList.add('bad');
-    title = 'No signed-in browser session. Click to open one and sign in to claude.ai.';
-  }else{
-    const who = d.sessions.find(s=>s.logged_in && s.active) ||
-                d.sessions.find(s=>s.can_authorize) ||
-                d.sessions.find(s=>s.logged_in) || {};
-    const whoTxt = who.email ? ' ('+who.email+')' : '';
-    if(d.active){
-      // blinking green — someone/something is using it right now
-      el.classList.add('ok','active');
-      title = 'Browser in use right now'+whoTxt+' — '+(d.active_what||'activity detected')+'. Click to watch.';
-    }else{
-      // steady green — signed in and idle
-      el.classList.add('ok');
-      title = 'Browser signed in'+whoTxt+' and idle. Click to manage.';
-    }
-    if(!d.any_can_authorize){
-      title += ' Note: no signed-in account has a Max/Pro plan.';
-    }
-  }
-  el.title = title;
+  const running=(d.sessions||[]).filter(s=>s.running).length;
+  el.classList.add(running?'ok':'unknown');
+  el.title=running
+    ? running+' browser session'+(running===1?' is':'s are')+' running. Click to manage.'
+    : 'No browser sessions are running. Click to manage.';
 }
 
-// Clicking the badge: finish a pending sign-in if there is one, else manage browsers.
 function onBrowserBadgeClick(){
-  const p = _browserAuth && _browserAuth.pending_auth;
-  if(p && p.url){
-    window.open(p.url, '_blank');
-    return;
-  }
   openSettings('browser');
 }
 
 function startBrowserAuthPolling(){
   refreshBrowserAuthBadge();
-  // 6s: idle/active has to react quickly enough that the blink actually tracks
-  // someone using the browser. The claude.ai login check behind it is cached.
-  if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 6000);
+  if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 15000);
 }
 
-// --- Browser tab (admin) — manage independent Claude browser sessions ---
+// --- Browser tab (admin) — manage independent browser sessions ---
 let _browserSessions = [];
 let _bsEditId = null;   // session id currently being renamed / annotated
 let _bsData = null;     // last payload, so an edit toggle can re-render without refetching
@@ -16398,11 +18049,7 @@ async function loadBrowserTab(){
   // Proxy state second: the exit-IP lookups go out over the network, so let the
   // cards paint first and fill the badges in when they land.
   loadBrowserProxy(true);
-  // Sign-in state needs a live claude.ai check per browser, so fetch it after
-  // the cards are already on screen and repaint when it lands.
-  refreshBrowserAuthBadge().then(()=>{
-    if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{});
-  });
+  refreshBrowserAuthBadge();
 }
 
 // Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY
@@ -16431,14 +18078,7 @@ function renderBrowserTab(data){
     const notesBlock = notes
       ? '<div class="bs-notes">'+esc(notes)+'</div>'
       : '<div class="bs-notes empty">No note — use Edit to say what this browser is for.</div>';
-    // Sign-in state for this browser (from /api/browser/auth-status).
-    const a = ((_browserAuth&&_browserAuth.sessions)||[]).find(x=>x.id===s.id) || {};
     let badges = '';
-    if(a.busy) badges += '<span class="bs-badge login">⟳ '+esc(a.busy_what||'working')+'</span>';
-    if(a.can_authorize) badges += '<span class="bs-badge ok">✓ can log Claude in'+(a.email?' · '+esc(a.email):'')+'</span>';
-    else if(a.logged_in) badges += '<span class="bs-badge warn">signed in'+(a.email?' · '+esc(a.email):'')+' · no Max/Pro</span>';
-    else if(a.running) badges += '<span class="bs-badge bad">not signed in to claude.ai</span>';
-    if(a.use_for_login) badges += '<span class="bs-badge login">login browser</span>';
     // What this browser looks like from outside: its own exit IP + what it has
     // spent of the (per-GB billed) residential quota.
     const px = ((_bsProxy&&_bsProxy.browsers)||[]).find(x=>x.id===s.id) || null;
@@ -16465,8 +18105,6 @@ function renderBrowserTab(data){
           '<input id="bs-edit-name-'+id+'" value="'+esc(s.name)+'" placeholder="Browser name">'+
           '<label>What is this browser for?</label>'+
           '<textarea id="bs-edit-notes-'+id+'" placeholder="e.g. logged into the GRABO Google account — use for Ads/Analytics only">'+esc(notes)+'</textarea>'+
-          '<label class="bs-loginrow"><input type="checkbox" id="bs-edit-login-'+id+'"'+(s.use_for_login?' checked':'')+'> '+
-            'Use this browser to sign Claude in (auto-auth)</label>'+
           '<div class="bs-edit-actions">'+
             '<button class="btn btn-primary" onclick="saveBrowserEdit(\''+id+'\')">Save</button> '+
             '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
@@ -16488,7 +18126,7 @@ function renderBrowserTab(data){
     : '<div class="bs-add"><input id="bs-new-name" placeholder="New session name (optional)"><button class="btn btn-primary" onclick="createBrowserSession()">+ New browser session</button></div>';
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
-      '<div class="pf-banner">Independent browsers you (or Claude) can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
+      '<div class="pf-banner">Independent browsers you or a Codex browser workflow can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -16684,33 +18322,31 @@ async function removeBrowserSession(id){
   loadBrowserTab();
 }
 
-// --- Login tab (admin) — long-lived never-revoke auth token ---
+// --- Codex login tab (admin) ---
 let _authStatus = null;
 function _fmtTs(ms){ if(!ms) return '—'; try{ return new Date(ms).toLocaleString(); }catch(e){ return String(ms); } }
 async function loadLoginTab(){
   let d;
-  try{ const r=await fetch(BASE+'/api/auth/status'); d=await r.json(); if(!r.ok) throw new Error(d.error||'Failed'); }
+  try{ const r=await fetch(BASE+'/api/auth/codex-status'); d=await r.json(); if(!r.ok) throw new Error(d.error||'Failed'); }
   catch(e){ document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load: '+esc(e.message||e)+'</div></div>'; return; }
   _authStatus=d; renderLoginTab();
 }
 function renderLoginTab(){
-  const d=_authStatus||{}; const ll=d.longlived||{}; const plan=d.plan||{};
-  const active=!!d.injecting;
-  const statusLine = active
-    ? '<span class="bs-dot on"></span> <b>Never-revoke mode is ON.</b> Sessions launch with a stored long-lived token ('+esc(ll.prefix||'')+'), so concurrent sessions no longer rotate the shared credential.'
-    : '<span class="bs-dot off"></span> <b>Using the rotating plan credential.</b> Add a long-lived token to stop intermittent “OAuth access token revoked”.';
-  const planLine = 'Plan token: '+(plan.valid?'valid':'expired/absent')+(plan.subscriptionType?(' · '+esc(plan.subscriptionType)):'')+' · expires '+_fmtTs(plan.expiresAt);
+  const d=_authStatus||{};
+  const active=!!d.loggedIn;
+  const statusLine=active
+    ? '<span class="bs-dot on"></span> <b>Codex is connected.</b> '+esc(d.email||'')+(d.subscriptionType?' · '+esc(d.subscriptionType):'')
+    : '<span class="bs-dot off"></span> <b>Codex is not connected.</b>';
+  const detail='Auth mode: '+esc(d.authMode||'unknown')+(d.model?' · model '+esc(d.model):'');
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
-      '<div class="pf-banner">'+statusLine+'<br><span style="color:#8b949e">'+esc(planLine)+'</span></div>'+
-      '<label>Option A — generate from the dashboard</label>'+
-      '<div class="pf-banner">Click Start, open the link in <b>your own browser</b> (this server is Cloudflare-blocked from claude.ai), approve, then paste the code back.</div>'+
-      '<div id="login-setup-area"><button class="btn btn-primary" onclick="startSetupToken()">Start setup-token</button></div>'+
-      '<label style="margin-top:14px">Option B — paste a token you minted with <code>claude setup-token</code></label>'+
-      '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-ant-oat01-…" style="min-height:56px"></textarea>'+
-      '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save token</button></div>'+
-      (active? '<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Turn off (remove token)</button></div>':'')+
-      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">Note: with a token, sessions show a “· Claude API” label in their header — cosmetic; billing stays on your plan.</div>'+
+      '<div class="pf-banner">'+statusLine+'<br><span style="color:#8b949e">'+detail+'</span></div>'+
+      '<label>OpenAI API key</label>'+
+      '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-…" style="min-height:56px"></textarea>'+
+      '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save API key</button></div>'+
+      (d.hasApiKey?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Clear dashboard API key</button></div>':'')+
+      (active?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="logoutCodex()">Log Codex out</button></div>':'')+
+      '<div class="pf-banner" style="margin-top:10px;color:#8b949e">For ChatGPT subscription login, run <code>codex login</code> on the server. New sessions inherit the server login automatically.</div>'+
     '</div>';
 }
 async function startSetupToken(){
@@ -16747,15 +18383,19 @@ async function saveLoginToken(){
   const t=el?el.value.trim():'';
   if(!t){ alert('Paste a token'); return; }
   try{
-    const r=await fetch(BASE+'/api/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+    const r=await fetch(BASE+'/api/auth/api-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:t})});
     const d=await r.json();
     if(!r.ok){ alert(d.error||'Failed'); return; }
     loadLoginTab();
   }catch(e){ alert('Failed: '+e.message); }
 }
 async function clearLoginToken(){
-  if(!confirm('Remove the long-lived token? Sessions revert to the rotating plan credential.')) return;
-  try{ const r=await fetch(BASE+'/api/auth/token',{method:'DELETE'}); const d=await r.json(); if(!r.ok){ alert(d.error||'Failed'); return; } loadLoginTab(); }catch(e){ alert('Failed: '+e.message); }
+  if(!confirm('Clear the dashboard-managed OpenAI API key? Existing ChatGPT login credentials are left intact.')) return;
+  try{ const r=await fetch(BASE+'/api/auth/api-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:''})}); const d=await r.json(); if(!r.ok){ alert(d.error||'Failed'); return; } loadLoginTab(); checkCodexAuth(); }catch(e){ alert('Failed: '+e.message); }
+}
+async function logoutCodex(){
+  if(!confirm('Log Codex out on this server? The credential file is backed up first, but new sessions will not authenticate until you log in again.'))return;
+  try{const r=await fetch(BASE+'/api/auth/logout',{method:'POST'});const d=await r.json();if(!r.ok){alert(d.error||'Failed');return;}loadLoginTab();checkCodexAuth();}catch(e){alert('Failed: '+e.message);}
 }
 
 // --- My Context tab ---
@@ -16766,32 +18406,32 @@ async function loadMyContext(){
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed to load context'); }
   }catch(e){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('config-content').innerHTML =
+      '<div class="config-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
     return;
   }
   const files = {};
   (data.files||[]).forEach(f => { files[f.name] = f; });
-  const claude = files['CLAUDE.md'] || {content:'', path:''};
+  const codex = files['AGENTS.md'] || {content:'', path:''};
   const memory = files['MEMORY.md'] || {content:'', path:''};
-  const settings = files['settings.json'] || {content:'', path:''};
+  const config = files['config.toml'] || {content:'', path:''};
   const html = `
-    <div class="settings-section">
-      <div class="pf-banner">These files are read by Claude Code in <strong>every session you launch</strong> (set via <code>CLAUDE_CONFIG_DIR=${esc(data.dir||'')}</code>). They are private to your account.</div>
-      <label>CLAUDE.md</label>
-      <div class="my-ctx-path">${esc(claude.path||'')}</div>
-      <textarea class="my-ctx-claude" id="my-ctx-claude" spellcheck="false">${esc(claude.content||'')}</textarea>
-      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('CLAUDE.md','my-ctx-claude')">Save CLAUDE.md</button></div>
+    <div class="config-section">
+      <div class="pf-banner">These files are read by Codex in <strong>every session you launch</strong> (set via <code>CODEX_HOME=${esc(data.dir||'')}</code>). They are private to your account.</div>
+      <label>AGENTS.md</label>
+      <div class="my-ctx-path">${esc(codex.path||'')}</div>
+      <textarea class="my-ctx-codex" id="my-ctx-codex" spellcheck="false">${esc(codex.content||'')}</textarea>
+      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('AGENTS.md','my-ctx-codex')">Save AGENTS.md</button></div>
       <label>MEMORY.md</label>
       <div class="my-ctx-path">${esc(memory.path||'')}</div>
       <textarea class="my-ctx-memory" id="my-ctx-memory" spellcheck="false">${esc(memory.content||'')}</textarea>
       <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('MEMORY.md','my-ctx-memory')">Save MEMORY.md</button></div>
-      <label>settings.json</label>
-      <div class="my-ctx-path">${esc(settings.path||'')}</div>
-      <textarea class="my-ctx-settings" id="my-ctx-settings" spellcheck="false">${esc(settings.content||'')}</textarea>
-      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('settings.json','my-ctx-settings')">Save settings.json</button></div>
+      <label>config.toml</label>
+      <div class="my-ctx-path">${esc(config.path||'')}</div>
+      <textarea class="my-ctx-config" id="my-ctx-config" spellcheck="false">${esc(config.content||'')}</textarea>
+      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('config.toml','my-ctx-config')">Save config.toml</button></div>
     </div>`;
-  document.getElementById('settings-content').innerHTML = html;
+  document.getElementById('config-content').innerHTML = html;
 }
 
 async function saveMyContext(filename, textareaId){
@@ -16823,14 +18463,14 @@ async function loadHistory(){
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed to load history'); }
   }catch(e){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="pf-banner">Failed to load history: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('config-content').innerHTML =
+      '<div class="config-section"><div class="pf-banner">Failed to load history: '+esc(e.message||e)+'</div></div>';
     return;
   }
   const sessions = data.sessions || [];
   if(!sessions.length){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="history-empty">No past sessions yet. Create a session and send some messages — they will appear here.</div></div>';
+    document.getElementById('config-content').innerHTML =
+      '<div class="config-section"><div class="history-empty">No past sessions yet. Create a session and send some messages — they will appear here.</div></div>';
     return;
   }
   const rows = sessions.map(s => {
@@ -16849,37 +18489,37 @@ async function loadHistory(){
       ${keyInfoBlock}
     </div>`;
   }).join('');
-  document.getElementById('settings-content').innerHTML =
-    '<div class="settings-section"><div class="history-list">'+rows+'</div></div>';
+  document.getElementById('config-content').innerHTML =
+    '<div class="config-section"><div class="history-list">'+rows+'</div></div>';
 }
 
 async function openHistoryDetail(sessionName){
-  _settingsHistoryDetail = {session_name: sessionName, loading: true};
+  _configHistoryDetail = {session_name: sessionName, loading: true};
   renderHistoryDetail();
   try{
     const resp = await fetch(BASE+'/api/history/'+encodeURIComponent(sessionName));
     const data = await resp.json();
     if(!resp.ok){
-      _settingsHistoryDetail = null;
+      _configHistoryDetail = null;
       alert(data.error||'Failed to load session');
-      renderSettingsContent();
+      renderConfigContent();
       return;
     }
-    _settingsHistoryDetail = {session_name: sessionName, loading: false, data};
+    _configHistoryDetail = {session_name: sessionName, loading: false, data};
     renderHistoryDetail();
   }catch(e){
-    _settingsHistoryDetail = null;
+    _configHistoryDetail = null;
     alert('Failed to load session: '+e.message);
-    renderSettingsContent();
+    renderConfigContent();
   }
 }
 
 function renderHistoryDetail(){
-  if(!_settingsHistoryDetail) return;
-  const el = document.getElementById('settings-content');
-  const {session_name, loading, data} = _settingsHistoryDetail;
+  if(!_configHistoryDetail) return;
+  const el = document.getElementById('config-content');
+  const {session_name, loading, data} = _configHistoryDetail;
   if(loading){
-    el.innerHTML = `<div class="settings-section">
+    el.innerHTML = `<div class="config-section">
       <div class="history-detail-header">
         <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
         <div class="history-detail-name">${esc(session_name)}</div>
@@ -16898,7 +18538,7 @@ function renderHistoryDetail(){
         ${esc(m.text||'').replace(/\\n/g,'<br>')}
       </div>`).join('')
     : '<div class="history-empty">No user messages were recorded for this session.</div>';
-  el.innerHTML = `<div class="settings-section">
+  el.innerHTML = `<div class="config-section">
     <div class="history-detail-header">
       <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
       <div class="history-detail-name">${esc(session_name)} <span style="font-size:.72rem;color:#6e7681;font-weight:400">· ${msgs.length} messages</span></div>
@@ -16911,8 +18551,8 @@ function renderHistoryDetail(){
 }
 
 function backToHistoryList(){
-  _settingsHistoryDetail = null;
-  renderSettingsContent();
+  _configHistoryDetail = null;
+  renderConfigContent();
 }
 
 // --- APIs tab (admin only) — catalog of all external API keys + live usage ---
@@ -17184,8 +18824,8 @@ async function loadUsersAdmin(){
     if(!resp.ok){ throw new Error(data.error||'Failed'); }
     const gr = await fetch(BASE+'/api/admin/groups'); if(gr.ok) gdata = await gr.json();
   }catch(e){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('config-content').innerHTML =
+      '<div class="config-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
     return;
   }
   _groupsCache = gdata.groups||[];
@@ -17217,7 +18857,7 @@ async function loadUsersAdmin(){
   }).join('');
   const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="openContextEditor('group','${esc(g.id)}','${esc(g.name)}');return false">ctx</a> <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
   document.getElementById('settings-content').innerHTML = `<div class="settings-section">
-    <div class="pf-banner">Create users, place them in work groups, and view/edit each user's &amp; group's context files (CLAUDE.md, skills, MEMORY.md, settings.json…). Each user has an isolated config + history.</div>
+    <div class="pf-banner">Create users, place them in work groups, and view/edit each user's &amp; group's Codex context (AGENTS.md, skills, MEMORY.md, config.toml…). Each user has an isolated CODEX_HOME + history.</div>
     <div class="users-new-bar">
       <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
       <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
@@ -17299,7 +18939,7 @@ async function _ctxRefresh(){
   const list=files.map(f=>`<div class="ctx-file ${f.path===_ctxState.cur?'active':''}" onclick="_ctxOpen('${esc(f.path)}')">${esc(f.path)}</div>`).join('')||'<div class="ctx-file muted">No files.</div>';
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`<h3>Context files — ${esc(_ctxState.label)} <span class="muted">(${_ctxState.scope})</span></h3>
-    <p class="conn-note">All files that shape Claude's behaviour. Edits apply to this ${_ctxState.scope}. Add a new file with the box below (e.g. <code>skills/mytool/SKILL.md</code>).</p>
+    <p class="conn-note">All files that shape Codex's behaviour. Edits apply to this ${_ctxState.scope}. Add a new file with the box below (e.g. <code>skills/mytool/SKILL.md</code>).</p>
     <div class="ctx-wrap">
       <div class="ctx-files">${list}</div>
       <div class="ctx-edit">
@@ -17397,7 +19037,7 @@ async function toggleUserRole(userId, currentRole){
 }
 
 async function deleteUser(userId, username){
-  if(!confirm('Delete user "'+username+'"? This kills their tmux sessions and removes their data and CLAUDE config directory. This cannot be undone.')) return;
+  if(!confirm('Delete user "'+username+'"? This kills their tmux sessions and removes their data and CODEX config directory. This cannot be undone.')) return;
   try{
     const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId), {
       method:'DELETE'
@@ -17484,7 +19124,7 @@ const _PROFILE_TABS = [
   {id:'identity', label:'Identity'},
   {id:'memory',   label:'Memory'},
   {id:'login',    label:'Login'},
-  {id:'settings', label:'Settings'},
+  {id:'config', label:'Config'},
   {id:'mcp',      label:'MCP'},
   {id:'agents',   label:'Agents'},
   {id:'commands', label:'Commands'},
@@ -17498,26 +19138,26 @@ function renderProfileEdit(){
   const isDefault = (p.id === 'default');
   const permJson = JSON.stringify(p.permissions||{}, null, 2);
   const envJson = JSON.stringify(p.env||{}, null, 2);
-  const dir = p.dir || (isDefault ? '~/.claude (merged)' : ('~/.claude-'+p.id));
+  const dir = p.dir || (isDefault ? '~/.codex (merged)' : ('~/.codex-'+p.id));
   const builtinTag = isDefault
     ? ' <span class="profile-row-builtin">default</span>'
     : (p.builtin ? ' <span class="profile-row-builtin">preset</span>' : '');
-  // Effort glyphs requested by user
-  const EFFORTS = [
-    {v:'',      label:'(default)'},
-    {v:'medium',label:'medium (◐)'},
-    {v:'high',  label:'high (●)'},
-    {v:'xhigh', label:'xhigh (◉)'},
-    {v:'max',   label:'max (⬤)'},
-  ];
+  const EFFORTS = [{v:'',label:'(default)'}].concat(
+    EFFORT_CHOICES.map(v=>({v,label:v==='xhigh'?'extra high':v}))
+  );
   const effortOpts = EFFORTS.map(o =>
     `<option value="${o.v}"${(p.effort||'')===o.v?' selected':''}>${o.label}</option>`
+  ).join('');
+  const models=MODEL_CHOICES.slice();
+  if(p.model&&!models.some(row=>row[0]===p.model))models.unshift([p.model,p.model]);
+  const modelOpts=models.map(row=>
+    `<option value="${esc(row[0])}"${(p.model||'')===row[0]?' selected':''}>${esc(row[1])}</option>`
   ).join('');
   const deleteBtn = isDefault
     ? ''
     : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
   const headerNote = isDefault
-    ? '<div class="profiles-hint" style="margin:0 0 6px">Settings → identity edits are merged into <code>~/.claude/settings.json</code> (only <code>model</code>, <code>env</code>, <code>permissions</code> touched). Backup at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
+    ? '<div class="profiles-hint" style="margin:0 0 6px">Model, effort, sandbox and approval keys are merged into <code>~/.codex/config.toml</code>; project and MCP sections are preserved. Every changed file receives a timestamped <code>.bak-dashboard-…</code> copy first.</div>'
     : '';
 
   const tabBar = _PROFILE_TABS.map(t =>
@@ -17535,7 +19175,7 @@ function renderProfileEdit(){
       <div class="row2">
         <div>
           <label>Model</label>
-          <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-8[1m] / blank">
+          <select id="ed-model">${modelOpts}</select>
         </div>
         <div>
           <label>Effort level</label>
@@ -17549,40 +19189,40 @@ function renderProfileEdit(){
     </div>
 
     <div class="pf-section${_profileActiveTab==='memory'?' active':''}" id="pf-section-memory">
-      <div class="pf-banner">CLAUDE.md and MEMORY.md live at the profile root. Claude Code loads them at every launch in this profile.</div>
-      <label>CLAUDE.md</label>
-      <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
+      <div class="pf-banner">AGENTS.md and MEMORY.md live at the profile root. Codex loads them at every launch in this profile.</div>
+      <label>AGENTS.md</label>
+      <textarea id="ed-codex" class="ed-codex" spellcheck="false">${esc(p.codex_md||'')}</textarea>
       <label>MEMORY.md</label>
       <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
     </div>
 
     <div class="pf-section${_profileActiveTab==='login'?' active':''}" id="pf-section-login">
-      <div class="pf-banner">Each profile keeps its own <code>.credentials.json</code>. Logging in once per profile is enough — switching profiles does not re-prompt.</div>
+      <div class="pf-banner">Each profile keeps its own <code>auth.json</code>. Logging in once per profile is enough; switching profiles does not re-prompt.</div>
       <div id="pf-credentials" class="pf-status">Loading login status...</div>
       <div class="pf-actions">
         <button class="extras-btn" onclick="refreshProfileCredentials('${esc(p.id)}')">Refresh status</button>
-        <button class="extras-btn" onclick="logoutProfile('${esc(p.id)}')" style="color:#f85149;border-color:#f8514944">Log out (remove credentials)</button>
+        <button class="extras-btn" onclick="logoutProfile('${esc(p.id)}')" style="color:#f85149;border-color:#f8514944">Log out (remove auth.json)</button>
       </div>
-      <div class="pf-help">To log in: open a session on this profile and run <code>/login</code> inside Claude. The token is written to <code>.credentials.json</code> inside the profile dir.</div>
+      <div class="pf-help">To log in: open a shell on this profile and run <code>codex login</code>. The token is written to <code>auth.json</code> inside the profile dir.</div>
     </div>
 
-    <div class="pf-section${_profileActiveTab==='settings'?' active':''}" id="pf-section-settings">
-      <div class="pf-banner">Full <code>settings.json</code> as Claude Code reads it. The Identity tab edits the <code>model</code>, <code>env</code>, and <code>permissions</code> keys — keep them in sync by saving here OR there, not both.</div>
-      <label>settings.json</label>
-      <textarea id="ed-settings-json" class="ed-rawjson" spellcheck="false">Loading...</textarea>
+    <div class="pf-section${_profileActiveTab==='config'?' active':''}" id="pf-section-config">
+      <div class="pf-banner">Full <code>config.toml</code> as Codex reads it. The Identity tab manages model, reasoning effort, sandbox, approval policy, and environment values.</div>
+      <label>config.toml</label>
+      <textarea id="ed-config-toml" class="ed-rawjson" spellcheck="false">Loading...</textarea>
       <div class="pf-actions">
-        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','settings.json','ed-settings-json')">Save settings.json</button>
-        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','settings.json','ed-settings-json')">Reload</button>
+        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','config.toml','ed-config-toml')">Save config.toml</button>
+        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','config.toml','ed-config-toml')">Reload</button>
       </div>
     </div>
 
     <div class="pf-section${_profileActiveTab==='mcp'?' active':''}" id="pf-section-mcp">
-      <div class="pf-banner">Profile-scope MCP servers + per-project approvals. Lives at <code>.claude.json</code>. Project-scope <code>.mcp.json</code> is edited per session via the More dropdown.</div>
-      <label>.claude.json</label>
+      <div class="pf-banner">Profile-scope MCP servers + per-project approvals. Lives at <code>.codex.json</code>. Project-scope <code>.mcp.json</code> is edited per session via the More dropdown.</div>
+      <label>.codex.json</label>
       <textarea id="ed-mcp-json" class="ed-mcp" spellcheck="false">Loading...</textarea>
       <div class="pf-actions">
-        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','.claude.json','ed-mcp-json')">Save .claude.json</button>
-        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','.claude.json','ed-mcp-json')">Reload</button>
+        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','.codex.json','ed-mcp-json')">Save .codex.json</button>
+        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','.codex.json','ed-mcp-json')">Reload</button>
       </div>
     </div>
 
@@ -17603,7 +19243,7 @@ function renderProfileEdit(){
     </div>
 
     <div class="pf-section${_profileActiveTab==='plugins'?' active':''}" id="pf-section-plugins">
-      <div class="pf-banner">Installed plugins under <code>plugins/</code>. Read-only here — install/remove plugins from inside Claude Code with <code>/plugin</code>.</div>
+      <div class="pf-banner">Installed plugins under <code>plugins/</code>. Read-only here — install/remove plugins from inside Codex with <code>/plugin</code>.</div>
       <div id="pf-plugins-list">Loading...</div>
     </div>
 
@@ -17632,8 +19272,8 @@ function switchProfileTab(tabId){
 // ── Section loaders ─────────────────────────────────────────────────────────
 async function loadProfileSectionData(pid, tab){
   if(tab==='login'){ refreshProfileCredentials(pid); return; }
-  if(tab==='settings'){ loadProfileRawFile(pid, 'settings.json', 'ed-settings-json'); return; }
-  if(tab==='mcp'){ loadProfileRawFile(pid, '.claude.json', 'ed-mcp-json'); return; }
+  if(tab==='config'){ loadProfileRawFile(pid, 'config.toml', 'ed-config-toml'); return; }
+  if(tab==='mcp'){ loadProfileRawFile(pid, '.codex.json', 'ed-mcp-json'); return; }
   if(tab==='agents'){ loadProfileDirSection(pid, 'agents', 'pf-agents-list'); return; }
   if(tab==='commands'){ loadProfileDirSection(pid, 'commands', 'pf-commands-list'); return; }
   if(tab==='plugins'){ loadProfilePluginsList(pid); return; }
@@ -17655,10 +19295,10 @@ async function refreshProfileCredentials(pid){
       el.textContent = `Logged in${plan}${days ? ` · ~${days} days until token expires` : ''}`;
     } else if(data.exists){
       el.className='pf-status warn';
-      el.textContent = 'Credentials present but token expired. Run /login in a session on this profile.';
+      el.textContent = 'auth.json is present but not usable. Run codex login in a shell on this profile.';
     } else {
       el.className='pf-status warn';
-      el.textContent = 'Not logged in. Open a session on this profile and run /login inside Claude.';
+      el.textContent = 'Not logged in. Open a shell on this profile and run codex login.';
     }
   }catch(e){
     el.className='pf-status err';
@@ -17667,7 +19307,7 @@ async function refreshProfileCredentials(pid){
 }
 
 async function logoutProfile(pid){
-  if(!confirm('Remove .credentials.json for this profile? You will need to /login again in any session that uses it.')) return;
+  if(!confirm('Remove auth.json for this profile? You will need to run codex login again in any session that uses it.')) return;
   try{
     const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/credentials', {method:'DELETE'});
     const data = await resp.json();
@@ -17813,7 +19453,7 @@ async function addProfileSubfile(pid, cat){
   }
   // Boilerplate frontmatter
   const stub = cat==='agents'
-    ? `---\nname: ${name.replace(/\.md$/,'')}\ndescription: Describe when Claude should delegate to this agent.\ntools: '*'\n---\n\n# ${name.replace(/\.md$/,'')}\n\nInstructions...\n`
+    ? `---\nname: ${name.replace(/\.md$/,'')}\ndescription: Describe when Codex should delegate to this agent.\ntools: '*'\n---\n\n# ${name.replace(/\.md$/,'')}\n\nInstructions...\n`
     : `---\ndescription: One-line summary shown in the slash-command menu.\nallowed-tools: '*'\n---\n\n# /${name.replace(/\.md$/,'')}\n\nWhat this command does...\n`;
   try{
     const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
@@ -17838,7 +19478,7 @@ async function loadProfilePluginsList(pid){
     if(!resp.ok){ container.innerHTML='<div class="pf-empty">'+(data.error||'Failed')+'</div>'; return; }
     const entries = ((data.categories||{}).plugins||{}).files || [];
     if(!entries.length){
-      container.innerHTML = '<div class="pf-empty">No plugins installed. Use <code>/plugin</code> inside Claude to install.</div>';
+      container.innerHTML = '<div class="pf-empty">No plugins installed. Use <code>/plugin</code> inside Codex to install.</div>';
       return;
     }
     container.innerHTML = entries.map(e =>
@@ -17859,7 +19499,7 @@ async function saveProfile(){
   const name = (document.getElementById('ed-name').value||'').trim();
   const model = (document.getElementById('ed-model').value||'').trim();
   const effort = document.getElementById('ed-effort').value;
-  const claudeMd = document.getElementById('ed-claude').value;
+  const codexMd = document.getElementById('ed-codex').value;
   const memoryMd = document.getElementById('ed-memory').value;
   let permissions, env;
   try{ permissions = JSON.parse(document.getElementById('ed-permissions').value||'{}'); }
@@ -17869,7 +19509,7 @@ async function saveProfile(){
   try{
     const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(p.id), {
       method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, model, effort, claude_md: claudeMd, memory_md: memoryMd, permissions, env})
+      body: JSON.stringify({name, model, effort, codex_md: codexMd, memory_md: memoryMd, permissions, env})
     });
     const data = await resp.json();
     if(!resp.ok){ alert(data.error||'Failed to save'); return; }
@@ -17880,7 +19520,7 @@ async function saveProfile(){
 
 async function deleteProfile(profileId){
   if(profileId==='default'){ alert("The default profile can't be deleted."); return; }
-  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.claude-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
+  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.codex-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
   try{
     const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId), {method:'DELETE'});
     const data = await resp.json();
@@ -17930,17 +19570,17 @@ async function newProfilePrompt(){
 let _projFile = {sessionName:'', path:'', absPath:'', cwd:'', content:'', exists:false};
 
 const _PROJFILE_LABELS = {
-  'CLAUDE.md': 'Project CLAUDE.md',
-  '.claude/settings.json': 'Project settings.json',
-  '.claude/settings.local.json': 'Project settings.local.json',
+  'AGENTS.md': 'Project AGENTS.md',
+  '.codex/config.toml': 'Project config.toml',
+  '.codex/config.local.toml': 'Project config.local.toml',
   '.mcp.json': 'Project .mcp.json',
 };
 
 const _PROJFILE_DESCRIPTIONS = {
-  'CLAUDE.md': 'Markdown rules loaded on top of the profile-level CLAUDE.md whenever Claude runs inside this cwd. Use this for repo-specific conventions.',
-  '.claude/settings.json': 'JSON. Project-level settings (model, env, hooks, permissions). Loaded on top of profile settings.',
-  '.claude/settings.local.json': 'JSON. Project-local overrides (typically gitignored). Loaded last and wins over both profile and project settings.',
-  '.mcp.json': 'JSON. Project-scope MCP servers — merged with the profile MCP servers when Claude runs in this cwd.',
+  'AGENTS.md': 'Markdown rules loaded on top of the profile-level AGENTS.md whenever Codex runs inside this cwd. Use this for repo-specific conventions.',
+  '.codex/config.toml': 'TOML. Project-level config (model, env, hooks, permissions). Loaded on top of profile config.',
+  '.codex/config.local.toml': 'TOML. Project-local overrides (typically gitignored). Loaded last and wins over both profile and project config.',
+  '.mcp.json': 'JSON. Project-scope MCP servers — merged with the profile MCP servers when Codex runs in this cwd.',
 };
 
 async function openProjectFile(sessionName, relPath){
@@ -18148,7 +19788,7 @@ async function deleteSessionMemoryExtra(name){
 }
 
 // ── Context Files editor ──
-// A fixed registry of the files Claude Code actually reads. Read/edit only —
+// A fixed registry of the files Codex actually reads. Read/edit only —
 // creating new sidecar CLAUDE_*.md files was removed on purpose.
 let _ctxFiles={files:[], editing:''};
 
@@ -18225,8 +19865,8 @@ async function saveContextFile(id){
   }catch(e){ alert('Failed to save.'); }
 }
 
-function closeClaudeMd(){
-  document.getElementById('claudemd-overlay').classList.remove('active');
+function closeCodexMd(){
+  document.getElementById('codexmd-overlay').classList.remove('active');
 }
 
 // ── Stats Window ──
@@ -18286,25 +19926,25 @@ function renderStats(s,usage){
     });
     html+='</div>';
   }
-  // Claude Processes
-  html+='<div class="stats-section"><div class="stats-section-title">Claude Processes</div>';
-  if(s.claude_processes&&s.claude_processes.length){
-    s.claude_processes.forEach(p=>{
+  // Codex Processes
+  html+='<div class="stats-section"><div class="stats-section-title">Codex Processes</div>';
+  if(s.codex_processes&&s.codex_processes.length){
+    s.codex_processes.forEach(p=>{
       const short=p.length>80?p.substring(0,80)+'...':p;
       html+='<div class="stats-row" style="word-break:break-all"><span class="stats-row-value" style="font-size:.7rem">'+esc(short)+'</span></div>';
     });
   }else{
-    html+='<div class="stats-row"><span class="stats-row-label">No Claude processes found</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label">No Codex processes found</span></div>';
   }
-  if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
+  if(s.codex_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.codex_related+'</span></div>';
   html+='</div>';
 
-  // Claude Usage
+  // Codex Usage
   if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
     function fmtTok(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
     function fmtCost(n){if(!n)return'—';return'$'+n.toFixed(2)}
-    function modelTag(m){if(!m||m==='unknown')return'';const short=m.replace('claude-','').replace(/-\d{8}$/,'');let bg='#30363d';if(short.includes('opus'))bg='#8b5cf6';else if(short.includes('haiku'))bg='#f59e0b';else if(short.includes('sonnet'))bg='#3b82f6';return'<span class="model-tag" style="background:'+bg+'">'+esc(short)+'</span>'}
-    html+='<div class="stats-section"><div class="stats-section-title">Claude Usage</div>';
+    function modelTag(m){if(!m||m==='unknown')return'';const short=m.replace('gpt-','').replace(/-\d{8}$/,'');let bg='#30363d';if(short.includes('mini'))bg='#3b82f6';else if(short.includes('o3'))bg='#f59e0b';else if(short.includes('5'))bg='#10a37f';return'<span class="model-tag" style="background:'+bg+'">'+esc(short)+'</span>'}
+    html+='<div class="stats-section"><div class="stats-section-title">Codex Usage</div>';
     html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Session</th><th>Model</th><th>5h Tokens</th><th>5h Cost</th><th>Week Tokens</th><th>Week Cost</th></tr></thead><tbody>';
     usage.sessions.forEach(sess=>{
       html+='<tr><td>'+esc(sess.name)+'</td><td>'+modelTag(sess.model)+'</td>';
@@ -18328,7 +19968,7 @@ function closeStats(){
 loadCurrentUser().then(applyRoleVisibility);
 loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
 loadAll();
-checkClaudeAuth();
+checkCodexAuth();
 </script>
 </body></html>
 """
@@ -18357,14 +19997,14 @@ _PROJECTS_PAGE_CSS = (
 
 def _projects_page_html(title: str, rows):
     items = "".join(
-        '<li><a href="/%s/%s">dianaotech.com/%s/%s</a> <span class="open">open ↗</span></li>' % (u, p, u, p)
-        for (u, p) in rows) or '<li class="muted">No projects yet. Ask Claude in a session to build something — it gets published here.</li>'
-    return ("<!doctype html><html><head><meta charset=utf-8><title>%s · %s</title>"
+        f'<li><a href="/{u}/{p}">dianaotech.com/{u}/{p}</a> <span class="open">open ↗</span></li>'
+        for (u, p) in rows) or '<li class="muted">No projects yet. Ask Codex in a session to build something — it gets published here.</li>'
+    return (f"<!doctype html><html><head><meta charset=utf-8><title>{title} · {BRAND_NAME}</title>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<style>%s</style></head><body><h1>%s</h1>"
-            "<div class=card><ul>%s</ul></div>"
-            "<p class=muted>%s — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
-            "</body></html>") % (title, BRAND_NAME, _PROJECTS_PAGE_CSS, title, items, BRAND_NAME)
+            f"<style>{_PROJECTS_PAGE_CSS}</style></head><body><h1>{title}</h1>"
+            f"<div class=card><ul>{items}</ul></div>"
+            f"<p class=muted>{BRAND_NAME} — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
+            "</body></html>")
 
 
 @app.get("/{username}", response_class=HTMLResponse)
@@ -18398,7 +20038,7 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     pdir = _project_dir(username, project)
     if pdir is None or not pdir.exists():
-        return HTMLResponse("Project not found. (Served from ~/web-projects/%s/%s/)" % (username, project),
+        return HTMLResponse(f"Project not found. (Served from ~/web-projects/{username}/{project}/)",
                             status_code=404)
     serve_cfg = pdir / ".serve.json"
     if serve_cfg.exists():

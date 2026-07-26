@@ -5,3 +5,6 @@ openai==1.58.1            # latest: 2.30.0 (MAJOR — breaking API changes; skip
 python-multipart==0.0.20  # GHSA-wp53-j4wj-2cfg partial mitigation; full fix at 0.0.22 not yet on PyPI
 starlette==0.49.3         # updated 2026-04-03 (was 0.41.3); fixes GHSA-2c2j-9gv5-cj73 + GHSA-7f5h-v6xp-fcq8
 pydantic==2.12.5          # updated 2026-04-03 (was 2.10.3)
+httpx==0.28.1             # browser/noVNC reverse proxy
+websockets==15.0.1        # browser WebSocket reverse proxy
+tomli==2.4.1; python_version < "3.11"  # stdlib tomllib compatibility
