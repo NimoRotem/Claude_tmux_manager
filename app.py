@@ -8348,7 +8348,7 @@ websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
 cb_chrome_env "$ID"
 mapfile -t FLAGS < <(cb_chrome_flags "$PROFILE" "$CDP" "$ID")
 printf '[%s] %s\n' "$(date -Is)" "${FLAGS[*]}" >>"$LOGS/chrome-flags.log"
-dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
+nice -n 5 dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
   "about:blank" >"$LOGS/chrome.log" 2>&1 & echo $! >> "$PIDS"
 
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
@@ -9089,6 +9089,9 @@ BROWSER_BUSY_CPU_PCT = float(os.environ.get("CB_BUSY_CPU_PCT") or 25)
 # Auto-park a browser burning CPU with nobody driving it, after this long idle.
 BROWSER_AUTOPARK_IDLE_S = float(os.environ.get("CB_AUTOPARK_IDLE_S") or 600)
 _CLK_TCK = float(os.sysconf("SC_CLK_TCK") or 100)
+# Scheduling priority for a browser tree. The cheapest rung of the guard, and
+# the only one that keeps working while someone is still using the browser.
+BROWSER_NICE = int(os.environ.get("CB_NICE") or 10)
 
 
 def _browser_pids(cdp_port: int) -> list:
@@ -9116,6 +9119,35 @@ def _browser_pids(cdp_port: int) -> list:
         frontier = [int(k) for k in kids if k.isdigit() and int(k) not in pids]
         pids.extend(frontier)
     return pids
+
+
+def _browser_renice(cdp_port: int, nice: int = BROWSER_NICE) -> int:
+    """Raise a browser tree's nice value toward `nice`. Returns how many moved.
+
+    Chrome here runs on SwiftShader over Xvfb, so a single animated tab
+    rasterises on the CPU forever at whatever priority it was started with. At
+    nice 0 that starves the dashboard, sshd and every other service on the box;
+    niced, the same tab still renders but yields the moment anything else wants
+    the CPU, which costs it nothing while the box is otherwise idle.
+
+    Only ever *raises* nice. The dashboard runs unprivileged, and Linux lets an
+    unprivileged process give up priority but never take it back, so this is a
+    ratchet: a browser that sat idle at nice 10 stays there when someone returns
+    to it. That is the safe direction to fail in — the cost is a slightly less
+    snappy noVNC session on a contended box, and restarting the browser session
+    (which relaunches it at nice 5) resets it.
+    """
+    moved = 0
+    for pid in _browser_pids(cdp_port):
+        try:
+            if os.getpriority(os.PRIO_PROCESS, pid) < nice:
+                os.setpriority(os.PRIO_PROCESS, pid, nice)
+                moved += 1
+        except Exception:
+            # A Chrome started under sudo runs as root and is not ours to
+            # renice (EPERM). Nothing to do but leave it.
+            continue
+    return moved
 
 
 def _browser_cpu_pct(sid: str, cdp_port: int) -> float:
@@ -9232,9 +9264,6 @@ async def browser_autopark_watchdog():
         try:
             for s in _load_browser_sessions():
                 sid = s.get("id")
-                if s.get("auto_park") is False:
-                    _browser_calm_since.pop(sid, None)
-                    continue
                 cdp = s.get("cdp_port", 0)
                 if not await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0)):
                     continue
@@ -9242,6 +9271,20 @@ async def browser_autopark_watchdog():
                 driven = sid in _browser_busy
                 human = 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS
                 now = time.time()
+                # Rung 1, unconditional, and deliberately outside the calm clock
+                # below. Any input at the display resets that clock, so a browser
+                # someone glances at every few minutes never reaches the park rung
+                # however much CPU it burns — which is exactly how a claude.com tab
+                # held ~1.5 of 4 cores for 20 minutes while the viewer was open.
+                # Nice bounds the damage in that window without touching the tabs:
+                # aim gentler while it is being used, firm once nothing is. The
+                # call only ratchets upward (see _browser_renice).
+                await asyncio.to_thread(
+                    _browser_renice, cdp,
+                    max(1, BROWSER_NICE // 2) if (driven or human) else BROWSER_NICE)
+                if s.get("auto_park") is False:
+                    _browser_calm_since.pop(sid, None)
+                    continue
                 if driven or human:
                     _browser_calm_since[sid] = now
                     _browser_parked.pop(sid, None)
