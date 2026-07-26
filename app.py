@@ -11293,12 +11293,49 @@ _LOGIN_NEEDED_RE = re.compile(
     r"you (?:are|'re) not (?:logged in|authenticated)|sign in to continue)",
     re.I,
 )
+_CLAUDE_OAUTH_FLOW_URL_RE = re.compile(
+    r"https://[^\s<>'\"]*(?:claude\.ai|anthropic\.com)[^\s<>'\"]*(?:oauth|authorize)",
+    re.I,
+)
+_LOGIN_CODE_PROMPT_RE = re.compile(
+    r"(?:paste|enter)\s+(?:the\s+)?(?:(?:authorization|oauth|login)\s+)?code\b",
+    re.I,
+)
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
 # clear it — otherwise we'd interrupt someone typing /login by hand.
 _LOGIN_FLOW_STALE_AFTER = 45
 _login_watchdog_state: Dict[str, dict] = {}
+
+
+def _classify_login_watchdog_screen(screen: str) -> tuple[bool, bool]:
+    """Return ``(needs_login, login_flow_open)`` for the live pane only.
+
+    Keep the inspection close to the prompt.  Combining unrelated scrollback
+    fragments such as an old ``oauth_token`` filename and a later ``https://``
+    link used to look like a live OAuth flow and caused completed sessions to be
+    relaunched every watchdog cooldown.
+    """
+    if not screen or not screen.strip():
+        return False, False
+
+    lines = screen.splitlines()
+    prompt_tail = "\n".join(lines[-30:])
+    exit_tail = "\n".join(lines[-12:])
+    if re.search(r"❯\s*/exit\b", exit_tail, re.I) and re.search(r"\bBye!", exit_tail):
+        return False, False
+
+    low = prompt_tail.lower()
+    login_flow_open = bool(
+        _LOGIN_CODE_PROMPT_RE.search(prompt_tail)
+        or _CLAUDE_OAUTH_FLOW_URL_RE.search(prompt_tail)
+        or ("oauth error" in low)
+        or ("select login method" in low)
+        or ("press enter to retry" in low and "esc to cancel" in low)
+    )
+    needs_login = bool(_LOGIN_NEEDED_RE.search(prompt_tail))
+    return needs_login, login_flow_open
 
 
 async def _login_watchdog_loop():
@@ -11322,19 +11359,19 @@ async def _login_watchdog_loop():
                 if not await _async_is_claude_running(name):
                     continue
                 try:
-                    recent = await asyncio.to_thread(capture_pane_recent, name, 40)
+                    pane = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if pane.returncode != 0:
+                        continue
+                    recent = pane.stdout
                 except Exception:
                     continue
-                low = (recent or "").lower()
-                # Is a Claude /login flow currently on screen? (auth-method menu,
-                # OAuth URL, paste-code prompt, or the "invalid code — retry" error).
-                login_flow_open = bool(recent) and (
-                    ("paste" in low and "code" in low)
-                    or ("https://" in recent and "oauth" in low)
-                    or ("oauth error" in low)
-                    or ("select login method" in low)
-                    or ("press enter to retry" in low and "esc to cancel" in low)
-                )
+                # Is a real Claude login message or flow on the live screen?
+                # Never infer one by combining unrelated lines from scrollback.
+                needs_login, login_flow_open = _classify_login_watchdog_screen(recent)
 
                 # Shared API-key (team) mode: /login is HARMFUL here. It writes OAuth
                 # creds that override the working apiKeyHelper key and 401 ("Invalid
@@ -11360,7 +11397,6 @@ async def _login_watchdog_loop():
                             llog.debug("login watchdog esc failed for '%s': %s", name, e)
                     continue
 
-                needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
                 if not needs_login and not login_flow_open:
                     state.pop("flow_since", None)
                     continue
