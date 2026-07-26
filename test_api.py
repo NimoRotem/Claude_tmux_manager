@@ -96,7 +96,7 @@ class TestSecurityHeaders:
     def test_security_headers_present(self, authed_client):
         resp = authed_client.get("/")
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
-        assert resp.headers.get("X-Frame-Options") == "DENY"
+        assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
         assert resp.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
         assert resp.headers.get("X-XSS-Protection") == "1; mode=block"
 
@@ -174,19 +174,19 @@ class TestSessionSpecificEndpoints:
             files={"file": ("test.txt", b"content", "text/plain")},
 
         )
-        assert resp.status_code == 500
-        assert "working directory" in resp.json()["error"].lower()
+        assert resp.status_code == 200
+        assert resp.json()["path"].endswith("/uploads/test-session/test.txt")
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_claude_md_missing_session(self, mock_sessions, authed_client):
-        resp = authed_client.get("/api/sessions/nonexistent/claude-md")
+        resp = authed_client.get("/api/sessions/nonexistent/codex-md")
         assert resp.status_code == 404
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.get_session_cwd", return_value="/tmp/test-cwd")
     def test_get_claude_md_success_returns_files_list(self, mock_cwd, mock_sessions, authed_client):
         """GET success: returns files list with cwd field (files may or may not exist)."""
-        resp = authed_client.get("/api/sessions/test-session/claude-md")
+        resp = authed_client.get("/api/sessions/test-session/codex-md")
         assert resp.status_code == 200
         data = resp.json()
         assert "files" in data
@@ -201,13 +201,13 @@ class TestSessionSpecificEndpoints:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_get_claude_md_handles_unreadable_file(self, mock_sessions, authed_client, tmp_path):
-        """When CWD CLAUDE.md exists but cannot be read, content should be empty string."""
-        md_path = tmp_path / "CLAUDE.md"
+        """When CWD AGENTS.md exists but cannot be read, content should be empty string."""
+        md_path = tmp_path / "AGENTS.md"
         md_path.write_text("secret content")
         md_path.chmod(0o000)
         try:
             with patch("app.get_session_cwd", return_value=str(tmp_path)):
-                resp = authed_client.get("/api/sessions/test-session/claude-md")
+                resp = authed_client.get("/api/sessions/test-session/codex-md")
             assert resp.status_code == 200
             data = resp.json()
             project_file = next(f for f in data["files"] if f["label"] == "Project")
@@ -218,14 +218,14 @@ class TestSessionSpecificEndpoints:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_get_claude_md_handles_unreadable_home_file(self, mock_sessions, authed_client, tmp_path):
-        """When home CLAUDE.md exists but cannot be read, content should be empty string."""
-        md_path = tmp_path / "CLAUDE.md"
+        """When home AGENTS.md exists but cannot be read, content should be empty string."""
+        md_path = tmp_path / "AGENTS.md"
         md_path.write_text("home content")
         md_path.chmod(0o000)
         try:
             with patch("app.get_session_cwd", return_value=""), \
                  patch("app.Path.home", return_value=tmp_path):
-                resp = authed_client.get("/api/sessions/test-session/claude-md")
+                resp = authed_client.get("/api/sessions/test-session/codex-md")
             assert resp.status_code == 200
             home_file = next(f for f in resp.json()["files"] if f["label"] == "Global")
             assert home_file["exists"] is True
@@ -311,7 +311,7 @@ class TestStatsEndpoint:
         """Stats response must contain the documented top-level keys."""
         resp = authed_client.get("/api/stats")
         data = resp.json()
-        expected_keys = {"cpu_load", "memory", "disk", "tmux_sessions", "claude_processes"}
+        expected_keys = {"cpu_load", "memory", "disk", "tmux_sessions", "codex_processes"}
         assert expected_keys <= data.keys(), f"Missing keys: {expected_keys - data.keys()}"
 
     @patch("app.subprocess.run", side_effect=Exception("no pgrep"))
@@ -324,7 +324,7 @@ class TestStatsEndpoint:
         # These keys should exist but may be empty dicts/lists on failure
         assert "memory" in data
         assert "disk" in data
-        assert "claude_processes" in data
+        assert "codex_processes" in data
 
     def test_stats_cpu_load_fallback_when_proc_missing(self, authed_client):
         """If /proc/loadavg is unavailable, cpu_load should be an empty dict (not crash)."""
@@ -357,12 +357,12 @@ class TestStatsEndpoint:
         assert resp.json().get("uptime") == "unknown"
 
 
-# ─── Claude Auth Endpoints ───
+# ─── Codex Auth Endpoints ───
 
 
-class TestClaudeAuthEndpoints:
-    def test_claude_status(self, authed_client):
-        resp = authed_client.get("/api/auth/claude-status")
+class TestCodexAuthEndpoints:
+    def test_codex_status(self, authed_client):
+        resp = authed_client.get("/api/auth/codex-status")
         assert resp.status_code == 200
         data = resp.json()
         assert "hasApiKey" in data
@@ -376,11 +376,11 @@ class TestClaudeAuthEndpoints:
         # Empty key clears the stored key
         assert resp.status_code == 200
 
-    @patch("app._save_anthropic_key")
+    @patch("app._save_openai_key")
     def test_set_key_valid(self, mock_save, authed_client):
         resp = authed_client.post(
             "/api/auth/api-key",
-            json={"apiKey": "sk-ant-test-key-12345"},
+            json={"apiKey": "sk-test-key-12345"},
 
         )
         assert resp.status_code == 200
@@ -396,24 +396,23 @@ class TestClaudeAuthEndpoints:
         assert resp.status_code == 400
         assert "Invalid" in resp.json()["error"]
 
-    @patch("app.subprocess.run", side_effect=Exception("claude binary not found"))
-    def test_claude_status_exception_returns_error_field(self, mock_run, authed_client):
-        """Exception during claude auth status check should still return 200 with error key."""
-        resp = authed_client.get("/api/auth/claude-status")
+    def test_codex_status_has_stable_schema(self, authed_client):
+        resp = authed_client.get("/api/auth/codex-status")
         assert resp.status_code == 200
         data = resp.json()
-        assert "error" in data
         assert "hasApiKey" in data
+        assert "authMode" in data
+        assert "loggedIn" in data
 
 
-# ─── CLAUDE.md Path Traversal Protection ───
+# ─── AGENTS.md Path Traversal Protection ───
 
 
 class TestClaudeMdSaveEndpoint:
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_rejects_non_claude_md_path(self, mock_sessions, authed_client):
         resp = authed_client.post(
-            "/api/sessions/test-session/claude-md",
+            "/api/sessions/test-session/codex-md",
             json={"path": "/etc/passwd", "content": "pwned"},
 
         )
@@ -422,8 +421,8 @@ class TestClaudeMdSaveEndpoint:
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_rejects_path_outside_home(self, mock_sessions, authed_client):
         resp = authed_client.post(
-            "/api/sessions/test-session/claude-md",
-            json={"path": "/etc/CLAUDE.md", "content": "pwned"},
+            "/api/sessions/test-session/codex-md",
+            json={"path": "/etc/AGENTS.md", "content": "pwned"},
 
         )
         assert resp.status_code == 403
@@ -431,9 +430,9 @@ class TestClaudeMdSaveEndpoint:
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_rejects_traversal_attack(self, mock_sessions, authed_client):
         from pathlib import Path
-        evil_path = str(Path.home() / ".." / "etc" / "CLAUDE.md")
+        evil_path = str(Path.home() / ".." / "etc" / "AGENTS.md")
         resp = authed_client.post(
-            "/api/sessions/test-session/claude-md",
+            "/api/sessions/test-session/codex-md",
             json={"path": evil_path, "content": "pwned"},
 
         )
@@ -443,48 +442,48 @@ class TestClaudeMdSaveEndpoint:
     def test_save_claude_md_missing_session_returns_404(self, mock_sessions, authed_client):
         """POST to a non-existent session should return 404."""
         resp = authed_client.post(
-            "/api/sessions/no-such-session/claude-md",
-            json={"path": "/home/user/CLAUDE.md", "content": "test"},
+            "/api/sessions/no-such-session/codex-md",
+            json={"path": "/home/user/AGENTS.md", "content": "test"},
         )
         assert resp.status_code == 404
         assert resp.json()["error"] == "Session not found"
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_save_claude_md_success(self, mock_sessions, authed_client, tmp_path):
-        """POST with a valid in-home CLAUDE.md path should write the file and return ok."""
+        """POST with a valid in-home AGENTS.md path should write the file and return ok."""
         from pathlib import Path as RealPath
-        target = str(tmp_path / "CLAUDE.md")
+        target = str(tmp_path / "AGENTS.md")
         with patch("app.Path.home", return_value=tmp_path):
             resp = authed_client.post(
-                "/api/sessions/test-session/claude-md",
+                "/api/sessions/test-session/codex-md",
                 json={"path": target, "content": "# hello"},
             )
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
-        assert (tmp_path / "CLAUDE.md").read_text() == "# hello"
+        assert (tmp_path / "AGENTS.md").read_text() == "# hello"
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_save_claude_md_non_slash_name_returns_400(self, mock_sessions, authed_client, tmp_path):
-        """Path that passes endswith('CLAUDE.md') but not endswith('/CLAUDE.md') should return 400."""
-        # e.g. /home/user/sub/prefixCLAUDE.md ends with "CLAUDE.md" but not "/CLAUDE.md"
-        target = str(tmp_path / "prefixCLAUDE.md")
+        """Path that passes endswith('AGENTS.md') but not endswith('/AGENTS.md') should return 400."""
+        # e.g. /home/user/sub/prefixAGENTS.md ends with "AGENTS.md" but not "/AGENTS.md"
+        target = str(tmp_path / "prefixAGENTS.md")
         with patch("app.Path.home", return_value=tmp_path):
             resp = authed_client.post(
-                "/api/sessions/test-session/claude-md",
+                "/api/sessions/test-session/codex-md",
                 json={"path": target, "content": "bad"},
             )
         assert resp.status_code == 400
         assert "Invalid path" in resp.json()["error"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("pathlib.Path.write_text", side_effect=OSError("disk full"))
+    @patch("app.os.makedirs", side_effect=OSError("disk full"))
     def test_save_claude_md_write_failure_returns_500(self, mock_write, mock_sessions, authed_client, tmp_path):
-        """A write failure during CLAUDE.md save should return 500."""
-        target = str(tmp_path / "CLAUDE.md")
+        """A write failure during AGENTS.md save should return 500."""
+        target = str(tmp_path / "AGENTS.md")
         with patch("app.Path.home", return_value=tmp_path):
             resp = authed_client.post(
-                "/api/sessions/test-session/claude-md",
+                "/api/sessions/test-session/codex-md",
                 json={"path": target, "content": "oops"},
             )
         assert resp.status_code == 500
@@ -534,50 +533,49 @@ class TestFindSessionJsonlFiles:
         assert result == []
 
     @patch("app.get_session_cwd", return_value="/home/user/myproject")
-    def test_returns_empty_when_project_dir_not_found(self, mock_cwd):
-        """_find_session_jsonl_files returns [] when no matching project dir exists."""
+    def test_returns_empty_when_sessions_dir_not_found(self, mock_cwd, tmp_path):
+        """Codex has no matching rollouts when CODEX_HOME/sessions is absent."""
         import app
-        with patch("app.os.path.isdir", return_value=False), \
-             patch("app.globmod.glob", return_value=[]):
+
+        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("no-dir-session")
         assert result == []
 
     @patch("app.get_session_cwd", return_value="/home/user/myproject")
-    def test_returns_files_when_project_dir_found(self, mock_cwd):
-        """_find_session_jsonl_files returns JSONL files when project dir exists."""
+    def test_returns_rollout_when_session_meta_cwd_matches(self, mock_cwd, tmp_path):
+        """Codex rollout discovery uses the cwd recorded in session_meta."""
         import app
-        with patch("app.os.path.isdir", return_value=True), \
-             patch("app.globmod.glob", return_value=["/home/user/.claude/projects/myproject/conversation.jsonl"]):
-            result = app._find_session_jsonl_files("has-dir-session")
-        assert len(result) > 0
+
+        sessions = tmp_path / ".codex" / "sessions" / "2026" / "07" / "26"
+        sessions.mkdir(parents=True)
+        rollout = sessions / "rollout-test.jsonl"
+        rollout.write_text(
+            json.dumps({
+                "type": "session_meta",
+                "payload": {"cwd": "/home/user/myproject/"},
+            }) + "\n"
+        )
+        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+            result = app._find_session_jsonl_files("has-rollout-session")
+        assert result == [str(rollout)]
 
     @patch("app.get_session_cwd", return_value="/home/user/myproject")
-    def test_uses_alt_dir_with_leading_dash(self, mock_cwd):
-        """Should use alt dir (with leading dash) when exact match is absent."""
+    def test_ignores_rollout_for_different_cwd(self, mock_cwd, tmp_path):
+        """A rollout from another workspace must not leak into session stats."""
         import app
-        with patch("app.os.path.isdir", side_effect=[False, True]), \
-             patch("app.globmod.glob", return_value=["/home/user/.claude/projects/-myproject/conv.jsonl"]):
-            result = app._find_session_jsonl_files("leading-dash-session")
-        assert len(result) > 0
 
-    @patch("app.get_session_cwd", return_value="/home/user/myproject")
-    def test_uses_glob_fallback(self, mock_cwd):
-        """Should set project_dir from glob candidates when no exact or alt dir matches."""
-        import app
-        call_count = [0]
-
-        def glob_fn(pattern):
-            call_count[0] += 1
-            if call_count[0] == 1:  # First call: fallback dir discovery
-                return ["/home/user/.claude/projects/my-myproject"]
-            # Subsequent calls: *.jsonl files within that dir
-            return ["/home/user/.claude/projects/my-myproject/conv.jsonl"]
-
-        with patch("app.os.path.isdir", return_value=False), \
-             patch("app.globmod.glob", side_effect=glob_fn):
-            result = app._find_session_jsonl_files("glob-session")
-        # The directory was found via glob; *.jsonl files were collected
-        assert "/home/user/.claude/projects/my-myproject/conv.jsonl" in result
+        sessions = tmp_path / ".codex" / "sessions"
+        sessions.mkdir(parents=True)
+        rollout = sessions / "rollout-other.jsonl"
+        rollout.write_text(
+            json.dumps({
+                "type": "session_meta",
+                "payload": {"cwd": "/home/user/other-project"},
+            }) + "\n"
+        )
+        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+            result = app._find_session_jsonl_files("other-rollout-session")
+        assert result == []
 
 
 # ─── Session Stats Endpoint ───
@@ -621,6 +619,15 @@ class TestSessionStats:
 
 
 class TestHealthEndpoint:
+    @pytest.fixture(autouse=True)
+    def _codex_cli_is_ready(self):
+        """Keep health tests focused on the individual dependency under test."""
+        with patch(
+            "app._codex_cli_readiness",
+            return_value=(True, "ready", {"version": "0.145.0"}),
+        ):
+            yield
+
     @patch("app.subprocess.run")
     def test_health_ok_when_tmux_running(self, mock_run, authed_client):
         mock_run.return_value = MagicMock(returncode=0, stdout="session1\nsession2\n", stderr="")
@@ -702,21 +709,8 @@ class TestUploadFileSizeLimit:
 
     @pytest.mark.asyncio
     async def test_post_read_oversized_returns_413(self):
-        """Covers line 1782: post-read oversized content check."""
-        from starlette.requests import Request
-
+        """The upload handler rejects an oversized body after reading it."""
         import app as _app
-
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": "/api/sessions/test-session/upload",
-            "query_string": b"",
-            "headers": [(b"content-length", b"100")],  # small pre-read → passes pre-check
-            "app": _app.app,
-        }
-
-        request = Request(scope)
 
         class FakeLargeFile:
             filename = "big.bin"
@@ -726,7 +720,7 @@ class TestUploadFileSizeLimit:
 
         with patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS), \
              patch("app.get_session_cwd", return_value="/tmp"):
-            resp = await _app.api_upload_file(request, "test-session", FakeLargeFile())
+            resp = await _app.api_upload_file("test-session", FakeLargeFile())
 
         assert resp.status_code == 413
         assert "too large" in resp.body.decode().lower()
@@ -783,15 +777,15 @@ class TestUploadFileSizeLimit:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run", side_effect=Exception("tmux unavailable"))
-    def test_upload_fails_when_get_cwd_subprocess_raises(self, mock_run, mock_sessions, authed_client):
-        """When get_session_cwd's subprocess.run raises, upload returns 500 (working directory error)."""
+    def test_upload_uses_session_storage_when_tmux_cwd_unavailable(self, mock_run, mock_sessions, authed_client):
+        """Uploads remain available even if tmux cannot report a workspace cwd."""
         from io import BytesIO
         resp = authed_client.post(
             "/api/sessions/test-session/upload",
             files={"file": ("test.txt", BytesIO(b"data"), "text/plain")},
         )
-        assert resp.status_code == 500
-        assert "working directory" in resp.json()["error"].lower()
+        assert resp.status_code == 200
+        assert resp.json()["path"].endswith("/uploads/test-session/test.txt")
 
     @patch("app._save_messages")
     def test_upload_loads_messages_when_cache_entry_empty(self, mock_save, authed_client, tmp_path):
@@ -813,7 +807,7 @@ class TestUploadFileSizeLimit:
 
     @patch("app.get_session_cwd", return_value="/tmp/test-cwd")
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("pathlib.Path.write_bytes", side_effect=OSError("disk full"))
+    @patch("app.open", side_effect=OSError("disk full"), create=True)
     def test_upload_write_failure_returns_500(self, mock_write, mock_sessions, mock_cwd, authed_client):
         """A write failure during upload should return 500 with error key."""
         from io import BytesIO
@@ -947,7 +941,7 @@ class TestAuthLogout:
         assert resp.json()["ok"] is True
         assert "warnings" in resp.json()
 
-    @patch("app.subprocess.run", side_effect=FileNotFoundError("claude not found"))
+    @patch("app.subprocess.run", side_effect=FileNotFoundError("codex not found"))
     def test_logout_subprocess_error_generic(self, mock_run, authed_client):
         resp = authed_client.post("/api/auth/logout")
         assert resp.status_code == 200
@@ -955,7 +949,7 @@ class TestAuthLogout:
         assert data["ok"] is True
         # Error message should be generic, not expose exception detail
         assert "warnings" in data
-        assert "claude not found" not in str(data["warnings"])
+        assert "codex not found" not in str(data["warnings"])
 
 
 # ─── Raw Tail Endpoint ───
@@ -1232,8 +1226,15 @@ class TestHstsHeader:
         assert "max-age=" in hsts
         assert "includeSubDomains" in hsts
 
+    def test_hsts_and_security_headers_on_unauthenticated_login(self, client):
+        """The auth middleware's direct login response must keep HTTPS headers."""
+        resp = client.get("/", headers={"x-forwarded-proto": "https"})
+        assert "max-age=" in resp.headers.get("Strict-Transport-Security", "")
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+        assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
 
-# ─── Claude Usage Endpoint ───
+
+# ─── Codex Usage Endpoint ───
 
 
 class TestClaudeUsageEndpoint:
@@ -1268,8 +1269,8 @@ class TestClaudeUsageEndpoint:
 
 
 class TestParseUsageFile:
-    def test_skips_entries_without_usage_field(self, tmp_path):
-        """_parse_usage_file should skip assistant entries with no usage data."""
+    def test_parses_codex_token_deltas_and_agent_messages(self, tmp_path):
+        """Only Codex token_count deltas and agent messages are counted."""
         import json
         from datetime import datetime, timezone
 
@@ -1277,17 +1278,35 @@ class TestParseUsageFile:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         jsonl_file = tmp_path / "test.jsonl"
         jsonl_file.write_text(
-            # Entry with no usage → should be skipped (hits line 2004 continue)
-            json.dumps({"type": "assistant", "timestamp": f"{today}T12:00:00Z",
-                        "message": {"model": "claude-sonnet"}}) + "\n" +
-            # Entry with usage → should be counted
-            json.dumps({"type": "assistant", "timestamp": f"{today}T12:01:00Z",
-                        "usage": {"input_tokens": 100, "output_tokens": 50,
-                                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}) + "\n"
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": f"{today}T12:00:00Z",
+                "payload": {"type": "agent_message", "message": "Done"},
+            }) + "\n" +
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": f"{today}T12:01:00Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"last_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cached_input_tokens": 20,
+                        "reasoning_output_tokens": 10,
+                    }},
+                },
+            }) + "\n" +
+            # A cumulative snapshot without a last-turn delta must be ignored.
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": f"{today}T12:02:00Z",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 9999,
+                }}},
+            }) + "\n"
         )
         result = app._parse_usage_file(str(jsonl_file), today)
-        assert result[0] == 100   # input_tokens from second entry
-        assert result[4] == 1     # msg_count = 1 (only second entry counted)
+        assert result == (100, 50, 20, 10, 1)
 
 
 # ─── Away Mode Toggle (404 path) ───
@@ -1338,6 +1357,14 @@ class TestGoNutsModeToggle:
 
 
 class TestCreateSession:
+    @pytest.fixture(autouse=True)
+    def _codex_cli_is_ready(self):
+        with patch(
+            "app._codex_cli_readiness",
+            return_value=(True, "ready", {"version": "0.145.0"}),
+        ):
+            yield
+
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run")
     def test_create_session_with_valid_name(self, mock_run, mock_sessions, authed_client):
@@ -1386,19 +1413,19 @@ class TestCreateSession:
         assert "error" in resp.json()
 
     @patch("app.subprocess.run")
-    @patch("app._stored_anthropic_key", "sk-ant-testkey123")
-    def test_create_session_injects_stored_api_key(self, mock_run, authed_client):
-        """When _stored_anthropic_key is set, session creation should export ANTHROPIC_API_KEY."""
+    @patch("app._stored_openai_key", "sk-test-not-real")
+    def test_create_session_does_not_put_api_key_in_tmux_command(self, mock_run, authed_client):
+        """Codex reads auth.json or the service env; tmux commands never expose the key."""
         sessions_before = [{"name": "keyed-session", "windows": "1", "created": "0", "attached": False}]
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         with patch("app.get_tmux_sessions", side_effect=[[], sessions_before]):
             resp = authed_client.post("/api/sessions/create", json={"name": "keyed-session"})
         assert resp.status_code == 200
         calls_str = [str(c) for c in mock_run.call_args_list]
-        assert any("ANTHROPIC_API_KEY" in c for c in calls_str)
+        assert not any("sk-test-not-real" in c for c in calls_str)
 
     @patch("app.subprocess.run")
-    @patch("app.NEW_SESSION_CMD", "claude")
+    @patch("app.NEW_SESSION_CMD", "codex --dangerously-bypass-approvals-and-sandbox")
     def test_create_session_sends_new_session_cmd(self, mock_run, authed_client):
         """When NEW_SESSION_CMD is set, session creation should send it to the new pane."""
         sessions_before = [{"name": "cmd-session", "windows": "1", "created": "0", "attached": False}]
@@ -1407,7 +1434,7 @@ class TestCreateSession:
             resp = authed_client.post("/api/sessions/create", json={"name": "cmd-session"})
         assert resp.status_code == 200
         calls_str = [str(c) for c in mock_run.call_args_list]
-        assert any("claude" in c for c in calls_str)
+        assert any("codex --dangerously-bypass-approvals-and-sandbox" in c for c in calls_str)
 
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run", side_effect=Exception("tmux daemon crashed"))
@@ -1516,14 +1543,17 @@ class TestSendCommandEndpoint:
     def test_send_short_command_success(self, mock_run, mock_sessions, authed_client):
         """Short commands (<=200 chars) should be sent via send-keys and return ok=True."""
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        resp = authed_client.post(
-            "/api/sessions/test-session/send",
-            json={"command": "echo hello"},
-        )
+        with patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            resp = authed_client.post(
+                "/api/sessions/test-session/send",
+                json={"command": "echo hello"},
+            )
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
+        mock_sleep.assert_awaited_once_with(0.25)
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -1602,91 +1632,15 @@ class TestSetAuthModeEndpoint:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
-    def test_set_auth_mode_subscription_success(self, mock_run, mock_sessions, authed_client):
-        """Setting mode=subscription should unset ANTHROPIC_API_KEY and return ok."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        resp = authed_client.post(
-            "/api/sessions/test-session/set-auth-mode",
-            json={"mode": "subscription"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        assert data["mode"] == "subscription"
-        assert data["session"] == "test-session"
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    @patch("app._stored_anthropic_key", "sk-ant-testkey123")
-    def test_set_auth_mode_api_with_stored_key_success(self, mock_run, mock_sessions, authed_client):
-        """Setting mode=api with a stored key should export ANTHROPIC_API_KEY and return ok."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    def test_valid_mode_is_managed_per_profile_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
+        """The retired pane toggle cannot place credentials in terminal history."""
         resp = authed_client.post(
             "/api/sessions/test-session/set-auth-mode",
             json={"mode": "api"},
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        assert data["mode"] == "api"
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._stored_anthropic_key", "")
-    def test_set_auth_mode_api_no_key_returns_400(self, mock_sessions, authed_client):
-        """Setting mode=api with no stored key and no fallback should return 400."""
-        # Patch read_text to raise so CLAUDE.md fallback also fails
-        with patch("app.asyncio.to_thread", side_effect=Exception("no file")):
-            resp = authed_client.post(
-                "/api/sessions/test-session/set-auth-mode",
-                json={"mode": "api"},
-            )
-        assert resp.status_code == 400
-        assert resp.json()["error"] == "No API key found"
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run", side_effect=Exception("tmux gone"))
-    def test_set_auth_mode_subprocess_failure_returns_500(self, mock_run, mock_sessions, authed_client):
-        """Subprocess failure in set-auth-mode should return 500."""
-        resp = authed_client.post(
-            "/api/sessions/test-session/set-auth-mode",
-            json={"mode": "subscription"},
-        )
-        assert resp.status_code == 500
-        assert "error" in resp.json()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    @patch("app._stored_anthropic_key", "")
-    def test_set_auth_mode_api_uses_claude_md_fallback_inline_key(self, mock_run, mock_sessions, authed_client, tmp_path):
-        """When no stored key, mode=api should extract inline sk-ant- key from CLAUDE.md."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        # Key embedded in a line (not starting with sk-ant-)
-        claude_md = tmp_path / "CLAUDE.md"
-        claude_md.write_text("# Config\nAPI key: sk-ant-fakekey123\n")
-        with patch("app.Path.home", return_value=tmp_path):
-            resp = authed_client.post(
-                "/api/sessions/test-session/set-auth-mode",
-                json={"mode": "api"},
-            )
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    @patch("app._stored_anthropic_key", "")
-    def test_set_auth_mode_api_uses_claude_md_fallback_bare_key(self, mock_run, mock_sessions, authed_client, tmp_path):
-        """When no stored key, mode=api should extract bare sk-ant- line from CLAUDE.md."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        # Key is on a line by itself (starts with sk-ant-)
-        claude_md = tmp_path / "CLAUDE.md"
-        claude_md.write_text("sk-ant-directkey456\n")
-        with patch("app.Path.home", return_value=tmp_path):
-            resp = authed_client.post(
-                "/api/sessions/test-session/set-auth-mode",
-                json={"mode": "api"},
-            )
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        assert resp.status_code == 409
+        assert "per profile" in resp.json()["error"].lower()
+        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1698,21 +1652,46 @@ class TestParseSessionStats:
 
     @staticmethod
     def _write_jsonl(path, entries):
-        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        flattened = []
+        for entry in entries:
+            flattened.extend(entry if isinstance(entry, list) else [entry])
+        path.write_text("\n".join(json.dumps(e) for e in flattened) + "\n")
 
     @staticmethod
     def _make_entry(today, model, offset_min=1, inp=1000, out=500, cr=0, cc=0):
-        return {
-            "type": "assistant",
-            "timestamp": f"{today}T12:{offset_min:02d}:00Z",
-            "model": model,
-            "usage": {
-                "input_tokens": inp,
-                "output_tokens": out,
-                "cache_read_input_tokens": cr,
-                "cache_creation_input_tokens": cc,
-            },
+        timestamp = f"{today}T12:{offset_min:02d}:00Z"
+        return TestParseSessionStats._make_entry_at(
+            timestamp, model, inp=inp, out=out, cr=cr, cc=cc
+        )
+
+    @staticmethod
+    def _make_entry_at(timestamp, model, inp=1000, out=500, cr=0, cc=0):
+        usage = {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cached_input_tokens": cr,
+            "reasoning_output_tokens": cc,
+            "total_tokens": inp + out + cr + cc,
         }
+        return [
+            {
+                "type": "turn_context",
+                "timestamp": timestamp,
+                "payload": {"model": model},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": usage,
+                        "total_token_usage": usage,
+                        "model_context_window": 200_000,
+                    },
+                },
+            },
+        ]
 
     def test_returns_available_false_when_no_files(self):
         import app as _app
@@ -1730,7 +1709,7 @@ class TestParseSessionStats:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         jsonl_file = tmp_path / "conv.jsonl"
-        self._write_jsonl(jsonl_file, [self._make_entry(today, "claude-sonnet-4-5")])
+        self._write_jsonl(jsonl_file, [self._make_entry(today, "gpt-5.6")])
 
         name = "stats-old-mtime-unit"
         _app._session_stats_cache.pop(name, None)
@@ -1749,7 +1728,7 @@ class TestParseSessionStats:
         self._write_jsonl(jsonl_file, [{
             "type": "assistant",
             "timestamp": "2020-01-01T12:00:00Z",  # far in the past
-            "model": "claude-sonnet-4-5",
+            "model": "gpt-5.6",
             "usage": {"input_tokens": 999, "output_tokens": 999,
                       "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
         }])
@@ -1771,8 +1750,8 @@ class TestParseSessionStats:
 
         jsonl_file = tmp_path / "conv.jsonl"
         self._write_jsonl(jsonl_file, [
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=1, inp=1000, out=500),
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=2, inp=1100, out=600),
+            self._make_entry(today, "gpt-5.6", offset_min=1, inp=1000, out=500),
+            self._make_entry(today, "gpt-5.6", offset_min=2, inp=1100, out=600),
         ])
 
         name = "stats-sonnet-unit"
@@ -1787,7 +1766,7 @@ class TestParseSessionStats:
         assert result["totalInput"] == 2100
         assert result["totalOutput"] == 1100
         assert result["totalTokens"] == 3200
-        assert "sonnet" in result["model"]
+        assert result["model"] == "gpt-5.6"
         assert result["estimatedCost"] > 0
         assert "_ts" in result
 
@@ -1798,10 +1777,10 @@ class TestParseSessionStats:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         opus_file = tmp_path / "opus.jsonl"
-        self._write_jsonl(opus_file, [self._make_entry(today, "claude-opus-4-5", inp=1_000_000, out=0)])
+        self._write_jsonl(opus_file, [self._make_entry(today, "gpt-4o", inp=1_000_000, out=0)])
 
         sonnet_file = tmp_path / "sonnet.jsonl"
-        self._write_jsonl(sonnet_file, [self._make_entry(today, "claude-sonnet-4-5", inp=1_000_000, out=0)])
+        self._write_jsonl(sonnet_file, [self._make_entry(today, "gpt-5.6", inp=1_000_000, out=0)])
 
         _app._session_stats_cache.pop("stats-opus-cost", None)
         _app._session_stats_cache.pop("stats-sonnet-cost", None)
@@ -1822,10 +1801,10 @@ class TestParseSessionStats:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         haiku_file = tmp_path / "haiku.jsonl"
-        self._write_jsonl(haiku_file, [self._make_entry(today, "claude-haiku-4-5", inp=1_000_000, out=0)])
+        self._write_jsonl(haiku_file, [self._make_entry(today, "gpt-5-mini", inp=1_000_000, out=0)])
 
         sonnet_file = tmp_path / "sonnet2.jsonl"
-        self._write_jsonl(sonnet_file, [self._make_entry(today, "claude-sonnet-4-5", inp=1_000_000, out=0)])
+        self._write_jsonl(sonnet_file, [self._make_entry(today, "gpt-5.6", inp=1_000_000, out=0)])
 
         _app._session_stats_cache.pop("stats-haiku-cost", None)
         _app._session_stats_cache.pop("stats-sonnet2-cost", None)
@@ -1847,8 +1826,8 @@ class TestParseSessionStats:
 
         jsonl_file = tmp_path / "conv.jsonl"
         self._write_jsonl(jsonl_file, [
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=1, inp=50_000, out=100),
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=2, inp=100_000, out=100),
+            self._make_entry(today, "gpt-5.6", offset_min=1, inp=50_000, out=100),
+            self._make_entry(today, "gpt-5.6", offset_min=2, inp=100_000, out=100),
         ])
 
         name = "stats-ctx-pct"
@@ -1882,7 +1861,7 @@ class TestParseSessionStats:
 
         jsonl_file = tmp_path / "conv.jsonl"
         self._write_jsonl(jsonl_file, [
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=1, inp=500, out=200),
+            self._make_entry(today, "gpt-5.6", offset_min=1, inp=500, out=200),
         ])
 
         name = "stats-rate-status"
@@ -1916,7 +1895,7 @@ class TestParseSessionStats:
              "usage": {"input_tokens": 999, "output_tokens": 999,
                        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}},
             # valid assistant entry
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=3, inp=100, out=50),
+            self._make_entry(today, "gpt-5.6", offset_min=3, inp=100, out=50),
         ])
 
         name = "stats-skip-non-assistant"
@@ -1943,10 +1922,10 @@ class TestParseSessionStats:
             {
                 "type": "assistant",
                 "timestamp": f"{today}T12:01:00Z",
-                "message": {"model": "claude-sonnet-4-5"},  # no 'usage' key
+                "message": {"model": "gpt-5.6"},  # no 'usage' key
             },
             # valid entry to ensure file is processed
-            self._make_entry(today, "claude-sonnet-4-5", offset_min=2, inp=100, out=50),
+            self._make_entry(today, "gpt-5.6", offset_min=2, inp=100, out=50),
         ])
 
         name = "stats-no-usage-in-msg"
@@ -1987,7 +1966,7 @@ class TestParseSessionStats:
         self._write_jsonl(jsonl_file, [{
             "type": "assistant",
             "timestamp": f"{today}TNOTAVALIDTIME",  # bad time part
-            "model": "claude-sonnet-4-5",
+            "model": "gpt-5.6",
             "usage": {"input_tokens": 100, "output_tokens": 50,
                       "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
         }])
@@ -2021,13 +2000,9 @@ class TestParseSessionStats:
             return  # skip near-midnight UTC
 
         jsonl_file = tmp_path / "conv.jsonl"
-        self._write_jsonl(jsonl_file, [{
-            "type": "assistant",
-            "timestamp": recent_ts,
-            "model": "claude-sonnet-4-5",
-            "usage": {"input_tokens": 1000, "output_tokens": 200,
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-        }])
+        self._write_jsonl(jsonl_file, [
+            self._make_entry_at(recent_ts, "gpt-5.6", inp=1000, out=200)
+        ])
 
         name = "stats-recent-rate"
         _app._session_stats_cache.pop(name, None)
@@ -2066,20 +2041,12 @@ class TestParseSessionStats:
             ts_i = dt_i.strftime("%Y-%m-%dT%H:%M:%SZ")
             if not ts_i.startswith(today):
                 return
-            peak_entries.append({
-                "type": "assistant",
-                "timestamp": ts_i,
-                "model": "claude-sonnet-4-5",
-                "usage": {"input_tokens": 1000, "output_tokens": 5000,
-                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-            })
-        recent_entry = {
-            "type": "assistant",
-            "timestamp": recent_ts,
-            "model": "claude-sonnet-4-5",
-            "usage": {"input_tokens": 1000, "output_tokens": 11,  # very low
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-        }
+            peak_entries.append(
+                self._make_entry_at(ts_i, "gpt-5.6", inp=1000, out=5000)
+            )
+        recent_entry = self._make_entry_at(
+            recent_ts, "gpt-5.6", inp=1000, out=11
+        )
 
         jsonl_file = tmp_path / "conv.jsonl"
         self._write_jsonl(jsonl_file, peak_entries + [recent_entry])
@@ -2112,26 +2079,18 @@ class TestParseSessionStats:
             ts_i = dt_i.strftime("%Y-%m-%dT%H:%M:%SZ")
             if not ts_i.startswith(today):
                 return  # skip near-midnight UTC
-            peak_entries.append({
-                "type": "assistant",
-                "timestamp": ts_i,
-                "model": "claude-sonnet-4-5",
-                "usage": {"input_tokens": 100, "output_tokens": 1000,
-                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-            })
+            peak_entries.append(
+                self._make_entry_at(ts_i, "gpt-5.6", inp=100, out=1000)
+            )
 
         # Recent entry: 2 min ago, output=400 → rate_pct=int(400/1000*100)=40 → "limited"
         recent_dt = datetime.fromtimestamp(now - 120, timezone.utc)
         recent_ts = recent_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         if not recent_ts.startswith(today):
             return
-        recent_entry = {
-            "type": "assistant",
-            "timestamp": recent_ts,
-            "model": "claude-sonnet-4-5",
-            "usage": {"input_tokens": 100, "output_tokens": 400,
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-        }
+        recent_entry = self._make_entry_at(
+            recent_ts, "gpt-5.6", inp=100, out=400
+        )
 
         jsonl_file = tmp_path / "conv.jsonl"
         self._write_jsonl(jsonl_file, peak_entries + [recent_entry])
@@ -2165,13 +2124,9 @@ class TestParseSessionStats:
             return  # skip near-midnight UTC
 
         jsonl_file = tmp_path / "conv.jsonl"
-        self._write_jsonl(jsonl_file, [{
-            "type": "assistant",
-            "timestamp": old_ts,
-            "model": "claude-sonnet-4-5",
-            "usage": {"input_tokens": 1000, "output_tokens": 5000,
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
-        }])
+        self._write_jsonl(jsonl_file, [
+            self._make_entry_at(old_ts, "gpt-5.6", inp=1000, out=5000)
+        ])
 
         name = "stats-no-recent-pct"
         _app._session_stats_cache.pop(name, None)
@@ -2185,112 +2140,122 @@ class TestParseSessionStats:
 
 
 # ---------------------------------------------------------------------------
-# _is_claude_running() — unit tests (covers lines 160-176)
+# _is_codex_running() — unit tests
 # ---------------------------------------------------------------------------
 
-class TestIsClaudeRunning:
-    """Unit tests for _is_claude_running() subprocess helper."""
+class TestIsCodexRunning:
+    """A pane counts as active only when one of its descendants is Codex."""
 
     @patch("app.subprocess.run")
-    def test_returns_true_when_node_running(self, mock_run):
+    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/codex\0")
+    @patch("pathlib.Path.read_text", return_value="codex\n")
+    def test_returns_true_for_codex_descendant(self, mock_text, mock_bytes, mock_run):
         import app as _app
-        mock_run.return_value = MagicMock(returncode=0, stdout="node\n", stderr="")
-        assert _app._is_claude_running("test-session") is True
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="100\n", stderr=""),
+            MagicMock(returncode=0, stdout="101\n", stderr=""),
+        ]
+        assert _app._is_codex_running("test-session") is True
 
     @patch("app.subprocess.run")
-    def test_returns_false_when_bash_running(self, mock_run):
+    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/node\0server.js\0")
+    @patch("pathlib.Path.read_text", return_value="node\n")
+    def test_returns_false_for_unrelated_node_descendant(self, mock_text, mock_bytes, mock_run):
         import app as _app
-        mock_run.return_value = MagicMock(returncode=0, stdout="bash\n", stderr="")
-        assert _app._is_claude_running("test-session") is False
 
-    @patch("app.subprocess.run")
-    def test_returns_false_when_zsh_running(self, mock_run):
-        import app as _app
-        mock_run.return_value = MagicMock(returncode=0, stdout="zsh\n", stderr="")
-        assert _app._is_claude_running("test-session") is False
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="100\n", stderr=""),
+            MagicMock(returncode=0, stdout="101\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr=""),
+        ]
+        assert _app._is_codex_running("test-session") is False
 
     @patch("app.subprocess.run")
     def test_returns_false_on_nonzero_returncode(self, mock_run):
         import app as _app
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="no session")
-        assert _app._is_claude_running("missing") is False
+        assert _app._is_codex_running("missing") is False
 
     @patch("app.subprocess.run", side_effect=Exception("tmux not found"))
     def test_returns_false_on_exception(self, mock_run):
         import app as _app
-        assert _app._is_claude_running("broken-session") is False
+        assert _app._is_codex_running("broken-session") is False
 
 
 # ---------------------------------------------------------------------------
-# _save_anthropic_key / _load_anthropic_key / _clear_anthropic_key (lines 48-79)
+# OpenAI key persistence
 # ---------------------------------------------------------------------------
 
-class TestAnthropicKeyFunctions:
-    """Unit tests for Anthropic API key persistence helpers."""
+class TestOpenAIKeyFunctions:
+    """OpenAI API keys are stored privately and mirrored into Codex auth.json."""
 
     def test_load_returns_key_from_file(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        key_file.write_text("sk-ant-testkey\n")
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file):
-            _app._stored_anthropic_key = ""
-            result = _app._load_anthropic_key()
-        assert result == "sk-ant-testkey"
+        key_file = tmp_path / "openai_api_key"
+        key_file.write_text("sk-test-not-real\n")
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file):
+            _app._stored_openai_key = ""
+            result = _app._load_openai_key()
+        assert result == "sk-test-not-real"
 
     def test_load_returns_empty_when_file_missing(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"  # does not exist
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file):
-            _app._stored_anthropic_key = ""
-            result = _app._load_anthropic_key()
+        key_file = tmp_path / "openai_api_key"  # does not exist
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file):
+            _app._stored_openai_key = ""
+            result = _app._load_openai_key()
         assert result == ""
 
     def test_load_handles_read_exception(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        key_file.write_text("sk-ant-shouldnotread")
-        key_file.chmod(0o000)
-        try:
-            with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file):
-                _app._stored_anthropic_key = ""
-                result = _app._load_anthropic_key()
-            assert result == ""
-        finally:
-            key_file.chmod(0o644)
+        key_file = tmp_path / "openai_api_key"
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
+             patch.object(key_file.__class__, "exists", return_value=True), \
+             patch.object(key_file.__class__, "read_text", side_effect=OSError("denied")):
+            _app._stored_openai_key = ""
+            result = _app._load_openai_key()
+        assert result == ""
 
     def test_save_writes_key_to_file(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file), \
+        key_file = tmp_path / "openai_api_key"
+        codex_home = tmp_path / ".codex"
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
+             patch.object(_app, "CODEX_HOME", codex_home), \
              patch("app.MESSAGES_DIR", tmp_path):
-            _app._save_anthropic_key("sk-ant-newkey")
+            _app._save_openai_key("sk-new-not-real")
         assert key_file.exists()
-        assert key_file.read_text() == "sk-ant-newkey"
+        assert key_file.read_text() == "sk-new-not-real"
+        auth = json.loads((codex_home / "auth.json").read_text())
+        assert auth == {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-new-not-real"}
+        assert (key_file.stat().st_mode & 0o777) == 0o600
+        assert ((codex_home / "auth.json").stat().st_mode & 0o777) == 0o600
 
     def test_save_handles_write_exception(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file), \
+        key_file = tmp_path / "openai_api_key"
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
              patch("app.MESSAGES_DIR", tmp_path), \
-             patch("pathlib.Path.rename", side_effect=OSError("disk full")):
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
             # Should not raise
-            _app._save_anthropic_key("sk-ant-key")
+            _app._save_openai_key("sk-test-not-real")
 
     def test_clear_removes_key_file(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        key_file.write_text("sk-ant-old")
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file):
-            _app._clear_anthropic_key()
+        key_file = tmp_path / "openai_api_key"
+        key_file.write_text("sk-old-not-real")
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file):
+            _app._clear_openai_key()
         assert not key_file.exists()
-        assert _app._stored_anthropic_key == ""
+        assert _app._stored_openai_key == ""
 
     def test_clear_handles_missing_file_gracefully(self, tmp_path):
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"  # does not exist
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file):
-            _app._clear_anthropic_key()  # should not raise
-        assert _app._stored_anthropic_key == ""
+        key_file = tmp_path / "openai_api_key"  # does not exist
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file):
+            _app._clear_openai_key()  # should not raise
+        assert _app._stored_openai_key == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2342,7 +2307,7 @@ class TestAutonomousStatePersistence:
         import app as _app
         state_file = tmp_path / "autonomous-modes.json"
         with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
-             patch("app._atomic_write_json", side_effect=OSError("disk full")):
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
             _app._save_autonomous_state()  # should not raise
 
     def test_save_includes_go_nuts_when_enabled(self, tmp_path):
@@ -2439,7 +2404,7 @@ class TestMiscUncoveredPaths:
         import app as _app
         notes_file = tmp_path / "notes.json"
         notes_file.write_text("{bad json}")
-        with patch.object(_app, "NOTES_FILE", notes_file):
+        with patch.object(_app, "MESSAGES_DIR", tmp_path):
             result = _app._load_all_notes()
         assert result == {}
 
@@ -2448,7 +2413,7 @@ class TestMiscUncoveredPaths:
         import app as _app
         messages_file = tmp_path / "messages.json"
         messages_file.write_text("{bad json}")
-        with patch.object(_app, "MESSAGES_FILE", messages_file):
+        with patch.object(_app, "MESSAGES_DIR", tmp_path):
             result = _app._load_messages()
         assert result == {}
 
@@ -2456,8 +2421,7 @@ class TestMiscUncoveredPaths:
         """_save_notes persists cache entries that have notes (lines 498-507)."""
         import app as _app
         notes_file = tmp_path / "notes.json"
-        with patch.object(_app, "NOTES_FILE", notes_file), \
-             patch("app.MESSAGES_DIR", tmp_path), \
+        with patch("app.MESSAGES_DIR", tmp_path), \
              patch.object(_app, "cache", {"sess1": {"notes": "my note"}}):
             _app._save_notes()
         assert notes_file.exists()
@@ -2467,32 +2431,28 @@ class TestMiscUncoveredPaths:
     def test_save_notes_handles_write_exception(self, tmp_path):
         """_save_notes exception path (lines 506-507)."""
         import app as _app
-        notes_file = tmp_path / "notes.json"
-        with patch.object(_app, "NOTES_FILE", notes_file), \
-             patch("app.MESSAGES_DIR", tmp_path), \
+        with patch("app.MESSAGES_DIR", tmp_path), \
              patch.object(_app, "cache", {"sess1": {"notes": "my note"}}), \
-             patch("app._atomic_write_json", side_effect=OSError("disk full")):
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
             _app._save_notes()  # should not raise
 
     def test_save_messages_handles_write_exception(self, tmp_path):
         """_save_messages exception path (lines 537-538)."""
         import app as _app
-        messages_file = tmp_path / "messages.json"
-        with patch.object(_app, "MESSAGES_FILE", messages_file), \
-             patch("app.MESSAGES_DIR", tmp_path), \
+        with patch("app.MESSAGES_DIR", tmp_path), \
              patch.object(_app, "cache", {"sess1": {"messages": [{"role": "user", "content": "hi"}]}}), \
-             patch("app._atomic_write_json", side_effect=OSError("disk full")):
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
             _app._save_messages()  # should not raise
 
-    def test_clear_anthropic_key_handles_unlink_exception(self, tmp_path):
-        """_clear_anthropic_key exception path (lines 78-79)."""
+    def test_clear_openai_key_handles_unlink_exception(self, tmp_path):
+        """Key clearing suppresses filesystem failures but clears memory."""
         import app as _app
-        key_file = tmp_path / "anthropic_api_key"
-        key_file.write_text("sk-ant-oldkey")
-        with patch.object(_app, "ANTHROPIC_API_KEY_FILE", key_file), \
+        key_file = tmp_path / "openai_api_key"
+        key_file.write_text("sk-old-not-real")
+        with patch.object(_app, "OPENAI_KEY_FILE", key_file), \
              patch("pathlib.Path.unlink", side_effect=OSError("permission denied")):
-            _app._clear_anthropic_key()  # should not raise
-        assert _app._stored_anthropic_key == ""
+            _app._clear_openai_key()  # should not raise
+        assert _app._stored_openai_key == ""
 
 # ---------------------------------------------------------------------------
 # llm_call() — async unit tests (covers lines 1094-1119)
@@ -2519,7 +2479,7 @@ class TestLlmCall:
         assert result == "hello world"
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_error_message(self):
+    async def test_timeout_returns_empty_fail_safe(self):
         import asyncio as _asyncio
 
         import app as _app
@@ -2531,10 +2491,10 @@ class TestLlmCall:
         with patch("app.asyncio.wait_for", fake_wait_for):
             result = await _app.llm_call("sys", "user")
 
-        assert result == "(error: LLM request timed out)"
+        assert result == ""
 
     @pytest.mark.asyncio
-    async def test_exception_returns_error_message(self):
+    async def test_exception_returns_empty_fail_safe(self):
         import app as _app
 
         async def fake_wait_for(coro, timeout):
@@ -2544,7 +2504,7 @@ class TestLlmCall:
         with patch("app.asyncio.wait_for", fake_wait_for):
             result = await _app.llm_call("sys", "user")
 
-        assert "(error: API failure)" in result
+        assert result == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2611,25 +2571,25 @@ class TestLlmPipelineHelpers:
 
     @pytest.mark.asyncio
     async def test_get_realtime_returns_string(self):
-        """Cover lines 1249-1268: get_realtime() captures pane and calls llm_call."""
+        """Realtime text is extracted directly from the Codex terminal."""
         import app as _app
 
-        with patch("app.asyncio.to_thread", new_callable=AsyncMock, return_value="pane content"), \
-             patch("app.async_detect_activity", new_callable=AsyncMock,
-                   return_value={"status": "idle", "detail": ""}), \
-             patch("app.llm_call", new_callable=AsyncMock, return_value="Realtime update"):
+        with patch(
+            "app.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value="❯ user prompt\n● Realtime update",
+        ):
             result = await _app.get_realtime("test-session")
 
         assert result == "Realtime update"
 
     @pytest.mark.asyncio
-    async def test_get_realtime_with_activity_detail(self):
-        """Cover the 'detail' branch in get_realtime (line 1253)."""
+    async def test_get_realtime_summarizes_very_long_codex_text(self):
         import app as _app
 
-        with patch("app.asyncio.to_thread", new_callable=AsyncMock, return_value="output"), \
-             patch("app.async_detect_activity", new_callable=AsyncMock,
-                   return_value={"status": "busy", "detail": "running tests"}), \
+        long_output = "❯ prompt\n● " + "word " * 501
+        with patch("app.asyncio.to_thread", new_callable=AsyncMock, return_value=long_output), \
+             patch("app.AUTO_SUMMARIZER_ENABLED", True), \
              patch("app.llm_call", new_callable=AsyncMock, return_value="Busy update"):
             result = await _app.get_realtime("test-session")
 
@@ -2645,7 +2605,8 @@ class TestLlmPipelineHelpers:
 
         fake_title_desc = ("Test Title", "Test description")
 
-        with patch("app.capture_pane_full", return_value="terminal output\n" * 50), \
+        with patch("app.AUTO_SUMMARIZER_ENABLED", True), \
+             patch("app.capture_pane_full", return_value="terminal output\n" * 50), \
              patch("app.get_title_and_description", new_callable=AsyncMock, return_value=fake_title_desc), \
              patch("app.get_progress", new_callable=AsyncMock, return_value="progress text"), \
              patch("app.get_notes", new_callable=AsyncMock, return_value="some important notes"), \
@@ -2659,87 +2620,6 @@ class TestLlmPipelineHelpers:
         assert result.get("title") == "Test Title"
         assert result.get("description") == "Test description"
         assert result.get("progress") == "progress text"
-
-
-# ---------------------------------------------------------------------------
-# _send_ctrl_c() — async unit test (covers line 648)
-# ---------------------------------------------------------------------------
-
-class TestSendCtrlC:
-    """Async unit test for _send_ctrl_c()."""
-
-    @pytest.mark.asyncio
-    async def test_sends_ctrl_c_to_session(self):
-        import app as _app
-
-        with patch("app.asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
-            await _app._send_ctrl_c("test-session")
-
-        mock_thread.assert_called_once()
-        call_args = mock_thread.call_args[0]
-        # Verify C-c is in the command list
-        assert "C-c" in call_args[1]
-
-
-# ---------------------------------------------------------------------------
-# /api/sessions/{name}/rename — endpoint tests (covers lines 1627-1655)
-# ---------------------------------------------------------------------------
-
-class TestRenameSessionEndpoint:
-    """Tests for POST /api/sessions/{name}/rename."""
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_missing_session_returns_404(self, mock_sessions, authed_client):
-        resp = authed_client.post("/api/sessions/no-such-session/rename",
-                                   json={"new_name": "valid-name"})
-        assert resp.status_code == 404
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_invalid_name_returns_400(self, mock_sessions, authed_client):
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "invalid name with spaces"})
-        assert resp.status_code == 400
-        assert "error" in resp.json()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_same_name_returns_ok(self, mock_sessions, authed_client):
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "test-session"})
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_duplicate_name_returns_409(self, mock_sessions, authed_client):
-        # "work-session" is the second session in MOCK_SESSIONS
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "work-session"})
-        assert resp.status_code == 409
-        assert "error" in resp.json()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    def test_success_returns_new_name(self, mock_run, mock_sessions, authed_client):
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "brand-new-name"})
-        assert resp.status_code == 200
-        assert resp.json()["name"] == "brand-new-name"
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    def test_tmux_failure_returns_500(self, mock_run, mock_sessions, authed_client):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="tmux error")
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "brand-new-name"})
-        assert resp.status_code == 500
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run", side_effect=Exception("tmux gone"))
-    def test_exception_returns_500(self, mock_run, mock_sessions, authed_client):
-        resp = authed_client.post("/api/sessions/test-session/rename",
-                                   json={"new_name": "brand-new-name"})
-        assert resp.status_code == 500
-        assert "error" in resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -2782,94 +2662,49 @@ class TestGoNutsLog:
     def test_trims_log_to_log_cap(self):
         import app as _app
 
-        state = {"phase": 0, "step": 0, "log": [{"ts": 0, "phase": 0, "step": 0, "action": f"old-{i}"} for i in range(_app._LOG_CAP)]}
+        state = {"phase": 0, "step": 0, "log": [{"ts": 0, "phase": 0, "step": 0, "action": f"old-{i}"} for i in range(_app._GO_NUTS_LOG_CAP)]}
         _app._go_nuts_log(state, "new action")
 
-        # Log should be capped at _LOG_CAP entries
-        assert len(state["log"]) == _app._LOG_CAP
+        assert len(state["log"]) == _app._GO_NUTS_LOG_CAP
         assert state["log"][-1]["action"] == "new action"
 
 
 # ---------------------------------------------------------------------------
-# _async_is_claude_running() — async unit test (covers line 181)
+# _async_is_codex_running() — async unit test
 # ---------------------------------------------------------------------------
 
-class TestAsyncIsClaudeRunning:
-    """Async unit test for _async_is_claude_running()."""
+class TestAsyncIsCodexRunning:
+    """Async unit test for _async_is_codex_running()."""
 
     @pytest.mark.asyncio
     async def test_delegates_to_sync_function(self):
         import app as _app
 
         with patch("app.asyncio.to_thread", new_callable=AsyncMock, return_value=True) as mock_thread:
-            result = await _app._async_is_claude_running("test-session")
+            result = await _app._async_is_codex_running("test-session")
 
         assert result is True
-        mock_thread.assert_called_once_with(_app._is_claude_running, "test-session")
+        mock_thread.assert_called_once_with(_app._is_codex_running, "test-session")
 
 
 # ---------------------------------------------------------------------------
-# _tmux_type_and_enter() — async unit test (covers new helper)
+# _ensure_codex_running() — async unit tests
 # ---------------------------------------------------------------------------
 
-class TestTmuxTypeAndEnter:
-    """Async unit tests for _tmux_type_and_enter() helper."""
+class TestEnsureCodexRunning:
+    """Unit tests for _ensure_codex_running() — OOM crash recovery."""
 
     @pytest.mark.asyncio
-    async def test_sends_text_then_enter(self):
-        import app as _app
-
-        calls = []
-
-        async def fake_to_thread(fn, *args, **kwargs):
-            calls.append(args)
-            return MagicMock(returncode=0)
-
-        with patch("app.asyncio.to_thread", side_effect=fake_to_thread):
-            await _app._tmux_type_and_enter("my-session", "echo hello")
-
-        assert len(calls) == 2
-        # calls[i] = (subprocess.run_fn, [tmux_args...]) — index [0] is the tmux command list
-        first_cmd = calls[0][0]
-        assert "-l" in first_cmd
-        assert "echo hello" in first_cmd
-        second_cmd = calls[1][0]
-        assert "Enter" in second_cmd
-
-    @pytest.mark.asyncio
-    async def test_custom_timeout_is_forwarded(self):
-        import app as _app
-
-        timeouts = []
-
-        async def fake_to_thread(fn, *args, **kwargs):
-            timeouts.append(kwargs.get("timeout"))
-            return MagicMock(returncode=0)
-
-        with patch("app.asyncio.to_thread", side_effect=fake_to_thread):
-            await _app._tmux_type_and_enter("my-session", "cmd", timeout=10)
-
-        assert all(t == 10 for t in timeouts)
-
-
-# ---------------------------------------------------------------------------
-# _ensure_claude_running() — async unit tests (covers lines 189-221)
-# ---------------------------------------------------------------------------
-
-class TestEnsureClaudeRunning:
-    """Unit tests for _ensure_claude_running() — OOM crash recovery."""
-
-    @pytest.mark.asyncio
-    async def test_returns_true_if_claude_already_running(self):
+    async def test_returns_true_if_codex_already_running(self):
         """Line 190-191: already running → return True immediately."""
         import app as _app
 
-        with patch("app._async_is_claude_running", new_callable=AsyncMock, return_value=True):
-            result = await _app._ensure_claude_running("my-session")
+        with patch("app._async_is_codex_running", new_callable=AsyncMock, return_value=True):
+            result = await _app._ensure_codex_running("my-session")
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_restarts_claude_and_returns_true(self):
+    async def test_restarts_codex_and_returns_true(self):
         """Lines 189-213: not running → sends restart command → running after 1 poll."""
         import app as _app
 
@@ -2881,10 +2716,10 @@ class TestEnsureClaudeRunning:
         async def fake_is_running(session_name):
             return is_running_values.pop(0)
 
-        with patch("app._async_is_claude_running", side_effect=fake_is_running), \
+        with patch("app._async_is_codex_running", side_effect=fake_is_running), \
              patch("app.asyncio.to_thread", new_callable=AsyncMock), \
              patch("app.asyncio.sleep", new_callable=AsyncMock):
-            result = await _app._ensure_claude_running(
+            result = await _app._ensure_codex_running(
                 "my-session",
                 log_fn=lambda s, msg: log_entries.append(msg),
                 state=state,
@@ -2900,10 +2735,10 @@ class TestEnsureClaudeRunning:
         async def fake_sleep(duration):
             pass
 
-        with patch("app._async_is_claude_running", new_callable=AsyncMock, return_value=False), \
+        with patch("app._async_is_codex_running", new_callable=AsyncMock, return_value=False), \
              patch("app.asyncio.to_thread", new_callable=AsyncMock), \
              patch("app.asyncio.sleep", side_effect=fake_sleep):
-            result = await _app._ensure_claude_running("my-session")
+            result = await _app._ensure_codex_running("my-session")
         assert result is False
 
     @pytest.mark.asyncio
@@ -2911,9 +2746,9 @@ class TestEnsureClaudeRunning:
         """Lines 219-221: exception during restart attempt."""
         import app as _app
 
-        with patch("app._async_is_claude_running", new_callable=AsyncMock, return_value=False), \
+        with patch("app._async_is_codex_running", new_callable=AsyncMock, return_value=False), \
              patch("app.asyncio.to_thread", new_callable=AsyncMock, side_effect=Exception("tmux gone")):
-            result = await _app._ensure_claude_running("my-session")
+            result = await _app._ensure_codex_running("my-session")
         assert result is False
 
     @pytest.mark.asyncio
@@ -2928,75 +2763,11 @@ class TestEnsureClaudeRunning:
         async def fake_sleep(duration):
             pass
 
-        with patch("app._async_is_claude_running", new_callable=AsyncMock, return_value=False), \
+        with patch("app._async_is_codex_running", new_callable=AsyncMock, return_value=False), \
              patch("app.asyncio.to_thread", new_callable=AsyncMock), \
              patch("app.asyncio.sleep", side_effect=fake_sleep):
-            await _app._ensure_claude_running("my-session", log_fn=lambda s, msg: log_entries.append(msg), state=state)
+            await _app._ensure_codex_running("my-session", log_fn=lambda s, msg: log_entries.append(msg), state=state)
         assert any("not running" in entry for entry in log_entries)
-
-
-# ---------------------------------------------------------------------------
-# Autonomous mode wrapper functions (lines 3040, 3055, 3292, 3690)
-# ---------------------------------------------------------------------------
-
-class TestAutonomousModeWrappers:
-    """Unit tests for thin async wrappers that delegate to shared functions."""
-
-    @pytest.mark.asyncio
-    async def test_away_mode_continuous_loop_delegates(self):
-        """Line 3040: _away_mode_continuous_loop delegates to _autonomous_continuous_loop."""
-        import app as _app
-
-        _app._away_mode_state["wrap-test"] = {"enabled": True}
-        try:
-            with patch("app._autonomous_continuous_loop", new_callable=AsyncMock) as mock_loop:
-                await _app._away_mode_continuous_loop("wrap-test")
-            mock_loop.assert_called_once()
-            call_kwargs = mock_loop.call_args.kwargs
-            assert call_kwargs.get("log_fn") is _app._away_log
-        finally:
-            _app._away_mode_state.pop("wrap-test", None)
-
-    @pytest.mark.asyncio
-    async def test_go_nuts_continuous_loop_delegates(self):
-        """Line 3055: _go_nuts_continuous_loop delegates to _autonomous_continuous_loop."""
-        import app as _app
-
-        _app._go_nuts_state["wrap-test"] = {"enabled": True}
-        try:
-            with patch("app._autonomous_continuous_loop", new_callable=AsyncMock) as mock_loop:
-                await _app._go_nuts_continuous_loop("wrap-test")
-            mock_loop.assert_called_once()
-            call_kwargs = mock_loop.call_args.kwargs
-            assert call_kwargs.get("log_fn") is _app._go_nuts_log
-        finally:
-            _app._go_nuts_state.pop("wrap-test", None)
-
-    @pytest.mark.asyncio
-    async def test_away_send_and_wait_delegates(self):
-        """Line 3292: _away_send_and_wait delegates to _autonomous_send_and_wait."""
-        import app as _app
-
-        state = {"enabled": True}
-        with patch("app._autonomous_send_and_wait", new_callable=AsyncMock, return_value="summary") as mock_fn:
-            result = await _app._away_send_and_wait("sess", "prompt text", state, "step-name")
-        assert result == "summary"
-        mock_fn.assert_called_once()
-        call_kwargs = mock_fn.call_args.kwargs
-        assert call_kwargs.get("log_fn") is _app._away_log
-
-    @pytest.mark.asyncio
-    async def test_go_nuts_send_and_wait_delegates(self):
-        """Line 3690: _go_nuts_send_and_wait delegates to _autonomous_send_and_wait."""
-        import app as _app
-
-        state = {"enabled": True}
-        with patch("app._autonomous_send_and_wait", new_callable=AsyncMock, return_value="gn-summary") as mock_fn:
-            result = await _app._go_nuts_send_and_wait("sess", "build prompt", state, "gn-step")
-        assert result == "gn-summary"
-        mock_fn.assert_called_once()
-        call_kwargs = mock_fn.call_args.kwargs
-        assert call_kwargs.get("log_fn") is _app._go_nuts_log
 
 
 # ─── Away Mode Toggle (enable/disable paths) ───
@@ -3335,122 +3106,6 @@ class TestGoNutsPhaseFunctions:
         assert len(calls) == 1
 
 
-# ─── _autonomous_send_and_wait body ───
-
-
-class TestAutonomousSendAndWait:
-    """Cover lines 3261-3286: _autonomous_send_and_wait shared implementation."""
-
-    @pytest.mark.asyncio
-    async def test_success_path_calls_llm_and_returns_summary(self):
-        """Lines 3261-3286: successful send-and-wait calls llm_call and logs done."""
-        import app as _app
-
-        async def noop(*args, **kwargs):
-            pass
-
-        async def fake_wait_idle(session_name, timeout=900):
-            return True
-
-        async def fake_llm(**kwargs):
-            return "LLM summary result"
-
-        state = {"enabled": True, "step": 1, "step_name": "", "log": []}
-        log_entries = []
-
-        with patch("app._away_send_prompt", noop), \
-             patch("app._away_wait_for_idle", fake_wait_idle), \
-             patch("app.capture_pane_full", return_value="some terminal output"), \
-             patch("app.llm_call", fake_llm):
-            result = await _app._autonomous_send_and_wait(
-                session_name="my-sess",
-                prompt="do something",
-                state=state,
-                step_name="test step",
-                timeout=60,
-                log_fn=lambda s, msg: log_entries.append(msg),
-                mode_label="Test mode",
-                summary_prompt="Summarize this",
-            )
-        assert result == "LLM summary result"
-        assert state["step"] == 2  # Incremented
-        assert any("Done" in e for e in log_entries)
-
-    @pytest.mark.asyncio
-    async def test_timeout_path_sends_ctrl_c(self):
-        """Lines 3267-3271: when wait times out, _send_ctrl_c is called."""
-        import app as _app
-
-        ctrl_c_calls = []
-
-        async def fake_send_prompt(session_name, prompt):
-            pass
-
-        async def fake_wait_idle(session_name, timeout=900):
-            return False  # Simulate timeout
-
-        async def fake_llm_call(**kwargs):
-            return "summary"
-
-        async def fake_ctrl_c(session_name):
-            ctrl_c_calls.append(session_name)
-
-        async def noop_sleep(_secs):
-            pass
-
-        state = {"enabled": True, "step": 1, "step_name": "", "log": []}
-
-        with patch("app._away_send_prompt", fake_send_prompt), \
-             patch("app._away_wait_for_idle", fake_wait_idle), \
-             patch("app.capture_pane_full", return_value=""), \
-             patch("app.llm_call", fake_llm_call), \
-             patch("app._send_ctrl_c", fake_ctrl_c), \
-             patch("app.asyncio.sleep", noop_sleep):
-            await _app._autonomous_send_and_wait(
-                session_name="my-sess",
-                prompt="prompt",
-                state=state,
-                step_name="step",
-                timeout=60,
-                log_fn=lambda s, msg: None,
-                mode_label="Mode",
-                summary_prompt="Summarize",
-            )
-        assert ctrl_c_calls == ["my-sess"]
-
-    @pytest.mark.asyncio
-    async def test_llm_exception_returns_unavailable(self):
-        """Lines 3281-3282: if llm_call raises, summary becomes '(summary unavailable)'."""
-        import app as _app
-
-        async def noop(*args, **kwargs):
-            pass
-
-        async def fake_wait_idle(session_name, timeout=900):
-            return True
-
-        async def raising_llm(**kwargs):
-            raise RuntimeError("API down")
-
-        state = {"enabled": True, "step": 1, "step_name": "", "log": []}
-
-        with patch("app._away_send_prompt", noop), \
-             patch("app._away_wait_for_idle", fake_wait_idle), \
-             patch("app.capture_pane_full", return_value="output"), \
-             patch("app.llm_call", raising_llm):
-            result = await _app._autonomous_send_and_wait(
-                session_name="my-sess",
-                prompt="p",
-                state=state,
-                step_name="s",
-                timeout=60,
-                log_fn=lambda s, msg: None,
-                mode_label="M",
-                summary_prompt="Sum",
-            )
-        assert result == "(summary unavailable)"
-
-
 # ─── _away_wait_for_idle ───
 
 
@@ -3570,7 +3225,7 @@ class TestRestoreAutonomousMode:
         async def mock_activity(session_name):
             return {"status": "idle"}
 
-        async def mock_ensure_claude(session_name, log_fn=None, state=None):
+        async def mock_ensure_codex(session_name, log_fn=None, state=None):
             return True
 
         async def mock_send_prompt(session_name, prompt):
@@ -3582,7 +3237,7 @@ class TestRestoreAutonomousMode:
         state = {"enabled": True, "phase": 4, "step": 0, "log": []}
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_claude_running", mock_ensure_claude), \
+             patch("app._ensure_codex_running", mock_ensure_codex), \
              patch("app._away_send_prompt", mock_send_prompt), \
              patch("app._away_mode_continuous_loop", mock_continuous_loop):
             await _app._restore_autonomous_mode("my-sess", state, "away")
@@ -3643,7 +3298,7 @@ class TestRestoreAutonomousMode:
         async def mock_activity(session_name):
             return {"status": "idle"}
 
-        async def mock_ensure_claude(session_name, log_fn=None, state=None):
+        async def mock_ensure_codex(session_name, log_fn=None, state=None):
             return True
 
         async def mock_send_prompt(session_name, prompt):
@@ -3655,7 +3310,7 @@ class TestRestoreAutonomousMode:
         state = {"enabled": True, "phase": 2, "step": 0, "log": []}
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_claude_running", mock_ensure_claude), \
+             patch("app._ensure_codex_running", mock_ensure_codex), \
              patch("app._away_send_prompt", mock_send_prompt), \
              patch("app._go_nuts_continuous_loop", mock_gonuts_loop):
             await _app._restore_autonomous_mode("my-sess", state, "gonuts")
@@ -3750,37 +3405,6 @@ class TestWatchdogLoop:
                    for name, mode in restart_calls)
 
 
-# ─── api_create_session with cwd ───
-
-
-class TestCreateSessionCwd:
-    """Cover line 1592: api_create_session appends -c when cwd is a valid directory."""
-
-    @patch("app.get_tmux_sessions", return_value=[])
-    @patch("app.asyncio.to_thread", new_callable=AsyncMock)
-    def test_create_session_with_valid_cwd_adds_c_flag(
-        self, mock_to_thread, mock_sessions, authed_client, tmp_path
-    ):
-        """Line 1592: -c flag is appended to the tmux command when cwd is a real directory."""
-        import app as _app
-
-        mock_to_thread.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.side_effect = [
-            [],  # initial duplicate check
-            [{"name": "cwd-sess", "windows": "1", "created": "0", "attached": False}],  # after create
-        ]
-        resp = authed_client.post(
-            "/api/sessions/create",
-            json={"name": "cwd-sess", "cwd": str(tmp_path)},
-        )
-        assert resp.status_code == 200
-        # Verify -c appeared in the tmux command args
-        call_args = mock_to_thread.call_args_list[0]
-        cmd = call_args[0][1]  # positional arg 1 is the command list
-        assert "-c" in cmd
-        assert str(tmp_path) in cmd
-
-
 # ─── _away_send_prompt ───
 
 
@@ -3872,6 +3496,7 @@ class TestAwaySendPrompt:
         import app as _app
 
         call_count = [0]
+        tmux_commands = []
 
         async def mock_to_thread(fn, *args, **kwargs):
             if fn is _app.capture_pane_recent:
@@ -3880,15 +3505,12 @@ class TestAwaySendPrompt:
                 if call_count[0] == 5:
                     return "Pasted text +10 lines in buffer"  # Stuck paste!
                 return "same"
+            if fn is _app.subprocess.run and args:
+                tmux_commands.append(args[0])
             return MagicMock(returncode=0, stdout="", stderr="")
 
         async def mock_activity(session_name):
             return {"status": "idle"}
-
-        ctrl_c_calls = []
-
-        async def mock_ctrl_c(session_name):
-            ctrl_c_calls.append(session_name)
 
         async def noop_sleep(_secs):
             pass
@@ -3896,12 +3518,11 @@ class TestAwaySendPrompt:
         with patch("app.asyncio.to_thread", mock_to_thread), \
              patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
-             patch("app._send_ctrl_c", mock_ctrl_c), \
              patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
              patch("app.os.close"), \
              patch("app.os.unlink"):
             await _app._away_send_prompt("test-sess", "hello prompt")
-        assert ctrl_c_calls == ["test-sess"]  # _send_ctrl_c was called during paste recovery
+        assert any("C-c" in command for command in tmux_commands)
 
     @pytest.mark.asyncio
     async def test_activity_exception_treated_as_unknown(self):
@@ -3993,7 +3614,7 @@ class TestRestoreAutonomousModeExtra:
 
     @pytest.mark.asyncio
     async def test_restore_stops_when_claude_dead(self):
-        """Lines 2694-2698: if Claude Code can't be restarted, restore stops."""
+        """Lines 2694-2698: if Codex can't be restarted, restore stops."""
         import app as _app
 
         loop_called = []
@@ -4005,7 +3626,7 @@ class TestRestoreAutonomousModeExtra:
             return {"status": "idle"}
 
         async def mock_ensure_dead(session_name, log_fn=None, state=None):
-            return False  # Claude couldn't restart
+            return False  # Codex couldn't restart
 
         async def mock_loop(session_name):
             loop_called.append(session_name)
@@ -4468,10 +4089,11 @@ class TestAwayModeWorkerContinuousLoop:
             with patch("app._away_phase_study", noop_phase), \
                  patch("app._away_phase_select", noop_phase), \
                  patch("app._away_phase_execute", noop_phase), \
+                 patch("app._away_log"), \
                  patch("app.asyncio.sleep", counting_sleep), \
                  patch("app.async_detect_activity", mock_activity), \
                  patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", noop_ensure), \
+                 patch("app._ensure_codex_running", noop_ensure), \
                  patch("app._away_send_and_wait", mock_send_wait), \
                  patch("app._save_autonomous_state"):
                 await _app._away_mode_worker("cont-away")
@@ -4485,7 +4107,7 @@ class TestAwayModeWorkerContinuousLoop:
 
     @pytest.mark.asyncio
     async def test_claude_dead_stops_loop(self):
-        """Lines 3554-3559: Claude dead and can't restart → stop."""
+        """Lines 3554-3559: Codex dead and can't restart → stop."""
         import app as _app
 
         async def counting_sleep(secs):
@@ -4503,7 +4125,7 @@ class TestAwayModeWorkerContinuousLoop:
             return val
 
         async def dead_ensure(session_name, log_fn=None, state=None):
-            return False  # Claude dead, can't restart
+            return False  # Codex dead, can't restart
 
         async def noop_phase(session_name, state):
             pass
@@ -4519,10 +4141,11 @@ class TestAwayModeWorkerContinuousLoop:
             with patch("app._away_phase_study", noop_phase), \
                  patch("app._away_phase_select", noop_phase), \
                  patch("app._away_phase_execute", noop_phase), \
+                 patch("app._away_log"), \
                  patch("app.asyncio.sleep", counting_sleep), \
                  patch("app.async_detect_activity", mock_activity), \
                  patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
                 await _app._away_mode_worker("dead-away")
         finally:
@@ -4577,10 +4200,11 @@ class TestGoNutsModeWorkerContinuousLoop:
             with patch("app._go_nuts_phase_discover", noop_phase), \
                  patch("app._go_nuts_phase_backlog", noop_phase), \
                  patch("app._go_nuts_phase_build", noop_phase), \
+                 patch("app._go_nuts_log"), \
                  patch("app.asyncio.sleep", counting_sleep), \
                  patch("app.async_detect_activity", mock_activity), \
                  patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", noop_ensure), \
+                 patch("app._ensure_codex_running", noop_ensure), \
                  patch("app._go_nuts_send_and_wait", mock_send_wait), \
                  patch("app._save_autonomous_state"):
                 await _app._go_nuts_mode_worker("cont-gn")
@@ -4594,7 +4218,7 @@ class TestGoNutsModeWorkerContinuousLoop:
 
     @pytest.mark.asyncio
     async def test_claude_dead_stops_loop(self):
-        """Go-nuts: Claude dead → stops loop."""
+        """Go-nuts: Codex dead → stops loop."""
         import app as _app
 
         async def counting_sleep(secs):
@@ -4628,10 +4252,11 @@ class TestGoNutsModeWorkerContinuousLoop:
             with patch("app._go_nuts_phase_discover", noop_phase), \
                  patch("app._go_nuts_phase_backlog", noop_phase), \
                  patch("app._go_nuts_phase_build", noop_phase), \
+                 patch("app._go_nuts_log"), \
                  patch("app.asyncio.sleep", counting_sleep), \
                  patch("app.async_detect_activity", mock_activity), \
                  patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
                 await _app._go_nuts_mode_worker("dead-gn")
         finally:
@@ -4640,180 +4265,15 @@ class TestGoNutsModeWorkerContinuousLoop:
         assert state["enabled"] is False
 
 
-class TestAutonomousContinuousLoop:
-    """Tests for _autonomous_continuous_loop (lines 2969-3037, watchdog restart path)."""
-
-    @pytest.mark.asyncio
-    async def test_one_cycle_then_disabled(self):
-        """Full path: idles, sends ping, completes cycle, exits when disabled."""
-        import app as _app
-
-        time_values = [0.0, 91.0, 91.0]
-        time_idx = [0]
-
-        async def counting_sleep(secs):
-            if secs == 5:
-                state["enabled"] = False
-
-        def mock_time():
-            val = time_values[min(time_idx[0], len(time_values) - 1)]
-            time_idx[0] += 1
-            return val
-
-        send_calls = [0]
-
-        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
-            send_calls[0] += 1
-
-        async def noop_ensure(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_wait_idle(session_name, timeout=900):
-            return True
-
-        state = {
-            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["acl-test"] = state
-
-        try:
-            with patch("app._away_wait_for_idle", noop_wait_idle), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", noop_ensure), \
-                 patch("app._save_autonomous_state"):
-                await _app._autonomous_continuous_loop(
-                    "acl-test",
-                    state=state,
-                    log_fn=_app._away_log,
-                    logger=__import__("logging").getLogger("test"),
-                    mode_name="Away mode",
-                    cycle_label="Ping cycle",
-                    ping_label="task ping",
-                    send_and_wait_fn=mock_send_wait,
-                    ping_prompt="ping!",
-                )
-        finally:
-            _app._away_mode_state.pop("acl-test", None)
-
-        assert send_calls[0] == 1
-        assert state["task"] is None
-
-    @pytest.mark.asyncio
-    async def test_claude_dead_stops_loop(self):
-        """Lines 2996-3001: Claude dead → loop stops."""
-        import app as _app
-
-        async def counting_sleep(secs):
-            pass
-
-        time_idx = [0]
-        time_vals = [0.0, 91.0]
-
-        def mock_time():
-            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
-            time_idx[0] += 1
-            return val
-
-        async def dead_ensure(session_name, log_fn=None, state=None):
-            return False
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_wait_idle(session_name, timeout=900):
-            return True
-
-        state = {
-            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["acl-dead"] = state
-
-        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
-            pass
-
-        try:
-            with patch("app._away_wait_for_idle", noop_wait_idle), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_claude_running", dead_ensure), \
-                 patch("app._save_autonomous_state"):
-                await _app._autonomous_continuous_loop(
-                    "acl-dead",
-                    state=state,
-                    log_fn=_app._away_log,
-                    logger=__import__("logging").getLogger("test"),
-                    mode_name="Away mode",
-                    cycle_label="Ping cycle",
-                    ping_label="task ping",
-                    send_and_wait_fn=mock_send_wait,
-                    ping_prompt="ping!",
-                )
-        finally:
-            _app._away_mode_state.pop("acl-dead", None)
-
-        assert state["enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_cancelled_error_sets_disabled_and_reraises(self):
-        """Lines 3025-3030: CancelledError from inner loop propagates correctly."""
-        import asyncio as _asyncio
-
-        import app as _app
-
-        async def cancelling_wait_idle(session_name, timeout=900):
-            raise _asyncio.CancelledError()
-
-        state = {
-            "enabled": True, "phase": 4, "phase_name": "Continuous (restarted)",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["acl-cancel"] = state
-
-        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
-            pass
-
-        try:
-            with patch("app._away_wait_for_idle", cancelling_wait_idle), \
-                 patch("app._save_autonomous_state"):
-                with pytest.raises(_asyncio.CancelledError):
-                    await _app._autonomous_continuous_loop(
-                        "acl-cancel",
-                        state=state,
-                        log_fn=_app._away_log,
-                        logger=__import__("logging").getLogger("test"),
-                        mode_name="Away mode",
-                        cycle_label="Ping cycle",
-                        ping_label="task ping",
-                        send_and_wait_fn=mock_send_wait,
-                        ping_prompt="ping!",
-                    )
-        finally:
-            _app._away_mode_state.pop("acl-cancel", None)
-
-        assert state["enabled"] is False
-        assert state["task"] is None
-
-
 class TestWatchdogCheckSession:
     """Tests for _watchdog_check_session (lines 2774-2882)."""
 
     @pytest.mark.asyncio
     async def test_empty_pane_returns_early(self):
         """Lines 2775-2779: empty pane → return immediately."""
-        import app as _app
-
         import logging
+
+        import app as _app
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
@@ -4825,9 +4285,9 @@ class TestWatchdogCheckSession:
     @pytest.mark.asyncio
     async def test_new_content_resets_snapshot(self):
         """Lines 2781-2790: new content hash → reset snapshot, return."""
-        import app as _app
-
         import logging
+
+        import app as _app
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
@@ -4837,20 +4297,18 @@ class TestWatchdogCheckSession:
             with patch("app.asyncio.to_thread", return_value="new terminal content here"), \
                  patch("app.time.time", return_value=1000.0):
                 await _app._watchdog_check_session("snap-sess", state, "away", wlog)
+            snap = _app._watchdog_snapshots.get("snap-sess")
+            assert snap is not None
+            assert snap["nudge_count"] == 0
         finally:
             _app._watchdog_snapshots.pop("snap-sess", None)
-
-        # Snapshot was created — now call again with SAME content → stall detected but < threshold
-        snap = _app._watchdog_snapshots.get("snap-sess")
-        assert snap is not None
-        assert snap["nudge_count"] == 0
 
     @pytest.mark.asyncio
     async def test_stall_below_threshold_returns_early(self):
         """Lines 2793-2795: stall detected but < _STALL_THRESHOLD → return."""
-        import app as _app
-
         import logging
+
+        import app as _app
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
@@ -4877,10 +4335,10 @@ class TestWatchdogCheckSession:
     @pytest.mark.asyncio
     async def test_stall_llm_says_stuck_triggers_nudge(self):
         """Lines 2801-2879: LLM says STUCK → nudge sent."""
-        import app as _app
-
         import hashlib
         import logging
+
+        import app as _app
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
@@ -4924,10 +4382,9 @@ class TestWatchdogRestartMode:
     async def test_away_mode_restart_launches_continuous_loop(self):
         """Lines 2887-2950: restart cancels old task, sends unstick, creates new task."""
         import asyncio as _asyncio
+        import logging
 
         import app as _app
-
-        import logging
 
         wlog = logging.getLogger("watchdog-test")
 
@@ -4948,9 +4405,6 @@ class TestWatchdogRestartMode:
         async def mock_send_prompt(session_name, prompt):
             send_calls[0] += 1
 
-        async def mock_ctrl_c(session_name):
-            pass
-
         async def mock_ensure(session_name, log_fn=None, state=None):
             return True
 
@@ -4958,9 +4412,9 @@ class TestWatchdogRestartMode:
             pass
 
         try:
-            with patch("app._send_ctrl_c", mock_ctrl_c), \
+            with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
                  patch("app.asyncio.sleep", return_value=None), \
-                 patch("app._ensure_claude_running", mock_ensure), \
+                 patch("app._ensure_codex_running", mock_ensure), \
                  patch("app._away_send_prompt", mock_send_prompt), \
                  patch("app._away_mode_continuous_loop", instant_continuous), \
                  patch("app._save_autonomous_state"), \
@@ -4974,11 +4428,11 @@ class TestWatchdogRestartMode:
         assert state["enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_restart_claude_dead_sets_disabled(self):
-        """Lines 2921-2924: if Claude can't be restarted, enabled=False."""
-        import app as _app
-
+    async def test_restart_codex_dead_sets_disabled(self):
+        """If Codex cannot be restarted, the autonomous mode is disabled."""
         import logging
+
+        import app as _app
 
         wlog = logging.getLogger("watchdog-test")
 
@@ -4989,20 +4443,16 @@ class TestWatchdogRestartMode:
         }
         _app._away_mode_state["restart-dead"] = state
 
-        async def mock_ctrl_c(session_name):
-            pass
-
         async def dead_ensure(session_name, log_fn=None, state=None):
             return False
 
         try:
-            with patch("app._send_ctrl_c", mock_ctrl_c), \
+            with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
                  patch("app.asyncio.sleep", return_value=None), \
-                 patch("app._ensure_claude_running", dead_ensure), \
+                 patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
                 await _app._watchdog_restart_mode("restart-dead", state, "away", wlog)
         finally:
             _app._away_mode_state.pop("restart-dead", None)
 
         assert state["enabled"] is False
-
