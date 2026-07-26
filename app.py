@@ -989,6 +989,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .err{color:#f85149;font-size:.8rem;margin-bottom:10px;display:none}
 .login-btn{width:100%;background:#1f6feb;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;font-size:.95rem;font-weight:500}
 .login-btn:hover{background:#388bfd}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#fff;color:#1f1f1f;border:1px solid #dadce0;border-radius:6px;padding:10px;font-size:.92rem;font-weight:500;text-decoration:none;margin-bottom:6px}
+.gbtn:hover{background:#f4f4f4}
+.ghint{color:#6e7681;font-size:.72rem;text-align:center;margin-bottom:16px}
+.sep{display:flex;align-items:center;gap:10px;color:#6e7681;font-size:.72rem;margin:0 0 16px}
+.sep:before,.sep:after{content:"";flex:1;height:1px;background:#30363d}
 </style></head><body>
 <!-- Root-absolute, not relative: this page is also served for deep links like
      /browser/<sid>/vnc.html, where action="login" POSTed to
@@ -997,18 +1002,51 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <h2>__BRAND__ Dashboard</h2>
   <p>Enter credentials to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
+__GOOGLE_BTN__
   <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
   <input type="hidden" name="next" id="next">
   <button class="login-btn" type="submit">Log in</button>
 </form>
 <script>
-if(location.search.includes('err=1'))document.getElementById('err').style.display='block';
+var q=new URLSearchParams(location.search),e=document.getElementById('err');
+if(q.get('err')==='1'){e.style.display='block';}
+/* Google sign-in rejections come back as ?gerr=<reason> so the user sees why. */
+var GERR={domain:'That Google account is not allowed. Use your company Google account.',
+          denied:'Google sign-in was cancelled.',
+          state:'Sign-in link expired \u2014 please try again.',
+          config:'Google sign-in is not configured on this server.',
+          failed:'Google sign-in failed \u2014 please try again.'};
+if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
 /* Carry the deep link through the login so signing in from e.g. a noVNC viewer
    URL lands back on the viewer instead of the dashboard home. */
-document.getElementById('next').value=location.pathname+location.search;
+var nxt=location.pathname+location.search;
+document.getElementById('next').value=nxt;
+var g=document.getElementById('gbtn');
+if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
 </script>
 </body></html>"""
+
+# Rendered into __GOOGLE_BTN__ only when a Google OAuth client is configured.
+_GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
+    <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
+    Continue with Google</a>
+  <div class="ghint">__GOOGLE_HINT__</div>
+  <div class="sep">or sign in with a password</div>"""
+
+
+def _login_page() -> str:
+    """The login page, with the Google button rendered only when configured.
+
+    Resolved per request rather than at import so dropping in
+    ~/.tmux-dashboard/google_oauth_client.json takes effect on the next page
+    load instead of needing the app restarted.
+    """
+    if not _google_login_enabled():
+        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+    domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
+    hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
+    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
 
 
 @app.middleware("http")
@@ -1114,6 +1152,9 @@ async def auth_middleware(request: Request, call_next):
     # must work even when the cross-site redirect from Google drops the cookie.
     if path.endswith("/api/sandbox/check") or path.endswith("/api/connections/google/callback"):
         return await call_next(request)
+    # Google sign-in: both legs run before there is a session cookie.
+    if "/auth/google/" in path:
+        return await call_next(request)
     # Public project serving: /<username>/<project>[/...] is served publicly (the
     # /<username> project-list page itself stays gated below).
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
@@ -1121,7 +1162,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
-        resp = HTMLResponse(LOGIN_PAGE)
+        resp = HTMLResponse(_login_page())
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
@@ -1130,7 +1171,7 @@ async def auth_middleware(request: Request, call_next):
     # the login screen.
     user = _user_from_token(token)
     if not user:
-        resp = HTMLResponse(LOGIN_PAGE)
+        resp = HTMLResponse(_login_page())
         resp.delete_cookie("tmux_auth")
         return resp
     request.state._current_user = user
@@ -1144,8 +1185,13 @@ async def api_auth_verify(request: Request):
     Returns 200 when the shared ``tmux_auth`` cookie is valid, else 401 — so a
     single login to this dashboard unlocks the other knowva.ai apps (matcher,
     crypto, zoom, ...) which gate on this endpoint instead of separate logins.
+
+    Accounts carrying ``sso: false`` (Google-provisioned employees) are 401'd
+    here on purpose: letting anyone with a company address into the dashboard
+    should not also hand them the crypto/sales/matcher apps.
     """
-    if _user_from_token(request.cookies.get("tmux_auth")):
+    u = _user_from_token(request.cookies.get("tmux_auth"))
+    if u and u.get("sso", True) is not False:
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False}, status_code=401)
 
@@ -1259,6 +1305,259 @@ async def do_logout(request: Request):
     return resp
 
 
+# --- Google sign-in --------------------------------------------------------
+# One-click login for company Google accounts. Employees at the allowed domains
+# get an account provisioned on first sign-in; everyone else is rejected before
+# any account is created. Uses the same OAuth client as the Drive/Gmail
+# connections feature (`_google_client()`), so a single client ID configured via
+# GOOGLE_OAUTH_CLIENT_ID/SECRET or ~/.tmux-dashboard/google_oauth_client.json
+# covers both. `_sign_state`/`_verify_state` live further down the module with
+# the connections code; they're only called at request time so the forward
+# reference is fine.
+GOOGLE_LOGIN_DOMAINS = [
+    d.strip().lower().lstrip("@")
+    for d in os.environ.get("TMUX_DASH_GOOGLE_DOMAINS", "grabo.com,nemopowertools.com").split(",")
+    if d.strip()
+]
+# Individual addresses allowed on top of the domains (e.g. a personal Gmail that
+# should map onto an existing account). Comma-separated.
+GOOGLE_LOGIN_EMAILS = [
+    e.strip().lower() for e in os.environ.get("TMUX_DASH_GOOGLE_EMAILS", "").split(",") if e.strip()
+]
+# Google address that signs in as the built-in admin (id="admin").
+ADMIN_GOOGLE_EMAIL = os.environ.get("TMUX_DASH_ADMIN_GOOGLE_EMAIL", "").strip().lower()
+GOOGLE_LOGIN_SCOPES = "openid email profile"
+
+
+def _google_login_enabled() -> bool:
+    cid, csec = _google_client()
+    return bool(cid and csec)
+
+
+def _public_base_url(request: Request) -> str:
+    """Externally-visible scheme://host for this request.
+
+    TMUX_DASH_PUBLIC_URL wins when set; otherwise trust the proxy headers, since
+    nginx terminates TLS and forwards plain HTTP (request.url.scheme would say
+    "http" and Google rejects a redirect_uri that doesn't match exactly).
+    """
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+    proto = (request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+             or request.url.scheme)
+    host = (request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+            or request.headers.get("host", "") or request.url.netloc)
+    return f"{proto}://{host}"
+
+
+def _google_login_redirect_uri(request: Request) -> str:
+    """Must match a redirect URI registered on the OAuth client, exactly."""
+    return _public_base_url(request) + ROOT_PATH + "/auth/google/callback"
+
+
+def _google_email_allowed(email: str) -> bool:
+    email = (email or "").lower()
+    if "@" not in email:
+        return False
+    if email in GOOGLE_LOGIN_EMAILS or (ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL):
+        return True
+    return email.split("@", 1)[1] in GOOGLE_LOGIN_DOMAINS
+
+
+def _decode_id_token(id_token: str) -> dict:
+    """Return the claims of a Google ID token.
+
+    No signature check: the token is read straight off Google's HTTPS token
+    endpoint in response to a request authenticated with our client secret, which
+    is the case Google explicitly documents as not needing local verification.
+    The claims below (aud/iss/exp) are still checked by the caller.
+    """
+    parts = id_token.split(".")
+    if len(parts) != 3:
+        raise ValueError("malformed id_token")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload.encode()))
+
+
+def _google_login_user(email: str, name: str) -> Optional[dict]:
+    """Find (or provision) the account for a verified Google address.
+
+    Explicit bindings win over the domain allowlist so a personal address can be
+    pinned to an existing account: an exact `google_email` match, the env-pinned
+    ADMIN_GOOGLE_EMAIL, or a username that already *is* the address. Only after
+    those do we fall back to "allowed domain → create a new member account".
+    """
+    email = (email or "").strip().lower()
+    users = _load_users()
+
+    target = next((u for u in users if (u.get("google_email") or "").lower() == email), None)
+    if target is None and ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL:
+        target = next((u for u in users if u.get("id") == "admin"), None)
+    if target is None:
+        target = next((u for u in users if (u.get("username") or "").lower() == email), None)
+    if target is not None:
+        if (target.get("google_email") or "").lower() != email:
+            target["google_email"] = email
+            _save_users(users)
+        return target
+
+    if not _google_email_allowed(email):
+        return None
+
+    # New employee: provision a member account with no password (password login
+    # stays impossible — _verify_password rejects an empty hash — so the Google
+    # identity is the only way in until an admin sets one).
+    base = re.sub(r"[^A-Za-z0-9._-]", "", email.split("@", 1)[0]) or "user"
+    username = base[:40]
+    taken = {(u.get("username") or "").lower() for u in users}
+    if username.lower() in taken:
+        username = email[:40]
+    if username.lower() in taken:
+        username = (base[:32] + "-" + secrets.token_hex(3))
+    new_user = {
+        "id": _new_user_id(),
+        "username": username,
+        "password_hash": "",
+        "password_salt": "",
+        "role": "user",
+        "group": "",
+        "google_email": email,
+        "display_name": (name or "")[:80],
+        "auth": "google",
+        # Google-provisioned members are dashboard-only: they must not inherit
+        # the nginx auth_request SSO that unlocks the sibling knowva.ai apps.
+        "sso": False,
+        "created_at": time.time(),
+        "last_login": 0,
+    }
+    users.append(new_user)
+    _save_users(users)
+    try:
+        _user_data_dir(new_user)
+        _ensure_user_claude_config_dir(new_user)
+    except Exception:
+        logger.exception("Failed to seed dirs for Google user %s", new_user["id"])
+    logger.info("Provisioned Google user '%s' (%s)", username, email)
+    return new_user
+
+
+def _sync_admin_google_email():
+    """Keep the admin record's google_email in step with the env pin."""
+    if not ADMIN_GOOGLE_EMAIL:
+        return
+    try:
+        users = _load_users()
+        admin = next((u for u in users if u.get("id") == "admin"), None)
+        if admin is not None and (admin.get("google_email") or "").lower() != ADMIN_GOOGLE_EMAIL:
+            admin["google_email"] = ADMIN_GOOGLE_EMAIL
+            _save_users(users)
+    except Exception:
+        logger.exception("Failed to sync the admin Google address")
+
+
+_sync_admin_google_email()
+
+
+@app.get("/auth/google/start")
+async def google_login_start(request: Request):
+    rp = request.scope.get("root_path", "")
+    cid, csec = _google_client()
+    if not cid or not csec:
+        return RedirectResponse(url=rp + "/?gerr=config", status_code=303)
+    nxt = (request.query_params.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = rp + "/"
+    state = _sign_state("glogin:%d:%s" % (
+        int(time.time()), base64.urlsafe_b64encode(nxt.encode()).decode()))
+    params = urllib.parse.urlencode({
+        "client_id": cid,
+        "redirect_uri": _google_login_redirect_uri(request),
+        "response_type": "code",
+        "scope": GOOGLE_LOGIN_SCOPES,
+        # Always show the picker: these boxes are shared, and a stale Google
+        # session would otherwise sign you in as the wrong person silently.
+        "prompt": "select_account",
+        "state": state,
+    })
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+
+
+@app.get("/auth/google/callback")
+async def google_login_callback(request: Request):
+    rp = request.scope.get("root_path", "")
+    ip = request.client.host if request.client else "unknown"
+    if request.query_params.get("error"):
+        return RedirectResponse(url=rp + "/?gerr=denied", status_code=303)
+    if not _check_login_rate_limit(ip):
+        return HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+    code = request.query_params.get("code") or ""
+    payload = _verify_state(request.query_params.get("state") or "")
+    if not code or not payload or not payload.startswith("glogin:"):
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    try:
+        _, ts, nxt_b64 = payload.split(":", 2)
+        nxt = base64.urlsafe_b64decode(nxt_b64.encode()).decode()
+    except Exception:
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    if time.time() - int(ts) > 600:
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    if not (nxt.startswith("/") and not nxt.startswith("//")):
+        nxt = rp + "/"
+
+    cid, csec = _google_client()
+    data = urllib.parse.urlencode({
+        "code": code, "client_id": cid, "client_secret": csec,
+        "redirect_uri": _google_login_redirect_uri(request),
+        "grant_type": "authorization_code",
+    }).encode()
+    try:
+        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tok = json.load(r)
+        claims = _decode_id_token(tok.get("id_token") or "")
+    except Exception:
+        logger.exception("Google sign-in token exchange failed")
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+
+    if claims.get("aud") != cid:
+        logger.warning("Google sign-in: id_token audience mismatch")
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        logger.warning("Google sign-in: unexpected issuer %s", claims.get("iss"))
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+    if float(claims.get("exp") or 0) < time.time():
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    email = (claims.get("email") or "").strip().lower()
+    if not email or not claims.get("email_verified"):
+        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+
+    target_user = _google_login_user(email, claims.get("name") or "")
+    if not target_user:
+        logger.warning("Google sign-in rejected for %s (not an allowed domain)", email)
+        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+
+    ua = (request.headers.get("user-agent", "") or "")[:300]
+    fwd = request.headers.get("x-forwarded-for", "")
+    real_ip = fwd.split(",")[0].strip() if fwd else ip
+    try:
+        users = _load_users()
+        for u in users:
+            if u.get("id") == target_user["id"]:
+                u["last_login"] = time.time()
+                u["last_login_ip"] = real_ip
+                u["last_login_ua"] = ua
+                u["last_login_via"] = "google"
+                break
+        _save_users(users)
+    except Exception:
+        logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
+
+    logger.info("Google sign-in: %s -> user '%s' (%s)",
+                email, target_user.get("username"), target_user.get("role"))
+    resp = RedirectResponse(url=nxt, status_code=303)
+    return _set_auth_cookie(resp, request, _make_token(target_user["id"]))
+
+
 class CreateUserBody(BaseModel):
     username: str
     password: str
@@ -1271,6 +1570,8 @@ class UpdateUserBody(BaseModel):
     role: Optional[str] = None
     username: Optional[str] = None
     group: Optional[str] = None
+    google_email: Optional[str] = None
+    sso: Optional[bool] = None
 
 
 def _public_user(u: dict) -> dict:
@@ -1280,10 +1581,13 @@ def _public_user(u: dict) -> dict:
         "username": u.get("username", ""),
         "role": u.get("role", "user"),
         "group": u.get("group", ""),
+        "google_email": u.get("google_email", ""),
+        "sso": u.get("sso", True) is not False,
         "created_at": u.get("created_at", 0),
         "last_login": u.get("last_login", 0),
         "last_login_ip": u.get("last_login_ip", ""),
         "last_login_ua": u.get("last_login_ua", ""),
+        "last_login_via": u.get("last_login_via", "password"),
     }
 
 
@@ -1384,6 +1688,19 @@ async def api_admin_update_user(request: Request, user_id: str, body: UpdateUser
         changed = True
     if body.group is not None:
         target["group"] = body.group.strip()
+        changed = True
+    if body.google_email is not None:
+        gmail = body.google_email.strip().lower()
+        if gmail and "@" not in gmail:
+            return JSONResponse({"error": "Invalid Google address"}, status_code=400)
+        if gmail and any((u.get("google_email") or "").lower() == gmail and u["id"] != user_id
+                         for u in users):
+            return JSONResponse({"error": "That Google address is already linked to another user"},
+                                status_code=409)
+        target["google_email"] = gmail
+        changed = True
+    if body.sso is not None:
+        target["sso"] = bool(body.sso)
         changed = True
     if changed:
         _save_users(users)
@@ -16875,7 +17192,7 @@ async function loadUsersAdmin(){
   const users = data.users || [];
   const rows = users.map(u => {
     const roleTag = u.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
-    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')) : 'never';
+    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')+(u.last_login_via==='google'?' · Google':'')) : 'never';
     const isMe = (_currentUser && _currentUser.id===u.id);
     const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase">you</span>' : '';
     const grpCell = u.role==='admin' ? '<span class="muted">—</span>' :
@@ -16886,10 +17203,13 @@ async function loadUsersAdmin(){
     if(!(u.id==='admin'||isMe)) acts += `<button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
       <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote':'Promote'}</button>
       <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>`;
+    const gCell = `<span style="font-size:.72rem">${u.google_email?esc(u.google_email):'<span class="muted">—</span>'}</span>
+      <button style="margin-left:6px" onclick="setUserGoogle('${esc(u.id)}','${esc(u.google_email||'')}')">${u.google_email?'Edit':'Link'}</button>`;
     return `<tr>
       <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
       <td>${roleTag}</td>
       <td>${grpCell}</td>
+      <td>${gCell}</td>
       <td>${u.session_count||0}</td>
       <td style="font-size:.72rem">${ll}</td>
       <td><div class="users-actions">${acts}</div></td>
@@ -16911,12 +17231,21 @@ async function loadUsersAdmin(){
       <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
     </div>
     <table class="users-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="6" class="history-empty">No users yet.</td></tr>'}</tbody>
+      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Google sign-in</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="history-empty">No users yet.</td></tr>'}</tbody>
     </table>
   </div>`;
 }
 
+async function setUserGoogle(userId, current){
+  const v = prompt('Google address that signs in as this user (blank to unlink):', current||'');
+  if(v===null) return;
+  const r = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId),
+    {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({google_email:v.trim()})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ alert(d.error||'Failed'); return; }
+  loadUsersAdmin();
+}
 async function setUserGroup(userId, group){
   try{ await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group})}); }
   catch(e){ alert('Failed to set group'); }
@@ -18009,6 +18338,7 @@ HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
+_GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
 # ===========================================================================
