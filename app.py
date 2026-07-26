@@ -54,8 +54,8 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 _CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
 _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
-    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6"),
-).strip() or "gpt-5.6"
+    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
+).strip() or "gpt-5.6-sol"
 _CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _CODEX_REASONING_EFFORT_ALIASES = {
     "ultra": "max",
