@@ -1133,11 +1133,8 @@ def _login_page() -> str:
     return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
 
 
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    """Add security headers to all responses and log slow requests."""
-    start = time.time()
-    response = await call_next(request)
+def _apply_security_headers(request: Request, response: Response) -> Response:
+    """Apply the dashboard's response policy, including direct login pages."""
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -1162,10 +1159,18 @@ async def security_headers_middleware(request: Request, call_next):
         "font-src 'self' data:; "
         "frame-ancestors 'self'"
     )
+    return response
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add security headers to all responses and log slow requests."""
+    start = time.time()
+    response = await call_next(request)
     duration = time.time() - start
     if duration > 2.0:
         logger.warning("Slow request: %s %s took %.1fs", request.method, request.url.path, duration)
-    return response
+    return _apply_security_headers(request, response)
 
 
 # Regex for /api/sessions/<name>/... and /api/sessions/<name> (DELETE/GET on bare URL).
@@ -1254,9 +1259,7 @@ async def auth_middleware(request: Request, call_next):
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
         resp = HTMLResponse(_login_page())
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        return resp
+        return _apply_security_headers(request, resp)
     # Token signature is valid — also verify the user still exists. If users.json
     # was tampered with or the user got deleted while logged in, fall back to
     # the login screen.
@@ -1264,7 +1267,7 @@ async def auth_middleware(request: Request, call_next):
     if not user:
         resp = HTMLResponse(_login_page())
         resp.delete_cookie("tmux_auth")
-        return resp
+        return _apply_security_headers(request, resp)
     request.state._current_user = user
     return await call_next(request)
 

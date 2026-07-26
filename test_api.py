@@ -1226,6 +1226,13 @@ class TestHstsHeader:
         assert "max-age=" in hsts
         assert "includeSubDomains" in hsts
 
+    def test_hsts_and_security_headers_on_unauthenticated_login(self, client):
+        """The auth middleware's direct login response must keep HTTPS headers."""
+        resp = client.get("/", headers={"x-forwarded-proto": "https"})
+        assert "max-age=" in resp.headers.get("Strict-Transport-Security", "")
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+        assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
+
 
 # ─── Codex Usage Endpoint ───
 
