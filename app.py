@@ -10716,115 +10716,133 @@ def _all_codex_rollouts() -> list[Path]:
     return files
 
 
+def _codex_app_server_rate_limits(codex_home: Path) -> dict:
+    """Read the authoritative plan windows from Codex's app-server."""
+    process = _codex_app_server_process(codex_home)
+    try:
+        _codex_app_server_initialize(process)
+        _codex_app_server_send(process, {
+            "method": "account/rateLimits/read",
+            "id": 2,
+            "params": None,
+        })
+        response = _codex_app_server_wait(process, 2, timeout=20)
+        if response.get("error"):
+            return {}
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        logger.warning("Codex rate-limit lookup failed", exc_info=True)
+        return {}
+    finally:
+        _terminate_codex_app_server(process)
+
+
+def _rate_limit_window_payload(slot: str, window: object) -> dict | None:
+    if not isinstance(window, dict):
+        return None
+    try:
+        used_percent = max(0, min(100, int(window.get("usedPercent", 0))))
+    except (TypeError, ValueError):
+        used_percent = 0
+    try:
+        duration = int(window.get("windowDurationMins") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration and duration % (24 * 60) == 0:
+        label = f"{duration // (24 * 60)}d"
+    elif duration and duration % 60 == 0:
+        label = f"{duration // 60}h"
+    elif duration:
+        label = f"{duration}m"
+    else:
+        label = slot.title()
+    resets_at = None
+    try:
+        reset_epoch = int(window.get("resetsAt") or 0)
+        if reset_epoch:
+            resets_at = datetime.fromtimestamp(
+                reset_epoch, timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    return {
+        "id": slot,
+        "label": label,
+        "duration_minutes": duration or None,
+        "utilization": used_percent,
+        "resets_at": resets_at,
+    }
+
+
 @app.get("/api/usage/limits")
 async def api_openai_usage_limits():
-    """Codex/OpenAI usage limits surface.
-
-    In api-key mode, OpenAI bills by spend rather than 5h/7d rate buckets, so
-    there is no live 5h/7d quota endpoint. We instead aggregate token_count
-    events from ~/.codex/sessions/**/*.jsonl over the last 5 hours and last
-    7 days and report them as utilisation indicators against soft thresholds.
-    """
+    """Return genuine ChatGPT plan windows; never invent API-key quotas."""
     now = time.time()
-    if now - _openai_limits_cache["ts"] < 600 and _openai_limits_cache["data"]:
-        return JSONResponse(_openai_limits_cache["data"])
+    auth_state = await asyncio.to_thread(
+        _ensure_codex_auth_with_fallback, CODEX_HOME, True
+    )
+    auth_mode = str(auth_state.get("activeMode") or "unknown")
+    cached = _openai_limits_cache.get("data")
+    if (
+        now - _openai_limits_cache["ts"] < 600
+        and isinstance(cached, dict)
+        and cached.get("auth_mode") == auth_mode
+    ):
+        return JSONResponse(cached)
 
-    def _scan() -> dict:
-        cutoff_5h = now - 5 * 3600
-        cutoff_7d = now - 7 * 86400
-        total_5h = 0
-        total_7d = 0
-        cache_5h = 0
-        cache_7d = 0
-        cost_5h = 0.0
-        cost_7d = 0.0
-        seen_5h = set()
-        seen_7d = set()
-        files = _all_codex_rollouts()
-        if not files:
-            return {}
-        for fpath in files:
-            try:
-                mtime = fpath.stat().st_mtime
-                if mtime < cutoff_7d:
-                    continue
-                model = "gpt-5.4"
-                sid = fpath.name
-                with open(fpath) as f:
-                    for line in f:
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        if d.get("type") == "turn_context":
-                            m = d.get("payload", {}).get("model")
-                            if m:
-                                model = m
-                        if d.get("type") != "event_msg":
-                            continue
-                        pl = d.get("payload", {})
-                        if pl.get("type") != "token_count":
-                            continue
-                        info = pl.get("info", {}) or {}
-                        last = info.get("last_token_usage", {}) or {}
-                        last_total = last.get("total_tokens", 0)
-                        last_cache = last.get("cached_input_tokens", 0)
-                        last_in = last.get("input_tokens", 0)
-                        last_out = last.get("output_tokens", 0)
-                        last_reason = last.get("reasoning_output_tokens", 0)
-                        ts_str = d.get("timestamp", "")
-                        try:
-                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        except Exception:
-                            ts = mtime
-                        c_in, c_out, c_cached = 1.25, 10.0, 0.125
-                        if "o3" in model.lower():
-                            c_in, c_out, c_cached = 2.0, 8.0, 0.5
-                        cost = (last_in * c_in + (last_out + last_reason) * c_out + last_cache * c_cached) / 1e6
-                        if ts >= cutoff_5h:
-                            total_5h += last_total
-                            cache_5h += last_cache
-                            cost_5h += cost
-                            seen_5h.add(sid)
-                        if ts >= cutoff_7d:
-                            total_7d += last_total
-                            cache_7d += last_cache
-                            cost_7d += cost
-                            seen_7d.add(sid)
-            except Exception:
-                logger.debug("Failed to scan rollout %s", fpath, exc_info=True)
-        soft_5h = 5_000_000
-        soft_7d = 50_000_000
-        return {
+    if auth_mode == "apikey":
+        data = {
             "fetched_at": now,
-            "five_hour": {
-                "tokens": total_5h,
-                "cached_tokens": cache_5h,
-                "sessions": len(seen_5h),
-                "soft_limit": soft_5h,
-                "utilization": round(total_5h / soft_5h * 100, 1) if soft_5h else 0,
-                "estimated_cost_usd": round(cost_5h, 2),
-            },
-            "seven_day": {
-                "tokens": total_7d,
-                "cached_tokens": cache_7d,
-                "sessions": len(seen_7d),
-                "soft_limit": soft_7d,
-                "utilization": round(total_7d / soft_7d * 100, 1) if soft_7d else 0,
-                "estimated_cost_usd": round(cost_7d, 2),
-            },
+            "auth_mode": "apikey",
+            "billing_mode": "pay_as_you_go",
+            "windows": [],
+            "message": "API-key usage is billed per token; it has no Codex plan quota windows.",
         }
+        _openai_limits_cache.update({"ts": now, "data": data})
+        return JSONResponse(data)
+    if auth_mode != "chatgpt":
+        return JSONResponse({
+            "auth_mode": auth_mode,
+            "windows": [],
+            "error": "Codex is not authenticated.",
+        }, status_code=503)
 
-    try:
-        data = await asyncio.to_thread(_scan)
-    except Exception as e:
-        logger.warning("Codex usage scan failed: %s", e)
-        if _openai_limits_cache["data"]:
-            return JSONResponse(_openai_limits_cache["data"])
-        return JSONResponse({"error": "scan_failed"}, status_code=502)
+    raw = await asyncio.to_thread(_codex_app_server_rate_limits, CODEX_HOME)
+    by_limit_id = raw.get("rateLimitsByLimitId")
+    snapshot = None
+    if isinstance(by_limit_id, dict):
+        snapshot = by_limit_id.get("codex")
+        if not isinstance(snapshot, dict):
+            snapshot = next(
+                (value for value in by_limit_id.values() if isinstance(value, dict)),
+                None,
+            )
+    if not isinstance(snapshot, dict):
+        snapshot = raw.get("rateLimits")
+    if not isinstance(snapshot, dict):
+        return JSONResponse({
+            "auth_mode": "chatgpt",
+            "windows": [],
+            "error": "Codex did not return plan rate limits.",
+        }, status_code=502)
 
-    if not data:
-        return JSONResponse({"error": "no_data"}, status_code=204)
+    windows = [
+        _rate_limit_window_payload("primary", snapshot.get("primary")),
+        _rate_limit_window_payload("secondary", snapshot.get("secondary")),
+    ]
+    windows = [window for window in windows if window is not None]
+    account = auth_state.get("account")
+    account = account if isinstance(account, dict) else {}
+    data = {
+        "fetched_at": now,
+        "auth_mode": "chatgpt",
+        "billing_mode": "plan",
+        "plan_type": snapshot.get("planType") or account.get("planType"),
+        "limit_id": snapshot.get("limitId"),
+        "limit_name": snapshot.get("limitName"),
+        "windows": windows,
+    }
     _openai_limits_cache["ts"] = now
     _openai_limits_cache["data"] = data
     return JSONResponse(data)
@@ -14841,9 +14859,9 @@ body.member-simple .hide-in-simple{display:none!important}
 .settings-section label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-top:4px}
 .settings-section textarea{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace;resize:vertical;line-height:1.5}
 .settings-section textarea:focus{border-color:#58a6ff}
-.settings-section .my-ctx-claude{min-height:240px}
+.settings-section .my-ctx-codex{min-height:240px}
 .settings-section .my-ctx-memory{min-height:160px}
-.settings-section .my-ctx-settings{min-height:120px}
+.settings-section .my-ctx-settings,.settings-section .my-ctx-config{min-height:120px}
 .settings-section .my-ctx-path{font-size:.7rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:2px}
 .settings-section .my-ctx-actions{display:flex;justify-content:flex-end;gap:8px}
 /* Header browser sign-in badge */
@@ -15080,17 +15098,17 @@ body.member-simple .hide-in-simple{display:none!important}
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
   <span class="nav-usage" id="nav-usage">
-    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="">
-      <span class="nav-usage-label">5h</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-5h-pct">--</span>
-      <span class="nav-usage-meta" id="nav-usage-5h-meta">no data</span>
+    <span class="nav-usage-item" id="nav-usage-primary-wrap" title="">
+      <span class="nav-usage-label" id="nav-usage-primary-label">plan</span>
+      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-primary-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-primary-pct">--</span>
+      <span class="nav-usage-meta" id="nav-usage-primary-meta">no data</span>
     </span>
-    <span class="nav-usage-item" id="nav-usage-7d-wrap" title="">
-      <span class="nav-usage-label">7d</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-7d-pct">--</span>
-      <span class="nav-usage-meta" id="nav-usage-7d-meta">no data</span>
+    <span class="nav-usage-item" id="nav-usage-secondary-wrap" title="">
+      <span class="nav-usage-label" id="nav-usage-secondary-label">plan</span>
+      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-secondary-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-secondary-pct">--</span>
+      <span class="nav-usage-meta" id="nav-usage-secondary-meta">no data</span>
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
@@ -15103,28 +15121,23 @@ body.member-simple .hide-in-simple{display:none!important}
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
       <div class="nav-tools-usage" id="nav-tools-usage">
-        <div class="nav-tools-usage-title">OpenAI limits</div>
-        <div class="nav-tools-usage-row" id="tools-usage-5h-wrap" title="">
-          <span class="nav-tools-usage-label">5h</span>
-          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-5h-fill" style="width:0%"></span></span>
-          <span class="nav-tools-usage-pct" id="tools-usage-5h-pct">&mdash;</span>
-          <span class="nav-tools-usage-pct" id="tools-usage-5h-meta">&mdash;</span>
+        <div class="nav-tools-usage-title">Codex plan limits</div>
+        <div class="nav-tools-usage-row" id="tools-usage-primary-wrap" title="">
+          <span class="nav-tools-usage-label" id="tools-usage-primary-label">plan</span>
+          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-primary-fill" style="width:0%"></span></span>
+          <span class="nav-tools-usage-pct" id="tools-usage-primary-pct">&mdash;</span>
+          <span class="nav-tools-usage-pct" id="tools-usage-primary-meta">&mdash;</span>
         </div>
-        <div class="nav-tools-usage-row" id="tools-usage-7d-wrap" title="">
-          <span class="nav-tools-usage-label">7d</span>
-          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-7d-fill" style="width:0%"></span></span>
-          <span class="nav-tools-usage-pct" id="tools-usage-7d-pct">&mdash;</span>
-          <span class="nav-tools-usage-pct" id="tools-usage-7d-meta">&mdash;</span>
+        <div class="nav-tools-usage-row" id="tools-usage-secondary-wrap" title="">
+          <span class="nav-tools-usage-label" id="tools-usage-secondary-label">plan</span>
+          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-secondary-fill" style="width:0%"></span></span>
+          <span class="nav-tools-usage-pct" id="tools-usage-secondary-pct">&mdash;</span>
+          <span class="nav-tools-usage-pct" id="tools-usage-secondary-meta">&mdash;</span>
         </div>
         <div class="nav-tools-usage-divider"></div>
       </div>
-      <!-- Each entry below opens its OWN window. Everything that lives as a tab
-           inside the Settings modal (My Context, History, Users, APIs, Browser,
-           Codex Login) is reached through the single Settings entry — listing
-           those tabs here as well is what made this menu a settings menu
-           containing a settings button. -->
+      <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Context Files</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
@@ -15190,24 +15203,6 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- Context files overlay -->
-<div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
-  <div class="claudemd-panel" id="claudemd-panel">
-    <h3>Context Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">
-      Every registered file Codex reads for context on this host. <b>Always loaded</b> files are injected into
-      each session's context window — keep them tight. <b>On demand</b> files cost nothing until
-      <code>AGENTS.md</code> sends a session to them, so detail belongs there.
-      <span id="ctxfiles-budget"></span>
-    </div>
-    <div class="extras-section claudemd-extras" id="context-files">
-      <div class="extras-empty">Loading...</div>
-    </div>
-    <div class="claudemd-actions">
-      <button class="btn" onclick="closeClaudeMd()">Close</button>
-    </div>
-  </div>
-</div>
 <!-- Profiles editor overlay -->
 <div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
   <div class="profiles-panel">
@@ -15220,13 +15215,13 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- Config overlay (My Context / History / Users) -->
-<div class="profiles-overlay" id="config-overlay" onclick="if(event.target===this)closeConfig()">
+<!-- Settings overlay -->
+<div class="profiles-overlay" id="settings-overlay" onclick="if(event.target===this)closeSettings()">
   <div class="profiles-panel" style="width:980px">
-    <h3>Config <button class="stats-close" onclick="closeConfig()">&times;</button></h3>
-    <div class="config-tabs" id="config-tabs"></div>
-    <div class="config-body" id="config-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
-      <div id="config-content" style="flex:1;min-height:0;overflow-y:auto;padding-top:8px"></div>
+    <h3>Settings <button class="stats-close" onclick="closeSettings()">&times;</button></h3>
+    <div class="settings-tabs" id="settings-tabs"></div>
+    <div class="settings-body" id="settings-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
+      <div id="settings-content" style="flex:1;min-height:0;overflow-y:auto;padding-top:8px"></div>
     </div>
   </div>
 </div>
@@ -15281,6 +15276,33 @@ const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+
 function _isBashFetchHeader(line){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   return _BASH_FILTER_RE.test(stripped);
+}
+// Hide low-value package/self-update chatter when tool calls are hidden. This
+// helper must stay defined before applyRawFilter: a missing definition leaves
+// the terminal on its initial "Loading Codex..." text after a successful poll.
+const _UPDATE_NOISE_RES=[
+  /^checking for updates?/i,
+  /^installing\b.*\b(codex|update|npm|node|package|version|v?\d)/i,
+  /^downloading\b.*\b(codex|update|npm|version|package|v?\d)/i,
+  /\b(update (installed|complete|available)|successfully updated|already up to date|codex v?\d[\d.]* installed)\b/i,
+  /^npm\b/i,
+  /\bnpm (warn|notice|info|err|http|verb|sill|deprecated|audit|fund)\b/i,
+  /^(added|changed|removed|audited)\s+\d+\s+packages?\b/i,
+  /\bpackages?\b[^\n]*\blooking for funding\b/i,
+  /^found \d+ vulnerabilit/i,
+  /\bnpm audit\b/i,
+  /\bto (apply|finish|complete) the update\b/i,
+  /^restart codex\b/i,
+  /^[\[(][#=>\-.\s]{3,}[\])]/,
+];
+function _isUpdateNoise(line){
+  if(!line)return false;
+  const s=line.replace(/^[\s⎿●⏺•·>*\-]+/,'').trim();
+  if(!s)return false;
+  for(let i=0;i<_UPDATE_NOISE_RES.length;i++){
+    if(_UPDATE_NOISE_RES[i].test(s))return true;
+  }
+  return false;
 }
 function applyRawFilter(text){
   const hideBash=getHideBashPref();
@@ -16846,7 +16868,7 @@ async function refreshNavStats(){
 }
 refreshNavStats();
 
-// --- OpenAI/Codex usage indicators (5h + 7d) in nav header ---
+// --- Authoritative ChatGPT-plan usage windows in the nav header ---
 let _usageLimitsTimer=null;
 function _fmtResetTime(iso){
   if(!iso)return'';
@@ -16870,22 +16892,29 @@ function _applyUsageStyle(fillEl,pctNum){
   else if(pctNum>=70)cls='warn';
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
-function _fmtUsageTokens(n){
-  n=Number(n)||0;
-  if(n>=1e9)return(n/1e9).toFixed(1)+'B';
-  if(n>=1e6)return(n/1e6).toFixed(1)+'M';
-  if(n>=1e3)return(n/1e3).toFixed(1)+'K';
-  return String(n);
-}
-function _fmtUsageCost(n){
-  n=Number(n)||0;
-  return '$'+n.toFixed(n>=10?0:2);
-}
-function _usageMetaText(windowData){
-  const used=_fmtUsageTokens(windowData.tokens||0);
-  const limit=_fmtUsageTokens(windowData.soft_limit||0);
-  const cost=_fmtUsageCost(windowData.estimated_cost_usd||0);
-  return used+'/'+limit+' · '+cost;
+function _setUsageWindow(slot,windowData){
+  const navWrap=document.getElementById('nav-usage-'+slot+'-wrap');
+  const toolsWrap=document.getElementById('tools-usage-'+slot+'-wrap');
+  const visible=!!windowData;
+  if(navWrap)navWrap.style.display=visible?'':'none';
+  if(toolsWrap)toolsWrap.style.display=visible?'':'none';
+  if(!visible)return;
+  const label=windowData.label||slot;
+  const pct=Math.round(Number(windowData.utilization)||0);
+  const reset=windowData.resets_at?_fmtResetTime(windowData.resets_at):'';
+  const meta=reset?('resets '+reset):'reset unavailable';
+  for(const prefix of ['nav-usage-','tools-usage-']){
+    const labelEl=document.getElementById(prefix+slot+'-label');
+    const pctEl=document.getElementById(prefix+slot+'-pct');
+    const metaEl=document.getElementById(prefix+slot+'-meta');
+    if(labelEl)labelEl.textContent=label;
+    if(pctEl)pctEl.textContent=pct+'%';
+    if(metaEl)metaEl.textContent=meta;
+    _applyUsageStyle(document.getElementById(prefix+slot+'-fill'),pct);
+  }
+  const title='Codex '+label+' plan window · '+pct+'% used · '+meta;
+  if(navWrap)navWrap.title=title;
+  if(toolsWrap)toolsWrap.title=title;
 }
 async function refreshUsageLimits(){
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
@@ -16902,45 +16931,20 @@ async function refreshUsageLimits(){
     // a transient failure should leave the last known values on screen.
     if(!resp.ok){if(!wrap.classList.contains('has-data'))setHasData(false);_scheduleUsageRetry();return}
     const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false);_scheduleUsageRetry();return}
+    // Platform API keys are pay-as-you-go and do not have ChatGPT plan
+    // windows. Hiding the plan bars is intentional; never synthesize quotas.
+    if(!data||data.auth_mode!=='chatgpt'){
+      setHasData(false);
+      _setUsageWindow('primary',null);
+      _setUsageWindow('secondary',null);
+      return;
+    }
+    const windows=Array.isArray(data.windows)?data.windows:[];
+    if(!windows.length){setHasData(false);_scheduleUsageRetry();return}
     setHasData(true);
     if(data.stale)_scheduleUsageRetry();
-    const fh=data.five_hour||{};
-    const sd=data.seven_day||{};
-    const fhPct=Math.round(Number(fh.utilization)||0);
-    const sdPct=Math.round(Number(sd.utilization)||0);
-    const fhMeta=_usageMetaText(fh);
-    const sdMeta=_usageMetaText(sd);
-    _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
-    const navPct5h=document.getElementById('nav-usage-5h-pct');
-    const navPct7d=document.getElementById('nav-usage-7d-pct');
-    const navMeta5h=document.getElementById('nav-usage-5h-meta');
-    const navMeta7d=document.getElementById('nav-usage-7d-meta');
-    if(navPct5h)navPct5h.textContent=fhPct+'%';
-    if(navPct7d)navPct7d.textContent=sdPct+'%';
-    if(navMeta5h)navMeta5h.textContent=fhMeta;
-    if(navMeta7d)navMeta7d.textContent=sdMeta;
-    const pct5h=document.getElementById('tools-usage-5h-pct');
-    const pct7d=document.getElementById('tools-usage-7d-pct');
-    const meta5h=document.getElementById('tools-usage-5h-meta');
-    const meta7d=document.getElementById('tools-usage-7d-meta');
-    if(pct5h)pct5h.textContent=fhPct+'%';
-    if(pct7d)pct7d.textContent=sdPct+'%';
-    if(meta5h)meta5h.textContent=fhMeta;
-    if(meta7d)meta7d.textContent=sdMeta;
-    const fhTitle='OpenAI 5-hour usage · '+fhPct+'% · '+fhMeta;
-    const sdTitle='OpenAI 7-day usage · '+sdPct+'% · '+sdMeta;
-    const fhWrap=document.getElementById('nav-usage-5h-wrap');
-    const sdWrap=document.getElementById('nav-usage-7d-wrap');
-    if(fhWrap)fhWrap.title=fhTitle;
-    if(sdWrap)sdWrap.title=sdTitle;
-    const tfh=document.getElementById('tools-usage-5h-wrap');
-    const tsd=document.getElementById('tools-usage-7d-wrap');
-    if(tfh)tfh.title=fhTitle;
-    if(tsd)tsd.title=sdTitle;
+    _setUsageWindow('primary',windows[0]||null);
+    _setUsageWindow('secondary',windows[1]||null);
   }catch(e){
     /* keep last known display */
   }
@@ -17243,6 +17247,9 @@ function renderUsageHtml(){
   const inPct=total?Math.round(u.inputTokens/total*100):0;
   const crPct=total?Math.round(u.cacheCreateTokens/total*100):0;
   const rdPct=total?Math.round(u.cacheReadTokens/total*100):0;
+  const usageNote=_authCache&&_authCache.activeMode==='apikey'
+    ? 'Recent token activity. API-key work is billed per token and has no ChatGPT plan window.'
+    : 'Recent token activity. Actual ChatGPT plan windows are shown in the header when Codex reports them.';
   // Bar segments
   const barH='<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;background:#21262d;margin:8px 0 4px">'
     +'<div style="width:'+outPct+'%;background:#f85149" title="Output '+outPct+'%"></div>'
@@ -17261,7 +17268,7 @@ function renderUsageHtml(){
     +'<span><span style="color:#d2a8ff">●</span> Cache write '+fmtTokens(u.cacheCreateTokens)+'</span>'
     +'<span style="color:#484f58">Cache read '+fmtTokens(u.cacheReadTokens)+'</span>'
     +'</div>'
-    +'<p class="auth-hint" style="margin-top:6px">Usage resets on a 5-hour rolling window.</p>';
+    +'<p class="auth-hint" style="margin-top:6px">'+usageNote+'</p>';
 }
 
 function renderAuthPanel(){
@@ -17276,7 +17283,7 @@ function renderAuthPanel(){
       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
       <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
       <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMode||'—')}</span></div>
-      ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">API Key</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
+      ${_authCache.hasApiKey?'<div class="auth-row"><span class="auth-row-label">'+(_authCache.activeMode==='chatgpt'?'Fallback API key':'API key')+'</span><span class="auth-row-value" style="color:#3fb950">Stored</span></div>':''}
       ${usageHtml}
       <hr class="auth-divider">
       ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
@@ -17285,7 +17292,8 @@ function renderAuthPanel(){
   }else{
     el.innerHTML=`
       <div class="auth-title">Codex — Not Connected</div>
-      <p class="auth-hint">Set an OpenAI API key to authenticate Codex for new sessions:</p>
+      <button class="auth-btn auth-btn-primary" style="margin-bottom:10px" onclick="document.getElementById('auth-dropdown').classList.remove('active');openSettings('login')">Sign in with ChatGPT</button>
+      <p class="auth-hint">Or configure a fallback OpenAI API key for usage-based access:</p>
       <input type="password" class="auth-api-input" id="auth-api-key-input"
         placeholder="sk-..." autocomplete="off" spellcheck="false"
         value="${_authCache.hasApiKey?'••••••••••••••••':''}">
@@ -18440,23 +18448,23 @@ async function doLogout(){
   }catch(e){ alert('Logout failed'); }
 }
 
-// ── Config modal (My Context / History / Users) ───────────────────────────
-let _configActiveTab = 'mycontext';
-let _configHistoryDetail = null; // {session_name, ...} or null when showing list
+// ── Settings modal ────────────────────────────────────────────────────────
+let _settingsActiveTab = 'mycontext';
+let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
 
-async function openConfig(tab){
+async function openSettings(tab){
   await loadCurrentUser();
-  _configActiveTab = tab || 'mycontext';
-  _configHistoryDetail = null;
-  const overlay = document.getElementById('config-overlay');
+  _settingsActiveTab = tab || 'mycontext';
+  _settingsHistoryDetail = null;
+  const overlay = document.getElementById('settings-overlay');
   overlay.classList.add('active');
-  renderConfigTabs();
-  renderConfigContent();
+  renderSettingsTabs();
+  renderSettingsContent();
 }
 
-function closeConfig(){
-  document.getElementById('config-overlay').classList.remove('active');
-  _configHistoryDetail = null;
+function closeSettings(){
+  document.getElementById('settings-overlay').classList.remove('active');
+  _settingsHistoryDetail = null;
 }
 
 
@@ -18467,36 +18475,43 @@ function renderSettingsTabs(){
     {id:'mycontext', label:'My Context'},
     {id:'history',   label:'History'},
   ];
+  if(isAdmin) tabs.push({id:'context', label:'Context Files'});
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
   if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
-    `<div class="config-tab${_configActiveTab===t.id?' active':''}" onclick="switchConfigTab('${t.id}')">${t.label}</div>`
+    `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
 }
 
-function switchConfigTab(tab){
-  _configActiveTab = tab;
-  _configHistoryDetail = null;
-  renderConfigTabs();
-  renderConfigContent();
+function switchSettingsTab(tab){
+  _settingsActiveTab = tab;
+  _settingsHistoryDetail = null;
+  renderSettingsTabs();
+  renderSettingsContent();
 }
 
-function renderConfigContent(){
-  const el = document.getElementById('config-content');
-  if(_configActiveTab === 'mycontext'){
-    el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading...</div></div>';
+function renderSettingsContent(){
+  const el = document.getElementById('settings-content');
+  if(_settingsActiveTab === 'mycontext'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
-  }else if(_configActiveTab === 'history'){
-    if(_configHistoryDetail){
+  }else if(_settingsActiveTab === 'history'){
+    if(_settingsHistoryDetail){
       renderHistoryDetail();
     }else{
-      el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading your past sessions...</div></div>';
+      el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading your past sessions...</div></div>';
       loadHistory();
     }
-  }else if(_configActiveTab === 'users'){
-    el.innerHTML = '<div class="config-section"><div class="pf-banner">Loading users...</div></div>';
+  }else if(_settingsActiveTab === 'context'){
+    el.innerHTML = '<div class="settings-section">'+
+      '<div class="pf-banner">Every registered file Codex reads for context on this host. <b>Always loaded</b> files enter each session context; <b>on demand</b> files are read only when <code>AGENTS.md</code> routes Codex to them. <span id="ctxfiles-budget"></span></div>'+
+      '<div class="extras-section codexmd-extras" id="context-files"><div class="extras-empty">Loading...</div></div>'+
+      '</div>';
+    loadContextFiles();
+  }else if(_settingsActiveTab === 'users'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading users...</div></div>';
     loadUsersAdmin();
   }else if(_settingsActiveTab === 'apis'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading APIs...</div></div>';
@@ -18892,9 +18907,9 @@ function renderLoginTab(){
       '<div class="my-ctx-actions"><button class="btn btn-primary btn-full" onclick="startChatgptLogin()">Sign in with ChatGPT</button></div>'+
       chatgptLoginHtml()+
       '<hr class="auth-divider">'+
-      '<label>OpenAI API key</label>'+
+      '<label>Fallback OpenAI API key</label>'+
       '<textarea id="login-token" class="my-ctx-settings" placeholder="sk-…" style="min-height:56px"></textarea>'+
-      '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save API key</button></div>'+
+      '<div class="my-ctx-actions"><button class="btn btn-full" onclick="saveLoginToken()">Save fallback API key</button></div>'+
       (d.hasApiKey?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="clearLoginToken()">Clear dashboard API key</button></div>':'')+
       (active?'<div class="my-ctx-actions"><button class="btn btn-danger" onclick="logoutCodex()">Log Codex out</button></div>':'')+
       '<div class="pf-banner" style="margin-top:10px;color:#8b949e">The stored API key remains available as an automatic fallback if ChatGPT authorization expires or is revoked.</div>'+
@@ -18996,8 +19011,8 @@ async function loadMyContext(){
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed to load context'); }
   }catch(e){
-    document.getElementById('config-content').innerHTML =
-      '<div class="config-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
     return;
   }
   const files = {};
@@ -19006,7 +19021,7 @@ async function loadMyContext(){
   const memory = files['MEMORY.md'] || {content:'', path:''};
   const config = files['config.toml'] || {content:'', path:''};
   const html = `
-    <div class="config-section">
+    <div class="settings-section">
       <div class="pf-banner">These files are read by Codex in <strong>every session you launch</strong> (set via <code>CODEX_HOME=${esc(data.dir||'')}</code>). They are private to your account.</div>
       <label>AGENTS.md</label>
       <div class="my-ctx-path">${esc(codex.path||'')}</div>
@@ -19021,7 +19036,7 @@ async function loadMyContext(){
       <textarea class="my-ctx-config" id="my-ctx-config" spellcheck="false">${esc(config.content||'')}</textarea>
       <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('config.toml','my-ctx-config')">Save config.toml</button></div>
     </div>`;
-  document.getElementById('config-content').innerHTML = html;
+  document.getElementById('settings-content').innerHTML = html;
 }
 
 async function saveMyContext(filename, textareaId){
@@ -19053,14 +19068,14 @@ async function loadHistory(){
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed to load history'); }
   }catch(e){
-    document.getElementById('config-content').innerHTML =
-      '<div class="config-section"><div class="pf-banner">Failed to load history: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load history: '+esc(e.message||e)+'</div></div>';
     return;
   }
   const sessions = data.sessions || [];
   if(!sessions.length){
-    document.getElementById('config-content').innerHTML =
-      '<div class="config-section"><div class="history-empty">No past sessions yet. Create a session and send some messages — they will appear here.</div></div>';
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="history-empty">No past sessions yet. Create a session and send some messages — they will appear here.</div></div>';
     return;
   }
   const rows = sessions.map(s => {
@@ -19079,37 +19094,37 @@ async function loadHistory(){
       ${keyInfoBlock}
     </div>`;
   }).join('');
-  document.getElementById('config-content').innerHTML =
-    '<div class="config-section"><div class="history-list">'+rows+'</div></div>';
+  document.getElementById('settings-content').innerHTML =
+    '<div class="settings-section"><div class="history-list">'+rows+'</div></div>';
 }
 
 async function openHistoryDetail(sessionName){
-  _configHistoryDetail = {session_name: sessionName, loading: true};
+  _settingsHistoryDetail = {session_name: sessionName, loading: true};
   renderHistoryDetail();
   try{
     const resp = await fetch(BASE+'/api/history/'+encodeURIComponent(sessionName));
     const data = await resp.json();
     if(!resp.ok){
-      _configHistoryDetail = null;
+      _settingsHistoryDetail = null;
       alert(data.error||'Failed to load session');
-      renderConfigContent();
+      renderSettingsContent();
       return;
     }
-    _configHistoryDetail = {session_name: sessionName, loading: false, data};
+    _settingsHistoryDetail = {session_name: sessionName, loading: false, data};
     renderHistoryDetail();
   }catch(e){
-    _configHistoryDetail = null;
+    _settingsHistoryDetail = null;
     alert('Failed to load session: '+e.message);
-    renderConfigContent();
+    renderSettingsContent();
   }
 }
 
 function renderHistoryDetail(){
-  if(!_configHistoryDetail) return;
-  const el = document.getElementById('config-content');
-  const {session_name, loading, data} = _configHistoryDetail;
+  if(!_settingsHistoryDetail) return;
+  const el = document.getElementById('settings-content');
+  const {session_name, loading, data} = _settingsHistoryDetail;
   if(loading){
-    el.innerHTML = `<div class="config-section">
+    el.innerHTML = `<div class="settings-section">
       <div class="history-detail-header">
         <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
         <div class="history-detail-name">${esc(session_name)}</div>
@@ -19128,7 +19143,7 @@ function renderHistoryDetail(){
         ${esc(m.text||'').replace(/\\n/g,'<br>')}
       </div>`).join('')
     : '<div class="history-empty">No user messages were recorded for this session.</div>';
-  el.innerHTML = `<div class="config-section">
+  el.innerHTML = `<div class="settings-section">
     <div class="history-detail-header">
       <button class="history-detail-back" onclick="backToHistoryList()">← Back</button>
       <div class="history-detail-name">${esc(session_name)} <span style="font-size:.72rem;color:#6e7681;font-weight:400">· ${msgs.length} messages</span></div>
@@ -19141,8 +19156,8 @@ function renderHistoryDetail(){
 }
 
 function backToHistoryList(){
-  _configHistoryDetail = null;
-  renderConfigContent();
+  _settingsHistoryDetail = null;
+  renderSettingsContent();
 }
 
 // --- APIs tab (admin only) — catalog of all external API keys + live usage ---
@@ -19414,8 +19429,8 @@ async function loadUsersAdmin(){
     if(!resp.ok){ throw new Error(data.error||'Failed'); }
     const gr = await fetch(BASE+'/api/admin/groups'); if(gr.ok) gdata = await gr.json();
   }catch(e){
-    document.getElementById('config-content').innerHTML =
-      '<div class="config-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    document.getElementById('settings-content').innerHTML =
+      '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
     return;
   }
   _groupsCache = gdata.groups||[];
@@ -20383,10 +20398,8 @@ async function deleteSessionMemoryExtra(name){
 let _ctxFiles={files:[], editing:''};
 
 async function openClaudeMd(){
-  document.getElementById('claudemd-overlay').classList.add('active');
-  document.getElementById('context-files').innerHTML='<div class="extras-empty">Loading...</div>';
-  document.getElementById('ctxfiles-budget').textContent='';
-  await loadContextFiles();
+  // Backwards-compatible entry point for old bookmarks/buttons.
+  await openSettings('context');
 }
 
 async function loadContextFiles(){
@@ -20455,8 +20468,8 @@ async function saveContextFile(id){
   }catch(e){ alert('Failed to save.'); }
 }
 
-function closeCodexMd(){
-  document.getElementById('codexmd-overlay').classList.remove('active');
+function closeClaudeMd(){
+  closeSettings();
 }
 
 // ── Stats Window ──
