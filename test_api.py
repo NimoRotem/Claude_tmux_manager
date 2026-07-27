@@ -106,6 +106,24 @@ class TestSecurityHeaders:
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
 
 
+class TestDashboardFrontendRegressions:
+    def test_terminal_renderer_defines_update_filter_before_use(self, authed_client):
+        html = authed_client.get("/").text
+        definition = html.index("function _isUpdateNoise(line)")
+        usage = html.index("if(hideBash&&_isUpdateNoise(line))continue")
+        assert definition < usage
+
+    def test_context_files_live_only_inside_settings(self, authed_client):
+        html = authed_client.get("/").text
+        assert 'id="settings-overlay"' in html
+        assert "function openSettings(tab)" in html
+        assert "{id:'context', label:'Context Files'}" in html
+        assert 'id="claudemd-overlay"' not in html
+        assert 'id="config-overlay"' not in html
+        assert "getElementById('config-content')" not in html
+        assert "Usage resets on a 5-hour rolling window" not in html
+
+
 # ─── Session List API Tests ───
 
 
@@ -1476,6 +1494,71 @@ class TestClaudeUsageEndpoint:
             assert resp.json().get("_cached") is True
         finally:
             app._usage_cache["ts"] = 0  # Reset so subsequent tests scan fresh
+
+
+class TestCodexRateLimitsEndpoint:
+    @pytest.fixture(autouse=True)
+    def _reset_limits_cache(self):
+        import app as app_module
+
+        previous = dict(app_module._openai_limits_cache)
+        app_module._openai_limits_cache.update({"ts": 0, "data": None})
+        yield
+        app_module._openai_limits_cache.clear()
+        app_module._openai_limits_cache.update(previous)
+
+    @patch("app._ensure_codex_auth_with_fallback")
+    def test_api_key_mode_has_no_fake_plan_windows(self, mock_auth, authed_client):
+        mock_auth.return_value = {
+            "activeMode": "apikey",
+            "account": {},
+        }
+        resp = authed_client.get("/api/usage/limits")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["auth_mode"] == "apikey"
+        assert data["billing_mode"] == "pay_as_you_go"
+        assert data["windows"] == []
+        assert "five_hour" not in data
+        assert "seven_day" not in data
+        assert "soft_limit" not in json.dumps(data)
+
+    @patch("app._codex_app_server_rate_limits")
+    @patch("app._ensure_codex_auth_with_fallback")
+    def test_chatgpt_mode_uses_codex_reported_window_durations(
+        self, mock_auth, mock_limits, authed_client
+    ):
+        mock_auth.return_value = {
+            "activeMode": "chatgpt",
+            "account": {"type": "chatgpt", "planType": "pro"},
+        }
+        mock_limits.return_value = {
+            "rateLimits": {
+                "planType": "pro",
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 180,
+                    "resetsAt": 1_800_000_000,
+                },
+                "secondary": {
+                    "usedPercent": 34,
+                    "windowDurationMins": 14_400,
+                    "resetsAt": 1_800_086_400,
+                },
+            }
+        }
+        resp = authed_client.get("/api/usage/limits")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["auth_mode"] == "chatgpt"
+        assert data["billing_mode"] == "plan"
+        assert data["plan_type"] == "pro"
+        assert [(window["label"], window["utilization"]) for window in data["windows"]] == [
+            ("3h", 12),
+            ("10d", 34),
+        ]
+        assert all(window["resets_at"].endswith("Z") for window in data["windows"])
 
 
 class TestParseUsageFile:
