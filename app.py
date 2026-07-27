@@ -11722,7 +11722,11 @@ async def _simple_watchdog_loop():
 
 _LOGIN_NEEDED_RE = re.compile(
     r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
-    r"invalid api key|authentication[ _]error|oauth[^\n]*(?:token)?[^\n]*(?:expired|invalid|revoked)|"
+    # "oauth <anything> invalid" matched any line mentioning a third-party OAuth
+    # problem (e.g. "the OAuth client redirect URI is invalid"), so debugging an
+    # unrelated OAuth flow read as "this session is logged out". Require the
+    # token/credential wording Claude actually prints when its own auth lapses.
+    r"invalid api key|authentication[ _]error|oauth\s+(?:token|credentials?)[^\n]{0,40}(?:expired|invalid|revoked)|"
     r"(?:your )?session (?:has )?expired|please (?:re-?)?log\s?in|login required|"
     r"you (?:are|'re) not (?:logged in|authenticated)|sign in to continue)",
     re.I,
@@ -11762,9 +11766,15 @@ async def _login_watchdog_loop():
                 low = (recent or "").lower()
                 # Is a Claude /login flow currently on screen? (auth-method menu,
                 # OAuth URL, paste-code prompt, or the "invalid code — retry" error).
+                # Match only *Anthropic's* OAuth host: a bare "https:// + oauth"
+                # test fires on any session that merely prints a third-party OAuth
+                # URL (Google Cloud console, accounts.google.com, …), which made
+                # this watchdog /exit healthy sessions every ~4 min while someone
+                # was debugging an unrelated OAuth flow.
                 login_flow_open = bool(recent) and (
                     ("paste" in low and "code" in low)
-                    or ("https://" in recent and "oauth" in low)
+                    or ("claude.ai/oauth" in low)
+                    or ("console.anthropic.com" in low and "oauth" in low)
                     or ("oauth error" in low)
                     or ("select login method" in low)
                     or ("press enter to retry" in low and "esc to cancel" in low)
@@ -11797,26 +11807,37 @@ async def _login_watchdog_loop():
                 needs_login = bool(recent) and bool(_LOGIN_NEEDED_RE.search(recent))
                 if not needs_login and not login_flow_open:
                     state.pop("flow_since", None)
+                    state.pop("flow_sig", None)
                     continue
 
                 # A login prompt on screen might be a HUMAN typing /login right
                 # now — never yank that out from under them. Only once the same
                 # prompt has sat unchanged for a while is it stale and ours.
-                if login_flow_open:
-                    since = state.get("flow_since")
-                    if not since:
-                        state["flow_since"] = now
-                        continue
-                    if now - since < _LOGIN_FLOW_STALE_AFTER:
-                        continue
-                else:
-                    state.pop("flow_since", None)
+                #
+                # "Unchanged" has to mean the pane really is frozen, not just that
+                # time passed since we first matched — and it has to gate BOTH
+                # triggers. Previously the keyword trigger had no staleness check
+                # at all and acted on first sight, so anything keeping a trigger
+                # word on screen while actively working — e.g. debugging someone
+                # else's OAuth flow, where "paste"/"code"/"oauth"/"login" recur —
+                # got /exit'd every few minutes. A live session's pane keeps
+                # changing; a genuinely abandoned prompt is byte-for-byte static,
+                # so comparing a digest of the pane tells the two apart.
+                sig = hashlib.sha1((recent or "").encode("utf-8", "replace")).hexdigest()
+                since = state.get("flow_since")
+                if not since or state.get("flow_sig") != sig:
+                    state["flow_since"] = now
+                    state["flow_sig"] = sig
+                    continue
+                if now - since < _LOGIN_FLOW_STALE_AFTER:
+                    continue
 
                 # Primary recovery: restore the machine's valid credential and
                 # relaunch. No OAuth, no browser, no clicks — a stranded /login
                 # clears itself within ~15s.
                 state["last_action"] = now
                 state.pop("flow_since", None)
+                state.pop("flow_sig", None)
                 llog.warning("Auto-fixing login for '%s' (%s)", name,
                              "stale login prompt" if login_flow_open else "login required")
                 res = await _auto_fix_login(name)
