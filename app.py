@@ -11,6 +11,8 @@ import os
 import re
 import secrets
 import shlex
+import signal
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -672,6 +674,18 @@ async def lifespan(_app: FastAPI):
     logger.info("Unmanaged-browser resource guard started (shared CPU cap %.2f cores)",
                 browser_resource_guard.cpu_quota_percent() / 100.0)
 
+    autopark_task = asyncio.create_task(browser_autopark_watchdog())
+    _background_tasks.append(autopark_task)
+    logger.info("Browser CPU guard started (nice %d always, freeze >%.0fs idle, "
+                "park >%.0fmin idle, threshold %.0f%% of a core)",
+                BROWSER_NICE, BROWSER_FREEZE_IDLE_S,
+                BROWSER_AUTOPARK_IDLE_S / 60, BROWSER_BUSY_CPU_PCT)
+
+    usage_cred_task = asyncio.create_task(usage_credential_watchdog())
+    _background_tasks.append(usage_cred_task)
+    logger.info("Usage-credential watchdog started (credential present=%s)",
+                _usage_credential_ok())
+
     yield  # Application is running
 
     # --- Shutdown ---
@@ -997,17 +1011,64 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .err{color:#f85149;font-size:.8rem;margin-bottom:10px;display:none}
 .login-btn{width:100%;background:#1f6feb;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;font-size:.95rem;font-weight:500}
 .login-btn:hover{background:#388bfd}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#fff;color:#1f1f1f;border:1px solid #dadce0;border-radius:6px;padding:10px;font-size:.92rem;font-weight:500;text-decoration:none;margin-bottom:6px}
+.gbtn:hover{background:#f4f4f4}
+.ghint{color:#6e7681;font-size:.72rem;text-align:center;margin-bottom:16px}
+.sep{display:flex;align-items:center;gap:10px;color:#6e7681;font-size:.72rem;margin:0 0 16px}
+.sep:before,.sep:after{content:"";flex:1;height:1px;background:#30363d}
 </style></head><body>
-<form class="login-box" method="POST" action="login">
+<!-- Root-absolute, not relative: this page is also served for deep links like
+     /browser/<sid>/vnc.html, where action="login" POSTed to
+     /browser/<sid>/login and the sign-in silently did nothing. -->
+<form class="login-box" method="POST" action="__ROOT_PATH__/login">
   <h2>__BRAND__ Dashboard</h2>
   <p>Enter credentials to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
+__GOOGLE_BTN__
   <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+  <input type="hidden" name="next" id="next">
   <button class="login-btn" type="submit">Log in</button>
 </form>
-<script>if(location.search.includes('err=1'))document.getElementById('err').style.display='block'</script>
+<script>
+var q=new URLSearchParams(location.search),e=document.getElementById('err');
+if(q.get('err')==='1'){e.style.display='block';}
+/* Google sign-in rejections come back as ?gerr=<reason> so the user sees why. */
+var GERR={domain:'That Google account is not allowed. Use your company Google account.',
+          denied:'Google sign-in was cancelled.',
+          state:'Sign-in link expired — please try again.',
+          config:'Google sign-in is not configured on this server.',
+          failed:'Google sign-in failed — please try again.'};
+if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
+/* Carry the deep link through the login so signing in from e.g. a noVNC viewer
+   URL lands back on the viewer instead of the dashboard home. */
+var nxt=location.pathname+location.search;
+document.getElementById('next').value=nxt;
+var g=document.getElementById('gbtn');
+if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
+</script>
 </body></html>"""
+
+# Rendered into __GOOGLE_BTN__ only when a Google OAuth client is configured.
+_GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
+    <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
+    Continue with Google</a>
+  <div class="ghint">__GOOGLE_HINT__</div>
+  <div class="sep">or sign in with a password</div>"""
+
+
+def _login_page() -> str:
+    """The login page, with the Google button rendered only when configured.
+
+    Resolved per request rather than at import so dropping in
+    ~/.tmux-dashboard/google_oauth_client.json takes effect on the next page
+    load instead of needing the app restarted.
+    """
+    if not _google_login_enabled():
+        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+    domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
+    hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
+    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
 
 
 @app.middleware("http")
@@ -1113,6 +1174,9 @@ async def auth_middleware(request: Request, call_next):
     # must work even when the cross-site redirect from Google drops the cookie.
     if path.endswith("/api/sandbox/check") or path.endswith("/api/connections/google/callback"):
         return await call_next(request)
+    # Google sign-in: both legs run before there is a session cookie.
+    if "/auth/google/" in path:
+        return await call_next(request)
     # Public project serving: /<username>/<project>[/...] is served publicly (the
     # /<username> project-list page itself stays gated below).
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
@@ -1120,7 +1184,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
-        resp = HTMLResponse(LOGIN_PAGE)
+        resp = HTMLResponse(_login_page())
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
@@ -1129,7 +1193,7 @@ async def auth_middleware(request: Request, call_next):
     # the login screen.
     user = _user_from_token(token)
     if not user:
-        resp = HTMLResponse(LOGIN_PAGE)
+        resp = HTMLResponse(_login_page())
         resp.delete_cookie("tmux_auth")
         return resp
     request.state._current_user = user
@@ -1143,8 +1207,13 @@ async def api_auth_verify(request: Request):
     Returns 200 when the shared ``tmux_auth`` cookie is valid, else 401 — so a
     single login to this dashboard unlocks the other knowva.ai apps (matcher,
     crypto, zoom, ...) which gate on this endpoint instead of separate logins.
+
+    Accounts carrying ``sso: false`` (Google-provisioned employees) are 401'd
+    here on purpose: letting anyone with a company address into the dashboard
+    should not also hand them the crypto/sales/matcher apps.
     """
-    if _user_from_token(request.cookies.get("tmux_auth")):
+    u = _user_from_token(request.cookies.get("tmux_auth"))
+    if u and u.get("sso", True) is not False:
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False}, status_code=401)
 
@@ -1179,6 +1248,11 @@ async def do_login(request: Request):
     form = await request.form()
     username = form.get("username", "")
     password = form.get("password", "")
+    # Where to land after a successful login. Only same-origin relative paths are
+    # honoured ("//host" would be an open redirect), and never /login itself.
+    nxt = (form.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = request.scope.get("root_path", "") + "/"
     # Legacy env-var path: if the credentials match TMUX_DASH_USER/TMUX_DASH_PASS,
     # accept and treat as the admin user. This keeps the dashboard reachable even
     # if users.json was deleted by hand.
@@ -1219,7 +1293,9 @@ async def do_login(request: Request):
     else:
         # The login form is served by GET "/" — there is no GET /login route, so
         # redirecting there on a bad password 405s instead of re-showing the form.
-        return RedirectResponse(url=request.scope.get("root_path", "") + "/?err=1", status_code=303)
+        # Any gated path re-serves the form, so bounce back to `next` and keep
+        # the deep link across a mistyped password.
+        return RedirectResponse(url=nxt + ("&" if "?" in nxt else "?") + "err=1", status_code=303)
 
     # Update last_login + capture IP / browser for the admin audit view
     ua = (request.headers.get("user-agent", "") or "")[:300]
@@ -1238,7 +1314,7 @@ async def do_login(request: Request):
         logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
 
     token = _make_token(target_user["id"])
-    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/", status_code=303)
+    resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
     return resp
@@ -1249,6 +1325,259 @@ async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
     resp.delete_cookie("tmux_auth")
     return resp
+
+
+# --- Google sign-in --------------------------------------------------------
+# One-click login for company Google accounts. Employees at the allowed domains
+# get an account provisioned on first sign-in; everyone else is rejected before
+# any account is created. Uses the same OAuth client as the Drive/Gmail
+# connections feature (`_google_client()`), so a single client ID configured via
+# GOOGLE_OAUTH_CLIENT_ID/SECRET or ~/.tmux-dashboard/google_oauth_client.json
+# covers both. `_sign_state`/`_verify_state` live further down the module with
+# the connections code; they're only called at request time so the forward
+# reference is fine.
+GOOGLE_LOGIN_DOMAINS = [
+    d.strip().lower().lstrip("@")
+    for d in os.environ.get("TMUX_DASH_GOOGLE_DOMAINS", "grabo.com,nemopowertools.com").split(",")
+    if d.strip()
+]
+# Individual addresses allowed on top of the domains (e.g. a personal Gmail that
+# should map onto an existing account). Comma-separated.
+GOOGLE_LOGIN_EMAILS = [
+    e.strip().lower() for e in os.environ.get("TMUX_DASH_GOOGLE_EMAILS", "").split(",") if e.strip()
+]
+# Google address that signs in as the built-in admin (id="admin").
+ADMIN_GOOGLE_EMAIL = os.environ.get("TMUX_DASH_ADMIN_GOOGLE_EMAIL", "").strip().lower()
+GOOGLE_LOGIN_SCOPES = "openid email profile"
+
+
+def _google_login_enabled() -> bool:
+    cid, csec = _google_client()
+    return bool(cid and csec)
+
+
+def _public_base_url(request: Request) -> str:
+    """Externally-visible scheme://host for this request.
+
+    TMUX_DASH_PUBLIC_URL wins when set; otherwise trust the proxy headers, since
+    nginx terminates TLS and forwards plain HTTP (request.url.scheme would say
+    "http" and Google rejects a redirect_uri that doesn't match exactly).
+    """
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+    proto = (request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+             or request.url.scheme)
+    host = (request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+            or request.headers.get("host", "") or request.url.netloc)
+    return f"{proto}://{host}"
+
+
+def _google_login_redirect_uri(request: Request) -> str:
+    """Must match a redirect URI registered on the OAuth client, exactly."""
+    return _public_base_url(request) + ROOT_PATH + "/auth/google/callback"
+
+
+def _google_email_allowed(email: str) -> bool:
+    email = (email or "").lower()
+    if "@" not in email:
+        return False
+    if email in GOOGLE_LOGIN_EMAILS or (ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL):
+        return True
+    return email.split("@", 1)[1] in GOOGLE_LOGIN_DOMAINS
+
+
+def _decode_id_token(id_token: str) -> dict:
+    """Return the claims of a Google ID token.
+
+    No signature check: the token is read straight off Google's HTTPS token
+    endpoint in response to a request authenticated with our client secret, which
+    is the case Google explicitly documents as not needing local verification.
+    The claims below (aud/iss/exp) are still checked by the caller.
+    """
+    parts = id_token.split(".")
+    if len(parts) != 3:
+        raise ValueError("malformed id_token")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload.encode()))
+
+
+def _google_login_user(email: str, name: str) -> Optional[dict]:
+    """Find (or provision) the account for a verified Google address.
+
+    Explicit bindings win over the domain allowlist so a personal address can be
+    pinned to an existing account: an exact `google_email` match, the env-pinned
+    ADMIN_GOOGLE_EMAIL, or a username that already *is* the address. Only after
+    those do we fall back to "allowed domain → create a new member account".
+    """
+    email = (email or "").strip().lower()
+    users = _load_users()
+
+    target = next((u for u in users if (u.get("google_email") or "").lower() == email), None)
+    if target is None and ADMIN_GOOGLE_EMAIL and email == ADMIN_GOOGLE_EMAIL:
+        target = next((u for u in users if u.get("id") == "admin"), None)
+    if target is None:
+        target = next((u for u in users if (u.get("username") or "").lower() == email), None)
+    if target is not None:
+        if (target.get("google_email") or "").lower() != email:
+            target["google_email"] = email
+            _save_users(users)
+        return target
+
+    if not _google_email_allowed(email):
+        return None
+
+    # New employee: provision a member account with no password (password login
+    # stays impossible — _verify_password rejects an empty hash — so the Google
+    # identity is the only way in until an admin sets one).
+    base = re.sub(r"[^A-Za-z0-9._-]", "", email.split("@", 1)[0]) or "user"
+    username = base[:40]
+    taken = {(u.get("username") or "").lower() for u in users}
+    if username.lower() in taken:
+        username = email[:40]
+    if username.lower() in taken:
+        username = (base[:32] + "-" + secrets.token_hex(3))
+    new_user = {
+        "id": _new_user_id(),
+        "username": username,
+        "password_hash": "",
+        "password_salt": "",
+        "role": "user",
+        "group": "",
+        "google_email": email,
+        "display_name": (name or "")[:80],
+        "auth": "google",
+        # Google-provisioned members are dashboard-only: they must not inherit
+        # the nginx auth_request SSO that unlocks the sibling knowva.ai apps.
+        "sso": False,
+        "created_at": time.time(),
+        "last_login": 0,
+    }
+    users.append(new_user)
+    _save_users(users)
+    try:
+        _user_data_dir(new_user)
+        _ensure_user_claude_config_dir(new_user)
+    except Exception:
+        logger.exception("Failed to seed dirs for Google user %s", new_user["id"])
+    logger.info("Provisioned Google user '%s' (%s)", username, email)
+    return new_user
+
+
+def _sync_admin_google_email():
+    """Keep the admin record's google_email in step with the env pin."""
+    if not ADMIN_GOOGLE_EMAIL:
+        return
+    try:
+        users = _load_users()
+        admin = next((u for u in users if u.get("id") == "admin"), None)
+        if admin is not None and (admin.get("google_email") or "").lower() != ADMIN_GOOGLE_EMAIL:
+            admin["google_email"] = ADMIN_GOOGLE_EMAIL
+            _save_users(users)
+    except Exception:
+        logger.exception("Failed to sync the admin Google address")
+
+
+_sync_admin_google_email()
+
+
+@app.get("/auth/google/start")
+async def google_login_start(request: Request):
+    rp = request.scope.get("root_path", "")
+    cid, csec = _google_client()
+    if not cid or not csec:
+        return RedirectResponse(url=rp + "/?gerr=config", status_code=303)
+    nxt = (request.query_params.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = rp + "/"
+    state = _sign_state("glogin:%d:%s" % (
+        int(time.time()), base64.urlsafe_b64encode(nxt.encode()).decode()))
+    params = urllib.parse.urlencode({
+        "client_id": cid,
+        "redirect_uri": _google_login_redirect_uri(request),
+        "response_type": "code",
+        "scope": GOOGLE_LOGIN_SCOPES,
+        # Always show the picker: these boxes are shared, and a stale Google
+        # session would otherwise sign you in as the wrong person silently.
+        "prompt": "select_account",
+        "state": state,
+    })
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+
+
+@app.get("/auth/google/callback")
+async def google_login_callback(request: Request):
+    rp = request.scope.get("root_path", "")
+    ip = request.client.host if request.client else "unknown"
+    if request.query_params.get("error"):
+        return RedirectResponse(url=rp + "/?gerr=denied", status_code=303)
+    if not _check_login_rate_limit(ip):
+        return HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+    code = request.query_params.get("code") or ""
+    payload = _verify_state(request.query_params.get("state") or "")
+    if not code or not payload or not payload.startswith("glogin:"):
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    try:
+        _, ts, nxt_b64 = payload.split(":", 2)
+        nxt = base64.urlsafe_b64decode(nxt_b64.encode()).decode()
+    except Exception:
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    if time.time() - int(ts) > 600:
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    if not (nxt.startswith("/") and not nxt.startswith("//")):
+        nxt = rp + "/"
+
+    cid, csec = _google_client()
+    data = urllib.parse.urlencode({
+        "code": code, "client_id": cid, "client_secret": csec,
+        "redirect_uri": _google_login_redirect_uri(request),
+        "grant_type": "authorization_code",
+    }).encode()
+    try:
+        req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            tok = json.load(r)
+        claims = _decode_id_token(tok.get("id_token") or "")
+    except Exception:
+        logger.exception("Google sign-in token exchange failed")
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+
+    if claims.get("aud") != cid:
+        logger.warning("Google sign-in: id_token audience mismatch")
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        logger.warning("Google sign-in: unexpected issuer %s", claims.get("iss"))
+        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+    if float(claims.get("exp") or 0) < time.time():
+        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    email = (claims.get("email") or "").strip().lower()
+    if not email or not claims.get("email_verified"):
+        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+
+    target_user = _google_login_user(email, claims.get("name") or "")
+    if not target_user:
+        logger.warning("Google sign-in rejected for %s (not an allowed domain)", email)
+        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+
+    ua = (request.headers.get("user-agent", "") or "")[:300]
+    fwd = request.headers.get("x-forwarded-for", "")
+    real_ip = fwd.split(",")[0].strip() if fwd else ip
+    try:
+        users = _load_users()
+        for u in users:
+            if u.get("id") == target_user["id"]:
+                u["last_login"] = time.time()
+                u["last_login_ip"] = real_ip
+                u["last_login_ua"] = ua
+                u["last_login_via"] = "google"
+                break
+        _save_users(users)
+    except Exception:
+        logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
+
+    logger.info("Google sign-in: %s -> user '%s' (%s)",
+                email, target_user.get("username"), target_user.get("role"))
+    resp = RedirectResponse(url=nxt, status_code=303)
+    return _set_auth_cookie(resp, request, _make_token(target_user["id"]))
 
 
 class CreateUserBody(BaseModel):
@@ -1263,6 +1592,8 @@ class UpdateUserBody(BaseModel):
     role: Optional[str] = None
     username: Optional[str] = None
     group: Optional[str] = None
+    google_email: Optional[str] = None
+    sso: Optional[bool] = None
 
 
 def _public_user(u: dict) -> dict:
@@ -1272,10 +1603,13 @@ def _public_user(u: dict) -> dict:
         "username": u.get("username", ""),
         "role": u.get("role", "user"),
         "group": u.get("group", ""),
+        "google_email": u.get("google_email", ""),
+        "sso": u.get("sso", True) is not False,
         "created_at": u.get("created_at", 0),
         "last_login": u.get("last_login", 0),
         "last_login_ip": u.get("last_login_ip", ""),
         "last_login_ua": u.get("last_login_ua", ""),
+        "last_login_via": u.get("last_login_via", "password"),
     }
 
 
@@ -1376,6 +1710,19 @@ async def api_admin_update_user(request: Request, user_id: str, body: UpdateUser
         changed = True
     if body.group is not None:
         target["group"] = body.group.strip()
+        changed = True
+    if body.google_email is not None:
+        gmail = body.google_email.strip().lower()
+        if gmail and "@" not in gmail:
+            return JSONResponse({"error": "Invalid Google address"}, status_code=400)
+        if gmail and any((u.get("google_email") or "").lower() == gmail and u["id"] != user_id
+                         for u in users):
+            return JSONResponse({"error": "That Google address is already linked to another user"},
+                                status_code=409)
+        target["google_email"] = gmail
+        changed = True
+    if body.sso is not None:
+        target["sso"] = bool(body.sso)
         changed = True
     if changed:
         _save_users(users)
@@ -5247,6 +5594,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
         **_session_model_fields(sess["name"]),
+        **_session_auth_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
     }
 
@@ -5316,6 +5664,7 @@ async def api_sessions_fast(request: Request):
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             **_session_model_fields(sess["name"]),
+            **_session_auth_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
         })
     return JSONResponse(out)
@@ -5360,6 +5709,7 @@ async def api_status(request: Request):
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             **_session_model_fields(sess["name"]),
+            **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
 
@@ -5691,6 +6041,90 @@ def get_session_cwd(session_name: str) -> str:
 
 
 UPLOADS_DIR = MESSAGES_DIR / "uploads"
+PENDING_UPLOADS_FILE = MESSAGES_DIR / "pending_uploads.json"
+
+
+def _session_upload_key(session_name: str, sess: Optional[dict] = None) -> str:
+    """Stable per-session-INSTANCE key for the uploads dir.
+
+    tmux session names get reused — kill "test", create "test" again — so keying
+    uploads on the name alone hands the new session the old one's files. tmux's
+    #{session_created} timestamp is unique per instance, so "<name>-<created>"
+    stays distinct across reuse. Falls back to the bare name if tmux didn't
+    report a creation time.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_name).strip("._-") or "session"
+    if sess is None:
+        _, sess = _find_session(session_name)
+    created = str((sess or {}).get("created") or "").strip()
+    return f"{safe}-{created}" if created.isdigit() else safe
+
+
+def _session_uploads_dir(session_name: str, sess: Optional[dict] = None,
+                         create: bool = True) -> Path:
+    """Uploads dir for one session instance, adopting the legacy bare-name dir."""
+    key = _session_upload_key(session_name, sess)
+    target = UPLOADS_DIR / key
+    legacy = UPLOADS_DIR / session_name
+    # One-time adoption: uploads made before this scheme lived in
+    # uploads/<name>/. Hand them to the first instance that asks rather than
+    # orphaning them.
+    if key != session_name and not target.exists() and legacy.is_dir():
+        try:
+            legacy.rename(target)
+        except Exception:
+            logger.debug("Could not migrate legacy uploads dir %s", legacy, exc_info=True)
+    if create:
+        target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _add_pending_upload(key: str, path: str, size: int):
+    """Queue an upload to be named in the session's NEXT outgoing message."""
+    data = _read_json_file(PENDING_UPLOADS_FILE)
+    items = [i for i in data.get(key, []) if i.get("path") != path]
+    items.append({"path": path, "size": size, "ts": time.time()})
+    data[key] = items[-20:]
+    _write_json_file(PENDING_UPLOADS_FILE, data)
+
+
+def _drop_pending_upload(key: str, path: str):
+    """Forget a queued upload (the file was deleted before it was ever sent)."""
+    data = _read_json_file(PENDING_UPLOADS_FILE)
+    items = [i for i in data.get(key, []) if i.get("path") != path]
+    if items:
+        data[key] = items
+    else:
+        data.pop(key, None)
+    _write_json_file(PENDING_UPLOADS_FILE, data)
+
+
+def _peek_pending_uploads(key: str) -> set:
+    return {i.get("path") for i in _read_json_file(PENDING_UPLOADS_FILE).get(key, [])}
+
+
+def _take_pending_uploads(key: str) -> list:
+    """Pop the queued uploads — they are about to be named in a message."""
+    data = _read_json_file(PENDING_UPLOADS_FILE)
+    items = data.pop(key, [])
+    if items:
+        _write_json_file(PENDING_UPLOADS_FILE, data)
+    return items
+
+
+def _format_upload_preamble(items: list) -> str:
+    """Header prepended to a message so the agent knows which files it names."""
+    if not items:
+        return ""
+    label = "file" if len(items) == 1 else "files"
+    lines = [f"[The user just uploaded {len(items)} {label} to this session; "
+             "the message below refers to them:]"]
+    for i in items:
+        n = i.get("size") or 0
+        size = f"{n} B" if n < 1024 else (f"{n / 1024:.1f} KB" if n < 1024 * 1024
+                                          else f"{n / 1048576:.1f} MB")
+        lines.append(f"  {i.get('path')} ({size})")
+    return "\n".join(lines) + "\n\n"
 
 
 @app.post("/api/sessions/{session_name}/upload")
@@ -5705,9 +6139,10 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    # Save to fixed session-specific uploads dir under ~/.tmux-dashboard/uploads/<session>/
-    uploads_dir = UPLOADS_DIR / session_name
-    uploads_dir.mkdir(parents=True, exist_ok=True)
+    # Save to this session INSTANCE's uploads dir — see _session_upload_key for
+    # why the tmux name alone isn't enough.
+    key = _session_upload_key(session_name, sess)
+    uploads_dir = _session_uploads_dir(session_name, sess)
     dest = str(uploads_dir / filename)
     try:
         content = await file.read()
@@ -5716,6 +6151,9 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
         with open(dest, "wb") as f:
             f.write(content)
+        # Queue it so the next message the user sends names this exact path —
+        # otherwise the agent in the pane never learns the upload happened.
+        _add_pending_upload(key, dest, len(content))
         # Per-session record only — never touch the project CLAUDE.md, which is
         # shared across every session running in the same cwd.
         size_kb = len(content) / 1024
@@ -5737,7 +6175,8 @@ async def api_list_uploads(session_name: str):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    uploads_dir = UPLOADS_DIR / session_name
+    uploads_dir = _session_uploads_dir(session_name, sess, create=False)
+    pending = _peek_pending_uploads(_session_upload_key(session_name, sess))
     files = []
     if uploads_dir.exists():
         for entry in uploads_dir.iterdir():
@@ -5750,6 +6189,8 @@ async def api_list_uploads(session_name: str):
                     "path": str(entry),
                     "size": st.st_size,
                     "mtime": st.st_mtime,
+                    # True = not yet named in a message; the next send announces it.
+                    "pending": str(entry) in pending,
                 })
             except Exception:
                 continue
@@ -5766,10 +6207,11 @@ async def api_delete_upload(session_name: str, filename: str):
     safe_name = os.path.basename(filename)
     if not safe_name or safe_name.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    target = UPLOADS_DIR / session_name / safe_name
+    target = _session_uploads_dir(session_name, sess, create=False) / safe_name
     try:
         if target.exists() and target.is_file():
             target.unlink()
+            _drop_pending_upload(_session_upload_key(session_name, sess), str(target))
             return JSONResponse({"ok": True})
         return JSONResponse({"error": "File not found"}, status_code=404)
     except Exception as e:
@@ -8315,7 +8757,11 @@ websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
 cb_chrome_env "$ID"
 mapfile -t FLAGS < <(cb_chrome_flags "$PROFILE" "$CDP" "$ID")
 printf '[%s] %s\n' "$(date -Is)" "${FLAGS[*]}" >>"$LOGS/chrome-flags.log"
-dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
+# nice 5: this box has 4 vCPUs and Chrome renders on the CPU (SwiftShader), so a
+# single animating page can otherwise out-schedule the Claude sessions that are
+# the point of the machine. Children inherit it; the dashboard's guard raises it
+# to 10 while nothing is driving the browser.
+nice -n 5 dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
   "about:blank" >"$LOGS/chrome.log" 2>&1 & echo $! >> "$PIDS"
 
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
@@ -8339,12 +8785,27 @@ def _ensure_browser_launcher():
             logger.info("Browser launcher script written to %s", p)
     except Exception:
         logger.debug("Failed to write browser launcher", exc_info=True)
+# The default session's ports are host-dependent: 5900/6080 is the convention,
+# but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
+# maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
+# viewer landed on UPS's RFB and hung on a VNC password prompt. There the
+# claude-vnc unit runs on 5902/6082 and these env vars point us at it.
+#
+# external_url is host-dependent for the same reason and MUST NOT be hardwired:
+# rotem.ai/browsertool is nginx on builder reverse-proxying to *instance-3's*
+# noVNC (10.128.0.5:6080). Baking it in here made builder's own dashboard offer
+# a "Direct" link to a different machine's browser — so the header sign-in dot
+# (which reads the LOCAL Chrome on CDP 9222) said "signed out" while the link
+# right next to it showed instance-3's signed-in Chrome. Set
+# CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
+# everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
+# only correct way in.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
-    "rfb_port": 5900, "vnc_port": 6080, "cdp_port": 9222, "managed": False,
-    "external_url": ("https://rotem.ai/browsertool/vnc.html?path=browsertool/websockify"
-                     "&autoconnect=true&resize=scale&shared=true"
-                     "&reconnect=true&reconnect_delay=2000"),
+    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
+    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
+    "cdp_port": 9222, "managed": False,
+    "external_url": os.environ.get("CB_DEFAULT_EXTERNAL_URL", ""),
 }
 
 
@@ -8951,6 +9412,50 @@ _PAID_CAPS = ("claude_pro", "claude_max", "pro", "max", "team", "enterprise", "r
 _browser_auth_cache: Dict[str, dict] = {}   # sid -> {"data": {...}, "ts": float}
 _BROWSER_AUTH_TTL = 120
 
+# Last probe that positively saw a signed-in account, per browser. A single
+# failed probe must NOT flip the header dot to red: these browsers egress
+# through a rotating residential proxy (~30-min sticky sessions), and when the
+# exit IP changes claude.ai answers one round of `account_session_invalid` /
+# bounces to `/login?from=logout` before the SPA re-establishes. Treated as
+# ground truth that showed the dot red while the browser was plainly signed in.
+# Within the grace window a negative probe is reported as "unconfirmed", and the
+# last known-good account is kept, so only a *sustained* signed-out state reds
+# the dot.
+_browser_auth_good: Dict[str, dict] = {}    # sid -> {"data": {...}, "ts": float}
+_BROWSER_AUTH_GRACE = 1800
+
+# Probe bodies that mean "ask again", not "signed out".
+_AUTH_TRANSIENT = ("account_session_invalid", "just a moment", "cloudflare",
+                   "checking your browser", "rate_limit", "overloaded")
+
+
+async def _probe_claude_account(tab) -> dict:
+    """One read of claude.ai's org list in an already-open tab."""
+    out = {"logged_in": False, "email": "", "can_authorize": False,
+           "capabilities": [], "error": "", "transient": False}
+    await tab.navigate("https://claude.ai/api/organizations", settle=0.8)
+    txt = ((await tab.eval("document.body ? document.body.innerText : ''")) or "").strip()
+    low = txt.lower()
+    if txt.startswith("["):
+        orgs = json.loads(txt)
+        out["logged_in"] = True
+        caps = []
+        for o in orgs:
+            caps += [str(x).lower() for x in (o.get("capabilities") or [])]
+            nm = o.get("name") or ""
+            if "@" in nm and not out["email"]:
+                out["email"] = nm.split("'")[0]
+        out["capabilities"] = sorted(set(caps))
+        out["can_authorize"] = any(c in _PAID_CAPS for c in caps)
+        if not out["can_authorize"]:
+            out["error"] = "signed in, but this account has no Max/Pro plan"
+    elif any(m in low for m in _AUTH_TRANSIENT) or not txt:
+        out["error"] = "claude.ai did not answer cleanly — retrying"
+        out["transient"] = True
+    else:
+        out["error"] = "not signed in to claude.ai"
+    return out
+
 
 async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) -> dict:
     """Is this browser signed into claude.ai, as whom, and can that account
@@ -8964,27 +9469,33 @@ async def _browser_claude_account(sid: str, cdp_port: int, force: bool = False) 
     try:
         async with _browser_busy_ctx(sid, "checking claude.ai login"):
             async with _cdp_tab(cdp_port) as tab:
-                await tab.navigate("https://claude.ai/api/organizations", settle=0.8)
-                txt = ((await tab.eval("document.body ? document.body.innerText : ''")) or "").strip()
-                if txt.startswith("["):
-                    orgs = json.loads(txt)
-                    out["logged_in"] = True
-                    caps = []
-                    for o in orgs:
-                        caps += [str(x).lower() for x in (o.get("capabilities") or [])]
-                        nm = o.get("name") or ""
-                        if "@" in nm and not out["email"]:
-                            out["email"] = nm.split("'")[0]
-                    out["capabilities"] = sorted(set(caps))
-                    out["can_authorize"] = any(c in _PAID_CAPS for c in caps)
-                    if not out["can_authorize"]:
-                        out["error"] = "signed in, but this account has no Max/Pro plan"
-                elif "just a moment" in txt.lower() or "cloudflare" in txt.lower():
-                    out["error"] = "Cloudflare challenge — retry"
-                else:
-                    out["error"] = "not signed in to claude.ai"
+                out = await _probe_claude_account(tab)
+                # One immediate retry: a proxy rotation costs exactly one round
+                # trip, and re-reading is far cheaper than a wrong red dot.
+                if not out["logged_in"]:
+                    await asyncio.sleep(2)
+                    retry = await _probe_claude_account(tab)
+                    if retry["logged_in"] or not out.get("transient"):
+                        out = retry
     except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
+        out = {"logged_in": False, "email": "", "can_authorize": False,
+               "capabilities": [], "error": f"{type(e).__name__}: {e}", "transient": True}
+    out.pop("transient", None)
+    if out["logged_in"]:
+        _browser_auth_good[sid] = {"data": dict(out), "ts": time.time()}
+    else:
+        good = _browser_auth_good.get(sid)
+        if good and time.time() - good["ts"] < _BROWSER_AUTH_GRACE:
+            logger.info("claude.ai probe for browser '%s' failed (%s) — keeping the "
+                        "last known-good sign-in (%s, %.0fs old)",
+                        sid, out["error"], good["data"].get("email") or "?",
+                        time.time() - good["ts"])
+            out = dict(good["data"])
+            out["unconfirmed"] = True
+            out["error"] = "last check did not reach claude.ai — showing the last known state"
+        else:
+            logger.warning("Browser '%s' reads as signed out of claude.ai: %s",
+                           sid, out["error"])
     _browser_auth_cache[sid] = {"data": out, "ts": time.time()}
     return out
 
@@ -9021,6 +9532,765 @@ def _pick_login_browser() -> dict:
     return running[0] if len(running) == 1 else {}
 
 
+# --- Is a browser actually *doing* something? -------------------------------
+# xprintidle only sees a human at the virtual display and _browser_busy only
+# sees us driving over CDP. Neither notices the third case, which is the one
+# that hurts: a tab left open rendering an animation. Chrome here runs on
+# SwiftShader (software GL) over Xvfb, so that rasterises on the CPU forever —
+# a MetaMask onboarding tab took the GPU process to 230% and the 4-vCPU box to
+# load 4+ while every indicator on the dashboard said "idle". So measure CPU.
+_browser_cpu_sample: Dict[str, dict] = {}   # sid -> {"ticks": int, "ts": float}
+# Above this the browser counts as working (amber, flashing).
+BROWSER_BUSY_CPU_PCT = float(os.environ.get("CB_BUSY_CPU_PCT") or 25)
+# Auto-park a browser burning CPU with nobody driving it, after this long idle.
+BROWSER_AUTOPARK_IDLE_S = float(os.environ.get("CB_AUTOPARK_IDLE_S") or 600)
+_CLK_TCK = float(os.sysconf("SC_CLK_TCK") or 100)
+
+
+# Process-tree walking is on the hot path — the header polls browser state every
+# few seconds — so it reads /proc directly instead of spawning pgrep per level.
+# The pgrep version cost ~10 subprocesses per browser per call and showed up as
+# real load on a 4-vCPU box, which is a poor look for the CPU guard.
+_ppid_cache: dict = {"kids": {}, "ts": 0.0}
+
+
+def _children_map() -> Dict[int, list]:
+    """{ppid: [child pids]} for every process, from one /proc pass (cached 3s)."""
+    now = time.time()
+    if now - _ppid_cache["ts"] < 3 and _ppid_cache["kids"]:
+        return _ppid_cache["kids"]
+    kids: Dict[int, list] = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                ppid = int(Path(f"/proc/{entry}/stat").read_text()
+                           .rsplit(") ", 1)[-1].split()[1])
+            except Exception:
+                continue
+            kids.setdefault(ppid, []).append(int(entry))
+    except Exception:
+        return _ppid_cache["kids"]
+    _ppid_cache.update({"kids": kids, "ts": now})
+    return kids
+
+
+def _pid_tree(root: int) -> list:
+    """`root` and every descendant of it."""
+    if not root:
+        return []
+    kids = _children_map()
+    pids, frontier = [root], [root]
+    while frontier:
+        nxt = [c for p in frontier for c in kids.get(p, []) if c not in pids]
+        pids.extend(nxt)
+        frontier = nxt
+    return pids
+
+
+def _chrome_root_pid(cdp_port: int) -> int:
+    """The browser process (not a --type=renderer child) serving this CDP port."""
+    for p in _chrome_processes():
+        if p["cdp_port"] == cdp_port:
+            return p["pid"]
+    return 0
+
+
+def _browser_pids(cdp_port: int) -> list:
+    """Every process in the tree of the Chrome serving this CDP port."""
+    return _pid_tree(_chrome_root_pid(cdp_port))
+
+
+# --- Every Chrome on this box, not only the ones we launched -----------------
+#
+# The dashboard used to list exactly the browsers in browser_sessions.json, but
+# those are not the only ones running: an agent's browser tool starts its own
+# Chrome with its own profile (typically under a session scratchpad in /tmp),
+# and a Playwright/Puppeteer run starts a headless one that talks over a pipe
+# with no CDP port at all. Both are invisible here while costing the same CPU and
+# RAM — one sat at 100%+ for a day with nothing on screen to explain the load. So
+# scan /proc instead of trusting the config file, and report whatever is running.
+_chrome_procs_cache: dict = {"rows": [], "ts": 0.0}
+
+
+def _chrome_processes() -> list:
+    """Top-level Chrome browser processes, straight from /proc (cached 8s).
+
+    `cdp_port` is 0 for a browser we cannot talk to (headless over a pipe); such
+    a browser can still be shown and killed, just not parked or frozen.
+    """
+    now = time.time()
+    if now - _chrome_procs_cache["ts"] < 8:
+        return _chrome_procs_cache["rows"]
+    out, browser_bins = [], set()
+    try:
+        entries = list(Path("/proc").iterdir())
+    except Exception:
+        return out
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            # NOT split on NULs: the Chrome browser process rewrites its own
+            # cmdline into one space-joined string (that is how `ps` shows it),
+            # so per-argument parsing finds no flags at all on exactly the
+            # processes we care about. Match on the flat text instead.
+            cmd = (entry / "cmdline").read_bytes().decode("utf-8", "replace").replace("\0", " ")
+        except Exception:
+            continue
+        if "chrome" not in cmd and "chromium" not in cmd:
+            continue
+        if "--type=" in cmd:
+            continue                                  # a renderer/gpu child
+        if "--user-data-dir=" not in cmd:
+            continue          # not a browser we can account for (wrapper, helper)
+        m = re.search(r"--remote-debugging-port=(\d+)", cmd)
+        port = int(m.group(1)) if m else 0
+        pm = re.search(r"--user-data-dir=(\S+)", cmd)
+        pid = int(entry.name)
+        if browser_resource_guard.is_browser_command(cmd):
+            browser_bins.add(pid)
+        out.append({"pid": pid, "cdp_port": port,
+                    "profile": pm.group(1) if pm else "",
+                    "headless": "--headless" in cmd,
+                    "started": _proc_start_time(pid)})
+    trees = {p["pid"]: set(_pid_tree(p["pid"])) for p in out}
+    # A launcher that is not itself a browser — `sudo -u x google-chrome …`, or a
+    # `timeout`/`env` wrapper — carries the whole browser command line and so
+    # matches on flags like the browser does. Never report it in place of the
+    # browser it started: the resource guard refuses to act on a non-browser pid
+    # ("browser process is gone or changed" while Chrome kept running), such a
+    # wrapper often runs as a different user than the browser, and the CPU cap is
+    # applied to the browser's tree, not the wrapper's.
+    out = [p for p in out
+           if p["pid"] in browser_bins or not (browser_bins & trees[p["pid"]])]
+    # One entry per browser: a launcher wrapper and the browser process it exec'd
+    # both carry the same flags, so each browser matches more than once. Keep the
+    # outermost of each family — its process tree covers the whole browser, which
+    # is what the CPU numbers are measured over.
+    rows = [p for p in out
+            if not any(q["pid"] != p["pid"] and p["pid"] in trees[q["pid"]] for q in out)]
+    _chrome_procs_cache.update({"rows": rows, "ts": now})
+    return rows
+
+
+_BOOT_TIME = 0.0
+
+
+def _proc_start_time(pid: int) -> float:
+    """Unix time a process started (from /proc; the dir's own mtime is not it)."""
+    global _BOOT_TIME
+    if not _BOOT_TIME:
+        try:
+            for line in Path("/proc/stat").read_text().splitlines():
+                if line.startswith("btime "):
+                    _BOOT_TIME = float(line.split()[1])
+                    break
+        except Exception:
+            return 0.0
+    try:
+        f = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+        return _BOOT_TIME + int(f[19]) / _CLK_TCK      # field 22: starttime
+    except Exception:
+        return 0.0
+
+
+def _proc_owner(pid: int) -> str:
+    """Username a pid runs as ('' if it is gone)."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+    except Exception:
+        return ""
+
+
+def _profile_owner_hint(profile: str) -> str:
+    """Who a stray browser belongs to, read off its profile path.
+
+    Agent-started browsers park their profile under the session scratchpad —
+    /tmp/claude-<uid>/<project-slug>/<claude-session-id>/scratchpad/... — so the
+    path alone says which project (and which conversation) opened it.
+    """
+    m = re.search(r"/tmp/claude-\d+/(-[^/]+)/([0-9a-f-]{8,})/", profile or "")
+    if not m:
+        return ""
+    # The slug is Claude's own cwd encoding and is not reversible into a path
+    # (both '/' and '_' become '-'), so show the project part verbatim rather
+    # than inventing a path that looks real and isn't.
+    project = re.sub(r"^-?home-[^-]+-[^-]+-", "", m.group(1))
+    return f"a Claude session in {project} ({m.group(2)[:8]})"
+
+
+# Who is holding a CDP socket open to a browser right now. This is the missing
+# "in use" signal: _browser_busy only knows about the dashboard's own CDP work,
+# so a browser being driven by an agent's MCP tool looked idle — and the idle
+# auto-park closed the tabs out from under a live agent mid-task (seen).
+_pane_pid_cache: dict = {"map": {}, "ts": 0.0}
+
+
+def _pane_pid_sessions() -> dict:
+    """{pane pid: tmux session name} for every pane, cached briefly."""
+    now = time.time()
+    if now - _pane_pid_cache["ts"] < 10 and _pane_pid_cache["map"]:
+        return _pane_pid_cache["map"]
+    m = {}
+    try:
+        for line in subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"],
+                capture_output=True, text=True, timeout=5).stdout.splitlines():
+            pid, _, name = line.partition(" ")
+            if pid.isdigit() and name:
+                m[int(pid)] = name
+    except Exception:
+        pass
+    _pane_pid_cache.update({"map": m, "ts": now})
+    return m
+
+
+def _owning_tmux_session(pid: int) -> str:
+    """Which tmux session a pid belongs to, by walking up its parents."""
+    panes = _pane_pid_sessions()
+    cur = pid
+    for _ in range(15):
+        if cur in panes:
+            return panes[cur]
+        try:
+            ppid = int(Path(f"/proc/{cur}/stat").read_text().rsplit(") ", 1)[-1].split()[1])
+        except Exception:
+            return ""
+        if ppid <= 1:
+            return ""
+        cur = ppid
+    return ""
+
+
+_cdp_clients_cache: dict = {"map": {}, "ts": 0.0}
+
+
+def _cdp_clients(ports: set = None) -> Dict[int, list]:
+    """{cdp port: [{pid, comm, session}]} — everything attached over CDP now.
+
+    `ports` limits the walk to the browsers we know about; without it every
+    established socket on the box (Postgres, redis, …) would get a parent-chain
+    lookup for nothing. Cached for 4s because the header polls browser state
+    every few seconds and `ss` walks every socket on the box.
+    """
+    now = time.time()
+    if ports is None and now - _cdp_clients_cache["ts"] < 4:
+        return _cdp_clients_cache["map"]
+    out: Dict[int, list] = {}
+    cacheable = ports is None
+    if ports is None:
+        ports = {p["cdp_port"] for p in _chrome_processes() if p["cdp_port"]}
+        ports |= {s.get("cdp_port") for s in _load_browser_sessions()}
+    ports = {int(p) for p in ports if p}
+    if not ports:
+        return out
+    try:
+        raw = subprocess.run(["ss", "-tnpH", "state", "established"],
+                             capture_output=True, text=True, timeout=6).stdout
+    except Exception:
+        return out
+    for line in raw.splitlines():
+        # Column layout shifts: `ss -H` prints the State column for a bare listing
+        # but omits it when a state filter is given, so a fixed index reads the
+        # wrong field and silently finds nothing. Pick out the address:port tokens
+        # instead — local first, peer second.
+        addrs = [t for t in line.split() if re.fullmatch(r"[\[\]0-9a-fA-F:.%*]+:\d+", t)]
+        if len(addrs) < 2:
+            continue
+        try:
+            port = int(addrs[1].rsplit(":", 1)[1])
+        except Exception:
+            continue
+        if port not in ports:
+            continue
+        m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+        if not m:
+            continue
+        comm, cpid = m.group(1), int(m.group(2))
+        if "chrome" in comm:            # the browser's own end of the socket
+            continue
+        rows = out.setdefault(port, [])
+        if any(r["pid"] == cpid for r in rows):
+            continue                    # one client, several sockets
+        rows.append({"pid": cpid, "comm": comm, "session": _owning_tmux_session(cpid)})
+    if cacheable:
+        _cdp_clients_cache.update({"map": out, "ts": now})
+    return out
+
+
+def _browser_cpu_pct(sid: str, cdp_port: int, root_pid: int = 0) -> float:
+    """CPU% of a browser's whole process tree since the previous call.
+
+    Percent of ONE core, so a 4-thread SwiftShader rasteriser reads as ~400.
+    First call for a session returns -1 (no baseline yet). Pass `root_pid` for a
+    browser with no CDP port to look up.
+    """
+    total = 0
+    for pid in (_pid_tree(root_pid) if root_pid else _browser_pids(cdp_port)):
+        try:
+            f = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+            total += int(f[11]) + int(f[12])      # utime + stime
+        except Exception:
+            continue
+    now = time.time()
+    prev = _browser_cpu_sample.get(sid)
+    _browser_cpu_sample[sid] = {"ticks": total, "ts": now}
+    if not prev or now <= prev["ts"]:
+        return -1.0
+    elapsed = now - prev["ts"]
+    if elapsed < 1.5:                     # too short to be meaningful; reuse last
+        _browser_cpu_sample[sid] = prev
+        return prev.get("pct", -1.0)
+    pct = (total - prev["ticks"]) / _CLK_TCK / elapsed * 100
+    _browser_cpu_sample[sid]["pct"] = max(0.0, pct)
+    return max(0.0, pct)
+
+
+# An MCP browser server keeps its CDP socket open for the whole life of the
+# Claude session that spawned it, so "attached" is a terrible proxy for "in use":
+# eight idle sessions at a prompt held the header amber for days. Attachment
+# still has to hold auto-park off (an agent that is thinking hasn't dropped its
+# socket), but the indicator should only light when a client is actually doing
+# something — and a client doing something burns CPU.
+_cdp_client_cpu_sample: Dict[int, dict] = {}
+# A playwright-MCP server driving a page uses whole percents of a core; parked
+# ones measure a flat 0. Anything above this counts as driving.
+CDP_CLIENT_BUSY_CPU_PCT = float(os.environ.get("CB_CLIENT_BUSY_CPU_PCT") or 1)
+
+
+def _cdp_clients_working(clients: list) -> list:
+    """The subset of attached CDP clients that has used CPU since the last poll.
+
+    First sighting of a client returns it as working: a brand-new connection is
+    almost always an agent that just reached for the browser, and guessing idle
+    there is the one direction that misleads.
+    """
+    now, working = time.time(), []
+    for c in clients:
+        pid = c.get("pid") or 0
+        try:
+            f = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+            ticks = int(f[11]) + int(f[12])
+        except Exception:
+            continue
+        prev = _cdp_client_cpu_sample.get(pid)
+        _cdp_client_cpu_sample[pid] = {"ticks": ticks, "ts": now}
+        if not prev:
+            working.append(c)
+            continue
+        elapsed = now - prev["ts"]
+        if elapsed < 1.5:                 # too short to measure; keep the verdict
+            _cdp_client_cpu_sample[pid] = prev
+            if prev.get("working"):
+                working.append(c)
+            continue
+        pct = (ticks - prev["ticks"]) / _CLK_TCK / elapsed * 100
+        hot = pct >= CDP_CLIENT_BUSY_CPU_PCT
+        _cdp_client_cpu_sample[pid]["working"] = hot
+        if hot:
+            working.append(c)
+    for dead in [p for p in _cdp_client_cpu_sample if now - _cdp_client_cpu_sample[p]["ts"] > 300]:
+        _cdp_client_cpu_sample.pop(dead, None)
+    return working
+
+
+async def _browser_park(sid: str, cdp_port: int) -> dict:
+    """Close every tab, leaving one about:blank.
+
+    This is the whole "pause" story: Chrome keeps running, and the profile —
+    cookies, the claude.ai session, extension state — is on disk and untouched,
+    so nothing has to sign in again. Only the rendering work goes away.
+    """
+    base = f"http://127.0.0.1:{cdp_port}"
+    closed = 0
+    async with httpx.AsyncClient(timeout=20) as c:
+        try:
+            targets = (await c.get(f"{base}/json/list")).json()
+        except Exception as e:
+            return {"ok": False, "error": f"CDP unreachable: {e}"}
+        pages = [t for t in targets if t.get("type") == "page"]
+        keep = ""
+        for t in pages:
+            if t.get("url", "").startswith("about:blank") and not keep:
+                keep = t["id"]
+                continue
+            try:
+                await c.get(f"{base}/json/close/{t['id']}")
+                closed += 1
+            except Exception:
+                logger.debug("Park: failed to close tab %s", t.get("id"), exc_info=True)
+        if not keep:
+            # Chrome exits when its last tab closes; always leave one behind.
+            try:
+                await c.put(f"{base}/json/new?about:blank")
+            except Exception:
+                logger.debug("Park: failed to open the placeholder tab", exc_info=True)
+    _browser_parked[sid] = time.time()
+    logger.info("Parked browser '%s': closed %d tab(s); profile and sign-in untouched",
+                sid, closed)
+    return {"ok": True, "closed": closed}
+
+
+_browser_parked: Dict[str, float] = {}      # sid -> when we parked it
+_browser_calm_since: Dict[str, float] = {}  # sid -> since when nobody has driven it
+
+
+_cdp_tabs_cache: Dict[int, dict] = {}
+
+
+async def _cdp_tab_list(cdp_port: int) -> list:
+    """[{title, url}] of a browser's open pages (empty if CDP won't answer).
+
+    Cached 8s — one HTTP round trip per browser, on the same poll path as
+    everything else here.
+    """
+    hit = _cdp_tabs_cache.get(cdp_port)
+    if hit and time.time() - hit["ts"] < 8:
+        return hit["tabs"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            targets = (await c.get(f"http://127.0.0.1:{cdp_port}/json/list")).json()
+    except Exception:
+        return []
+    tabs = [{"title": (t.get("title") or "")[:90], "url": (t.get("url") or "")[:200]}
+            for t in targets if t.get("type") == "page"]
+    _cdp_tabs_cache[cdp_port] = {"ts": time.time(), "tabs": tabs}
+    return tabs
+
+
+async def _unmanaged_browser_rows(clients: Dict[int, list] = None) -> list:
+    """Chromes running on this host that are not in browser_sessions.json.
+
+    These are the browsers agents start for themselves (the MCP browser tool),
+    and they are the reason this exists: the Browser tab showed two browsers
+    while three were running, so a third at 100% CPU had nothing on screen to
+    account for it. Reported, not adopted — we don't own their lifecycle.
+    """
+    known = {s.get("cdp_port") for s in _load_browser_sessions()}
+    if clients is None:
+        clients = await asyncio.to_thread(_cdp_clients)
+    rows = []
+    for p in await asyncio.to_thread(_chrome_processes):
+        cdp = p["cdp_port"]
+        if cdp and cdp in known:
+            continue
+        sid = f"proc:{cdp or p['pid']}"
+        att = clients.get(cdp, []) if cdp else []
+        owner = (next((c["session"] for c in att if c.get("session")), "")
+                 or await asyncio.to_thread(_owning_tmux_session, p["pid"])
+                 or _profile_owner_hint(p["profile"]))
+        owner_user = await asyncio.to_thread(_proc_owner, p["pid"])
+        rows.append({
+            "id": sid, "cdp_port": cdp, "pid": p["pid"], "profile": p["profile"],
+            "started": p["started"], "unmanaged": True, "headless": p.get("headless"),
+            "cpu_pct": round(await asyncio.to_thread(_browser_cpu_pct, sid, cdp, p["pid"]), 1),
+            "clients": att, "owner_session": owner,
+            "tabs": await _cdp_tab_list(cdp) if cdp else [],
+            "frozen_tabs": (_browser_frozen.get(sid) or {}).get("tabs", []),
+            "parked_ago": (round(time.time() - _browser_parked[sid])
+                           if sid in _browser_parked else None),
+            "proc_user": owner_user,
+            "controllable": (owner_user in ("", os.environ.get("USER", "")
+                                            or Path.home().name)
+                             or browser_resource_guard.can_control_privileged_processes()),
+            "resource_limited": browser_resource_guard.is_limited(p["pid"]),
+        })
+    return sorted(rows, key=lambda r: -r["cpu_pct"])
+
+
+@app.get("/api/browser/unmanaged")
+async def api_browser_unmanaged(request: Request):
+    """Browsers running outside the dashboard's own list (agents' own Chromes)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    return JSONResponse({"browsers": await _unmanaged_browser_rows(),
+                         "busy_cpu_pct": BROWSER_BUSY_CPU_PCT,
+                         "resource_guard": browser_resource_guard.guard_status()})
+
+
+@app.post("/api/browser/unmanaged/{ident}/{action}")
+async def api_browser_unmanaged_action(ident: str, action: str, request: Request):
+    """park / freeze / kill an agent-started browser.
+
+    `ident` is its CDP port, or "pid:<n>" for a browser with no CDP port (a
+    headless Playwright run talks over a pipe). kill is included because a browser
+    whose owning session is gone has nobody left to close it, and park only buys
+    back the rendering cost — the ~400 MB of Chrome stays until something ends the
+    process.
+    """
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    procs = await asyncio.to_thread(_chrome_processes)
+    if ident.startswith("pid:"):
+        want = ident[4:]
+        p = next((x for x in procs if str(x["pid"]) == want), None)
+    else:
+        p = next((x for x in procs if str(x["cdp_port"]) == ident and x["cdp_port"]), None)
+    if not p:
+        return JSONResponse({"error": f"no browser found for '{ident}'"}, status_code=404)
+    cdp_port, root = p["cdp_port"], p["pid"]
+    if cdp_port and cdp_port in {s.get("cdp_port") for s in _load_browser_sessions()}:
+        return JSONResponse({"error": "that is a managed browser — use its own controls"},
+                            status_code=400)
+    sid = f"proc:{cdp_port or root}"
+    if action in ("park", "freeze") and not cdp_port:
+        return JSONResponse({"error": "this browser exposes no CDP port, so its tabs cannot "
+                                      "be reached — it can only be killed"}, status_code=400)
+    if action == "park":
+        res = await _browser_park(sid, cdp_port)
+    elif action == "freeze":
+        res = await _browser_freeze_tabs(sid, cdp_port)
+    elif action == "kill":
+        try:
+            res = await asyncio.to_thread(
+                browser_resource_guard.stop_browser_workload,
+                root,
+                expected_started=p.get("started", 0),
+            )
+            if res.get("ok"):
+                _chrome_procs_cache["ts"] = 0
+                _browser_cpu_sample.pop(sid, None)
+                logger.warning("Stopped unmanaged browser workload for pid %d (CDP %d): "
+                               "root=%s targeted=%s", root, cdp_port,
+                               res.get("workload_root"), res.get("targeted"))
+        except Exception as e:
+            res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    else:
+        return JSONResponse({"error": "action must be park, freeze or kill"}, status_code=400)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 502)
+
+
+@app.post("/api/browser/{sid}/park")
+async def api_browser_park(sid: str, request: Request):
+    """Manually park a browser (close its tabs, keep it signed in)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = next((x for x in _load_browser_sessions() if x.get("id") == sid), None)
+    if not s:
+        return JSONResponse({"error": "unknown browser session"}, status_code=404)
+    res = await _browser_park(sid, s.get("cdp_port", 0))
+    return JSONResponse(res, status_code=200 if res.get("ok") else 502)
+
+
+@app.post("/api/browser/{sid}/freeze")
+async def api_browser_freeze(sid: str, request: Request):
+    """Suspend a browser's background tabs (the gentle half of Park)."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = next((x for x in _load_browser_sessions() if x.get("id") == sid), None)
+    if not s:
+        return JSONResponse({"error": "unknown browser session"}, status_code=404)
+    res = await _browser_freeze_tabs(sid, s.get("cdp_port", 0))
+    return JSONResponse(res, status_code=200 if res.get("ok") else 502)
+
+
+@app.post("/api/browser/{sid}/autopark")
+async def api_browser_set_autopark(sid: str, request: Request):
+    """Toggle the idle auto-park lock for one browser."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool(body.get("enabled", True))
+    sessions = _load_browser_sessions()
+    if not any(x.get("id") == sid for x in sessions):
+        return JSONResponse({"error": "unknown browser session"}, status_code=404)
+    for x in sessions:
+        if x.get("id") == sid:
+            x["auto_park"] = enabled
+    _save_browser_sessions(sessions)
+    return JSONResponse({"ok": True, "auto_park": enabled})
+
+
+# --- The CPU guard ladder ----------------------------------------------------
+#
+# Three rungs, cheapest and least invasive first. Each is a response to how this
+# actually went wrong: a Chrome tree sat at 240% of a core for hours (software-GL
+# rasterising an animation on a page nobody was looking at) while the box ran at
+# load 5+ on 4 vCPUs, and the one blunt instrument available — closing the tabs —
+# fired on a browser an agent was mid-task in.
+#
+#   1. renice  always, on sight. A browser must never outrank a Claude session
+#              for CPU. Costs nothing and cannot break a page.
+#   2. freeze  hot + nothing attached over CDP for BROWSER_FREEZE_IDLE_S: suspend
+#              background tabs (Page.setWebLifecycleState). Reversible, keeps the
+#              tabs; only done when no client is attached, so no agent can be
+#              mid-task in them.
+#   3. park    hot + untouched for BROWSER_AUTOPARK_IDLE_S: close the tabs. Last
+#              resort, and never while a CDP client is attached.
+BROWSER_FREEZE_IDLE_S = float(os.environ.get("CB_FREEZE_IDLE_S") or 120)
+BROWSER_NICE = int(os.environ.get("CB_NICE") or 10)
+_browser_niced: Dict[int, int] = {}          # root pid -> nice level we set
+_browser_frozen: Dict[str, dict] = {}        # sid -> {"ts", "tabs"}
+
+
+def _browser_renice(cdp_port: int, nice: int = BROWSER_NICE, root_pid: int = 0) -> int:
+    """Deprioritise a whole browser tree. Returns how many processes we moved.
+
+    Niceness can only be raised by an unprivileged process, which is exactly the
+    direction we want, so this needs no root. New renderers inherit the parent's
+    niceness, so re-running it only ever picks up processes started since.
+    """
+    root = root_pid or _chrome_root_pid(cdp_port)
+    if not root:
+        return 0
+    moved = 0
+    for pid in _pid_tree(root):
+        try:
+            if os.getpriority(os.PRIO_PROCESS, pid) >= nice:
+                continue
+            os.setpriority(os.PRIO_PROCESS, pid, nice)
+            moved += 1
+        except Exception:
+            continue
+    if moved and _browser_niced.get(root) != nice:
+        logger.info("Renice: browser on CDP %d -> nice %d (%d processes)",
+                    cdp_port, nice, moved)
+    _browser_niced[root] = nice
+    return moved
+
+
+async def _browser_freeze_tabs(sid: str, cdp_port: int) -> dict:
+    """Suspend a browser's background tabs so they stop rendering.
+
+    `Page.setWebLifecycleState: frozen` is the same mechanism Chrome uses on
+    real desktops to stop background tabs costing anything: timers and
+    requestAnimationFrame stop, the page stays loaded, and it thaws by itself
+    when the tab is shown or navigated. Chrome refuses it for the visible tab,
+    which is why this is a rung below park rather than a replacement for it.
+    """
+    base = f"http://127.0.0.1:{cdp_port}"
+    frozen, failed = [], 0
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            targets = (await c.get(f"{base}/json/list")).json()
+    except Exception as e:
+        return {"ok": False, "error": f"CDP unreachable: {e}"}
+    for t in targets:
+        if t.get("type") != "page" or not t.get("webSocketDebuggerUrl"):
+            continue
+        if (t.get("url") or "about:blank").startswith("about:blank"):
+            continue
+        try:
+            ws = await websockets.connect(t["webSocketDebuggerUrl"], max_size=None,
+                                          ping_interval=None, open_timeout=10)
+        except Exception:
+            failed += 1
+            continue
+        try:
+            tab = _CdpTab(ws)
+            await tab.call("Page.setWebLifecycleState", {"state": "frozen"}, timeout=10)
+            frozen.append((t.get("title") or t.get("url") or "")[:60])
+        except Exception:
+            failed += 1              # the visible tab: Chrome won't freeze it
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+    if frozen:
+        _browser_frozen[sid] = {"ts": time.time(), "tabs": frozen}
+        logger.info("Froze %d background tab(s) on browser '%s': %s",
+                    len(frozen), sid, "; ".join(frozen))
+    return {"ok": True, "frozen": len(frozen), "skipped": failed, "tabs": frozen}
+
+
+async def _browser_guard_cycle(sid: str, cdp: int, *, driven: bool, human: bool,
+                               auto_park: bool, label: str = "", root_pid: int = 0) -> None:
+    """One browser's turn through the ladder above."""
+    now = time.time()
+    # Rung 1, unconditional. Gentler while someone is actually using the browser
+    # (a noVNC session that renders at nice 10 under load feels broken), firm
+    # once nothing is: an unattended browser has no claim on this CPU at all.
+    await asyncio.to_thread(_browser_renice, cdp,
+                            max(1, BROWSER_NICE // 2) if (driven or human) else BROWSER_NICE,
+                            root_pid)
+    if driven or human:
+        _browser_calm_since[sid] = now
+        _browser_parked.pop(sid, None)
+        _browser_frozen.pop(sid, None)
+        return
+    calm_from = _browser_calm_since.setdefault(sid, now)
+    calm_for = now - calm_from
+    if calm_for < BROWSER_FREEZE_IDLE_S:
+        return
+    pct = await asyncio.to_thread(_browser_cpu_pct, sid, cdp, root_pid)
+    if pct < BROWSER_BUSY_CPU_PCT:
+        return
+    if not cdp:
+        # Nothing to talk to: renice (done above) is the only lever we have, and
+        # the operator needs to know something is spending the box's CPU.
+        if now - (_browser_frozen.get(sid) or {}).get("ts", 0) > 600:
+            _browser_frozen[sid] = {"ts": now, "tabs": []}
+            logger.warning("Browser %s at %.0f%% CPU with no CDP port to control it "
+                           "— reniced only; kill it from the Browser tab if it is stray",
+                           label or sid, pct)
+        return
+    if calm_for >= BROWSER_AUTOPARK_IDLE_S and auto_park:
+        logger.warning("Browser %s untouched for %.0fmin and still at %.0f%% CPU "
+                       "— parking it", label or sid, calm_for / 60, pct)
+        await _browser_park(sid, cdp)
+        _browser_calm_since[sid] = now
+        return
+    # Still inside the park window: freeze instead, and only re-freeze every
+    # couple of minutes (a page that thaws itself and keeps burning ends up
+    # parked by the rung above anyway).
+    last = (_browser_frozen.get(sid) or {}).get("ts", 0)
+    if now - last > 120:
+        logger.warning("Browser %s untouched for %.0fs at %.0f%% CPU — freezing its "
+                       "background tabs", label or sid, calm_for, pct)
+        await _browser_freeze_tabs(sid, cdp)
+
+
+async def browser_autopark_watchdog():
+    """Keep every Chrome on this box from eating the machine.
+
+    Covers browsers we launched *and* ones an agent started on its own (found by
+    scanning /proc), because both cost the same CPU. "In use" means a person at
+    its display, the dashboard driving it, or — the signal this used to miss —
+    any process holding a CDP socket open to it, which is what an agent's browser
+    tool does for as long as it is working.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            clients = await asyncio.to_thread(_cdp_clients)
+            configured = _load_browser_sessions()
+            for s in configured:
+                sid, cdp = s.get("id"), s.get("cdp_port", 0)
+                if not await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0)):
+                    continue
+                idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0))
+                attached = bool(clients.get(cdp))
+                await _browser_guard_cycle(
+                    sid, cdp,
+                    driven=(sid in _browser_busy) or attached,
+                    human=0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS,
+                    auto_park=s.get("auto_park", True) is not False and not attached,
+                    label=f"'{sid}'")
+            known = {s.get("cdp_port") for s in configured}
+            for p in await asyncio.to_thread(_chrome_processes):
+                cdp = p["cdp_port"]
+                if cdp and cdp in known:
+                    continue
+                sid = f"proc:{cdp or p['pid']}"
+                attached = bool(clients.get(cdp)) if cdp else False
+                await _browser_guard_cycle(
+                    sid, cdp, driven=attached, human=False,
+                    # Never close tabs in a browser whose owning session is still
+                    # around — park it only once nothing is attached to it.
+                    auto_park=not attached, root_pid=p["pid"],
+                    label=f"(unmanaged, {'CDP %d' % cdp if cdp else 'pid %d' % p['pid']})")
+        except Exception:
+            logger.debug("browser_autopark_watchdog cycle failed", exc_info=True)
+        await asyncio.sleep(60)
+
+
 @app.get("/api/browser/auth-status")
 async def api_browser_auth_status(request: Request, refresh: int = 0):
     """Header indicator state: is any browser signed into claude.ai with an
@@ -9029,6 +10299,7 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
     login_pick = _pick_login_browser()
+    clients = await asyncio.to_thread(_cdp_clients)
     out = []
     for s in sessions:
         sid = s.get("id")
@@ -9041,28 +10312,67 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
                 acct = await _browser_claude_account(sid, s.get("cdp_port", 0), force=bool(refresh))
             else:
                 acct = cached["data"]
-        # "In use" = real input on its X display (someone driving it over noVNC)
-        # OR us driving it over CDP right now.
+        # "In use" = real input on its X display (someone driving it over noVNC),
+        # OR us driving it over CDP right now, OR the browser burning CPU on its
+        # own — a background tab rendering something is work, and work the box is
+        # paying for, so it has to light the indicator like any other use.
         idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0)) if alive else -1
         driven = sid in _browser_busy
-        active = driven or (0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS)
+        human = 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS
+        cpu_pct = await asyncio.to_thread(_browser_cpu_pct, sid, s.get("cdp_port", 0)) if alive else -1
+        rendering = cpu_pct >= BROWSER_BUSY_CPU_PCT
+        # Anything attached over CDP is using this browser, even though it isn't
+        # us: that is how an agent's browser tool holds a session open.
+        att = clients.get(s.get("cdp_port", 0), []) if alive else []
+        who = ", ".join(sorted({c["session"] or c["comm"] for c in att}))
+        active = driven or human or rendering or bool(att)
+        # …but only a client that is actually spending CPU counts as *using* it.
+        # An idle Claude session's MCP server holds its socket open for hours.
+        busy_att = await asyncio.to_thread(_cdp_clients_working, att) if att else []
+        busy_who = ", ".join(sorted({c["session"] or c["comm"] for c in busy_att}))
+        working = driven or human or rendering or bool(busy_att)
+        why = ((_browser_busy.get(sid) or {}).get("what", "")
+               or (f"driven by {busy_who}" if busy_att else "")
+               or ("someone is using it over noVNC" if human else "")
+               or (f"rendering in the background ({cpu_pct:.0f}% CPU)" if rendering else "")
+               or (f"held open by {who} — attached, idle" if att else ""))
         out.append({
             "id": sid, "name": s.get("name", ""), "running": alive,
             "use_for_login": bool(s.get("use_for_login")) or (login_pick.get("id") == sid),
             "busy": driven,
             "busy_what": (_browser_busy.get(sid) or {}).get("what", ""),
-            "idle_ms": idle_ms, "active": active,
+            "idle_ms": idle_ms, "active": active, "working": working,
+            "cpu_pct": round(cpu_pct, 1), "rendering": rendering, "why": why,
+            "clients": att, "driven_by": busy_who, "held_by": who,
+            "tabs": await _cdp_tab_list(s.get("cdp_port", 0)) if alive else [],
+            "frozen_tabs": (_browser_frozen.get(sid) or {}).get("tabs", []),
+            "auto_park": s.get("auto_park", True) is not False,
+            "parked_ago": (round(time.time() - _browser_parked[sid])
+                           if sid in _browser_parked else None),
             **acct,
         })
     return JSONResponse({
         "sessions": out,
+        # Chromes running outside our list — an agent's own browser counts against
+        # the same 4 vCPUs, so it belongs on the same screen.
+        "unmanaged": await _unmanaged_browser_rows(clients),
+        "resource_guard": browser_resource_guard.guard_status(),
         "any_logged_in": any(x["logged_in"] for x in out),
         "any_can_authorize": any(x["can_authorize"] for x in out),
-        # A signed-in browser is being used right now (by a person over noVNC or
-        # by us) -> the indicator blinks.
-        "active": any(x["active"] and x["logged_in"] for x in out),
-        "active_what": next((x["busy_what"] or ("in use: " + x["name"])
-                             for x in out if x["active"] and x["logged_in"]), ""),
+        # `active` = something has a claim on this browser, so auto-park keeps its
+        # hands off. That includes a session merely attached over CDP, because an
+        # agent that is thinking between tool calls still owns its tabs.
+        "active": any(x["active"] for x in out),
+        # `working` = it is being used *right now* (a person over noVNC, us, an
+        # agent actually issuing CDP commands, or a tab of its own still
+        # rendering) -> amber, flashing. Attached-but-idle does not qualify: that
+        # kept the header amber around the clock and taught everyone to ignore it.
+        "working": any(x["working"] for x in out),
+        "active_what": (next((x["why"] or ("in use: " + x["name"])
+                              for x in out if x["active"] and x["logged_in"]), "")
+                        or next((x["why"] or ("in use: " + x["name"])
+                                 for x in out if x["active"]), "")),
+        "busy_cpu_pct": BROWSER_BUSY_CPU_PCT,
         "busy": bool(_browser_busy),
         "busy_what": next((v.get("what", "") for v in _browser_busy.values()), ""),
         "login_browser": login_pick.get("id", ""),
@@ -9663,7 +10973,8 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 # dashboard restart, so a restart that lands on a 429 used to blank the bars for
 # an hour. `retry_after` holds a backoff deadline so we stop hammering upstream.
 _ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
-_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after": 0}
+_anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "",
+                                 "retry_after": 0, "retry_fp": "", "last_error": ""}
 
 # --- Dedicated credential for the usage bars -------------------------------
 #
@@ -9687,6 +10998,90 @@ _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "", "retry_after":
 _USAGE_OAUTH_FILE = MESSAGES_DIR / "usage_oauth.json"
 _USAGE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _usage_oauth_lock = threading.Lock()
+# Granting that credential needs a consent click, which we can drive through a
+# signed-in browser — but Anthropic's token endpoint rate-limits hard (a stretch
+# of 429s can outlast an hour), and a grant that fails there is simply lost. So
+# the dashboard keeps trying on its own instead of leaving it to whoever
+# remembers: while the credential is missing, retry at a widening interval and
+# stop the moment it exists. Nothing here touches ~/.claude.
+_USAGE_GRANT_SCRIPT = Path(__file__).resolve().parent / "usage_oauth_login.py"
+_USAGE_GRANT_MIN_WAIT = 45 * 60
+_USAGE_GRANT_MAX_WAIT = 6 * 3600
+_usage_grant_state: dict = {"next_try": 0.0, "wait": _USAGE_GRANT_MIN_WAIT,
+                            "last_error": "", "last_try": 0.0, "tries": 0}
+
+
+def _usage_credential_ok() -> bool:
+    """Is there a usable dedicated usage credential on disk?"""
+    try:
+        d = json.loads(_USAGE_OAUTH_FILE.read_text())
+        return bool(d.get("refreshToken") or d.get("accessToken"))
+    except Exception:
+        return False
+
+
+async def usage_credential_watchdog():
+    """Keep the 5h/7d bars supplied with an account-scoped credential.
+
+    Runs only while there is no credential, only through a browser that is
+    already signed in to claude.ai with a plan that can authorize, and never more
+    often than _USAGE_GRANT_MIN_WAIT. The heavy lifting is usage_oauth_login.py,
+    invoked as a subprocess so there is exactly one implementation of the flow.
+    """
+    await asyncio.sleep(120)
+    while True:
+        try:
+            # Only when the bars are actually broken *for want of scope*. The
+            # shared long-lived token was assumed to be permanently 403 on the
+            # usage API; it is not (it started answering on 2026-07-26), so a
+            # blanket "no dedicated credential => grant one" would spend consent
+            # grants to fix something that is not broken. A rate limit or a
+            # network blip is not this watchdog's problem either.
+            needs_scope = _anthropic_limits_cache.get("last_error") in (
+                "needs_account_scope", "not_authenticated")
+            if needs_scope and not _usage_credential_ok() and _USAGE_GRANT_SCRIPT.exists():
+                now = time.time()
+                if now >= _usage_grant_state["next_try"]:
+                    pick = _pick_login_browser()
+                    acct = _browser_auth_cache.get(pick.get("id", ""), {}).get("data", {})
+                    if not pick:
+                        _usage_grant_state["last_error"] = "no login browser is set up"
+                    elif not acct.get("can_authorize", True):
+                        _usage_grant_state["last_error"] = (
+                            f"{pick.get('name')} cannot authorize: {acct.get('error') or 'no Max/Pro plan'}")
+                    else:
+                        _usage_grant_state.update({"last_try": now,
+                                                   "tries": _usage_grant_state["tries"] + 1})
+                        logger.info("Usage credential missing — attempting an account-scoped "
+                                    "grant through browser '%s' (attempt %d)",
+                                    pick.get("id"), _usage_grant_state["tries"])
+                        proc = await asyncio.create_subprocess_exec(
+                            sys.executable, str(_USAGE_GRANT_SCRIPT),
+                            "--cdp-port", str(pick.get("cdp_port", 9222)),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT)
+                        try:
+                            raw, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                            raw = b"timed out"
+                        text = (raw or b"").decode("utf-8", "replace").strip()
+                        if _usage_credential_ok():
+                            logger.info("Usage-bars credential granted — the 5h/7d bars will "
+                                        "fill in on the next poll")
+                            _anthropic_limits_cache["retry_after"] = 0   # try upstream at once
+                            _usage_grant_state["last_error"] = ""
+                        else:
+                            tail = text.splitlines()[-1][:200] if text else "no output"
+                            _usage_grant_state["last_error"] = tail
+                            _usage_grant_state["wait"] = min(_USAGE_GRANT_MAX_WAIT,
+                                                             _usage_grant_state["wait"] * 2)
+                            logger.warning("Usage-credential grant failed (%s) — retrying in "
+                                           "%.0f min", tail, _usage_grant_state["wait"] / 60)
+                    _usage_grant_state["next_try"] = time.time() + _usage_grant_state["wait"]
+        except Exception:
+            logger.debug("usage_credential_watchdog cycle failed", exc_info=True)
+        await asyncio.sleep(300)
 
 
 def _usage_oauth_refresh(cred: dict) -> str:
@@ -9720,6 +11115,100 @@ def _usage_oauth_refresh(cred: dict) -> str:
     return ""
 
 
+# --- Fallback source for the bars: the inference response's own headers -------
+#
+# /api/oauth/usage needs account scope, which the long-lived setup-token this box
+# runs on does not have (403). But every *inference* response carries the same
+# numbers as headers:
+#
+#   anthropic-ratelimit-unified-5h-utilization: 0.0     (a FRACTION, 0..1)
+#   anthropic-ratelimit-unified-5h-reset:       1785070800
+#   anthropic-ratelimit-unified-7d-utilization: 1.0
+#   anthropic-ratelimit-unified-status:         rejected
+#   anthropic-ratelimit-unified-overage-in-use: true
+#
+# and the inference-only token is, by definition, allowed to make an inference
+# call. So the bars no longer depend on a credential this host cannot keep: one
+# 1-token Haiku ping per hour (a small fraction of a cent) reads them. Only a real
+# call returns these headers — /v1/messages/count_tokens, a 400 and a 404 all come
+# back without them, so there is no free version of this probe.
+_USAGE_PROBE_MODEL = os.environ.get("USAGE_PROBE_MODEL") or "claude-haiku-4-5-20251001"
+
+
+def _usage_from_headers(token: str) -> dict:
+    """Read 5h/7d utilization off a 1-token inference call. {} if unavailable.
+
+    Shaped exactly like the /api/oauth/usage payload the frontend already
+    consumes, so it is a drop-in substitute rather than a second code path.
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps({"model": _USAGE_PROBE_MODEL, "max_tokens": 1,
+                         "messages": [{"role": "user", "content": "."}]}).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json",
+            # The OAuth plan credential is only accepted for Claude Code traffic.
+            "User-Agent": "claude-cli/2.1.220 (external, cli)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            headers = dict(resp.headers)
+    except Exception as e:
+        # A 429 ("limit reached") still carries the headers — that answer is the
+        # most interesting one there is, so read it rather than giving up.
+        headers = dict(getattr(e, "headers", {}) or {})
+        if not headers:
+            logger.debug("Usage header probe failed", exc_info=True)
+            return {}
+
+    low = {k.lower(): v for k, v in headers.items()}
+    p = "anthropic-ratelimit-unified-"
+
+    def block(prefix: str) -> dict:
+        util, reset = low.get(f"{p}{prefix}utilization"), low.get(f"{p}{prefix}reset")
+        if util is None:
+            return {}
+        try:
+            # Fractions here (7d 1.0 = exhausted), percentages in the OAuth API.
+            pct = max(0.0, min(100.0, float(util) * 100))
+        except ValueError:
+            return {}
+        out = {"utilization": round(pct, 1), "limit_dollars": None,
+               "used_dollars": None, "remaining_dollars": None}
+        try:
+            out["resets_at"] = datetime.fromtimestamp(
+                int(reset), timezone.utc).isoformat()
+        except Exception:
+            out["resets_at"] = None
+        return out
+
+    fh, sd = block("5h-"), block("7d-")
+    if not fh and not sd:
+        return {}
+    out = {"five_hour": fh or None, "seven_day": sd or None,
+           "source": "ratelimit_headers"}
+    if str(low.get(f"{p}overage-in-use", "")).lower() == "true":
+        # The plan's own window is spent and spend has moved to overage credits.
+        # Worth saying out loud: it is the difference between "busy" and "paying".
+        out["overage"] = {**block("overage-"), "in_use": True}
+    out["status"] = low.get(f"{p}status", "")
+    return out
+
+
+def _shared_claude_token() -> str:
+    """The credential Claude Code itself runs on (whatever type it is)."""
+    try:
+        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        return creds.get("claudeAiOauth", {}).get("accessToken", "") or ""
+    except Exception:
+        return ""
+
+
 def _usage_access_token() -> tuple[str, str]:
     """Token for the usage API, plus which source it came from.
 
@@ -9742,11 +11231,8 @@ def _usage_access_token() -> tuple[str, str]:
             pass
         except Exception:
             logger.debug("Unusable dedicated usage credential", exc_info=True)
-    try:
-        creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
-        return (creds.get("claudeAiOauth", {}).get("accessToken", "") or ""), "shared"
-    except Exception:
-        return "", "none"
+    tok = _shared_claude_token()
+    return (tok, "shared") if tok else ("", "none")
 
 
 def _load_anthropic_limits_cache():
@@ -9863,10 +11349,27 @@ async def api_anthropic_usage_limits():
             if isinstance(out, dict):
                 out = {**out, "stale": True}
             return JSONResponse(out)
-        return JSONResponse({"error": "fetch_failed"}, status_code=502)
+        # Carry *why* forward. The reason is established once, on the call that
+        # actually hit upstream; every later call inside the backoff window used
+        # to answer a bare "fetch_failed", so the UI could not tell a wrong
+        # credential type (needs a one-off re-grant) from a rate limit (just wait).
+        err = _anthropic_limits_cache.get("last_error") or "fetch_failed"
+        return JSONResponse({
+            "error": err, "token_source": token_source,
+            # So the UI can say "retrying by itself in N min" instead of leaving
+            # the reader to wonder whether anything is being done about it.
+            "grant": {"have_credential": _usage_credential_ok(),
+                      "retry_in_s": max(0, round(_usage_grant_state["next_try"] - now)),
+                      "tries": _usage_grant_state["tries"],
+                      "last_error": _usage_grant_state["last_error"]},
+        }, status_code=403 if err == "needs_account_scope" else 502)
 
     # Upstream told us to back off — don't re-hit it until the deadline passes.
-    if now < _anthropic_limits_cache.get("retry_after", 0):
+    # Unless the credential itself changed: a 403 backoff is a statement about
+    # *that* token, and the whole point of granting a new one is to try again
+    # now. Without this the bars stayed empty for an hour after the fix landed.
+    if (now < _anthropic_limits_cache.get("retry_after", 0)
+            and _anthropic_limits_cache.get("retry_fp") == fp):
         return _stale_or_error()
 
     def _fetch():
@@ -9898,12 +11401,16 @@ async def api_anthropic_usage_limits():
             except Exception:
                 pass
             _anthropic_limits_cache["retry_after"] = now + delay
+            _anthropic_limits_cache["retry_fp"] = fp
+            _anthropic_limits_cache["last_error"] = "rate_limited"
             logger.warning("Anthropic usage API rate-limited; backing off %ss", delay)
         elif status == 403:
             # Wrong credential *type*, not a transient failure. A setup-token is
             # inference-only, so re-minting one changes nothing — retrying just
             # burns into the shared rate limit. Back off hard and say why.
             _anthropic_limits_cache["retry_after"] = now + 3600
+            _anthropic_limits_cache["retry_fp"] = fp
+            _anthropic_limits_cache["last_error"] = "needs_account_scope"
             logger.warning(
                 "Usage API 403 (needs account scope). Token source: %s. "
                 "Run usage_oauth_login.py to grant the dashboard its own "
@@ -9913,7 +11420,28 @@ async def api_anthropic_usage_limits():
                     {"error": "needs_account_scope", "token_source": token_source},
                     status_code=403)
         else:
+            _anthropic_limits_cache["last_error"] = "fetch_failed"
             logger.warning("Anthropic OAuth usage fetch failed: %s", e)
+        # The account endpoint is out (wrong credential type, or rate-limited).
+        # Fall back to the rate-limit headers on a 1-token inference call, which
+        # the plan credential *is* allowed to make. Uses the shared Claude Code
+        # credential deliberately: that is the account the sessions run on, so
+        # those are the numbers the bars are supposed to show.
+        shared = _shared_claude_token()
+        hdr = await asyncio.to_thread(_usage_from_headers, shared or token)
+        if hdr and (hdr.get("five_hour") or hdr.get("seven_day")):
+            payload = {"fetched_at": now, **hdr}
+            _anthropic_limits_cache.update({
+                "ts": now, "data": payload,
+                "fp": hashlib.sha1((shared or token).encode()).hexdigest()[:16],
+                "last_error": "",
+            })
+            _persist_anthropic_limits_cache()
+            logger.info("Usage limits read from inference rate-limit headers "
+                        "(5h %.0f%%, 7d %.0f%%)",
+                        (hdr.get("five_hour") or {}).get("utilization") or 0,
+                        (hdr.get("seven_day") or {}).get("utilization") or 0)
+            return JSONResponse(payload)
         return _stale_or_error()
 
     payload = {"fetched_at": now, **data}
@@ -9921,6 +11449,7 @@ async def api_anthropic_usage_limits():
     _anthropic_limits_cache["data"] = payload
     _anthropic_limits_cache["fp"] = fp
     _anthropic_limits_cache["retry_after"] = 0
+    _anthropic_limits_cache["last_error"] = ""
     _persist_anthropic_limits_cache()
     return JSONResponse(payload)
 
@@ -10161,6 +11690,111 @@ _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 # Model switches requested via the header dropdown, not yet confirmed by the
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
 _session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+
+
+# --- How is each session actually signed in? --------------------------------
+# Three credential shapes reach a `claude` process and they behave differently
+# enough that you need to see which one a session got:
+#
+#   Claude Max(S)  short-lived interactive OAuth from ~/.claude/.credentials.json.
+#                  Auto-refreshes, and account endpoints (the 5h/7d usage API)
+#                  accept it.
+#   Claude Max(L)  long-lived `claude setup-token` exported as
+#                  CLAUDE_CODE_OAUTH_TOKEN. Stable across parallel sessions (no
+#                  refresh-token rotation war) but inference-only: it cannot
+#                  read /api/oauth/usage, which is why a host running on (L)
+#                  needs the separate usage credential.
+#   API sk-…XXXX   metered ANTHROPIC_API_KEY. Bills per token, not the plan.
+#
+# Read from the live process environment rather than from what we *intended* at
+# launch: sessions outlive credential changes, and the env is the ground truth.
+_session_auth_label_cache: Dict[str, dict] = {}
+_AUTH_LABEL_TTL = 60
+
+
+def _plan_name(sub_type: str) -> str:
+    st = (sub_type or "").lower()
+    if "max" in st:
+        return "Claude Max"
+    if "pro" in st:
+        return "Claude Pro"
+    if "team" in st or "enterprise" in st:
+        return "Claude Team"
+    return "Claude"
+
+
+def _creds_plan(config_dir: str = "") -> str:
+    """Plan name from a credentials file (defaults to the shared one)."""
+    base = Path(config_dir) if config_dir else (Path.home() / ".claude")
+    try:
+        d = json.loads((base / ".credentials.json").read_text())
+        return _plan_name(d.get("claudeAiOauth", {}).get("subscriptionType", ""))
+    except Exception:
+        return "Claude"
+
+
+def _session_claude_env(session_name: str) -> dict:
+    """Environment of the `claude` process running in a session's first pane."""
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=5).stdout.split()
+    except Exception:
+        return {}
+    pids = [p for p in out if p.isdigit()]
+    # The pane's own pid is a shell; `claude` is a descendant of it.
+    for pid in pids:
+        try:
+            kids = subprocess.run(["pgrep", "-P", pid], capture_output=True,
+                                  text=True, timeout=5).stdout.split()
+        except Exception:
+            kids = []
+        for cand in [*kids, pid]:
+            try:
+                if "claude" not in Path(f"/proc/{cand}/cmdline").read_bytes().decode(
+                        "utf-8", "replace"):
+                    continue
+                raw = Path(f"/proc/{cand}/environ").read_bytes().decode("utf-8", "replace")
+            except Exception:
+                continue
+            env = {}
+            for item in raw.split("\0"):
+                k, _, v = item.partition("=")
+                if k:
+                    env[k] = v
+            return env
+    return {}
+
+
+def _session_auth_fields(session_name: str) -> dict:
+    """`auth_label` / `auth_kind` for API payloads (see the block comment above)."""
+    now = time.time()
+    cached = _session_auth_label_cache.get(session_name)
+    if cached and now - cached["ts"] < _AUTH_LABEL_TTL:
+        return cached["data"]
+    env = _session_claude_env(session_name)
+    key = (env.get("ANTHROPIC_API_KEY") or "").strip()
+    tok = (env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    cfg = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if key:
+        data = {"auth_kind": "api",
+                "auth_label": "API " + (key[:2] + "…" + key[-4:] if len(key) > 8 else "key"),
+                "auth_detail": "Metered ANTHROPIC_API_KEY — billed per token, not on the plan."}
+    elif tok:
+        data = {"auth_kind": "longlived",
+                "auth_label": _creds_plan(cfg) + "(L)",
+                "auth_detail": "Long-lived setup-token (CLAUDE_CODE_OAUTH_TOKEN): stable "
+                               "across parallel sessions, but inference-only — it cannot "
+                               "read the 5h/7d usage API."}
+    elif env:
+        data = {"auth_kind": "shortlived",
+                "auth_label": _creds_plan(cfg) + "(S)",
+                "auth_detail": "Short-lived interactive OAuth credential — auto-refreshes, "
+                               "and account endpoints accept it."}
+    else:
+        data = {"auth_kind": "", "auth_label": "", "auth_detail": ""}
+    _session_auth_label_cache[session_name] = {"data": data, "ts": now}
+    return data
 
 
 def _session_model_fields(session_name: str) -> dict:
@@ -10453,7 +12087,15 @@ async def api_send_command(session_name: str, body: SendCommand):
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         cmd_text = body.command
-        if len(cmd_text) > 200:
+        # Announce any files uploaded since the last message, so "what did I
+        # just upload?" resolves to the exact paths instead of the agent having
+        # to guess (or finding another session's files).
+        pending = _take_pending_uploads(_session_upload_key(session_name, sess))
+        cmd_text = _format_upload_preamble(pending) + cmd_text
+        # Multi-line text MUST go via paste-buffer: `send-keys -l` delivers a
+        # literal newline, which Claude Code submits on, truncating the message
+        # at the first line.
+        if len(cmd_text) > 200 or "\n" in cmd_text:
             # For long messages, use tmux load-buffer + paste-buffer.
             # Claude Code's bracketed paste mode shows "[Pasted text +N lines]"
             # as a preview and often swallows the Enter that follows, leaving
@@ -10522,10 +12164,11 @@ async def api_send_command(session_name: str, body: SendCommand):
         if "messages" not in entry:
             entry["messages"] = _load_session_messages(session_name)
         entry["messages"].append({
-            "role": "user", "text": body.command, "ts": now
+            "role": "user", "text": cmd_text, "ts": now
         })
         _save_messages()
-        return JSONResponse({"ok": True, "sent": body.command})
+        return JSONResponse({"ok": True, "sent": cmd_text,
+                             "attached": [i.get("path") for i in pending]})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -11973,14 +13616,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
-.nav-usage{display:none;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
-.nav-usage.has-data{display:flex}
-.nav-usage-item{display:flex;align-items:center;gap:5px;cursor:default;line-height:1}
+/* Always laid out, never display:none on data loss. Hiding the whole block when
+   the usage API answers nothing is indistinguishable from "the feature is gone"
+   — which is exactly how these bars disappeared for a week. No data now shows
+   as an empty, dimmed bar with the reason in its tooltip. */
+.nav-usage{display:flex;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage-item{display:flex;align-items:center;gap:5px;cursor:help;line-height:1}
 .nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
-.nav-usage-bar{position:relative;width:96px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-usage-bar{position:relative;width:82px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
 .nav-usage-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
+.nav-usage-pct{color:#8b949e;font-size:.6rem;font-weight:600;width:26px;text-align:right;font-variant-numeric:tabular-nums}
+/* No usable number yet (no account-scoped credential, or upstream down). */
+.nav-usage.no-data{opacity:.6}
+.nav-usage.no-data .nav-usage-pct{color:#6e7681}
+.nav-usage.stale .nav-usage-pct{font-style:italic;opacity:.75}
 .nav-usage.disabled{display:none}
 /* Usage bars mirrored into tools dropdown (mobile only) */
 .nav-tools-usage{display:none;padding:8px 14px 4px 14px}
@@ -12013,6 +13664,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .badge.attached{background:#238636;color:#fff}
 .badge.detached{background:#6e7681;color:#fff}
 .badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500;cursor:pointer;user-select:none}
+/* How the session is signed in. Colour-coded because the difference matters:
+   plan-billed short-lived (blue), plan-billed long-lived (purple), metered API
+   key (amber — money leaves the plan). */
+.badge.auth-badge{font-size:.65rem;font-weight:600;letter-spacing:.02em;cursor:help;border:1px solid transparent}
+.badge.auth-badge.shortlived{background:#1f6feb22;color:#79c0ff;border-color:#1f6feb55}
+.badge.auth-badge.longlived{background:#8957e522;color:#d2a8ff;border-color:#8957e555}
+.badge.auth-badge.api{background:#d2992222;color:#e3b341;border-color:#d2992255}
 .badge.model-badge:hover{background:#3c444d;color:#e6edf3}
 .badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
 .badge.model-badge.pending{opacity:.75;font-style:italic}
@@ -12034,7 +13692,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tab-more-wrap{position:relative}
 .tab-more-trigger{display:flex;align-items:center;gap:4px}
 .tab-more-icon{display:none;font-size:1.1rem;line-height:1}
-.tab-more-menu{display:none;position:absolute;top:100%;left:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:120px;padding:4px 0;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.tab-more-menu{display:none;position:absolute;top:100%;left:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:210px;padding:4px 0;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .tab-more-menu.open{display:block}
 .tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
 .tab-more-item:hover{background:#1c2128;color:#c9d1d9}
@@ -12089,10 +13747,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
-.chat-controls{display:flex;justify-content:flex-end;margin-bottom:4px;min-height:0}
-.raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
-.raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
-.raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
+/* The terminal's own control row is gone — its contents sit in the header line
+   with Delete (see renderDetail). These two therefore style header children now. */
+.raw-info{color:#6e7681;font-size:.72rem;flex-shrink:0;font-variant-numeric:tabular-nums}
+.raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;padding:0 10px;align-self:center}
 .raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
 .raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
@@ -12168,6 +13826,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .uploaded-files-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.04em;text-align:left}
 .uploaded-file{display:flex;align-items:center;gap:6px;padding:5px 8px;background:#0d1117;border:1px solid #21262d;border-radius:4px;font-size:.7rem;font-family:'SF Mono','Fira Code',Consolas,monospace;color:#c9d1d9;text-align:left;overflow:hidden}
 .uploaded-file:hover{border-color:#30363d}
+.uploaded-file.pending{border-color:#1f6feb88;background:#0d1117}
+.uploaded-file-badge{flex-shrink:0;padding:1px 6px;border-radius:9px;font-size:.6rem;letter-spacing:.03em;text-transform:uppercase;background:#1f6feb22;border:1px solid #1f6feb66;color:#58a6ff}
 .uploaded-file-icon{flex-shrink:0;opacity:.7}
 .uploaded-file-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .uploaded-file-size{flex-shrink:0;color:#6e7681;font-size:.65rem}
@@ -12407,15 +14067,15 @@ body.member-simple .hide-in-simple{display:none!important}
 .skills-editor{flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;resize:none;min-height:200px;line-height:1.5;outline:none}
 .skills-editor:focus{border-color:#58a6ff}
 .skills-empty{color:#6e7681;font-size:.8rem;padding:12px 0;text-align:center}
-/* Profile dropdown next to Terminal tab */
-.profile-wrap{display:flex;align-items:center;gap:6px;margin-left:8px;padding-left:8px;border-left:1px solid #21262d}
-.profile-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
+/* Profile selector — inside the "More" menu (it used to sit on the tab bar) */
+.profile-wrap{display:flex;align-items:center;gap:6px;padding:4px 16px 6px}
+.profile-wrap .profile-select{flex:1;min-width:0}
+.profile-label{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
 .profile-select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-size:.78rem;padding:4px 22px 4px 8px;border-radius:6px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%238b949e' d='M5 7L1 3h8z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center}
 .profile-select:focus{border-color:#58a6ff}
 .profile-restart-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:.85rem;line-height:1}
 .profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
 .profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
-@media(max-width:768px){.profile-label{display:none}.profile-wrap{margin-left:4px;padding-left:6px}}
 
 /* Profile editor modal */
 .profiles-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
@@ -12509,10 +14169,17 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
 /* Blinking green: the signed-in browser is being used right now (a person over
    noVNC, or Claude driving it in the background). */
-.nav-browser-badge.ok.active{border-color:#3fb950}
-.nav-browser-badge.ok.active .nbb-dot{animation:nbb-blink 1s ease-in-out infinite}
+/* In use / doing work = AMBER and flashing, not green. Green means "signed in
+   and quiet"; a browser that is rendering something in the background is
+   spending this box's CPU, and that has to be visible at a glance — an idle-
+   looking green dot is exactly how a runaway tab pinned 230% CPU unnoticed. */
+.nav-browser-badge.ok.active{border-color:#d29922}
+.nav-browser-badge.ok.active .nbb-dot{background:#d29922;animation:nbb-blink 1s ease-in-out infinite}
 .nav-browser-badge.ok.active .nbb-glyph{animation:nbb-pulse 1.6s ease-in-out infinite}
-@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #3fb950}50%{opacity:.3;box-shadow:none}}
+@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #d29922}50%{opacity:.3;box-shadow:none}}
+/* Parked: tabs closed to free the CPU, profile (and the claude.ai session) intact. */
+.nav-browser-badge.parked .nbb-dot{background:#6e7681;box-shadow:none}
+.nav-browser-badge.parked .nbb-glyph{filter:grayscale(1) opacity(.5)}
 .nav-browser-badge.ok .nbb-glyph{filter:none}
 /* Working: the dot becomes a spinning ring so background use is obvious. */
 .nav-browser-badge.busy{border-color:#58a6ff}
@@ -12549,6 +14216,15 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-edit textarea{min-height:80px;resize:vertical;line-height:1.45}
 .bs-edit input:focus,.bs-edit textarea:focus{border-color:#58a6ff}
 .bs-edit-actions{display:flex;gap:6px;justify-content:flex-end}
+/* Chromes we did not launch (an agent's own browser). Dashed border so it reads
+   as "found, not managed" without inventing a second colour. */
+.bs-card.unmanaged{border-style:dashed}
+.bs-sub{padding:0 10px 6px;font-size:.72rem;color:#8b949e;line-height:1.45}
+.bs-path{padding:0 10px 8px;font-size:.66rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;word-break:break-all}
+.bs-tabs{padding:0 10px 8px;font-size:.7rem;color:#c9d1d9;display:flex;flex-direction:column;gap:2px}
+.bs-tabs .bs-tab{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bs-tabs .bs-tab .u{color:#6e7681}
+.bs-section-title{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin:14px 0 6px}
 .bs-add{display:flex;gap:8px;align-items:center;margin-top:4px}
 .bs-add input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none}
 .bs-add input:focus{border-color:#58a6ff}
@@ -12695,8 +14371,8 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-attached{display:none}
   .nav-server-stats{display:none}
   .nav-status-text{display:none}
-  .nav-usage.has-data{display:none}
-  .nav-tools-usage.has-data{display:block}
+  .nav-usage{display:none}
+  .nav-tools-usage{display:block}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
   .claude-auth .status-dot{width:10px;height:10px}
@@ -12709,17 +14385,22 @@ body.member-simple .hide-in-simple{display:none!important}
   .detail-badges{flex-wrap:wrap}
   .detail-badges .status-pill{display:none}
   .detail-badges .model-badge{display:none}
+  /* Stop / Reload / Delete moved onto this row, so on a phone the labels have to
+     go instead — Delete was pushed off the right edge. Both are in the More menu
+     or the status dot. */
+  .detail-badges .raw-info{display:none}
+  .detail-badges .auth-badge{display:none}
   .chat-msg{max-width:92%}
   .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
   .raw-output{max-height:50vh}
   .modal{min-width:280px;margin:0 16px}
   .tab{padding:8px 12px;font-size:.8rem}
-  .tab-more-menu{min-width:160px}
+  .tab-more-menu{min-width:210px}
   .tab-more-label{display:none}
   .tab-more-arrow{display:none}
   .tab-more-icon{display:inline-block}
   .tab-more-model-block{display:block}
-  .profile-select{width:34px;padding:4px;color:transparent;-webkit-text-fill-color:transparent;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16'%3E%3Cpath fill='%238b949e' d='M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1c-2.21 0-6 1.106-6 3.3V14h12v-1.7C14 10.106 10.21 9 8 9z'/%3E%3C/svg%3E");background-position:center;background-repeat:no-repeat}
+  .raw-title{display:none}
 }
 </style></head>
 <body>
@@ -12732,14 +14413,16 @@ body.member-simple .hide-in-simple{display:none!important}
 </nav>
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
-  <span class="nav-usage" id="nav-usage">
-    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="">
+  <span class="nav-usage no-data" id="nav-usage">
+    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="Anthropic 5-hour limit">
       <span class="nav-usage-label">5h</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-5h-pct">&mdash;</span>
     </span>
-    <span class="nav-usage-item" id="nav-usage-7d-wrap" title="">
+    <span class="nav-usage-item" id="nav-usage-7d-wrap" title="Anthropic 7-day limit">
       <span class="nav-usage-label">7d</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
+      <span class="nav-usage-pct" id="nav-usage-7d-pct">&mdash;</span>
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
@@ -12884,6 +14567,16 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+
+// Transient one-line feedback in the header. There is no toast system here and
+// one line beats a modal for "done, here's what happened".
+let _toastTimer=null;
+function showToast(msg, ms){
+  if(!statusInfoEl) return;
+  statusInfoEl.textContent = msg;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(()=>{ statusInfoEl.textContent='Watching for changes...'; }, ms||6000);
+}
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
@@ -13436,6 +15129,16 @@ function statusLabel(s){
   return'...';
 }
 
+// How this session authenticates, shown beside the idle/working pill. (S) is a
+// short-lived auto-refreshing OAuth credential, (L) a long-lived setup-token
+// (stable across parallel sessions but inference-only), "API sk-…" a metered
+// key. Which one a session got changes both billing and what it can read.
+function authBadge(s){
+  if(!s.auth_label)return'';
+  return '<span class="badge auth-badge '+esc(s.auth_kind||'')+'" title="'+
+         esc(s.auth_detail||'')+'">'+esc(s.auth_label)+'</span>';
+}
+
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   const brand=navEl.querySelector('.nav-brand');
@@ -13497,11 +15200,11 @@ function renderDetail(){
   mainEl.innerHTML=`
     <div class="tab-bar">
       <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
-      ${renderProfileDropdown(s)}
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
           <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
+          ${renderProfileDropdown(s)}
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
@@ -13518,24 +15221,26 @@ function renderDetail(){
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>`}
         </div>
       </div>
+      <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
       <div class="detail-badges">
         <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
           <span class="status-dot"></span>
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
+        ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="btn" onclick="reloadActive('${esc(s.name)}')" title="Re-read this session's terminal from tmux">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
 
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
-        <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-        </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
@@ -13555,12 +15260,9 @@ function renderDetail(){
     </div>
 
     <div class="tab-content tab-raw ${tab==='raw'?'active':''}" id="tab-raw-${s.name}">
-      <div class="raw-controls">
-        <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
-        <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
-        <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
-      </div>
+      <!-- No control row here on purpose: Stop / Reload / the line count and the
+           pane title all live in the header line next to Delete, which buys the
+           terminal ~34px of height on every screen. -->
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
       <div class="cmd-bar" style="position:relative">
@@ -14122,7 +15824,7 @@ function _uploadOneFile(name,tab,file){
       if(xhr.status>=200&&xhr.status<300){
         progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('done')}});
         progName.forEach(function(el){if(el)el.textContent=file.name+' uploaded'});
-        appendChatBubble(name,'user','Uploaded '+file.name+' ('+_formatSize(file.size)+')',Date.now()/1000);
+        appendChatBubble(name,'user','Uploaded '+file.name+' ('+_formatSize(file.size)+') — will be attached to your next message',Date.now()/1000);
         refreshUploadedFiles(name);
       }else{
         let msg='Upload failed';
@@ -14184,6 +15886,8 @@ async function sendCmd(name,source){
     });
     input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
     delete draftText[source+'-'+name];
+    // Any pending uploads were just attached to this message — clear the badges.
+    refreshUploadedFiles(name);
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
       const st=getRawState(name);
@@ -14315,6 +16019,15 @@ async function loadRaw(name){
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
   await pollRawDelta(name);
+}
+
+// Reload now lives in the header line, which is visible from every tab — so it
+// refreshes whatever that tab is showing rather than only the terminal.
+function reloadActive(name){
+  const tab=activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw');
+  if(tab==='raw')loadRaw(name);
+  else if(tab==='skills')loadProfileSkills(name);
+  else refreshOne(name);
 }
 
 function updateStatusPill(name,status,detail){
@@ -14519,23 +16232,56 @@ function _applyUsageStyle(fillEl,pctNum){
   else if(pctNum>=70)cls='warn';
   fillEl.className='nav-usage-fill'+(cls?' '+cls:'');
 }
+// Why there is no number, in words the reader can act on. The endpoint's own
+// error strings are the only thing that distinguishes "wrong credential type"
+// (needs a one-off re-grant) from "upstream is rate-limiting us" (just wait).
+function _usageErrText(err){
+  if(err==='needs_account_scope')
+    return 'the dashboard credential is inference-only, so Anthropic refuses the usage API '
+          +'(403). Re-grant it: python3 usage_oauth_login.py --cdp-port 9224';
+  if(err==='not_authenticated') return 'no Claude credential on this host yet.';
+  if(err==='rate_limited') return 'Anthropic is rate-limiting the usage API; backing off and retrying.';
+  return 'the Anthropic usage API did not answer (retrying).';
+}
 async function refreshUsageLimits(){
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
   const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
-  const setHasData=(has)=>{
+  // The bars stay on screen either way — only their state changes. `has-data`
+  // used to gate `display`, so one bad answer made them vanish entirely and the
+  // feature looked deleted.
+  const setHasData=(has,why)=>{
     wrap.classList.toggle('has-data',has);
-    if(toolsWrap)toolsWrap.classList.toggle('has-data',has);
+    wrap.classList.toggle('no-data',!has);
+    if(toolsWrap){toolsWrap.classList.toggle('has-data',has);toolsWrap.classList.toggle('no-data',!has)}
+    if(!has){
+      const t='Anthropic usage unavailable — '+(why||'no data yet.');
+      ['nav-usage-5h','nav-usage-7d','tools-usage-5h','tools-usage-7d'].forEach(p=>{
+        const pct=document.getElementById(p+'-pct'); if(pct)pct.textContent='—';
+        const fill=document.getElementById(p+'-fill'); if(fill)fill.style.width='0%';
+      });
+      ['nav-usage-5h-wrap','nav-usage-7d-wrap','tools-usage-5h-wrap','tools-usage-7d-wrap']
+        .forEach(id=>{const el=document.getElementById(id); if(el)el.title=t});
+    }
   };
   try{
     const resp=await fetch(BASE+'/api/usage/limits');
     // Only blank the bars if we have never had data. Once they are showing,
     // a transient failure should leave the last known values on screen.
-    if(!resp.ok){if(!wrap.classList.contains('has-data'))setHasData(false);_scheduleUsageRetry();return}
+    if(!resp.ok){
+      let err='', g=null;
+      try{ const j=await resp.json(); err=j.error||''; g=j.grant||null; }catch(e){}
+      let why=_usageErrText(err);
+      if(g && !g.have_credential && g.retry_in_s>0)
+        why += ' The dashboard is re-granting it by itself — next attempt in '+Math.ceil(g.retry_in_s/60)+' min.';
+      if(!wrap.classList.contains('has-data'))setHasData(false,why);
+      _scheduleUsageRetry();return;
+    }
     const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false);_scheduleUsageRetry();return}
+    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false,_usageErrText(data&&data.error));_scheduleUsageRetry();return}
     setHasData(true);
+    wrap.classList.toggle('stale',!!data.stale);
     if(data.stale)_scheduleUsageRetry();
     const fh=data.five_hour||{};
     const sd=data.seven_day||{};
@@ -14545,12 +16291,22 @@ async function refreshUsageLimits(){
     _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
     _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
     _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
-    const pct5h=document.getElementById('tools-usage-5h-pct');
-    const pct7d=document.getElementById('tools-usage-7d-pct');
-    if(pct5h)pct5h.textContent=fhPct+'%';
-    if(pct7d)pct7d.textContent=sdPct+'%';
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at);
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at);
+    [['nav-usage-5h-pct',fhPct],['nav-usage-7d-pct',sdPct],
+     ['tools-usage-5h-pct',fhPct],['tools-usage-7d-pct',sdPct]].forEach(([id,v])=>{
+      const el=document.getElementById(id); if(el)el.textContent=v+'%';
+    });
+    const staleNote=data.stale?' · last known value (upstream unreachable)':'';
+    // Where the number came from, and whether spend has moved to overage credits
+    // (the 7-day window being spent is exactly when that starts to cost money).
+    const srcNote=data.source==='ratelimit_headers'
+      ? ' · read from the rate-limit headers on a 1-token probe (the account usage API needs a credential this host does not have)'
+      : '';
+    const ovNote=(data.overage&&data.overage.in_use)
+      ? ' · ⚠ plan window spent — running on overage credits'+
+        (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
+      : '';
+    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+staleNote+srcNote+ovNote;
+    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+staleNote+srcNote+ovNote;
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
     if(fhWrap)fhWrap.title=fhTitle;
@@ -14990,7 +16746,8 @@ async function interruptSession(name){
   setTimeout(()=>refreshOne(name),2000);
 }
 function toggleInterruptButtons(name,show){
-  ['interrupt-chat-'+name,'interrupt-raw-'+name].forEach(id=>{
+  // One Stop button, in the header line — the per-tab copies are gone.
+  ['interrupt-hdr-'+name].forEach(id=>{
     const btn=document.getElementById(id);
     if(btn){if(show)btn.classList.add('visible');else btn.classList.remove('visible')}
   });
@@ -15531,7 +17288,7 @@ async function refreshUploadedFiles(name){
     container.appendChild(label);
     files.forEach(function(f){
       const row=document.createElement('div');
-      row.className='uploaded-file';
+      row.className='uploaded-file'+(f.pending?' pending':'');
       row.title=f.path||'';
 
       const icon=document.createElement('span');
@@ -15543,6 +17300,15 @@ async function refreshUploadedFiles(name){
       nameSpan.className='uploaded-file-name';
       nameSpan.textContent=f.name;
       row.appendChild(nameSpan);
+
+      if(f.pending){
+        // Not yet named in any message — the next send will announce its path.
+        const badge=document.createElement('span');
+        badge.className='uploaded-file-badge';
+        badge.textContent='attaching';
+        badge.title='Will be attached to your next message';
+        row.appendChild(badge);
+      }
 
       const sizeSpan=document.createElement('span');
       sizeSpan.className='uploaded-file-size';
@@ -15951,11 +17717,16 @@ function renderProfileDropdown(s){
   const restartTitle = _profilePending[s.name]
     ? 'Restart Claude to apply the new profile'
     : 'Restart Claude with this profile';
-  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)">
+  // Lives inside the "More" menu, not on the tab bar: it is a set-once-per-session
+  // control, and on the tab bar it cost a permanent slot next to Terminal.
+  // onclick stops the bubble because the menu closes on any outside click and
+  // was swallowing the <select>.
+  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)" onclick="event.stopPropagation()">
     <span class="profile-label">Profile</span>
     <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
     <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
-  </div>`;
+  </div>
+  <div class="tab-more-model-sep"></div>`;
 }
 
 async function onProfileChange(sessionName, profileId){
@@ -16152,28 +17923,50 @@ async function refreshBrowserAuthBadge(){
   _browserAuth = d;
   el.style.display = 'inline-flex';
   el.classList.remove('ok','bad','active','unknown');
+  // An agent's own Chrome burning CPU has to light this up too — that load was
+  // invisible here, which is the whole reason it ran for a day unnoticed.
+  const hotUnmanaged = (d.unmanaged||[]).filter(b=>(b.cpu_pct||0) >= (d.busy_cpu_pct||25));
   let title;
   if(!d.any_logged_in){
     // red — nothing signed in
     el.classList.add('bad');
     title = 'No signed-in browser session. Click to open one and sign in to claude.ai.';
   }else{
-    const who = d.sessions.find(s=>s.logged_in && s.active) ||
+    const who = d.sessions.find(s=>s.logged_in && s.working) ||
+                d.sessions.find(s=>s.logged_in && s.active) ||
                 d.sessions.find(s=>s.can_authorize) ||
                 d.sessions.find(s=>s.logged_in) || {};
     const whoTxt = who.email ? ' ('+who.email+')' : '';
-    if(d.active){
+    if(d.working){
       // blinking green — someone/something is using it right now
       el.classList.add('ok','active');
       title = 'Browser in use right now'+whoTxt+' — '+(d.active_what||'activity detected')+'. Click to watch.';
     }else{
-      // steady green — signed in and idle
+      // steady green — signed in and idle. Sessions may still be attached over
+      // CDP (that holds auto-park off), but nothing is driving it, and a badge
+      // that blinks while nothing happens is a badge nobody reads.
       el.classList.add('ok');
-      title = 'Browser signed in'+whoTxt+' and idle. Click to manage.';
+      const held = (d.sessions.find(s=>s.logged_in && s.held_by) || {}).held_by || '';
+      title = 'Browser signed in'+whoTxt+' and idle. '
+            + (held ? 'Held open by '+held+' (attached, not driving). ' : '')
+            + 'Click to manage.';
     }
     if(!d.any_can_authorize){
       title += ' Note: no signed-in account has a Max/Pro plan.';
     }
+    // Stayed green off the last known-good check because claude.ai did not
+    // answer this round (rotating-proxy exit IP change). Say so rather than
+    // implying the state was just verified.
+    if(d.sessions.some(s=>s.logged_in && s.unconfirmed)){
+      title += ' (Last check did not reach claude.ai — showing the last known state.)';
+    }
+  }
+  if(hotUnmanaged.length){
+    el.classList.remove('bad');
+    el.classList.add('ok','active');
+    title += ' ⚠ '+hotUnmanaged.length+' browser'+(hotUnmanaged.length>1?'s':'')+
+      ' outside the dashboard using CPU ('+hotUnmanaged.map(b=>b.cpu_pct.toFixed(0)+'%').join(', ')+
+      ') — click to see them under Browser.';
   }
   el.title = title;
 }
@@ -16242,7 +18035,13 @@ function renderBrowserTab(data){
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
-      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
+      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'')+
+      (s.running? ' <button class="btn btn-ghost" onclick="freezeBrowser(\''+id+'\')"'+
+        ' title="Suspend this browser\'s background tabs so they stop rendering. Reversible —'+
+        ' a tab resumes when it is shown or navigated, and nothing is closed.">Freeze</button>':'')+
+      (s.running? ' <button class="btn btn-ghost" onclick="parkBrowser(\''+id+'\')"'+
+        ' title="Close this browser\'s tabs to stop it burning CPU. The profile — cookies, the'+
+        ' claude.ai session, extension state — is untouched, so nothing signs in again.">Park</button>':'');
     const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
     const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
     const preview = s.running
@@ -16260,6 +18059,41 @@ function renderBrowserTab(data){
     else if(a.logged_in) badges += '<span class="bs-badge warn">signed in'+(a.email?' · '+esc(a.email):'')+' · no Max/Pro</span>';
     else if(a.running) badges += '<span class="bs-badge bad">not signed in to claude.ai</span>';
     if(a.use_for_login) badges += '<span class="bs-badge login">login browser</span>';
+    // What it is costing right now, and whether the idle auto-park is armed.
+    if(a.running && typeof a.cpu_pct === 'number' && a.cpu_pct >= 0){
+      badges += '<span class="bs-badge '+(a.rendering?'warn':'')+'" title="CPU used by this '+
+        'browser\'s whole process tree, as a percentage of one core.">'+a.cpu_pct.toFixed(0)+'% CPU</span>';
+    }
+    // Who is driving it over CDP. Without this an agent's browser work looked
+    // like idleness, which is how the auto-park closed a live agent's tabs.
+    if(a.driven_by){
+      badges += '<span class="bs-badge login" title="Issuing CDP commands right now, '+
+        'so the guards leave this browser alone.">'+
+        '⇄ '+esc(a.driven_by)+'</span>';
+    }else if(a.held_by){
+      // Attached but spending nothing: an idle Claude session's MCP browser
+      // server keeps its socket open for as long as the session lives. Worth
+      // showing — it is why auto-park stays off — but it is not "in use".
+      badges += '<span class="bs-badge" title="These sessions have a CDP connection open '+
+        'but are not driving the browser. The connection alone keeps auto-park off, so if '+
+        'they are finished with it, exit them (or park this browser by hand).">'+
+        '⇄ '+esc(a.held_by)+' · idle</span>';
+    }
+    if((a.frozen_tabs||[]).length){
+      badges += '<span class="bs-badge" title="Background tabs suspended to stop them '+
+        'rendering. They resume when shown or navigated — nothing was lost:\n· '+
+        esc(a.frozen_tabs.join('\n· '))+'">❄ '+a.frozen_tabs.length+' frozen</span>';
+    }
+    if(a.running){
+      badges += '<span class="bs-badge'+(a.auto_park?'':' warn')+'" style="cursor:pointer" '+
+        'onclick="toggleAutoPark(\''+id+'\','+(a.auto_park?'false':'true')+')" '+
+        'title="When armed, a browser left idle with tabs still burning CPU gets parked '+
+        'automatically. Turn it off to keep long-running background pages alive.">'+
+        (a.auto_park?'🔓 auto-park on':'🔒 auto-park off')+'</span>';
+    }
+    if(a.parked_ago!=null && !a.rendering){
+      badges += '<span class="bs-badge">parked '+(a.parked_ago<90?a.parked_ago+'s':Math.round(a.parked_ago/60)+'m')+' ago</span>';
+    }
     // What this browser looks like from outside: its own exit IP + what it has
     // spent of the (per-GB billed) residential quota.
     const px = ((_bsProxy&&_bsProxy.browsers)||[]).find(x=>x.id===s.id) || null;
@@ -16313,7 +18147,97 @@ function renderBrowserTab(data){
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
+      renderUnmanagedBrowsers()+
     '</div>';
+}
+
+// Chromes running on this box that are NOT in our session list — the ones an
+// agent starts for itself through its browser tool. They cost the same CPU and
+// RAM as ours, so they belong on this screen: one sat at 240% of a core for a
+// day with nothing anywhere to explain the load.
+function renderUnmanagedBrowsers(){
+  const rows = ((_browserAuth&&_browserAuth.unmanaged)||[]);
+  if(!rows.length) return '';
+  const busyAt = (_browserAuth&&_browserAuth.busy_cpu_pct)||25;
+  const cards = rows.map(b=>{
+    // Identify by CDP port when it has one, else by pid — a headless Playwright
+    // Chrome talks over a pipe and has no port at all.
+    const ident = b.cdp_port ? String(b.cdp_port) : 'pid:'+b.pid;
+    const hot = (b.cpu_pct||0) >= busyAt;
+    const driving = (b.clients||[]).map(c=>c.session||c.comm).filter(Boolean);
+    let badges = '<span class="bs-badge '+(hot?'warn':'')+'" title="CPU of this browser\'s '+
+      'whole process tree, as a percentage of one core.">'+(b.cpu_pct||0).toFixed(0)+'% CPU</span>';
+    if(b.headless) badges += '<span class="bs-badge">headless</span>';
+    if(b.resource_limited){
+      badges += '<span class="bs-badge login" title="This browser shares a kernel CPU quota '+
+        'with every other unmanaged browser, so they cannot saturate the host.">CPU capped</span>';
+    }
+    if(b.controllable === false){
+      badges += '<span class="bs-badge bad" title="It runs as '+esc(b.proc_user||'another user')+
+        ', so this dashboard cannot renice, park or kill it — the guards do not apply. '+
+        'From a shell: sudo kill '+b.pid+'">runs as '+esc(b.proc_user||'?')+' · not controllable</span>';
+    }
+    if(!b.cdp_port){
+      badges += '<span class="bs-badge warn" title="It talks to its driver over a pipe, not a '+
+        'port, so its tabs cannot be reached from here — it can only be reniced or killed.">no CDP port</span>';
+    }else{
+      badges += driving.length
+        ? '<span class="bs-badge login" title="Holding a CDP connection open to it right now.">⇄ '+esc(driving.join(', '))+'</span>'
+        : '<span class="bs-badge" title="Nothing is attached over CDP, so nothing is using it right now.">no client attached</span>';
+      badges += '<span class="bs-badge">'+(b.tabs||[]).length+' tab'+((b.tabs||[]).length===1?'':'s')+'</span>';
+    }
+    if((b.frozen_tabs||[]).length) badges += '<span class="bs-badge">❄ '+b.frozen_tabs.length+' frozen</span>';
+    if(b.parked_ago!=null) badges += '<span class="bs-badge">parked '+(b.parked_ago<90?b.parked_ago+'s':Math.round(b.parked_ago/60)+'m')+' ago</span>';
+    const tabList = (b.tabs||[]).slice(0,6).map(t=>
+      '<div class="bs-tab" title="'+esc(t.url)+'">'+esc(t.title||t.url||'(blank)')+
+      ' <span class="u">'+esc((t.url||'').replace(/^https?:\/\//,'').slice(0,42))+'</span></div>').join('');
+    const more = (b.tabs||[]).length>6 ? '<div class="bs-tab u">+'+((b.tabs||[]).length-6)+' more…</div>' : '';
+    const ctl = b.cdp_port
+      ? '<button class="btn btn-ghost" onclick="unmanagedBrowserAction(\''+ident+'\',\'freeze\')" title="Suspend its background tabs so they stop rendering. Reversible — they resume when shown or navigated.">Freeze</button> '+
+        '<button class="btn btn-ghost" onclick="unmanagedBrowserAction(\''+ident+'\',\'park\')" title="Close its tabs. The profile stays on disk, so nothing signs in again.">Park</button> '
+      : '';
+    return '<div class="bs-card unmanaged">'+
+      '<div class="bs-head"><span class="bs-dot on"></span><span class="bs-name">Agent browser</span>'+
+        '<span class="bs-meta">'+(b.cdp_port?'CDP '+b.cdp_port+' · ':'')+'pid '+b.pid+' · up '+_fmtAge(b.started)+'</span></div>'+
+      '<div class="bs-sub">Started by '+(b.owner_session? esc(b.owner_session) : 'a process outside the dashboard')+'.</div>'+
+      '<div class="bs-badges">'+badges+'</div>'+
+      (tabList? '<div class="bs-tabs">'+tabList+more+'</div>':'')+
+      '<div class="bs-path">'+esc(b.profile||'')+'</div>'+
+      '<div class="bs-actions">'+ctl+
+        '<button class="btn btn-danger" onclick="unmanagedBrowserAction(\''+ident+'\',\'kill\')" title="End the browser and its dedicated runner tree. Use when the session that started it is gone.">Stop workload</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+  const guard = (_browserAuth&&_browserAuth.resource_guard)||{};
+  const cap = guard.active
+    ? ' Together they are kernel-capped at '+Number(guard.cpu_cores||0).toFixed(1)+' CPU cores.'
+    : ' Resource cap is not active; check the dashboard logs.';
+  return '<div class="bs-section-title">Also running on this server ('+rows.length+')</div>'+
+    '<div class="pf-banner">Chrome instances the dashboard did not start — normally an agent\'s '+
+    'own browser tool. They share this server\'s CPU, so the same guards apply: anything over '+
+    busyAt+'% of a core with no client attached gets its background tabs frozen, then parked.'+cap+'</div>'+
+    '<div class="bs-grid">'+cards+'</div>';
+}
+
+function _fmtAge(ts){
+  if(!ts) return '?';
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if(s < 3600) return Math.round(s/60)+'m';
+  if(s < 86400) return Math.round(s/3600)+'h';
+  return Math.floor(s/86400)+'d '+Math.round((s%86400)/3600)+'h';
+}
+
+async function unmanagedBrowserAction(ident, action){
+  if(action==='kill' && !confirm('Kill the browser '+ident+'?\n\nIf an agent is still using it, its browser tool will error out. The profile on disk is untouched.')) return;
+  try{
+    const r = await fetch(BASE+'/api/browser/unmanaged/'+encodeURIComponent(ident)+'/'+action,{method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||action+' failed');
+    showToast(action==='freeze' ? 'Froze '+(d.frozen||0)+' tab(s) on '+ident
+            : action==='park'   ? 'Closed '+(d.closed||0)+' tab(s) on '+ident
+            : 'Stopped the browser workload '+ident);
+  }catch(e){ showToast(action+' failed: '+(e.message||e)); }
+  refreshBrowserAuthBadge().then(()=>{ if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{}); });
 }
 
 function _fmtBytes(n){
@@ -16455,6 +18379,43 @@ function openBrowserSession(id){
 function openBrowserDirect(id){
   const s=_bsFind(id);
   if(s&&s.external_url) window.open(s.external_url, '_blank');
+}
+
+// Park = close the tabs, keep the browser (and its claude.ai session) alive.
+// The profile lives on disk, so this costs nothing but the open pages.
+async function parkBrowser(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/park',{method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'park failed');
+    showToast('Parked — closed '+(d.closed||0)+' tab(s). Still signed in.');
+  }catch(e){ showToast('Park failed: '+(e.message||e)); }
+  refreshBrowserAuthBadge();
+  loadBrowserTab();
+}
+
+// Freeze = stop the tabs rendering but keep them. Park's gentler sibling.
+async function freezeBrowser(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/freeze',{method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'freeze failed');
+    showToast(d.frozen? 'Froze '+d.frozen+' background tab(s) — they resume when shown.'
+                      : 'Nothing to freeze (only the visible tab is loaded).');
+  }catch(e){ showToast('Freeze failed: '+(e.message||e)); }
+  refreshBrowserAuthBadge().then(()=>{ if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{}); });
+}
+
+async function toggleAutoPark(id, enabled){
+  try{
+    await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/autopark',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: enabled})});
+    showToast(enabled? 'Auto-park armed for this browser.'
+                     : 'Auto-park off — idle tabs will be left running.');
+  }catch(e){ showToast('Could not change auto-park: '+(e.message||e)); }
+  refreshBrowserAuthBadge();
+  loadBrowserTab();
 }
 
 function startEditBrowser(id){ _bsEditId=id; renderBrowserTab(_bsData||{}); }
@@ -17013,7 +18974,7 @@ async function loadUsersAdmin(){
   const users = data.users || [];
   const rows = users.map(u => {
     const roleTag = u.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
-    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')) : 'never';
+    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')+(u.last_login_via==='google'?' · Google':'')) : 'never';
     const isMe = (_currentUser && _currentUser.id===u.id);
     const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase">you</span>' : '';
     const grpCell = u.role==='admin' ? '<span class="muted">—</span>' :
@@ -17024,10 +18985,13 @@ async function loadUsersAdmin(){
     if(!(u.id==='admin'||isMe)) acts += `<button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
       <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote':'Promote'}</button>
       <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>`;
+    const gCell = `<span style="font-size:.72rem">${u.google_email?esc(u.google_email):'<span class="muted">—</span>'}</span>
+      <button style="margin-left:6px" onclick="setUserGoogle('${esc(u.id)}','${esc(u.google_email||'')}')">${u.google_email?'Edit':'Link'}</button>`;
     return `<tr>
       <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
       <td>${roleTag}</td>
       <td>${grpCell}</td>
+      <td>${gCell}</td>
       <td>${u.session_count||0}</td>
       <td style="font-size:.72rem">${ll}</td>
       <td><div class="users-actions">${acts}</div></td>
@@ -17049,12 +19013,21 @@ async function loadUsersAdmin(){
       <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
     </div>
     <table class="users-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="6" class="history-empty">No users yet.</td></tr>'}</tbody>
+      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Google sign-in</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="history-empty">No users yet.</td></tr>'}</tbody>
     </table>
   </div>`;
 }
 
+async function setUserGoogle(userId, current){
+  const v = prompt('Google address that signs in as this user (blank to unlink):', current||'');
+  if(v===null) return;
+  const r = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId),
+    {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({google_email:v.trim()})});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ alert(d.error||'Failed'); return; }
+  loadUsersAdmin();
+}
 async function setUserGroup(userId, group){
   try{ await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group})}); }
   catch(e){ alert('Failed to set group'); }
@@ -18147,6 +20120,7 @@ HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
+_GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
 # ===========================================================================

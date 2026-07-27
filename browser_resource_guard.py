@@ -108,6 +108,18 @@ def _executable_name(command: str) -> str:
     return Path(first).name.lower()
 
 
+def is_browser_command(command: str) -> bool:
+    """True when ``command`` runs a browser binary itself, not via a wrapper.
+
+    A launcher such as ``sudo -u someone google-chrome --user-data-dir=…`` carries
+    every browser flag, so anything matching on flags alone will pick it up. This
+    guard only ever acts on a real browser binary, so callers that choose which
+    pid to report have to agree with it — reporting the wrapper's pid instead is
+    what made "stop this browser" fail with "browser process is gone or changed".
+    """
+    return _executable_name(command) in _BROWSER_EXECUTABLES
+
+
 def _is_browser_root(row: ProcRecord) -> bool:
     name = _executable_name(row.command)
     has_control_flag = (
@@ -422,8 +434,14 @@ def stop_browser_workload(
     """Stop a freshly revalidated unmanaged browser and its dedicated runner."""
     snapshot = snapshot_processes()
     browser = snapshot.get(int(browser_pid))
-    if browser is None or not _is_browser_root(browser):
+    if browser is None:
         return {"ok": False, "error": "browser process is gone or changed"}
+    if not _is_browser_root(browser):
+        # Say which process was refused: passing a launcher wrapper's pid here
+        # used to report the browser as "gone" while it kept running.
+        return {"ok": False,
+                "error": f"pid {browser.pid} is not a browser process "
+                         f"({_executable_name(browser.command) or 'unknown'})"}
     if expected_start_ticks and browser.start_ticks != int(expected_start_ticks):
         return {"ok": False, "error": "browser PID was recycled; refresh and try again"}
     if expected_started:
