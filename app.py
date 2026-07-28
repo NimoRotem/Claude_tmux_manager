@@ -207,11 +207,13 @@ async def _model_refresh_loop():
 
 
 def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) -> str:
-    """Build a Codex launch command using the selected profile configuration."""
+    """Build a Codex launch command using the standard dashboard configuration."""
     out = cmd.strip() or NEW_SESSION_CMD
     if resume:
         out = "codex resume --last"
-        if "--dangerously-bypass-approvals-and-sandbox" in cmd:
+        if "--yolo" in cmd:
+            out += " --yolo"
+        elif "--dangerously-bypass-approvals-and-sandbox" in cmd:
             out += " --dangerously-bypass-approvals-and-sandbox"
         elif "--sandbox" in cmd or " -s " in f" {cmd} ":
             out += " --sandbox workspace-write --ask-for-approval never"
@@ -221,11 +223,11 @@ def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) ->
 
 
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
-    """Use a sandboxed launch for team members; admins keep the configured command."""
+    """Use unattended full-access launch for members; admins keep their command."""
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
-        if TEAM_MODE and owner and not _is_admin(owner):
-            return "codex --sandbox workspace-write --ask-for-approval never"
+        if owner and not _is_admin(owner):
+            return "codex --yolo"
     except Exception:
         pass
     return NEW_SESSION_CMD
@@ -267,7 +269,7 @@ def _model_flag_for_relaunch(session_name: str) -> str:
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, shared Codex authentication, per-user context, OAuth connections,
-# and a soft sandbox (cross-server actions are blocked and logged). Gated behind
+# and unattended full-access Codex sessions. Gated behind
 # env so the shared codebase is unchanged for the personal
 # single-admin dashboards (instance-3, builder) that never set these vars.
 TEAM_MODE = os.environ.get("TMUX_DASH_TEAM_MODE", "") == "1"
@@ -275,15 +277,24 @@ BRAND_NAME = os.environ.get("TMUX_DASH_BRAND", "tmux")
 ADMIN_APPROVAL_EMAIL = os.environ.get("TMUX_DASH_ADMIN_EMAIL", "nimrod.rotem@gmail.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("TMUX_DASH_MAIL_FROM", f"{BRAND_NAME} <dev@grabo.cc>")
-PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dianaotech.com
-PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
+PUBLIC_BASE_URL = os.environ.get(
+    "TMUX_DASH_PUBLIC_URL",
+    "",
+).rstrip("/")  # e.g. https://build.grabo.tools
+PUB_URL = (
+    PUBLIC_BASE_URL or f"http://127.0.0.1:{PORT}"
+) + ROOT_PATH  # external base including any configured root path
+HOST_MACHINE = os.environ.get(
+    "TMUX_DASH_HOSTNAME",
+    os.uname().nodename,
+).strip() or os.uname().nodename
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
 TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", _CODEX_DEFAULT_MODEL)
 TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
-GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "dianaotech.com")
+GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "grabo.tech")
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -294,7 +305,34 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 # sessions, and settings survive the runtime migration.
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
+GOOGLE_MCP_PYTHON = MESSAGES_DIR / "mcp" / "venv" / "bin" / "python"
+GOOGLE_MCP_SCRIPT = Path(__file__).resolve().with_name(
+    "google_workspace_mcp.py"
+)
+GOOGLE_DWD_SERVICE_ACCOUNT_FILE = Path(
+    os.environ.get(
+        "GOOGLE_WORKSPACE_DWD_SERVICE_ACCOUNT_FILE",
+        str(Path.home() / ".gworkspace-admin" / "sa-key.json"),
+    )
+).expanduser()
 _stored_openai_key: str = ""
+
+
+def _google_mcp_command() -> str:
+    """Return the configured command or this checkout's deployed MCP runtime."""
+    configured = os.environ.get("GOOGLE_MCP_COMMAND", "").strip()
+    if configured:
+        return configured
+    if (
+        GOOGLE_MCP_PYTHON.is_file()
+        and os.access(GOOGLE_MCP_PYTHON, os.X_OK)
+        and GOOGLE_MCP_SCRIPT.is_file()
+    ):
+        return shlex.join((
+            str(GOOGLE_MCP_PYTHON),
+            str(GOOGLE_MCP_SCRIPT),
+        ))
+    return ""
 
 
 def _load_openai_key() -> str:
@@ -396,57 +434,6 @@ def _session_real_auth_mode(session_name: str) -> str:
     except Exception:
         logger.debug("Failed to resolve auth mode for '%s'", session_name, exc_info=True)
     return _session_auth_mode.get(session_name, "unconfigured")
-
-# Away mode state per session
-_away_mode_state: dict[str, dict] = {}
-# Per-session structure when active:
-# {
-#   "enabled": bool,
-#   "phase": int (1-5),
-#   "phase_name": str,
-#   "step": int,
-#   "step_name": str,
-#   "started_at": float,
-#   "log": [{"ts": float, "phase": int, "step": int, "action": str}],
-#   "report": str,
-#   "task": asyncio.Task | None,
-# }
-
-# Go Nuts mode state per session (same structure as away mode)
-_go_nuts_state: dict[str, dict] = {}
-
-# Flag to prevent CancelledError handlers from wiping persisted state during shutdown.
-# When True, worker cancel handlers skip setting enabled=False and re-saving to disk.
-_shutting_down = False
-
-# --- Persistent autonomous mode state ---
-# Survives restarts: stores which sessions had away/go-nuts mode enabled.
-AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
-
-def _save_autonomous_state():
-    """Persist which sessions have away/go-nuts mode enabled to disk."""
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        state = {}
-        for name, s in _away_mode_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["away_mode"] = True
-        for name, s in _go_nuts_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["go_nuts_mode"] = True
-        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
-    except Exception:
-        logger.debug("Failed to save autonomous mode state", exc_info=True)
-
-def _load_autonomous_state() -> dict[str, dict]:
-    """Load persisted autonomous mode state from disk."""
-    try:
-        if AUTONOMOUS_STATE_FILE.exists():
-            return json.loads(AUTONOMOUS_STATE_FILE.read_text())
-    except Exception:
-        logger.debug("Failed to load autonomous mode state", exc_info=True)
-    return {}
-
 
 # --- Simple Watchdog ---
 # Default-ON, lightweight watchdog that auto-replies "continue" when Codex is
@@ -582,15 +569,6 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         log_fn(state, msg)
 
     try:
-        # Re-export the active profile's CODEX_HOME before launching, in
-        # case the shell was respawned (env vars don't survive a fresh bash).
-        try:
-            pid = _get_session_profile_id(session_name)
-            if pid != DEFAULT_PROFILE_ID:
-                await asyncio.to_thread(_send_profile_export, session_name, pid)
-                await asyncio.sleep(0.2)
-        except Exception:
-            logger.debug("Failed to re-export profile env on auto-restart", exc_info=True)
         # Re-apply clean member auth before relaunch so an accidental /login (which
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
@@ -609,6 +587,14 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
             )
         except Exception:
             logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
+        # A crashed pane may have stale shell state from before account
+        # isolation was provisioned. Re-export the owner's CODEX_HOME on every
+        # recovery before constructing the launch command.
+        await asyncio.to_thread(
+            _send_profile_export,
+            session_name,
+            DEFAULT_PROFILE_ID,
+        )
         # Codex stores local threads under CODEX_HOME. Resume the newest thread
         # for this working directory instead of opening the interactive picker.
         launch_base = _session_launch_base(session_name)
@@ -672,6 +658,22 @@ async def lifespan(_app: FastAPI):
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
+    try:
+        migrated_prompts = await asyncio.to_thread(
+            _backfill_prompt_audit,
+            _load_users(),
+        )
+        if migrated_prompts:
+            logger.info(
+                "Prompt audit: migrated %d historical user prompts",
+                migrated_prompts,
+            )
+    except Exception:
+        logger.exception("Prompt audit history migration failed")
+    try:
+        await asyncio.to_thread(_ensure_all_user_browser_sessions)
+    except Exception:
+        logger.exception("Account browser provisioning failed")
     if TEAM_MODE:
         try:
             _setup_shared_git_config()
@@ -688,10 +690,6 @@ async def lifespan(_app: FastAPI):
     task = asyncio.create_task(_auto_responder_loop())
     _background_tasks.append(task)
     logger.info("Auto-responder background task started")
-    watchdog_task = asyncio.create_task(_watchdog_loop())
-    _background_tasks.append(watchdog_task)
-    logger.info("Autonomous mode watchdog started")
-
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
@@ -702,41 +700,6 @@ async def lifespan(_app: FastAPI):
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
     logger.info("Tmp watchdog started")
-
-    # Restore persistent autonomous mode state from disk
-    saved = _load_autonomous_state()
-    if saved:
-        session_names = {s["name"] for s in sessions}
-        for name, modes in saved.items():
-            if name not in session_names:
-                logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
-                continue
-            if modes.get("away_mode"):
-                logger.info("Restoring Away Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _away_mode_state[name] = state
-                _away_log(state, "Away mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "away"))
-                state["task"] = t
-            elif modes.get("go_nuts_mode"):
-                logger.info("Restoring Go Nuts Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous Build (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _go_nuts_state[name] = state
-                _go_nuts_log(state, "Go Nuts mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
-                state["task"] = t
-
-    # Clean up orphaned entries (sessions that no longer exist were skipped above
-    # but file still has their old state). Re-save now based on in-memory dicts only.
-    _save_autonomous_state()
 
     crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
     _background_tasks.append(crash_recovery_task)
@@ -749,25 +712,10 @@ async def lifespan(_app: FastAPI):
     yield  # Application is running
 
     # --- Shutdown ---
-    global _shutting_down
-    _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
     logger.info("Codex Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
-    # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
-    _save_autonomous_state()
-    logger.info("Autonomous mode state saved to disk for restore on next startup")
     for t in _background_tasks:
         if not t.done():
             t.cancel()
-    # Cancel any running away-mode workers
-    for name, state in _away_mode_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled away-mode worker for '%s'", name)
-    # Cancel any running go-nuts-mode workers
-    for name, state in _go_nuts_state.items():
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-            logger.info("Cancelled go-nuts-mode worker for '%s'", name)
     try:
         _cancel_codex_chatgpt_login()
     except Exception:
@@ -797,6 +745,8 @@ AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 # same domain (e.g. knowva.ai/tmux + /codex) collide: both set "tmux_auth" at
 # Path=/, so logging into one overwrites/invalidates the other's cookie.
 AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
+_USER_ONLINE_WINDOW_SECONDS = 120
+_user_presence: dict[str, float] = {}
 
 
 def _make_token(user_id: str) -> str:
@@ -902,6 +852,12 @@ def _user_from_token(token: str | None) -> dict | None:
     return _find_user_by_id(user_id)
 
 
+def _touch_user_presence(user: dict | None) -> None:
+    """Record authenticated dashboard activity for lightweight presence."""
+    if user and user.get("id"):
+        _user_presence[str(user["id"])] = time.time()
+
+
 def _current_user(request: Request) -> dict | None:
     """Resolve the user for an HTTP request via the tmux_auth cookie.
 
@@ -912,17 +868,42 @@ def _current_user(request: Request) -> dict | None:
     if not AUTH_PASS:
         admin = _find_user_by_id("admin")
         if admin:
+            _touch_user_presence(admin)
             return admin
-        return {
+        synthetic = {
             "id": "admin", "username": AUTH_USER or "admin",
             "role": "admin", "_synthetic": True,
         }
+        _touch_user_presence(synthetic)
+        return synthetic
     # Stash on request.state to avoid re-loading users.json per request.
+    if getattr(request.state, "_current_user_resolved", False):
+        return getattr(request.state, "_current_user", None) or None
     cached = getattr(request.state, "_current_user", None)
-    if cached is not None:
-        return cached or None  # explicit None vs sentinel
-    user = _user_from_token(request.cookies.get(AUTH_COOKIE))
+    base_user = getattr(request.state, "_authenticated_user", None)
+    if base_user is None:
+        base_user = (cached or None) if cached is not None else _user_from_token(
+            request.cookies.get(AUTH_COOKIE)
+        )
+    user = base_user
+    impersonation_token = request.headers.get("X-Tmux-Impersonate", "").strip()
+    if impersonation_token:
+        target = None
+        if _is_admin(base_user):
+            target = _user_from_impersonation_session(
+                impersonation_token,
+                base_user,
+            )
+        if target:
+            request.state._impersonator = base_user
+            user = target
+        else:
+            request.state._invalid_impersonation = True
     request.state._current_user = user or {}
+    request.state._current_user_resolved = True
+    if user:
+        _touch_user_presence(user)
+        request.state._presence_touched = True
     return user
 
 
@@ -961,10 +942,6 @@ def _user_uploads_dir(user: dict | None) -> Path:
     return _user_data_dir(user) / "uploads"
 
 
-def _user_autonomous_file(user: dict | None) -> Path:
-    return _user_data_dir(user) / "autonomous-modes.json"
-
-
 def _user_codex_config_dir(user: dict | None) -> Path:
     """Where Codex reads AGENTS.md / MEMORY.md / config.toml / skills/
     / projects/ / memory/ for this user. Admin uses ~/.codex (the global root,
@@ -973,6 +950,247 @@ def _user_codex_config_dir(user: dict | None) -> Path:
     if not user or user.get("id") == "admin":
         return Path.home() / ".codex"
     return Path.home() / f".codex-user-{user['id']}"
+
+
+def _member_session_project_dir(user: dict, session_name: str) -> Path:
+    """Return and create the only writable project root for a member pane."""
+    username = str(user.get("username") or user.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9.@_-]{1,128}", username):
+        username = str(user.get("id") or "member")
+    safe_session = str(session_name or "")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", safe_session):
+        safe_session = "session-" + hashlib.sha256(
+            safe_session.encode("utf-8")
+        ).hexdigest()[:16]
+    project_dir = PROJECTS_ROOT / username / safe_session
+    project_dir.mkdir(parents=True, exist_ok=True)
+    return project_dir
+
+
+def _rewrite_top_level_toml(existing: str, values: dict[str, str | None]) -> str:
+    """Replace or remove selected top-level keys without touching TOML tables."""
+    out: list[str] = []
+    written: set[str] = set()
+    in_section = False
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if not in_section:
+                for key, value in values.items():
+                    if value is not None and key not in written:
+                        out.append(f"{key} = {value}")
+                        written.add(key)
+            in_section = True
+            out.append(line)
+            continue
+        if not in_section and "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+            if key in values:
+                if values[key] is not None and key not in written:
+                    out.append(f"{key} = {values[key]}")
+                    written.add(key)
+                continue
+        out.append(line)
+    if not in_section:
+        if out and out[-1].strip():
+            out.append("")
+        for key, value in values.items():
+            if value is not None and key not in written:
+                out.append(f"{key} = {value}")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _strip_toml_sections(existing: str, prefixes: tuple[str, ...]) -> str:
+    """Remove complete TOML tables whose dotted names match a prefix."""
+    out: list[str] = []
+    skipping = False
+    for line in existing.splitlines():
+        match = re.match(r"^\s*\[([^\[\]]+)\]\s*$", line)
+        if match:
+            section = match.group(1).strip()
+            skipping = any(
+                section == prefix or section.startswith(prefix + ".")
+                for prefix in prefixes
+            )
+        if not skipping:
+            out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _set_toml_table_bool(existing: str, section: str, key: str, value: bool) -> str:
+    """Upsert one boolean in an existing or new TOML table."""
+    lines = existing.splitlines()
+    header = f"[{section}]"
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip() == header),
+        None,
+    )
+    rendered = f"{key} = {'true' if value else 'false'}"
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend((header, rendered))
+        return "\n".join(lines).rstrip() + "\n"
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].strip().startswith("[")
+            and lines[index].strip().endswith("]")
+        ),
+        len(lines),
+    )
+    matches = [
+        index
+        for index in range(start + 1, end)
+        if re.match(rf"^\s*{re.escape(key)}\s*=", lines[index])
+    ]
+    if matches:
+        lines[matches[0]] = rendered
+        for duplicate in reversed(matches[1:]):
+            del lines[duplicate]
+    else:
+        lines.insert(start + 1, rendered)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# The GRABO Document Vault (~150k business documents: emails, PDFs, invoices,
+# POs, quotes, specs, certificates) lives on grabo-systems and is published at
+# grabo.cc/docvault-mcp behind a static bearer key. Codex can speak
+# streamable-HTTP to it directly, but only reads a bearer token from its own
+# process environment — which would mean exporting the vault key into every
+# member's shell, where they can echo it. The local stdio bridge takes the key
+# from `mcp_servers.docvault.env` in the member's own config instead.
+DOCVAULT_MCP_URL = os.environ.get(
+    "DOCVAULT_MCP_URL", "https://grabo.cc/docvault-mcp/mcp")
+DOCVAULT_MCP_KEY = os.environ.get("DOCVAULT_MCP_KEY", "")
+DOCVAULT_MCP_SCRIPT = Path(__file__).resolve().with_name("docvault_mcp.py")
+
+
+def _configure_member_codex_isolation(
+    cfg_dir: Path,
+    user: dict,
+    browser: dict | None = None,
+) -> bool:
+    """Write the complete unattended full-access config for one member."""
+    if not user or _is_admin(user):
+        return False
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    config = cfg_dir / "config.toml"
+    existing = config.read_text() if config.exists() else ""
+    project_root = PROJECTS_ROOT / str(user.get("username") or user["id"])
+    trusted_projects = []
+    try:
+        trusted_projects = [
+            project_root / session_name
+            for session_name, owner_id in sorted(
+                _load_session_owners().items()
+            )
+            if owner_id == user.get("id")
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", session_name)
+        ]
+    except Exception:
+        logger.warning(
+            "Could not enumerate trusted projects for member %s",
+            user.get("id", ""),
+            exc_info=True,
+        )
+
+    lines = [
+        'model = "gpt-5.6-sol"',
+        'model_reasoning_effort = "max"',
+        'approval_policy = "never"',
+        'default_permissions = ":danger-full-access"',
+        "",
+        "[notice]",
+        "hide_full_access_warning = true",
+        "",
+        "[features]",
+        "remote_plugin = false",
+        "apps = false",
+        "",
+        "[tui.model_availability_nux]",
+        '"gpt-5.6-sol" = 3',
+    ]
+    for trusted_project in trusted_projects:
+        lines.extend((
+            "",
+            f'[projects."{_toml_escape(str(trusted_project))}"]',
+            'trust_level = "trusted"',
+        ))
+    lines.extend((
+        "",
+        "[apps._default]",
+        "enabled = false",
+    ))
+    google_cmd = _google_mcp_command()
+    try:
+        google_parts = shlex.split(google_cmd)
+    except ValueError:
+        google_parts = []
+    if google_parts:
+        google_args = ", ".join(
+            f'"{_toml_escape(value)}"' for value in google_parts[1:]
+        )
+        google_env = [
+            (
+                'GOOGLE_MCP_CREDENTIALS_DIR = "'
+                + _toml_escape(str(CONNECTIONS_DIR / user["id"]))
+                + '"'
+            ),
+            (
+                'GOOGLE_OAUTH_CLIENT_FILE = "'
+                + _toml_escape(str(GOOGLE_OAUTH_CLIENT_FILE))
+                + '"'
+            ),
+        ]
+        dwd_subject = _google_workspace_subject(user)
+        if dwd_subject:
+            google_env.extend((
+                (
+                    'GOOGLE_WORKSPACE_DWD_SERVICE_ACCOUNT_FILE = "'
+                    + _toml_escape(str(GOOGLE_DWD_SERVICE_ACCOUNT_FILE))
+                    + '"'
+                ),
+                (
+                    'GOOGLE_WORKSPACE_DWD_SUBJECT = "'
+                    + _toml_escape(dwd_subject)
+                    + '"'
+                ),
+            ))
+        lines.extend((
+            "",
+            "# BEGIN GRABO GOOGLE MCP (managed)",
+            "[mcp_servers.google]",
+            f'command = "{_toml_escape(google_parts[0])}"',
+            f"args = [{google_args}]",
+            'default_tools_approval_mode = "approve"',
+            "",
+            "[mcp_servers.google.env]",
+            *google_env,
+            "# END GRABO GOOGLE MCP",
+        ))
+    if google_parts and DOCVAULT_MCP_KEY and DOCVAULT_MCP_SCRIPT.is_file():
+        lines.extend((
+            "",
+            "# BEGIN GRABO DOCVAULT MCP (managed)",
+            "[mcp_servers.docvault]",
+            f'command = "{_toml_escape(google_parts[0])}"',
+            f'args = ["{_toml_escape(str(DOCVAULT_MCP_SCRIPT))}"]',
+            'default_tools_approval_mode = "approve"',
+            "",
+            "[mcp_servers.docvault.env]",
+            f'DOCVAULT_MCP_URL = "{_toml_escape(DOCVAULT_MCP_URL)}"',
+            f'DOCVAULT_MCP_KEY = "{_toml_escape(DOCVAULT_MCP_KEY)}"',
+            "# END GRABO DOCVAULT MCP",
+        ))
+    updated = "\n".join(lines) + "\n"
+    tomllib.loads(updated)
+    if updated == existing:
+        return False
+    _backup_before_dashboard_write(config)
+    config.write_text(updated)
+    return True
 
 
 def _ensure_user_codex_config_dir(user: dict):
@@ -1001,10 +1219,8 @@ def _ensure_user_codex_config_dir(user: dict):
         desired_config = (
             f'model = "{_CODEX_DEFAULT_MODEL}"\n'
             f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
-            'sandbox_mode = "danger-full-access"\n'
             'approval_policy = "never"\n'
         )
-    desired_config = _ensure_codex_project_trust(desired_config, os.getcwd())
     if desired_config != existing_config:
         _backup_before_dashboard_write(config_toml)
         config_toml.write_text(desired_config)
@@ -1014,21 +1230,31 @@ def _ensure_user_codex_config_dir(user: dict):
             _write_codex_api_auth(d, key)
         except Exception:
             logger.debug("Failed to seed Codex auth for user %s", user.get("id"), exc_info=True)
-    # Team mode: shared Codex auth, managed global context block,
-    # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
-    # stays current (e.g. after the admin edits the global context).
+    # Managed member context is independent of the legacy TEAM_MODE flag:
+    # multi-account deployments existed before that flag was introduced.
+    # Re-apply on every call so existing and newly provisioned accounts
+    # self-heal after a host/context change.
+    try:
+        _sync_global_context_into(codex_md)
+        _sync_group_context_into(codex_md, user.get("group", ""))
+        _sync_group_skills_into(d, user.get("group", ""))
+        _sync_git_rules_into(codex_md)
+    except Exception:
+        logger.exception(
+            "Failed to apply managed context for user %s",
+            user.get("id"),
+        )
+    # TEAM_MODE additionally shares Codex authentication and applies the
+    # compatibility guard/model setup used by older team deployments.
     if TEAM_MODE:
         try:
             _apply_member_auth(d)
-            _sync_global_context_into(codex_md)
-            _sync_group_context_into(codex_md, user.get("group", ""))
-            _sync_group_skills_into(d, user.get("group", ""))
-            _install_sandbox_hook(d, user)
-            _ensure_google_mcp(d, user)
-            _set_team_model_effort(d)
-            _sync_git_rules_into(codex_md)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
+    try:
+        _configure_member_codex_isolation(d, user)
+    except Exception:
+        logger.exception("Failed to configure Codex for user %s", user.get("id"))
 
 
 # Compatibility aliases used throughout the newer Grabo team/admin code.
@@ -1129,13 +1355,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
      /browser/<sid>/login and the sign-in silently did nothing. -->
 <form class="login-box" method="POST" action="__ROOT_PATH__/login">
   <h2>__BRAND__ Dashboard</h2>
-  <p>Enter credentials to continue.</p>
+  <p>Log in to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
 __GOOGLE_BTN__
-  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
-  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+__PASSWORD_LOGIN__
   <input type="hidden" name="next" id="next">
-  <button class="login-btn" type="submit">Log in</button>
 </form>
 <script>
 var q=new URLSearchParams(location.search),e=document.getElementById('err');
@@ -1145,6 +1369,7 @@ var GERR={domain:'That Google account is not allowed. Use your company Google ac
           denied:'Google sign-in was cancelled.',
           state:'Sign-in link expired \u2014 please try again.',
           config:'Google sign-in is not configured on this server.',
+          permissions:'Drive and Gmail access are required to use this dashboard.',
           failed:'Google sign-in failed \u2014 please try again.'};
 if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
 /* Carry the deep link through the login so signing in from e.g. a noVNC viewer
@@ -1160,8 +1385,11 @@ if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
 _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
     <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
     Continue with Google</a>
-  <div class="ghint">__GOOGLE_HINT__</div>
-  <div class="sep">or sign in with a password</div>"""
+  <div class="ghint">__GOOGLE_HINT__</div>"""
+
+_PASSWORD_LOGIN_HTML = """  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
+  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+  <button class="login-btn" type="submit">Log in</button>"""
 
 
 def _login_page() -> str:
@@ -1172,10 +1400,27 @@ def _login_page() -> str:
     load instead of needing the app restarted.
     """
     if not _google_login_enabled():
-        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+        return (
+            LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+            .replace("__PASSWORD_LOGIN__", _PASSWORD_LOGIN_HTML)
+        )
     domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
-    hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
-    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
+    hint = (
+        ("Company accounts only (" + domains + ")")
+        if domains
+        else "Company accounts only"
+    )
+    hint += (
+        ". Your company Google Drive and Gmail are connected automatically "
+        "with full read and write access."
+    )
+    return (
+        LOGIN_PAGE.replace(
+            "__GOOGLE_BTN__",
+            _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint),
+        )
+        .replace("__PASSWORD_LOGIN__", "")
+    )
 
 
 def _apply_security_headers(request: Request, response: Response) -> Response:
@@ -1186,7 +1431,7 @@ def _apply_security_headers(request: Request, response: Response) -> Response:
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
     if (
         request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower() == "https"
         or request.url.scheme == "https"
@@ -1248,6 +1493,11 @@ async def session_ownership_middleware(request: Request, call_next):
     else:
         rel = path
     user = _current_user(request)
+    if getattr(request.state, "_invalid_impersonation", False):
+        return JSONResponse(
+            {"error": "Impersonation session expired or invalid"},
+            status_code=401,
+        )
     # Admin-only routes (Profiles, global AGENTS.md, etc.)
     for prefix in _ADMIN_ONLY_PREFIXES:
         if rel == prefix or rel.startswith(prefix + "/"):
@@ -1301,7 +1551,7 @@ async def auth_middleware(request: Request, call_next):
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
     if _is_public_project_request(rel_path):
         return await call_next(request)
-    token = request.cookies.get("tmux_auth")
+    token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
         resp = HTMLResponse(_login_page())
         return _apply_security_headers(request, resp)
@@ -1311,8 +1561,9 @@ async def auth_middleware(request: Request, call_next):
     user = _user_from_token(token)
     if not user:
         resp = HTMLResponse(_login_page())
-        resp.delete_cookie("tmux_auth")
+        resp.delete_cookie(AUTH_COOKIE)
         return _apply_security_headers(request, resp)
+    request.state._authenticated_user = user
     request.state._current_user = user
     return await call_next(request)
 
@@ -1329,7 +1580,7 @@ async def api_auth_verify(request: Request):
     here on purpose: letting anyone with a company address into the dashboard
     should not also hand them the crypto/sales/matcher apps.
     """
-    u = _user_from_token(request.cookies.get("tmux_auth"))
+    u = _user_from_token(request.cookies.get(AUTH_COOKIE))
     if u and u.get("sso", True) is not False:
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False}, status_code=401)
@@ -1431,16 +1682,22 @@ async def do_login(request: Request):
         logger.debug("Failed to update last_login for %s", target_user.get("id"), exc_info=True)
 
     token = _make_token(target_user["id"])
-    resp = RedirectResponse(url=nxt, status_code=303)
+    resp = RedirectResponse(
+        url=_browser_login_redirect(nxt, target_user),
+        status_code=303,
+    )
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
     return resp
 
 
-@app.post("/logout")
+@app.api_route("/logout", methods=["GET", "POST"])
 async def do_logout(request: Request):
-    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
-    resp.delete_cookie(AUTH_COOKIE)
+    root = request.scope.get("root_path", "").rstrip("/") + "/"
+    resp = RedirectResponse(url=root, status_code=303)
+    resp.delete_cookie(AUTH_COOKIE, path="/")
+    resp.delete_cookie("tmux_imp_orig", path="/")
+    resp.delete_cookie(AUTH_COOKIE + "_google_state", path="/")
     return resp
 
 
@@ -1465,7 +1722,50 @@ GOOGLE_LOGIN_EMAILS = [
 ]
 # Google address that signs in as the built-in admin (id="admin").
 ADMIN_GOOGLE_EMAIL = os.environ.get("TMUX_DASH_ADMIN_GOOGLE_EMAIL", "").strip().lower()
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GOOGLE_WORKSPACE_REQUIRED_SCOPES = (
+    GOOGLE_DRIVE_SCOPE,
+    GOOGLE_GMAIL_SCOPE,
+)
 GOOGLE_LOGIN_SCOPES = "openid email profile"
+GOOGLE_LOGIN_STATE_COOKIE = AUTH_COOKIE + "_google_state"
+
+
+def _google_workspace_subject(user: dict | None) -> str:
+    """Return the company identity that DWD may impersonate for this member."""
+    if not user or not GOOGLE_DWD_SERVICE_ACCOUNT_FILE.is_file():
+        return ""
+    email = str(user.get("google_email") or "").strip().lower()
+    if "@" not in email:
+        return ""
+    if email.split("@", 1)[1] not in GOOGLE_LOGIN_DOMAINS:
+        return ""
+    return email
+
+
+def _google_workspace_delegation_ready(user: dict | None) -> bool:
+    """Verify that the company delegation grants both required APIs."""
+    subject = _google_workspace_subject(user)
+    if not subject:
+        return False
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import service_account
+
+        credentials = service_account.Credentials.from_service_account_file(
+            str(GOOGLE_DWD_SERVICE_ACCOUNT_FILE),
+            scopes=list(GOOGLE_WORKSPACE_REQUIRED_SCOPES),
+            subject=subject,
+        )
+        credentials.refresh(GoogleAuthRequest())
+        return bool(credentials.token)
+    except Exception:
+        logger.exception(
+            "Google Workspace delegation preflight failed for %s",
+            subject,
+        )
+        return False
 
 
 def _google_login_enabled() -> bool:
@@ -1606,8 +1906,10 @@ async def google_login_start(request: Request):
     nxt = (request.query_params.get("next") or "").strip()
     if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
         nxt = rp + "/"
+    browser_nonce = secrets.token_urlsafe(24)
     state = _sign_state(
-        f"glogin:{int(time.time())}:{base64.urlsafe_b64encode(nxt.encode()).decode()}"
+        f"glogin:{int(time.time())}:{browser_nonce}:"
+        f"{base64.urlsafe_b64encode(nxt.encode()).decode()}"
     )
     params = urllib.parse.urlencode({
         "client_id": cid,
@@ -1619,28 +1921,60 @@ async def google_login_start(request: Request):
         "prompt": "select_account",
         "state": state,
     })
-    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    response = RedirectResponse(
+        "https://accounts.google.com/o/oauth2/v2/auth?" + params
+    )
+    is_https = (
+        request.headers.get("x-forwarded-proto") == "https"
+        or request.url.scheme == "https"
+    )
+    response.set_cookie(
+        GOOGLE_LOGIN_STATE_COOKIE,
+        browser_nonce,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        path=(rp.rstrip("/") + "/") if rp else "/",
+    )
+    return response
 
 
 @app.get("/auth/google/callback")
 async def google_login_callback(request: Request):
     rp = request.scope.get("root_path", "")
+    cookie_path = (rp.rstrip("/") + "/") if rp else "/"
+
+    def redirect(url: str) -> RedirectResponse:
+        response = RedirectResponse(url=url, status_code=303)
+        response.delete_cookie(
+            GOOGLE_LOGIN_STATE_COOKIE,
+            path=cookie_path,
+        )
+        return response
+
     ip = request.client.host if request.client else "unknown"
     if request.query_params.get("error"):
-        return RedirectResponse(url=rp + "/?gerr=denied", status_code=303)
+        return redirect(rp + "/?gerr=denied")
     if not _check_login_rate_limit(ip):
         return HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
     code = request.query_params.get("code") or ""
     payload = _verify_state(request.query_params.get("state") or "")
     if not code or not payload or not payload.startswith("glogin:"):
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return redirect(rp + "/?gerr=state")
     try:
-        _, ts, nxt_b64 = payload.split(":", 2)
+        _, ts, browser_nonce, nxt_b64 = payload.split(":", 3)
+        cookie_nonce = request.cookies.get(GOOGLE_LOGIN_STATE_COOKIE) or ""
+        if not cookie_nonce or not hmac.compare_digest(
+            browser_nonce,
+            cookie_nonce,
+        ):
+            raise ValueError("Google login browser state mismatch")
         nxt = base64.urlsafe_b64decode(nxt_b64.encode()).decode()
     except Exception:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return redirect(rp + "/?gerr=state")
     if time.time() - int(ts) > 600:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return redirect(rp + "/?gerr=state")
     if not (nxt.startswith("/") and not nxt.startswith("//")):
         nxt = rp + "/"
 
@@ -1657,24 +1991,41 @@ async def google_login_callback(request: Request):
         claims = _decode_id_token(tok.get("id_token") or "")
     except Exception:
         logger.exception("Google sign-in token exchange failed")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return redirect(rp + "/?gerr=failed")
 
     if claims.get("aud") != cid:
         logger.warning("Google sign-in: id_token audience mismatch")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return redirect(rp + "/?gerr=failed")
     if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         logger.warning("Google sign-in: unexpected issuer %s", claims.get("iss"))
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return redirect(rp + "/?gerr=failed")
     if float(claims.get("exp") or 0) < time.time():
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return redirect(rp + "/?gerr=state")
     email = (claims.get("email") or "").strip().lower()
     if not email or not claims.get("email_verified"):
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return redirect(rp + "/?gerr=domain")
 
     target_user = _google_login_user(email, claims.get("name") or "")
     if not target_user:
         logger.warning("Google sign-in rejected for %s (not an allowed domain)", email)
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return redirect(rp + "/?gerr=domain")
+    if not await asyncio.to_thread(
+        _google_workspace_delegation_ready,
+        target_user,
+    ):
+        logger.warning(
+            "Google sign-in blocked: delegated Drive/Gmail unavailable for %s",
+            email,
+        )
+        return redirect(rp + "/?gerr=permissions")
+    try:
+        _write_google_mcp(target_user, "workspace")
+    except Exception:
+        logger.exception(
+            "Google sign-in Workspace provisioning failed for %s",
+            target_user.get("id"),
+        )
+        return redirect(rp + "/?gerr=failed")
 
     ua = (request.headers.get("user-agent", "") or "")[:300]
     fwd = request.headers.get("x-forwarded-for", "")
@@ -1694,8 +2045,16 @@ async def google_login_callback(request: Request):
 
     logger.info("Google sign-in: %s -> user '%s' (%s)",
                 email, target_user.get("username"), target_user.get("role"))
-    resp = RedirectResponse(url=nxt, status_code=303)
-    return _set_auth_cookie(resp, request, _make_token(target_user["id"]))
+    resp = RedirectResponse(
+        url=_browser_login_redirect(nxt, target_user),
+        status_code=303,
+    )
+    resp = _set_auth_cookie(resp, request, _make_token(target_user["id"]))
+    resp.delete_cookie(
+        GOOGLE_LOGIN_STATE_COOKIE,
+        path=cookie_path,
+    )
+    return resp
 
 
 class CreateUserBody(BaseModel):
@@ -1742,12 +2101,63 @@ async def api_admin_list_users(request: Request):
     if not _is_admin(user):
         return JSONResponse({"error": "Admin only"}, status_code=403)
     users = _load_users()
+    sessions = get_tmux_sessions()
+    owners = _load_session_owners()
+    activities = await asyncio.gather(
+        *(async_detect_activity(session["name"]) for session in sessions)
+    )
+    live_by_user: dict[str, list[str]] = {}
+    busy_by_user: dict[str, list[str]] = {}
+    for session, activity in zip(sessions, activities):
+        user_id = owners.get(session["name"], "admin")
+        live_by_user.setdefault(user_id, []).append(session["name"])
+        if activity.get("status") == "busy":
+            busy_by_user.setdefault(user_id, []).append(session["name"])
+
+    usage_rows = await asyncio.gather(
+        *(asyncio.to_thread(_user_usage_summary, account) for account in users)
+    )
+    prompt_summary = await asyncio.to_thread(_prompt_audit_summary)
+    generated_at = time.time()
     out = []
-    for u in users:
+    for u, usage in zip(users, usage_rows):
+        user_id = str(u.get("id", ""))
+        live_sessions = live_by_user.get(user_id, [])
+        busy_sessions = busy_by_user.get(user_id, [])
+        last_seen = float(_user_presence.get(user_id, 0) or 0)
+        prompts = prompt_summary.get(user_id, {})
         rec = _public_user(u)
-        rec["session_count"] = _user_session_count(u["id"])
+        rec.update({
+            "session_count": len(live_sessions),
+            "live_session_count": len(live_sessions),
+            "busy_session_count": len(busy_sessions),
+            "session_names": live_sessions,
+            "busy_session_names": busy_sessions,
+            "working": bool(busy_sessions),
+            "last_seen": last_seen,
+            "online": bool(
+                last_seen
+                and generated_at - last_seen <= _USER_ONLINE_WINDOW_SECONDS
+            ),
+            "usage": usage,
+            "prompt_count": int(prompts.get("count", 0) or 0),
+            "last_prompt_at": float(prompts.get("last_ts", 0) or 0),
+        })
         out.append(rec)
-    return JSONResponse({"users": out})
+    return JSONResponse({
+        "users": out,
+        "summary": {
+            "user_count": len(out),
+            "online_count": sum(1 for item in out if item["online"]),
+            "working_count": sum(1 for item in out if item["working"]),
+            "live_session_count": sum(item["live_session_count"] for item in out),
+            "total_tokens": sum(
+                int(item["usage"].get("total_tokens", 0) or 0) for item in out
+            ),
+            "total_prompts": sum(item["prompt_count"] for item in out),
+        },
+        "generated_at": generated_at,
+    })
 
 
 @app.post("/api/admin/users")
@@ -1784,8 +2194,12 @@ async def api_admin_create_user(request: Request, body: CreateUserBody):
     try:
         _user_data_dir(new_user)
         _ensure_user_codex_config_dir(new_user)
+        _ensure_user_browser_session(new_user, start=False)
     except Exception:
-        logger.exception("Failed to seed dirs for new user %s", new_user["id"])
+        logger.exception(
+            "Failed to seed account resources for new user %s",
+            new_user["id"],
+        )
     logger.info("Admin '%s' created user '%s' (role=%s)", user["username"], username, role)
     return JSONResponse({"ok": True, "user": _public_user(new_user)})
 
@@ -1891,6 +2305,14 @@ async def api_admin_delete_user(request: Request, user_id: str):
             shutil.rmtree(cfg_dir, ignore_errors=True)
     except Exception:
         logger.debug("Failed to remove user codex config for %s", user_id, exc_info=True)
+    try:
+        _delete_user_browser_session(user_id)
+    except Exception:
+        logger.debug(
+            "Failed to remove user browser for %s",
+            user_id,
+            exc_info=True,
+        )
     logger.info("Admin '%s' deleted user '%s' (and %d sessions)",
                 user["username"], target.get("username", user_id), len(owned))
     return JSONResponse({"ok": True})
@@ -1898,15 +2320,90 @@ async def api_admin_delete_user(request: Request, user_id: str):
 
 def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30,
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
     return resp
 
 
+_IMPERSONATION_TICKET_TTL = 60
+_IMPERSONATION_SESSION_TTL = 8 * 60 * 60
+_impersonation_lock = threading.Lock()
+_impersonation_tickets: dict[str, dict] = {}
+_impersonation_sessions: dict[str, dict] = {}
+IMPERSONATION_SESSIONS_FILE = MESSAGES_DIR / "impersonation-sessions.json"
+_impersonation_sessions_loaded = False
+
+
+def _load_impersonation_sessions_locked() -> None:
+    """Load active opaque tab sessions once; caller holds the lock."""
+    global _impersonation_sessions_loaded
+    if _impersonation_sessions_loaded:
+        return
+    loaded = {}
+    try:
+        data = json.loads(IMPERSONATION_SESSIONS_FILE.read_text())
+        rows = data.get("sessions", {}) if isinstance(data, dict) else {}
+        if isinstance(rows, dict):
+            loaded = {
+                str(token): record
+                for token, record in rows.items()
+                if isinstance(record, dict)
+            }
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        loaded = {}
+    _impersonation_sessions.clear()
+    _impersonation_sessions.update(loaded)
+    _impersonation_sessions_loaded = True
+
+
+def _save_impersonation_sessions_locked() -> None:
+    """Persist opaque tab sessions privately; caller holds the lock."""
+    _atomic_write_json(
+        IMPERSONATION_SESSIONS_FILE,
+        {"sessions": _impersonation_sessions},
+    )
+
+
+def _purge_expired_impersonation_tokens(now: float | None = None) -> None:
+    """Purge expired records; caller holds ``_impersonation_lock``."""
+    _load_impersonation_sessions_locked()
+    timestamp = now or time.time()
+    sessions_changed = False
+    for store in (_impersonation_tickets, _impersonation_sessions):
+        for token, record in list(store.items()):
+            if float(record.get("expires_at", 0) or 0) <= timestamp:
+                store.pop(token, None)
+                if store is _impersonation_sessions:
+                    sessions_changed = True
+    if sessions_changed:
+        _save_impersonation_sessions_locked()
+
+
+def _user_from_impersonation_session(
+    token: str,
+    authenticated_admin: dict,
+) -> dict | None:
+    """Resolve a tab-scoped session only when its original admin is logged in."""
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens()
+        record = _impersonation_sessions.get(token)
+        if (
+            not record
+            or record.get("admin_id") != authenticated_admin.get("id")
+        ):
+            return None
+        target_id = str(record.get("target_id", ""))
+    target = _find_user_by_id(target_id)
+    return target if target and target.get("id") != authenticated_admin.get("id") else None
+
+
+class ImpersonationExchangeBody(BaseModel):
+    ticket: str = Field(min_length=20, max_length=200)
+
+
 @app.post("/api/admin/users/{user_id}/impersonate")
 async def api_admin_impersonate(request: Request, user_id: str):
-    """Admin 'log in as' a user to see their work. Stashes the admin's own token
-    in a side cookie so they can return; swaps tmux_auth to the target."""
+    """Issue a short-lived ticket for an isolated impersonation browser tab."""
     admin = _current_user(request)
     if not _is_admin(admin):
         return JSONResponse({"error": "Admin only"}, status_code=403)
@@ -1915,18 +2412,92 @@ async def api_admin_impersonate(request: Request, user_id: str):
         return JSONResponse({"error": "User not found"}, status_code=404)
     if target["id"] == admin["id"]:
         return JSONResponse({"error": "That's already you"}, status_code=400)
-    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp = JSONResponse({"ok": True, "username": target.get("username", "")})
-    # Keep the EARLIEST admin token if already impersonating, so a chain of
-    # impersonations still returns to the real admin.
-    orig = request.cookies.get("tmux_imp_orig")
-    if not (orig and _is_admin(_user_from_token(orig))):
-        orig = _make_token(admin["id"])
-    resp.set_cookie("tmux_imp_orig", orig, max_age=86400,
-                    httponly=True, samesite="lax", secure=is_https)
-    _set_auth_cookie(resp, request, _make_token(target["id"]))
-    logger.info("Admin '%s' is now impersonating '%s'", admin.get("username"), target.get("username"))
-    return resp
+    ticket = secrets.token_urlsafe(32)
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens()
+        _impersonation_tickets[ticket] = {
+            "admin_id": admin["id"],
+            "target_id": target["id"],
+            "expires_at": time.time() + _IMPERSONATION_TICKET_TTL,
+        }
+    url = (
+        f"{ROOT_PATH or ''}/?impersonate_ticket="
+        f"{urllib.parse.quote(ticket, safe='')}"
+    )
+    logger.info(
+        "Admin '%s' issued an impersonation ticket for '%s'",
+        admin.get("username"),
+        target.get("username"),
+    )
+    return JSONResponse({
+        "ok": True,
+        "username": target.get("username", ""),
+        "url": url,
+        "expires_in": _IMPERSONATION_TICKET_TTL,
+    })
+
+
+@app.post("/api/admin/impersonation/exchange")
+async def api_admin_impersonation_exchange(
+    request: Request,
+    body: ImpersonationExchangeBody,
+):
+    """Consume a one-time ticket and return a token kept in tab sessionStorage."""
+    admin = _current_user(request)
+    if not _is_admin(admin):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    now = time.time()
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens(now)
+        record = _impersonation_tickets.get(body.ticket)
+        if not record:
+            return JSONResponse(
+                {"error": "Impersonation ticket expired or already used"},
+                status_code=410,
+            )
+        if record.get("admin_id") != admin.get("id"):
+            return JSONResponse({"error": "Ticket belongs to another admin"}, status_code=403)
+        _impersonation_tickets.pop(body.ticket, None)
+        token = secrets.token_urlsafe(48)
+        _impersonation_sessions[token] = {
+            "admin_id": admin["id"],
+            "target_id": record["target_id"],
+            "expires_at": now + _IMPERSONATION_SESSION_TTL,
+        }
+        _save_impersonation_sessions_locked()
+    target = _find_user_by_id(str(record["target_id"]))
+    if not target:
+        with _impersonation_lock:
+            _impersonation_sessions.pop(token, None)
+            _save_impersonation_sessions_locked()
+        return JSONResponse({"error": "User no longer exists"}, status_code=404)
+    return JSONResponse({
+        "ok": True,
+        "token": token,
+        "expires_in": _IMPERSONATION_SESSION_TTL,
+        "user": _public_user(target),
+    })
+
+
+@app.post("/api/impersonation/end")
+async def api_end_impersonation(request: Request):
+    """Revoke the current tab-scoped impersonation token."""
+    token = request.headers.get("X-Tmux-Impersonate", "").strip()
+    impersonator = getattr(request.state, "_impersonator", None)
+    target = _current_user(request)
+    if not token or not _is_admin(impersonator) or not target:
+        return JSONResponse({"error": "Not impersonating"}, status_code=400)
+    with _impersonation_lock:
+        record = _impersonation_sessions.get(token)
+        if (
+            not record
+            or record.get("admin_id") != impersonator.get("id")
+            or record.get("target_id") != target.get("id")
+        ):
+            return JSONResponse({"error": "Not impersonating"}, status_code=400)
+        _impersonation_sessions.pop(token, None)
+        _save_impersonation_sessions_locked()
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/unimpersonate")
@@ -2165,6 +2736,34 @@ def _public_api_entry(e: dict) -> dict:
         "usage_provider": e.get("usage_provider", ""),
         "status": e.get("status", "active"),
         "updated_at": e.get("updated_at", 0),
+    }
+
+
+def _member_api_entry(e: dict) -> dict:
+    """Return only the API catalog fields useful to members.
+
+    Provider credentials, masked key fragments, environment variable names,
+    internal notes, billing detail, and admin-console links stay private.
+    """
+    status = e.get("status", "active")
+    configured = bool(e.get("key")) or not bool(e.get("env_var"))
+    docs_url = str(e.get("docs_url") or "").strip()
+    try:
+        parsed_docs = urllib.parse.urlsplit(docs_url)
+        if parsed_docs.scheme not in ("http", "https") or not parsed_docs.netloc:
+            docs_url = ""
+    except ValueError:
+        docs_url = ""
+    return {
+        "id": e.get("id", ""),
+        "name": e.get("name", ""),
+        "provider": e.get("provider", ""),
+        "category": e.get("category", "other"),
+        "available": status == "active" and configured,
+        "plan": e.get("plan", ""),
+        "limits": e.get("limits", ""),
+        "docs_url": docs_url,
+        "status": status,
     }
 
 
@@ -2465,6 +3064,19 @@ class ApiEntryBody(BaseModel):
     status: str | None = None
 
 
+@app.get("/api/my/apis")
+async def api_member_list_apis(request: Request):
+    """Read-only, secret-free catalog of shared tools available to this user."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    return JSONResponse({
+        "apis": [_member_api_entry(e) for e in _load_api_registry()],
+        "category_order": _API_CATEGORY_ORDER,
+        "category_labels": _API_CATEGORY_LABELS,
+    })
+
+
 @app.get("/api/admin/apis")
 async def api_admin_list_apis(request: Request):
     user = _current_user(request)
@@ -2604,29 +3216,105 @@ def _my_context_path(user: dict, filename: str) -> Path | None:
 
 
 _MY_CONTEXT_ALLOWED = {"AGENTS.md", "MEMORY.md", "config.toml"}
+_MY_CONTEXT_VISIBLE_TOP = ("AGENTS.md", "MEMORY.md", "config.toml", ".mcp.json")
+_MY_CONTEXT_VISIBLE_DIRS = ("skills", "agents", "commands")
+
+
+def _my_context_files(user: dict) -> list[dict]:
+    """Return text context files Codex can load for this account.
+
+    Credentials and other config-home internals are deliberately excluded.
+    Managed global AGENTS.md text is stripped for non-admin members.
+    """
+    base = _user_codex_config_dir(user)
+    base.mkdir(parents=True, exist_ok=True)
+    candidates = [base / name for name in _MY_CONTEXT_VISIBLE_TOP]
+    for dirname in _MY_CONTEXT_VISIBLE_DIRS:
+        directory = base / dirname
+        if directory.exists():
+            candidates.extend(
+                path for path in sorted(directory.rglob("*"))
+                if path.is_file() and path.suffix.lower() in (".md", ".json", ".toml")
+            )
+
+    allowed_roots = [base.resolve()]
+    group_id = (user.get("group") or "").strip()
+    if group_id:
+        try:
+            allowed_roots.append(_group_dir(group_id).resolve())
+        except Exception:
+            pass
+    try:
+        allowed_roots.append(SKILL_LIBRARY_DIR.resolve())
+    except Exception:
+        pass
+
+    files = []
+    seen = set()
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            resolved = path.resolve()
+            if not any(
+                resolved == root or resolved.is_relative_to(root)
+                for root in allowed_roots
+            ):
+                continue
+            relative = str(path.relative_to(base)).replace("\\", "/")
+            if relative in seen:
+                continue
+            seen.add(relative)
+            content = path.read_text()
+            if relative == "AGENTS.md" and not _is_admin(user):
+                content = _member_visible_agents_context(content)
+            files.append({
+                "name": relative,
+                "content": content,
+                "exists": True,
+                "path": str(path),
+                "editable": relative in _MY_CONTEXT_ALLOWED,
+            })
+        except (OSError, UnicodeError, ValueError):
+            logger.debug("Failed to read context file %s", path, exc_info=True)
+    return files
+
+
+def _member_visible_agents_context(content: str) -> str:
+    """Remove managed global-prompt blocks from member-visible AGENTS.md text."""
+    visible = content or ""
+    while _GLOBAL_CTX_BEGIN in visible and _GLOBAL_CTX_END in visible:
+        before, remainder = visible.split(_GLOBAL_CTX_BEGIN, 1)
+        _managed, after = remainder.split(_GLOBAL_CTX_END, 1)
+        visible = before + after
+    return visible.lstrip("\n")
+
+
+def _merge_member_agents_context(existing: str, submitted: str) -> str:
+    """Keep the server-managed global prompt while replacing member-owned text."""
+    start = existing.find(_GLOBAL_CTX_BEGIN)
+    end = existing.find(_GLOBAL_CTX_END, start + len(_GLOBAL_CTX_BEGIN))
+    private = _member_visible_agents_context(submitted)
+    if start < 0 or end < 0:
+        return private
+    end += len(_GLOBAL_CTX_END)
+    managed = existing[start:end]
+    return managed + ("\n\n" + private if private else "\n")
 
 
 @app.get("/api/my/context")
 async def api_my_context(request: Request):
-    """Return current user's AGENTS.md / MEMORY.md / config.toml contents."""
+    """Return every non-secret context file visible to the current account."""
     user = _current_user(request)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     if not _is_admin(user):
         _ensure_user_codex_config_dir(user)
-    out = {"dir": str(_user_codex_config_dir(user)), "files": []}
-    for name in ("AGENTS.md", "MEMORY.md", "config.toml"):
-        p = _my_context_path(user, name)
-        content = ""
-        exists = False
-        if p and p.exists():
-            try:
-                content = p.read_text()
-                exists = True
-            except Exception:
-                logger.debug("Failed to read %s", p, exc_info=True)
-        out["files"].append({"name": name, "content": content, "exists": exists, "path": str(p)})
-    return JSONResponse(out)
+    return JSONResponse({
+        "dir": str(_user_codex_config_dir(user)),
+        "files": _my_context_files(user),
+        "global_context_hidden": not _is_admin(user),
+    })
 
 
 @app.post("/api/my/context/{filename}")
@@ -2642,13 +3330,34 @@ async def api_my_context_save(request: Request, filename: str, body: SaveMyConte
     if p is None:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
+        previous = p.read_text() if p.exists() else ""
         # Validate config.toml before writing; Codex expects valid TOML.
         if filename == "config.toml":
             try:
                 tomllib.loads(body.content or "")
             except tomllib.TOMLDecodeError as e:
                 return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
-        p.write_text(body.content or "")
+        content = body.content or ""
+        if filename == "AGENTS.md" and not _is_admin(user):
+            existing = p.read_text() if p.exists() else ""
+            content = _merge_member_agents_context(existing, content)
+        p.write_text(content)
+        if filename == "config.toml" and not _is_admin(user):
+            try:
+                browser = _ensure_user_browser_session(
+                    user,
+                    start=False,
+                )
+                _configure_member_codex_isolation(
+                    p.parent,
+                    user,
+                    browser,
+                )
+            except Exception:
+                # Never leave a member-controlled unsandboxed config behind if
+                # enforcing the managed security tables fails.
+                p.write_text(previous)
+                raise
         return JSONResponse({"ok": True, "path": str(p)})
     except Exception:
         logger.exception("Failed to save my-context %s for %s", filename, user["id"])
@@ -2770,7 +3479,9 @@ async def api_me(request: Request):
     # Impersonation: an admin "logged in as" this user has their real token in
     # the side cookie, so we can surface a "return to admin" banner.
     imp_orig = request.cookies.get("tmux_imp_orig")
-    imp_admin = _user_from_token(imp_orig) if imp_orig else None
+    imp_admin = getattr(request.state, "_impersonator", None)
+    if imp_admin is None:
+        imp_admin = _user_from_token(imp_orig) if imp_orig else None
     impersonating = bool(imp_admin and _is_admin(imp_admin) and imp_admin["id"] != user["id"])
     return JSONResponse({
         "id": user["id"],
@@ -2787,7 +3498,7 @@ async def api_me(request: Request):
 
 
 # ===========================================================================
-# Team mode: shared auth, global context, soft sandbox, Google connections.
+# Team mode: shared auth, global context, unattended access, Google connections.
 # All gated behind TEAM_MODE; no effect on personal boxes.
 # ===========================================================================
 import base64
@@ -2806,18 +3517,19 @@ _GLOBAL_CTX_END = "<!-- END TEAM GLOBAL CONTEXT -->"
 
 _DEFAULT_GLOBAL_CONTEXT = """# __BRAND__ environment (shared global context)
 You are running inside **__BRAND__**, a shared team development environment on the
-server `dianaotech.com`. Several team members share this machine; each has their
-own private workspace, memory, and context below this block.
+public dashboard `__PUBLIC_HOST__`, backed by the machine `__HOST_MACHINE__`.
+This is the current box; do not assume you are on another dashboard VM. Several
+team members share this machine; each has their own private workspace, memory,
+and context below this block.
 
-## Hard rules — soft sandbox
-- You may freely read, create, and change files and run services **on this server only**.
-- Do **NOT** modify, deploy to, SSH into, or change configuration on any OTHER
-  server or cloud resource (other GCP VMs, other hosts, production systems, buckets).
-- Reaching sensitive data on other servers is blocked by a guard. The block is
-  final — ask the admin directly rather than trying to work around it (no
-  obfuscation, no alternate tooling).
-- Remote/cloud tools (`gcloud`, `gsutil`, `bq`, `ssh`, `scp`, `kubectl`, `aws`, the
-  GCP metadata server, …) are restricted; expect them to be denied.
+## Runtime permissions — unattended full access
+- Codex launches as `codex --yolo`; its config uses
+  `default_permissions = ":danger-full-access"` with `approval_policy = "never"`.
+  Do the work without asking for approval or expecting sandbox restrictions.
+- Full filesystem and network access are available. Use them for the user's task
+  while remembering that the current box is `__HOST_MACHINE__`.
+- Access to remote/cloud tools does not change the host identity above. Do not
+  assume you are on, or silently act as though you are on, another machine.
 
 ## Projects & working folder
 - Unless told otherwise, publish every project you build at __PUBURL__/<username>/<project>.
@@ -2835,6 +3547,19 @@ Stay focused on the user's project in this workspace.
 """
 
 
+def _render_default_global_context() -> str:
+    public_host = urllib.parse.urlsplit(
+        PUBLIC_BASE_URL or PUB_URL
+    ).hostname or "unknown"
+    return (
+        _DEFAULT_GLOBAL_CONTEXT
+        .replace("__BRAND__", BRAND_NAME)
+        .replace("__PUBURL__", PUB_URL)
+        .replace("__PUBLIC_HOST__", public_host)
+        .replace("__HOST_MACHINE__", HOST_MACHINE)
+    )
+
+
 def _html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -2842,7 +3567,7 @@ def _html_escape(s: str) -> str:
 def _ensure_global_context_file():
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not GLOBAL_CONTEXT_FILE.exists():
-        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL))
+        GLOBAL_CONTEXT_FILE.write_text(_render_default_global_context())
 
 
 def _read_global_context() -> str:
@@ -3344,13 +4069,8 @@ def _write_sandbox_hook_script():
 
 
 def _install_sandbox_hook(cfg_dir: Path, user: dict):
-    """Apply Codex's workspace sandbox for a non-admin team member.
-
-    Claude's PreToolUse hook format is not read by Codex. The dashboard instead
-    launches these sessions without the dangerous bypass flag and pins
-    workspace-write + never-ask behavior in config.toml.
-    """
-    _set_team_model_effort(cfg_dir)
+    """Compatibility wrapper for the canonical member full-access config."""
+    _configure_member_codex_isolation(cfg_dir, user)
 
 
 # --- email (Resend) --------------------------------------------------------
@@ -3407,8 +4127,8 @@ async def api_sandbox_check(request: Request):
 
 # --- Google connections (Drive / Gmail / Calendar) -------------------------
 GOOGLE_SCOPES = {
-    "drive": ["https://www.googleapis.com/auth/drive.readonly"],
-    "gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
+    "drive": [GOOGLE_DRIVE_SCOPE],
+    "gmail": [GOOGLE_GMAIL_SCOPE],
     "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
 }
 GOOGLE_LABELS = {"drive": "Google Drive", "gmail": "Gmail", "calendar": "Google Calendar"}
@@ -3428,8 +4148,64 @@ def _google_client():
     return cid, csec
 
 
+# The company-wide Google grant. Members have no company Google credentials of
+# their own, so without this only the admin could ever reach the shared docs —
+# every member session answered "Drive is not connected". One admin-owned grant
+# is stored here and every user falls back to it (see _token_path in
+# google_workspace_mcp.py). A personal connection still wins over it.
+SHARED_CONNECTION_ID = "_shared"
+
+
 def _conn_path(user_id: str, service: str) -> Path:
     return CONNECTIONS_DIR / str(user_id) / (service + ".json")
+
+
+def _shared_conn_path(service: str) -> Path:
+    return _conn_path(SHARED_CONNECTION_ID, service)
+
+
+def _connection_status(user: dict, service: str) -> dict:
+    """How this user reaches `service`: their own grant, the company one, or not."""
+    user_id = user["id"]
+    if (
+        service in ("drive", "gmail")
+        and _google_workspace_subject(user)
+    ):
+        return {"connected": True, "shared": False, "delegated": True}
+    if _conn_path(user_id, service).exists():
+        return {"connected": True, "shared": False, "delegated": False}
+    if _shared_conn_path(service).exists():
+        return {"connected": True, "shared": True, "delegated": False}
+    return {"connected": False, "shared": False, "delegated": False}
+
+
+def _store_google_connection_token(
+    user_id: str,
+    service: str,
+    token: dict,
+) -> Path:
+    """Privately persist one Google grant, retaining a prior refresh token."""
+    path = _conn_path(user_id, service)
+    previous = {}
+    try:
+        if path.exists():
+            loaded = json.loads(path.read_text())
+            previous = loaded if isinstance(loaded, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        previous = {}
+    stored = {
+        key: value
+        for key, value in dict(token or {}).items()
+        if key != "id_token"
+    }
+    if not stored.get("refresh_token") and previous.get("refresh_token"):
+        stored["refresh_token"] = previous["refresh_token"]
+    stored["_obtained_at"] = time.time()
+    stored["_service"] = service
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    _atomic_write_json(path, stored)
+    return path
 
 
 def _sign_state(payload: str) -> str:
@@ -3454,9 +4230,51 @@ def _callback_uri(request: Request) -> str:
     return base + ROOT_PATH + "/api/connections/google/callback"
 
 
+
+
+def _ensure_docvault_mcp(cfg_dir: Path):
+    """Register the Document Vault bridge in this user's Codex config.toml."""
+    cmd = _google_mcp_command()          # same interpreter + script convention
+    if not cmd or not DOCVAULT_MCP_KEY or not DOCVAULT_MCP_SCRIPT.is_file():
+        return
+    cfg = cfg_dir / "config.toml"
+    begin = "# BEGIN GRABO DOCVAULT MCP (managed)"
+    end = "# END GRABO DOCVAULT MCP"
+    try:
+        interpreter = shlex.split(cmd)[0]
+        existing = cfg.read_text() if cfg.exists() else ""
+        if begin in existing and end in existing:
+            existing = re.sub(
+                rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?",
+                "\n",
+                existing,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+        elif re.search(r"^\s*\[mcp_servers\.docvault\]\s*$", existing, re.MULTILINE):
+            logger.warning("Leaving user-managed mcp_servers.docvault unchanged in %s", cfg)
+            return
+        block = (
+            f"{begin}\n"
+            "[mcp_servers.docvault]\n"
+            f'command = "{_toml_escape(interpreter)}"\n'
+            f'args = ["{_toml_escape(str(DOCVAULT_MCP_SCRIPT))}"]\n'
+            'default_tools_approval_mode = "approve"\n'
+            "\n[mcp_servers.docvault.env]\n"
+            f'DOCVAULT_MCP_URL = "{_toml_escape(DOCVAULT_MCP_URL)}"\n'
+            f'DOCVAULT_MCP_KEY = "{_toml_escape(DOCVAULT_MCP_KEY)}"\n'
+            f"{end}\n"
+        )
+        updated = existing.rstrip() + "\n\n" + block if existing.strip() else block
+        _backup_before_dashboard_write(cfg)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(updated)
+    except Exception:
+        logger.debug("Failed to write the docvault MCP entry into %s", cfg, exc_info=True)
+
+
 def _ensure_google_mcp(cfg_dir: Path, user: dict):
     """Register Grabo's Google MCP server in this user's Codex config.toml."""
-    cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
+    cmd = _google_mcp_command()
     if not cmd or not user or not user.get("id"):
         return
     cfg = cfg_dir / "config.toml"
@@ -3480,14 +4298,27 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
         args = ", ".join(f'"{_toml_escape(value)}"' for value in parts[1:])
         credentials_dir = _toml_escape(str(CONNECTIONS_DIR / user["id"]))
         client_file = _toml_escape(str(GOOGLE_OAUTH_CLIENT_FILE))
+        dwd_subject = _google_workspace_subject(user)
+        delegated_env = ""
+        if dwd_subject:
+            delegated_env = (
+                'GOOGLE_WORKSPACE_DWD_SERVICE_ACCOUNT_FILE = "'
+                + _toml_escape(str(GOOGLE_DWD_SERVICE_ACCOUNT_FILE))
+                + '"\n'
+                'GOOGLE_WORKSPACE_DWD_SUBJECT = "'
+                + _toml_escape(dwd_subject)
+                + '"\n'
+            )
         block = (
             f"{begin}\n"
             "[mcp_servers.google]\n"
             f'command = "{_toml_escape(parts[0])}"\n'
             f"args = [{args}]\n"
+            'default_tools_approval_mode = "approve"\n'
             "\n[mcp_servers.google.env]\n"
             f'GOOGLE_MCP_CREDENTIALS_DIR = "{credentials_dir}"\n'
             f'GOOGLE_OAUTH_CLIENT_FILE = "{client_file}"\n'
+            f"{delegated_env}"
             f"{end}\n"
         )
         updated = existing.rstrip() + "\n\n" + block if existing.strip() else block
@@ -3511,13 +4342,18 @@ async def api_connections(request: Request):
     cid, _ = _google_client()
     out = {
         "configured": bool(cid),
-        "mcp_ready": bool(os.environ.get("GOOGLE_MCP_COMMAND", "")),
+        "mcp_ready": bool(_google_mcp_command()),
         "services": [],
     }
+    out["is_admin"] = bool(_is_admin(user))
     for svc in ("drive", "gmail", "calendar"):
+        status = _connection_status(user, svc)
         out["services"].append({
             "id": svc, "label": GOOGLE_LABELS[svc],
-            "connected": _conn_path(user["id"], svc).exists(),
+            "connected": status["connected"],
+            "shared": status["shared"],
+            "delegated": status["delegated"],
+            "shared_available": _shared_conn_path(svc).exists(),
         })
     return JSONResponse(out)
 
@@ -3533,7 +4369,14 @@ async def api_connection_start(request: Request, service: str):
     if not cid or not csec:
         return JSONResponse({"error": "Google connections are not configured yet. "
                              "Ask the admin to add the OAuth client."}, status_code=503)
-    state = _sign_state(user["id"] + ":" + service + ":" + str(int(time.time())))
+    # ?shared=1 authorises the company account for everybody instead of just the
+    # caller. Admin only — it hands read access to whatever Google account signs
+    # in to every user of this dashboard.
+    shared = request.query_params.get("shared") in ("1", "true", "yes")
+    if shared and not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    owner = SHARED_CONNECTION_ID if shared else user["id"]
+    state = _sign_state(owner + ":" + service + ":" + str(int(time.time())))
     params = urllib.parse.urlencode({
         "client_id": cid,
         "redirect_uri": _callback_uri(request),
@@ -3573,19 +4416,27 @@ async def api_connection_callback(request: Request):
     except Exception:
         logger.exception("Google token exchange failed")
         return RedirectResponse(ROOT_PATH + "/?connect=error")
-    p = _conn_path(user_id, service)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tok["_obtained_at"] = time.time()
-    tok["_service"] = service
     try:
-        p.write_text(json.dumps(tok, indent=2))
-        p.chmod(0o600)
+        _store_google_connection_token(user_id, service, tok)
     except Exception:
         logger.exception("Failed to store connection token")
         return RedirectResponse(ROOT_PATH + "/?connect=error")
-    u = _find_user_by_id(user_id)
-    if u:
-        _write_google_mcp(u, service)
+    if user_id == SHARED_CONNECTION_ID:
+        # The grant is for everybody, so every user needs the MCP server wired
+        # into their Codex config — including members who never connected
+        # anything themselves.
+        for u in _load_users():
+            try:
+                _write_google_mcp(u, service)
+            except Exception:
+                logger.debug("Could not register the Google MCP for %s",
+                             u.get("id"), exc_info=True)
+        logger.info("Stored the shared company %s grant — available to all users",
+                    service)
+    else:
+        u = _find_user_by_id(user_id)
+        if u:
+            _write_google_mcp(u, service)
     return RedirectResponse(ROOT_PATH + "/?connect=ok&svc=" + service)
 
 
@@ -3594,7 +4445,12 @@ async def api_connection_delete(request: Request, service: str):
     user = _current_user(request)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
-    p = _conn_path(user["id"], service)
+    shared = request.query_params.get("shared") in ("1", "true", "yes")
+    if shared and not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    # Without this a member "disconnecting" would delete their own file and
+    # silently fall back to the company grant, which reads as a no-op.
+    p = _shared_conn_path(service) if shared else _conn_path(user["id"], service)
     if p.exists():
         try:
             p.unlink()
@@ -3993,7 +4849,7 @@ async def api_admin_user_history_detail(request: Request, user_id: str, session_
 
 # --- public projects: serving + helpers -----------------------------------
 def _safe_seg(s: str) -> bool:
-    return bool(s) and re.match(r"^[A-Za-z0-9._-]{1,64}$", s or "") is not None and s not in (".", "..")
+    return bool(s) and re.match(r"^[A-Za-z0-9.@_-]{1,64}$", s or "") is not None and s not in (".", "..")
 
 
 def _user_projects_dir(username: str) -> Path:
@@ -4019,6 +4875,122 @@ def _is_public_project_request(rel: str) -> bool:
     if len(segs) < 2 or segs[0] in _RESERVED_TOP:
         return False
     return _find_user_by_username(segs[0]) is not None
+
+
+def _protected_local_service_ports() -> set[int]:
+    """Ports a member project must never use as a reverse-proxy target."""
+    ports = {PORT}
+    try:
+        for session in _load_browser_sessions():
+            for key in ("rfb_port", "vnc_port", "cdp_port"):
+                port = int(session.get(key, 0) or 0)
+                if 0 < port < 65536:
+                    ports.add(port)
+    except Exception:
+        logger.warning("Could not enumerate protected browser ports", exc_info=True)
+    try:
+        sessions = _proxy_conf().get("sessions") or {}
+        if isinstance(sessions, dict):
+            for session in sessions.values():
+                if not isinstance(session, dict):
+                    continue
+                port = int(session.get("local_port", 0) or 0)
+                if 0 < port < 65536:
+                    ports.add(port)
+    except Exception:
+        logger.warning("Could not enumerate protected proxy ports", exc_info=True)
+    return ports
+
+
+def _tmux_session_process_ids(session_name: str) -> set[int]:
+    """Return the tmux pane process and its current descendant process tree."""
+    try:
+        pane = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-t",
+                session_name,
+                "-p",
+                "#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pane_pid = int((pane.stdout or "").strip())
+        if pane.returncode != 0 or pane_pid <= 0:
+            return set()
+        processes = subprocess.run(
+            ["ps", "-eo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if processes.returncode != 0:
+            return set()
+        children: dict[int, list[int]] = {}
+        for line in (processes.stdout or "").splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not all(field.isdigit() for field in fields):
+                continue
+            pid, parent_pid = (int(field) for field in fields)
+            children.setdefault(parent_pid, []).append(pid)
+        descendants = {pane_pid}
+        pending = [pane_pid]
+        while pending and len(descendants) < 4096:
+            parent_pid = pending.pop()
+            for child_pid in children.get(parent_pid, []):
+                if child_pid in descendants:
+                    continue
+                descendants.add(child_pid)
+                pending.append(child_pid)
+        return descendants
+    except Exception:
+        logger.debug(
+            "Could not inspect process tree for project session %s",
+            session_name,
+            exc_info=True,
+        )
+        return set()
+
+
+def _listening_process_ids(port: int) -> set[int]:
+    """Return process IDs currently listening on one TCP port."""
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{int(port)}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return set()
+        return {
+            int(pid)
+            for pid in re.findall(r"\bpid=(\d+)", result.stdout or "")
+        }
+    except Exception:
+        logger.debug(
+            "Could not inspect listener on project port %s",
+            port,
+            exc_info=True,
+        )
+        return set()
+
+
+def _member_project_port_allowed(user: dict, project: str, port: int) -> bool:
+    """Allow only a listener owned by this member's matching tmux session."""
+    if (
+        _is_admin(user)
+        or not (0 < port < 65536)
+        or port in _protected_local_service_ports()
+        or _session_owner_id(project) != user.get("id")
+    ):
+        return False
+    session_processes = _tmux_session_process_ids(project)
+    listener_processes = _listening_process_ids(port)
+    return bool(session_processes and session_processes & listener_processes)
 
 
 async def _proxy_to_port(request: Request, port: int, subpath: str):
@@ -4311,6 +5283,19 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
         target = Path(path).resolve()
     except Exception:
         return _file_error(request, 400, "Bad request", "That path could not be resolved.", orig_path)
+    user = _current_user(request)
+    if user and not _is_admin(user):
+        project_root = _user_projects_dir(
+            str(user.get("username") or user.get("id") or "")
+        ).resolve()
+        if target != project_root and not target.is_relative_to(project_root):
+            return _file_error(
+                request,
+                403,
+                "Forbidden",
+                "Member file links are limited to your project workspace.",
+                orig_path,
+            )
     # Re-check denylist against the resolved real path (defeats symlink tricks).
     real = str(target)
     if real in _FILE_SERVE_DENYLIST:
@@ -4361,6 +5346,177 @@ cache: dict[str, dict] = {}
 # users get ~/.tmux-dashboard/users/<id>/messages.json and notes.json.
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
+PROMPT_AUDIT_FILE = MESSAGES_DIR / "prompt-history.jsonl"
+PROMPT_AUDIT_BACKFILL_MARKER = MESSAGES_DIR / "prompt-history-backfill-v1.json"
+_prompt_audit_lock = threading.Lock()
+
+
+def _append_prompt_audit(
+    user: dict,
+    session_name: str,
+    prompt: str,
+    *,
+    source: str = "dashboard",
+    impersonator: dict | None = None,
+    timestamp: float | None = None,
+) -> dict:
+    """Append one immutable human prompt record to the private audit log."""
+    entry = {
+        "id": secrets.token_hex(12),
+        "ts": float(timestamp if timestamp is not None else time.time()),
+        "user_id": user.get("id", ""),
+        "username": user.get("username", ""),
+        "role": user.get("role", "user"),
+        "session_name": session_name,
+        "prompt": prompt,
+        "source": source,
+    }
+    if impersonator:
+        entry["impersonated_by_id"] = impersonator.get("id", "")
+        entry["impersonated_by"] = impersonator.get("username", "")
+    encoded = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    with _prompt_audit_lock:
+        PROMPT_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            PROMPT_AUDIT_FILE,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return entry
+
+
+def _iter_prompt_audit_reverse():
+    """Yield valid prompt records newest-first without loading the whole log."""
+    if not PROMPT_AUDIT_FILE.exists():
+        return
+    block_size = 64 * 1024
+    with _prompt_audit_lock, PROMPT_AUDIT_FILE.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        position = stream.tell()
+        remainder = b""
+        while position > 0:
+            size = min(block_size, position)
+            position -= size
+            stream.seek(position)
+            chunk = stream.read(size) + remainder
+            lines = chunk.split(b"\n")
+            remainder = lines[0]
+            for raw in reversed(lines[1:]):
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+        if remainder.strip():
+            try:
+                entry = json.loads(remainder)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                entry = None
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _read_prompt_audit(
+    *,
+    user_id: str = "",
+    limit: int = 100,
+    before: float = 0,
+    cursor: str = "",
+) -> list[dict]:
+    prompts = []
+    cursor_found = not cursor
+    for entry in _iter_prompt_audit_reverse() or ():
+        if user_id and entry.get("user_id") != user_id:
+            continue
+        if not cursor_found:
+            if str(entry.get("id", "")) == cursor:
+                cursor_found = True
+            continue
+        timestamp = float(entry.get("ts") or 0)
+        if before and timestamp >= before:
+            continue
+        prompts.append(entry)
+        if len(prompts) >= limit:
+            break
+    return prompts
+
+
+_prompt_audit_summary_cache: dict = {"signature": None, "data": {}}
+
+
+def _prompt_audit_summary() -> dict[str, dict]:
+    """Count prompts by account, reusing results while the audit file is unchanged."""
+    try:
+        stat = PROMPT_AUDIT_FILE.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return {}
+    if _prompt_audit_summary_cache["signature"] == signature:
+        return {
+            key: dict(value)
+            for key, value in _prompt_audit_summary_cache["data"].items()
+        }
+
+    summary: dict[str, dict] = {}
+    with _prompt_audit_lock:
+        try:
+            with PROMPT_AUDIT_FILE.open(errors="replace") as stream:
+                for raw in stream:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    user_id = str(entry.get("user_id", ""))
+                    if not user_id:
+                        continue
+                    row = summary.setdefault(user_id, {"count": 0, "last_ts": 0})
+                    row["count"] += 1
+                    row["last_ts"] = max(
+                        float(row["last_ts"]),
+                        float(entry.get("ts", 0) or 0),
+                    )
+        except OSError:
+            return {}
+    _prompt_audit_summary_cache["signature"] = signature
+    _prompt_audit_summary_cache["data"] = summary
+    return {key: dict(value) for key, value in summary.items()}
+
+
+@app.get("/api/admin/prompts")
+async def api_admin_prompts(
+    request: Request,
+    user_id: str = "",
+    limit: int = 100,
+    before: float = 0,
+    cursor: str = "",
+):
+    """Return the private, append-only human prompt audit to administrators."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    safe_limit = max(1, min(int(limit or 100), 500))
+    prompts = await asyncio.to_thread(
+        _read_prompt_audit,
+        user_id=(user_id or "").strip(),
+        limit=safe_limit,
+        before=max(0, float(before or 0)),
+        cursor=(cursor or "").strip()[:200],
+    )
+    next_before = float(prompts[-1].get("ts") or 0) if len(prompts) == safe_limit else 0
+    next_cursor = str(prompts[-1].get("id", "")) if len(prompts) == safe_limit else ""
+    return JSONResponse({
+        "prompts": prompts,
+        "next_before": next_before,
+        "next_cursor": next_cursor,
+    })
 
 
 def _read_json_file(path: Path) -> dict:
@@ -4443,6 +5599,80 @@ def _load_session_notes(session_name: str) -> str:
 def _load_messages(user: dict | None = None) -> dict[str, list]:
     """Load all session messages for a given user from disk."""
     return _read_json_file(_user_messages_file(user))
+
+
+def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
+    """Migrate existing per-user chat prompts into the global audit once."""
+    if PROMPT_AUDIT_BACKFILL_MARKER.exists():
+        return 0
+    users = users if users is not None else _load_users()
+    existing_ids = {
+        str(entry.get("id", ""))
+        for entry in (_iter_prompt_audit_reverse() or ())
+        if entry.get("id")
+    }
+    records = []
+    for user in users:
+        for session_name, messages in _load_messages(user).items():
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                prompt = message.get("text")
+                if not isinstance(prompt, str) or not prompt:
+                    continue
+                timestamp = float(message.get("ts", 0) or 0)
+                identity = "\0".join((
+                    str(user.get("id", "")),
+                    str(session_name),
+                    repr(timestamp),
+                    prompt,
+                ))
+                entry_id = "legacy_" + hashlib.sha256(
+                    identity.encode("utf-8")
+                ).hexdigest()[:24]
+                if entry_id in existing_ids:
+                    continue
+                existing_ids.add(entry_id)
+                records.append({
+                    "id": entry_id,
+                    "ts": timestamp,
+                    "user_id": user.get("id", ""),
+                    "username": user.get("username", ""),
+                    "role": user.get("role", "user"),
+                    "session_name": str(session_name),
+                    "prompt": prompt,
+                    "source": "legacy_messages_backfill",
+                })
+    if records:
+        encoded = "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in records
+        ).encode("utf-8")
+        with _prompt_audit_lock:
+            PROMPT_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(
+                PROMPT_AUDIT_FILE,
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    remaining = remaining[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    _atomic_write_json(PROMPT_AUDIT_BACKFILL_MARKER, {
+        "completed_at": time.time(),
+        "migrated": len(records),
+    })
+    _prompt_audit_summary_cache["signature"] = None
+    _prompt_audit_summary_cache["data"] = {}
+    return len(records)
 
 
 def _save_messages():
@@ -4576,6 +5806,18 @@ def get_tmux_sessions() -> list[dict]:
         return sessions
     except Exception:
         return []
+
+
+def _get_all_tmux_session_names() -> set[str]:
+    """Return tmux's global session names without dashboard visibility filtering."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return set(result.stdout.splitlines()) if result.returncode == 0 else set()
+    except Exception:
+        return set()
 
 
 def _find_session(session_name: str) -> tuple:
@@ -6010,7 +7252,6 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 
 class CreateSession(BaseModel):
     name: str = ""
-    profile_id: str = ""
 
 
 def _is_valid_session_name(name: str) -> bool:
@@ -6022,7 +7263,6 @@ async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
     user = _current_user(request)
     name = body.name.strip()
-    requested_profile = (body.profile_id or "").strip() or DEFAULT_PROFILE_ID
     if name:
         # Validate name: alphanumeric, dash, underscore only
         if not _is_valid_session_name(name):
@@ -6033,16 +7273,14 @@ async def api_create_session(request: Request, body: CreateSession):
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
             return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+        if name in _get_all_tmux_session_names():
+            return JSONResponse(
+                {"error": f"A tmux session named '{name}' already exists but is hidden from this Codex dashboard."},
+                status_code=409,
+            )
     # A stored API key is the recovery credential when a managed ChatGPT token
     # can no longer be refreshed. Validate/switch before launching the new pane.
-    auth_home = CODEX_HOME
-    if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
-        try:
-            if _find_profile(requested_profile, _load_roles()):
-                auth_home = _profile_dir(requested_profile)
-        except Exception:
-            logger.debug("Could not resolve requested profile auth", exc_info=True)
-    await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
+    await asyncio.to_thread(_ensure_codex_auth_with_fallback, CODEX_HOME, True)
     ready, reason, details = await asyncio.to_thread(_codex_cli_readiness)
     if not ready:
         return JSONResponse(
@@ -6066,7 +7304,7 @@ async def api_create_session(request: Request, body: CreateSession):
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
         # Export project-publishing convention env vars so Codex can publish to
-        # https://dianaotech.com/<username>/<session> reliably (see global context).
+        # the configured public dashboard URL reliably (see global context).
         try:
             _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
             _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
@@ -6092,6 +7330,7 @@ async def api_create_session(request: Request, body: CreateSession):
                 acfg = _user_codex_config_dir(user)
                 _sync_projects_note_into(acfg / "AGENTS.md")
                 _ensure_google_mcp(acfg, user)
+                _ensure_docvault_mcp(acfg)
                 _set_team_model_effort(acfg)
                 _sync_git_rules_into(acfg / "AGENTS.md")
         except Exception:
@@ -6100,17 +7339,8 @@ async def api_create_session(request: Request, body: CreateSession):
         # invocation in this pane reads from the user's private config.
         if user and not _is_admin(user):
             try:
-                _ensure_user_codex_config_dir(user)
-                user_cfg = _user_codex_config_dir(user)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", created, "-l",
-                     f"export CODEX_HOME={shlex.quote(str(user_cfg))}"],
-                    capture_output=True, text=True, timeout=5
-                )
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", created, "Enter"],
-                    capture_output=True, text=True, timeout=5
-                )
+                if not _send_profile_export(created, DEFAULT_PROFILE_ID):
+                    raise RuntimeError("could not configure member pane")
             except Exception:
                 logger.exception("Failed to set per-user CODEX_HOME for '%s'", created)
         # Authenticate non-admin sessions from the shared Codex auth file.
@@ -6127,29 +7357,10 @@ async def api_create_session(request: Request, body: CreateSession):
                 else "api" if mode == "apikey"
                 else "unconfigured"
             )
-        # Apply profile (CODEX_HOME) if requested. For non-admin users the
-        # per-user dir we exported above takes precedence; honoring profile_id
-        # would let one user point at another's profile, so we ignore it for
-        # non-admins. Admins keep the existing behavior.
-        if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
-            roles = _load_roles()
-            if _find_profile(requested_profile, roles):
-                roles["session_profiles"][created] = requested_profile
-                _save_roles(roles)
-                _send_profile_export(created, requested_profile)
-            else:
-                logger.warning("Unknown profile_id '%s' on session create", requested_profile)
-        # Optionally launch a command in the new session. Pin the default model
-        # unless the chosen profile or isolated member config pins its own.
+        # Optionally launch a command in the new session. Team members keep the
+        # model pinned in their isolated Codex config; admins use the dashboard default.
         if NEW_SESSION_CMD:
             _pin_model = not (user and not _is_admin(user))
-            try:
-                if _is_admin(user) and requested_profile != DEFAULT_PROFILE_ID:
-                    _prof = _find_profile(requested_profile, _load_roles())
-                    if _prof and (_prof.get("model") or "").strip():
-                        _pin_model = False
-            except Exception:
-                logger.debug("Profile model lookup failed on create", exc_info=True)
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
                  _launch_codex_cmd(_session_launch_base(created, user), pin_model=_pin_model)],
@@ -6228,12 +7439,6 @@ async def api_delete_session(request: Request, session_name: str):
         _session_stats_cache.pop(session_name, None)
         _auto_respond_cooldown.pop(session_name, None)
         _session_auth_mode.pop(session_name, None)
-        _away_mode_state.pop(session_name, None)
-        # Cancel go-nuts worker if running
-        gn_state = _go_nuts_state.get(session_name, {})
-        if gn_state.get("task") and not gn_state["task"].done():
-            gn_state["task"].cancel()
-        _go_nuts_state.pop(session_name, None)
         _simple_watchdog_state.pop(session_name, None)
         _simple_watchdog_log.pop(session_name, None)
         _crash_recovery_state.pop(session_name, None)
@@ -6241,15 +7446,6 @@ async def api_delete_session(request: Request, session_name: str):
         if session_name in _simple_watchdog_disabled:
             _simple_watchdog_disabled.discard(session_name)
             _save_simple_watchdog_disabled()
-        # Drop session->profile mapping so a future session reusing this name
-        # starts on the default profile.
-        try:
-            _roles = _load_roles()
-            if session_name in _roles.get("session_profiles", {}):
-                _roles["session_profiles"].pop(session_name, None)
-                _save_roles(_roles)
-        except Exception:
-            logger.debug("Failed to clean up profile mapping for '%s'", session_name, exc_info=True)
         # Drop the ownership record. Messages/notes are kept on disk so they
         # show up in the user's History tab even after the live session dies.
         _clear_session_owner(session_name)
@@ -6439,14 +7635,14 @@ def _encode_project_path(cwd: str) -> str:
 def _session_config_base(session_name: str) -> Path:
     """Resolve the CODEX_HOME a session actually uses.
 
-    Non-admin users always use their isolated ``~/.codex-user-<id>/`` dir,
-    overriding any profile_id that may have been recorded. Admin sessions fall
-    back to the normal profile resolver.
+    Non-admin users use their isolated ``~/.codex-user-<id>/`` dir. All admin
+    sessions use the standard dashboard Codex home; legacy profile mappings are
+    intentionally ignored.
     """
     owner = _user_for_session(session_name)
     if owner and not _is_admin(owner):
         return _user_codex_config_dir(owner)
-    return _profile_dir(_get_session_profile_id(session_name))
+    return CODEX_HOME
 
 
 def _session_memory_dir(session_name: str) -> tuple[Path, str, str]:
@@ -6473,7 +7669,7 @@ def _sanitize_memory_filename(name: str) -> str:
 
 @app.get("/api/sessions/{session_name}/memory-md")
 async def api_get_session_memory_md(session_name: str):
-    """Read the auto-memory MEMORY.md for the session's (profile, cwd) pair."""
+    """Read the auto-memory MEMORY.md for the session's Codex home and cwd."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -6612,7 +7808,7 @@ class ContextFileBody(BaseModel):
 _CONTEXT_FILES = [
     {"id": "codex-agents", "paths": [CODEX_HOME / "AGENTS.md"], "load": "auto",
      "label": "$CODEX_HOME/AGENTS.md",
-     "note": "Global Codex instructions loaded for every session using the default profile."},
+     "note": "Global Codex instructions loaded for every dashboard session."},
     {"id": "home-agents", "paths": [Path.home() / "AGENTS.md"], "load": "auto",
      "label": "~/AGENTS.md",
      "note": "Project-tree instructions for sessions whose working directory is under home."},
@@ -6684,7 +7880,9 @@ def _context_file_entries():
 
 
 @app.get("/api/context-files")
-async def api_list_context_files():
+async def api_list_context_files(request: Request):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     files = []
     for e in _context_file_entries():
         p = e["path"]
@@ -6705,9 +7903,11 @@ async def api_list_context_files():
 
 
 @app.post("/api/context-files")
-async def api_save_context_file(body: ContextFileBody):
+async def api_save_context_file(request: Request, body: ContextFileBody):
     """Save one registry file in place. `name` carries the registry id — the path
     is never taken from the client, so there is nothing to traverse."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     entry = next((e for e in _context_file_entries() if e["id"] == body.name), None)
     if entry is None:
         return JSONResponse({"error": "Unknown context file"}, status_code=404)
@@ -6735,13 +7935,11 @@ async def api_save_context_file(body: ContextFileBody):
 #   1. Library:  ~/.tmux-dashboard/skill-library/<name>/SKILL.md
 #                Canonical user-authored skills with YAML frontmatter
 #                (name + description). This is the source of truth.
-#   2. Profile:  ~/.codex-<profile_id>/skills/<name>/SKILL.md
-#                Per-profile skills directory that Codex reads when
-#                CODEX_HOME is set. Library skills are *symlinked* in
-#                here on a per-profile basis, so the same library entry can
-#                be enabled in some profiles and disabled in others.
+#   2. Active:   ~/.codex/skills/<name>/SKILL.md
+#                Global skills loaded by every dashboard session. Library
+#                skills are symlinked here when enabled.
 #   3. Built-ins: bundled into the Codex binary itself. Always present,
-#                not configurable per profile. Listed via /api/builtin-skills
+#                not configurable. Listed via /api/builtin-skills
 #                so the UI can surface them as read-only.
 
 SKILLS_DIR = MESSAGES_DIR / "skills"
@@ -6751,7 +7949,7 @@ _SKILL_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_-]+\.md$")
 _SKILL_DIR_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 # Built-in skills bundled with Codex itself. Always available; cannot be
-# disabled per profile. Surfaced to the UI as a read-only "Built-in" section
+# disabled. Surfaced to the UI as a read-only "Built-in" section
 # so users understand which skills are available without any configuration.
 _BUILTIN_SKILLS = [
     {"name": "imagegen", "description": "Generate and edit images with OpenAI image models."},
@@ -7037,16 +8235,14 @@ async def api_list_builtin_skills():
     return JSONResponse({"skills": list(_BUILTIN_SKILLS)})
 
 
-# --- Codex role profiles (per-role isolated configs via CODEX_HOME) ---
+# --- Standard Codex settings (legacy profile-shaped persistence) ---
 
 ROLES_FILE = MESSAGES_DIR / "codex-roles.json"
 DEFAULT_PROFILE_ID = "default"
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _RESERVED_PROFILE_IDS = {DEFAULT_PROFILE_ID}
 
-# Common permissions + env baseline applied to every profile (uniform
-# "no permission prompts + telemetry off + generous bash timeouts" across
-# all roles). Individual profiles can still override via the Profiles editor.
+# Common permissions and environment baseline kept in the legacy default record.
 _COMMON_PERMISSIONS = {
     "defaultMode": "bypassPermissions",
     "allow": ["*"],
@@ -7059,301 +8255,8 @@ _COMMON_ENV = {
     "BASH_MAX_TIMEOUT_MS": "600000",
 }
 
-# Built-in role presets seeded on first run. Each becomes ~/.codex-<id>/
-# with config.toml, AGENTS.md, and an empty skills/ dir. The user can edit
-# any of these via the Profiles editor in Config.
-_PROFILE_PRESETS = [
-    {
-        "id": "ui-expert", "name": "UI Expert",
-        "model": "gpt-5.4-mini", "effort": "medium",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# UI Expert\n\n"
-            "## Verify visually\n"
-            "After every UI change: run dev server, screenshot the affected viewport at 375/768/1280/1920px. "
-            "Compare against the previous screenshot. Don't claim \"done\" without the diff.\n\n"
-            "## Design tokens are law\n"
-            "Use design tokens from `src/styles/tokens.css`. No raw hex, rem, or px in component files. "
-            "If a token is missing, propose adding it before hardcoding.\n\n"
-            "## Component patterns\n"
-            "- Composition > props explosion. Slot/children before 12-prop variants.\n"
-            "- Every interactive element must have :hover, :focus-visible, :disabled, :active.\n"
-            "- Motion: prefers-reduced-motion respected always.\n\n"
-            "## Accessibility floor\n"
-            "WCAG 2.2 AA minimum. Every PR runs axe via Playwright. Never ship contrast < 4.5:1.\n"
-        ),
-    },
-    {
-        "id": "ux-expert", "name": "UX Expert",
-        "model": "gpt-5.4", "effort": "high",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# UX Expert\n\n"
-            "## Process discipline\n"
-            "Problem -> user -> JTBD -> flow -> wireframe -> copy -> test plan. "
-            "Never jump to UI before the JTBD is written down in one sentence.\n\n"
-            "## Outputs\n"
-            "- Flows: mermaid stateDiagram or flowchart\n"
-            "- Heuristic evals: severity 0-4 (Nielsen scale), one finding per row, with screenshot ref\n"
-            "- Microcopy: provide 3 variants, label each by tone (direct / warm / playful)\n\n"
-            "## Synthesis rules\n"
-            "When given >3 transcripts: cluster by theme first, count mentions, "
-            "quote sparingly (<=15 words), surface contradictions explicitly.\n\n"
-            "## Reject without data\n"
-            "If asked \"should we add X feature\": ask what user evidence exists. "
-            "No evidence -> propose smallest test to gather it before designing.\n"
-        ),
-    },
-    {
-        "id": "qa-agent", "name": "QA Agent",
-        "model": "gpt-5.4-mini", "effort": "medium",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# QA Agent\n\n"
-            "## Test pyramid targets\n"
-            "70% unit, 20% integration, 10% e2e. Question any PR that inverts this.\n\n"
-            "## Coverage rules\n"
-            "Lines >= 80%, branches >= 75%. New code: >= 90% lines or justify in PR. "
-            "Coverage is necessary, not sufficient -- also assert behavior, not just calls.\n\n"
-            "## Flake protocol\n"
-            "Failed test re-run passes? Don't merge. Mark `.flaky`, file an issue, "
-            "investigate root cause within 48h. Never @retry on green CI.\n\n"
-            "## Edge case checklist (always)\n"
-            "- empty / null / undefined inputs\n"
-            "- boundary values (0, 1, max, max+1, negative)\n"
-            "- concurrent operations / race conditions\n"
-            "- network failure / timeout\n"
-            "- malformed input / fuzzing\n"
-            "- a11y: keyboard-only path, screen reader labels\n\n"
-            "## Browser-driven verification (use agent-browser)\n"
-            "For any web-app QA, drive a real Chromium via the `agent-browser` CLI -- "
-            "do NOT scrape with curl/fetch. Before issuing commands the first time, "
-            "run `agent-browser skills get core --full` to load the version-matched "
-            "command reference, and `agent-browser skills get dogfood` for the QA "
-            "exploration workflow.\n\n"
-            "Standard loop:\n"
-            "```\n"
-            "agent-browser --session qa open <URL>\n"
-            "agent-browser --session qa snapshot -i        # interactive elements with @eN refs\n"
-            "agent-browser --session qa click @e3           # use refs, not CSS\n"
-            "agent-browser --session qa screenshot --annotate ./qa-output/<step>.png\n"
-            "agent-browser --session qa errors              # JS errors\n"
-            "agent-browser --session qa console             # console logs\n"
-            "agent-browser --session qa close               # when done\n"
-            "```\n\n"
-            "Save artifacts to `./qa-output/{screenshots,videos}/`. Use `--annotate` for "
-            "evidence screenshots. Reference elements by `@eN` (from `snapshot -i`), not CSS "
-            "selectors -- refs survive minor DOM changes. Always check `errors` + `console` "
-            "after every interaction.\n\n"
-            "## What I don't do\n"
-            "Write or modify production code. Push to remote. Approve my own PRs.\n"
-        ),
-        "seed_skills": [
-            {
-                "path": "agent-browser/SKILL.md",
-                "content": (
-                    "---\n"
-                    "name: agent-browser\n"
-                    "description: Browser automation CLI for AI agents. Use when QA work needs to interact with websites -- navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or any browser automation. Triggers include 'open a website', 'fill out a form', 'click a button', 'take a screenshot', 'test this web app', 'login to a site', 'automate browser actions', 'dogfood', 'exploratory test', 'find issues', 'bug hunt', 'review the quality of this app'. Prefer agent-browser over WebFetch / curl / built-in browser tools.\n"
-                    "allowed-tools: Bash(agent-browser:*), Bash(npx agent-browser:*)\n"
-                    "---\n\n"
-                    "# agent-browser\n\n"
-                    "Fast browser automation CLI for AI agents. Chrome/Chromium via CDP with\n"
-                    "accessibility-tree snapshots and compact `@eN` element refs.\n\n"
-                    "Already installed globally on this machine: `which agent-browser` -> /usr/bin/agent-browser.\n\n"
-                    "## Start here (read before running any agent-browser command)\n\n"
-                    "This file is a discovery stub. Load the version-matched workflow content from the CLI:\n\n"
-                    "```bash\n"
-                    "agent-browser skills get core              # workflows, common patterns, troubleshooting\n"
-                    "agent-browser skills get core --full       # also includes full command reference\n"
-                    "agent-browser skills get dogfood           # systematic QA / exploratory testing playbook\n"
-                    "```\n\n"
-                    "Always invoke as `agent-browser ...` directly -- never `npx agent-browser`. The\n"
-                    "direct binary uses the fast Rust client; npx routes through Node and is slower.\n\n"
-                    "## QA workflow at a glance\n\n"
-                    "1. **Open** target URL with a named session: `agent-browser --session qa open <URL>`\n"
-                    "2. **Snapshot** to discover interactive elements with refs: `agent-browser --session qa snapshot -i`\n"
-                    "3. **Act** using `@eN` refs from the snapshot:\n"
-                    "   - `agent-browser --session qa click @e3`\n"
-                    "   - `agent-browser --session qa fill @e2 \"value\"`\n"
-                    "   - `agent-browser --session qa press Enter`\n"
-                    "4. **Verify** state: `agent-browser --session qa errors` (JS errors), `console` (logs),\n"
-                    "   `screenshot --annotate ./qa-output/<step>.png` (visual evidence).\n"
-                    "5. **Close** when finished: `agent-browser --session qa close`.\n\n"
-                    "Always:\n"
-                    "- Use `@eN` refs from `snapshot -i`, not CSS selectors -- refs survive minor DOM changes.\n"
-                    "- After every interaction check `errors` and `console` for regressions.\n"
-                    "- Take an annotated screenshot of every reproducible bug. Save under `./qa-output/`.\n"
-                    "- Use `--session <name>` so login/cookies persist between commands.\n\n"
-                    "## QA report format\n\n"
-                    "Return findings as structured JSON when the user asks for a report:\n\n"
-                    "```json\n"
-                    "{\n"
-                    "  \"verdict\": \"HEALTHY | MINOR_ISSUES | CRITICAL_BUGS\",\n"
-                    "  \"summary\": \"<one-paragraph executive summary>\",\n"
-                    "  \"bugs\": [\n"
-                    "    {\n"
-                    "      \"severity\": \"critical | major | minor\",\n"
-                    "      \"title\": \"<short>\",\n"
-                    "      \"description\": \"<what, where, repro steps, expected vs actual>\",\n"
-                    "      \"evidence\": \"<path to screenshot or log>\"\n"
-                    "    }\n"
-                    "  ]\n"
-                    "}\n"
-                    "```\n\n"
-                    "Severity rubric:\n"
-                    "- **critical**: blocks the user (crash, broken login, data loss, security)\n"
-                    "- **major**: core feature degraded but workaround exists\n"
-                    "- **minor**: cosmetic, copy, polish\n"
-                ),
-            },
-            {
-                "path": "qa-browser-checklist.md",
-                "content": (
-                    "---\n"
-                    "name: qa-browser-checklist\n"
-                    "description: Per-page QA checklist to run after navigating to any web page during exploratory testing. Use alongside agent-browser. Trigger when doing QA, dogfood, exploratory test, smoke test, or bug hunt on a web app.\n"
-                    "---\n\n"
-                    "# Per-page QA checklist\n\n"
-                    "After every page load (or significant state change) during browser-driven QA, run\n"
-                    "through this checklist before moving on. Skip items that are clearly not applicable.\n\n"
-                    "## 1. Render & layout\n"
-                    "- Page loads without spinner stuck > 5s\n"
-                    "- No empty regions where content should be\n"
-                    "- No overlapping or cut-off text (check at 1280 and 375 viewport)\n"
-                    "- Critical above-the-fold content visible without scrolling\n\n"
-                    "## 2. Console & network\n"
-                    "```\n"
-                    "agent-browser --session qa errors\n"
-                    "agent-browser --session qa console\n"
-                    "agent-browser --session qa network requests --filter 4xx\n"
-                    "agent-browser --session qa network requests --filter 5xx\n"
-                    "```\n"
-                    "Any 4xx/5xx other than expected auth challenges is a finding. JS exceptions\n"
-                    "are a finding even if the page looks fine.\n\n"
-                    "## 3. Interactivity\n"
-                    "- Primary CTA reachable by Tab from the top of the page\n"
-                    "- :focus-visible ring present on every focusable element\n"
-                    "- Forms: try empty submit, invalid email, too-long input, special chars in name\n"
-                    "- Modals/dialogs close with Escape and with the close button\n\n"
-                    "## 4. Accessibility floor\n"
-                    "- Every form field has a label (use `agent-browser snapshot -i` and look for unlabelled inputs)\n"
-                    "- Images have alt text\n"
-                    "- Color contrast looks adequate; flag any low-contrast text for verification\n\n"
-                    "## 5. Performance smell test\n"
-                    "```\n"
-                    "agent-browser --session qa vitals\n"
-                    "```\n"
-                    "Flag LCP > 2.5s, INP > 200ms, CLS > 0.1 on the critical path.\n\n"
-                    "## 6. State leakage\n"
-                    "- Refresh the page -- does state persist as expected?\n"
-                    "- Navigate away and back -- does it restore correctly?\n"
-                    "- Open in a new tab -- does it work standalone?\n\n"
-                    "## What goes in the bug report\n\n"
-                    "For each finding: title, severity, exact repro steps using `@eN` refs from a fresh\n"
-                    "`snapshot -i`, expected vs actual, screenshot path under `./qa-output/screenshots/`,\n"
-                    "and a console/errors excerpt if relevant.\n"
-                ),
-            },
-        ],
-    },
-    {
-        "id": "researcher", "name": "Researcher",
-        "model": "gpt-5.4", "effort": "high",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# Researcher\n\n"
-            "## Output format (always)\n"
-            "1. Executive summary (<=150 words)\n"
-            "2. Key findings (bulleted, each with source link)\n"
-            "3. Methodology\n"
-            "4. Detailed sections\n"
-            "5. Open questions\n"
-            "6. Sources (numbered, full citations)\n\n"
-            "Save to `.research/<topic>/final_report.md`. Cache raw fetches in `.research/<topic>/raw/`.\n\n"
-            "## Source hierarchy\n"
-            "Primary > peer-reviewed > industry reports > reputable news > blogs > forums. "
-            "Every load-bearing claim needs a primary source.\n\n"
-            "## Decomposition first\n"
-            "For any non-trivial query: write 3-7 sub-questions before searching. "
-            "Run searches in parallel where possible. Aggregate, then synthesize.\n\n"
-            "## Quote discipline\n"
-            "Paraphrase by default. Direct quotes only when wording is legally / technically "
-            "load-bearing. Max one quote per source, <=15 words.\n\n"
-            "## Uncertainty is a finding\n"
-            "\"I couldn't determine X\" is a valid output. Don't fabricate to fill gaps.\n"
-        ),
-    },
-    {
-        "id": "security-expert", "name": "Security Expert",
-        "model": "gpt-5.4", "effort": "high",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# Security Expert\n\n"
-            "## Default posture: read-only\n"
-            "I review, report, and recommend. I do not patch unless explicitly asked "
-            "(\"apply the fix\"). I do not run network commands. I do not exfiltrate "
-            "data -- even sample logs go in redacted form.\n\n"
-            "## Review framework\n"
-            "For every concern: STRIDE category -> CVSS estimate -> exploitability notes -> "
-            "proof-of-concept (sanitized) -> remediation -> references (CWE/CVE/OWASP).\n\n"
-            "## Always check\n"
-            "- Secrets in code/config/history (gitleaks before review)\n"
-            "- Dependency CVEs (npm/pip/cargo audit)\n"
-            "- Auth: session fixation, CSRF, OAuth state, JWT alg=none, weak rotation\n"
-            "- Injection: SQL, command, SSTI, prompt injection in LLM contexts\n"
-            "- Crypto: deprecated algorithms, ECB mode, hardcoded IVs, weak RNG\n"
-            "- IDOR / authz at every endpoint, not just authn\n"
-            "- SSRF / file inclusion / path traversal\n"
-            "- Supply chain: lockfile drift, typosquats, install scripts\n\n"
-            "## Reporting\n"
-            "Severity: Critical / High / Medium / Low / Info. One issue per finding.\n\n"
-            "## What I don't do\n"
-            "Run exploits against live systems. Modify .env / secrets / IAM. "
-            "Disable checks \"to test something.\" Approve my own findings.\n"
-        ),
-    },
-    {
-        "id": "optimizer", "name": "Optimizer",
-        "model": "gpt-5.4", "effort": "high",
-        "permissions": dict(_COMMON_PERMISSIONS),
-        "env": dict(_COMMON_ENV),
-        "codex_md": (
-            "# Optimizer\n\n"
-            "## Measure first, always\n"
-            "No optimization without a baseline number. Format every proposal as:\n"
-            "  Before: X (units, conditions)\n"
-            "  After:  Y (same conditions)\n"
-            "  Method: how measured, repetitions, variance\n\n"
-            "If I can't produce \"Before\", I don't propose \"After\".\n\n"
-            "## Performance budgets (web)\n"
-            "- LCP < 2.5s, INP < 200ms, CLS < 0.1 (75th percentile, mobile, slow 4G)\n"
-            "- JS bundle: < 170KB gzipped initial route\n"
-            "- Lighthouse perf >= 90 on every PR touching the critical path\n\n"
-            "## Order of operations\n"
-            "1. Profile (find the hot path)\n"
-            "2. Algorithmic fix (Big-O)\n"
-            "3. Reduce work (memo, dedupe, cache)\n"
-            "4. Parallelize / defer\n"
-            "5. Lower-level tuning (allocations, syscalls)\n"
-            "Never invert this order.\n\n"
-            "## Anti-patterns I flag\n"
-            "- Premature memo / useMemo on cheap pure expressions\n"
-            "- Cache without invalidation strategy\n"
-            "- \"It's faster on my machine\" without prod-like data volume\n"
-            "- Micro-benchmarks without warmup, GC pause, statistical test\n"
-            "- Optimizing the 1% case while the 99% case is the bottleneck\n\n"
-            "## Cost dimension\n"
-            "Performance includes $ -- token cost, compute cost, egress cost. "
-            "Always note cost delta alongside latency delta.\n"
-        ),
-    },
-]
+# Role-specific presets are retired; all sessions use the standard Codex home.
+_PROFILE_PRESETS: list[dict] = []
 
 
 def _default_profile_record() -> dict:
@@ -7417,7 +8320,7 @@ def _refresh_builtin_presets(data: dict) -> bool:
 
 
 def _load_roles() -> dict:
-    """Load profiles + per-session mappings; seed presets on first run."""
+    """Load the legacy roles file used to persist the default Codex settings."""
     if not ROLES_FILE.exists():
         data = {
             "profiles": [_default_profile_record()] + [{**p, "builtin": True} for p in _PROFILE_PRESETS],
@@ -7701,18 +8604,16 @@ def _find_profile(profile_id: str, data: dict | None = None):
 
 
 def _get_session_profile_id(session_name: str) -> str:
-    data = _load_roles()
-    return data["session_profiles"].get(session_name) or DEFAULT_PROFILE_ID
+    """Compatibility shim: role profiles are retired, so every session is default."""
+    return DEFAULT_PROFILE_ID
 
 
-# Seed roles file + materialize built-ins at import time
+# Ensure the compatibility roles file has its default record. Retired role
+# profiles are deliberately not materialized into separate CODEX_HOME trees.
 try:
-    _initial_roles = _load_roles()
-    for _p in _initial_roles["profiles"]:
-        if _p["id"] != DEFAULT_PROFILE_ID:
-            _materialize_profile(_p)
+    _load_roles()
 except Exception:
-    logger.exception("Failed to initialize role profiles")
+    logger.exception("Failed to initialize the default Codex configuration")
 
 
 def _profile_summary(p: dict) -> dict:
@@ -7721,6 +8622,15 @@ def _profile_summary(p: dict) -> dict:
         "model": p.get("model", ""), "effort": p.get("effort", ""),
         "builtin": bool(p.get("builtin")),
     }
+
+
+def _retired_role_profile_response(profile_id: str) -> JSONResponse | None:
+    if profile_id == DEFAULT_PROFILE_ID:
+        return None
+    return JSONResponse(
+        {"error": "Role profiles have been removed; all sessions use the standard Codex home."},
+        status_code=410,
+    )
 
 
 def _normalize_reasoning_effort(effort: str | None) -> str | None:
@@ -7766,11 +8676,15 @@ class SetSessionModelBody(BaseModel):
 @app.get("/api/profiles")
 async def api_list_profiles():
     data = _load_roles()
-    return JSONResponse({"profiles": [_profile_summary(p) for p in data["profiles"]]})
+    default = _find_profile(DEFAULT_PROFILE_ID, data) or _default_profile_record()
+    return JSONResponse({"profiles": [_profile_summary(default)]})
 
 
 @app.get("/api/profiles/{profile_id}")
 async def api_get_profile(profile_id: str):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     p = _find_profile(profile_id, data)
     if not p:
@@ -7782,35 +8696,17 @@ async def api_get_profile(profile_id: str):
 
 @app.post("/api/profiles")
 async def api_create_profile(body: CreateProfileBody):
-    name = body.name.strip()
-    if not name:
-        return JSONResponse({"error": "Name is required"}, status_code=400)
-    pid = re.sub(r"[^a-z0-9-]", "-", name.lower())
-    pid = re.sub(r"-+", "-", pid).strip("-")[:32]
-    if not pid or not _PROFILE_ID_RE.match(pid) or pid in _RESERVED_PROFILE_IDS:
-        return JSONResponse({"error": "Invalid name (use letters/numbers; can't be 'default')"}, status_code=400)
-    data = _load_roles()
-    if any(p["id"] == pid for p in data["profiles"]):
-        return JSONResponse({"error": f"Profile id '{pid}' already exists"}, status_code=409)
-    base = _find_profile(body.from_preset, data) if body.from_preset else None
-    new_p = {
-        "id": pid, "name": name,
-        "model": (base or {}).get("model", ""),
-        "effort": (base or {}).get("effort", ""),
-        "permissions": (base or {}).get("permissions", {}),
-        "env": (base or {}).get("env", {}),
-        "codex_md": (base or {}).get("codex_md", ""),
-        "memory_md": (base or {}).get("memory_md", ""),
-        "builtin": False,
-    }
-    data["profiles"].append(new_p)
-    _save_roles(data)
-    _materialize_profile(new_p)
-    return JSONResponse({"ok": True, "id": pid, "profile": _profile_summary(new_p)})
+    return JSONResponse(
+        {"error": "Role profiles have been removed; configure the standard Codex home instead."},
+        status_code=410,
+    )
 
 
 @app.put("/api/profiles/{profile_id}")
 async def api_update_profile(profile_id: str, body: UpdateProfileBody):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     p = _find_profile(profile_id, data)
     if not p:
@@ -7838,6 +8734,9 @@ async def api_update_profile(profile_id: str, body: UpdateProfileBody):
 
 @app.delete("/api/profiles/{profile_id}")
 async def api_delete_profile(profile_id: str):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     if profile_id == DEFAULT_PROFILE_ID:
         return JSONResponse({"error": "The default profile cannot be deleted."}, status_code=400)
     data = _load_roles()
@@ -7856,12 +8755,16 @@ async def api_delete_profile(profile_id: str):
 
 @app.get("/api/profiles/{profile_id}/skills")
 async def api_list_profile_skills(profile_id: str):
-    """List the skills currently installed under ~/.codex-<profile>/skills/.
+    """List the global skills installed under the standard ~/.codex/skills/.
 
     Each entry is a directory containing SKILL.md (the format Codex reads).
     Library symlinks are flagged with `from_library: true`. Any leftover flat .md
-    files are surfaced under `legacy_files` so the UI can warn the user.
+    files are surfaced under `legacy_files`. The profile-shaped route remains
+    only for default-scope compatibility.
     """
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -7880,7 +8783,10 @@ async def api_list_profile_skills(profile_id: str):
 
 @app.get("/api/profiles/{profile_id}/skills/library")
 async def api_list_profile_library_state(profile_id: str):
-    """Return the full library with per-profile enabled state."""
+    """Return the full library with its global enabled state."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -7898,10 +8804,10 @@ async def api_list_profile_library_state(profile_id: str):
 
 @app.post("/api/profiles/{profile_id}/skills/library/{skill_name}")
 async def api_enable_library_skill(profile_id: str, skill_name: str):
-    """Enable a library skill for this profile by symlinking it into the profile's skills/ dir.
-
-    Works on the default profile too — the library is now the source of truth.
-    """
+    """Enable a library skill globally by symlinking it into ~/.codex/skills/."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -7916,7 +8822,7 @@ async def api_enable_library_skill(profile_id: str, skill_name: str):
     if target.is_symlink() or target.exists():
         if _is_library_link(skills_dir, name):
             return JSONResponse({"ok": True, "already_enabled": True})
-        return JSONResponse({"error": f"'{name}' already exists in this profile and isn't a library link"}, status_code=409)
+        return JSONResponse({"error": f"'{name}' already exists and isn't a library link"}, status_code=409)
     try:
         target.symlink_to(src.resolve(), target_is_directory=True)
     except Exception:
@@ -7927,10 +8833,10 @@ async def api_enable_library_skill(profile_id: str, skill_name: str):
 
 @app.delete("/api/profiles/{profile_id}/skills/library/{skill_name}")
 async def api_disable_library_skill(profile_id: str, skill_name: str):
-    """Disable a library skill for this profile by removing its symlink.
-
-    Works on the default profile too — the library is now the source of truth.
-    """
+    """Disable a global library skill by removing its ~/.codex/skills/ symlink."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -7942,7 +8848,7 @@ async def api_disable_library_skill(profile_id: str, skill_name: str):
     if not target.is_symlink() and not target.exists():
         return JSONResponse({"ok": True, "already_disabled": True})
     if not _is_library_link(skills_dir, name):
-        return JSONResponse({"error": f"'{name}' is not a library link in this profile (refusing to delete custom content)"}, status_code=409)
+        return JSONResponse({"error": f"'{name}' is not a library link (refusing to delete custom content)"}, status_code=409)
     try:
         target.unlink()
     except Exception:
@@ -7953,11 +8859,14 @@ async def api_disable_library_skill(profile_id: str, skill_name: str):
 
 @app.post("/api/profiles/{profile_id}/skills/{skill_name}/promote")
 async def api_promote_profile_skill(profile_id: str, skill_name: str):
-    """Move a custom in-profile skill into the shared library so any profile can enable it.
+    """Move a custom active skill into the shared library.
 
-    Copies <profile>/skills/<name>/ -> ~/.tmux-dashboard/skill-library/<name>/, then
-    replaces the original with a symlink so the source profile keeps it active.
+    Copies ~/.codex/skills/<name>/ into the library, then replaces the original
+    with a symlink so the skill remains globally active.
     """
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -7966,7 +8875,7 @@ async def api_promote_profile_skill(profile_id: str, skill_name: str):
         return JSONResponse({"error": "Invalid skill name"}, status_code=400)
     src = _profile_dir(profile_id) / "skills" / name
     if not (src / "SKILL.md").is_file():
-        return JSONResponse({"error": "Skill not found in this profile"}, status_code=404)
+        return JSONResponse({"error": "Active skill not found"}, status_code=404)
     if src.is_symlink():
         return JSONResponse({"error": "Skill is already a library link"}, status_code=409)
     SKILL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
@@ -7996,12 +8905,15 @@ async def api_promote_profile_skill(profile_id: str, skill_name: str):
 
 @app.post("/api/profiles/{profile_id}/skills")
 async def api_save_profile_skill(profile_id: str, body: SkillFileBody):
-    """Legacy: write a flat .md file at the profile root skills/ dir.
+    """Legacy: write a flat .md file in the standard skills directory.
 
     Kept so existing tooling doesn't break. Codex does NOT load these as
     Skills (they're not in the `<name>/SKILL.md` directory format). Prefer the
-    library + per-profile toggle endpoints for new content.
+    library toggles for new content.
     """
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8023,11 +8935,14 @@ async def api_save_profile_skill(profile_id: str, body: SkillFileBody):
 
 @app.delete("/api/profiles/{profile_id}/skills/{filename}")
 async def api_delete_profile_skill(profile_id: str, filename: str):
-    """Legacy: delete a flat .md file (or a directory-form skill) from a profile's skills/.
+    """Legacy: delete a flat .md file or active skill from ~/.codex/skills/.
 
     Refuses to delete library symlinks via this endpoint — use the library
     enable/disable endpoints instead.
     """
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8056,13 +8971,12 @@ async def api_delete_profile_skill(profile_id: str, filename: str):
 # there were never referenced from it, so nothing ever read them.
 
 
-# --- Profile file browser (full ~/.codex-<id>/ contents) ---
-# Lets the Profiles editor expose every file Codex actually loads from the
-# config dir: config.toml (full), .codex.json (MCP/projects), agents/, commands/,
-# plus an auth.json status read (we never expose tokens or API keys).
+# --- Legacy profile-shaped file routes (default ~/.codex only) ---
+# Non-default IDs are retired. These compatibility routes expose standard Codex
+# config files without ever returning tokens or API keys.
 
-# Categories the UI surfaces. The first element of each tuple is the relative path
-# under the profile dir; the second is the kind ("json", "md", "binary").
+# The first element of each tuple is the relative path under the config dir; the
+# second is the kind ("json", "md", "binary").
 _PROFILE_FILE_CATEGORIES = {
     "config": [("config.toml", "toml")],
     "mcp":      [(".codex.json", "json")],
@@ -8119,6 +9033,9 @@ def _read_dir_entries(d: Path, exts: tuple = (".md", ".json", ".toml")) -> list:
 @app.get("/api/profiles/{profile_id}/files")
 async def api_list_profile_files(profile_id: str):
     """Return a structured inventory of every editable file inside the profile dir."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8175,6 +9092,9 @@ class ProfileFileBody(BaseModel):
 
 @app.get("/api/profiles/{profile_id}/file")
 async def api_get_profile_file(profile_id: str, path: str):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8195,6 +9115,9 @@ async def api_get_profile_file(profile_id: str, path: str):
 
 @app.put("/api/profiles/{profile_id}/file")
 async def api_save_profile_file(profile_id: str, body: ProfileFileBody):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8227,6 +9150,9 @@ async def api_save_profile_file(profile_id: str, body: ProfileFileBody):
 
 @app.delete("/api/profiles/{profile_id}/file")
 async def api_delete_profile_file(profile_id: str, path: str):
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8260,6 +9186,9 @@ async def api_delete_profile_file(profile_id: str, path: str):
 @app.get("/api/profiles/{profile_id}/credentials")
 async def api_profile_credentials_status(profile_id: str):
     """Read login status from auth.json -- never returns tokens or keys."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8296,6 +9225,9 @@ async def api_profile_credentials_status(profile_id: str):
 @app.delete("/api/profiles/{profile_id}/credentials")
 async def api_profile_logout(profile_id: str):
     """Remove auth.json for this profile."""
+    retired = _retired_role_profile_response(profile_id)
+    if retired is not None:
+        return retired
     data = _load_roles()
     if not _find_profile(profile_id, data):
         return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -8311,20 +9243,20 @@ async def api_profile_logout(profile_id: str):
 
 
 # --- Project-scope (per-session, cwd-bound) file management ---
-# Codex loads these on top of the active profile, regardless of which profile
-# the session uses: <cwd>/AGENTS.md, <cwd>/.codex/config.toml, <cwd>/.mcp.json.
-# Surface them in the session's "More" dropdown so the user can edit per-project
-# rules without leaving the dashboard.
+# Codex loads these on top of the standard home configuration:
+# <cwd>/AGENTS.md, <cwd>/.codex/config.toml, <cwd>/.mcp.json.
+# The API remains available for existing direct integrations, but these files are
+# no longer surfaced in the session UI.
 
 _PROJECT_FILES = [
     ("AGENTS.md", "md",
-     "Project rules loaded on top of the profile's AGENTS.md."),
+     "Project rules loaded on top of the global AGENTS.md."),
     (".codex/config.toml", "toml",
-     "Project config (model, env, hooks) loaded on top of profile config."),
+     "Project config (model, env, hooks) loaded on top of global config."),
     (".codex/config.local.toml", "toml",
      "Project-local config (not committed). Loaded last; wins over everything."),
     (".mcp.json", "json",
-     "Project-scope MCP servers (added to profile MCP servers)."),
+     "Project-scope MCP servers (added to global MCP servers)."),
 ]
 
 
@@ -8428,7 +9360,34 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
 
 def _send_profile_export(session_name: str, profile_id: str):
     """Send `export CODEX_HOME=...` (or unset) to the tmux pane shell."""
-    if profile_id == DEFAULT_PROFILE_ID:
+    owner = _user_for_session(session_name)
+    if owner and not _is_admin(owner):
+        member_project_dir = _member_session_project_dir(owner, session_name)
+        try:
+            _ensure_user_codex_config_dir(owner)
+            _ensure_user_browser_session(owner, start=False)
+            member_codex_home = _user_codex_config_dir(owner)
+            member_config = member_codex_home / "config.toml"
+            existing = member_config.read_text() if member_config.exists() else ""
+            trusted = _ensure_codex_project_trust(
+                existing,
+                str(member_project_dir),
+            )
+            if trusted != existing:
+                _backup_before_dashboard_write(member_config)
+                member_config.write_text(trusted)
+        except Exception:
+            logger.exception(
+                "Failed to refresh member isolation for '%s'",
+                session_name,
+            )
+        cmd = (
+            "export CODEX_HOME="
+            + shlex.quote(str(_user_codex_config_dir(owner)))
+            + "; cd -- "
+            + shlex.quote(str(member_project_dir))
+        )
+    elif profile_id == DEFAULT_PROFILE_ID:
         cmd = "unset CODEX_HOME"
     else:
         cmd = f"export CODEX_HOME={shlex.quote(str(_profile_dir(profile_id)))}"
@@ -8448,34 +9407,43 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    data = _load_roles()
-    profile = _find_profile(body.profile_id, data)
-    if not profile:
-        return JSONResponse({"error": "Profile not found"}, status_code=404)
-    pid = body.profile_id
-    if pid == DEFAULT_PROFILE_ID:
-        data["session_profiles"].pop(session_name, None)
-    else:
-        data["session_profiles"][session_name] = pid
-    _save_roles(data)
-
-    codex_running = await _async_is_codex_running(session_name)
-    exported = False
-    restarted = False
-    if not codex_running:
-        # Shell is exposed -- export immediately so the next `codex` invocation picks it up
-        exported = _send_profile_export(session_name, pid)
-    elif body.restart:
-        exported, restarted = await _restart_codex_with_active_profile(session_name, pid)
-
-    return JSONResponse({
-        "ok": True, "profile_id": pid,
-        "codex_was_running": codex_running,
-        "exported": exported, "restarted": restarted,
-    })
+    return JSONResponse(
+        {"error": "Session profiles have been removed; all sessions use the standard Codex configuration."},
+        status_code=410,
+    )
 
 
 # --- System stats ---
+
+# Real CPU utilisation, sampled as a delta between two /proc/stat reads. The
+# dashboard used to report `loadavg / ncpu` as "CPU Usage", which is a different
+# quantity: load average counts runnable *and* uninterruptible tasks, so a box
+# with several agents waiting on disk or network shows "100% CPU" while most
+# cores are idle. On a 4-vCPU box running four agent sessions that misfires
+# constantly. Keep the two apart.
+_CPU_SAMPLE = {"total": 0, "idle": 0, "pct": 0.0}
+_CPU_SAMPLE_LOCK = threading.Lock()
+
+
+def _cpu_utilisation_pct() -> float:
+    """Percentage of all cores busy since the previous call (0 on first call)."""
+    try:
+        with open("/proc/stat") as fh:
+            fields = [int(x) for x in fh.readline().split()[1:]]
+    except Exception:
+        return 0.0
+    total = sum(fields)
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # idle + iowait
+    with _CPU_SAMPLE_LOCK:
+        prev_total, prev_idle = _CPU_SAMPLE["total"], _CPU_SAMPLE["idle"]
+        _CPU_SAMPLE["total"], _CPU_SAMPLE["idle"] = total, idle
+        d_total, d_idle = total - prev_total, idle - prev_idle
+        # Too small a window (or the first call) gives a meaningless ratio —
+        # reuse the last good reading rather than printing noise.
+        if prev_total and d_total > 50:
+            _CPU_SAMPLE["pct"] = max(0.0, min(100.0, round(100.0 * (1 - d_idle / d_total), 1)))
+        return _CPU_SAMPLE["pct"]
+
 
 @app.get("/api/stats")
 async def api_stats():
@@ -8493,12 +9461,16 @@ async def api_stats():
                 stats["threads_total"] = int(total)
     except Exception:
         stats["cpu_load"] = {}
-    # CPU count and approximate usage percent
+    # CPU count and usage percent
     try:
         cpu_count = os.cpu_count() or 1
         stats["cpu_count"] = cpu_count
+        stats["cpu_percent"] = _cpu_utilisation_pct()
+        # Load average is a queue length, not a utilisation — a box with four
+        # agents blocked on I/O reads "100%" while three cores sit idle. Report
+        # it as its own number so the two are never confused again.
         load_1m = float(stats.get("cpu_load", {}).get("1m", 0))
-        stats["cpu_percent"] = min(round(load_1m / cpu_count * 100, 1), 100.0)
+        stats["cpu_load_pct"] = min(round(load_1m / cpu_count * 100, 1), 999.0)
     except Exception:
         stats["cpu_count"] = 1
         stats["cpu_percent"] = 0
@@ -8880,7 +9852,11 @@ async def api_login_health():
 # --- Codex authentication status --------------------------------------------
 def _auth_admin_ok(request: Request) -> bool:
     user = _current_user(request)
-    return not TEAM_MODE or bool(user and _is_admin(user))
+    # Role is the authorization boundary whenever accounts exist. TEAM_MODE
+    # controls member provisioning/sandbox behavior, not admin privileges.
+    # With authentication disabled, _current_user() already returns a synthetic
+    # admin, preserving the single-user development behavior.
+    return bool(user and _is_admin(user))
 
 
 def _load_longlived_token() -> str:
@@ -8935,7 +9911,10 @@ async def api_legacy_claude_auth_removed(request: Request):
 # pre-existing systemd browser on display :99 / port 6080.
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
-BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+BROWSER_MAX_EXTRA = 4  # cap optional admin extras; account browsers are required
+_browser_sessions_lock = threading.Lock()
+_browser_starting: dict[str, float] = {}
+_BROWSER_START_RETRY_SECONDS = 30
 # Auto-auth: drive the OAuth click-through in the designated login browser and
 # type the code back.
 #
@@ -9038,7 +10017,8 @@ _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222, "managed": False,
+    "cdp_port": 9222, "managed": False, "owner_id": "admin",
+    "account_browser": True,
 }
 
 
@@ -9069,8 +10049,10 @@ def _load_browser_sessions() -> list:
 
 def _save_browser_sessions(sessions: list):
     try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        BROWSER_SESSIONS_FILE.write_text(json.dumps({"sessions": sessions}, indent=2))
+        _atomic_write_json(
+            BROWSER_SESSIONS_FILE,
+            {"sessions": sessions},
+        )
     except Exception:
         logger.debug("Failed to save browser sessions", exc_info=True)
 
@@ -9098,6 +10080,243 @@ def _next_browser_slot(sessions: list) -> int:
     while k in used:
         k += 1
     return k
+
+
+def _spawn_browser_session(session: dict) -> None:
+    """Start one managed Chrome/noVNC stack without waiting for readiness."""
+    _ensure_browser_launcher()
+    subprocess.Popen(
+        [
+            "setsid",
+            "bash",
+            BROWSER_LAUNCHER,
+            "start",
+            str(session["id"]),
+            str(session["display"]),
+            str(session["rfb_port"]),
+            str(session["vnc_port"]),
+            str(session["cdp_port"]),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _claim_browser_proxy_session(session: dict) -> None:
+    """Give one browser exclusive ownership of its loopback proxy port."""
+    sid = str(session.get("id", "")).strip()
+    display = int(session.get("display", 0) or 0)
+    if not sid or display < 99:
+        return
+    local_port = 3128 + display - 99
+    conf = _proxy_conf()
+    proxy_sessions = conf.setdefault("sessions", {})
+    if not isinstance(proxy_sessions, dict):
+        proxy_sessions = {}
+        conf["sessions"] = proxy_sessions
+    changed = False
+    for other_sid, other in list(proxy_sessions.items()):
+        if (
+            other_sid != sid
+            and isinstance(other, dict)
+            and int(other.get("local_port", 0) or 0) == local_port
+        ):
+            proxy_sessions.pop(other_sid, None)
+            changed = True
+    proxy_session = proxy_sessions.setdefault(sid, {})
+    if int(proxy_session.get("local_port", 0) or 0) != local_port:
+        proxy_session["local_port"] = local_port
+        changed = True
+    if not proxy_session.get("session_id"):
+        proxy_session["session_id"] = secrets.token_hex(5)
+        changed = True
+    if "enabled" not in proxy_session:
+        proxy_session["enabled"] = True
+        changed = True
+    if changed:
+        _proxy_save(conf)
+
+
+def _release_browser_proxy_sessions(session_ids: set[str]) -> None:
+    """Remove relay identities that belonged to deleted browser sessions."""
+    if not session_ids:
+        return
+    conf = _proxy_conf()
+    proxy_sessions = conf.get("sessions")
+    if not isinstance(proxy_sessions, dict):
+        return
+    changed = False
+    for sid in session_ids:
+        if proxy_sessions.pop(sid, None) is not None:
+            changed = True
+    if changed:
+        _proxy_save(conf)
+
+
+def _ensure_user_browser_session(
+    user: dict,
+    *,
+    start: bool = True,
+) -> dict:
+    """Allocate and, on access, start one persistent browser for an account."""
+    user_id = str(user.get("id", "")).strip()
+    if not user_id:
+        return {}
+    with _browser_sessions_lock:
+        sessions = _load_browser_sessions()
+        owned = [
+            session
+            for session in sessions
+            if _browser_owner_id(session) == user_id
+            and session.get("account_browser", session.get("id") == "default")
+        ]
+        session = next(
+            (item for item in owned if item.get("use_for_login")),
+            owned[0] if owned else None,
+        )
+        if session is None:
+            slot = _next_browser_slot(sessions)
+            sid_base = "acct-" + hashlib.sha256(
+                user_id.encode("utf-8")
+            ).hexdigest()[:16]
+            sid = sid_base
+            suffix = 2
+            existing_ids = {str(item.get("id", "")) for item in sessions}
+            while sid in existing_ids:
+                sid = f"{sid_base}-{suffix}"
+                suffix += 1
+            session = {
+                "id": sid,
+                "name": f"{user.get('username') or 'User'} browser"[:80],
+                "slot": slot,
+                "display": 99 + slot,
+                "rfb_port": 5900 + slot,
+                "vnc_port": 6080 + slot,
+                "cdp_port": 9222 + slot,
+                "managed": True,
+                "owner_id": user_id,
+                "account_browser": True,
+                "created_at": time.time(),
+            }
+            sessions.append(session)
+            _save_browser_sessions(sessions)
+            logger.info(
+                "Allocated browser '%s' to account '%s'",
+                sid,
+                user_id,
+            )
+        if not _is_admin(user):
+            try:
+                member_cfg = _user_codex_config_dir(user)
+                if (member_cfg / "config.toml").exists():
+                    _configure_member_codex_isolation(
+                        member_cfg,
+                        user,
+                        session,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to bind browser '%s' to account '%s'",
+                    session.get("id", ""),
+                    user_id,
+                )
+        if start and session.get("managed"):
+            try:
+                _claim_browser_proxy_session(session)
+            except Exception:
+                logger.debug(
+                    "Failed to claim proxy port for browser '%s'",
+                    session.get("id", ""),
+                    exc_info=True,
+                )
+        if (
+            start
+            and session.get("managed")
+            and not _browser_port_alive(session.get("vnc_port", 0))
+        ):
+            sid = str(session.get("id", ""))
+            last_start = float(_browser_starting.get(sid, 0) or 0)
+            if time.time() - last_start >= _BROWSER_START_RETRY_SECONDS:
+                _browser_starting[sid] = time.time()
+                try:
+                    _spawn_browser_session(session)
+                except Exception:
+                    _browser_starting.pop(sid, None)
+                    logger.exception(
+                        "Failed to start browser '%s' for account '%s'",
+                        sid,
+                        user_id,
+                    )
+        return session
+
+
+def _ensure_all_user_browser_sessions() -> None:
+    """Refresh member context and restore every account browser at startup."""
+    for user in _load_users():
+        if not _is_admin(user):
+            try:
+                _ensure_user_codex_config_dir(user)
+            except Exception:
+                logger.exception(
+                    "Failed to refresh Codex context for account '%s'",
+                    user.get("id", ""),
+                )
+        try:
+            _ensure_user_browser_session(user)
+        except Exception:
+            logger.exception(
+                "Failed to provision browser for account '%s'",
+                user.get("id", ""),
+            )
+
+
+def _delete_user_browser_session(user_id: str) -> None:
+    """Stop and remove browser stacks owned by a deleted account."""
+    with _browser_sessions_lock:
+        sessions = _load_browser_sessions()
+        owned = [
+            session
+            for session in sessions
+            if _browser_owner_id(session) == user_id
+            and session.get("account_browser")
+        ]
+        for session in owned:
+            sid = str(session.get("id", ""))
+            if session.get("managed"):
+                subprocess.run(
+                    ["bash", BROWSER_LAUNCHER, "stop", sid],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            _browser_starting.pop(sid, None)
+            if (
+                sid not in (".", "..")
+                and re.fullmatch(r"[A-Za-z0-9._-]+", sid)
+            ):
+                session_dir = CB_ROOT / "sessions" / sid
+                if session_dir.exists():
+                    shutil.rmtree(session_dir, ignore_errors=True)
+        if owned:
+            owned_ids = {id(session) for session in owned}
+            _save_browser_sessions([
+                session
+                for session in sessions
+                if id(session) not in owned_ids
+            ])
+        try:
+            _release_browser_proxy_sessions({
+                str(session.get("id", ""))
+                for session in owned
+                if session.get("id")
+            })
+        except Exception:
+            logger.debug(
+                "Failed to release browser proxy sessions for user '%s'",
+                user_id,
+                exc_info=True,
+            )
 
 
 def _browser_viewer_url(s: dict) -> str:
@@ -9140,17 +10359,32 @@ class BrowserCreateBody(BaseModel):
     name: str = ""
 
 
+def _is_admin_extra_browser(session: dict) -> bool:
+    return bool(session.get("managed") and not session.get("account_browser"))
+
+
 @app.get("/api/browser/sessions")
 async def api_browser_sessions(request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    sessions = _load_browser_sessions()
+    user = _current_user(request)
+    user_id = str((user or {}).get("id", ""))
+    sessions = [
+        session
+        for session in _load_browser_sessions()
+        if _browser_owner_id(session) == user_id
+    ]
+    usernames = {
+        str(user.get("id", "")): str(user.get("username", ""))
+        for user in _load_users()
+    }
     out = []
     for s in sessions:
         row = _browser_response_row(s)
+        row["owner_username"] = usernames.get(_browser_owner_id(s), "")
         row["running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
         out.append(row)
-    extra = sum(1 for s in sessions if s.get("managed"))
+    extra = sum(1 for s in sessions if _is_admin_extra_browser(s))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
 
@@ -9160,7 +10394,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
-    if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
+    if sum(1 for s in sessions if _is_admin_extra_browser(s)) >= BROWSER_MAX_EXTRA:
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
     slot = _next_browser_slot(sessions)
     sid = f"s{slot}"
@@ -9182,7 +10416,9 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
             ok = True
             break
     entry = {"id": sid, "name": name, "slot": slot, "display": disp, "rfb_port": rfb,
-             "vnc_port": vnc, "cdp_port": cdp, "managed": True, "created_at": time.time()}
+             "vnc_port": vnc, "cdp_port": cdp, "managed": True,
+             "owner_id": "admin", "account_browser": False,
+             "created_at": time.time()}
     sessions.append(entry)
     _save_browser_sessions(sessions)
     row = _browser_response_row(entry)
@@ -9196,10 +10432,21 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
 async def api_browser_delete(sid: str, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    user = _current_user(request)
+    if not _user_can_access_browser(user, sid):
+        return JSONResponse({"error": "not found"}, status_code=404)
     sessions = _load_browser_sessions()
     target = next((s for s in sessions if s.get("id") == sid), None)
-    if not target:
-        return JSONResponse({"error": "not found"}, status_code=404)
+    if target.get("account_browser"):
+        return JSONResponse(
+            {
+                "error": (
+                    "Account browsers are removed only when their user "
+                    "account is deleted."
+                )
+            },
+            status_code=400,
+        )
     if not target.get("managed"):
         return JSONResponse({"error": "The default browser is managed by systemd and can't be removed here."},
                             status_code=400)
@@ -9234,10 +10481,12 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     Allowed for the default systemd browser too — it's only metadata."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    user = _current_user(request)
+    if not _user_can_access_browser(user, sid):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user_id = str((user or {}).get("id", ""))
     sessions = _load_browser_sessions()
     target = next((s for s in sessions if s.get("id") == sid), None)
-    if not target:
-        return JSONResponse({"error": "not found"}, status_code=404)
     if body.name is not None:
         name = body.name.strip()
         if not name:
@@ -9246,9 +10495,11 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     if body.notes is not None:
         target["notes"] = body.notes.strip()[:2000]
     if body.use_for_login is not None:
-        # Exactly one browser is the designated login browser.
+        # Exactly one browser owned by this account is the designated login
+        # browser. Never modify another account's browser metadata.
         for s in sessions:
-            s["use_for_login"] = False
+            if _browser_owner_id(s) == user_id:
+                s["use_for_login"] = False
         target["use_for_login"] = bool(body.use_for_login)
     _save_browser_sessions(sessions)
     _browser_auth_cache.pop(sid, None)   # re-check on next poll
@@ -9269,6 +10520,73 @@ CB_ROOT = Path.home() / ".claude-browser"
 BROWSER_PROXY_CONF = CB_ROOT / "proxy.json"
 BROWSER_PROXY_USAGE = CB_ROOT / "state" / "proxy-usage.json"
 BROWSER_FINGERPRINT_TOOL = CB_ROOT / "bin" / "fingerprint-audit.py"
+
+
+def _browser_profile_dir(session: dict) -> Path:
+    """Return the persistent Chrome user-data directory for a browser session."""
+    if session.get("id") == "default":
+        return CB_ROOT / "profile"
+    return CB_ROOT / "sessions" / str(session.get("id", "")) / "profile"
+
+
+def _browser_signin_state(session: dict) -> dict:
+    """Read Chrome's local account metadata without returning cookies or tokens."""
+    profile_root = _browser_profile_dir(session)
+    local_state: dict = {}
+    try:
+        local_state = json.loads((profile_root / "Local State").read_text())
+        if not isinstance(local_state, dict):
+            local_state = {}
+    except Exception:
+        local_state = {}
+
+    profile_meta = local_state.get("profile") or {}
+    ordered_names = []
+    last_used = profile_meta.get("last_used")
+    if isinstance(last_used, str) and last_used:
+        ordered_names.append(last_used)
+    for name in profile_meta.get("profiles_order") or []:
+        if isinstance(name, str) and name not in ordered_names:
+            ordered_names.append(name)
+    info_cache = profile_meta.get("info_cache") or {}
+    if isinstance(info_cache, dict):
+        for name in info_cache:
+            if isinstance(name, str) and name not in ordered_names:
+                ordered_names.append(name)
+    for fallback in ("Default", "Profile 1"):
+        if fallback not in ordered_names:
+            ordered_names.append(fallback)
+
+    for name in ordered_names:
+        try:
+            preferences = json.loads((profile_root / name / "Preferences").read_text())
+        except Exception:
+            continue
+        account_info = preferences.get("account_info") if isinstance(preferences, dict) else []
+        if isinstance(account_info, dict):
+            account_info = list(account_info.values())
+        if not isinstance(account_info, list):
+            continue
+        for account in account_info:
+            if not isinstance(account, dict):
+                continue
+            email = str(account.get("email") or "").strip()
+            if email or account.get("gaia"):
+                return {"signed_in": True, "email": email}
+
+    # Chrome can briefly update Local State before Preferences. Count it only
+    # when the account is also listed as active, which avoids stale profile
+    # display names looking like a current sign-in after logout.
+    active_accounts = (local_state.get("signin") or {}).get("active_accounts") or {}
+    if active_accounts and isinstance(info_cache, dict):
+        for name in ordered_names:
+            meta = info_cache.get(name) or {}
+            if not isinstance(meta, dict):
+                continue
+            email = str(meta.get("user_name") or "").strip()
+            if email and meta.get("gaia_id"):
+                return {"signed_in": True, "email": email}
+    return {"signed_in": False, "email": ""}
 
 
 def _proxy_presets() -> dict:
@@ -9337,10 +10655,17 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
     the bandwidth each browser has burned — residential traffic is billed per GB."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    user = _current_user(request)
+    user_id = str((user or {}).get("id", ""))
     conf = _proxy_conf()
     usage = _proxy_usage()
     rows = []
-    for s in _load_browser_sessions():
+    sessions = [
+        session
+        for session in _load_browser_sessions()
+        if _browser_owner_id(session) == user_id
+    ]
+    for s in sessions:
         sid = s.get("id")
         sess = (conf.get("sessions") or {}).get(sid) or {}
         u = usage.get(sid) or {}
@@ -9357,7 +10682,7 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
         if check and sess.get("local_port"):
             row["exit"] = await _proxy_exit_info(sess["local_port"])
         rows.append(row)
-    total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
+    total = sum(row["bytes"] for row in rows)
     return JSONResponse({
         "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
         "enabled": bool(conf.get("enabled")),
@@ -9426,6 +10751,9 @@ async def api_browser_proxy_rotate(sid: str, request: Request):
     """New sticky session id => the provider hands this browser a new exit IP."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    user = _current_user(request)
+    if not _user_can_access_browser(user, sid):
+        return JSONResponse({"error": "not found"}, status_code=404)
     conf = _proxy_conf()
     sess = (conf.get("sessions") or {}).get(sid)
     if not sess:
@@ -9450,9 +10778,10 @@ async def api_browser_fingerprint(sid: str, request: Request):
     exit IP, fonts, media devices …)."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    s = _browser_session_by_id(sid)
-    if not s:
+    user = _current_user(request)
+    if not _user_can_access_browser(user, sid):
         return JSONResponse({"error": "not found"}, status_code=404)
+    s = _browser_session_by_id(sid)
     if not BROWSER_FINGERPRINT_TOOL.exists():
         return JSONResponse({"error": "fingerprint-audit.py is not installed"}, status_code=501)
 
@@ -9671,11 +11000,27 @@ def _display_idle_ms(display: int) -> int:
 BROWSER_ACTIVE_IDLE_MS = 15000
 
 
-def _pick_login_browser() -> dict:
-    """Which browser to click the OAuth flow through: one explicitly flagged
-    use_for_login, else one whose name/notes mention login/auth, else the only
-    running session. {} when there's nothing usable."""
-    sessions = _load_browser_sessions()
+def _browser_owner_id(session: dict) -> str:
+    """Return the account that owns a browser, including legacy metadata."""
+    owner_id = str(session.get("owner_id", "")).strip()
+    if owner_id:
+        return owner_id
+    # All browser records created before per-account isolation were admin tools.
+    return "admin"
+
+
+def _pick_login_browser(user: dict | None = None) -> dict:
+    """Return only the persistent browser owned by ``user``.
+
+    Calls without a user are legacy admin automation and therefore stay scoped
+    to the default admin instead of falling through to another account.
+    """
+    user_id = str((user or {}).get("id") or "admin")
+    sessions = [
+        session
+        for session in _load_browser_sessions()
+        if _browser_owner_id(session) == user_id
+    ]
     for s in sessions:
         if s.get("use_for_login"):
             return s
@@ -9683,8 +11028,109 @@ def _pick_login_browser() -> dict:
         blob = f"{s.get('name','')} {s.get('notes','')}".lower()
         if "login" in blob or "auth" in blob or "sign in" in blob:
             return s
-    running = [s for s in sessions if _browser_port_alive(s.get("vnc_port", 0))]
-    return running[0] if len(running) == 1 else {}
+    for s in sessions:
+        if s.get("id") == "default":
+            return s
+    return sessions[0] if sessions else {}
+
+
+def _browser_login_ready(user: dict | None = None) -> bool:
+    """Whether the designated browser is both reachable and signed into Chrome."""
+    session = (
+        _ensure_user_browser_session(user)
+        if user
+        else _pick_login_browser()
+    )
+    if not session or not _browser_port_alive(session.get("vnc_port", 0)):
+        return False
+    return bool(_browser_signin_state(session).get("signed_in"))
+
+
+def _browser_login_redirect(url: str, user: dict | None = None) -> str:
+    """Tag a post-login landing so the SPA opens noVNC when sign-in is missing."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        # Already entering the viewer: do not bounce the user back into Settings.
+        if "/browser/" in parts.path or _browser_login_ready(user):
+            return url
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "browser_login"]
+        query.append(("browser_login", "1"))
+        return urllib.parse.urlunsplit((
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urllib.parse.urlencode(query),
+            parts.fragment,
+        ))
+    except Exception:
+        logger.debug("Failed to prepare browser login reminder", exc_info=True)
+        return url
+
+
+async def _member_browser_status(user: dict) -> dict:
+    """Return the non-secret state shared by the member tab and header badge."""
+    session = await asyncio.to_thread(_ensure_user_browser_session, user)
+    if not session:
+        return {
+            "session": None,
+            "connected": False,
+            "signed_in": False,
+            "working": False,
+            "needs_sign_in": True,
+            "state": "disconnected",
+        }
+    running = await asyncio.to_thread(
+        _browser_port_alive,
+        session.get("vnc_port", 0),
+    )
+    signin = (
+        await asyncio.to_thread(_browser_signin_state, session)
+        if running
+        else {"signed_in": False, "email": ""}
+    )
+    signed_in = bool(signin.get("signed_in"))
+    sid = str(session.get("id", ""))
+    driven = sid in _browser_busy
+    idle_ms = (
+        await asyncio.to_thread(_display_idle_ms, session.get("display", 0))
+        if running
+        else -1
+    )
+    connected = running and signed_in
+    working = connected and (driven or 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS)
+    return {
+        "session": {
+            "id": sid,
+            "name": session.get("name", "") or "Browser",
+            "running": running,
+            "viewer_url": _browser_viewer_url(session),
+        },
+        "connected": connected,
+        "signed_in": signed_in,
+        "working": working,
+        "needs_sign_in": not connected,
+        "state": "working" if working else "connected" if connected else "disconnected",
+    }
+
+
+def _user_can_access_browser(user: dict | None, sid: str) -> bool:
+    """Allow a viewer only when the authenticated account owns that browser."""
+    if not user:
+        return False
+    session = _browser_session_by_id(sid)
+    return bool(
+        session
+        and _browser_owner_id(session) == str(user.get("id", ""))
+    )
+
+
+@app.get("/api/my/browser")
+async def api_my_browser(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    return JSONResponse(await _member_browser_status(user))
 
 
 @app.get("/api/browser/auth-status")
@@ -9692,8 +11138,15 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
     """Compatibility endpoint for the retired Claude browser-auth integration."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    user = _current_user(request)
+    user_id = str((user or {}).get("id", ""))
     generic = []
-    for session in _load_browser_sessions():
+    sessions = [
+        session
+        for session in _load_browser_sessions()
+        if _browser_owner_id(session) == user_id
+    ]
+    for session in sessions:
         running = await asyncio.to_thread(_browser_port_alive, session.get("vnc_port", 0))
         generic.append({
             "id": session.get("id"),
@@ -10055,7 +11508,18 @@ async def api_auto_auth(session_name: str, request: Request):
 async def browser_proxy_ws(ws: WebSocket, sid: str):
     """Reverse-proxy the noVNC WebSocket to the session's local websockify. The
     HTTP auth middleware doesn't run for websockets, so re-check the cookie here."""
-    if AUTH_PASS and not _check_token(ws.cookies.get("tmux_auth")):
+    user = None
+    if AUTH_PASS:
+        user = _user_from_token(ws.cookies.get(AUTH_COOKIE))
+        if not user:
+            await ws.close(code=1008)
+            return
+    else:
+        user = _find_user_by_id("admin") or {
+            "id": "admin",
+            "role": "admin",
+        }
+    if not _user_can_access_browser(user, sid):
         await ws.close(code=1008)
         return
     s = _browser_session_by_id(sid)
@@ -10132,6 +11596,8 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
 async def browser_proxy_http(sid: str, path: str, request: Request):
     """Reverse-proxy noVNC static assets (vnc.html + app/core/vendor) to the
     session's local websockify, so the viewer is same-origin with the dashboard."""
+    if not _user_can_access_browser(_current_user(request), sid):
+        return Response("unknown browser session", status_code=404)
     s = _browser_session_by_id(sid)
     if not s:
         return Response("unknown browser session", status_code=404)
@@ -10643,7 +12109,9 @@ class SetApiKey(BaseModel):
 
 
 @app.post("/api/auth/api-key")
-async def api_set_codex_key(body: SetApiKey):
+async def api_set_codex_key(body: SetApiKey, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
     key = body.apiKey.strip()
     if key:
         if not key.startswith("sk-"):
@@ -10663,8 +12131,10 @@ async def api_set_codex_key(body: SetApiKey):
 
 
 @app.post("/api/auth/logout")
-async def api_codex_auth_logout():
+async def api_codex_auth_logout(request: Request):
     """Back up the current credential file, then run `codex logout`."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
     errors = []
     auth_path = CODEX_HOME / "auth.json"
     if auth_path.exists():
@@ -10946,6 +12416,100 @@ def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
     elif "gpt-5" in m or "5.4" in m or "5.3" in m:
         ci, co, ccr = 1.25, 10.0, 0.125
     return inp * ci / 1e6 + (out + cc) * co / 1e6 + cr * ccr / 1e6
+
+
+_user_usage_cache: dict[str, dict] = {}
+_USER_USAGE_CACHE_TTL = 60
+
+
+def _user_usage_summary(user: dict, *, force: bool = False) -> dict:
+    """Aggregate all Codex rollout usage stored in one account's CODEX_HOME."""
+    user_id = user.get("id", "")
+    now = time.time()
+    cached = _user_usage_cache.get(user_id)
+    if not force and cached and now - cached.get("ts", 0) < _USER_USAGE_CACHE_TTL:
+        return dict(cached["data"])
+
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "tokens_24h": 0,
+        "tokens_7d": 0,
+        "turns": 0,
+        "estimated_cost": 0.0,
+        "estimated_cost_7d": 0.0,
+        "last_active": "",
+    }
+    sessions_dir = _user_codex_config_dir(user) / "sessions"
+    if sessions_dir.exists():
+        cutoff_24h = now - 86400
+        cutoff_7d = now - 7 * 86400
+        for rollout in sessions_dir.rglob("rollout-*.jsonl"):
+            current_model = _CODEX_DEFAULT_MODEL
+            try:
+                with rollout.open() as stream:
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        payload = event.get("payload", {}) or {}
+                        if event.get("type") == "turn_context":
+                            current_model = payload.get("model") or current_model
+                            continue
+                        if (
+                            event.get("type") != "event_msg"
+                            or payload.get("type") != "token_count"
+                        ):
+                            continue
+                        usage = (
+                            (payload.get("info", {}) or {})
+                            .get("last_token_usage", {}) or {}
+                        )
+                        if not usage:
+                            continue
+                        inp = int(usage.get("input_tokens", 0) or 0)
+                        out = int(usage.get("output_tokens", 0) or 0)
+                        cache_read = int(usage.get("cached_input_tokens", 0) or 0)
+                        reasoning = int(usage.get("reasoning_output_tokens", 0) or 0)
+                        token_total = inp + out + cache_read + reasoning
+                        timestamp = str(event.get("timestamp") or "")
+                        try:
+                            epoch = datetime.fromisoformat(
+                                timestamp.replace("Z", "+00:00")
+                            ).timestamp()
+                        except (TypeError, ValueError):
+                            epoch = 0
+                        cost = _estimate_cost(
+                            inp,
+                            out,
+                            cache_read,
+                            reasoning,
+                            current_model,
+                        )
+                        totals["input_tokens"] += inp
+                        totals["output_tokens"] += out
+                        totals["cache_read_tokens"] += cache_read
+                        totals["reasoning_tokens"] += reasoning
+                        totals["total_tokens"] += token_total
+                        totals["turns"] += 1
+                        totals["estimated_cost"] += cost
+                        if epoch >= cutoff_24h:
+                            totals["tokens_24h"] += token_total
+                        if epoch >= cutoff_7d:
+                            totals["tokens_7d"] += token_total
+                            totals["estimated_cost_7d"] += cost
+                        if timestamp > totals["last_active"]:
+                            totals["last_active"] = timestamp
+            except (OSError, UnicodeError):
+                logger.debug("Failed to parse usage rollout %s", rollout, exc_info=True)
+    totals["estimated_cost"] = round(totals["estimated_cost"], 4)
+    totals["estimated_cost_7d"] = round(totals["estimated_cost_7d"], 4)
+    _user_usage_cache[user_id] = {"ts": now, "data": dict(totals)}
+    return totals
 
 
 @app.get("/api/stats/usage")
@@ -11405,19 +12969,27 @@ class SendKeys(BaseModel):
 class AuthModeBody(BaseModel):
     mode: str  # "api" or "subscription"
 
-class AwayModeBody(BaseModel):
-    enabled: bool
-
-class GoNutsModeBody(BaseModel):
-    enabled: bool
-
-
 @app.post("/api/sessions/{session_name}/send")
-async def api_send_command(session_name: str, body: SendCommand):
+async def api_send_command(request: Request, session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    user = _current_user(request)
+    if user and not _is_admin(user):
+        if any(
+            (ord(char) < 32 and char not in "\n\r\t") or ord(char) == 127
+            for char in body.command
+        ):
+            return JSONResponse(
+                {"error": "Terminal control bytes are admin only"},
+                status_code=403,
+            )
+        if not await asyncio.to_thread(_is_codex_running, session_name):
+            return JSONResponse(
+                {"error": "Codex is restarting; host shell input is disabled"},
+                status_code=409,
+            )
     try:
         cmd_text = body.command
         if len(cmd_text) > 200:
@@ -11495,6 +13067,27 @@ async def api_send_command(session_name: str, body: SendCommand):
             "role": "user", "text": body.command, "ts": now
         })
         _save_messages()
+        try:
+            prompt_user = _current_user(request) or _user_for_session(session_name)
+            if prompt_user:
+                impersonator = getattr(request.state, "_impersonator", None)
+                if impersonator is None:
+                    original = request.cookies.get("tmux_imp_orig")
+                    original_user = _user_from_token(original) if original else None
+                    if original_user and _is_admin(original_user):
+                        impersonator = original_user
+                _append_prompt_audit(
+                    prompt_user,
+                    session_name,
+                    body.command,
+                    impersonator=impersonator,
+                    timestamp=now,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to append prompt audit for session '%s'",
+                session_name,
+            )
         return JSONResponse({"ok": True, "sent": body.command})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -11526,7 +13119,11 @@ ALLOWED_TMUX_KEYS = {
 }
 
 @app.post("/api/sessions/{session_name}/send-keys")
-async def api_send_keys(session_name: str, body: SendKeys):
+async def api_send_keys(
+    request: Request,
+    session_name: str,
+    body: SendKeys,
+):
     """Send raw key sequences to a tmux session (Escape, C-c, Enter, q, etc.).
 
     Unlike /send, this does NOT wrap text in -l (literal) mode and does NOT
@@ -11535,6 +13132,19 @@ async def api_send_keys(session_name: str, body: SendKeys):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    user = _current_user(request)
+    if user and not _is_admin(user):
+        if not await asyncio.to_thread(_is_codex_running, session_name):
+            return JSONResponse(
+                {"error": "Codex is restarting; host shell input is disabled"},
+                status_code=409,
+            )
+        forbidden = {"C-c", "C-d", "C-z"}
+        if any(key in forbidden for key in body.keys):
+            return JSONResponse(
+                {"error": "Codex exit/suspend keys are admin only"},
+                status_code=403,
+            )
     try:
         for key in body.keys:
             # Allow single printable characters (q, y, n, etc.) and known tmux key names
@@ -11582,10 +13192,9 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
     """Reject the legacy per-pane auth toggle.
 
     Codex credentials belong to CODEX_HOME. Mutating a shell variable in an
-    already-running pane neither switches the active Codex process nor safely
-    isolates one session from another profile, and sending a key through tmux
-    would expose it in pane history. Authentication is therefore managed in
-    Settings or on the profile itself.
+    already-running pane does not switch the active Codex process, and sending
+    a key through tmux would expose it in pane history. Authentication is
+    managed globally in Settings.
     """
     _, sess = _find_session(session_name)
     if not sess:
@@ -11595,8 +13204,8 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
     return JSONResponse(
         {
             "error": (
-                "Codex authentication is configured per profile. "
-                "Use Settings → Login or the profile credentials panel."
+                "Codex authentication is configured globally. "
+                "Use Settings → Login."
             )
         },
         status_code=409,
@@ -11706,7 +13315,7 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
 
 @app.post("/api/sessions/{session_name}/model")
 async def api_set_session_model(session_name: str, body: SetSessionModelBody):
-    """Persist a profile's Codex model and optionally restart the live pane."""
+    """Persist the global Codex model and optionally restart the live pane."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -12172,11 +13781,6 @@ async def _simple_watchdog_loop():
                 # gets option-picking + prompt confirms via the auto-responder.)
                 if _get_autopush_mode(name) != "full":
                     _simple_watchdog_state.pop(name, None)
-                    continue
-                # Don't fight the autonomous-mode watchdog — those modes have their own loop
-                if _away_mode_state.get(name, {}).get("enabled"):
-                    continue
-                if _go_nuts_state.get(name, {}).get("enabled"):
                     continue
                 # Don't fire if Codex isn't even running
                 if not await _async_is_codex_running(name):
@@ -12698,120 +14302,6 @@ async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody
     })
 
 
-# --- Autonomous Mode Watchdog ---
-# Monitors all active away-mode and go-nuts-mode sessions.
-# Detects stalls (no terminal change for too long) and unsticks them.
-
-_watchdog_snapshots: dict[str, dict] = {}
-# Per-session: {"content_hash": str, "first_seen": float, "nudge_count": int, "last_nudge": float}
-
-_WATCHDOG_INTERVAL = 30         # Check every 30 seconds
-_STALL_THRESHOLD = 600          # 10 minutes of identical terminal = stalled
-_NUDGE_COOLDOWN = 180           # Wait 3 minutes between nudge attempts
-_MAX_NUDGES_BEFORE_RESTART = 3  # After 3 failed nudges, hard-restart the mode
-
-_NUDGE_PROMPT = """You appear to be idle or stuck. The user is not present — you are in autonomous mode.
-
-If you just finished a task: pick the next one and start working. Check your skill files and backlog.
-If you're waiting for something: cancel the wait (Ctrl+C if needed) and move to a different task.
-If you encountered an error: log it, revert if needed, and continue with the next item.
-
-Do NOT say "standing by" or ask for instructions. Take action NOW."""
-
-_UNSTICK_PROMPT_AWAY = """You are in Away Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Run `pwd` to confirm you are in the correct project directory
-2. Check git log to see what you've already done
-3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
-4. Pick the next most valuable skill to execute
-
-IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Take action immediately."""
-
-_UNSTICK_PROMPT_GONUTS = """You are in Go Nuts Mode. The system detected you were stuck and restarted your task loop.
-
-Your previous work is preserved on the current branch. Pick up where you left off:
-1. Run `pwd` to confirm you are in the correct project directory
-2. Check git log to see what you've already built
-3. Check /tmp/ for your session-specific notes (files prefixed with your session name)
-4. Pick the next feature to build or generate new ideas
-
-IMPORTANT: Only work on files within your current project directory. Do not touch other projects.
-
-Available skills are at: {skills_dir}/
-Read a SKILL.md file and execute its tasks. Build something NOW."""
-
-
-async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
-    """Restore an autonomous mode after server restart: wait for session, send prompt, launch loop."""
-    rlog = logging.getLogger("restore")
-    rlog.info(f"Restoring {mode} mode for '{session_name}' — waiting 15s for tmux to stabilize")
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    try:
-        # Give tmux and Codex a moment to settle after server restart
-        await asyncio.sleep(15)
-
-        if not state.get("enabled"):
-            return
-
-        # Check the session still exists
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            log_fn(state, "Session not found during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
-        # Wait for session to be idle before sending prompt (max 10 min)
-        if activity.get("status") == "busy":
-            log_fn(state, "Session is busy — waiting for it to finish current task")
-            await _away_wait_for_idle(session_name, timeout=600)
-
-        if not state.get("enabled"):
-            return
-
-        # Ensure Codex is actually running (handles OOM/crash during server downtime)
-        codex_ok = await _ensure_codex_running(session_name, log_fn, state)
-        if not codex_ok:
-            log_fn(state, "Could not restart Codex during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
-            return
-
-        # Send the appropriate unstick/resume prompt (with project isolation)
-        skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-        unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-        log_fn(state, "Sending resume prompt to session")
-        await _away_send_prompt(session_name, unstick_prompt)
-        await asyncio.sleep(2)
-
-        # Now enter the continuous monitoring loop
-        if mode == "away":
-            await _away_mode_continuous_loop(session_name)
-        else:
-            await _go_nuts_continuous_loop(session_name)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            log_fn(state, f"{mode} restore cancelled (server shutdown — will restore)")
-        else:
-            log_fn(state, f"{mode} restore cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        log_fn(state, f"{mode} restore error: {e}")
-        rlog.error(f"Restore {mode} for '{session_name}' failed: {e}")
-        # Don't set enabled=False — watchdog zombie detection will restart us
-    finally:
-        state["task"] = None
-
-
 _TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
 _TMP_WATCHDOG_WARN_PCT = 75             # start cleaning at 75% full
 _TMP_WATCHDOG_CRITICAL_PCT = 90         # aggressive clean at 90% full
@@ -12933,1359 +14423,6 @@ def _tmp_watchdog_size(path: str) -> int:
             except OSError:
                 pass
     return total
-
-
-async def _watchdog_loop():
-    """Background watchdog: detects stalled autonomous sessions and unsticks them."""
-    wlog = logging.getLogger("watchdog")
-    wlog.info("Autonomous mode watchdog started")
-    while True:
-        try:
-            await asyncio.sleep(_WATCHDOG_INTERVAL)
-            # Collect all active autonomous sessions
-            active_sessions: list[tuple[str, dict, str]] = []  # (name, state, mode)
-            for name, state in _away_mode_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "away"))
-            for name, state in _go_nuts_state.items():
-                if state.get("enabled") and state.get("task") and not state["task"].done():
-                    active_sessions.append((name, state, "gonuts"))
-
-            if not active_sessions:
-                if _watchdog_snapshots:
-                    _watchdog_snapshots.clear()
-                continue
-
-            for session_name, state, mode in active_sessions:
-                try:
-                    await _watchdog_check_session(session_name, state, mode, wlog)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    wlog.error(f"Watchdog error checking '{session_name}': {e}")
-
-            # Also check for zombie states: enabled=True but task is dead
-            for name, state in list(_away_mode_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Away mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "away", wlog)
-            for name, state in list(_go_nuts_state.items()):
-                if state.get("enabled") and (not state.get("task") or state["task"].done()):
-                    wlog.warning(f"Go Nuts mode zombie detected for '{name}' — restarting worker")
-                    await _watchdog_restart_mode(name, state, "gonuts", wlog)
-
-        except asyncio.CancelledError:
-            wlog.info("Watchdog cancelled")
-            raise
-        except Exception as e:
-            wlog.error(f"Watchdog loop error: {e}")
-            await asyncio.sleep(60)
-
-
-async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
-    """Check a single session for stalls."""
-    import hashlib
-    now = time.time()
-
-    # Capture recent terminal content (non-blocking)
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
-    if not recent.strip():
-        return  # Empty pane, can't assess
-
-    content_hash = hashlib.md5(recent.encode()).hexdigest()
-    snap = _watchdog_snapshots.get(session_name)
-
-    if snap is None or snap["content_hash"] != content_hash:
-        # Terminal content changed — session is making progress
-        _watchdog_snapshots[session_name] = {
-            "content_hash": content_hash,
-            "first_seen": now,
-            "nudge_count": 0,
-            "last_nudge": 0,
-        }
-        return
-
-    # Terminal content is UNCHANGED since last check
-    stall_duration = now - snap["first_seen"]
-
-    if stall_duration < _STALL_THRESHOLD:
-        return  # Not stalled yet — could be processing
-
-    # Terminal has been identical for >10 minutes. Check if there's a good reason.
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # Check if Codex has crashed (OOM, etc) — if so, restart immediately
-    if not await _async_is_codex_running(session_name):
-        wlog.warning(f"Codex not running in '{session_name}' — OOM/crash detected, restarting")
-        log_fn(state, "Watchdog: Codex crashed (OOM?) — restarting")
-        _watchdog_snapshots.pop(session_name, None)
-        await _watchdog_restart_mode(session_name, state, mode, wlog)
-        return
-
-    # First stall detection — use LLM to check if it's a legitimate long operation
-    if snap["nudge_count"] == 0 and snap["last_nudge"] == 0:
-        wlog.info(f"Potential stall detected for '{session_name}' ({mode}) — {stall_duration:.0f}s unchanged")
-        try:
-            assessment = await llm_call(
-                system_prompt=(
-                    "You are monitoring an autonomous AI coding session. The terminal output has not changed "
-                    "for over 10 minutes. Assess whether this is:\n"
-                    "1. LEGITIMATE: downloading large files, compiling a big project, running extensive tests, "
-                    "waiting for a deployment, or any operation that genuinely takes >10 minutes\n"
-                    "2. STUCK: the agent said 'standing by', asked a question, hit an error and stopped, "
-                    "is waiting for user input, or simply finished and didn't continue\n\n"
-                    "Reply with ONLY one word: LEGITIMATE or STUCK"
-                ),
-                user_content=f"Terminal output (last 50 lines):\n{recent[-3000:]}",
-                max_tokens=10,
-            )
-            assessment = assessment.strip().upper()
-        except Exception:
-            assessment = "STUCK"  # If we can't assess, assume stuck
-
-        if "LEGITIMATE" in assessment:
-            wlog.info(f"Session '{session_name}' stall assessed as LEGITIMATE — skipping for now")
-            log_fn(state, f"Watchdog: stall detected ({stall_duration:.0f}s) but appears legitimate — waiting")
-            # Push out the first_seen so we re-check in another 10 minutes
-            snap["first_seen"] = now - _STALL_THRESHOLD + 300  # Re-check in 5 min
-            return
-
-        wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
-
-    # Session is stuck. Try nudging.
-    if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
-        return  # Wait for cooldown between nudges
-
-    if snap["nudge_count"] < _MAX_NUDGES_BEFORE_RESTART:
-        # Gentle nudge: send continuation prompt
-        snap["nudge_count"] += 1
-        snap["last_nudge"] = now
-        log_fn(state, f"Watchdog: nudge #{snap['nudge_count']} — sending continuation prompt")
-        wlog.info(f"Nudging '{session_name}' (attempt {snap['nudge_count']}/{_MAX_NUDGES_BEFORE_RESTART})")
-
-        # Ensure Codex is running before nudging
-        if not await _async_is_codex_running(session_name):
-            wlog.warning(f"Codex not running in '{session_name}' during nudge — restarting mode")
-            log_fn(state, "Watchdog: Codex not running during nudge — restarting")
-            _watchdog_snapshots.pop(session_name, None)
-            await _watchdog_restart_mode(session_name, state, mode, wlog)
-            return
-
-        # If session appears to be waiting for input or truly idle, just send the nudge
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            activity = {"status": "unknown"}
-
-        if activity["status"] == "busy":
-            # Session claims busy but terminal hasn't changed — might be truly stuck
-            # Send Ctrl+C first to break out of whatever it's doing
-            log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(5)
-
-        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
-        return
-
-    # Nudges exhausted — hard restart
-    log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
-    wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
-    await _watchdog_restart_mode(session_name, state, mode, wlog)
-    # Reset snapshot
-    _watchdog_snapshots.pop(session_name, None)
-
-
-async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
-    """Gracefully restart an autonomous mode session, preserving history."""
-    log_fn = _away_log if mode == "away" else _go_nuts_log
-
-    # 1. Cancel existing task
-    old_task = state.get("task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-
-    # 2. Send Ctrl+C to break any stuck process in the terminal
-    try:
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(3)
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(2)
-    except Exception:
-        pass
-
-    # 2b. Ensure Codex is actually running (handles OOM/crash recovery)
-    codex_ok = await _ensure_codex_running(session_name, log_fn, state)
-    if not codex_ok:
-        log_fn(state, "Watchdog: could not restart Codex — aborting restart")
-        state["enabled"] = False
-        _save_autonomous_state()
-        return
-
-    # 3. Preserve the log history, reset state for fresh loop
-    old_log = state.get("log", [])
-    old_started = state.get("started_at", time.time())
-    old_step = state.get("step", 0)
-
-    log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
-
-    # 4. Re-initialize state
-    state.update({
-        "enabled": True,
-        "phase": 4,
-        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
-        "step": old_step,
-        "step_name": "Watchdog restart",
-        "started_at": old_started,  # Keep original start time
-        "log": old_log,  # Keep full log history
-        "task": None,
-    })
-    _save_autonomous_state()
-
-    # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
-    skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
-    unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
-
-    await _away_send_prompt(session_name, unstick_prompt)
-    await asyncio.sleep(2)
-
-    # 6. Launch fresh worker that skips to continuous loop
-    if mode == "away":
-        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
-        state["task"] = task
-    else:
-        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
-        state["task"] = task
-
-    wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
-
-
-async def _away_mode_continuous_loop(session_name: str):
-    """Standalone continuous loop for away mode (used by watchdog restart)."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    try:
-        # Wait for the unstick prompt to be processed
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
-                if not codex_ok:
-                    _away_log(state, "Codex dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle 90s — task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _away_log(state, "Away mode (restarted) cancelled (server shutdown — will restore)")
-        else:
-            _away_log(state, "Away mode (restarted) cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode (restarted) error: {e}")
-        log.error(f"Away mode restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-async def _go_nuts_continuous_loop(session_name: str):
-    """Standalone continuous loop for go-nuts mode (used by watchdog restart)."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    try:
-        await _away_wait_for_idle(session_name, timeout=600)
-
-        cycle = state.get("step", 0) + 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
-                if not codex_ok:
-                    _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle 90s — build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled (server shutdown — will restore)")
-        else:
-            _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
-            state["enabled"] = False
-            _save_autonomous_state()
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
-        log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-
-
-# --- Away Mode ---
-# Autonomous mode: sends structured prompts to a Codex session,
-# waits for idle, captures output, summarizes, advances to next phase.
-
-def _away_log(state: dict, action: str):
-    """Append a log entry to the away-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > 200:
-        state["log"] = state["log"][-200:]
-
-
-def _away_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of away-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _away_send_prompt(session_name: str, prompt: str):
-    """Send a long prompt to a Codex session via tmux paste-buffer.
-
-    Two-phase approach to defeat the bracketed paste "[Pasted text +N lines]" hang:
-    Phase 1: Write prompt to a temp file, then send a short shell-pipe command that
-             reads the file and feeds it to the Codex prompt via xdotool-style
-             keyboard simulation. This avoids bracketed paste entirely.
-    Phase 2 (fallback): If Phase 1 fails or Codex is truly at its ❯ prompt
-             (not a shell), use paste-buffer with aggressive Enter retries.
-    """
-    log = logging.getLogger("away-mode")
-    prompt_text = prompt.rstrip("\n\r ")  # Strip trailing whitespace/newlines
-    prompt_file = None
-    try:
-        fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
-        os.close(fd)
-        Path(prompt_file).write_text(prompt_text)
-
-        # Capture terminal state before paste to detect changes later
-        pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-
-        # --- Strategy: Disable bracketed paste, then paste raw ---
-        # Send \e[?2004l escape sequence directly to the terminal to disable
-        # bracketed paste mode. tmux send-keys -H sends raw hex bytes.
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H",
-             "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.sleep(0.2)
-
-        # Load file into tmux buffer and paste
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "load-buffer", prompt_file],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "paste-buffer", "-t", session_name],
-            capture_output=True, text=True, timeout=10,
-        )
-
-        # Scale wait time with prompt size
-        wait_secs = max(2.0, min(8.0, len(prompt_text) / 1500))
-        await asyncio.sleep(wait_secs)
-
-        # Send Enter to submit
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
-        log.info(f"Sent prompt to '{session_name}' ({len(prompt_text)} chars, waited {wait_secs:.1f}s)")
-
-        # Note: we do NOT re-enable bracketed paste (\e[?2004h) here.
-        # Bracketed paste causes "[Pasted text +N lines]" previews that hang.
-        # Users can toggle it back on from the Keys bar if they want it.
-
-        # --- Verify submission with retries ---
-        for attempt in range(3):
-            await asyncio.sleep(3)
-            try:
-                activity = await async_detect_activity(session_name)
-            except Exception:
-                activity = {"status": "unknown"}
-
-            if activity["status"] == "busy":
-                log.info(f"Session '{session_name}' is busy — prompt accepted")
-                return  # Success — session started processing
-
-            # Check if terminal output changed (even if still "idle" per detection)
-            post_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-            if post_snapshot != pre_snapshot:
-                log.info(f"Session '{session_name}' terminal changed — prompt likely accepted")
-                return  # Terminal content changed, prompt was received
-
-            # Still showing the same content — try Enter again
-            log.warning(f"Session '{session_name}' still idle after paste (attempt {attempt+1}/3) — retrying Enter")
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5,
-            )
-
-        # All Enter retries failed. Check if there's a bracketed paste preview stuck.
-        recent = await asyncio.to_thread(capture_pane_recent, session_name, 10)
-        if "Pasted text" in recent or "pasted" in recent.lower():
-            # Bracketed paste preview is stuck — Escape to cancel it, then re-send
-            log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
-            await asyncio.sleep(0.5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-            await asyncio.sleep(1)
-            # Re-send the prompt, this time relying on bracketed paste disabled earlier
-            await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "paste-buffer", "-t", session_name], capture_output=True, text=True, timeout=10)
-            await asyncio.sleep(wait_secs)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Enter"], capture_output=True, text=True, timeout=5)
-            log.info(f"Re-sent prompt to '{session_name}' after clearing stuck paste")
-
-    except Exception as e:
-        log.error(f"Failed to send prompt to '{session_name}': {e}")
-    finally:
-        if prompt_file:
-            try:
-                os.unlink(prompt_file)
-            except (OSError, UnboundLocalError):
-                pass
-
-
-async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
-    """Wait for a session to become busy then return to idle. Returns True on success."""
-    log = logging.getLogger("away-mode")
-
-    # Phase A: wait for session to become busy (max 30s)
-    start = time.time()
-    became_busy = False
-    while time.time() - start < 30:
-        await asyncio.sleep(2)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "busy":
-            became_busy = True
-            break
-
-    if not became_busy:
-        log.warning(f"Session '{session_name}' never became busy, proceeding anyway")
-
-    # Phase B: wait for session to return to idle (up to timeout)
-    idle_count = 0
-    while time.time() - start < timeout:
-        await asyncio.sleep(5)
-        activity = await async_detect_activity(session_name)
-        if activity["status"] == "idle":
-            idle_count += 1
-            if idle_count >= 2:  # 2 consecutive idle readings = confirmed idle
-                return True
-        else:
-            idle_count = 0
-
-    log.warning(f"Session '{session_name}' timed out after {timeout}s")
-    return False
-
-
-def _build_project_isolation_preamble(session_name: str) -> str:
-    """Build a preamble that anchors the autonomous mode to the correct project."""
-    cwd = get_session_cwd(session_name)
-    return f"""PROJECT ISOLATION — READ THIS FIRST:
-You are working in tmux session "{session_name}".
-Your project directory is: {cwd or '(unknown — run pwd to confirm)'}
-
-STRICT RULES:
-- ONLY modify files inside your project directory ({cwd or 'current working directory'}).
-- NEVER cd into, read from, or write to other project directories on this server.
-- NEVER modify files under /var/www/, /opt/, or ~/  that belong to other projects.
-- Write all reports and temp files to /tmp/ using your session name as prefix: /tmp/{session_name}-*.md
-- Do NOT write to generic paths like /tmp/away-mode-*.md or /tmp/go-nuts-*.md — always include the session name.
-- If you need to check infrastructure context, read ~/.codex/vm_projects_dir.md (read-only, never modify during autonomous mode).
-- If a skill or task does not apply to THIS project, skip it entirely.
-- Do NOT restart, modify configs for, or interact with services belonging to other projects.
-
-"""
-
-
-async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
-                               step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _away_log(state, f"Sending: {step_name}")
-
-    prompt = _build_project_isolation_preamble(session_name) + prompt
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _away_log(state, f"Timeout on: {step_name}")
-        # Send Ctrl+C to unstick if needed
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    # Capture output and summarize
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: files created/modified, tests run, errors, "
-                "branches created, findings. Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Away mode step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _away_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Phase implementations ---
-# Skills are installed at ~/.codex/away-mode-skills/XX-name/SKILL.md
-_SKILLS_DIR = str(Path.home() / ".codex" / "away-mode-skills")
-
-_PHASE1_PROMPT = f"""I'm putting you in Away Mode. You are autonomous — the user is not present. Every action must be safe, verifiable, and revertible. You cannot ask questions — make decisions and document reasoning.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Study the Project
-
-1. Read the project root directory structure
-2. Examine root config files (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, docker-compose.yml, .env.example, etc.)
-3. Examine source directories (src/, app/, lib/, components/, routes/, api/)
-4. Check test directories (test/, tests/, __tests__/, spec/, e2e/)
-5. Check git history: recent commits, active areas of development
-6. Create a project profile at /tmp/<SESSION_NAME>-away-mode-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above) covering:
-   - Project name, type, primary languages, frameworks
-   - Architecture: frontend, backend, database, external services
-   - Current state: can it build? tests? linting?
-   - Development patterns, known issues from TODOs
-7. Establish baseline:
-   - Record git status and recent commits
-   - Create safety branch: git checkout -b away-mode/session-$(date +%Y%m%d-%H%M%S)
-   - Run existing tests if available, record results
-   - Run linter if configured, record results
-
-CRITICAL: Never commit to main/master. Work on the away-mode branch.
-CRITICAL: If tests fail at baseline, note which tests fail — do NOT introduce NEW failures.
-
-When done with this phase, immediately continue to the next task without waiting."""
-
-_PHASE2_PROMPT = f"""PHASE 2: Select Applicable Skills
-
-Review the project profile you created. The following skills are available on disk. For each, read its SKILL.md to understand its scope, then decide if it applies to THIS project.
-
-Available skills (read the SKILL.md inside each directory):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing (ALWAYS applicable)
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage (ALWAYS applicable)
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring (ALWAYS applicable)
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
- 8. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
- 9. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing (if web app)
-10. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed (if web app/API)
-11. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
-12. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards (if public web pages)
-13. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility (if UI exists)
-14. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish (if UI)
-15. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-16. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-17. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements (if UI)
-18. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-
-For each skill, read the SKILL.md, then decide: applicable? priority? risk level?
-
-Write selection to /tmp/<SESSION_NAME>-away-mode-skills-selected.md (use your session name) with selected skills in priority order.
-
-When done, immediately continue to executing skills — do not wait."""
-
-_PHASE3_ROUND1_PROMPT = f"""PHASE 3, ROUND 1: Observe and Audit (NO code changes)
-
-Read these skill files and execute their AUDIT tasks. Do NOT modify code — observe and report only.
-
-1. Read {_SKILLS_DIR}/05-security/SKILL.md — execute all security scan tasks
-2. Read {_SKILLS_DIR}/06-content-integrity/SKILL.md — execute content integrity checks
-3. Read {_SKILLS_DIR}/21-codebase-audit/SKILL.md — execute codebase audit tasks
-
-For EVERY finding, log it in /tmp/<SESSION_NAME>-away-mode-audit.md (use your session name) with:
-- Category | Severity (critical/high/medium/low) | Description | File:Line
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND2_PROMPT = f"""PHASE 3, ROUND 2: Safe Mechanical Fixes
-
-Read these skill files and execute their FIX tasks — only safe, deterministic changes:
-
-1. Read {_SKILLS_DIR}/07-dependencies/SKILL.md — apply patch updates (semver-safe only)
-2. Read {_SKILLS_DIR}/22-config-hardening/SKILL.md — tighten configs, fix .gitignore
-3. Read {_SKILLS_DIR}/23-git-hygiene/SKILL.md — clean up git state
-
-EXECUTION WRAPPER for every change:
-1. Record current git SHA
-2. Make ONE logical change
-3. Run full test suite + build
-4. ALL GREEN → commit: [away-mode][category] description
-5. ANY RED → git checkout . to fully revert
-
-When done, immediately continue to the next round."""
-
-_PHASE3_ROUND3_PROMPT = f"""PHASE 3, ROUND 3: Test-Gated Improvements
-
-Read these skill files and execute their tasks:
-
-1. Read {_SKILLS_DIR}/08-testing/SKILL.md — generate tests for untested code (HIGHEST PRIORITY)
-2. Read {_SKILLS_DIR}/09-code-quality/SKILL.md — refactor, remove dead code, simplify
-3. Read {_SKILLS_DIR}/10-error-handling/SKILL.md — fix empty catches, add error handlers
-
-EXECUTION WRAPPER: one commit per change, test after each, revert on failure.
-
-When done, immediately continue to the next task."""
-
-async def _away_phase_study(session_name: str, state: dict):
-    """Phase 1: Study the project."""
-    state["phase"] = 1
-    state["phase_name"] = "Study Project"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 1: Study the Project")
-    await _away_send_and_wait(session_name, _PHASE1_PROMPT, state,
-                               "Study project structure & establish baseline", timeout=600)
-
-
-async def _away_phase_select(session_name: str, state: dict):
-    """Phase 2: Select applicable skills."""
-    state["phase"] = 2
-    state["phase_name"] = "Select Skills"
-    state["step"] = 1
-    _away_log(state, "Starting Phase 2: Select Applicable Skills")
-    await _away_send_and_wait(session_name, _PHASE2_PROMPT, state,
-                               "Evaluate and select skills", timeout=300)
-
-
-async def _away_phase_execute(session_name: str, state: dict):
-    """Phase 3: Execute skills in rounds."""
-    state["phase"] = 3
-    state["phase_name"] = "Execute Skills"
-    state["step"] = 1
-
-    rounds = [
-        ("Round 1: Audit (read-only)", _PHASE3_ROUND1_PROMPT, 600),
-        ("Round 2: Safe fixes", _PHASE3_ROUND2_PROMPT, 900),
-        ("Round 3: Test-gated improvements", _PHASE3_ROUND3_PROMPT, 900),
-    ]
-
-    for round_name, prompt, timeout in rounds:
-        if not state.get("enabled"):
-            return
-        _away_log(state, f"Starting {round_name}")
-        await _away_send_and_wait(session_name, prompt, state, round_name, timeout=timeout)
-        # Brief pause between rounds
-        await asyncio.sleep(5)
-
-
-_AWAY_PING_PROMPT = f"""You are in Away Mode. The user is not present. You are autonomous.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do. Choose a skill you haven't fully completed yet, or revisit one that could be improved.
-
-STEP 1: Pick a skill from the list below.
-STEP 2: Read the SKILL.md file for that skill — it contains detailed tasks and instructions.
-STEP 3: Execute the tasks described in the SKILL.md.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_SKILLS_DIR}/05-security/SKILL.md — Security Auditing & Hardening
- 2. {_SKILLS_DIR}/08-testing/SKILL.md — Testing & Coverage
- 3. {_SKILLS_DIR}/09-code-quality/SKILL.md — Code Quality & Refactoring
- 4. {_SKILLS_DIR}/07-dependencies/SKILL.md — Dependency Management
- 5. {_SKILLS_DIR}/10-error-handling/SKILL.md — Error Handling & Resilience
- 6. {_SKILLS_DIR}/13-documentation/SKILL.md — Documentation
- 7. {_SKILLS_DIR}/02-performance/SKILL.md — Performance & Speed
- 8. {_SKILLS_DIR}/06-content-integrity/SKILL.md — Content & Data Integrity
- 9. {_SKILLS_DIR}/22-config-hardening/SKILL.md — Build & Config Hardening
-10. {_SKILLS_DIR}/21-codebase-audit/SKILL.md — Codebase Audit & Reporting
-11. {_SKILLS_DIR}/14-styling/SKILL.md — Styling & Visual Polish
-12. {_SKILLS_DIR}/15-data-api/SKILL.md — Data, Database & API Quality
-13. {_SKILLS_DIR}/16-observability/SKILL.md — Logging & Observability
-14. {_SKILLS_DIR}/19-ux-improvements/SKILL.md — UX Micro-Improvements
-15. {_SKILLS_DIR}/23-git-hygiene/SKILL.md — Git Hygiene
-16. {_SKILLS_DIR}/01-live-qa/SKILL.md — Live QA & Runtime Testing
-17. {_SKILLS_DIR}/03-seo/SKILL.md — SEO & Web Standards
-18. {_SKILLS_DIR}/04-accessibility/SKILL.md — Accessibility
-19. {_SKILLS_DIR}/12-devops/SKILL.md — DevOps & CI/CD
-20. {_SKILLS_DIR}/20-feature-generation/SKILL.md — Smart Feature Generation
-21. {_SKILLS_DIR}/24-cost-optimization/SKILL.md — Cost Optimization
-22. {_SKILLS_DIR}/25-migration-readiness/SKILL.md — Migration Readiness
-23. {_SKILLS_DIR}/26-email-notifications/SKILL.md — Email & Notifications
-24. {_SKILLS_DIR}/27-mobile-pwa/SKILL.md — Mobile & PWA
-25. {_SKILLS_DIR}/28-asset-pipeline/SKILL.md — Asset Pipeline
-26. {_SKILLS_DIR}/29-developer-tooling/SKILL.md — Developer Tooling
-27. {_SKILLS_DIR}/30-disaster-recovery/SKILL.md — Disaster Recovery
-
-Rules:
-- Work on the away-mode branch (create one if not already on it)
-- Never commit to main/master
-- One logical change per commit: [away-mode][category] description
-- Run tests after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Take concrete action — don't just plan or summarize
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _away_mode_worker(session_name: str):
-    """Main away-mode coroutine. Runs initial phases then loops forever, pinging when idle."""
-    log = logging.getLogger("away-mode")
-    state = _away_mode_state[session_name]
-    log.info(f"Away mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _away_phase_study(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Away mode phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_select(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Away mode phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _away_phase_execute(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _away_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Away mode phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _away_log(state, f"Monitoring for idle (cycle {cycle})...")
-                # Wait for confirmed idle: 90 seconds of consecutive idle readings
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break  # Confirmed idle for 90s
-                    else:
-                        idle_since = None  # Reset — session is busy
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
-                if not codex_ok:
-                    _away_log(state, "Codex dead and couldn't restart — stopping away mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                # Session has been idle for 90s — send ping prompt
-                state["step"] = cycle
-                state["step_name"] = f"Ping cycle {cycle}"
-                _away_log(state, f"Session idle for 90s — sending task ping (cycle {cycle})")
-                await _away_send_and_wait(session_name, _AWAY_PING_PROMPT, state,
-                                           f"Task ping cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _away_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Away mode cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _away_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _away_log(state, "Away mode cancelled (server shutdown — will restore)")
-        else:
-            _away_log(state, "Away mode cancelled by user")
-            state["enabled"] = False
-            _save_autonomous_state()
-        log.info(f"Away mode cancelled for '{session_name}'")
-        raise
-    except Exception as e:
-        _away_log(state, f"Away mode fatal error: {e}")
-        log.error(f"Away mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Away mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
-    """Toggle away mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Don't allow both away mode and go-nuts mode at the same time on same session
-        if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Go Nuts Mode is active on this session. Disable it first."}, status_code=409)
-
-        # Check if already running for this session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
-
-        # Initialize and launch
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _away_mode_state[session_name] = state
-        _away_log(state, "Away mode enabled")
-        task = asyncio.create_task(_away_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-    else:
-        # Disable
-        state = _away_mode_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _away_log(state, "Away mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_status(session_name: str):
-    """Get current away-mode state for a session."""
-    state = _away_mode_state.get(session_name, {})
-    return JSONResponse(_away_state_summary(state))
-
-
-# --- Go Nuts Mode ---
-# Autonomous feature-building mode: discovers the project, generates a feature backlog,
-# then continuously builds features, tests, and improves the project in a loop.
-
-_GO_NUTS_SKILLS_DIR = str(Path.home() / ".codex" / "go-nuts-mode-skills")
-_GO_NUTS_LOG_CAP = 200
-
-def _go_nuts_log(state: dict, action: str):
-    """Append a log entry to the go-nuts-mode state."""
-    entry = {"ts": time.time(), "phase": state.get("phase", 0), "step": state.get("step", 0), "action": action}
-    state.setdefault("log", []).append(entry)
-    if len(state["log"]) > _GO_NUTS_LOG_CAP:
-        state["log"] = state["log"][-_GO_NUTS_LOG_CAP:]
-
-
-def _go_nuts_state_summary(state: dict) -> dict:
-    """Return a JSON-safe summary of go-nuts-mode state (no asyncio.Task)."""
-    return {
-        "enabled": state.get("enabled", False),
-        "phase": state.get("phase", 0),
-        "phase_name": state.get("phase_name", ""),
-        "step": state.get("step", 0),
-        "step_name": state.get("step_name", ""),
-        "started_at": state.get("started_at", 0),
-        "log": state.get("log", [])[-30:],
-        "report": state.get("report", ""),
-    }
-
-
-async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
-                                  step_name: str, timeout: int = 900) -> str:
-    """Send prompt, wait for completion, capture and summarize output."""
-    state["step_name"] = step_name
-    _go_nuts_log(state, f"Sending: {step_name}")
-
-    prompt = _build_project_isolation_preamble(session_name) + prompt
-    # Reuse the same send/wait infrastructure as away mode
-    await _away_send_prompt(session_name, prompt)
-    completed = await _away_wait_for_idle(session_name, timeout=timeout)
-
-    if not completed:
-        _go_nuts_log(state, f"Timeout on: {step_name}")
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
-        await asyncio.sleep(2)
-
-    output = capture_pane_full(session_name)
-    try:
-        summary = await llm_call(
-            system_prompt=(
-                "Summarize what the agent accomplished in this terminal output. "
-                "Focus on concrete actions: features built, files created/modified, tests run, errors. "
-                "Be specific and concise. Under 80 words."
-            ),
-            user_content=f"Go Nuts step: {step_name}\n\nTerminal output:\n{output[-4000:]}",
-            max_tokens=200,
-        )
-    except Exception:
-        summary = "(summary unavailable)"
-
-    _go_nuts_log(state, f"Done: {summary[:200]}")
-    state["step"] += 1
-    return summary
-
-
-# --- Go Nuts Phase Prompts ---
-
-_GN_PHASE1_PROMPT = f"""I'm putting you in Go Nuts Mode. You are autonomous — the user is not present. Your job is to BUILD FEATURES and IMPROVE this project as aggressively as possible.
-
-IMPORTANT: Detailed skill instructions are available as files on disk at:
-  {_GO_NUTS_SKILLS_DIR}/
-Each subdirectory contains a SKILL.md with specific tasks and guidance. You MUST read the relevant SKILL.md file before executing any skill.
-
-PHASE 1: Discover the Project
-
-Read {_GO_NUTS_SKILLS_DIR}/01-project-discovery/SKILL.md and execute ALL tasks described in it.
-
-Key objectives:
-1. Map every route, endpoint, model, dependency, and feature
-2. Understand the product vision — who uses this, what does "done" look like?
-3. Assess maturity level (skeleton/prototype/MVP/early product/established)
-4. Map constraints — what can and can't we build?
-5. Write the product profile to /tmp/<SESSION_NAME>-go-nuts-product-profile.md (replace <SESSION_NAME> with the session name from the PROJECT ISOLATION preamble above)
-
-Then immediately read {_GO_NUTS_SKILLS_DIR}/02-product-gap-analysis/SKILL.md and execute it:
-1. Compare what exists vs what users of this product type expect
-2. Identify every missing feature and gap
-3. Write the gap analysis to /tmp/<SESSION_NAME>-go-nuts-gap-analysis.md (use your session name)
-
-CRITICAL: Create a working branch: git checkout -b go-nuts/session-$(date +%Y%m%d-%H%M%S)
-CRITICAL: Never commit to main/master. All work on the go-nuts branch.
-CRITICAL: After EVERY feature you build, run tests + build to verify nothing broke.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE2_PROMPT = f"""PHASE 2: Generate Feature Backlog
-
-Read {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md and execute ALL tasks:
-1. Use the brainstorming frameworks (What If, Adjacent Feature, Delight, Productization)
-2. Research competitors if possible (use web search)
-3. Score each feature on Impact/Feasibility/Independence/Novelty
-4. Write the prioritized backlog to /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name)
-
-Then pick the TOP 3 highest-priority features from the backlog and start building them.
-
-For EACH feature:
-1. Create a git checkpoint (read {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md)
-2. Build the complete feature — not a stub, not a placeholder, the REAL thing
-3. Match existing code style, design language, and patterns
-4. Handle all states: loading, empty, error, populated
-5. Run tests + build after completion
-6. If tests pass → commit: [go-nuts][feature] description
-7. If tests fail → revert and move to next feature
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PHASE3_PROMPT = f"""PHASE 3: Build Features (Batch)
-
-Continue building features from the backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name from the PROJECT ISOLATION preamble).
-
-For each feature, use the relevant skill file:
-- UI/pages → Read {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md
-- API/backend → Read {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md
-- Auth/users → Read {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md
-- Navigation → Read {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md
-- Data/state → Read {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md
-- Search → Read {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md
-- Notifications → Read {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md
-- Config → Read {_GO_NUTS_SKILLS_DIR}/11-config-preferences/SKILL.md
-- Content pages → Read {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md
-- Dashboard → Read {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md
-- Import/Export → Read {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md
-
-EXECUTION WRAPPER for every feature:
-1. Checkpoint (git stash or note SHA)
-2. Build the COMPLETE feature
-3. Run tests + build
-4. ALL GREEN → commit: [go-nuts][feature] description
-5. ANY RED → full revert, log why it failed, move on
-
-Build as many features as you can. Prioritize high-impact, high-feasibility items.
-
-When done, immediately continue to the next task without waiting."""
-
-_GN_PING_PROMPT = f"""You are in Go Nuts Mode. The user is not present. You are autonomous. Your mission: BUILD FEATURES and IMPROVE the project.
-
-You just finished your previous task and are now idle. Pick the NEXT most valuable thing to do.
-
-STEP 1: Check your backlog at /tmp/<SESSION_NAME>-go-nuts-feature-backlog.md (use your session name) — any features left to build?
-STEP 2: If backlog is empty or low, generate new ideas using {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md
-STEP 3: Pick a skill and execute it.
-
-Available skills (each has a SKILL.md with full instructions):
- 1. {_GO_NUTS_SKILLS_DIR}/07-ui-pages-components/SKILL.md — Build UI Pages & Components
- 2. {_GO_NUTS_SKILLS_DIR}/08-api-backend/SKILL.md — Build API & Backend Features
- 3. {_GO_NUTS_SKILLS_DIR}/04-auth-user-system/SKILL.md — Auth & User System
- 4. {_GO_NUTS_SKILLS_DIR}/05-navigation-routing/SKILL.md — Navigation & Routing
- 5. {_GO_NUTS_SKILLS_DIR}/06-data-state/SKILL.md — Data & State Management
- 6. {_GO_NUTS_SKILLS_DIR}/09-search-filtering/SKILL.md — Search & Filtering
- 7. {_GO_NUTS_SKILLS_DIR}/10-notifications-realtime/SKILL.md — Notifications & Realtime
- 8. {_GO_NUTS_SKILLS_DIR}/11-config-preferences/SKILL.md — Config & Preferences
- 9. {_GO_NUTS_SKILLS_DIR}/12-content-pages/SKILL.md — Content Pages
-10. {_GO_NUTS_SKILLS_DIR}/13-dashboard-analytics/SKILL.md — Dashboard & Analytics
-11. {_GO_NUTS_SKILLS_DIR}/14-import-export/SKILL.md — Import & Export
-12. {_GO_NUTS_SKILLS_DIR}/15-social-collaboration/SKILL.md — Social & Collaboration
-13. {_GO_NUTS_SKILLS_DIR}/16-onboarding-empty-states/SKILL.md — Onboarding & Empty States
-14. {_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md — QA & Stability Audit
-15. {_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md — Security Sweep
-16. {_GO_NUTS_SKILLS_DIR}/19-web-research/SKILL.md — Web Research & Inspiration
-17. {_GO_NUTS_SKILLS_DIR}/03-feature-ideation/SKILL.md — Feature Ideation & Brainstorming
-18. {_GO_NUTS_SKILLS_DIR}/20-backup-checkpoint/SKILL.md — Backup & Checkpoint Manager
-
-Rules:
-- Work on the go-nuts branch (create one if not already on it)
-- Never commit to main/master
-- One feature per commit: [go-nuts][feature] description
-- Run tests + build after every change — revert immediately on new failures
-- READ the SKILL.md first, then execute its specific tasks
-- Build COMPLETE features, not stubs or placeholders
-- Every 5th cycle, run QA audit ({_GO_NUTS_SKILLS_DIR}/17-qa-stability-audit/SKILL.md) and security sweep ({_GO_NUTS_SKILLS_DIR}/18-security-sweep/SKILL.md)
-
-Pick a skill, read its SKILL.md, and execute it now."""
-
-
-async def _go_nuts_phase_discover(session_name: str, state: dict):
-    """Phase 1: Discover the project and analyze gaps."""
-    state["phase"] = 1
-    state["phase_name"] = "Discover Project"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 1: Project Discovery & Gap Analysis")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE1_PROMPT, state,
-                                  "Discover project & analyze gaps", timeout=600)
-
-
-async def _go_nuts_phase_backlog(session_name: str, state: dict):
-    """Phase 2: Generate feature backlog and start building."""
-    state["phase"] = 2
-    state["phase_name"] = "Feature Backlog"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 2: Generate Feature Backlog & Build Top Features")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE2_PROMPT, state,
-                                  "Generate backlog & build top features", timeout=900)
-
-
-async def _go_nuts_phase_build(session_name: str, state: dict):
-    """Phase 3: Build features from backlog."""
-    state["phase"] = 3
-    state["phase_name"] = "Build Features"
-    state["step"] = 1
-    _go_nuts_log(state, "Starting Phase 3: Build Features Batch")
-    await _go_nuts_send_and_wait(session_name, _GN_PHASE3_PROMPT, state,
-                                  "Build features from backlog", timeout=900)
-
-
-async def _go_nuts_mode_worker(session_name: str):
-    """Main go-nuts-mode coroutine. Runs discovery phases then loops forever, building features."""
-    log = logging.getLogger("go-nuts-mode")
-    state = _go_nuts_state[session_name]
-    log.info(f"Go Nuts mode started for session '{session_name}'")
-    try:
-        # --- Initial setup phases (run once, errors skip to continuous loop) ---
-        try:
-            await _go_nuts_phase_discover(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 1 error (skipping): {e}")
-            log.error(f"Go Nuts phase 1 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_backlog(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 2 error (skipping): {e}")
-            log.error(f"Go Nuts phase 2 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        try:
-            await _go_nuts_phase_build(session_name, state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _go_nuts_log(state, f"Phase 3 error (skipping): {e}")
-            log.error(f"Go Nuts phase 3 error for '{session_name}': {e}")
-
-        if not state.get("enabled"):
-            return
-
-        # --- Continuous loop: monitor idle, ping with next feature task ---
-        # This loop NEVER exits unless cancelled or disabled by user.
-        state["phase"] = 4
-        state["phase_name"] = "Continuous Build"
-        cycle = 1
-        consecutive_errors = 0
-        while state.get("enabled"):
-            try:
-                _go_nuts_log(state, f"Monitoring for idle (cycle {cycle})...")
-                idle_since = None
-                while state.get("enabled"):
-                    await asyncio.sleep(10)
-                    try:
-                        activity = await async_detect_activity(session_name)
-                    except Exception:
-                        activity = {"status": "unknown"}
-                    if activity["status"] == "idle":
-                        if idle_since is None:
-                            idle_since = time.time()
-                        elif time.time() - idle_since >= 90:
-                            break
-                    else:
-                        idle_since = None
-
-                if not state.get("enabled"):
-                    return
-
-                # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
-                if not codex_ok:
-                    _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
-                    state["enabled"] = False
-                    _save_autonomous_state()
-                    return
-
-                state["step"] = cycle
-                state["step_name"] = f"Build cycle {cycle}"
-                _go_nuts_log(state, f"Session idle for 90s — sending build ping (cycle {cycle})")
-                await _go_nuts_send_and_wait(session_name, _GN_PING_PROMPT, state,
-                                              f"Build cycle {cycle}", timeout=900)
-                cycle += 1
-                consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                _go_nuts_log(state, f"Cycle {cycle} error ({consecutive_errors}): {e}")
-                log.error(f"Go Nuts cycle {cycle} error for '{session_name}': {e}")
-                if consecutive_errors >= 5:
-                    _go_nuts_log(state, "Too many consecutive errors, pausing 5 minutes...")
-                    await asyncio.sleep(300)
-                    consecutive_errors = 0
-                else:
-                    await asyncio.sleep(30)
-
-    except asyncio.CancelledError:
-        if _shutting_down:
-            _go_nuts_log(state, "Go Nuts mode cancelled (server shutdown — will restore)")
-        else:
-            _go_nuts_log(state, "Go Nuts mode cancelled by user")
-            state["enabled"] = False
-            _save_autonomous_state()
-        log.info(f"Go Nuts mode cancelled for '{session_name}'")
-        raise
-    except Exception as e:
-        _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
-        log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
-        # Don't set enabled=False — let watchdog zombie detection restart us
-    finally:
-        state["task"] = None
-        log.info(f"Go Nuts mode finished for '{session_name}'")
-
-
-@app.post("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
-    """Toggle go-nuts mode on or off for a session."""
-    _, sess = _find_session(session_name)
-    if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-
-    if body.enabled:
-        # Don't allow both away mode and go-nuts mode at the same time on same session
-        if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Away Mode is active on this session. Disable it first."}, status_code=409)
-
-        if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_go_nuts_state_summary(_go_nuts_state[session_name]))
-
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _go_nuts_state[session_name] = state
-        _go_nuts_log(state, "Go Nuts mode enabled")
-        task = asyncio.create_task(_go_nuts_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-    else:
-        state = _go_nuts_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _go_nuts_log(state, "Go Nuts mode disabled by user")
-        _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
-
-
-@app.get("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_status(session_name: str):
-    """Get current go-nuts-mode state for a session."""
-    state = _go_nuts_state.get(session_name, {})
-    return JSONResponse(_go_nuts_state_summary(state))
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -14424,12 +14561,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 /* Command bar */
 .cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:visible;flex-shrink:0}
 .cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
+.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
+.btn.composer-action{width:48px;height:48px;flex:0 0 48px;display:flex;align-items:center;justify-content:center;border:none;border-radius:50%;padding:0;margin:0 10px 10px 6px;background:#238636;color:#fff}
+.btn.composer-action:hover{background:#2ea043}
+.composer-action svg{display:block}
+.composer-action.is-mic{background:#238636;color:#fff}
+.composer-action.is-send{background:#238636;color:#fff}
+.composer-action.is-recording{background:#da3633;color:#fff;animation:composer-recording 1.2s ease-in-out infinite}
+.composer-action.is-recording:hover{background:#f85149}
+.composer-action.is-transcribing{background:#30363d;color:#c9d1d9;cursor:wait}
+.composer-spin{width:18px;height:18px;border:2px solid #8b949e;border-top-color:#f0f6fc;border-radius:50%;animation:composer-spin .8s linear infinite}
+@keyframes composer-recording{0%,100%{box-shadow:0 0 0 0 #da363355}50%{box-shadow:0 0 0 7px #da363300}}
+@keyframes composer-spin{to{transform:rotate(360deg)}}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -14529,14 +14677,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tier:last-of-type{margin-bottom:0}
 .tier-label{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;display:flex;align-items:center;gap:6px}
 .tier-label .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
-.tier-description .tier-label{color:#8b949e}
-.tier-description .dot{background:#8b949e}
-.tier-description .tier-text{color:#c9d1d9;font-weight:500}
-.tier-progress .tier-label{color:#d2a8ff}
-.tier-progress .dot{background:#d2a8ff}
-.tier-notes .tier-label{color:#e3b341}
-.tier-notes .dot{background:#e3b341}
-.tier-notes .tier-text{white-space:pre-wrap;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;max-height:300px;overflow-y:auto}
 .tier-text{color:#b1bac4;line-height:1.6;font-size:1.05rem}
 .tier-text.loading{color:#6e7681;font-style:italic}
 
@@ -14560,34 +14700,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
-/* Away mode toggle */
-.away-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.away-toggle input{opacity:0;width:0;height:0}
-.away-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.away-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.away-toggle input:checked+.away-toggle-slider{background:#238636}
-.away-toggle input:checked+.away-toggle-slider:before{transform:translateX(20px);background:#fff}
-.away-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:200px;overflow-y:auto;scrollbar-width:thin}
-.away-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.away-log-entry .away-ts{color:#58a6ff}
-.nav-away{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5;background:#3d1f6d;color:#d2a8ff}
-
-/* Go Nuts mode toggle */
-.gonuts-toggle{position:relative;display:inline-block;width:44px;height:24px}
-.gonuts-toggle input{opacity:0;width:0;height:0}
-.gonuts-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
-.gonuts-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.gonuts-toggle input:checked+.gonuts-toggle-slider{background:#da3633}
-.gonuts-toggle input:checked+.gonuts-toggle-slider:before{transform:translateX(20px);background:#fff}
 .watchdog-toggle{position:relative;display:inline-block;width:44px;height:24px}
 .watchdog-toggle input{opacity:0;width:0;height:0}
 .watchdog-toggle-slider{position:absolute;cursor:pointer;inset:0;background:#21262d;border-radius:12px;transition:.3s}
 .watchdog-toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
 .watchdog-toggle input:checked+.watchdog-toggle-slider{background:#238636}
 .watchdog-toggle input:checked+.watchdog-toggle-slider:before{transform:translateX(20px);background:#fff}
-.watchdog-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:120px;overflow-y:auto;scrollbar-width:thin}
-.watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
-.watchdog-log-entry .watchdog-ts{color:#56d364}
 /* Auto-push 3-way segmented control (off / basic / full) */
 .autopush-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
 .autopush-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
@@ -14683,7 +14801,6 @@ body.member-simple .nav-tools-wrap{display:none}
 body.member-simple .codex-auth{display:none}
 body.member-simple .nav-server-stats{display:none}
 body.member-simple .nav-usage{display:none}
-body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
 body.member-simple .hide-in-simple{display:none!important}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
@@ -14772,16 +14889,6 @@ body.member-simple .hide-in-simple{display:none!important}
 .skills-editor{flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;resize:none;min-height:200px;line-height:1.5;outline:none}
 .skills-editor:focus{border-color:#58a6ff}
 .skills-empty{color:#6e7681;font-size:.8rem;padding:12px 0;text-align:center}
-/* Profile dropdown next to Terminal tab */
-.profile-wrap{display:flex;align-items:center;gap:6px;margin-left:8px;padding-left:8px;border-left:1px solid #21262d}
-.profile-label{font-size:.65rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
-.profile-select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-size:.78rem;padding:4px 22px 4px 8px;border-radius:6px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%238b949e' d='M5 7L1 3h8z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center}
-.profile-select:focus{border-color:#58a6ff}
-.profile-restart-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:.85rem;line-height:1}
-.profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
-.profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
-@media(max-width:768px){.profile-label{display:none}.profile-wrap{margin-left:4px;padding-left:6px}}
-
 /* Profile editor modal */
 .profiles-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .profiles-overlay.active{display:flex}
@@ -14864,20 +14971,37 @@ body.member-simple .hide-in-simple{display:none!important}
 .settings-section .my-ctx-settings,.settings-section .my-ctx-config{min-height:120px}
 .settings-section .my-ctx-path{font-size:.7rem;color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;margin-bottom:2px}
 .settings-section .my-ctx-actions{display:flex;justify-content:flex-end;gap:8px}
+.my-context-browser{display:grid;grid-template-columns:250px minmax(0,1fr);gap:10px;flex:1;min-height:360px;overflow:hidden}
+.my-context-file-list{background:#0d1117;border:1px solid #21262d;border-radius:7px;overflow:auto;padding:5px}
+.my-context-file{display:block;width:100%;border:0;background:transparent;color:#8b949e;text-align:left;padding:7px 8px;border-radius:5px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.72rem;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.my-context-file:hover{background:#161b22;color:#c9d1d9}
+.my-context-file.active{background:#1c2333;color:#79c0ff}
+.my-context-file-badge{float:right;color:#6e7681;font-family:inherit;font-size:.58rem;text-transform:uppercase}
+.my-context-editor-pane{display:flex;flex-direction:column;min-width:0;min-height:0}
+.my-context-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px}
+.my-context-editor-name{font-family:'SF Mono','Fira Code',Consolas,monospace;color:#e6edf3;font-size:.82rem;font-weight:600;overflow-wrap:anywhere}
+.my-context-editor-mode{font-size:.62rem;color:#6e7681;border:1px solid #30363d;border-radius:9px;padding:2px 7px;white-space:nowrap}
+.my-context-editor{flex:1;min-height:310px;resize:none!important}
+.my-context-editor[readonly]{color:#8b949e;background:#080b10}
+@media(max-width:700px){
+  .my-context-browser{grid-template-columns:1fr;overflow:visible}
+  .my-context-file-list{max-height:180px}
+  .my-context-editor{min-height:360px}
+}
 /* Header browser sign-in badge */
-.nav-browser-badge{display:inline-flex;align-items:center;gap:5px;cursor:pointer;padding:3px 7px;border-radius:12px;border:1px solid #30363d;background:#0d1117;user-select:none;line-height:1}
+.nav-browser-badge{display:inline-flex;align-items:center;gap:5px;cursor:pointer;padding:3px 7px;border-radius:12px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;user-select:none;line-height:1}
 .nav-browser-badge:hover{border-color:#58a6ff}
 .nav-browser-badge .nbb-glyph{font-size:.8rem;filter:grayscale(1) opacity(.75)}
 .nav-browser-badge .nbb-dot{width:8px;height:8px;border-radius:50%;background:#6e7681;flex:0 0 auto}
 .nav-browser-badge.ok .nbb-dot{background:#3fb950;box-shadow:0 0 6px #3fb95099}
 .nav-browser-badge.bad .nbb-dot{background:#f85149;box-shadow:0 0 6px #f8514999}
 .nav-browser-badge.warn .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299}
-/* Blinking green: the signed-in browser is being used right now (a person over
-   noVNC, or Codex driving it in the background). */
-.nav-browser-badge.ok.active{border-color:#3fb950}
-.nav-browser-badge.ok.active .nbb-dot{animation:nbb-blink 1s ease-in-out infinite}
-.nav-browser-badge.ok.active .nbb-glyph{animation:nbb-pulse 1.6s ease-in-out infinite}
-@keyframes nbb-blink{0%,100%{opacity:1;box-shadow:0 0 8px #3fb950}50%{opacity:.3;box-shadow:none}}
+/* Flashing yellow: the connected browser is being used right now (a person
+   over noVNC, or a browser workflow driving it in the background). */
+.nav-browser-badge.working{border-color:#d29922}
+.nav-browser-badge.working .nbb-dot{background:#d29922;box-shadow:0 0 8px #d29922aa;animation:nbb-working .9s ease-in-out infinite}
+.nav-browser-badge.working .nbb-glyph{filter:none;animation:nbb-pulse 1.4s ease-in-out infinite}
+@keyframes nbb-working{0%,100%{opacity:1;box-shadow:0 0 8px #d29922aa}50%{opacity:.25;box-shadow:none}}
 .nav-browser-badge.ok .nbb-glyph{filter:none}
 /* Working: the dot becomes a spinning ring so background use is obvious. */
 .nav-browser-badge.busy{border-color:#58a6ff}
@@ -14967,6 +15091,72 @@ body.member-simple .hide-in-simple{display:none!important}
 .users-new-bar input:focus,.users-new-bar select:focus{border-color:#58a6ff}
 .users-new-bar button{background:#1f6feb;color:#fff;border:none;padding:7px 14px;border-radius:5px;font-size:.82rem;cursor:pointer;font-weight:500}
 .users-new-bar button:hover{background:#388bfd}
+.users-summary{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:8px}
+.users-summary-card{background:#0d1117;border:1px solid #21262d;border-radius:7px;padding:9px 11px;min-width:0}
+.users-summary-label{display:block;color:#6e7681;font-size:.62rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+.users-summary-value{display:block;color:#e6edf3;font-size:1.05rem;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
+.users-summary-card.live .users-summary-value{color:#3fb950}
+.users-summary-card.working .users-summary-value{color:#f85149}
+.users-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;position:relative}
+.users-search{flex:1;min-width:180px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 10px;font-size:.8rem;outline:none}
+.users-search:focus{border-color:#58a6ff}
+.users-status-chips{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.users-status-chip{background:#161b22;border:1px solid #30363d;border-radius:14px;color:#8b949e;padding:4px 9px;font-size:.7rem;cursor:pointer}
+.users-status-chip:hover{color:#c9d1d9;border-color:#484f58}
+.users-status-chip.active{background:#1c2333;border-color:#58a6ff;color:#79c0ff}
+.users-toolbar-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 10px;font-size:.75rem;cursor:pointer}
+.users-toolbar-btn:hover{background:#30363d}
+.users-columns-wrap{position:relative}
+.users-columns-menu{display:none;position:absolute;right:0;top:calc(100% + 5px);z-index:40;width:230px;background:#161b22;border:1px solid #30363d;border-radius:7px;box-shadow:0 10px 28px rgba(0,0,0,.5);padding:8px}
+.users-columns-menu.open{display:block}
+.users-columns-menu label{display:flex;align-items:center;gap:8px;padding:5px 4px;margin:0;color:#c9d1d9;text-transform:none;letter-spacing:0;font-size:.75rem;cursor:pointer}
+.users-columns-menu label:hover{background:#21262d;border-radius:4px}
+.users-columns-menu input{accent-color:#58a6ff}
+.users-columns-reset{width:100%;margin-top:6px}
+.users-top-scroll{height:12px;overflow-x:auto;overflow-y:hidden;border:1px solid #21262d;border-bottom:0;border-radius:6px 6px 0 0;background:#0d1117}
+.users-top-scroll>div{height:1px}
+.users-table-scroll{overflow:auto;max-height:calc(100vh - 430px);min-height:230px;border:1px solid #21262d;border-radius:0 0 6px 6px;background:#0d1117}
+.users-top-scroll,.users-table-scroll{scrollbar-width:thin;scrollbar-color:#484f58 #0d1117}
+.users-top-scroll::-webkit-scrollbar,.users-table-scroll::-webkit-scrollbar{width:10px;height:10px}
+.users-top-scroll::-webkit-scrollbar-track,.users-table-scroll::-webkit-scrollbar-track{background:#0d1117}
+.users-top-scroll::-webkit-scrollbar-thumb,.users-table-scroll::-webkit-scrollbar-thumb{background:#484f58;border:2px solid #0d1117;border-radius:6px}
+.users-top-scroll::-webkit-scrollbar-thumb:hover,.users-table-scroll::-webkit-scrollbar-thumb:hover{background:#6e7681}
+.users-table{table-layout:fixed;min-width:100%;width:max-content;border-collapse:separate;border-spacing:0;font-size:.78rem}
+.users-table th{position:sticky;top:0;z-index:4;background:#161b22;height:32px;padding:5px 22px 5px 8px;border-bottom:1px solid #30363d;border-right:1px solid #21262d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none}
+.users-table th[data-tip]:hover::after{content:attr(data-tip);position:fixed;z-index:100;background:#010409;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:5px 7px;font-size:.68rem;text-transform:none;letter-spacing:0;white-space:normal;max-width:240px;margin-top:23px;margin-left:-40px;box-shadow:0 6px 16px rgba(0,0,0,.45)}
+.users-table td{height:58px;max-height:58px;padding:7px 8px;border-bottom:1px solid #161b22;border-right:1px solid #161b22;vertical-align:middle;overflow:hidden;text-overflow:ellipsis}
+.users-table tbody tr{cursor:pointer;background:#0d1117}
+.users-table tbody tr:nth-child(even){background:#10151d}
+.users-table tbody tr:hover{background:#1c2128}
+.users-table .user-row-number{position:sticky;left:0;z-index:3;width:42px;min-width:42px;max-width:42px;text-align:center;background:inherit;color:#6e7681;font-variant-numeric:tabular-nums}
+.users-table th.user-row-number{z-index:6;background:#161b22}
+.user-col-resizer{position:absolute;right:-3px;top:0;width:7px;height:100%;cursor:col-resize;z-index:8}
+.user-col-resizer:hover{background:#58a6ff66}
+.users-sort{color:#58a6ff;margin-left:4px;font-size:.62rem}
+.users-presence{display:inline-flex;align-items:center;gap:6px;font-size:.72rem;white-space:nowrap}
+.users-presence-dot{width:8px;height:8px;border-radius:50%;background:#6e7681;flex:0 0 auto}
+.users-presence.online .users-presence-dot{background:#3fb950;box-shadow:0 0 6px #3fb95088}
+.users-presence.working .users-presence-dot{background:#f85149;box-shadow:0 0 7px #f8514999;animation:pulse-glow 1.5s ease-in-out infinite}
+.users-cell-main{display:block;color:#e6edf3;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.users-cell-sub{display:block;color:#6e7681;font-size:.66rem;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.users-token{font-variant-numeric:tabular-nums}
+.users-actions{justify-content:flex-start;flex-wrap:wrap;max-height:45px;overflow:hidden}
+.users-table-footer{display:flex;justify-content:space-between;gap:10px;color:#6e7681;font-size:.68rem;padding:5px 2px;flex-wrap:wrap}
+.prompt-audit-list{display:flex;flex-direction:column;gap:8px;max-height:65vh;overflow:auto;margin-top:10px}
+.prompt-audit-row{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:9px 10px}
+.prompt-audit-meta{color:#6e7681;font-size:.68rem;margin-bottom:5px;display:flex;gap:8px;flex-wrap:wrap}
+.prompt-audit-text{color:#e6edf3;font-size:.82rem;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.user-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0}
+.user-detail-item{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px}
+.user-detail-item span{display:block;color:#6e7681;font-size:.64rem;text-transform:uppercase;letter-spacing:.04em}
+.user-detail-item strong{display:block;color:#e6edf3;margin-top:3px;font-size:.82rem;overflow-wrap:anywhere}
+@media(max-width:800px){
+  .users-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .users-new-bar{flex-wrap:wrap}
+  .users-new-bar input,.users-new-bar select{flex:1;min-width:130px}
+  .users-table-scroll{max-height:calc(100vh - 360px)}
+  .user-detail-grid{grid-template-columns:1fr}
+}
 /* APIs tab */
 .api-toolbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 2px}
 .api-summary{font-size:.75rem;color:#8b949e}
@@ -15084,7 +15274,6 @@ body.member-simple .hide-in-simple{display:none!important}
   .tab-more-arrow{display:none}
   .tab-more-icon{display:inline-block}
   .tab-more-model-block{display:block}
-  .profile-select{width:34px;padding:4px;color:transparent;-webkit-text-fill-color:transparent;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16'%3E%3Cpath fill='%238b949e' d='M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1c-2.21 0-6 1.106-6 3.3V14h12v-1.7C14 10.106 10.21 9 8 9z'/%3E%3C/svg%3E");background-position:center;background-repeat:no-repeat}
 }
 </style></head>
 <body>
@@ -15113,10 +15302,10 @@ body.member-simple .hide-in-simple{display:none!important}
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
   <!-- Generic browser-session status. Codex auto-auth is retired. -->
-  <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
-        title="Browser sign-in status" onclick="onBrowserBadgeClick()">
+  <button type="button" class="nav-browser-badge bad" id="nav-browser-badge"
+        title="Checking browser connection" aria-label="Checking browser connection" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
-  </span>
+  </button>
   <div class="nav-tools-wrap">
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
@@ -15138,7 +15327,7 @@ body.member-simple .hide-in-simple{display:none!important}
       </div>
       <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('users');closeToolsMenu()"><span class="icon">&#x1F465;</span> Users</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
@@ -15147,6 +15336,7 @@ body.member-simple .hide-in-simple{display:none!important}
     </div>
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
+  <button class="nav-icon-btn member-only" id="nav-settings-btn" onclick="openSettings('mycontext')" title="Settings"><span class="icon">&#x2699;</span></button>
   <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
@@ -15188,7 +15378,7 @@ body.member-simple .hide-in-simple{display:none!important}
 <div class="codexmd-overlay" id="memorymd-overlay" onclick="if(event.target===this)closeSessionMemory()">
   <div class="codexmd-panel">
     <h3>MEMORY.md <span id="memorymd-session-tag" style="font-size:.75rem;color:#8b949e;font-weight:400;margin-left:8px"></span> <button class="stats-close" onclick="closeSessionMemory()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Codex in this session. Lives at <code id="memorymd-dir"></code> — scoped to the session's <code>(profile, cwd)</code> pair. <span style="color:#e3b341">Note:</span> two tmux sessions on the same profile + cwd share this file. To isolate, put each session on its own profile.</div>
+    <div class="profiles-hint" style="margin-bottom:10px">Project auto-memory loaded by Codex in this session. Lives at <code id="memorymd-dir"></code> and is scoped to the account's Codex home plus the working directory. <span style="color:#e3b341">Note:</span> two sessions using the same working directory share this file; use separate project directories when isolation is needed.</div>
     <label class="codexmd-label">MEMORY.md (index)</label>
     <div class="codexmd-path" id="memorymd-path"></div>
     <textarea class="codexmd-editor" id="memorymd-editor" spellcheck="false"></textarea>
@@ -15203,21 +15393,9 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- Profiles editor overlay -->
-<div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
-  <div class="profiles-panel">
-    <h3>Codex Profiles <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
-    <div class="profiles-hint">Each profile is a fully isolated Codex config (config.toml, AGENTS.md, MEMORY.md, skills/, plus any extra <code>.md</code> sidecar files you add) under <code>~/.codex-&lt;id&gt;/</code> selected per tmux session via <code>CODEX_HOME</code>. The <strong>Default</strong> profile uses the standard <code>~/.codex</code>.</div>
-    <div class="profiles-body">
-      <div class="profiles-list" id="profiles-list">Loading...</div>
-      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
-    </div>
-  </div>
-</div>
-
 <!-- Settings overlay -->
 <div class="profiles-overlay" id="settings-overlay" onclick="if(event.target===this)closeSettings()">
-  <div class="profiles-panel" style="width:980px">
+  <div class="profiles-panel" style="width:min(1180px,94vw)">
     <h3>Settings <button class="stats-close" onclick="closeSettings()">&times;</button></h3>
     <div class="settings-tabs" id="settings-tabs"></div>
     <div class="settings-body" id="settings-body" style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden">
@@ -15231,6 +15409,45 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+const _nativeFetch=window.fetch.bind(window);
+function _storedImpersonationToken(){
+  try{return sessionStorage.getItem('tmuxImpersonationToken')||''}catch(e){return''}
+}
+window.fetch=function(input,init){
+  const token=_storedImpersonationToken();
+  if(!token)return _nativeFetch(input,init);
+  try{
+    const raw=typeof input==='string'?input:input.url;
+    const url=new URL(raw,window.location.href);
+    if(url.origin===window.location.origin){
+      const next=Object.assign({},init||{});
+      const baseHeaders=(init&&init.headers)||(typeof Request!=='undefined'&&input instanceof Request?input.headers:undefined);
+      const headers=new Headers(baseHeaders||{});
+      headers.set('X-Tmux-Impersonate',token);
+      next.headers=headers;
+      return _nativeFetch(input,next);
+    }
+  }catch(e){}
+  return _nativeFetch(input,init);
+};
+async function bootstrapImpersonation(){
+  const url=new URL(window.location.href);
+  const ticket=url.searchParams.get('impersonate_ticket');
+  if(!ticket)return;
+  try{
+    const resp=await _nativeFetch(BASE+'/api/admin/impersonation/exchange',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket})
+    });
+    const data=await resp.json();
+    if(!resp.ok)throw new Error(data.error||'Could not start impersonation');
+    sessionStorage.setItem('tmuxImpersonationToken',data.token);
+  }catch(e){
+    alert('Could not open the user view: '+(e.message||e));
+  }finally{
+    url.searchParams.delete('impersonate_ticket');
+    history.replaceState(null,'',url.pathname+url.search+url.hash);
+  }
+}
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
 let selectedSession=null;
@@ -15239,52 +15456,86 @@ const activeTabs={};
 const rawState={};
 function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
 
-// --- "Hide Bash/Fetch" filter ---
-function getHideBashPref(){
-  try{const v=localStorage.getItem('hideBashLines');return v===null?true:v==='true'}catch(e){return true}
-}
-function setHideBashPref(v){
-  try{localStorage.setItem('hideBashLines',v?'true':'false')}catch(e){}
-}
-// Independently hide tool OUTPUT — the `⎿ …` result blocks (file dumps, command
-// output, "Shell cwd was reset…") plus their indented continuation rows — so the
-// terminal shows only Codex's spoken text, not the plumbing. Default on.
-function getHideOutputPref(){
-  try{const v=localStorage.getItem('hideOutputLines');return v===null?true:v==='true'}catch(e){return true}
-}
-function setHideOutputPref(v){
-  try{localStorage.setItem('hideOutputLines',v?'true':'false')}catch(e){}
-}
-// Codex's TUI lays out tool calls like:
-//   ● Bash(sleep 540 && gcloud ...
-//         --command="date; ...")        <- wrap continuation, indented, no marker
-//     ⎿  Mon May 11 ...                 <- output
+// --- "Clean view" terminal filter ---
+// One switch. On, the terminal shows only what the agent SAID to you and drops
+// everything that is plumbing: tool-call headers (Claude's `Bash(…)`, Codex's
+// `Ran …` / `Edited …` / `Explored` / `Called …`), their wrapped command rows,
+// every tool-output block (`⎿ …` for Claude, `└ …` for Codex) plus its indented
+// continuation rows, package/self-update chatter, per-turn bookkeeping, and the
+// shell plumbing the dashboard types to launch a session. Off, the pane is
+// passed through untouched.
 //
-// The user wants the "specific commands the agent is writing" hidden — so we
-// hide the bullet header line AND its wrap-continuation lines (indented, no
-// bullet/output marker). We KEEP the `⎿` output lines so the user can still
-// see what the command produced.
-// Tool-call headers Codex renders as "● ToolName(args)". We require the
-// "(" so we never hide ordinary prose that happens to start with a word like
-// "Read"/"Write"/"Update"/"Add"/"Task". Covers file ops (Write/Edit/Read/...),
-// shell, web, search and mcp__ tools so the terminal shows the conversation, not
-// the plumbing.
-const _BASH_FILTER_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add)\s*\(|mcp__[^(\s]+\s*\()/i;
-const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
-const _OUTPUT_MARKER_RE=/^[\s]*⎿/;
-const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
-function _isBashFetchHeader(line){
-  const stripped=line.replace(_ANY_DECORATION_RE,'');
-  return _BASH_FILTER_RE.test(stripped);
+// This replaced two separate toggles ("hide tool calls" / "hide tool output"),
+// which could be set to combinations nobody wanted — hiding the command but
+// keeping its 400-line output, say. Migrate: if either old pref was explicitly
+// off, clean view starts off. Default on.
+function getCleanViewPref(){
+  try{
+    const v=localStorage.getItem('terminalCleanView');
+    if(v!==null)return v==='true';
+    const a=localStorage.getItem('hideBashLines');
+    const b=localStorage.getItem('hideOutputLines');
+    if(a===null&&b===null)return true;
+    return a!=='false'&&b!=='false';
+  }catch(e){return true}
 }
-// Hide low-value package/self-update chatter when tool calls are hidden. This
-// helper must stay defined before applyRawFilter: a missing definition leaves
-// the terminal on its initial "Loading Codex..." text after a successful poll.
-const _UPDATE_NOISE_RES=[
+function setCleanViewPref(v){
+  try{
+    localStorage.setItem('terminalCleanView',v?'true':'false');
+    // Keep the legacy keys in step so an older tab left open agrees with us.
+    localStorage.setItem('hideBashLines',v?'true':'false');
+    localStorage.setItem('hideOutputLines',v?'true':'false');
+  }catch(e){}
+}
+// Back-compat aliases for any caller still asking for the two old prefs.
+function getHideBashPref(){return getCleanViewPref()}
+function getHideOutputPref(){return getCleanViewPref()}
+
+// Claude Code lays a tool call out as:
+//   ● Bash(sleep 540 && gcloud ...
+//         --command="date; ...")     <- wrap continuation, indented, no marker
+//     ⎿  Mon May 11 ...              <- output
+// Codex lays the same thing out as:
+//   • Ran pwd && rg --files -g '*.
+//     │ {jpg,png}' .                 <- wrapped command, `│` marker
+//     └ /home/nimrod_rotem/...       <- output
+//   • Edited test_api.py (+2 -0)
+//         233   ),                   <- diff rows, indented, no marker
+// Prose bullets ("• I'm tracing both issues…") are kept along with their
+// indented sub-bullets, so the conversation still reads as prose.
+const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
+// Output markers: Claude's ⎿, Codex's └. `│` is a wrapped *command* row. The
+// box-drawing ones must be indented — Codex's start-up banner draws its frame
+// with │ at column 0 and we do not want to eat that.
+const _OUTPUT_MARKER_RE=/^[\s]*⎿|^\s+[└╰]\s/;
+const _CALL_CONT_RE=/^\s+│/;
+const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
+// Claude-style `ToolName(args)`. The "(" is required so ordinary prose starting
+// with a word like "Read"/"Write"/"Update"/"Add"/"Task" is never swallowed.
+const _TOOL_PAREN_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add|Agent|Artifact|Skill|Workflow|ToolSearch)\s*\(|mcp__[^(\s]+\s*\()/i;
+// Codex verbs that are only ever emitted as a tool header, never as prose.
+const _CODEX_VERB_RE=/^(?:Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
+// Codex file ops carry a diff stat: "Edited app.py (+12 -3)", "Added x.md (+40)".
+// The stat is what tells them apart from prose ("Added swap and a monitor").
+const _CODEX_FILEOP_RE=/^(?:Edited|Added|Created|Wrote|Updated|Deleted|Removed|Renamed|Moved|Read|Patched)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
+function _isToolHeader(line,followerIsMarker){
+  const stripped=line.replace(_ANY_DECORATION_RE,'');
+  if(_TOOL_PAREN_RE.test(stripped))return true;
+  if(_CODEX_VERB_RE.test(stripped))return true;
+  if(_CODEX_FILEOP_RE.test(stripped))return true;
+  // Structural fallback: a bullet whose next non-empty row is a `│`/`└`/`⎿`
+  // marker is a tool block whatever the verb is. Prose bullets never are.
+  return !!followerIsMarker;
+}
+// Kept for compatibility with the old two-toggle helper name.
+function _isBashFetchHeader(line){return _isToolHeader(line,false)}
+// Package/self-update chatter, plus the per-turn bookkeeping and footer hint
+// bars both CLIs print. These wrap, so a match opens a suppression block.
+const _NOISE_RES=[
   /^checking for updates?/i,
-  /^installing\b.*\b(codex|update|npm|node|package|version|v?\d)/i,
-  /^downloading\b.*\b(codex|update|npm|version|package|v?\d)/i,
-  /\b(update (installed|complete|available)|successfully updated|already up to date|codex v?\d[\d.]* installed)\b/i,
+  /^installing\b.*\b(claude|codex|update|npm|node|package|version|v?\d)/i,
+  /^downloading\b.*\b(claude|codex|update|npm|version|package|v?\d)/i,
+  /\b(update (installed|complete|available)|successfully updated|already up to date|(claude code|codex) v?\d[\d.]* installed)\b/i,
   /^npm\b/i,
   /\bnpm (warn|notice|info|err|http|verb|sill|deprecated|audit|fund)\b/i,
   /^(added|changed|removed|audited)\s+\d+\s+packages?\b/i,
@@ -15292,56 +15543,107 @@ const _UPDATE_NOISE_RES=[
   /^found \d+ vulnerabilit/i,
   /\bnpm audit\b/i,
   /\bto (apply|finish|complete) the update\b/i,
-  /^restart codex\b/i,
+  /^restart (claude|codex)\b/i,
   /^[\[(][#=>\-.\s]{3,}[\])]/,
+  /^token usage:\s/i,
+  /^to continue this session, run (codex|claude) resume\b/i,
+  /^…\s*\+\d+\s+lines?\b/,
+  /^\+\d+\s+lines?\b/,
+  /^tip:\s/i,
+  /^context (left|remaining|window):/i,
+  /^esc to interrupt\b/i,
+  /^shell cwd was reset\b/i,
+  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,
+  /^made \d+\s+\S+.*\b(edit|change)/i,
+  /^⏵/,
+  /\bnew task\?\s*\/clear to save\b/i,
+  /^shift\+tab to cycle\b/i,
 ];
-function _isUpdateNoise(line){
+function _isNoise(line){
   if(!line)return false;
-  const s=line.replace(/^[\s⎿●⏺•·>*\-]+/,'').trim();
+  const s=line.replace(/^[\s⎿●⏺•·│└├>*\-]+/,'').trim();
   if(!s)return false;
-  for(let i=0;i<_UPDATE_NOISE_RES.length;i++){
-    if(_UPDATE_NOISE_RES[i].test(s))return true;
-  }
+  for(let i=0;i<_NOISE_RES.length;i++){if(_NOISE_RES[i].test(s))return true;}
   return false;
 }
+// Kept for compatibility with the old two-toggle helper name.
+function _isUpdateNoise(line){return _isNoise(line)}
+// Structural furniture the pane draws at column 0: the `›`/`❯` composer prompt,
+// the start-up banner box, and the horizontal rules between turns. These always
+// end a hidden block.
+const _PANE_STRUCTURE_RE=/^[›❯>]\s|^[╭╰╮╯│├┤─━═]/;
+// A shell prompt line ("nimo@host:~/dir$ codex --yolo") and the `export DASH_…`
+// / `cd -- …` plumbing the dashboard types to start a session. Only stripped in
+// panes that are actually running an agent — a plain shell session would
+// otherwise render as an empty page.
+const _SHELL_PROMPT_RE=/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s]*\s*[$#]\s?/;
+function _looksLikeAgentPane(text){
+  return /^[\s]*[●⏺•]/m.test(text)||text.indexOf('⎿')>=0||
+         text.indexOf('OpenAI Codex')>=0||text.indexOf('Claude Code')>=0;
+}
 function applyRawFilter(text){
-  const hideBash=getHideBashPref();
-  const hideOut=getHideOutputPref();
-  if(!hideBash&&!hideOut)return text;
+  if(!getCleanViewPref())return text;
   if(!text)return text;
   const lines=text.split('\n');
+  const agentPane=_looksLikeAgentPane(text);
+  // Index of the next non-empty line, for the structural tool-block test and
+  // for deciding whether a blank row ends a hidden block or sits inside one.
+  const nextNonEmpty=new Array(lines.length).fill(-1);
+  for(let i=lines.length-2;i>=0;i--){
+    nextNonEmpty[i]=lines[i+1].trim()===''?nextNonEmpty[i+1]:i+1;
+  }
   const out=[];
-  // A single suppression state machine that composes two independent filters:
-  //   'call'   — a hidden tool-call header (● Bash(…), Read(…), mcp__…(…)) and
-  //              its wrap-continuation rows (indented, no marker).
-  //   'output' — a hidden `⎿ …` result block and its indented continuation rows
-  //              (file dumps, "Shell cwd was reset…", "… +N lines" markers).
-  // Suppression ends at the next bullet, blank line, another ⎿, or a column-0
-  // line — so Codex's spoken text and paragraph breaks are always kept.
+  // One suppression state machine:
+  //   'call'   — a hidden tool-call header and its wrapped command rows.
+  //   'output' — a hidden ⎿/└ result block and its indented continuation rows.
+  //   'noise'  — a hidden bookkeeping/update line and its wrapped rows.
+  //   'shell'  — a hidden shell command and its wrapped rows.
+  // Suppression ends at a bullet, at pane structure, or at a blank row that is
+  // followed by something starting at column 0 — so the agent's spoken text and
+  // its paragraph breaks always survive.
   let mode='';
-  for(const line of lines){
-    if(hideBash&&_isUpdateNoise(line))continue;
-    // Start of a ⎿ output block.
-    if(_OUTPUT_MARKER_RE.test(line)){
-      if(hideOut){mode='output';continue;}   // hide the ⎿ line itself
-      mode='';out.push(line);continue;        // keep output; end any call-suppression
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(_isNoise(line)){mode='noise';continue;}
+    if(_CALL_CONT_RE.test(line)){mode='call';continue;}
+    if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
+    if(_LEADING_BULLET_RE.test(line)){
+      const nx=nextNonEmpty[i];
+      const followerIsMarker=nx>=0&&(_OUTPUT_MARKER_RE.test(lines[nx])||_CALL_CONT_RE.test(lines[nx]));
+      if(_isToolHeader(line,followerIsMarker)){mode='call';continue;}
+      mode='';out.push(line);continue;   // prose bullet
     }
-    const isBullet=_LEADING_BULLET_RE.test(line);
-    // Start of a hidden tool-call header.
-    if(hideBash&&isBullet&&_isBashFetchHeader(line)){
-      mode='call';continue;
+    if(agentPane&&_SHELL_PROMPT_RE.test(line)){mode='shell';continue;}
+    if(line.trim()===''){
+      // A blank row inside a hidden block (command output routinely has them)
+      // must not end the suppression, or the tail of the block leaks out. It
+      // ends when the block does — when the next real row is a bullet or
+      // starts at column 0.
+      const nx=nextNonEmpty[i];
+      if(mode&&nx>=0&&/^\s/.test(lines[nx])&&!_LEADING_BULLET_RE.test(lines[nx]))continue;
+      mode='';out.push(line);continue;
     }
-    // A different bullet (Codex's spoken text) — always kept, ends suppression.
-    if(isBullet){mode='';out.push(line);continue;}
-    // Blank line — keep so paragraph breaks stay intact, ends suppression.
-    if(line.trim()===''){mode='';out.push(line);continue;}
-    // Column-0 non-space — not a wrap continuation, kept, ends suppression.
-    if(/^\S/.test(line)){mode='';out.push(line);continue;}
-    // Indented continuation row — drop it if it belongs to a hidden block.
+    if(/^\S/.test(line)){
+      // Column-0 non-space. Inside an agent pane every spoken word sits inside
+      // a `•` bullet at an indent, so a column-0 row reached while a block is
+      // being hidden is that block's wrapped tail, not prose — drop it. Pane
+      // structure (rules, banner, `›` prompt) still breaks out.
+      if(mode&&agentPane&&!_PANE_STRUCTURE_RE.test(line))continue;
+      if(mode==='shell')continue;
+      mode='';out.push(line);continue;
+    }
+    // Indented continuation row — dropped if it belongs to a hidden block.
     if(mode)continue;
     out.push(line);
   }
-  return out.join('\n');
+  // Removing whole blocks leaves ragged runs of blank rows behind. Collapse
+  // them to a single separator so the conversation reads as prose.
+  const tidy=[];
+  for(const l of out){
+    if(l.trim()===''&&(!tidy.length||tidy[tidy.length-1].trim()===''))continue;
+    tidy.push(l);
+  }
+  return tidy.join('\n');
 }
 function _escTermHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -15577,16 +15879,18 @@ function rerenderAllRaw(){
     if(rawState[n]&&rawState[n].fullText)renderRawText(n);
   }
 }
-function toggleHideBash(name,checked){
-  setHideBashPref(checked);
-  const lbl=document.getElementById('hidebash-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool calls':'Off — showing all output';
-  rerenderAllRaw();
-}
-function toggleHideOutput(name,checked){
-  setHideOutputPref(checked);
-  const lbl=document.getElementById('hideoutput-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool output (⎿ …)':'Off — showing tool output';
+const CLEAN_VIEW_ON='On — only the agent\'s replies';
+const CLEAN_VIEW_OFF='Off — showing the full terminal';
+function toggleCleanView(name,checked){
+  setCleanViewPref(checked);
+  // Every open session detail panel carries its own copy of this switch, and
+  // the pref is global — keep them all in step instead of just the clicked one.
+  document.querySelectorAll('[id^="cleanview-toggle-"]').forEach(function(el){
+    if(el.checked!==checked)el.checked=checked;
+  });
+  document.querySelectorAll('[id^="cleanview-status-"]').forEach(function(el){
+    el.textContent=checked?CLEAN_VIEW_ON:CLEAN_VIEW_OFF;
+  });
   rerenderAllRaw();
 }
 const lastStatus={};
@@ -15613,6 +15917,7 @@ function restoreDrafts(){
       const key=tab+'-'+s.name;
       const el=document.getElementById('cmd-'+tab+'-'+s.name);
       if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
+      if(el)updateComposerBtn(key);
     });
   });
 }
@@ -15801,8 +16106,6 @@ function renderNav(){
       <span class="nav-session-id">${esc(s.name)}</span>
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
-        ${s.away_mode?'<span class="nav-away">AW</span>':''}
-        ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
     brand.after(item);
   });
@@ -15852,7 +16155,6 @@ function renderDetail(){
   mainEl.innerHTML=`
     <div class="tab-bar">
       <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
-      ${renderProfileDropdown(s)}
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
@@ -15863,15 +16165,6 @@ function renderDetail(){
           <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
           ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          ${MEMBER_SIMPLE?'':`
-          <div style="height:1px;background:#21262d;margin:4px 0"></div>
-          <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
-          <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.toml');closeTabMore()">Project config.toml</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.local.toml');closeTabMore()">Project config.local.toml</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>
-          `}
         </div>
       </div>
       <div class="detail-badges">
@@ -15883,6 +16176,7 @@ function renderDetail(){
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
@@ -15901,9 +16195,12 @@ function renderDetail(){
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this)"
+            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="btn cmd-send composer-action is-mic"
+            id="cmd-send-chat-${s.name}"
+            onclick="composerAction('chat-${s.name}')"
+            aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
@@ -15915,7 +16212,6 @@ function renderDetail(){
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
-        <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
@@ -15924,9 +16220,12 @@ function renderDetail(){
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
           placeholder="Type a command and press Enter..."
           onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this)"
+          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
+        <button class="btn cmd-send composer-action is-mic"
+          id="cmd-send-raw-${s.name}"
+          onclick="composerAction('raw-${s.name}')"
+          aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
       ${buildKeyBar(s.name,'raw')}
@@ -15940,11 +16239,11 @@ function renderDetail(){
           <button class="btn" onclick="loadProfileSkills('${s.name}')">Refresh</button>
         </div>
         <div class="skills-section">
-          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Codex in this profile)</span></div>
+          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Codex for every session)</span></div>
           <div class="skills-list" id="skills-active-${s.name}"></div>
         </div>
         <div class="skills-section">
-          <div class="skills-section-header">Library <span class="skills-section-hint">(toggle on/off for this profile)</span></div>
+          <div class="skills-section-header">Library <span class="skills-section-hint">(toggle on/off globally)</span></div>
           <div class="skills-list" id="skills-library-${s.name}"></div>
         </div>
         <div class="skills-section">
@@ -15964,103 +16263,32 @@ function renderDetail(){
     </div>
 
     <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
-      <div class="tier tier-description">
-        <div class="tier-label"><span class="dot"></span>Project</div>
-        <div class="tier-text" id="desc-${s.name}">${esc(s.description)||'Loading...'}</div>
-      </div>
-      <div class="tier tier-progress">
-        <div class="tier-label"><span class="dot"></span>Progress</div>
-        <div class="tier-text" id="prog-${s.name}">${esc(s.progress)||'Loading...'}</div>
-      </div>
-      <div class="tier tier-notes">
-        <div class="tier-label"><span class="dot"></span>Key Info</div>
-        <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
-      </div>
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="font-size:.85rem;color:#c9d1d9;margin-top:6px">
           ${s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
-          <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed per Codex profile in Settings</span>
+          <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed globally in Settings</span>
         </div>
       </div>
       <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
       </div>
-      <div class="tier" style="margin-top:12px" id="hidebash-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool calls</div>
+      <div class="tier" style="margin-top:12px" id="cleanview-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Clean view</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
           <label class="watchdog-toggle">
-            <input type="checkbox" id="hidebash-toggle-${s.name}"
-              onchange="toggleHideBash('${esc(s.name)}',this.checked)"
-              ${getHideBashPref()?'checked':''}>
+            <input type="checkbox" id="cleanview-toggle-${s.name}"
+              onchange="toggleCleanView('${esc(s.name)}',this.checked)"
+              ${getCleanViewPref()?'checked':''}>
             <span class="watchdog-toggle-slider"></span>
           </label>
-          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls':'Off — showing all output'}</span>
+          <span id="cleanview-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getCleanViewPref()?CLEAN_VIEW_ON:CLEAN_VIEW_OFF}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Use <b>Hide tool output</b> below to also drop the <code style="color:#79c0ff">⎿</code> result blocks. Setting is shared across all sessions.</div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="hideoutput-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool output</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="watchdog-toggle">
-            <input type="checkbox" id="hideoutput-toggle-${s.name}"
-              onchange="toggleHideOutput('${esc(s.name)}',this.checked)"
-              ${getHideOutputPref()?'checked':''}>
-            <span class="watchdog-toggle-slider"></span>
-          </label>
-          <span id="hideoutput-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideOutputPref()?'On — hiding tool output (⎿ …)':'Off — showing tool output'}</span>
-        </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Codex's spoken text. Setting is shared across all sessions.</div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
-        <div style="margin-top:8px">${autopushSeg(s.name, s.autopush_mode, false)}</div>
-        <div id="autopush-status-${s.name}" style="font-size:.82rem;color:#8b949e;margin-top:8px">${autopushDesc(s.autopush_mode)}</div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.5">
-          <b style="color:#8b949e">Off</b> — the dashboard never types into this terminal.<br>
-          <b style="color:#79c0ff">Basic</b> — auto-selects from Codex's option menus and confirms permission/plan prompts (presses Enter), and keeps the session logged in. No free-form messages.<br>
-          <b style="color:#56d364">Full</b> — everything in Basic, plus it writes a "keep going" instruction when Codex pauses or seems to stop before the task is 100% finished.
-        </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Codex is paused waiting for confirmation to keep going on the current task.</div>
-        <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="away-toggle">
-            <input type="checkbox" id="away-toggle-${s.name}"
-              onchange="toggleAwayMode('${esc(s.name)}',this.checked)"
-              ${s.away_mode?'checked':''}>
-            <span class="away-toggle-slider"></span>
-          </label>
-          <span id="away-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.away_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="away-log" id="away-log-${s.name}"></div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="gonuts-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Go Nuts Mode</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="gonuts-toggle">
-            <input type="checkbox" id="gonuts-toggle-${s.name}"
-              onchange="toggleGoNutsMode('${esc(s.name)}',this.checked)"
-              ${s.go_nuts_mode?'checked':''}>
-            <span class="gonuts-toggle-slider"></span>
-          </label>
-          <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
-        </div>
-        <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
-      </div>
-      <div class="detail-footer" style="margin-top:24px">
-        <div class="timestamps">
-          <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
-          <div class="ts">progress: <span id="ts-prog-${s.name}">${timeAgo(s.progress_at)}</span></div>
-          <div class="ts">notes: <span id="ts-notes-${s.name}">${timeAgo(s.notes_at)}</span></div>
-          <div class="ts">live: <span id="ts-rt-${s.name}">${timeAgo(s.realtime_at)}</span></div>
-        </div>
-        <div class="btn-group">
-          <button class="btn" id="btn-${s.name}" onclick="refreshOne('${esc(s.name)}')">Update</button>
-          <button class="btn btn-full" id="btn-full-${s.name}" onclick="refreshFull('${esc(s.name)}')">Full</button>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">
+          <b style="color:#8b949e">On</b> — the terminal shows only what the agent said to you. Everything else is hidden: tool calls (<code style="color:#79c0ff">Ran …</code>, <code style="color:#79c0ff">Edited …</code>, <code style="color:#79c0ff">Explored</code>, <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code>), their tool output (<code style="color:#79c0ff">⎿</code> / <code style="color:#79c0ff">└</code> blocks, file dumps, diffs, "<code style="color:#79c0ff">… +N lines</code>"), npm/update chatter, token-usage lines and the shell commands used to start the session.<br>
+          <b style="color:#8b949e">Off</b> — the raw terminal, exactly as the agent draws it.<br>
+          Setting is shared across all sessions.
         </div>
       </div>
     </div>`;
@@ -16100,8 +16328,6 @@ function renderDetail(){
   }
   if(tab==='info'){
     startStatsPolling(s.name);
-    if((s.autopush_mode||'basic')==='full')startWatchdogPolling(s.name);
-    else loadWatchdogStatus(s.name);
   }
   if(tab==='skills')loadProfileSkills(s.name);
 }
@@ -16138,15 +16364,9 @@ function switchTab(name,tab){
   if(target)target.classList.add('active');
   stopAllRawPolling();
   stopStatsPolling();
-  stopAllAwayPolling();
-  stopAllGoNutsPolling();
-  stopAllWatchdogPolling();
   if(tab==='raw')startRawPolling(name);
   if(tab==='info'){
     startStatsPolling(name);
-    const s=sessions.find(x=>x.name===name);
-    if(s&&(s.autopush_mode||'basic')==='full')startWatchdogPolling(name);
-    else loadWatchdogStatus(name);
   }
   if(tab==='skills')loadProfileSkills(name);
   if(tab==='chat'){
@@ -16325,7 +16545,9 @@ function updateComposerBtn(key){
   btn.classList.toggle('is-send',hasText);
   btn.classList.toggle('is-mic',!hasText);
   btn.innerHTML=hasText?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
-  btn.title=hasText?'Send message':'Record voice message';
+  const label=hasText?'Send message':'Record voice message';
+  btn.title=label;
+  btn.setAttribute('aria-label',label);
 }
 function composerAction(key){
   const inp=document.getElementById('cmd-'+key);
@@ -16351,7 +16573,12 @@ async function toggleRecording(key){
     const btn=document.getElementById('cmd-send-'+key);
     if(btn)btn.classList.remove('is-recording');
     if(!blob.size){updateComposerBtn(key);return;}
-    if(btn){btn.classList.add('is-transcribing');btn.innerHTML='<span class="composer-spin"></span>';btn.title='Transcribing…';}
+    if(btn){
+      btn.classList.add('is-transcribing');
+      btn.innerHTML='<span class="composer-spin"></span>';
+      btn.title='Transcribing voice message…';
+      btn.setAttribute('aria-label','Transcribing voice message');
+    }
     try{
       const fd=new FormData();fd.append('audio',blob,'voice.webm');
       const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
@@ -16367,7 +16594,13 @@ async function toggleRecording(key){
   try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
   _recording[key]=true;
   const btn=document.getElementById('cmd-send-'+key);
-  if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
+  if(btn){
+    btn.classList.remove('is-mic','is-send');
+    btn.classList.add('is-recording');
+    btn.innerHTML=_COMPOSER_STOP_SVG;
+    btn.title='Stop recording and transcribe';
+    btn.setAttribute('aria-label','Stop recording and transcribe');
+  }
 }
 
 async function sendChat(name){
@@ -16387,6 +16620,7 @@ async function sendChat(name){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
+    updateComposerBtn('chat-'+name);
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
@@ -16556,6 +16790,7 @@ async function sendCmd(name,source){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
+    updateComposerBtn(source+'-'+name);
     delete draftText[source+'-'+name];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
@@ -16831,7 +17066,7 @@ async function pollStatus(){
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update away_mode, go_nuts_mode, and model badges in nav
+      // Update model badges in the session navigation.
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
@@ -17089,17 +17324,33 @@ async function openConnections(){
   try{
     const r=await fetch(BASE+'/api/connections'); const d=await r.json();
     const icons={drive:'\u{1F4C1}',gmail:'✉️',calendar:'\u{1F4C5}'};
-    const rows=(d.services||[]).map(s=>`<div class="conn-row">
+    const rows=(d.services||[]).map(s=>{
+      const status = s.connected
+        ? (s.shared
+            ? `<span class="conn-status">● Company account</span>`
+            : (s.delegated
+                ? `<span class="conn-status">● Connected automatically at sign-in</span>`
+                : `<span class="conn-status">● Connected</span><button class="conn-btn disconnect" onclick="disconnectService('${s.id}')">Disconnect</button>`))
+        : `<button class="conn-btn" ${d.configured?'':'disabled title=\"Admin must configure Google OAuth first\"'} onclick="connectService('${s.id}')">Connect</button>`;
+      // Admins additionally get to authorise (or revoke) the company account
+      // that everyone else falls back to.
+      const adminBits = d.is_admin
+        ? (s.shared_available
+            ? `<button class="conn-btn disconnect" onclick="disconnectShared('${s.id}')">Remove company</button>`
+            : `<button class="conn-btn" ${d.configured?'':'disabled'} onclick="connectShared('${s.id}')">Connect for everyone</button>`)
+        : '';
+      const own = s.connected && !s.shared
+        ? '' : (d.is_admin ? `<button class="conn-btn" ${d.configured?'':'disabled'} onclick="connectService('${s.id}')">Use my own</button>` : '');
+      return `<div class="conn-row">
         <span class="conn-name"><span class="conn-ico">${icons[s.id]||'\u{1F517}'}</span>${esc(s.label)}</span>
-        <span>${s.connected
-          ?`<span class="conn-status">● Connected</span><button class="conn-btn disconnect" onclick="disconnectService('${s.id}')">Disconnect</button>`
-          :`<button class="conn-btn" ${d.configured?'':'disabled title=\"Admin must configure Google OAuth first\"'} onclick="connectService('${s.id}')">Connect</button>`}</span>
-      </div>`).join('');
+        <span>${status}${s.shared?own:''}${adminBits}</span>
+      </div>`;
+    }).join('');
     const note = !d.configured
       ? 'Google connections aren’t configured yet — ask the admin to add the OAuth client.'
       : (d.mcp_ready ? '' : 'Connected accounts are saved securely; Codex’s live access turns on once the admin enables the Google tool.');
     modal.innerHTML=`<h3>Connect data sources</h3>
-      <p class="conn-note">Give Codex access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
+      <p class="conn-note">Company members get full read and write access to their own Drive and Gmail automatically at Google sign-in. Shared company sources are searched too.</p>
       ${rows}${note?`<p class="conn-note">${note}</p>`:''}
       <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
   }catch(e){
@@ -17108,6 +17359,14 @@ async function openConnections(){
   }
 }
 function connectService(svc){ window.location.href=BASE+'/api/connections/'+svc+'/start'; }
+// Admin-only: authorise one Google account that every user of this dashboard
+// falls back to.
+function connectShared(svc){ window.location.href=BASE+'/api/connections/'+svc+'/start?shared=1'; }
+async function disconnectShared(svc){
+  if(!confirm('Remove the company '+svc+' connection? Every user loses it.'))return;
+  try{ await fetch(BASE+'/api/connections/'+svc+'?shared=1',{method:'DELETE'}); }catch(e){}
+  openConnections();
+}
 async function disconnectService(svc){
   try{ await fetch(BASE+'/api/connections/'+svc,{method:'DELETE'}); }catch(e){}
   openConnections();
@@ -17287,7 +17546,7 @@ function renderAuthPanel(){
       ${usageHtml}
       <hr class="auth-divider">
       ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
-      <button class="auth-btn auth-btn-danger" onclick="codexLogout()">Sign out of Codex</button>
+      <button class="auth-btn auth-btn-danger" onclick="doLogout()">Sign out</button>
     `;
   }else{
     el.innerHTML=`
@@ -17530,17 +17789,11 @@ function stopStatsPolling(){
 }
 
 // ── Auto-push (auto-responder + autopilot watchdog) ──
-let _watchdogTimers={};
 const AUTOPUSH_TITLES={
   off:'Off — the dashboard never types into this terminal',
   basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
   full:'Full — Basic, plus write a "keep going" instruction when Codex pauses before finishing'
 };
-function autopushDesc(mode){
-  return ({off:'Off — no auto-typing',
-           basic:'Basic — picks options + confirms prompts',
-           full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
-}
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
 function autopushSeg(name,mode,compact){
   mode=mode||'basic';
@@ -17550,7 +17803,7 @@ function autopushSeg(name,mode,compact){
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
     b('off','Off')+b('basic','Basic')+b('full','Full')+'</div>';
 }
-// Reflect a mode across every rendered control for this session (More menu + Info tab).
+// Reflect the saved mode in the More dropdown control.
 function syncAutopushUI(name,mode){
   mode=mode||'basic';
   document.querySelectorAll('.autopush-seg').forEach(seg=>{
@@ -17559,8 +17812,6 @@ function syncAutopushUI(name,mode){
       btn.classList.toggle('active',btn.classList.contains('ap-'+mode));
     });
   });
-  const st=document.getElementById('autopush-status-'+name);
-  if(st)st.textContent=autopushDesc(mode);
 }
 async function setAutopush(name,mode){
   const idx=sessions.findIndex(s=>s.name===name);
@@ -17577,9 +17828,6 @@ async function setAutopush(name,mode){
     if(resp.ok&&data.mode){
       if(idx>=0)sessions[idx].autopush_mode=data.mode;
       syncAutopushUI(name,data.mode);
-      renderWatchdogLog(name,data.log);
-      if(data.mode==='full')startWatchdogPolling(name);
-      else stopWatchdogPolling(name);
     }else{
       if(idx>=0)sessions[idx].autopush_mode=prev;
       syncAutopushUI(name,prev);
@@ -17588,36 +17836,6 @@ async function setAutopush(name,mode){
     if(idx>=0)sessions[idx].autopush_mode=prev;
     syncAutopushUI(name,prev);
   }
-}
-function renderWatchdogLog(name,log){
-  const logEl=document.getElementById('watchdog-log-'+name);
-  if(logEl&&log&&log.length){
-    logEl.innerHTML=log.slice(-10).map(e=>
-      '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
-    ).join('');
-    logEl.scrollTop=logEl.scrollHeight;
-  }
-}
-function startWatchdogPolling(name){
-  stopWatchdogPolling(name);
-  loadWatchdogStatus(name);
-  _watchdogTimers[name]=setInterval(()=>loadWatchdogStatus(name),15000);
-}
-function stopWatchdogPolling(name){
-  if(_watchdogTimers[name]){clearInterval(_watchdogTimers[name]);delete _watchdogTimers[name];}
-}
-function stopAllWatchdogPolling(){
-  Object.keys(_watchdogTimers).forEach(n=>stopWatchdogPolling(n));
-}
-async function loadWatchdogStatus(name){
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/autopush');
-    const data=await resp.json();
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].autopush_mode=data.mode;
-    syncAutopushUI(name,data.mode);
-    renderWatchdogLog(name,data.log);
-  }catch(e){}
 }
 
 // ── Key Bar + Slash Commands ──
@@ -17873,7 +18091,7 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='No project URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
+      empty.textContent='No project URLs, credentials or files captured yet.';
       body.appendChild(empty);
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
@@ -18033,21 +18251,15 @@ async function sendSlashCommand(name,cmd){
 }
 
 // ── Skills Tab ──
-// Per-profile skills UI:
-//   • Active section: what Codex actually loads from ~/.codex-<profile>/skills/
-//   • Library section: toggle-on/off canonical skills from ~/.tmux-dashboard/skill-library/
-//     (enabling = symlink into the profile's skills dir; disabling = unlink)
+// Global skills UI:
+//   • Active section: what Codex loads from the standard ~/.codex/skills/
+//   • Library section: toggle canonical skills from ~/.tmux-dashboard/skill-library/
+//     (enabling = symlink into ~/.codex/skills; disabling = unlink)
 //   • Built-in section: read-only list of skills bundled with Codex
-//
-// The session's profile_id (set per tmux session) determines the scope.
 let _builtinSkillsCache=null;
 let _editingSkillSession=null;
 let _editingSkillName=null;
-
-function _profileForSession(name){
-  const s=sessions.find(x=>x.name===name);
-  return (s&&s.profile_id)||'default';
-}
+const GLOBAL_SKILLS_SCOPE='default';
 
 async function loadProfileSkills(name){
   const meta=document.getElementById('skills-meta-'+name);
@@ -18055,8 +18267,8 @@ async function loadProfileSkills(name){
   const libEl=document.getElementById('skills-library-'+name);
   const builtinEl=document.getElementById('skills-builtin-'+name);
   if(!activeEl||!libEl||!builtinEl)return;
-  const pid=_profileForSession(name);
-  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>';
+  const pid=GLOBAL_SKILLS_SCOPE;
+  if(meta)meta.innerHTML='Shared by <code>all sessions</code>';
   activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
   libEl.innerHTML='<div class="skills-empty">Loading...</div>';
   builtinEl.innerHTML='<div class="skills-empty">Loading...</div>';
@@ -18087,18 +18299,18 @@ function _renderActiveSkills(name,pid,data){
   const legacy=(data&&data.legacy_files)||[];
   const rows=[];
   if(!skills.length&&!legacy.length){
-    el.innerHTML='<div class="skills-empty">No skills installed for this profile. Enable some from the Library below.</div>';
+    el.innerHTML='<div class="skills-empty">No skills installed. Enable some from the Library below.</div>';
     return;
   }
   for(const sk of skills){
-    const tag=sk.from_library?'library link':'custom (in-profile)';
+    const tag=sk.from_library?'library link':'custom';
     const nameClass=sk.from_library?'':'custom-name';
     const promoteBtn=sk.from_library?'':`
-      <button class="btn" onclick="promoteProfileSkill('${esc(name)}','${esc(sk.dir_name)}')" title="Move this skill to the shared library so other profiles can enable it">Promote</button>`;
+      <button class="btn" onclick="promoteProfileSkill('${esc(name)}','${esc(sk.dir_name)}')" title="Move this skill to the shared library">Promote</button>`;
     const removeLabel=sk.from_library?'Disable':'Delete';
     const removeTitle=sk.from_library
-      ? 'Disable this library skill in this profile (the library copy is kept).'
-      : 'Delete this custom skill from this profile.';
+      ? 'Disable this library skill (the library copy is kept).'
+      : 'Delete this custom skill.';
     rows.push(`
       <div class="skills-row">
         <div class="skills-row-body">
@@ -18168,7 +18380,7 @@ function _renderBuiltinSkills(name,skills){
 }
 
 async function toggleLibrarySkill(sessionName,skillDirName,enable){
-  const pid=_profileForSession(sessionName);
+  const pid=GLOBAL_SKILLS_SCOPE;
   const url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library/'+encodeURIComponent(skillDirName);
   try{
     const resp=await fetch(url,{method:enable?'POST':'DELETE'});
@@ -18183,11 +18395,10 @@ async function toggleLibrarySkill(sessionName,skillDirName,enable){
 }
 
 async function promoteProfileSkill(sessionName, skillDirName){
-  const pid=_profileForSession(sessionName);
+  const pid=GLOBAL_SKILLS_SCOPE;
   if(!confirm('Promote "'+skillDirName+'" to the shared library?\n\n' +
-              'It will move to ~/.tmux-dashboard/skill-library/ and the current profile ' +
-              'will keep it active via a symlink. Other profiles can then toggle it on ' +
-              'from their Library list.')) return;
+              'It will move to ~/.tmux-dashboard/skill-library/ and remain active ' +
+              'for every session via a symlink.')) return;
   try{
     const resp=await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/'+encodeURIComponent(skillDirName)+'/promote', {method:'POST'});
     const data=await resp.json();
@@ -18197,12 +18408,12 @@ async function promoteProfileSkill(sessionName, skillDirName){
 }
 
 async function removeProfileSkill(sessionName, skillDirName, fromLibrary){
-  const pid=_profileForSession(sessionName);
+  const pid=GLOBAL_SKILLS_SCOPE;
   const verb=fromLibrary?'Disable':'Delete';
   const desc=fromLibrary
-    ? 'This removes the symlink from this profile. The library copy is kept and can be re-enabled later.'
-    : 'This permanently deletes '+skillDirName+'/SKILL.md from this profile. If you want to keep it for other profiles, click Promote first.';
-  if(!confirm(verb+' "'+skillDirName+'" in profile "'+pid+'"?\n\n'+desc)) return;
+    ? 'This removes the active symlink. The library copy is kept and can be re-enabled later.'
+    : 'This permanently deletes '+skillDirName+'/SKILL.md. Click Promote first if you want to keep a library copy.';
+  if(!confirm(verb+' "'+skillDirName+'"?\n\n'+desc)) return;
   try{
     let url;
     if(fromLibrary){
@@ -18293,7 +18504,7 @@ async function saveLibrarySkill(sessionName){
 }
 
 async function deleteLibrarySkill(sessionName,skillDirName){
-  if(!confirm('Delete library skill "'+skillDirName+'"?\nThis removes it from EVERY profile (any symlinks pointing to it will also be removed).'))return;
+  if(!confirm('Delete library skill "'+skillDirName+'"?\nIts active symlink will also be removed.'))return;
   try{
     const resp=await fetch(BASE+'/api/skill-library/'+encodeURIComponent(skillDirName),{method:'DELETE'});
     const data=await resp.json();
@@ -18307,100 +18518,6 @@ function closeSkillEditor(name){
   if(wrap)wrap.style.display='none';
   _editingSkillSession=null;
   _editingSkillName=null;
-}
-
-// ── Codex profiles ──
-let _profilesCache = null;        // [{id,name,model,effort,builtin}, ...]
-let _profilesEditing = null;       // currently-edited full profile object
-let _profilePending = {};          // sessionName -> "pending restart" flag
-
-async function loadProfiles(force){
-  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
-  if(_profilesCache && !force) return _profilesCache;
-  try{
-    const resp = await fetch(BASE+'/api/profiles');
-    const data = await resp.json();
-    _profilesCache = data.profiles || [];
-  }catch(e){ _profilesCache = []; }
-  return _profilesCache;
-}
-
-function renderProfileDropdown(s){
-  if(MEMBER_SIMPLE) return '';  // members have no profile selector
-  const cur = s.profile_id || 'default';
-  const list = _profilesCache || [];
-  const opts = list.length
-    ? list.map(p=>`<option value="${esc(p.id)}" ${p.id===cur?'selected':''}>${esc(p.name)}</option>`).join('')
-    : `<option value="default" selected>Default</option>`;
-  const pending = _profilePending[s.name] ? ' pending' : '';
-  const restartTitle = _profilePending[s.name]
-    ? 'Restart Codex to apply the new profile'
-    : 'Restart Codex with this profile';
-  return `<div class="profile-wrap" title="Codex profile (CODEX_HOME)">
-    <span class="profile-label">Profile</span>
-    <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
-    <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
-  </div>`;
-}
-
-async function onProfileChange(sessionName, profileId){
-  // First call: probe whether Codex is currently running in this session
-  // (we pass restart:false so we get back the running state). If it IS running,
-  // ask the user whether to restart now; otherwise the new profile won't take
-  // effect until Codex is next launched and the user's memory will appear to
-  // "spill" from the previous profile.
-  try{
-    let resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: profileId, restart: false})
-    });
-    let data = await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to set profile'); return;}
-    const sess = sessions.find(x=>x.name===sessionName);
-    if(sess) sess.profile_id = profileId;
-
-    if(data.codex_was_running && !data.restarted){
-      const wantRestart = confirm(
-        'Profile switched to "' + profileId + '".\n\n' +
-        'Codex is still running with the previous profile and will keep using it ' +
-        '(including its memory) until you restart it.\n\n' +
-        'Restart Codex now?'
-      );
-      if(wantRestart){
-        resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({profile_id: profileId, restart: true})
-        });
-        data = await resp.json();
-        if(resp.ok && data.restarted){
-          delete _profilePending[sessionName];
-        }else{
-          _profilePending[sessionName] = true;
-        }
-      }else{
-        _profilePending[sessionName] = true;
-      }
-    }else{
-      delete _profilePending[sessionName];
-    }
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to set profile.'); }
-}
-
-async function restartWithProfile(sessionName){
-  const sess = sessions.find(x=>x.name===sessionName);
-  const pid = (sess && sess.profile_id) || 'default';
-  if(!confirm('Exit Codex in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Codex state will be lost.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: pid, restart: true})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to restart'); return; }
-    delete _profilePending[sessionName];
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to restart Codex.'); }
 }
 
 // ── Current-user awareness ──────────────────────────────────────────────────
@@ -18434,7 +18551,7 @@ async function applyRoleVisibility(){
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
-  if(isAdmin) startBrowserAuthPolling();
+  startBrowserAuthPolling();
 }
 
 async function doLogout(){
@@ -18451,20 +18568,36 @@ async function doLogout(){
 // ── Settings modal ────────────────────────────────────────────────────────
 let _settingsActiveTab = 'mycontext';
 let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
+let _settingsRouteSync = false;
+const USERS_ROUTE='#/settings/users';
 
 async function openSettings(tab){
   await loadCurrentUser();
   _settingsActiveTab = tab || 'mycontext';
+  const adminOnly=['context','users','login'];
+  if(adminOnly.includes(_settingsActiveTab)&&!(_currentUser&&_currentUser.role==='admin')){
+    _settingsActiveTab='mycontext';
+  }
   _settingsHistoryDetail = null;
+  if(!_settingsRouteSync){
+    const route='#/settings/'+_settingsActiveTab;
+    if(window.location.hash!==route)history.pushState(null,'',route);
+  }
   const overlay = document.getElementById('settings-overlay');
   overlay.classList.add('active');
   renderSettingsTabs();
   renderSettingsContent();
+  setUsersPolling(_settingsActiveTab==='users');
 }
 
 function closeSettings(){
   document.getElementById('settings-overlay').classList.remove('active');
   _settingsHistoryDetail = null;
+  setUsersPolling(false);
+  clearMemberBrowserRefresh();
+  if(!_settingsRouteSync&&window.location.hash.startsWith('#/settings/')){
+    history.pushState(null,'','#/dashboard');
+  }
 }
 
 
@@ -18472,13 +18605,13 @@ function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
   const tabs = [
-    {id:'mycontext', label:'My Context'},
+    {id:'mycontext', label:'Context Files'},
+    {id:'apis',      label:'APIs'},
+    {id:'browser',   label:'Browser'},
     {id:'history',   label:'History'},
   ];
-  if(isAdmin) tabs.push({id:'context', label:'Context Files'});
+  if(isAdmin) tabs.push({id:'context', label:'System Context'});
   if(isAdmin) tabs.push({id:'users', label:'Users'});
-  if(isAdmin) tabs.push({id:'apis', label:'APIs'});
-  if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
@@ -18488,9 +18621,30 @@ function renderSettingsTabs(){
 function switchSettingsTab(tab){
   _settingsActiveTab = tab;
   _settingsHistoryDetail = null;
+  if(tab!=='browser') clearMemberBrowserRefresh();
+  if(!_settingsRouteSync){
+    const route='#/settings/'+tab;
+    if(window.location.hash!==route)history.pushState(null,'',route);
+  }
   renderSettingsTabs();
   renderSettingsContent();
+  setUsersPolling(tab==='users');
 }
+
+async function handleAppRoute(){
+  const match=window.location.hash.match(/^#\/settings\/([a-z]+)$/);
+  _settingsRouteSync=true;
+  try{
+    if(match){
+      await openSettings(match[1]);
+    }else{
+      closeSettings();
+    }
+  }finally{
+    _settingsRouteSync=false;
+  }
+}
+window.addEventListener('hashchange',handleAppRoute);
 
 function renderSettingsContent(){
   const el = document.getElementById('settings-content');
@@ -18515,7 +18669,8 @@ function renderSettingsContent(){
     loadUsersAdmin();
   }else if(_settingsActiveTab === 'apis'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading APIs...</div></div>';
-    loadApisAdmin();
+    if(_currentUser&&_currentUser.role==='admin') loadApisAdmin();
+    else loadApisMember();
   }else if(_settingsActiveTab === 'browser'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading browser sessions…</div></div>';
     loadBrowserTab();
@@ -18532,21 +18687,33 @@ let _browserAuthTimer = null;
 async function refreshBrowserAuthBadge(){
   const el = document.getElementById('nav-browser-badge');
   if(!el) return;
-  if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
   let d;
   try{
-    const r = await fetch(BASE+'/api/browser/sessions');
-    if(!r.ok){ el.style.display='none'; return; }
+    const r = await fetch(BASE+'/api/my/browser');
+    if(!r.ok) throw new Error('status unavailable');
     d = await r.json();
-  }catch(e){ return; }
+  }catch(e){
+    el.classList.remove('ok','working','unknown');
+    el.classList.add('bad');
+    el.title='Browser disconnected';
+    el.setAttribute('aria-label',el.title);
+    return;
+  }
   _browserAuth = d;
-  el.style.display = 'inline-flex';
-  el.classList.remove('ok','bad','active','unknown');
-  const running=(d.sessions||[]).filter(s=>s.running).length;
-  el.classList.add(running?'ok':'unknown');
-  el.title=running
-    ? running+' browser session'+(running===1?' is':'s are')+' running. Click to manage.'
-    : 'No browser sessions are running. Click to manage.';
+  el.classList.remove('ok','bad','working','unknown');
+  if(d.state==='working'){
+    el.classList.add('working');
+    el.title='Browser connected and working — click to open';
+  }else if(d.connected){
+    el.classList.add('ok');
+    el.title='Browser connected — click to open';
+  }else{
+    el.classList.add('bad');
+    el.title=d.session&&d.session.running
+      ? 'Browser needs sign-in — click to open'
+      : 'Browser disconnected — click to open';
+  }
+  el.setAttribute('aria-label',el.title);
 }
 
 function onBrowserBadgeClick(){
@@ -18558,17 +18725,38 @@ function startBrowserAuthPolling(){
   if(!_browserAuthTimer) _browserAuthTimer = setInterval(refreshBrowserAuthBadge, 15000);
 }
 
-// --- Browser tab (admin) — manage independent browser sessions ---
+// --- Browser tab — member viewer + admin session management ---
 let _browserSessions = [];
 let _bsEditId = null;   // session id currently being renamed / annotated
 let _bsData = null;     // last payload, so an edit toggle can re-render without refetching
 let _bsProxy = null;    // /api/browser/proxy payload (config + per-browser exit IP + GB used)
 let _bsProxyEdit = false;
 let _bsFp = {};         // sid -> last fingerprint audit result
+let _memberBrowserRefreshTimer = null;
+function clearMemberBrowserRefresh(){
+  if(_memberBrowserRefreshTimer){
+    clearTimeout(_memberBrowserRefreshTimer);
+    _memberBrowserRefreshTimer=null;
+  }
+}
+function scheduleMemberBrowserRefresh(data){
+  clearMemberBrowserRefresh();
+  if(
+    _settingsActiveTab==='browser' &&
+    _currentUser && _currentUser.role!=='admin' &&
+    (!data.session || !data.session.running)
+  ){
+    _memberBrowserRefreshTimer=setTimeout(()=>{
+      _memberBrowserRefreshTimer=null;
+      if(_settingsActiveTab==='browser') loadBrowserTab();
+    },2500);
+  }
+}
 async function loadBrowserTab(){
   let data;
+  const isAdmin=!!(_currentUser&&_currentUser.role==='admin');
   try{
-    const r = await fetch(BASE+'/api/browser/sessions');
+    const r = await fetch(BASE+(isAdmin?'/api/browser/sessions':'/api/my/browser'));
     data = await r.json();
     if(!r.ok) throw new Error(data.error||'Failed');
   }catch(e){
@@ -18576,6 +18764,15 @@ async function loadBrowserTab(){
       '<div class="settings-section"><div class="pf-banner">Failed to load browser sessions: '+esc(e.message||e)+'</div></div>';
     return;
   }
+  if(!isAdmin){
+    _browserSessions=data.session?[data.session]:[];
+    _bsData=data;
+    renderMemberBrowserTab(data);
+    scheduleMemberBrowserRefresh(data);
+    refreshBrowserAuthBadge();
+    return;
+  }
+  clearMemberBrowserRefresh();
   _browserSessions = data.sessions||[];
   _bsData = data;
   renderBrowserTab(data);
@@ -18583,6 +18780,38 @@ async function loadBrowserTab(){
   // cards paint first and fill the badges in when they land.
   loadBrowserProxy(true);
   refreshBrowserAuthBadge();
+}
+
+function renderMemberBrowserTab(data){
+  const el=document.getElementById('settings-content');
+  const s=data.session||null;
+  if(!s){
+    el.innerHTML='<div class="settings-section"><div class="pf-banner">No browser is configured. Ask the admin to connect one.</div></div>';
+    return;
+  }
+  const status=data.working
+    ? '<span style="color:#d29922">Connected and working</span>'
+    : data.connected
+      ? '<span style="color:#3fb950">Connected</span>'
+      : s.running
+        ? '<span style="color:#f85149">Sign-in required</span>'
+        : '<span style="color:#f85149">Disconnected</span>';
+  const preview=s.running
+    ? '<div class="bs-preview"><iframe src="'+esc(s.viewer_url)+'" title="'+esc(s.name)+'"></iframe></div>'
+    : '<div class="bs-preview"><div class="bs-off">Browser is currently unavailable</div></div>';
+  el.innerHTML='<div class="settings-section">'+
+    '<div class="pf-banner">'+
+      (data.needs_sign_in
+        ? '<b>Sign in to the browser to connect it.</b> The live noVNC window is open below.'
+        : 'This is your live browser window. The header icon stays green while connected and flashes yellow while it is working.')+
+    '</div>'+
+    '<div class="bs-grid"><div class="bs-card">'+
+      '<div class="bs-head"><span class="bs-dot '+(data.connected?'on':'off')+'"></span>'+
+        '<span class="bs-name">'+esc(s.name)+'</span><span class="bs-meta">'+status+'</span></div>'+
+      preview+
+      '<div class="bs-actions"><button class="btn btn-primary" onclick="openBrowserSession(\''+esc(s.id)+'\')">Open full window&nbsp;↗</button></div>'+
+    '</div></div>'+
+  '</div>';
 }
 
 // Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY
@@ -18603,7 +18832,10 @@ function renderBrowserTab(data){
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
       (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
     const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
-    const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
+    const rm = s.managed&&!s.account_browser ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
+    const ownerMeta = s.account_browser
+      ? ' · account '+esc(s.owner_username||s.owner_id||'unknown')
+      : '';
     const preview = s.running
       ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
       : '<div class="bs-off">Session stopped</div>';
@@ -18649,7 +18881,7 @@ function renderBrowserTab(data){
       ? ' <button class="btn btn-ghost" onclick="rotateBrowserIp(\''+id+'\')">New IP</button>' : '';
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
-        '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
+        '<span class="bs-meta">'+status+ownerMeta+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
       body+
       '<div class="bs-actions">'+openBtns+editBtn+fpBtn+ipBtn+rm+'</div>'+
     '</div>';
@@ -18659,7 +18891,7 @@ function renderBrowserTab(data){
     : '<div class="bs-add"><input id="bs-new-name" placeholder="New session name (optional)"><button class="btn btn-primary" onclick="createBrowserSession()">+ New browser session</button></div>';
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
-      '<div class="pf-banner">Independent browsers you or a Codex browser workflow can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
+      '<div class="pf-banner">Each account browser has its own persistent Chrome profile and noVNC window. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Admin extras are isolated the same way.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -19004,6 +19236,8 @@ async function logoutCodex(){
 }
 
 // --- My Context tab ---
+let _myContextData={files:[],dir:'',global_context_hidden:false};
+let _myContextCurrent='';
 async function loadMyContext(){
   let data;
   try{
@@ -19015,28 +19249,32 @@ async function loadMyContext(){
       '<div class="settings-section"><div class="pf-banner">Failed to load context: '+esc(e.message||e)+'</div></div>';
     return;
   }
-  const files = {};
-  (data.files||[]).forEach(f => { files[f.name] = f; });
-  const codex = files['AGENTS.md'] || {content:'', path:''};
-  const memory = files['MEMORY.md'] || {content:'', path:''};
-  const config = files['config.toml'] || {content:'', path:''};
-  const html = `
-    <div class="settings-section">
-      <div class="pf-banner">These files are read by Codex in <strong>every session you launch</strong> (set via <code>CODEX_HOME=${esc(data.dir||'')}</code>). They are private to your account.</div>
-      <label>AGENTS.md</label>
-      <div class="my-ctx-path">${esc(codex.path||'')}</div>
-      <textarea class="my-ctx-codex" id="my-ctx-codex" spellcheck="false">${esc(codex.content||'')}</textarea>
-      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('AGENTS.md','my-ctx-codex')">Save AGENTS.md</button></div>
-      <label>MEMORY.md</label>
-      <div class="my-ctx-path">${esc(memory.path||'')}</div>
-      <textarea class="my-ctx-memory" id="my-ctx-memory" spellcheck="false">${esc(memory.content||'')}</textarea>
-      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('MEMORY.md','my-ctx-memory')">Save MEMORY.md</button></div>
-      <label>config.toml</label>
-      <div class="my-ctx-path">${esc(config.path||'')}</div>
-      <textarea class="my-ctx-config" id="my-ctx-config" spellcheck="false">${esc(config.content||'')}</textarea>
-      <div class="my-ctx-actions"><button class="btn btn-full" onclick="saveMyContext('config.toml','my-ctx-config')">Save config.toml</button></div>
-    </div>`;
-  document.getElementById('settings-content').innerHTML = html;
+  _myContextData=data;
+  const files=data.files||[];
+  if(!files.some(file=>file.name===_myContextCurrent)){
+    _myContextCurrent=(files.find(file=>file.name==='AGENTS.md')||files[0]||{}).name||'';
+  }
+  renderMyContext();
+}
+function openMyContextFile(name){_myContextCurrent=name;renderMyContext();}
+function renderMyContext(){
+  const files=_myContextData.files||[];
+  const current=files.find(file=>file.name===_myContextCurrent)||files[0]||null;
+  const list=files.map(file=>`<button class="my-context-file ${current&&file.name===current.name?'active':''}" data-name="${esc(file.name)}" onclick="openMyContextFile(this.dataset.name)" title="${esc(file.path||file.name)}">${esc(file.name)}${file.editable?'':'<span class="my-context-file-badge">read-only</span>'}</button>`).join('')||'<div class="history-empty">No context files found.</div>';
+  const hidden=_myContextData.global_context_hidden
+    ? '<div class="pf-banner"><b>Your context files are private to your account.</b> Admin-managed global context is applied to every session but hidden here.</div>'
+    : '<div class="pf-banner">All non-secret context files loaded from <code>'+esc(_myContextData.dir||'')+'</code>. Credentials are never shown here.</div>';
+  let editor='<div class="history-empty">Select a context file.</div>';
+  if(current){
+    editor=`<div class="my-context-editor-head"><div><div class="my-context-editor-name">${esc(current.name)}</div><div class="my-ctx-path">${esc(current.path||'')}</div></div><span class="my-context-editor-mode">${current.editable?'editable':'read-only'}</span></div>
+      <textarea class="my-context-editor" id="my-context-editor" spellcheck="false" ${current.editable?'':'readonly'}>${esc(current.content||'')}</textarea>
+      <div class="my-ctx-actions">${current.editable?`<button class="btn btn-full" onclick="saveCurrentMyContext()">Save ${esc(current.name)}</button>`:'<span class="muted">This file is shown for transparency and is read-only here.</span>'}</div>`;
+  }
+  document.getElementById('settings-content').innerHTML=`<div class="settings-section">${hidden}<div class="my-context-browser"><div id="my-context-file-list" class="my-context-file-list">${list}</div><div class="my-context-editor-pane">${editor}</div></div></div>`;
+}
+function saveCurrentMyContext(){
+  const current=(_myContextData.files||[]).find(file=>file.name===_myContextCurrent);
+  if(current&&current.editable)saveMyContext(current.name,'my-context-editor');
 }
 
 async function saveMyContext(filename, textareaId){
@@ -19050,6 +19288,8 @@ async function saveMyContext(filename, textareaId){
     });
     const data = await resp.json();
     if(!resp.ok){ alert(data.error||'Save failed'); return; }
+    const current=(_myContextData.files||[]).find(file=>file.name===filename);
+    if(current)current.content=content;
     // Subtle confirmation via the path line
     const banner = ta.parentElement.querySelector('.my-ctx-path');
     if(banner){
@@ -19158,6 +19398,55 @@ function renderHistoryDetail(){
 function backToHistoryList(){
   _settingsHistoryDetail = null;
   renderSettingsContent();
+}
+
+async function loadApisMember(){
+  let data;
+  try{
+    const resp=await fetch(BASE+'/api/my/apis');
+    data=await resp.json();
+    if(!resp.ok) throw new Error(data.error||'Failed to load APIs');
+  }catch(e){
+    document.getElementById('settings-content').innerHTML=
+      '<div class="settings-section"><div class="pf-banner">Failed to load APIs: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const apis=data.apis||[];
+  const categories=[...(data.category_order||['search','llm','mail','other'])];
+  apis.forEach(item=>{
+    const category=item.category||'other';
+    if(!categories.includes(category)) categories.push(category);
+  });
+  const labels=data.category_labels||{};
+  let sections='';
+  categories.forEach(category=>{
+    const rows=apis.filter(item=>(item.category||'other')===category);
+    if(!rows.length) return;
+    sections+='<div class="api-cat"><div class="api-cat-title">'+esc(labels[category]||category)+
+      ' <span class="api-cat-count">'+rows.length+'</span></div><table class="api-table"><tbody>'+
+      rows.map(item=>{
+        const available=item.available&&item.status!=='revoked';
+        const meta=[item.plan,item.limits].filter(Boolean).join(' · ');
+        const docs=item.docs_url
+          ? '<a class="api-mini link" href="'+encodeURI(item.docs_url)+'" target="_blank" rel="noopener">docs ↗</a>'
+          : '';
+        return '<tr class="api-row '+(available?'':'is-revoked')+'">'+
+          '<td class="api-c-name"><div class="api-name">'+esc(item.name)+'</div>'+
+            '<div class="api-sub">'+esc(item.provider||'')+'</div></td>'+
+          '<td class="api-c-key"><span class="api-pill '+(available?'':'nokey')+'">'+
+            (available?'available':'not configured')+'</span></td>'+
+          '<td class="api-c-meta">'+(meta?esc(meta):'<span class="api-usage-na">—</span>')+'</td>'+
+          '<td class="api-c-act">'+docs+'</td></tr>';
+      }).join('')+
+      '</tbody></table></div>';
+  });
+  const available=apis.filter(item=>item.available&&item.status!=='revoked').length;
+  document.getElementById('settings-content').innerHTML=
+    '<div class="settings-section">'+
+      '<div class="pf-banner">Shared APIs and tools available to your sessions. Keys and billing settings are managed by the admin and are never shown here.</div>'+
+      '<div class="api-summary">'+available+' available · '+apis.length+' registered</div>'+
+      (sections||'<div class="history-empty">No APIs are registered.</div>')+
+    '</div>';
 }
 
 // --- APIs tab (admin only) — catalog of all external API keys + live usage ---
@@ -19419,68 +19708,328 @@ async function refreshAllApiUsage(){
 
 // --- Users tab (admin only) ---
 let _groupsCache=[];
+let _usersCache=[];
+let _usersSummary={};
+let _usersGeneratedAt=0;
+let _usersPollTimer=null;
+let _usersDragColumn='';
+let _usersFilter={status:'all',query:''};
+let _usersSort={key:'status',dir:'desc'};
+const _USER_COLUMNS={
+  username:{label:'Username',tip:'Account display/login name',width:190},
+  status:{label:'Status',tip:'Online means dashboard activity in the last 2 minutes; Working means an owned session is busy',width:130},
+  role:{label:'Role',tip:'Administrator or standard user',width:86},
+  group:{label:'Group',tip:'Work group and inherited group context',width:145},
+  sessions:{label:'Sessions',tip:'Busy and currently running owned sessions',width:130},
+  tokens:{label:'Total tokens',tip:'All-time Codex tokens across this user’s rollout history',width:130},
+  prompts:{label:'Prompts',tip:'Human prompts retained in the append-only audit log',width:90},
+  lastLogin:{label:'Last login',tip:'Most recent successful login, address, browser, and method',width:205},
+  created:{label:'Created',tip:'Account creation timestamp',width:145},
+  google:{label:'Google sign-in',tip:'Google account linked to this dashboard account',width:190},
+  actions:{label:'Actions',tip:'Open the user view, prompts, context, or details',width:265},
+};
+const _USER_DEFAULT_ORDER=['username','status','role','group','sessions','tokens','prompts','lastLogin','created','google','actions'];
+let _usersColumnOrder=_USER_DEFAULT_ORDER.slice();
+let _usersVisibleColumns=new Set(['username','status','role','group','sessions','tokens','prompts','lastLogin','actions']);
+let _usersColumnWidths=Object.fromEntries(Object.entries(_USER_COLUMNS).map(([key,col])=>[key,col.width]));
+
+function _loadUsersTablePrefs(){
+  try{
+    const prefs=JSON.parse(localStorage.getItem('adminUsersTablePrefs')||'{}');
+    if(Array.isArray(prefs.order)){
+      const valid=prefs.order.filter(key=>_USER_COLUMNS[key]);
+      _usersColumnOrder=[...valid,..._USER_DEFAULT_ORDER.filter(key=>!valid.includes(key))];
+    }
+    if(Array.isArray(prefs.visible)){
+      _usersVisibleColumns=new Set(prefs.visible.filter(key=>_USER_COLUMNS[key]));
+    }
+    if(prefs.widths&&typeof prefs.widths==='object'){
+      Object.keys(_USER_COLUMNS).forEach(key=>{
+        const width=Number(prefs.widths[key]);
+        if(width>=70&&width<=520)_usersColumnWidths[key]=width;
+      });
+    }
+    if(prefs.filter&&['all','online','working','offline'].includes(prefs.filter))_usersFilter.status=prefs.filter;
+    if(typeof prefs.query==='string')_usersFilter.query=prefs.query.slice(0,200);
+    if(prefs.sort&&_USER_COLUMNS[prefs.sort.key])_usersSort={key:prefs.sort.key,dir:prefs.sort.dir==='asc'?'asc':'desc'};
+  }catch(e){}
+}
+function _saveUsersTablePrefs(){
+  try{localStorage.setItem('adminUsersTablePrefs',JSON.stringify({
+    order:_usersColumnOrder,visible:[..._usersVisibleColumns],widths:_usersColumnWidths,
+    filter:_usersFilter.status,query:_usersFilter.query,sort:_usersSort,
+  }))}catch(e){}
+}
+_loadUsersTablePrefs();
+
 function _browserName(ua){ua=ua||'';if(/Edg\//.test(ua))return'Edge';if(/OPR\//.test(ua))return'Opera';if(/Chrome\//.test(ua))return'Chrome';if(/Firefox\//.test(ua))return'Firefox';if(/Safari\//.test(ua))return'Safari';return (ua.slice(0,16)||'?');}
 function _groupOpts(sel){return '<option value="">— no group —</option>'+_groupsCache.map(g=>`<option value="${esc(g.id)}" ${g.id===sel?'selected':''}>${esc(g.name)}</option>`).join('');}
-async function loadUsersAdmin(){
+function _fmtUserTokens(value){const n=Number(value||0);if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n);}
+function _fmtUserCost(value){const n=Number(value||0);return n?'$'+n.toFixed(n<1?3:2):'$0';}
+function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString()}catch(e){return'Never'}}
+function _userPresenceName(user){return user.working?'working':(user.online?'online':'offline')}
+function _userStatusRank(user){return user.working?3:(user.online?2:1)}
+function _userSortValue(user,key){
+  if(key==='status')return _userStatusRank(user);
+  if(key==='tokens')return Number((user.usage||{}).total_tokens||0);
+  if(key==='prompts')return Number(user.prompt_count||0);
+  if(key==='sessions')return Number(user.live_session_count||0);
+  if(key==='lastLogin')return Number(user.last_login||0);
+  if(key==='created')return Number(user.created_at||0);
+  if(key==='group')return user.group||'';
+  if(key==='role')return user.role||'';
+  if(key==='google')return user.google_email||'';
+  return (user.username||'').toLowerCase();
+}
+function _filteredUsers(){
+  const query=(_usersFilter.query||'').trim().toLowerCase();
+  return _usersCache.filter(user=>{
+    const state=_userPresenceName(user);
+    if(_usersFilter.status!=='all'&&state!==_usersFilter.status){
+      if(!(_usersFilter.status==='online'&&user.online))return false;
+    }
+    if(!query)return true;
+    const hay=[user.username,user.role,user.group,user.google_email,...(user.session_names||[])].join(' ').toLowerCase();
+    return hay.includes(query);
+  }).sort((a,b)=>{
+    const av=_userSortValue(a,_usersSort.key),bv=_userSortValue(b,_usersSort.key);
+    let result=typeof av==='number'&&typeof bv==='number'?av-bv:String(av).localeCompare(String(bv));
+    if(!result)result=(a.username||'').localeCompare(b.username||'');
+    return _usersSort.dir==='asc'?result:-result;
+  });
+}
+function setUsersPolling(active){
+  if(_usersPollTimer){clearInterval(_usersPollTimer);_usersPollTimer=null;}
+  if(active){
+    _usersPollTimer=setInterval(()=>{
+      const overlay=document.getElementById('settings-overlay');
+      if(_settingsActiveTab==='users'&&overlay&&overlay.classList.contains('active'))loadUsersAdmin(true);
+    },15000);
+  }
+}
+async function loadUsersAdmin(silent){
   let data, gdata={groups:[]};
   try{
-    const resp = await fetch(BASE+'/api/admin/users');
+    const [resp,gr] = await Promise.all([
+      fetch(BASE+'/api/admin/users'),
+      fetch(BASE+'/api/admin/groups'),
+    ]);
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed'); }
-    const gr = await fetch(BASE+'/api/admin/groups'); if(gr.ok) gdata = await gr.json();
+    if(gr.ok) gdata = await gr.json();
   }catch(e){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    if(!silent){
+      const host=document.getElementById('settings-content');
+      if(host)host.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    }
     return;
   }
   _groupsCache = gdata.groups||[];
-  const users = data.users || [];
-  const rows = users.map(u => {
-    const roleTag = u.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
-    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')+(u.last_login_via==='google'?' · Google':'')) : 'never';
-    const isMe = (_currentUser && _currentUser.id===u.id);
-    const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase">you</span>' : '';
-    const grpCell = u.role==='admin' ? '<span class="muted">—</span>' :
-      `<select class="grp-sel" onchange="setUserGroup('${esc(u.id)}',this.value)">${_groupOpts(u.group||'')}</select>`;
-    let acts = `<button class="imp" onclick="openContextEditor('user','${esc(u.id)}','${esc(u.username)}')">Context</button>
-      <button onclick="openUserHistory('${esc(u.id)}','${esc(u.username)}')">History</button>
-      <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset pw</button>`;
-    if(!(u.id==='admin'||isMe)) acts += `<button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
-      <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote':'Promote'}</button>
-      <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>`;
-    const gCell = `<span style="font-size:.72rem">${u.google_email?esc(u.google_email):'<span class="muted">—</span>'}</span>
-      <button style="margin-left:6px" onclick="setUserGoogle('${esc(u.id)}','${esc(u.google_email||'')}')">${u.google_email?'Edit':'Link'}</button>`;
-    return `<tr>
-      <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
-      <td>${roleTag}</td>
-      <td>${grpCell}</td>
-      <td>${gCell}</td>
-      <td>${u.session_count||0}</td>
-      <td style="font-size:.72rem">${ll}</td>
-      <td><div class="users-actions">${acts}</div></td>
-    </tr>`;
-  }).join('');
-  const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="openContextEditor('group','${esc(g.id)}','${esc(g.name)}');return false">ctx</a> <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
-  document.getElementById('settings-content').innerHTML = `<div class="settings-section">
-    <div class="pf-banner">Create users, place them in work groups, and view/edit each user's &amp; group's Codex context (AGENTS.md, skills, MEMORY.md, config.toml…). Each user has an isolated CODEX_HOME + history.</div>
-    <div class="users-new-bar">
-      <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
-      <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
-      <select id="users-new-role"><option value="user">user</option><option value="admin">admin</option></select>
-      <select id="users-new-group">${_groupOpts('')}</select>
-      <button onclick="createUserFromForm()">+ Create user</button>
-    </div>
-    <div class="users-new-bar" style="margin-top:8px;flex-wrap:wrap">
-      <input id="new-group-name" placeholder="new work group name" autocomplete="off">
-      <button onclick="createGroup()">+ Group</button>
-      <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
-    </div>
-    <table class="users-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Google sign-in</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="7" class="history-empty">No users yet.</td></tr>'}</tbody>
-    </table>
-  </div>`;
+  _usersCache=data.users||[];
+  _usersSummary=data.summary||{};
+  _usersGeneratedAt=data.generated_at||Date.now()/1000;
+  if(_settingsActiveTab==='users')renderUsersAdmin();
 }
+function _usersStatusChips(){
+  const counts={
+    all:_usersCache.length,
+    online:_usersCache.filter(user=>user.online).length,
+    working:_usersCache.filter(user=>user.working).length,
+    offline:_usersCache.filter(user=>!user.online).length,
+  };
+  return ['all','online','working','offline'].map(state=>
+    `<button class="users-status-chip ${_usersFilter.status===state?'active':''}" onclick="setUsersStatusFilter('${state}')">${state[0].toUpperCase()+state.slice(1)} ${counts[state]}</button>`
+  ).join('');
+}
+function _usersSummaryHtml(){
+  const s=_usersSummary;
+  return [
+    ['Users',s.user_count||0,''],
+    ['Online now',s.online_count||0,'live'],
+    ['Working now',s.working_count||0,'working'],
+    ['Total tokens',_fmtUserTokens(s.total_tokens||0),''],
+    ['Prompts',_fmtUserTokens(s.total_prompts||0),''],
+  ].map(([label,value,cls])=>`<div class="users-summary-card ${cls}"><span class="users-summary-label">${label}</span><span class="users-summary-value">${value}</span></div>`).join('');
+}
+function _userColumnsMenu(){
+  return _usersColumnOrder.map(key=>`<label><input type="checkbox" ${_usersVisibleColumns.has(key)?'checked':''} onchange="toggleUserColumn('${key}',this.checked)"> ${esc(_USER_COLUMNS[key].label)}</label>`).join('')+
+    '<button class="users-toolbar-btn users-columns-reset" onclick="resetUsersTable()">Reset columns</button>';
+}
+function renderUsersAdmin(){
+  const host=document.getElementById('settings-content');
+  if(!host||_settingsActiveTab!=='users')return;
+  const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="openContextEditor('group','${esc(g.id)}','${esc(g.name)}');return false">ctx</a> <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
+  host.innerHTML = `<div class="settings-section">
+    <div id="users-summary" class="users-summary">${_usersSummaryHtml()}</div>
+    <div class="users-toolbar">
+      <input class="users-search" id="users-search" value="${esc(_usersFilter.query)}" placeholder="Search users, groups, sessions…" oninput="setUsersSearch(this.value)">
+      <div id="users-status-chips" class="users-status-chips">${_usersStatusChips()}</div>
+      <button class="users-toolbar-btn" onclick="openPromptAudit('','All users')">All prompts</button>
+      <button class="users-toolbar-btn" onclick="loadUsersAdmin()">Refresh</button>
+      <div class="users-columns-wrap">
+        <button class="users-toolbar-btn" onclick="toggleUsersColumnsMenu(event)">Columns ▾</button>
+        <div id="users-columns-menu" class="users-columns-menu" onclick="event.stopPropagation()">${_userColumnsMenu()}</div>
+      </div>
+    </div>
+    <details>
+      <summary style="cursor:pointer;color:#8b949e;font-size:.75rem">Create accounts and manage work groups</summary>
+      <div class="users-new-bar" style="margin-top:8px">
+        <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
+        <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
+        <select id="users-new-role"><option value="user">user</option><option value="admin">admin</option></select>
+        <select id="users-new-group">${_groupOpts('')}</select>
+        <button onclick="createUserFromForm()">+ Create user</button>
+      </div>
+      <div class="users-new-bar" style="margin-top:8px;flex-wrap:wrap">
+        <input id="new-group-name" placeholder="new work group name" autocomplete="off">
+        <button onclick="createGroup()">+ Group</button>
+        <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
+      </div>
+    </details>
+    <div id="users-top-scroll" class="users-top-scroll"><div></div></div>
+    <div id="users-table-scroll" class="users-table-scroll">
+      <table class="users-table" id="users-table"><colgroup id="users-colgroup"></colgroup><thead id="users-thead"></thead><tbody id="users-tbody"></tbody></table>
+    </div>
+    <div class="users-table-footer"><span id="users-table-count"></span><span>Drag headers to reorder · drag header edges to resize · preferences are saved</span></div>
+  </div>`;
+  renderUsersRows();
+}
+function _userCell(user,key){
+  const usage=user.usage||{};
+  const isMe=!!(_currentUser&&_currentUser.id===user.id);
+  if(key==='username')return `<span class="users-cell-main">${esc(user.username||'')}${isMe?' <span class="users-role-user">you</span>':''}</span><span class="users-cell-sub">${esc(user.id||'')}</span>`;
+  if(key==='status'){
+    const state=_userPresenceName(user),label=state==='working'?'Working':(user.online?'Online':'Offline');
+    const sub=user.last_seen?(state==='offline'?'Seen '+timeAgo(user.last_seen):'Active '+timeAgo(user.last_seen)):'No recent activity';
+    return `<span class="users-presence ${state}"><span class="users-presence-dot"></span><strong>${label}</strong></span><span class="users-cell-sub">${esc(sub)}</span>`;
+  }
+  if(key==='role')return user.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
+  if(key==='group')return user.role==='admin'?'<span class="muted">—</span>':`<select class="grp-sel" onclick="event.stopPropagation()" onchange="setUserGroup('${esc(user.id)}',this.value)">${_groupOpts(user.group||'')}</select>`;
+  if(key==='sessions'){
+    const busy=Number(user.busy_session_count||0),live=Number(user.live_session_count||0);
+    return `<span class="users-cell-main">${busy?busy+' working':live+' running'}</span><span class="users-cell-sub" title="${esc((user.session_names||[]).join(', '))}">${esc((user.session_names||[]).join(', ')||'No live sessions')}</span>`;
+  }
+  if(key==='tokens')return `<span class="users-cell-main users-token">${_fmtUserTokens(usage.total_tokens||0)}</span><span class="users-cell-sub">${_fmtUserTokens(usage.tokens_7d||0)} in 7d · ${_fmtUserCost(usage.estimated_cost||0)}</span>`;
+  if(key==='prompts')return `<button class="users-toolbar-btn" onclick="event.stopPropagation();openPromptAudit('${esc(user.id)}','${esc(user.username)}')">${_fmtUserTokens(user.prompt_count||0)}</button><span class="users-cell-sub">${user.last_prompt_at?'Last '+timeAgo(user.last_prompt_at):'No prompts yet'}</span>`;
+  if(key==='lastLogin'){
+    const detail=[user.last_login_ip,_browserName(user.last_login_ua),user.last_login_via==='google'?'Google':''].filter(Boolean).join(' · ');
+    return `<span class="users-cell-main">${user.last_login?timeAgo(user.last_login):'Never'}</span><span class="users-cell-sub" title="${esc(_fmtUserDate(user.last_login)+(detail?' · '+detail:''))}">${esc(detail||_fmtUserDate(user.last_login))}</span>`;
+  }
+  if(key==='created')return `<span class="users-cell-main">${user.created_at?timeAgo(user.created_at):'Unknown'}</span><span class="users-cell-sub">${esc(_fmtUserDate(user.created_at))}</span>`;
+  if(key==='google')return `<span class="users-cell-main">${user.google_email?esc(user.google_email):'—'}</span><button class="users-toolbar-btn" onclick="event.stopPropagation();setUserGoogle('${esc(user.id)}','${esc(user.google_email||'')}')">${user.google_email?'Edit':'Link'}</button>`;
+  if(key==='actions'){
+    let login='';
+    if(!(user.id==='admin'||isMe))login=`<button class="imp" onclick="impersonateUser('${esc(user.id)}','${esc(user.username)}')">Log in as ↗</button>`;
+    return `<div class="users-actions" onclick="event.stopPropagation()">${login}<button onclick="openPromptAudit('${esc(user.id)}','${esc(user.username)}')">Prompts</button><button onclick="openContextEditor('user','${esc(user.id)}','${esc(user.username)}')">Context</button><button onclick="openUserDetail('${esc(user.id)}')">Details</button></div>`;
+  }
+  return'';
+}
+function renderUsersRows(){
+  const tbody=document.getElementById('users-tbody'),thead=document.getElementById('users-thead'),colgroup=document.getElementById('users-colgroup');
+  if(!tbody||!thead||!colgroup)return;
+  const visible=_usersColumnOrder.filter(key=>_usersVisibleColumns.has(key));
+  const users=_filteredUsers();
+  colgroup.innerHTML='<col style="width:42px">'+visible.map(key=>`<col data-user-col="${key}" style="width:${_usersColumnWidths[key]}px">`).join('');
+  thead.innerHTML='<tr><th class="user-row-number" data-tip="Visible row number">#</th>'+visible.map(key=>{
+    const col=_USER_COLUMNS[key],sorted=_usersSort.key===key?`<span class="users-sort">${_usersSort.dir==='asc'?'▲':'▼'}</span>`:'';
+    return `<th draggable="true" data-user-col="${key}" data-tip="${esc(col.tip)}" onclick="sortUserColumn('${key}')" ondragstart="dragUserColumnStart(event,'${key}')" ondragover="event.preventDefault()" ondrop="dropUserColumn(event,'${key}')">${esc(col.label)}${sorted}<span class="user-col-resizer" onmousedown="startUserColResize(event,'${key}')"></span></th>`;
+  }).join('')+'</tr>';
+  tbody.innerHTML=users.map((user,index)=>`<tr onclick="openUserDetail('${esc(user.id)}')"><td class="user-row-number">${index+1}</td>${visible.map(key=>`<td data-user-col="${key}" title="${key==='actions'?'':esc(String(_userSortValue(user,key)||''))}">${_userCell(user,key)}</td>`).join('')}</tr>`).join('')||
+    `<tr><td class="history-empty" colspan="${visible.length+1}">No users match this filter.</td></tr>`;
+  const count=document.getElementById('users-table-count');
+  if(count)count.textContent=`Showing ${users.length} of ${_usersCache.length} users · updated ${timeAgo(_usersGeneratedAt)}`;
+  const chips=document.getElementById('users-status-chips');
+  if(chips)chips.innerHTML=_usersStatusChips();
+  requestAnimationFrame(setupUsersTableUX);
+}
+function setupUsersTableUX(){
+  const top=document.getElementById('users-top-scroll'),body=document.getElementById('users-table-scroll'),table=document.getElementById('users-table');
+  if(!top||!body||!table)return;
+  const visible=_usersColumnOrder.filter(key=>_usersVisibleColumns.has(key));
+  const width=42+visible.reduce((sum,key)=>sum+Number(_usersColumnWidths[key]||100),0);
+  table.style.width=Math.max(width,body.clientWidth)+'px';
+  top.firstElementChild.style.width=table.style.width;
+  let syncing=false;
+  top.onscroll=()=>{if(syncing)return;syncing=true;body.scrollLeft=top.scrollLeft;syncing=false};
+  body.onscroll=()=>{if(syncing)return;syncing=true;top.scrollLeft=body.scrollLeft;syncing=false};
+}
+function setUsersStatusFilter(status){_usersFilter.status=status;_saveUsersTablePrefs();renderUsersRows();}
+function setUsersSearch(query){_usersFilter.query=query.slice(0,200);_saveUsersTablePrefs();renderUsersRows();}
+function sortUserColumn(key){
+  if(key==='actions')return;
+  if(_usersSort.key===key)_usersSort.dir=_usersSort.dir==='asc'?'desc':'asc';else _usersSort={key,dir:key==='username'?'asc':'desc'};
+  _saveUsersTablePrefs();renderUsersRows();
+}
+function toggleUsersColumnsMenu(event){event.stopPropagation();const menu=document.getElementById('users-columns-menu');if(menu)menu.classList.toggle('open');}
+function toggleUserColumn(key,visible){if(visible)_usersVisibleColumns.add(key);else _usersVisibleColumns.delete(key);_saveUsersTablePrefs();renderUsersRows();}
+function resetUsersTable(){
+  _usersColumnOrder=_USER_DEFAULT_ORDER.slice();
+  _usersVisibleColumns=new Set(['username','status','role','group','sessions','tokens','prompts','lastLogin','actions']);
+  _usersColumnWidths=Object.fromEntries(Object.entries(_USER_COLUMNS).map(([key,col])=>[key,col.width]));
+  _usersFilter={status:'all',query:''};_usersSort={key:'status',dir:'desc'};_saveUsersTablePrefs();renderUsersAdmin();
+}
+function dragUserColumnStart(event,key){_usersDragColumn=key;event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',key);}
+function dropUserColumn(event,target){
+  event.preventDefault();const source=_usersDragColumn||event.dataTransfer.getData('text/plain');if(!source||source===target)return;
+  const order=_usersColumnOrder.filter(key=>key!==source),index=order.indexOf(target);order.splice(index,0,source);_usersColumnOrder=order;_saveUsersTablePrefs();renderUsersRows();
+}
+function startUserColResize(event,key){
+  event.preventDefault();event.stopPropagation();
+  const startX=event.clientX,startWidth=Number(_usersColumnWidths[key]||100);
+  function move(ev){_usersColumnWidths[key]=Math.max(70,Math.min(520,startWidth+ev.clientX-startX));const col=document.querySelector(`col[data-user-col="${key}"]`);if(col)col.style.width=_usersColumnWidths[key]+'px';setupUsersTableUX();}
+  function up(){window.removeEventListener('mousemove',move);window.removeEventListener('mouseup',up);_saveUsersTablePrefs();renderUsersRows();}
+  window.addEventListener('mousemove',move);window.addEventListener('mouseup',up);
+}
+document.addEventListener('click',()=>{const menu=document.getElementById('users-columns-menu');if(menu)menu.classList.remove('open');});
+
+function openUserDetail(userId){
+  const user=_usersCache.find(item=>item.id===userId);if(!user)return;
+  const usage=user.usage||{},isMe=!!(_currentUser&&_currentUser.id===user.id);
+  let actions=`<button class="modal-cancel" onclick="openUserHistory('${esc(user.id)}','${esc(user.username)}')">Session history</button><button class="modal-cancel" onclick="openPromptAudit('${esc(user.id)}','${esc(user.username)}')">Prompt audit</button><button class="modal-cancel" onclick="openContextEditor('user','${esc(user.id)}','${esc(user.username)}')">Context</button><button class="modal-cancel" onclick="resetUserPassword('${esc(user.id)}','${esc(user.username)}')">Reset password</button>`;
+  if(!(user.id==='admin'||isMe))actions=`<button class="modal-confirm-create" onclick="impersonateUser('${esc(user.id)}','${esc(user.username)}')">Log in as ↗</button>`+actions+`<button class="modal-cancel" onclick="toggleUserRole('${esc(user.id)}','${esc(user.role)}')">${user.role==='admin'?'Demote':'Promote'}</button><button class="danger modal-cancel" onclick="deleteUser('${esc(user.id)}','${esc(user.username)}')">Delete</button>`;
+  const state=_userPresenceName(user);
+  const modal=document.getElementById('modal-content');modal.classList.add('modal-wide');
+  modal.innerHTML=`<h3>${esc(user.username)} <span class="${user.role==='admin'?'users-role-admin':'users-role-user'}">${esc(user.role)}</span></h3>
+    <div class="user-detail-grid">
+      <div class="user-detail-item"><span>Status</span><strong>${state==='working'?'Working now':(user.online?'Online':'Offline')}</strong></div>
+      <div class="user-detail-item"><span>Sessions</span><strong>${user.busy_session_count||0} working · ${user.live_session_count||0} running</strong></div>
+      <div class="user-detail-item"><span>Total tokens</span><strong>${_fmtUserTokens(usage.total_tokens||0)} · ${_fmtUserCost(usage.estimated_cost||0)} estimated</strong></div>
+      <div class="user-detail-item"><span>Prompts</span><strong>${user.prompt_count||0}</strong></div>
+      <div class="user-detail-item"><span>Last login</span><strong>${esc(_fmtUserDate(user.last_login))}</strong></div>
+      <div class="user-detail-item"><span>Login details</span><strong>${esc([user.last_login_ip,_browserName(user.last_login_ua),user.last_login_via].filter(Boolean).join(' · ')||'None')}</strong></div>
+    </div><div class="modal-actions" style="flex-wrap:wrap">${actions}<button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  document.getElementById('modal-overlay').classList.add('active');
+}
+
+let _promptAuditState={userId:'',label:'',items:[],nextBefore:0,nextCursor:''};
+async function openPromptAudit(userId,label,before,append){
+  if(!append){
+    _promptAuditState={userId:userId||'',label:label||'All users',items:[],nextBefore:0,nextCursor:''};
+    const modal=document.getElementById('modal-content');modal.classList.add('modal-wide');
+    modal.innerHTML=`<h3>Prompt audit — ${esc(_promptAuditState.label)}</h3><p class="conn-note">Loading append-only prompt history…</p>`;
+    document.getElementById('modal-overlay').classList.add('active');
+  }
+  const params=new URLSearchParams({limit:'100'});
+  if(_promptAuditState.userId)params.set('user_id',_promptAuditState.userId);
+  if(append&&_promptAuditState.nextCursor)params.set('cursor',_promptAuditState.nextCursor);
+  else if(before)params.set('before',String(before));
+  try{
+    const resp=await fetch(BASE+'/api/admin/prompts?'+params);
+    const data=await resp.json();if(!resp.ok)throw new Error(data.error||'Failed');
+    _promptAuditState.items=append?_promptAuditState.items.concat(data.prompts||[]):(data.prompts||[]);
+    _promptAuditState.nextBefore=data.next_before||0;
+    _promptAuditState.nextCursor=data.next_cursor||'';
+    renderPromptAudit();
+  }catch(e){
+    document.getElementById('modal-content').innerHTML=`<h3>Prompt audit</h3><p class="conn-note">Failed: ${esc(e.message||e)}</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }
+}
+function renderPromptAudit(){
+  const state=_promptAuditState;
+  const rows=state.items.map(item=>`<div class="prompt-audit-row"><div class="prompt-audit-meta"><strong>${esc(item.username||item.user_id||'Unknown')}</strong><span>${esc(item.session_name||'')}</span><span>${esc(_fmtUserDate(item.ts))}</span>${item.impersonated_by?`<span>via ${esc(item.impersonated_by)}</span>`:''}</div><div class="prompt-audit-text">${esc(item.prompt||'')}</div></div>`).join('')||'<div class="history-empty">No prompts recorded yet.</div>';
+  document.getElementById('modal-content').innerHTML=`<h3>Prompt audit — ${esc(state.label)}</h3><p class="conn-note">Human prompts from users and administrators. Records are append-only and retained independently of session chat history.</p><div class="prompt-audit-list">${rows}</div><div class="modal-actions">${state.nextCursor?'<button class="modal-cancel" onclick="loadMorePromptAudit()">Load older</button>':''}<button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+}
+function loadMorePromptAudit(){openPromptAudit(_promptAuditState.userId,_promptAuditState.label,0,true);}
 
 async function setUserGoogle(userId, current){
   const v = prompt('Google address that signs in as this user (blank to unlink):', current||'');
@@ -19654,18 +20203,22 @@ async function deleteUser(userId, username){
 }
 
 async function impersonateUser(userId, username){
-  if(!confirm('Log in as "'+username+'"? You\'ll see the dashboard exactly as they do (their sessions, their view). Use the "Return to admin" bar at the bottom to come back.')) return;
+  const popup=window.open('about:blank','_blank');
+  if(!popup){alert('Allow pop-ups for this dashboard to open the user view.');return;}
+  try{popup.document.title='Opening '+username;popup.document.body.textContent='Opening user view…';}catch(e){}
   try{
     const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId)+'/impersonate', {method:'POST'});
     const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed'); return; }
-    window.location.href = BASE + '/';  // reload as the impersonated user
-  }catch(e){ alert('Failed: '+e.message); }
+    if(!resp.ok)throw new Error(data.error||'Failed');
+    try{popup.opener=null;}catch(e){}
+    popup.location.replace(new URL(data.url,window.location.origin).href);
+  }catch(e){try{popup.close()}catch(_){}alert('Failed: '+e.message);}
 }
 
 async function returnToAdmin(){
-  try{ await fetch(BASE+'/api/unimpersonate', {method:'POST'}); }catch(e){}
-  window.location.href = BASE + '/';
+  try{await fetch(BASE+'/api/impersonation/end',{method:'POST'});}catch(e){}
+  try{sessionStorage.removeItem('tmuxImpersonationToken')}catch(e){}
+  window.location.replace(BASE+'/#/dashboard');
 }
 
 function renderImpersonationBanner(){
@@ -19681,496 +20234,6 @@ function renderImpersonationBanner(){
   }
 }
 
-async function openProfiles(){
-  const overlay = document.getElementById('profiles-overlay');
-  overlay.classList.add('active');
-  await loadProfiles(true);
-  renderProfilesList();
-  document.getElementById('profile-edit').innerHTML =
-    '<div class="profile-empty">Select a profile on the left, or create a new one.</div>';
-}
-
-function closeProfiles(){
-  document.getElementById('profiles-overlay').classList.remove('active');
-  _profilesEditing = null;
-}
-
-function renderProfilesList(){
-  const list = _profilesCache || [];
-  const el = document.getElementById('profiles-list');
-  let html = '<button class="profile-new-btn" onclick="newProfilePrompt()">+ New profile</button>';
-  list.forEach(p => {
-    const sel = (_profilesEditing && _profilesEditing.id===p.id) ? ' selected' : '';
-    const tag = p.builtin
-      ? (p.id==='default' ? '<span class="profile-row-builtin">default</span>' : '<span class="profile-row-builtin">preset</span>')
-      : '';
-    const meta = (p.model||'') + (p.effort?(' &middot; '+esc(p.effort)):'');
-    html += `<div class="profile-row${sel}" onclick="editProfile('${esc(p.id)}')">
-      <div class="profile-row-name">${esc(p.name)} ${tag}</div>
-      <div class="profile-row-meta">${meta || '&mdash;'}</div>
-    </div>`;
-  });
-  el.innerHTML = html;
-}
-
-async function editProfile(profileId){
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId));
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to load profile'); return; }
-    _profilesEditing = data;
-    renderProfilesList();
-    renderProfileEdit();
-  }catch(e){ alert('Failed to load profile.'); }
-}
-
-let _profileActiveTab = 'identity';
-const _PROFILE_TABS = [
-  {id:'identity', label:'Identity'},
-  {id:'memory',   label:'Memory'},
-  {id:'login',    label:'Login'},
-  {id:'config', label:'Config'},
-  {id:'mcp',      label:'MCP'},
-  {id:'agents',   label:'Agents'},
-  {id:'commands', label:'Commands'},
-  {id:'plugins',  label:'Plugins'},
-];
-
-function renderProfileEdit(){
-  const p = _profilesEditing;
-  const el = document.getElementById('profile-edit');
-  if(!p){ el.innerHTML = '<div class="profile-empty">Select a profile.</div>'; return; }
-  const isDefault = (p.id === 'default');
-  const permJson = JSON.stringify(p.permissions||{}, null, 2);
-  const envJson = JSON.stringify(p.env||{}, null, 2);
-  const dir = p.dir || (isDefault ? '~/.codex (merged)' : ('~/.codex-'+p.id));
-  const builtinTag = isDefault
-    ? ' <span class="profile-row-builtin">default</span>'
-    : (p.builtin ? ' <span class="profile-row-builtin">preset</span>' : '');
-  const EFFORTS = [{v:'',label:'(default)'}].concat(
-    EFFORT_CHOICES.map(v=>({v,label:v==='xhigh'?'extra high':v}))
-  );
-  const effortOpts = EFFORTS.map(o =>
-    `<option value="${o.v}"${(p.effort||'')===o.v?' selected':''}>${o.label}</option>`
-  ).join('');
-  const models=MODEL_CHOICES.slice();
-  if(p.model&&!models.some(row=>row[0]===p.model))models.unshift([p.model,p.model]);
-  const modelOpts=models.map(row=>
-    `<option value="${esc(row[0])}"${(p.model||'')===row[0]?' selected':''}>${esc(row[1])}</option>`
-  ).join('');
-  const deleteBtn = isDefault
-    ? ''
-    : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
-  const headerNote = isDefault
-    ? '<div class="profiles-hint" style="margin:0 0 6px">Model, effort, sandbox and approval keys are merged into <code>~/.codex/config.toml</code>; project and MCP sections are preserved. Every changed file receives a timestamped <code>.bak-dashboard-…</code> copy first.</div>'
-    : '';
-
-  const tabBar = _PROFILE_TABS.map(t =>
-    `<div class="pf-tab${_profileActiveTab===t.id?' active':''}" onclick="switchProfileTab('${t.id}')">${t.label}</div>`
-  ).join('');
-
-  el.innerHTML = `
-    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}${builtinTag}</div>
-    ${headerNote}
-    <div class="pf-tabs">${tabBar}</div>
-
-    <div class="pf-section${_profileActiveTab==='identity'?' active':''}" id="pf-section-identity">
-      <label>Name</label>
-      <input id="ed-name" value="${esc(p.name||'')}">
-      <div class="row2">
-        <div>
-          <label>Model</label>
-          <select id="ed-model">${modelOpts}</select>
-        </div>
-        <div>
-          <label>Effort level</label>
-          <select id="ed-effort">${effortOpts}</select>
-        </div>
-      </div>
-      <label>Permissions (JSON)</label>
-      <textarea id="ed-permissions" class="ed-permissions" spellcheck="false">${esc(permJson)}</textarea>
-      <label>Env (JSON)</label>
-      <textarea id="ed-env" class="ed-permissions" spellcheck="false">${esc(envJson)}</textarea>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='memory'?' active':''}" id="pf-section-memory">
-      <div class="pf-banner">AGENTS.md and MEMORY.md live at the profile root. Codex loads them at every launch in this profile.</div>
-      <label>AGENTS.md</label>
-      <textarea id="ed-codex" class="ed-codex" spellcheck="false">${esc(p.codex_md||'')}</textarea>
-      <label>MEMORY.md</label>
-      <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='login'?' active':''}" id="pf-section-login">
-      <div class="pf-banner">Each profile keeps its own <code>auth.json</code>. Logging in once per profile is enough; switching profiles does not re-prompt.</div>
-      <div id="pf-credentials" class="pf-status">Loading login status...</div>
-      <div class="pf-actions">
-        <button class="extras-btn" onclick="refreshProfileCredentials('${esc(p.id)}')">Refresh status</button>
-        <button class="extras-btn" onclick="logoutProfile('${esc(p.id)}')" style="color:#f85149;border-color:#f8514944">Log out (remove auth.json)</button>
-      </div>
-      <div class="pf-help">To log in: open a shell on this profile and run <code>codex login</code>. The token is written to <code>auth.json</code> inside the profile dir.</div>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='config'?' active':''}" id="pf-section-config">
-      <div class="pf-banner">Full <code>config.toml</code> as Codex reads it. The Identity tab manages model, reasoning effort, sandbox, approval policy, and environment values.</div>
-      <label>config.toml</label>
-      <textarea id="ed-config-toml" class="ed-rawjson" spellcheck="false">Loading...</textarea>
-      <div class="pf-actions">
-        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','config.toml','ed-config-toml')">Save config.toml</button>
-        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','config.toml','ed-config-toml')">Reload</button>
-      </div>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='mcp'?' active':''}" id="pf-section-mcp">
-      <div class="pf-banner">Profile-scope MCP servers + per-project approvals. Lives at <code>.codex.json</code>. Project-scope <code>.mcp.json</code> is edited per session via the More dropdown.</div>
-      <label>.codex.json</label>
-      <textarea id="ed-mcp-json" class="ed-mcp" spellcheck="false">Loading...</textarea>
-      <div class="pf-actions">
-        <button class="extras-btn" onclick="saveProfileRawFile('${esc(p.id)}','.codex.json','ed-mcp-json')">Save .codex.json</button>
-        <button class="extras-btn" onclick="loadProfileRawFile('${esc(p.id)}','.codex.json','ed-mcp-json')">Reload</button>
-      </div>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='agents'?' active':''}" id="pf-section-agents">
-      <div class="pf-banner">Custom subagents in <code>agents/</code>. Each <code>.md</code> file with frontmatter (<code>name</code>, <code>description</code>) becomes a delegatable agent in this profile.</div>
-      <div id="pf-agents-list">Loading...</div>
-      <div class="pf-actions">
-        <button class="extras-btn" onclick="addProfileSubfile('${esc(p.id)}','agents')">+ New agent</button>
-      </div>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='commands'?' active':''}" id="pf-section-commands">
-      <div class="pf-banner">Custom slash commands in <code>commands/</code>. Each <code>.md</code> file becomes <code>/&lt;name&gt;</code>.</div>
-      <div id="pf-commands-list">Loading...</div>
-      <div class="pf-actions">
-        <button class="extras-btn" onclick="addProfileSubfile('${esc(p.id)}','commands')">+ New command</button>
-      </div>
-    </div>
-
-    <div class="pf-section${_profileActiveTab==='plugins'?' active':''}" id="pf-section-plugins">
-      <div class="pf-banner">Installed plugins under <code>plugins/</code>. Read-only here — install/remove plugins from inside Codex with <code>/plugin</code>.</div>
-      <div id="pf-plugins-list">Loading...</div>
-    </div>
-
-    <div class="profile-edit-actions">
-      ${deleteBtn || '<span></span>'}
-      <div style="display:flex;gap:8px">
-        <button class="modal-cancel" onclick="closeProfiles()">Close</button>
-        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + memory</button>
-      </div>
-    </div>
-  `;
-  loadProfileSectionData(p.id, _profileActiveTab);
-}
-
-function switchProfileTab(tabId){
-  _profileActiveTab = tabId;
-  document.querySelectorAll('.pf-tab').forEach(t=>{
-    t.classList.toggle('active', t.textContent.trim().toLowerCase()===tabId);
-  });
-  document.querySelectorAll('.pf-section').forEach(s=>{
-    s.classList.toggle('active', s.id==='pf-section-'+tabId);
-  });
-  if(_profilesEditing) loadProfileSectionData(_profilesEditing.id, tabId);
-}
-
-// ── Section loaders ─────────────────────────────────────────────────────────
-async function loadProfileSectionData(pid, tab){
-  if(tab==='login'){ refreshProfileCredentials(pid); return; }
-  if(tab==='config'){ loadProfileRawFile(pid, 'config.toml', 'ed-config-toml'); return; }
-  if(tab==='mcp'){ loadProfileRawFile(pid, '.codex.json', 'ed-mcp-json'); return; }
-  if(tab==='agents'){ loadProfileDirSection(pid, 'agents', 'pf-agents-list'); return; }
-  if(tab==='commands'){ loadProfileDirSection(pid, 'commands', 'pf-commands-list'); return; }
-  if(tab==='plugins'){ loadProfilePluginsList(pid); return; }
-}
-
-async function refreshProfileCredentials(pid){
-  const el = document.getElementById('pf-credentials');
-  if(!el) return;
-  el.className = 'pf-status';
-  el.textContent = 'Loading...';
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/credentials');
-    const data = await resp.json();
-    if(!resp.ok){ el.className='pf-status err'; el.textContent = data.error||'Failed to load'; return; }
-    if(data.loggedIn){
-      el.className='pf-status ok';
-      const days = data.expiresInDays;
-      const plan = data.subscriptionType ? ` · ${data.subscriptionType}` : '';
-      el.textContent = `Logged in${plan}${days ? ` · ~${days} days until token expires` : ''}`;
-    } else if(data.exists){
-      el.className='pf-status warn';
-      el.textContent = 'auth.json is present but not usable. Run codex login in a shell on this profile.';
-    } else {
-      el.className='pf-status warn';
-      el.textContent = 'Not logged in. Open a shell on this profile and run codex login.';
-    }
-  }catch(e){
-    el.className='pf-status err';
-    el.textContent = 'Failed to load credentials status';
-  }
-}
-
-async function logoutProfile(pid){
-  if(!confirm('Remove auth.json for this profile? You will need to run codex login again in any session that uses it.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/credentials', {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to log out'); return; }
-    refreshProfileCredentials(pid);
-  }catch(e){ alert('Failed to log out'); }
-}
-
-async function loadProfileRawFile(pid, relPath, taId){
-  const ta = document.getElementById(taId);
-  if(!ta) return;
-  ta.value = 'Loading...';
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(relPath));
-    const data = await resp.json();
-    if(!resp.ok){ ta.value=''; alert(data.error||'Failed to load'); return; }
-    ta.value = data.content || '';
-    if(!data.exists){
-      ta.placeholder = relPath + ' does not exist yet — saving will create it.';
-    }
-  }catch(e){ ta.value=''; alert('Failed to load file'); }
-}
-
-async function saveProfileRawFile(pid, relPath, taId){
-  const ta = document.getElementById(taId);
-  if(!ta) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path: relPath, content: ta.value})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
-    ta.style.borderColor = '#3fb950';
-    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
-  }catch(e){ alert('Failed to save'); }
-}
-
-let _profileDirSections = {agents:{files:[],editing:''}, commands:{files:[],editing:''}};
-
-async function loadProfileDirSection(pid, cat, containerId){
-  const container = document.getElementById(containerId);
-  if(!container) return;
-  container.innerHTML = '<div class="pf-empty">Loading...</div>';
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/files');
-    const data = await resp.json();
-    if(!resp.ok){ container.innerHTML='<div class="pf-empty">'+(data.error||'Failed to load')+'</div>'; return; }
-    const entry = (data.categories||{})[cat] || {files:[]};
-    const files = (entry.files||[]).filter(f => f.kind==='file');
-    _profileDirSections[cat] = _profileDirSections[cat] || {files:[],editing:''};
-    _profileDirSections[cat].files = files;
-    renderProfileDirSection(pid, cat, containerId);
-  }catch(e){ container.innerHTML='<div class="pf-empty">Failed to load</div>'; }
-}
-
-function renderProfileDirSection(pid, cat, containerId){
-  const container = document.getElementById(containerId);
-  if(!container) return;
-  const state = _profileDirSections[cat] || {files:[],editing:''};
-  const files = state.files || [];
-  if(!files.length){
-    container.innerHTML = '<div class="pf-empty">No '+cat+' yet.</div>';
-    return;
-  }
-  let html = '';
-  files.forEach(f => {
-    const isEditing = state.editing === f.name;
-    html += `<div class="pf-row">
-      <span class="pf-row-name" onclick="toggleProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">${esc(f.name)}</span>
-      <span class="pf-row-meta">${f.size} bytes</span>
-      <button class="extras-btn" onclick="toggleProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">${isEditing?'Hide':'Edit'}</button>
-      <button class="extras-del" onclick="deleteProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')" title="Delete">&times;</button>
-    </div>
-    <div class="extras-editor${isEditing?' active':''}" id="dirfile-editor-${esc(cat)}-${esc(f.name)}">
-      <textarea spellcheck="false" data-dir-name="${esc(f.name)}">Loading...</textarea>
-      <div style="display:flex;gap:6px;justify-content:flex-end">
-        <button class="extras-btn" onclick="saveProfileDirFile('${esc(pid)}','${esc(cat)}','${esc(f.name)}')">Save changes</button>
-      </div>
-    </div>`;
-  });
-  container.innerHTML = html;
-  // Lazy-load content for the currently-editing one
-  if(state.editing){
-    loadProfileDirFileContent(pid, cat, state.editing);
-  }
-}
-
-async function toggleProfileDirFile(pid, cat, name){
-  const state = _profileDirSections[cat] || {files:[],editing:''};
-  state.editing = (state.editing === name) ? '' : name;
-  renderProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
-}
-
-async function loadProfileDirFileContent(pid, cat, name){
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(cat+'/'+name));
-    const data = await resp.json();
-    if(!resp.ok){ return; }
-    const ta = document.querySelector('#dirfile-editor-'+CSS.escape(cat)+'-'+CSS.escape(name)+' textarea');
-    if(ta) ta.value = data.content || '';
-  }catch(e){}
-}
-
-async function saveProfileDirFile(pid, cat, name){
-  const ta = document.querySelector('#dirfile-editor-'+CSS.escape(cat)+'-'+CSS.escape(name)+' textarea');
-  if(!ta) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path: cat+'/'+name, content: ta.value})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
-    ta.style.borderColor = '#3fb950';
-    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
-  }catch(e){ alert('Failed to save'); }
-}
-
-async function deleteProfileDirFile(pid, cat, name){
-  if(!confirm('Delete '+cat+'/'+name+'?')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(cat+'/'+name), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    loadProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
-  }catch(e){ alert('Failed to delete'); }
-}
-
-async function addProfileSubfile(pid, cat){
-  const example = cat==='agents'
-    ? 'my-agent.md'
-    : 'my-command.md';
-  const raw = window.prompt('New '+cat.slice(0,-1)+' filename (must end in .md):', example);
-  if(raw === null) return;
-  let name = (raw||'').trim();
-  if(!name) return;
-  if(!name.toLowerCase().endsWith('.md')) name += '.md';
-  // Sanitize: alphanumeric + dash + underscore + .md
-  if(!/^[A-Za-z0-9._-]+\.md$/.test(name)){
-    alert('Use alphanumerics, dashes, underscores, dots only; must end in .md.');
-    return;
-  }
-  // Boilerplate frontmatter
-  const stub = cat==='agents'
-    ? `---\nname: ${name.replace(/\.md$/,'')}\ndescription: Describe when Codex should delegate to this agent.\ntools: '*'\n---\n\n# ${name.replace(/\.md$/,'')}\n\nInstructions...\n`
-    : `---\ndescription: One-line summary shown in the slash-command menu.\nallowed-tools: '*'\n---\n\n# /${name.replace(/\.md$/,'')}\n\nWhat this command does...\n`;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path: cat+'/'+name, content: stub})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create'); return; }
-    _profileDirSections[cat] = _profileDirSections[cat] || {files:[],editing:''};
-    _profileDirSections[cat].editing = name;
-    loadProfileDirSection(pid, cat, cat==='agents'?'pf-agents-list':'pf-commands-list');
-  }catch(e){ alert('Failed to create'); }
-}
-
-async function loadProfilePluginsList(pid){
-  const container = document.getElementById('pf-plugins-list');
-  if(!container) return;
-  container.innerHTML = '<div class="pf-empty">Loading...</div>';
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/files');
-    const data = await resp.json();
-    if(!resp.ok){ container.innerHTML='<div class="pf-empty">'+(data.error||'Failed')+'</div>'; return; }
-    const entries = ((data.categories||{}).plugins||{}).files || [];
-    if(!entries.length){
-      container.innerHTML = '<div class="pf-empty">No plugins installed. Use <code>/plugin</code> inside Codex to install.</div>';
-      return;
-    }
-    container.innerHTML = entries.map(e =>
-      `<div class="pf-row">
-        <span class="pf-row-name">${esc(e.name)}</span>
-        <span class="pf-row-tag">${esc(e.kind)}</span>
-      </div>`
-    ).join('');
-  }catch(e){ container.innerHTML='<div class="pf-empty">Failed to load</div>'; }
-}
-
-// Sidecar .md files at the profile root were removed from the UI: a profile's
-// persona belongs in its CLAUDE.md, and extra files there were never referenced.
-
-async function saveProfile(){
-  const p = _profilesEditing;
-  if(!p) return;
-  const name = (document.getElementById('ed-name').value||'').trim();
-  const model = (document.getElementById('ed-model').value||'').trim();
-  const effort = document.getElementById('ed-effort').value;
-  const codexMd = document.getElementById('ed-codex').value;
-  const memoryMd = document.getElementById('ed-memory').value;
-  let permissions, env;
-  try{ permissions = JSON.parse(document.getElementById('ed-permissions').value||'{}'); }
-  catch(e){ alert('Permissions JSON is invalid: '+e.message); return; }
-  try{ env = JSON.parse(document.getElementById('ed-env').value||'{}'); }
-  catch(e){ alert('Env JSON is invalid: '+e.message); return; }
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(p.id), {
-      method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, model, effort, codex_md: codexMd, memory_md: memoryMd, permissions, env})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
-    await loadProfiles(true);
-    await editProfile(p.id);
-  }catch(e){ alert('Failed to save profile.'); }
-}
-
-async function deleteProfile(profileId){
-  if(profileId==='default'){ alert("The default profile can't be deleted."); return; }
-  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.codex-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    _profilesEditing = null;
-    await loadProfiles(true);
-    renderProfilesList();
-    document.getElementById('profile-edit').innerHTML =
-      '<div class="profile-empty">Profile deleted.</div>';
-    // Refresh visible session dropdowns
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to delete profile.'); }
-}
-
-async function newProfilePrompt(){
-  const list = _profilesCache || [];
-  const presets = list.filter(p => p.builtin && p.id!=='default');
-  let promptMsg = 'New profile name (e.g. "My UI Reviewer"):';
-  if(presets.length){
-    promptMsg += '\\n\\nLeave empty to start blank. To clone a preset, append " | preset-id" -- available preset ids:\\n  '
-      + presets.map(p=>p.id).join(', ');
-  }
-  const raw = window.prompt(promptMsg, '');
-  if(raw === null) return;
-  let name = raw.trim();
-  let fromPreset = '';
-  if(name.includes('|')){
-    const parts = name.split('|');
-    name = parts[0].trim();
-    fromPreset = parts[1].trim();
-  }
-  if(!name){ alert('Name is required.'); return; }
-  try{
-    const resp = await fetch(BASE+'/api/profiles', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, from_preset: fromPreset})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create profile'); return; }
-    await loadProfiles(true);
-    await editProfile(data.id);
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to create profile.'); }
-}
-
 // ── Project-scope file editor (per-session, cwd-bound) ──
 let _projFile = {sessionName:'', path:'', absPath:'', cwd:'', content:'', exists:false};
 
@@ -20182,10 +20245,10 @@ const _PROJFILE_LABELS = {
 };
 
 const _PROJFILE_DESCRIPTIONS = {
-  'AGENTS.md': 'Markdown rules loaded on top of the profile-level AGENTS.md whenever Codex runs inside this cwd. Use this for repo-specific conventions.',
-  '.codex/config.toml': 'TOML. Project-level config (model, env, hooks, permissions). Loaded on top of profile config.',
-  '.codex/config.local.toml': 'TOML. Project-local overrides (typically gitignored). Loaded last and wins over both profile and project config.',
-  '.mcp.json': 'JSON. Project-scope MCP servers — merged with the profile MCP servers when Codex runs in this cwd.',
+  'AGENTS.md': 'Markdown rules loaded on top of the global AGENTS.md whenever Codex runs inside this cwd. Use this for repo-specific conventions.',
+  '.codex/config.toml': 'TOML. Project-level config (model, env, hooks, permissions). Loaded on top of the global Codex config.',
+  '.codex/config.local.toml': 'TOML. Project-local overrides (typically gitignored). Loaded last and wins over global and project config.',
+  '.mcp.json': 'JSON. Project-scope MCP servers merged with the global MCP servers when Codex runs in this cwd.',
 };
 
 async function openProjectFile(sessionName, relPath){
@@ -20499,6 +20562,11 @@ function renderStats(s,usage){
   if(s.cpu_percent!=null){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Usage</span><span class="stats-row-value">'+s.cpu_percent+'% ('+s.cpu_count+' CPUs)</span></div>';
   }
+  if(s.cpu_load_pct!=null){
+    // Load average as a percentage of the core count. Over 100% means tasks are
+    // queueing, which is not the same as the cores being busy.
+    html+='<div class="stats-row"><span class="stats-row-label">Run Queue</span><span class="stats-row-value">'+s.cpu_load_pct+'% of '+s.cpu_count+' cores</span></div>';
+  }
   if(s.threads_running!=null){
     html+='<div class="stats-row"><span class="stats-row-label">Threads</span><span class="stats-row-value">'+s.threads_running+' running / '+s.threads_total+' total</span></div>';
   }
@@ -20568,10 +20636,26 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
-loadCurrentUser().then(applyRoleVisibility);
-loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
-loadAll();
-checkCodexAuth();
+function consumeBrowserLoginReminder(){
+  const url=new URL(window.location.href);
+  if(url.searchParams.get('browser_login')!=='1') return false;
+  url.searchParams.delete('browser_login');
+  const clean=url.pathname+(url.search?'?'+url.searchParams.toString():'')+'#/settings/browser';
+  history.replaceState(null,'',clean);
+  return true;
+}
+
+async function bootstrapDashboard(){
+  await bootstrapImpersonation();
+  await loadCurrentUser();
+  await applyRoleVisibility();
+  const browserReminder=consumeBrowserLoginReminder();
+  if(!browserReminder&&!window.location.hash)history.replaceState(null,'','#/dashboard');
+  await handleAppRoute();
+  loadAll();
+  checkCodexAuth();
+}
+bootstrapDashboard();
 </script>
 </body></html>
 """
@@ -20599,14 +20683,23 @@ _PROJECTS_PAGE_CSS = (
 
 
 def _projects_page_html(title: str, rows):
+    public_base = PUB_URL.rstrip("/")
     items = "".join(
-        f'<li><a href="/{u}/{p}">dianaotech.com/{u}/{p}</a> <span class="open">open ↗</span></li>'
+        (
+            f'<li><a href="{_html_escape(public_base)}/'
+            f'{urllib.parse.quote(str(u), safe="")}/'
+            f'{urllib.parse.quote(str(p), safe="")}">'
+            f'{_html_escape(public_base)}/{_html_escape(str(u))}/'
+            f'{_html_escape(str(p))}</a> '
+            '<span class="open">open ↗</span></li>'
+        )
         for (u, p) in rows) or '<li class="muted">No projects yet. Ask Codex in a session to build something — it gets published here.</li>'
     return (f"<!doctype html><html><head><meta charset=utf-8><title>{title} · {BRAND_NAME}</title>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<style>{_PROJECTS_PAGE_CSS}</style></head><body><h1>{title}</h1>"
             f"<div class=card><ul>{items}</ul></div>"
-            f"<p class=muted>{BRAND_NAME} — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
+            f"<p class=muted>{BRAND_NAME} — projects are served at "
+            f"{_html_escape(public_base)}/&lt;user&gt;/&lt;project&gt;.</p>"
             "</body></html>")
 
 
@@ -20639,30 +20732,66 @@ async def user_projects_page(request: Request, username: str):
 async def serve_project(request: Request, username: str, project: str, subpath: str = ""):
     if username in _RESERVED_TOP:
         return HTMLResponse("Not found", status_code=404)
+    owner = _find_user_by_username(username)
+    if not owner:
+        return HTMLResponse("Not found", status_code=404)
     pdir = _project_dir(username, project)
     if pdir is None or not pdir.exists():
         return HTMLResponse(f"Project not found. (Served from ~/web-projects/{username}/{project}/)",
                             status_code=404)
-    serve_cfg = pdir / ".serve.json"
+    projects_root = PROJECTS_ROOT.resolve()
+    user_root = (PROJECTS_ROOT / username).resolve()
+    project_root = pdir.resolve()
+    try:
+        user_root.relative_to(projects_root)
+        project_root.relative_to(user_root)
+    except ValueError:
+        return HTMLResponse("Forbidden", status_code=403)
+    serve_cfg = project_root / ".serve.json"
     if serve_cfg.exists():
         try:
-            port = int(json.loads(serve_cfg.read_text()).get("port", 0))
+            resolved_cfg = serve_cfg.resolve()
+            resolved_cfg.relative_to(project_root)
+            port = int(json.loads(resolved_cfg.read_text()).get("port", 0))
         except Exception:
             port = 0
         if port:
+            if not _is_admin(owner):
+                allowed = await asyncio.to_thread(
+                    _member_project_port_allowed,
+                    owner,
+                    project,
+                    port,
+                )
+                if not allowed:
+                    logger.warning(
+                        "Blocked member project proxy %s/%s to localhost:%s",
+                        username,
+                        project,
+                        port,
+                    )
+                    return HTMLResponse("Forbidden", status_code=403)
             return await _proxy_to_port(request, port, subpath)
     rel = subpath or "index.html"
-    target = (pdir / rel).resolve()
+    target = (project_root / rel).resolve()
     try:
-        target.relative_to(pdir.resolve())
+        target.relative_to(project_root)
     except ValueError:
         return HTMLResponse("Forbidden", status_code=403)
     if target.is_dir():
-        target = target / "index.html"
+        target = (target / "index.html").resolve()
+        try:
+            target.relative_to(project_root)
+        except ValueError:
+            return HTMLResponse("Forbidden", status_code=403)
     if not target.exists():
-        idx = pdir / "index.html"
+        idx = (project_root / "index.html").resolve()
+        try:
+            idx.relative_to(project_root)
+        except ValueError:
+            return HTMLResponse("Forbidden", status_code=403)
         target = idx if idx.exists() else None
-    if not target or not target.exists():
+    if not target or not target.is_file():
         return HTMLResponse("Not found", status_code=404)
     mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     return FileResponse(str(target), media_type=mime)

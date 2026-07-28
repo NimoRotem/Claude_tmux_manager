@@ -29,8 +29,6 @@ from app import (
     IDLE_CONFIRM_COUNT,
     _activity_state,
     _append_assistant_msg,
-    _away_log,
-    _away_state_summary,
     _check_login_rate_limit,
     _check_token,
     _detect_interactive_prompt,
@@ -221,66 +219,6 @@ class TestAppendAssistantMsg:
             assert entry["messages"][-1]["text"] == "old message"
         finally:
             app._save_messages = original_save
-
-
-# ─── Away Mode Utility Tests ───
-
-
-class TestAwayLog:
-    def test_appends_log_entry(self):
-        state = {"phase": 1, "step": 2, "log": []}
-        _away_log(state, "test action")
-        assert len(state["log"]) == 1
-        assert state["log"][0]["action"] == "test action"
-        assert state["log"][0]["phase"] == 1
-        assert state["log"][0]["step"] == 2
-        assert "ts" in state["log"][0]
-
-    def test_creates_log_list_if_missing(self):
-        state = {"phase": 1, "step": 1}
-        _away_log(state, "first entry")
-        assert "log" in state
-        assert len(state["log"]) == 1
-
-    def test_truncates_at_200_entries(self):
-        state = {"phase": 1, "step": 1, "log": [{"ts": i, "phase": 1, "step": 1, "action": f"entry-{i}"} for i in range(200)]}
-        _away_log(state, "entry-200")
-        assert len(state["log"]) == 200  # stays at 200, not 201
-        assert state["log"][-1]["action"] == "entry-200"
-        assert state["log"][0]["action"] == "entry-1"  # entry-0 was dropped
-
-    def test_defaults_phase_and_step(self):
-        state = {}
-        _away_log(state, "no phase")
-        assert state["log"][0]["phase"] == 0
-        assert state["log"][0]["step"] == 0
-
-
-class TestAwayStateSummary:
-    def test_returns_safe_dict(self):
-        state = {
-            "enabled": True,
-            "phase": 3,
-            "phase_name": "execute",
-            "step": 2,
-            "step_name": "running tests",
-            "started_at": 1000.0,
-            "log": [{"ts": 1, "phase": 1, "step": 1, "action": "test"}],
-            "report": "all good",
-            "task": "SHOULD_NOT_APPEAR",  # asyncio.Task — not JSON-safe
-        }
-        summary = _away_state_summary(state)
-        assert summary["enabled"] is True
-        assert summary["phase"] == 3
-        assert summary["phase_name"] == "execute"
-        assert "task" not in summary
-        assert json.dumps(summary)  # must be JSON-serializable
-
-    def test_empty_state_defaults(self):
-        summary = _away_state_summary({})
-        assert summary["enabled"] is False
-        assert summary["phase"] == 0
-        assert summary["phase_name"] == ""
 
 
 # ─── Interactive Prompt Detection Tests ───

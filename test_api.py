@@ -44,6 +44,63 @@ def authed_client():
     return c
 
 
+@pytest.fixture(autouse=True)
+def isolated_prompt_audit(tmp_path, monkeypatch):
+    """Tests must never mutate live prompt or impersonation state."""
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "PROMPT_AUDIT_FILE",
+        tmp_path / "prompt-history.jsonl",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "PROMPT_AUDIT_BACKFILL_MARKER",
+        tmp_path / "prompt-history-backfill-v1.json",
+    )
+    app_module._prompt_audit_summary_cache.update({
+        "signature": None,
+        "data": {},
+    })
+    monkeypatch.setattr(
+        app_module,
+        "IMPERSONATION_SESSIONS_FILE",
+        tmp_path / "impersonation-sessions.json",
+    )
+    monkeypatch.setattr(app_module, "_impersonation_tickets", {})
+    monkeypatch.setattr(app_module, "_impersonation_sessions", {})
+    monkeypatch.setattr(app_module, "_impersonation_sessions_loaded", False)
+    monkeypatch.setattr(
+        app_module,
+        "BROWSER_SESSIONS_FILE",
+        tmp_path / "browser-sessions.json",
+    )
+    browser_root = tmp_path / "browsers"
+    monkeypatch.setattr(app_module, "CB_ROOT", browser_root)
+    monkeypatch.setattr(
+        app_module,
+        "BROWSER_PROXY_CONF",
+        browser_root / "proxy.json",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "BROWSER_PROXY_USAGE",
+        browser_root / "state" / "proxy-usage.json",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "BROWSER_FINGERPRINT_TOOL",
+        browser_root / "bin" / "fingerprint-audit.py",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "BROWSER_LAUNCHER",
+        str(browser_root / "bin" / "browser-session.sh"),
+    )
+    monkeypatch.setattr(app_module, "_browser_starting", {})
+
+
 # ─── Auth & Middleware Tests ───
 
 
@@ -51,7 +108,7 @@ class TestAuthMiddleware:
     def test_unauthenticated_returns_login_page(self, client):
         resp = client.get("/", follow_redirects=False)
         assert resp.status_code == 200
-        assert "tmux Dashboard" in resp.text
+        assert "Dashboard" in resp.text
         assert "Log in" in resp.text
 
     def test_authenticated_returns_app(self, authed_client):
@@ -92,6 +149,1775 @@ class TestAuthMiddleware:
         assert "err=1" in resp.headers.get("location", "")
 
 
+class TestMemberAuthAndContextIsolation:
+    @staticmethod
+    def _member(password: str = "member-pass") -> dict:
+        import app as app_module
+
+        salt = "member-test-salt"
+        return {
+            "id": "u_member",
+            "username": "member@example.com",
+            "password_hash": app_module._hash_password(password, salt),
+            "password_salt": salt,
+            "role": "user",
+            "created_at": 1,
+            "last_login": 0,
+        }
+
+    def test_member_launch_uses_yolo_when_team_mode_is_disabled(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "TEAM_MODE", False),
+            patch.object(
+                app_module,
+                "NEW_SESSION_CMD",
+                "codex --dangerously-bypass-approvals-and-sandbox",
+            ),
+        ):
+            command = app_module._session_launch_base(user=member)
+
+        assert command == "codex --yolo"
+
+    def test_member_resume_preserves_yolo(self):
+        import app as app_module
+
+        member = self._member()
+        launch = app_module._launch_codex_cmd(
+            app_module._session_launch_base(user=member),
+            pin_model=False,
+            resume=True,
+        )
+
+        assert launch == "codex resume --last --yolo"
+
+    def test_member_codex_home_uses_the_complete_yolo_config(self, tmp_path):
+        import tomllib
+
+        import app as app_module
+
+        member = self._member()
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model = "gpt-test"\n'
+            'sandbox_mode = "danger-full-access"\n'
+            '\n[projects."/work"]\n'
+            'trust_level = "trusted"\n'
+            "\n[mcp_servers.admin-browser]\n"
+            'command = "node"\n'
+            'args = ["browser.js", "--cdp", "http://127.0.0.1:9222"]\n'
+        )
+        browser = {
+            "id": "member-browser",
+            "owner_id": member["id"],
+            "cdp_port": 9223,
+        }
+        projects_root = tmp_path / "projects"
+
+        with (
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+            patch.object(
+                app_module,
+                "_load_session_owners",
+                return_value={"member-work": member["id"]},
+            ),
+            patch.object(app_module, "_google_mcp_command", return_value=""),
+        ):
+            app_module._configure_member_codex_isolation(
+                tmp_path,
+                member,
+                browser,
+            )
+
+        parsed = tomllib.loads(config.read_text())
+        member_project = str(
+            projects_root / member["username"] / "member-work"
+        )
+        assert (
+            parsed["model"],
+            parsed["model_reasoning_effort"],
+            parsed["approval_policy"],
+            parsed["default_permissions"],
+            "sandbox_mode" in parsed,
+            "permissions" in parsed,
+            parsed["features"]["apps"],
+            parsed["features"]["remote_plugin"],
+            parsed["notice"]["hide_full_access_warning"],
+            parsed["tui"]["model_availability_nux"]["gpt-5.6-sol"],
+            parsed["apps"]["_default"]["enabled"],
+            "mcp_servers" in parsed,
+            set(parsed["projects"]),
+            parsed["projects"][member_project]["trust_level"],
+        ) == (
+            "gpt-5.6-sol",
+            "max",
+            "never",
+            ":danger-full-access",
+            False,
+            False,
+            False,
+            False,
+            True,
+            3,
+            False,
+            False,
+            {member_project},
+            "trusted",
+        )
+
+    def test_member_relaunch_preserves_its_codex_home(self, tmp_path):
+        import shlex
+
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        with (
+            patch.object(app_module, "_user_for_session", return_value=member),
+            patch.object(app_module, "_user_codex_config_dir", return_value=tmp_path),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+            patch.object(app_module, "_ensure_user_browser_session"),
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            exported = app_module._send_profile_export(
+                "member-session",
+                app_module.DEFAULT_PROFILE_ID,
+            )
+
+        sent = run.call_args_list[0].args[0]
+        project_dir = projects_root / member["username"] / "member-session"
+        assert (
+            exported,
+            sent[:5],
+            sent[5],
+            project_dir.is_dir(),
+        ) == (
+            True,
+            ["tmux", "send-keys", "-t", "member-session", "-l"],
+            (
+                f"export CODEX_HOME={shlex.quote(str(tmp_path))}; "
+                f"cd -- {shlex.quote(str(project_dir))}"
+            ),
+            True,
+        )
+
+    def test_member_config_editor_restores_the_complete_yolo_config(
+        self,
+        tmp_path,
+    ):
+        import tomllib
+
+        import app as app_module
+
+        member = self._member()
+        browser = {
+            "id": "member-browser",
+            "owner_id": member["id"],
+            "cdp_port": 9223,
+        }
+        submitted = (
+            'model = "gpt-test"\n'
+            'sandbox_mode = "danger-full-access"\n'
+            '\n[features]\n'
+            'apps = true\n'
+            '\n[mcp_servers.admin-browser]\n'
+            'command = "node"\n'
+            'args = ["--cdp", "http://127.0.0.1:9222"]\n'
+        )
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(
+                app_module,
+                "_user_codex_config_dir",
+                return_value=tmp_path,
+            ),
+            patch.object(
+                app_module,
+                "_ensure_user_codex_config_dir",
+            ),
+            patch.object(
+                app_module,
+                "_ensure_user_browser_session",
+                return_value=browser,
+            ),
+            patch.object(
+                app_module,
+                "PROJECTS_ROOT",
+                tmp_path / "projects",
+            ),
+            patch.object(app_module, "_google_mcp_command", return_value=""),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/my/context/config.toml",
+                json={"content": submitted},
+            )
+
+        parsed = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert (
+            response.status_code,
+            parsed["model"],
+            parsed["model_reasoning_effort"],
+            parsed["approval_policy"],
+            "sandbox_mode" in parsed,
+            "permissions" in parsed,
+            parsed["features"]["apps"],
+            parsed["features"]["remote_plugin"],
+            parsed["default_permissions"],
+            parsed["notice"]["hide_full_access_warning"],
+            "mcp_servers" in parsed,
+        ) == (
+            200,
+            "gpt-5.6-sol",
+            "max",
+            "never",
+            False,
+            False,
+            False,
+            False,
+            ":danger-full-access",
+            True,
+            False,
+        )
+
+    def test_member_cannot_exit_codex_into_the_shared_host_shell(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(
+                app_module,
+                "_session_owner_id",
+                return_value=member["id"],
+            ),
+            patch.object(
+                app_module,
+                "_find_session",
+                return_value=(0, {"name": "member-session"}),
+            ),
+            patch.object(
+                app_module,
+                "_is_codex_running",
+                return_value=True,
+            ),
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/sessions/member-session/send-keys",
+                json={"keys": ["C-c"]},
+            )
+
+        assert (response.status_code, run.call_count) == (403, 0)
+
+    def test_member_command_is_rejected_when_codex_is_not_running(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(
+                app_module,
+                "_session_owner_id",
+                return_value=member["id"],
+            ),
+            patch.object(
+                app_module,
+                "_find_session",
+                return_value=(0, {"name": "member-session"}),
+            ),
+            patch.object(
+                app_module,
+                "_is_codex_running",
+                return_value=False,
+            ),
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/sessions/member-session/send",
+                json={"command": "cat ~/.codex/auth.json"},
+            )
+
+        assert (response.status_code, run.call_count) == (409, 0)
+
+    def test_member_prompt_cannot_embed_terminal_control_bytes(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(
+                app_module,
+                "_session_owner_id",
+                return_value=member["id"],
+            ),
+            patch.object(
+                app_module,
+                "_find_session",
+                return_value=(0, {"name": "member-session"}),
+            ),
+            patch.object(
+                app_module,
+                "_is_codex_running",
+                return_value=True,
+            ),
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/sessions/member-session/send",
+                json={"command": "\u0003"},
+            )
+
+        assert (response.status_code, run.call_count) == (403, 0)
+
+    def test_member_file_links_are_confined_to_its_project_root(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        own_file = (
+            projects_root
+            / member["username"]
+            / "session"
+            / "result.txt"
+        )
+        own_file.parent.mkdir(parents=True)
+        own_file.write_text("member result")
+        admin_file = tmp_path / "admin-browser-profile.txt"
+        admin_file.write_text("admin secret")
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            own_response = member_client.get(
+                "/file",
+                params={"path": str(own_file)},
+            )
+            admin_response = member_client.get(
+                "/file",
+                params={"path": str(admin_file)},
+            )
+
+        assert (
+            own_response.status_code,
+            own_response.text,
+            admin_response.status_code,
+            "admin secret" in admin_response.text,
+        ) == (200, "member result", 403, False)
+
+    def test_member_project_proxy_cannot_target_admin_cdp(
+        self,
+        tmp_path,
+    ):
+        from fastapi.responses import HTMLResponse
+
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        project = projects_root / member["username"] / "member-app"
+        project.mkdir(parents=True)
+        (project / ".serve.json").write_text('{"port": 9222}')
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+            patch.object(
+                app_module,
+                "_proxy_to_port",
+                new_callable=AsyncMock,
+                return_value=HTMLResponse("proxied"),
+            ) as proxy,
+        ):
+            response = TestClient(app).get(
+                f"/{member['username']}/member-app/json/version",
+            )
+
+        assert (response.status_code, proxy.await_count) == (403, 0)
+
+    def test_member_project_proxy_cannot_target_unowned_local_service(
+        self,
+        tmp_path,
+    ):
+        from fastapi.responses import HTMLResponse
+
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        project = projects_root / member["username"] / "member-app"
+        project.mkdir(parents=True)
+        (project / ".serve.json").write_text('{"port": 45678}')
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+            patch.object(
+                app_module,
+                "_proxy_to_port",
+                new_callable=AsyncMock,
+                return_value=HTMLResponse("proxied"),
+            ) as proxy,
+        ):
+            response = TestClient(app).get(
+                f"/{member['username']}/member-app/",
+            )
+
+        assert (response.status_code, proxy.await_count) == (403, 0)
+
+    def test_member_project_proxy_allows_its_session_listener(
+        self,
+        tmp_path,
+    ):
+        from fastapi.responses import HTMLResponse
+
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        project = projects_root / member["username"] / "member-app"
+        project.mkdir(parents=True)
+        (project / ".serve.json").write_text('{"port": 45678}')
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+            patch.object(
+                app_module,
+                "_member_project_port_allowed",
+                return_value=True,
+            ) as allowed,
+            patch.object(
+                app_module,
+                "_proxy_to_port",
+                new_callable=AsyncMock,
+                return_value=HTMLResponse("proxied"),
+            ) as proxy,
+        ):
+            response = TestClient(app).get(
+                f"/{member['username']}/member-app/",
+            )
+
+        assert (
+            response.status_code,
+            response.text,
+            allowed.call_args.args,
+            proxy.await_count,
+        ) == (200, "proxied", (member, "member-app", 45678), 1)
+
+    def test_member_project_listener_must_be_in_its_tmux_process_tree(self):
+        import subprocess
+
+        import app as app_module
+
+        member = self._member()
+
+        def process_result(command, **_kwargs):
+            if command[0] == "tmux":
+                return subprocess.CompletedProcess(command, 0, "100\n", "")
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "100 1\n101 100\n102 101\n999 1\n",
+                    "",
+                )
+            if command[0] == "ss":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    'LISTEN users:(("python",pid=102,fd=3))\n',
+                    "",
+                )
+            raise AssertionError(command)
+
+        with (
+            patch.object(
+                app_module,
+                "_protected_local_service_ports",
+                return_value=set(),
+            ),
+            patch.object(
+                app_module,
+                "_session_owner_id",
+                return_value=member["id"],
+            ),
+            patch.object(
+                app_module.subprocess,
+                "run",
+                side_effect=process_result,
+            ),
+        ):
+            allowed = app_module._member_project_port_allowed(
+                member,
+                "member-app",
+                45678,
+            )
+
+        assert allowed is True
+
+    def test_member_project_directory_symlink_cannot_escape_user_root(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        member_root = projects_root / member["username"]
+        member_root.mkdir(parents=True)
+        admin_dir = tmp_path / "admin-private"
+        admin_dir.mkdir()
+        (admin_dir / "index.html").write_text("admin browser secret")
+        (member_root / "member-app").symlink_to(
+            admin_dir,
+            target_is_directory=True,
+        )
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+        ):
+            response = TestClient(app).get(
+                f"/{member['username']}/member-app/",
+            )
+
+        assert (
+            response.status_code,
+            "admin browser secret" in response.text,
+        ) == (403, False)
+
+    def test_member_project_index_symlink_cannot_escape_project(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        member = self._member()
+        projects_root = tmp_path / "projects"
+        project = projects_root / member["username"] / "member-app"
+        project.mkdir(parents=True)
+        admin_file = tmp_path / "admin-private.html"
+        admin_file.write_text("admin browser secret")
+        (project / "index.html").symlink_to(admin_file)
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "PROJECTS_ROOT", projects_root),
+        ):
+            response = TestClient(app).get(
+                f"/{member['username']}/member-app/missing",
+            )
+
+        assert (
+            response.status_code,
+            "admin browser secret" in response.text,
+        ) == (403, False)
+
+    def test_non_admin_password_login_uses_configured_cookie_name(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "AUTH_COOKIE", "custom_tmux_auth"),
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_save_users"),
+        ):
+            member_client = TestClient(app)
+            login = member_client.post(
+                "/login",
+                data={"username": member["username"], "password": "member-pass"},
+                follow_redirects=False,
+            )
+            me = member_client.get("/api/me")
+
+        assert (
+            login.status_code,
+            "custom_tmux_auth" in login.cookies,
+            me.headers.get("content-type", "").startswith("application/json"),
+        ) == (303, True, True)
+
+    def test_non_admin_cannot_read_global_context_registry(self):
+        import app as app_module
+
+        member = self._member()
+        with patch.object(app_module, "_load_users", return_value=[member]):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/context-files")
+
+        assert response.status_code == 403
+
+    def test_non_admin_cannot_write_global_context_registry(self, tmp_path):
+        import app as app_module
+
+        member = self._member()
+        registry_file = tmp_path / "global.md"
+        registry_file.write_text("admin-only")
+        registry = [{
+            "id": "global",
+            "path": registry_file,
+            "load": "auto",
+            "note": "Global",
+        }]
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_context_file_entries", return_value=registry),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/context-files",
+                json={"name": "global", "content": "member overwrite"},
+            )
+
+        assert (response.status_code, registry_file.read_text()) == (403, "admin-only")
+
+    def test_member_context_hides_managed_global_prompt(self, tmp_path):
+        import app as app_module
+
+        member = self._member()
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text(
+            app_module._GLOBAL_CTX_BEGIN
+            + "\nadmin-only global prompt\n"
+            + app_module._GLOBAL_CTX_END
+            + "\n\n# Member context\n"
+        )
+        (tmp_path / "MEMORY.md").write_text("# Memory\n")
+        (tmp_path / "config.toml").write_text('model = "gpt-test"\n')
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_user_codex_config_dir", return_value=tmp_path),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/context")
+
+        agents_response = next(
+            item["content"] for item in response.json()["files"]
+            if item["name"] == "AGENTS.md"
+        )
+        assert agents_response == "# Member context\n"
+
+    def test_member_can_see_all_context_files_except_global_context(self, tmp_path):
+        import app as app_module
+
+        member = self._member()
+        (tmp_path / "skills" / "research").mkdir(parents=True)
+        (tmp_path / "skills" / "research" / "SKILL.md").write_text("# Research\n")
+        (tmp_path / "AGENTS.md").write_text(
+            app_module._GLOBAL_CTX_BEGIN
+            + "\nadmin-only global prompt\n"
+            + app_module._GLOBAL_CTX_END
+            + "\n\n# Member context\n"
+        )
+        (tmp_path / "MEMORY.md").write_text("# Memory\n")
+        (tmp_path / "config.toml").write_text('model = "gpt-5"\n')
+        (tmp_path / ".mcp.json").write_text("{}\n")
+        (tmp_path / "auth.json").write_text('{"secret":"hidden"}\n')
+
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_user_codex_config_dir", return_value=tmp_path),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/context")
+
+        files = {item["name"]: item for item in response.json()["files"]}
+        assert set(files) == {
+            "AGENTS.md",
+            "MEMORY.md",
+            "config.toml",
+            ".mcp.json",
+            "skills/research/SKILL.md",
+        }
+        assert "admin-only global prompt" not in files["AGENTS.md"]["content"]
+        assert files["skills/research/SKILL.md"]["editable"] is False
+
+    def test_member_context_save_preserves_hidden_global_prompt(self, tmp_path):
+        import app as app_module
+
+        member = self._member()
+        real_block = (
+            app_module._GLOBAL_CTX_BEGIN
+            + "\nadmin-only global prompt\n"
+            + app_module._GLOBAL_CTX_END
+        )
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text(real_block + "\n\n# Old member context\n")
+        submitted = (
+            app_module._GLOBAL_CTX_BEGIN
+            + "\nmember-supplied fake global prompt\n"
+            + app_module._GLOBAL_CTX_END
+            + "\n\n# New member context\n"
+        )
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_user_codex_config_dir", return_value=tmp_path),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/my/context/AGENTS.md",
+                json={"content": submitted},
+            )
+
+        assert (response.status_code, agents.read_text()) == (
+            200,
+            real_block + "\n\n# New member context\n",
+        )
+
+    def test_member_browser_status_is_safe_and_reports_working(self):
+        import app as app_module
+
+        member = self._member()
+        browser = {
+            "id": "user-member",
+            "owner_id": member["id"],
+            "account_browser": True,
+            "name": "Member browser",
+            "display": 100,
+            "rfb_port": 5901,
+            "vnc_port": 6081,
+            "cdp_port": 9223,
+            "notes": "admin-only notes",
+            "managed": True,
+        }
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=[browser]),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+            patch.object(
+                app_module,
+                "_browser_signin_state",
+                return_value={"signed_in": True, "email": "private@example.com"},
+            ),
+            patch.object(app_module, "_display_idle_ms", return_value=100),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/browser")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["state"] == "working"
+        assert (data["connected"], data["working"], data["needs_sign_in"]) == (
+            True,
+            True,
+            False,
+        )
+        assert data["session"] == {
+            "id": "user-member",
+            "name": "Member browser",
+            "running": True,
+            "viewer_url": app_module._browser_viewer_url(browser),
+        }
+        serialized = json.dumps(data)
+        for secret_field in (
+            "private@example.com",
+            "admin-only notes",
+            "rfb_port",
+            "vnc_port",
+            "cdp_port",
+            '"display"',
+        ):
+            assert secret_field not in serialized
+
+    def test_member_browser_status_requires_a_signed_in_browser(self):
+        import app as app_module
+
+        member = self._member()
+        browser = {
+            "id": "user-member",
+            "owner_id": member["id"],
+            "account_browser": True,
+            "name": "Member browser",
+            "vnc_port": 6081,
+        }
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=[browser]),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+            patch.object(
+                app_module,
+                "_browser_signin_state",
+                return_value={"signed_in": False, "email": ""},
+            ),
+            patch.object(app_module, "_display_idle_ms", return_value=-1),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/browser")
+
+        assert response.status_code == 200
+        assert response.json() | {} == {
+            "session": {
+                "id": "user-member",
+                "name": "Member browser",
+                "running": True,
+                "viewer_url": app_module._browser_viewer_url(browser),
+            },
+            "connected": False,
+            "signed_in": False,
+            "working": False,
+            "needs_sign_in": True,
+            "state": "disconnected",
+        }
+
+    def test_each_account_receives_its_owned_browser_session(self):
+        import app as app_module
+
+        admin = {
+            "id": "admin",
+            "username": "admin",
+            "role": "admin",
+        }
+        member = self._member()
+        sessions = [
+            {
+                "id": "default",
+                "owner_id": "admin",
+                "name": "Admin browser",
+                "display": 99,
+                "vnc_port": 6080,
+            },
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "account_browser": True,
+                "name": "Member browser",
+                "display": 100,
+                "vnc_port": 6081,
+            },
+        ]
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=sessions),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+            patch.object(
+                app_module,
+                "_browser_signin_state",
+                return_value={"signed_in": True, "email": "private@example.com"},
+            ),
+            patch.object(app_module, "_display_idle_ms", return_value=60_000),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            admin_response = admin_client.get("/api/my/browser")
+            member_response = member_client.get("/api/my/browser")
+
+        assert (
+            admin_response.json()["session"]["id"],
+            member_response.json()["session"]["id"],
+        ) == ("default", "user-member")
+
+    def test_member_browser_is_provisioned_when_the_account_has_none(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        member = self._member()
+        sessions_file = tmp_path / "browser-sessions.json"
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "BROWSER_SESSIONS_FILE", sessions_file),
+            patch.object(app_module, "CB_ROOT", tmp_path / "browsers"),
+            patch.object(app_module, "_ensure_browser_launcher"),
+            patch.object(app_module.subprocess, "Popen") as spawn,
+            patch.object(app_module, "_browser_port_alive", return_value=False),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/browser")
+
+        saved = json.loads(sessions_file.read_text())["sessions"]
+        owned = next(
+            session for session in saved
+            if session.get("owner_id") == member["id"]
+        )
+        assert (
+            response.status_code,
+            response.json()["session"]["id"],
+            owned["managed"],
+            spawn.call_count,
+        ) == (200, owned["id"], True, 1)
+
+    def test_member_cannot_open_an_undesignated_browser_session(self):
+        import app as app_module
+
+        member = self._member()
+        sessions = [
+            {
+                "id": "default",
+                "owner_id": "admin",
+                "name": "Admin browser",
+                "vnc_port": 6080,
+            },
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "account_browser": True,
+                "name": "Member browser",
+                "vnc_port": 6081,
+            },
+        ]
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=sessions),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/browser/default/vnc.html")
+
+        assert response.status_code == 404
+
+    def test_admin_cannot_open_a_member_owned_browser_session(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        sessions = [
+            dict(app_module._DEFAULT_BROWSER_SESSION),
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "account_browser": True,
+                "name": "Member browser",
+                "vnc_port": 6081,
+            },
+        ]
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=sessions),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            response = admin_client.get("/browser/user-member/vnc.html")
+
+        assert response.status_code == 404
+
+    def test_admin_browser_catalog_omits_member_owned_browsers(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        sessions = [
+            dict(app_module._DEFAULT_BROWSER_SESSION),
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "account_browser": True,
+                "name": "Member browser",
+                "vnc_port": 6081,
+            },
+        ]
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(app_module, "_load_browser_sessions", return_value=sessions),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            response = admin_client.get("/api/browser/sessions")
+
+        assert [row["id"] for row in response.json()["sessions"]] == ["default"]
+
+    def test_admin_cannot_drive_member_browser_fingerprint(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        member_browser = {
+            "id": "user-member",
+            "owner_id": member["id"],
+            "cdp_port": 9223,
+        }
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=[dict(app_module._DEFAULT_BROWSER_SESSION), member_browser],
+            ),
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            response = admin_client.get("/api/browser/fingerprint/user-member")
+
+        assert (response.status_code, run.call_count) == (404, 0)
+
+    def test_admin_cannot_update_or_delete_member_browser(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        member_browser = {
+            "id": "user-member",
+            "owner_id": member["id"],
+            "account_browser": True,
+            "managed": True,
+            "name": "Member browser",
+            "vnc_port": 6081,
+        }
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=[
+                    dict(app_module._DEFAULT_BROWSER_SESSION),
+                    member_browser,
+                ],
+            ),
+            patch.object(app_module, "_save_browser_sessions") as save,
+            patch.object(app_module.subprocess, "run") as run,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            update = admin_client.patch(
+                "/api/browser/sessions/user-member",
+                json={"name": "Taken over"},
+            )
+            delete = admin_client.delete(
+                "/api/browser/sessions/user-member",
+            )
+
+        assert (
+            update.status_code,
+            delete.status_code,
+            save.call_count,
+            run.call_count,
+            member_browser["name"],
+        ) == (404, 404, 0, 0, "Member browser")
+
+    def test_admin_browser_metadata_update_does_not_modify_member_browser(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        admin_browser = {
+            **dict(app_module._DEFAULT_BROWSER_SESSION),
+            "use_for_login": False,
+        }
+        member_browser = {
+            "id": "user-member",
+            "owner_id": member["id"],
+            "account_browser": True,
+            "name": "Member browser",
+            "use_for_login": True,
+            "vnc_port": 6081,
+        }
+        sessions = [admin_browser, member_browser]
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=sessions,
+            ),
+            patch.object(app_module, "_save_browser_sessions"),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            response = admin_client.patch(
+                "/api/browser/sessions/default",
+                json={"use_for_login": True},
+            )
+
+        assert (
+            response.status_code,
+            admin_browser["use_for_login"],
+            member_browser["use_for_login"],
+        ) == (200, True, True)
+
+    def test_admin_proxy_endpoints_hide_member_browser(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        sessions = [
+            dict(app_module._DEFAULT_BROWSER_SESSION),
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "name": "Member browser",
+            },
+        ]
+        proxy_conf = {
+            "sessions": {
+                "default": {"local_port": 18880, "session_id": "admin"},
+                "user-member": {
+                    "local_port": 18881,
+                    "session_id": "member",
+                },
+            },
+        }
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=sessions,
+            ),
+            patch.object(app_module, "_proxy_conf", return_value=proxy_conf),
+            patch.object(app_module, "_proxy_usage", return_value={}),
+            patch.object(app_module, "_proxy_presets", return_value={}),
+            patch.object(app_module, "_proxy_save") as save,
+            patch.object(app_module.asyncio, "sleep"),
+            patch.object(app_module, "_proxy_exit_info") as exit_info,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            catalog = admin_client.get("/api/browser/proxy")
+            rotate = admin_client.post(
+                "/api/browser/proxy/user-member/rotate",
+            )
+
+        assert (
+            [row["id"] for row in catalog.json()["browsers"]],
+            rotate.status_code,
+            save.call_count,
+            exit_info.call_count,
+        ) == (["default"], 404, 0, 0)
+
+    def test_admin_browser_auth_status_hides_member_browser(self):
+        import app as app_module
+
+        member = self._member()
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        sessions = [
+            dict(app_module._DEFAULT_BROWSER_SESSION),
+            {
+                "id": "user-member",
+                "owner_id": member["id"],
+                "name": "Member browser",
+                "vnc_port": 6081,
+            },
+        ]
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=sessions,
+            ),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token(admin["id"]))
+            response = admin_client.get("/api/browser/auth-status")
+
+        assert [row["id"] for row in response.json()["sessions"]] == ["default"]
+
+    def test_member_api_catalog_omits_keys_and_admin_metadata(self):
+        import app as app_module
+
+        member = self._member()
+        registry = [{
+            "id": "api_search",
+            "name": "Search API",
+            "provider": "search",
+            "category": "search",
+            "key": "sk-do-not-return-this",
+            "env_var": "SEARCH_API_KEY",
+            "key_label": "private-account",
+            "plan": "Team",
+            "limits": "100/day",
+            "costs": "$99",
+            "notes": "private admin note",
+            "docs_url": "https://docs.example.com",
+            "dashboard_url": "https://admin.example.com",
+            "status": "active",
+        }]
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_load_api_registry", return_value=registry),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/my/apis")
+
+        assert response.status_code == 200
+        entry = response.json()["apis"][0]
+        assert entry == {
+            "id": "api_search",
+            "name": "Search API",
+            "provider": "search",
+            "category": "search",
+            "available": True,
+            "plan": "Team",
+            "limits": "100/day",
+            "docs_url": "https://docs.example.com",
+            "status": "active",
+        }
+        assert "sk-do-not-return-this" not in response.text
+        assert "private admin note" not in response.text
+
+    def test_member_api_catalog_rejects_non_http_documentation_links(self):
+        import app as app_module
+
+        entry = app_module._member_api_entry({
+            "id": "api_bad_link",
+            "name": "Bad link",
+            "key": "configured",
+            "docs_url": 'javascript:alert("xss")',
+        })
+
+        assert entry["docs_url"] == ""
+
+    def test_member_cannot_mutate_shared_openai_key(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_save_openai_key") as save_key,
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.post(
+                "/api/auth/api-key",
+                json={"apiKey": "sk-member-must-not-set-global-key"},
+            )
+
+        assert response.status_code == 403
+        save_key.assert_not_called()
+
+    def test_member_cannot_use_full_browser_management_api(self):
+        import app as app_module
+
+        member = self._member()
+        with patch.object(app_module, "_load_users", return_value=[member]):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token(member["id"]))
+            response = member_client.get("/api/browser/sessions")
+
+        assert response.status_code == 403
+
+    def test_fresh_login_opens_browser_reminder_only_when_sign_in_is_missing(self):
+        import app as app_module
+
+        member = self._member()
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_save_users"),
+            patch.object(app_module, "_check_login_rate_limit", return_value=True),
+            patch.object(app_module, "_browser_login_ready", return_value=False),
+        ):
+            member_client = TestClient(app)
+            missing = member_client.post(
+                "/login",
+                data={"username": member["username"], "password": "member-pass"},
+                follow_redirects=False,
+            )
+
+        with (
+            patch.object(app_module, "_load_users", return_value=[member]),
+            patch.object(app_module, "_save_users"),
+            patch.object(app_module, "_check_login_rate_limit", return_value=True),
+            patch.object(app_module, "_browser_login_ready", return_value=True),
+        ):
+            member_client = TestClient(app)
+            ready = member_client.post(
+                "/login",
+                data={"username": member["username"], "password": "member-pass"},
+                follow_redirects=False,
+            )
+
+        assert "browser_login=1" in missing.headers["location"]
+        assert "browser_login=1" not in ready.headers["location"]
+
+
+class TestAdminUserManagement:
+    @staticmethod
+    def _admin() -> dict:
+        return {
+            "id": "admin",
+            "username": "admin",
+            "role": "admin",
+            "created_at": 1,
+            "last_login": 2,
+        }
+
+    @staticmethod
+    def _member() -> dict:
+        return {
+            "id": "u_member",
+            "username": "member@example.com",
+            "role": "user",
+            "created_at": 1,
+            "last_login": 2,
+        }
+
+    def test_new_account_gets_a_dedicated_browser_allocation(self):
+        import app as app_module
+
+        users = [self._admin()]
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "_save_users"),
+            patch.object(app_module, "_new_user_id", return_value="u_new"),
+            patch.object(app_module, "_user_data_dir"),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+            patch.object(
+                app_module,
+                "_ensure_user_browser_session",
+            ) as provision_browser,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.post(
+                "/api/admin/users",
+                json={
+                    "username": "new@example.com",
+                    "password": "member-pass",
+                    "role": "user",
+                },
+            )
+
+        assert (
+            response.status_code,
+            provision_browser.call_args.args[0]["id"],
+            provision_browser.call_args.kwargs,
+        ) == (200, "u_new", {"start": False})
+
+    def test_deleted_account_browser_is_stopped_and_removed(self):
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "_save_users"),
+            patch.object(app_module, "_load_session_owners", return_value={}),
+            patch.object(app_module.shutil, "rmtree"),
+            patch.object(
+                app_module,
+                "_delete_user_browser_session",
+                create=True,
+            ) as delete_browser,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.delete("/api/admin/users/u_member")
+
+        assert (
+            response.status_code,
+            delete_browser.call_args.args,
+        ) == (200, ("u_member",))
+
+    def test_startup_ensures_one_browser_for_every_account(self):
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "_ensure_user_codex_config_dir"),
+            patch.object(
+                app_module,
+                "_ensure_user_browser_session",
+            ) as ensure_browser,
+        ):
+            app_module._ensure_all_user_browser_sessions()
+
+        assert [
+            call.args[0]["id"] for call in ensure_browser.call_args_list
+        ] == ["admin", "u_member"]
+
+    def test_admin_can_filter_append_only_prompt_audit_by_user(self, tmp_path):
+        import app as app_module
+
+        audit_file = tmp_path / "prompt-history.jsonl"
+        audit_file.write_text(
+            "\n".join([
+                json.dumps({
+                    "id": "p-admin",
+                    "ts": 10,
+                    "user_id": "admin",
+                    "username": "admin",
+                    "session_name": "admin-work",
+                    "prompt": "admin prompt",
+                }),
+                json.dumps({
+                    "id": "p-member",
+                    "ts": 20,
+                    "user_id": "u_member",
+                    "username": "member@example.com",
+                    "session_name": "member-work",
+                    "prompt": "member prompt",
+                }),
+            ]) + "\n"
+        )
+        users = [self._admin(), self._member()]
+        with (
+            patch.object(app_module, "PROMPT_AUDIT_FILE", audit_file),
+            patch.object(app_module, "_load_users", return_value=users),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.get(
+                "/api/admin/prompts",
+                params={"user_id": "u_member", "limit": 10},
+            )
+
+        assert response.status_code == 200
+        assert [item["id"] for item in response.json()["prompts"]] == ["p-member"]
+
+    def test_prompt_audit_cursor_does_not_skip_equal_timestamps(self, tmp_path):
+        import app as app_module
+
+        audit_file = tmp_path / "prompt-history.jsonl"
+        audit_file.write_text("".join(
+            json.dumps({
+                "id": f"p-{index}",
+                "ts": 10,
+                "user_id": "admin",
+                "username": "admin",
+                "session_name": "work",
+                "prompt": f"prompt {index}",
+            }) + "\n"
+            for index in range(4)
+        ))
+        with (
+            patch.object(app_module, "PROMPT_AUDIT_FILE", audit_file),
+            patch.object(app_module, "_load_users", return_value=[self._admin()]),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            first = admin_client.get("/api/admin/prompts", params={"limit": 2})
+            second = admin_client.get(
+                "/api/admin/prompts",
+                params={"limit": 2, "cursor": first.json()["next_cursor"]},
+            )
+
+        ids = [
+            item["id"]
+            for page in (first.json(), second.json())
+            for item in page["prompts"]
+        ]
+        assert ids == ["p-3", "p-2", "p-1", "p-0"]
+
+    def test_member_cannot_read_the_global_prompt_audit(self):
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with patch.object(app_module, "_load_users", return_value=users):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token("u_member"))
+            response = member_client.get("/api/admin/prompts")
+
+        assert response.status_code == 403
+
+    def test_user_usage_summary_totals_all_rollout_tokens(self, tmp_path):
+        import app as app_module
+
+        rollout_dir = tmp_path / "sessions" / "2026" / "07" / "27"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / "rollout-test.jsonl"
+        rollout.write_text(
+            "\n".join([
+                json.dumps({
+                    "timestamp": "2026-07-27T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"cwd": "/work/member"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-07-27T10:00:01Z",
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.4"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-07-27T10:01:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 20,
+                                "cached_input_tokens": 30,
+                                "reasoning_output_tokens": 40,
+                            },
+                        },
+                    },
+                }),
+            ]) + "\n"
+        )
+        member = self._member()
+        with patch.object(app_module, "_user_codex_config_dir", return_value=tmp_path):
+            usage = app_module._user_usage_summary(member, force=True)
+
+        assert (
+            usage["total_tokens"],
+            usage["input_tokens"],
+            usage["output_tokens"],
+            usage["turns"],
+            usage["last_active"],
+        ) == (100, 10, 20, 1, "2026-07-27T10:01:00Z")
+
+    def test_prompt_audit_backfills_existing_admin_and_member_history_once(self, tmp_path):
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        histories = {}
+        for user, timestamp in zip(users, (10, 20)):
+            path = tmp_path / f"{user['id']}-messages.json"
+            path.write_text(json.dumps({
+                f"{user['id']}-session": [
+                    {"role": "user", "text": f"{user['id']} old prompt", "ts": timestamp},
+                    {"role": "assistant", "text": "not a human prompt", "ts": timestamp + 1},
+                ],
+            }))
+            histories[user["id"]] = path
+
+        audit_file = tmp_path / "prompt-history.jsonl"
+        marker_file = tmp_path / "prompt-history-backfill-v1.json"
+        with (
+            patch.object(app_module, "PROMPT_AUDIT_FILE", audit_file),
+            patch.object(app_module, "PROMPT_AUDIT_BACKFILL_MARKER", marker_file, create=True),
+            patch.object(
+                app_module,
+                "_user_messages_file",
+                side_effect=lambda user: histories[user["id"]],
+            ),
+        ):
+            first = app_module._backfill_prompt_audit(users)
+            second = app_module._backfill_prompt_audit(users)
+
+        records = [json.loads(line) for line in audit_file.read_text().splitlines()]
+        assert (first, second, len(records)) == (2, 0, 2)
+        assert {(row["user_id"], row["ts"], row["source"]) for row in records} == {
+            ("admin", 10, "legacy_messages_backfill"),
+            ("u_member", 20, "legacy_messages_backfill"),
+        }
+        assert marker_file.stat().st_mode & 0o777 == 0o600
+
+    def test_admin_user_list_includes_presence_work_tokens_and_prompts(self):
+        import app as app_module
+
+        now = time.time()
+        users = [self._admin(), self._member()]
+        sessions = [
+            {"name": "admin-work", "windows": "1", "created": "1", "attached": False},
+            {"name": "member-work", "windows": "1", "created": "1", "attached": False},
+        ]
+        owners = {"admin-work": "admin", "member-work": "u_member"}
+
+        async def activity(session_name):
+            return {
+                "status": "busy" if session_name == "member-work" else "idle",
+                "command": "",
+                "detail": "",
+            }
+
+        def usage(user):
+            total = 500 if user["id"] == "u_member" else 100
+            return {
+                "total_tokens": total,
+                "tokens_7d": total,
+                "estimated_cost": total / 1000,
+                "estimated_cost_7d": total / 1000,
+                "turns": 2,
+                "last_active": "2026-07-27T10:00:00Z",
+            }
+
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "get_tmux_sessions", return_value=sessions),
+            patch.object(app_module, "_load_session_owners", return_value=owners),
+            patch.object(app_module, "async_detect_activity", side_effect=activity),
+            patch.object(app_module, "_user_usage_summary", side_effect=usage),
+            patch.object(
+                app_module,
+                "_prompt_audit_summary",
+                return_value={
+                    "admin": {"count": 1, "last_ts": now - 20},
+                    "u_member": {"count": 3, "last_ts": now - 10},
+                },
+                create=True,
+            ),
+            patch.object(
+                app_module,
+                "_user_presence",
+                {"admin": now - 5, "u_member": now - 5},
+                create=True,
+            ),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.get("/api/admin/users")
+
+        member = next(user for user in response.json()["users"] if user["id"] == "u_member")
+        assert (
+            member["online"],
+            member["working"],
+            member["busy_session_count"],
+            member["usage"]["total_tokens"],
+            member["prompt_count"],
+            response.json()["summary"]["working_count"],
+        ) == (True, True, 1, 500, 3, 1)
+
+    def test_impersonation_returns_new_window_ticket_without_swapping_cookie(self):
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with patch.object(app_module, "_load_users", return_value=users):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.post(
+                "/api/admin/users/u_member/impersonate",
+            )
+
+        assert response.status_code == 200
+        assert "impersonate_ticket=" in response.json()["url"]
+        assert AUTH_COOKIE not in response.cookies
+        assert "tmux_imp_orig" not in response.cookies
+
+    def test_impersonation_ticket_is_one_time_and_header_is_tab_scoped(self):
+        import urllib.parse
+
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "_impersonation_tickets", {}),
+            patch.object(app_module, "_impersonation_sessions", {}),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            issued = admin_client.post("/api/admin/users/u_member/impersonate")
+            ticket = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(issued.json()["url"]).query
+            )["impersonate_ticket"][0]
+
+            exchanged = admin_client.post(
+                "/api/admin/impersonation/exchange",
+                json={"ticket": ticket},
+            )
+            replay = admin_client.post(
+                "/api/admin/impersonation/exchange",
+                json={"ticket": ticket},
+            )
+            original_me = admin_client.get("/api/me")
+            member_me = admin_client.get(
+                "/api/me",
+                headers={"X-Tmux-Impersonate": exchanged.json()["token"]},
+            )
+
+        assert exchanged.status_code == 200
+        assert replay.status_code in (400, 410)
+        assert original_me.json()["id"] == "admin"
+        assert (
+            member_me.json()["id"],
+            member_me.json()["impersonating"],
+            member_me.json()["impersonator"],
+        ) == ("u_member", True, "admin")
+
+    def test_invalid_impersonation_header_cannot_fall_back_to_admin(self):
+        users = [self._admin(), self._member()]
+        with patch("app._load_users", return_value=users):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.get(
+                "/api/me",
+                headers={"X-Tmux-Impersonate": "expired-or-forged-token"},
+            )
+
+        assert response.status_code == 401
+
+    def test_return_to_admin_revokes_tab_impersonation_token(self):
+        import urllib.parse
+
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "_impersonation_tickets", {}),
+            patch.object(app_module, "_impersonation_sessions", {}),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            issued = admin_client.post("/api/admin/users/u_member/impersonate")
+            ticket = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(issued.json()["url"]).query
+            )["impersonate_ticket"][0]
+            token = admin_client.post(
+                "/api/admin/impersonation/exchange",
+                json={"ticket": ticket},
+            ).json()["token"]
+            ended = admin_client.post(
+                "/api/impersonation/end",
+                headers={"X-Tmux-Impersonate": token},
+            )
+            replay = admin_client.get(
+                "/api/me",
+                headers={"X-Tmux-Impersonate": token},
+            )
+
+        assert ended.status_code == 200
+        assert replay.status_code == 401
+
+    def test_impersonation_session_survives_dashboard_restart(self, tmp_path):
+        import urllib.parse
+
+        import app as app_module
+
+        users = [self._admin(), self._member()]
+        session_file = tmp_path / "impersonation-sessions.json"
+        with (
+            patch.object(app_module, "_load_users", return_value=users),
+            patch.object(app_module, "IMPERSONATION_SESSIONS_FILE", session_file, create=True),
+            patch.object(app_module, "_impersonation_tickets", {}),
+            patch.object(app_module, "_impersonation_sessions", {}),
+            patch.object(app_module, "_impersonation_sessions_loaded", False, create=True),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            issued = admin_client.post("/api/admin/users/u_member/impersonate")
+            ticket = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(issued.json()["url"]).query
+            )["impersonate_ticket"][0]
+            exchanged = admin_client.post(
+                "/api/admin/impersonation/exchange",
+                json={"ticket": ticket},
+            )
+            token = exchanged.json()["token"]
+
+            app_module._impersonation_sessions.clear()
+            app_module._impersonation_sessions_loaded = False
+            after_restart = admin_client.get(
+                "/api/me",
+                headers={"X-Tmux-Impersonate": token},
+            )
+
+        assert session_file.stat().st_mode & 0o777 == 0o600
+        assert (after_restart.status_code, after_restart.json()["id"]) == (
+            200,
+            "u_member",
+        )
+
+
 class TestSecurityHeaders:
     def test_security_headers_present(self, authed_client):
         resp = authed_client.get("/")
@@ -109,19 +1935,134 @@ class TestSecurityHeaders:
 class TestDashboardFrontendRegressions:
     def test_terminal_renderer_defines_update_filter_before_use(self, authed_client):
         html = authed_client.get("/").text
-        definition = html.index("function _isUpdateNoise(line)")
-        usage = html.index("if(hideBash&&_isUpdateNoise(line))continue")
+        definition = html.index("function _isNoise(line)")
+        usage = html.index("if(_isNoise(line))")
         assert definition < usage
 
     def test_context_files_live_only_inside_settings(self, authed_client):
         html = authed_client.get("/").text
         assert 'id="settings-overlay"' in html
         assert "function openSettings(tab)" in html
-        assert "{id:'context', label:'Context Files'}" in html
+        assert "{id:'mycontext', label:'Context Files'}" in html
+        assert "{id:'context', label:'System Context'}" in html
         assert 'id="claudemd-overlay"' not in html
         assert 'id="config-overlay"' not in html
         assert "getElementById('config-content')" not in html
         assert "Usage resets on a 5-hour rolling window" not in html
+
+    def test_frontend_never_requests_role_profiles(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert "fetch(BASE+'/api/profiles')" not in html
+
+    def test_dashboard_has_no_role_profile_ui(self, authed_client):
+        html = authed_client.get("/").text
+        forbidden = (
+            'class="profile-select"',
+            'id="profiles-overlay"',
+            "function renderProfileDropdown",
+            "function openProfiles",
+        )
+
+        assert [token for token in forbidden if token in html] == []
+
+    def test_skills_ui_is_global_not_profile_scoped(self, authed_client):
+        html = authed_client.get("/").text
+        profile_scoped_copy = (
+            "_profileForSession",
+            "loaded by Codex in this profile",
+            "toggle on/off for this profile",
+            "No skills installed for this profile",
+        )
+
+        assert [text for text in profile_scoped_copy if text in html] == []
+
+    def test_admin_users_screen_has_live_table_routing_and_tab_impersonation(self, authed_client):
+        html = authed_client.get("/").text
+
+        required = (
+            "openSettings('users')",
+            "#/settings/users",
+            "window.addEventListener('hashchange',handleAppRoute)",
+            "sessionStorage.getItem('tmuxImpersonationToken')",
+            "'X-Tmux-Impersonate'",
+            "window.open('about:blank'",
+            'id="users-summary"',
+            'id="users-status-chips"',
+            'id="users-top-scroll"',
+            'id="users-columns-menu"',
+            "user-col-resizer",
+            "Total tokens",
+            "Prompts",
+        )
+
+        assert [token for token in required if token not in html] == []
+        assert "window.location.href = BASE + '/';  // reload as the impersonated user" not in html
+
+    def test_context_screen_lists_all_member_files_and_explains_hidden_global_context(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert 'id="my-context-file-list"' in html
+        assert "Admin-managed global context is applied to every session but hidden here" in html
+        assert "global_context_hidden" in html
+        assert "read-only" in html
+
+    def test_member_shell_exposes_settings_browser_apis_and_status_reminder(self, authed_client):
+        html = authed_client.get("/").text
+
+        required = (
+            'id="nav-settings-btn"',
+            "{id:'apis',      label:'APIs'}",
+            "{id:'browser',   label:'Browser'}",
+            "loadApisMember()",
+            "fetch(BASE+'/api/my/apis')",
+            "fetch(BASE+'/api/my/browser')",
+            "if(!categories.includes(category)) categories.push(category);",
+            "consumeBrowserLoginReminder()",
+            "browser_login",
+            ".nav-browser-badge.working .nbb-dot",
+            "Browser connected and working",
+        )
+        assert [token for token in required if token not in html] == []
+        assert "if(isAdmin) startBrowserAuthPolling();" not in html
+        assert "el.style.display='none'; return;" not in html
+
+    def test_admin_browser_cards_identify_account_ownership(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert (
+            "s.owner_username||s.owner_id",
+            "s.managed&&!s.account_browser",
+            "Each account browser has its own persistent Chrome profile",
+        ) == tuple(
+            token
+            for token in (
+                "s.owner_username||s.owner_id",
+                "s.managed&&!s.account_browser",
+                "Each account browser has its own persistent Chrome profile",
+            )
+            if token in html
+        )
+
+    def test_fresh_account_browser_view_reloads_until_novnc_is_ready(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+
+        assert (
+            "scheduleMemberBrowserRefresh(data)",
+            "clearMemberBrowserRefresh()",
+            "_memberBrowserRefreshTimer=setTimeout",
+        ) == tuple(
+            token
+            for token in (
+                "scheduleMemberBrowserRefresh(data)",
+                "clearMemberBrowserRefresh()",
+                "_memberBrowserRefreshTimer=setTimeout",
+            )
+            if token in html
+        )
 
 
 # ─── Session List API Tests ───
@@ -298,6 +2239,145 @@ class TestSessionSpecificEndpoints:
 
 
 class TestSessionCreateDelete:
+    def test_create_session_contract_has_no_profile_selector(self):
+        import app as app_module
+
+        assert set(app_module.CreateSession.model_fields) == {"name"}
+
+    def test_legacy_profile_mapping_does_not_change_session_codex_home(self):
+        import app as app_module
+
+        legacy_roles = {
+            "profiles": [
+                {"id": "default"},
+                {"id": "ui-expert"},
+            ],
+            "session_profiles": {"test-session": "ui-expert"},
+        }
+        with (
+            patch.object(app_module, "_load_roles", return_value=legacy_roles),
+            patch.object(app_module, "_user_for_session", return_value=None),
+        ):
+            codex_home = app_module._session_config_base("test-session")
+
+        assert codex_home == app_module.CODEX_HOME
+
+    def test_legacy_profile_mapping_is_reported_as_default(self):
+        import app as app_module
+
+        legacy_roles = {
+            "profiles": [{"id": "default"}, {"id": "ui-expert"}],
+            "session_profiles": {"test-session": "ui-expert"},
+        }
+        with patch.object(app_module, "_load_roles", return_value=legacy_roles):
+            profile_id = app_module._get_session_profile_id("test-session")
+
+        assert profile_id == app_module.DEFAULT_PROFILE_ID
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_session_profile_switching_is_retired(self, mock_sessions, authed_client):
+        response = authed_client.post(
+            "/api/sessions/test-session/profile",
+            json={"profile_id": "ui-expert", "restart": False},
+        )
+
+        assert response.status_code == 410
+
+    def test_role_profiles_can_no_longer_be_created(self, authed_client):
+        import app as app_module
+
+        roles = {
+            "profiles": [app_module._default_profile_record()],
+            "session_profiles": {},
+        }
+        with (
+            patch.object(app_module, "_load_roles", return_value=roles),
+            patch.object(app_module, "_save_roles"),
+            patch.object(app_module, "_materialize_profile"),
+        ):
+            response = authed_client.post(
+                "/api/profiles",
+                json={"name": "Retired role profile"},
+            )
+
+        assert response.status_code == 410
+
+    def test_legacy_role_profiles_are_hidden_from_api(self, authed_client):
+        import app as app_module
+
+        legacy_roles = {
+            "profiles": [
+                app_module._default_profile_record(),
+                {"id": "ui-expert", "name": "UI Expert"},
+            ],
+            "session_profiles": {"test-session": "ui-expert"},
+        }
+        with patch.object(app_module, "_load_roles", return_value=legacy_roles):
+            response = authed_client.get("/api/profiles")
+
+        assert [profile["id"] for profile in response.json()["profiles"]] == ["default"]
+
+    def test_legacy_custom_profile_routes_are_retired(self, authed_client, tmp_path):
+        import app as app_module
+
+        legacy_roles = {
+            "profiles": [
+                app_module._default_profile_record(),
+                {"id": "ui-expert", "name": "UI Expert"},
+            ],
+            "session_profiles": {"test-session": "ui-expert"},
+        }
+        requests = (
+            ("GET", "/api/profiles/ui-expert", {}),
+            ("PUT", "/api/profiles/ui-expert", {"json": {}}),
+            ("GET", "/api/profiles/ui-expert/skills", {}),
+            ("GET", "/api/profiles/ui-expert/skills/library", {}),
+            ("POST", "/api/profiles/ui-expert/skills/library/example", {}),
+            ("DELETE", "/api/profiles/ui-expert/skills/library/example", {}),
+            ("POST", "/api/profiles/ui-expert/skills/example/promote", {}),
+            (
+                "POST",
+                "/api/profiles/ui-expert/skills",
+                {"json": {"name": "legacy.md", "content": "unused"}},
+            ),
+            ("DELETE", "/api/profiles/ui-expert/skills/legacy.md", {}),
+            ("GET", "/api/profiles/ui-expert/files", {}),
+            (
+                "PUT",
+                "/api/profiles/ui-expert/file",
+                {"json": {"path": "agents/test.md", "content": "unused"}},
+            ),
+            (
+                "GET",
+                "/api/profiles/ui-expert/file",
+                {"params": {"path": "agents/test.md"}},
+            ),
+            (
+                "DELETE",
+                "/api/profiles/ui-expert/file",
+                {"params": {"path": "agents/test.md"}},
+            ),
+            ("GET", "/api/profiles/ui-expert/credentials", {}),
+            ("DELETE", "/api/profiles/ui-expert/credentials", {}),
+            ("DELETE", "/api/profiles/ui-expert", {}),
+        )
+        with (
+            patch.object(app_module, "_load_roles", return_value=legacy_roles),
+            patch.object(app_module, "_save_roles"),
+            patch.object(app_module, "_materialize_profile"),
+            patch.object(
+                app_module,
+                "_profile_dir",
+                side_effect=lambda profile_id: tmp_path / f".codex-{profile_id}",
+            ),
+        ):
+            responses = [
+                authed_client.request(method, path, **kwargs)
+                for method, path, kwargs in requests
+            ]
+
+        assert [response.status_code for response in responses] == [410] * len(requests)
+
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_create_session_invalid_name(self, mock_sessions, authed_client):
         resp = authed_client.post(
@@ -317,6 +2397,29 @@ class TestSessionCreateDelete:
         )
         assert resp.status_code == 409
         assert "already exists" in resp.json()["error"]
+
+    @patch("app._ensure_codex_auth_with_fallback")
+    @patch("app._codex_cli_readiness", return_value=(True, "ready", {}))
+    @patch("app.get_tmux_sessions", return_value=[])
+    @patch("app.subprocess.run")
+    def test_create_session_explains_hidden_tmux_name_collision(
+        self, mock_run, mock_sessions, mock_readiness, mock_auth, authed_client
+    ):
+        def run_tmux(args, **kwargs):
+            if args[:2] == ["tmux", "list-sessions"]:
+                return MagicMock(returncode=0, stdout="hidden-test\n", stderr="")
+            return MagicMock(returncode=1, stdout="", stderr="duplicate session: hidden-test")
+
+        mock_run.side_effect = run_tmux
+        resp = authed_client.post(
+            "/api/sessions/create",
+            json={"name": "hidden-test"},
+        )
+
+        assert (resp.status_code, resp.json()["error"]) == (
+            409,
+            "A tmux session named 'hidden-test' already exists but is hidden from this Codex dashboard.",
+        )
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_create_session_injection_attempt(self, mock_sessions, authed_client):
@@ -697,6 +2800,200 @@ class TestContextFileRegistry:
 
 
 class TestBrowserExternalUrl:
+    def test_allocated_accounts_have_distinct_displays_ports_and_profiles(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        with (
+            patch.object(
+                app_module,
+                "BROWSER_SESSIONS_FILE",
+                tmp_path / "browser-sessions.json",
+            ),
+            patch.object(app_module, "CB_ROOT", tmp_path / "browsers"),
+        ):
+            first = app_module._ensure_user_browser_session(
+                {"id": "u_first", "username": "first"},
+                start=False,
+            )
+            second = app_module._ensure_user_browser_session(
+                {"id": "u_second", "username": "second"},
+                start=False,
+            )
+            first_profile = app_module._browser_profile_dir(first)
+            second_profile = app_module._browser_profile_dir(second)
+
+        assert (
+            first["id"] != second["id"],
+            first["display"] != second["display"],
+            first["vnc_port"] != second["vnc_port"],
+            first["cdp_port"] != second["cdp_port"],
+            first_profile != second_profile,
+        ) == (True, True, True, True, True)
+
+    def test_account_browser_reclaims_its_proxy_port_from_a_stale_user(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        proxy_conf = {
+            "sessions": {
+                "acct-deleted-user": {
+                    "local_port": 3129,
+                    "session_id": "old-sticky",
+                    "enabled": True,
+                },
+                "unrelated": {
+                    "local_port": 3199,
+                    "session_id": "keep-me",
+                    "enabled": True,
+                },
+            },
+        }
+        with (
+            patch.object(
+                app_module,
+                "BROWSER_SESSIONS_FILE",
+                tmp_path / "browser-sessions.json",
+            ),
+            patch.object(app_module, "CB_ROOT", tmp_path / "browsers"),
+            patch.object(
+                app_module,
+                "BROWSER_PROXY_CONF",
+                tmp_path / "proxy.json",
+            ),
+            patch.object(app_module, "_proxy_conf", return_value=proxy_conf),
+            patch.object(app_module, "_proxy_save") as save_proxy,
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+        ):
+            session = app_module._ensure_user_browser_session(
+                {"id": "u_replacement", "username": "replacement"},
+            )
+
+        saved_sessions = save_proxy.call_args.args[0]["sessions"]
+        assert (
+            saved_sessions.get(session["id"], {}).get("local_port"),
+            "acct-deleted-user" in saved_sessions,
+            saved_sessions.get("unrelated", {}).get("session_id"),
+        ) == (3129, False, "keep-me")
+
+    def test_deleting_account_browser_releases_its_proxy_identity(
+        self,
+        tmp_path,
+    ):
+        import app as app_module
+
+        account_browser = {
+            "id": "acct-member",
+            "owner_id": "u_member",
+            "account_browser": True,
+            "managed": True,
+        }
+        proxy_conf = {
+            "sessions": {
+                "acct-member": {
+                    "local_port": 3129,
+                    "session_id": "member-sticky",
+                },
+                "unrelated": {
+                    "local_port": 3130,
+                    "session_id": "keep-me",
+                },
+            },
+        }
+        with (
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=[
+                    dict(app_module._DEFAULT_BROWSER_SESSION),
+                    account_browser,
+                ],
+            ),
+            patch.object(app_module, "_save_browser_sessions"),
+            patch.object(app_module, "CB_ROOT", tmp_path / "browsers"),
+            patch.object(app_module.subprocess, "run"),
+            patch.object(app_module, "_proxy_conf", return_value=proxy_conf),
+            patch.object(app_module, "_proxy_save") as save_proxy,
+        ):
+            app_module._delete_user_browser_session("u_member")
+
+        saved_sessions = save_proxy.call_args.args[0]["sessions"]
+        assert (
+            "acct-member" in saved_sessions,
+            saved_sessions.get("unrelated", {}).get("session_id"),
+        ) == (False, "keep-me")
+
+    def test_account_browsers_do_not_consume_the_admin_extra_browser_cap(self):
+        import app as app_module
+
+        sessions = [dict(app_module._DEFAULT_BROWSER_SESSION)]
+        sessions.extend(
+            {
+                "id": f"acct-{index}",
+                "owner_id": f"u_{index}",
+                "account_browser": True,
+                "managed": True,
+                "slot": index,
+                "display": 99 + index,
+                "rfb_port": 5900 + index,
+                "vnc_port": 6080 + index,
+                "cdp_port": 9222 + index,
+            }
+            for index in range(1, app_module.BROWSER_MAX_EXTRA + 1)
+        )
+        with (
+            patch.object(app_module, "_load_browser_sessions", return_value=sessions),
+            patch.object(app_module, "_save_browser_sessions"),
+            patch.object(app_module, "_ensure_browser_launcher"),
+            patch.object(app_module.subprocess, "Popen"),
+            patch.object(app_module, "_browser_port_alive", return_value=True),
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.post(
+                "/api/browser/sessions",
+                json={"name": "Admin extra"},
+            )
+
+        assert response.status_code == 200
+
+    def test_other_accounts_browser_is_hidden_from_admin_delete(self):
+        import app as app_module
+
+        account_browser = {
+            "id": "acct-member",
+            "owner_id": "u_member",
+            "account_browser": True,
+            "managed": True,
+        }
+        with (
+            patch.object(
+                app_module,
+                "_load_browser_sessions",
+                return_value=[
+                    dict(app_module._DEFAULT_BROWSER_SESSION),
+                    account_browser,
+                ],
+            ),
+            patch.object(app_module, "_save_browser_sessions") as save_sessions,
+            patch.object(app_module.subprocess, "run") as stop_browser,
+        ):
+            admin_client = TestClient(app)
+            admin_client.cookies.set(AUTH_COOKIE, _make_token("admin"))
+            response = admin_client.delete(
+                "/api/browser/sessions/acct-member",
+            )
+
+        assert (
+            response.status_code,
+            save_sessions.call_count,
+            stop_browser.call_count,
+        ) == (404, 0, 0)
+
     def test_direct_url_uses_this_dashboard_host_and_root_path(self):
         import app as app_module
 
@@ -716,6 +3013,36 @@ class TestBrowserExternalUrl:
         with patch.object(app_module, "PUBLIC_BASE_URL", ""):
             row = app_module._browser_response_row({"id": "default"})
         assert "external_url" not in row
+
+    def test_browser_profile_signin_reads_chrome_account_without_tokens(self, tmp_path):
+        import app as app_module
+
+        profile = tmp_path / "profile"
+        chrome_profile = profile / "Profile 7"
+        chrome_profile.mkdir(parents=True)
+        (profile / "Local State").write_text(json.dumps({
+            "profile": {
+                "last_used": "Profile 7",
+                "info_cache": {
+                    "Profile 7": {
+                        "user_name": "person@example.com",
+                        "gaia_id": "gaia-123",
+                    },
+                },
+            },
+        }))
+        (chrome_profile / "Preferences").write_text(json.dumps({
+            "account_info": [{
+                "email": "person@example.com",
+                "gaia": "gaia-123",
+                "refresh_token": "must-never-be-returned",
+            }],
+        }))
+
+        with patch.object(app_module, "CB_ROOT", tmp_path):
+            state = app_module._browser_signin_state({"id": "default"})
+
+        assert state == {"signed_in": True, "email": "person@example.com"}
 
 
 # ─── Auth Mode Endpoint ───
@@ -1370,43 +3697,6 @@ class TestFullSessionsList:
         assert resp.json() == []
 
 
-# ─── Away Mode Status Endpoint ───
-
-
-class TestAwayModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
-        resp = authed_client.get("/api/sessions/no-such-session/away-mode")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
-        assert "phase" in data
-        assert "log" in data
-
-    def test_returns_disabled_for_known_session_not_running(self, authed_client):
-        import app
-        app._away_mode_state.pop("test-clean-session", None)
-        resp = authed_client.get("/api/sessions/test-clean-session/away-mode")
-        assert resp.status_code == 200
-        assert resp.json()["enabled"] is False
-
-
-# ─── Go Nuts Mode Status Endpoint ───
-
-
-class TestGoNutsModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
-        resp = authed_client.get("/api/sessions/no-such-session/go-nuts-mode")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
-
-    def test_status_schema_has_required_fields(self, authed_client):
-        resp = authed_client.get("/api/sessions/any-session/go-nuts-mode")
-        data = resp.json()
-        for field in ("enabled", "phase", "log"):
-            assert field in data, f"Missing field: {field}"
-
-
 # ─── API Key Error Response Schema ───
 
 
@@ -1602,50 +3892,6 @@ class TestParseUsageFile:
         assert result == (100, 50, 20, 10, 1)
 
 
-# ─── Away Mode Toggle (404 path) ───
-
-
-class TestAwayModeToggle:
-    def test_toggle_missing_session_returns_404(self, authed_client):
-        """POST away-mode toggle with unknown session must return 404."""
-        resp = authed_client.post(
-            "/api/sessions/does-not-exist/away-mode",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 404
-        assert "error" in resp.json()
-
-    def test_disable_missing_session_returns_404(self, authed_client):
-        """Disabling away-mode on unknown session must return 404."""
-        resp = authed_client.post(
-            "/api/sessions/does-not-exist/away-mode",
-            json={"enabled": False},
-        )
-        assert resp.status_code == 404
-
-
-# ─── Go Nuts Mode Toggle (404 path) ───
-
-
-class TestGoNutsModeToggle:
-    def test_toggle_missing_session_returns_404(self, authed_client):
-        """POST go-nuts-mode toggle with unknown session must return 404."""
-        resp = authed_client.post(
-            "/api/sessions/does-not-exist/go-nuts-mode",
-            json={"enabled": True},
-        )
-        assert resp.status_code == 404
-        assert "error" in resp.json()
-
-    def test_disable_missing_session_returns_404(self, authed_client):
-        """Disabling go-nuts-mode on unknown session must return 404."""
-        resp = authed_client.post(
-            "/api/sessions/does-not-exist/go-nuts-mode",
-            json={"enabled": False},
-        )
-        assert resp.status_code == 404
-
-
 # ─── Create Session Tests ───
 
 
@@ -1832,22 +4078,6 @@ class TestDeleteSession:
         assert any("pkill" in c for c in calls_str)
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    def test_delete_session_cancels_active_go_nuts_task(self, mock_run, mock_sessions, authed_client):
-        """Delete should cancel any active go-nuts task for the session."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        import app
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        app._go_nuts_state["test-session"] = {"enabled": True, "task": mock_task}
-        try:
-            resp = authed_client.delete("/api/sessions/test-session")
-            assert resp.status_code == 200
-            mock_task.cancel.assert_called_once()
-        finally:
-            app._go_nuts_state.pop("test-session", None)
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run", side_effect=Exception("tmux daemon gone"))
     def test_delete_session_outer_exception_returns_500(self, mock_run, mock_sessions, authed_client):
         """An unexpected outer exception should return 500."""
@@ -1895,6 +4125,82 @@ class TestSendCommandEndpoint:
         assert data["sent"] == "echo hello"
         mock_sleep.assert_awaited_once_with(0.25)
         assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    @patch("app.subprocess.run")
+    def test_send_saves_admin_prompt_to_append_only_audit(
+        self,
+        mock_run,
+        mock_sessions,
+        authed_client,
+        tmp_path,
+    ):
+        import app as app_module
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        audit_file = tmp_path / "prompt-history.jsonl"
+        with (
+            patch.object(
+                app_module,
+                "PROMPT_AUDIT_FILE",
+                audit_file,
+                create=True,
+            ),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            response = authed_client.post(
+                "/api/sessions/test-session/send",
+                json={"command": "audit this admin prompt"},
+            )
+
+        records = [json.loads(line) for line in audit_file.read_text().splitlines()]
+        assert (
+            response.status_code,
+            records[0]["user_id"],
+            records[0]["session_name"],
+            records[0]["prompt"],
+        ) == (
+            200,
+            "admin",
+            "test-session",
+            "audit this admin prompt",
+        )
+
+    @patch("app.subprocess.run")
+    def test_send_saves_member_prompt_under_the_member_account(
+        self,
+        mock_run,
+        tmp_path,
+    ):
+        import app as app_module
+
+        admin = {"id": "admin", "username": "admin", "role": "admin"}
+        member = {"id": "u_member", "username": "member@example.com", "role": "user"}
+        sessions = [{"name": "member-work", "windows": "1", "created": "1", "attached": False}]
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        audit_file = tmp_path / "prompt-history.jsonl"
+        with (
+            patch.object(app_module, "_load_users", return_value=[admin, member]),
+            patch.object(app_module, "PROMPT_AUDIT_FILE", audit_file),
+            patch.object(app_module, "get_tmux_sessions", return_value=sessions),
+            patch.object(app_module, "_load_session_owners", return_value={"member-work": "u_member"}),
+            patch.object(app_module, "_save_messages"),
+            patch.object(app_module, "_is_codex_running", return_value=True),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            member_client = TestClient(app)
+            member_client.cookies.set(AUTH_COOKIE, _make_token("u_member"))
+            response = member_client.post(
+                "/api/sessions/member-work/send",
+                json={"command": "member-owned prompt"},
+            )
+
+        record = json.loads(audit_file.read_text().splitlines()[0])
+        assert (response.status_code, record["user_id"], record["prompt"]) == (
+            200,
+            "u_member",
+            "member-owned prompt",
+        )
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -1973,14 +4279,14 @@ class TestSetAuthModeEndpoint:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
-    def test_valid_mode_is_managed_per_profile_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
+    def test_valid_mode_is_managed_globally_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
         """The retired pane toggle cannot place credentials in terminal history."""
         resp = authed_client.post(
             "/api/sessions/test-session/set-auth-mode",
             json={"mode": "api"},
         )
         assert resp.status_code == 409
-        assert "per profile" in resp.json()["error"].lower()
+        assert "configured globally" in resp.json()["error"].lower()
         mock_run.assert_not_called()
 
 
@@ -2603,72 +4909,6 @@ class TestOpenAIKeyFunctions:
 # _save_autonomous_state / _load_autonomous_state (lines 128-150)
 # ---------------------------------------------------------------------------
 
-class TestAutonomousStatePersistence:
-    """Unit tests for _save_autonomous_state() and _load_autonomous_state()."""
-
-    def test_save_and_load_roundtrip(self, tmp_path):
-        import app as _app
-        state_file = tmp_path / "autonomous-modes.json"
-        orig_away = dict(_app._away_mode_state)
-        orig_nuts = dict(_app._go_nuts_state)
-
-        _app._away_mode_state["my-session"] = {"enabled": True}
-        _app._go_nuts_state["my-session"] = {"enabled": False}  # not enabled, should not be saved
-
-        try:
-            with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
-                 patch("app.MESSAGES_DIR", tmp_path):
-                _app._save_autonomous_state()
-                loaded = _app._load_autonomous_state()
-        finally:
-            _app._away_mode_state.clear()
-            _app._away_mode_state.update(orig_away)
-            _app._go_nuts_state.clear()
-            _app._go_nuts_state.update(orig_nuts)
-
-        assert loaded.get("my-session", {}).get("away_mode") is True
-        assert "go_nuts_mode" not in loaded.get("my-session", {})
-
-    def test_load_returns_empty_when_file_missing(self, tmp_path):
-        import app as _app
-        state_file = tmp_path / "autonomous-modes.json"
-        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file):
-            result = _app._load_autonomous_state()
-        assert result == {}
-
-    def test_load_handles_corrupt_json(self, tmp_path):
-        import app as _app
-        state_file = tmp_path / "autonomous-modes.json"
-        state_file.write_text("{invalid json}")
-        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file):
-            result = _app._load_autonomous_state()
-        assert result == {}
-
-    def test_save_handles_write_exception(self, tmp_path):
-        import app as _app
-        state_file = tmp_path / "autonomous-modes.json"
-        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
-             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
-            _app._save_autonomous_state()  # should not raise
-
-    def test_save_includes_go_nuts_when_enabled(self, tmp_path):
-        """Cover line 138: go_nuts_state with enabled=True is persisted."""
-        import app as _app
-        state_file = tmp_path / "autonomous-modes.json"
-        orig_nuts = dict(_app._go_nuts_state)
-
-        _app._go_nuts_state["nuts-session"] = {"enabled": True}
-
-        try:
-            with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
-                 patch("app.MESSAGES_DIR", tmp_path):
-                _app._save_autonomous_state()
-                loaded = _app._load_autonomous_state()
-        finally:
-            _app._go_nuts_state.clear()
-            _app._go_nuts_state.update(orig_nuts)
-
-        assert loaded.get("nuts-session", {}).get("go_nuts_mode") is True
 
 
 # ---------------------------------------------------------------------------
@@ -2980,37 +5220,6 @@ class TestAuthMiddlewareNoPassword:
 
 
 # ---------------------------------------------------------------------------
-# _go_nuts_log() — direct unit test (covers lines 3692-3695)
-# ---------------------------------------------------------------------------
-
-class TestGoNutsLog:
-    """Unit tests for _go_nuts_log() helper."""
-
-    def test_appends_entry_to_state_log(self):
-        import app as _app
-
-        state = {"phase": 2, "step": 3}
-        _app._go_nuts_log(state, "test action")
-
-        assert "log" in state
-        assert len(state["log"]) == 1
-        entry = state["log"][0]
-        assert entry["action"] == "test action"
-        assert entry["phase"] == 2
-        assert entry["step"] == 3
-        assert "ts" in entry
-
-    def test_trims_log_to_log_cap(self):
-        import app as _app
-
-        state = {"phase": 0, "step": 0, "log": [{"ts": 0, "phase": 0, "step": 0, "action": f"old-{i}"} for i in range(_app._GO_NUTS_LOG_CAP)]}
-        _app._go_nuts_log(state, "new action")
-
-        assert len(state["log"]) == _app._GO_NUTS_LOG_CAP
-        assert state["log"][-1]["action"] == "new action"
-
-
-# ---------------------------------------------------------------------------
 # _async_is_codex_running() — async unit test
 # ---------------------------------------------------------------------------
 
@@ -3069,6 +5278,40 @@ class TestEnsureCodexRunning:
         assert any("restarted" in e for e in log_entries)  # covers line 210
 
     @pytest.mark.asyncio
+    async def test_recovery_reapplies_the_session_codex_home_before_launch(self):
+        """Crash recovery must not inherit an admin CODEX_HOME in member panes."""
+        import app as _app
+
+        is_running_values = [False, True]
+
+        async def fake_is_running(session_name):
+            return is_running_values.pop(0)
+
+        with (
+            patch(
+                "app._async_is_codex_running",
+                side_effect=fake_is_running,
+            ),
+            patch(
+                "app.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as to_thread,
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await _app._ensure_codex_running("member-session")
+
+        export_calls = [
+            call
+            for call in to_thread.await_args_list
+            if call.args and call.args[0] is _app._send_profile_export
+        ]
+        assert result is True
+        assert export_calls[0].args[1:] == (
+            "member-session",
+            _app.DEFAULT_PROFILE_ID,
+        )
+
+    @pytest.mark.asyncio
     async def test_returns_false_after_timeout(self):
         """Lines 215-218: not running → sends restart command → never restarts."""
         import app as _app
@@ -3111,1031 +5354,81 @@ class TestEnsureCodexRunning:
         assert any("not running" in entry for entry in log_entries)
 
 
-# ─── Away Mode Toggle (enable/disable paths) ───
+class TestHostBrowserIsolation:
+    def test_proxy_relay_classifies_local_addresses_as_blocked(self):
+        import importlib.util
+        from pathlib import Path
 
+        relay_path = (
+            Path.home() / ".claude-browser" / "bin" / "proxy_relay.py"
+        )
+        if not relay_path.exists():
+            pytest.skip("host browser relay is not installed")
+        spec = importlib.util.spec_from_file_location(
+            "host_proxy_relay",
+            relay_path,
+        )
+        relay = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(relay)
 
-class TestAwayModeToggleEnable:
-    """Cover lines 3617-3649: api_away_mode_toggle enable/disable with valid session."""
+        assert (
+            relay._address_is_public("127.0.0.1"),
+            relay._address_is_public("169.254.169.254"),
+            relay._address_is_public("10.0.0.1"),
+            relay._address_is_public("::1"),
+            relay._address_is_public("8.8.8.8"),
+        ) == (False, False, False, False, True)
+        auth_failure = relay._upstream_failure_response(
+            b"HTTP/1.1 407 Proxy Authentication Required"
+        )
+        assert auth_failure.startswith(b"HTTP/1.1 502 ")
+        assert b"407" not in auth_failure
 
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_enable_fresh_creates_task_and_returns_summary(
-        self, mock_save, mock_sessions, authed_client
+    def test_member_chrome_routes_loopback_through_the_guarded_relay(
+        self,
+        tmp_path,
     ):
-        """Lines 3622-3639: enabling away mode on a session initialises state and creates task."""
-        import app as _app
-
-        _app._away_mode_state.pop("test-session", None)
-
-        async def instant_worker(session_name):
-            pass  # Completes immediately, no leaked coroutine
-
-        try:
-            with patch("app._away_mode_worker", instant_worker):
-                resp = authed_client.post(
-                    "/api/sessions/test-session/away-mode", json={"enabled": True}
-                )
-        finally:
-            _app._away_mode_state.pop("test-session", None)
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is True
-        mock_save.assert_called()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_enable_when_already_running_returns_current_state(
-        self, mock_save, mock_sessions, authed_client
-    ):
-        """Line 3619-3620: if away mode is already enabled, returns existing state immediately."""
-        import app as _app
-
-        _app._away_mode_state["test-session"] = {
-            "enabled": True,
-            "phase": 2,
-            "phase_name": "Running",
-            "step": 3,
-            "step_name": "work",
-            "started_at": 0.0,
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        try:
-            resp = authed_client.post(
-                "/api/sessions/test-session/away-mode", json={"enabled": True}
-            )
-        finally:
-            _app._away_mode_state.pop("test-session", None)
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is True
-        # _save_autonomous_state should NOT be called (early return before it)
-        mock_save.assert_not_called()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_disable_cancels_running_task(
-        self, mock_save, mock_sessions, authed_client
-    ):
-        """Lines 3640-3649: disable cancels the active task and returns disabled state."""
-        import app as _app
-
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        _app._away_mode_state["test-session"] = {
-            "enabled": True,
-            "phase": 1,
-            "phase_name": "Running",
-            "step": 1,
-            "step_name": "",
-            "started_at": 0.0,
-            "log": [],
-            "report": "",
-            "task": mock_task,
-        }
-        try:
-            resp = authed_client.post(
-                "/api/sessions/test-session/away-mode", json={"enabled": False}
-            )
-        finally:
-            _app._away_mode_state.pop("test-session", None)
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
-        mock_task.cancel.assert_called_once()
-        mock_save.assert_called()
-
-
-# ─── Go Nuts Mode Toggle (enable/disable paths) ───
-
-
-class TestGoNutsModeToggleEnable:
-    """Cover lines 3966-3999: api_go_nuts_mode_toggle enable/disable with valid session."""
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_enable_fresh_creates_task(
-        self, mock_save, mock_sessions, authed_client
-    ):
-        """Lines 3974-3990: enabling go-nuts mode on a clean session creates task."""
-        import app as _app
-
-        _app._away_mode_state.pop("test-session", None)
-        _app._go_nuts_state.pop("test-session", None)
-
-        async def instant_worker(session_name):
-            pass  # Completes immediately, no leaked coroutine
-
-        try:
-            with patch("app._go_nuts_mode_worker", instant_worker):
-                resp = authed_client.post(
-                    "/api/sessions/test-session/go-nuts-mode", json={"enabled": True}
-                )
-        finally:
-            _app._go_nuts_state.pop("test-session", None)
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is True
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_enable_conflicts_with_away_mode_returns_409(
-        self, mock_sessions, authed_client
-    ):
-        """Line 3968-3969: enabling go-nuts when away mode is active returns 409."""
-        import app as _app
-
-        _app._away_mode_state["test-session"] = {
-            "enabled": True, "phase": 1, "phase_name": "Running",
-            "step": 1, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        try:
-            resp = authed_client.post(
-                "/api/sessions/test-session/go-nuts-mode", json={"enabled": True}
-            )
-        finally:
-            _app._away_mode_state.pop("test-session", None)
-        assert resp.status_code == 409
-        assert "error" in resp.json()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_enable_when_already_running_returns_current_state(
-        self, mock_save, mock_sessions, authed_client
-    ):
-        """Line 3971-3972: if go-nuts already enabled, returns existing state."""
-        import app as _app
-
-        _app._go_nuts_state["test-session"] = {
-            "enabled": True, "phase": 3, "phase_name": "Building",
-            "step": 5, "step_name": "features", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        try:
-            resp = authed_client.post(
-                "/api/sessions/test-session/go-nuts-mode", json={"enabled": True}
-            )
-        finally:
-            _app._go_nuts_state.pop("test-session", None)
-        assert resp.status_code == 200
-        assert resp.json()["enabled"] is True
-        mock_save.assert_not_called()
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app._save_autonomous_state")
-    def test_disable_cancels_running_task(
-        self, mock_save, mock_sessions, authed_client
-    ):
-        """Lines 3991-3999: disable cancels the task and returns disabled state."""
-        import app as _app
-
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        _app._go_nuts_state["test-session"] = {
-            "enabled": True, "phase": 2, "phase_name": "Running",
-            "step": 1, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": mock_task,
-        }
-        try:
-            resp = authed_client.post(
-                "/api/sessions/test-session/go-nuts-mode", json={"enabled": False}
-            )
-        finally:
-            _app._go_nuts_state.pop("test-session", None)
-        assert resp.status_code == 200
-        assert resp.json()["enabled"] is False
-        mock_task.cancel.assert_called_once()
-
-
-# ─── Away Phase Functions ───
-
-
-class TestAwayPhaseFunctions:
-    """Cover lines 3407-3443: _away_phase_study, _away_phase_select, _away_phase_execute."""
-
-    @pytest.mark.asyncio
-    async def test_phase_study_sets_state_and_sends(self):
-        """Lines 3407-3412: _away_phase_study sets phase/step and calls _away_send_and_wait."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        state = {"enabled": True, "phase": 0, "step": 0, "log": []}
-        with patch("app._away_send_and_wait", capture):
-            await _app._away_phase_study("my-session", state)
-        assert state["phase"] == 1
-        assert state["step"] == 1
-        assert len(calls) == 1
-        assert calls[0][0] == "my-session"
-
-    @pytest.mark.asyncio
-    async def test_phase_select_sets_state_and_sends(self):
-        """Lines 3417-3422: _away_phase_select sets phase/step and calls _away_send_and_wait."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        state = {"enabled": True, "phase": 1, "step": 0, "log": []}
-        with patch("app._away_send_and_wait", capture):
-            await _app._away_phase_select("my-session", state)
-        assert state["phase"] == 2
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_phase_execute_iterates_rounds(self):
-        """Lines 3427-3443: _away_phase_execute runs 3 rounds and sleeps between them."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        async def noop_sleep(_secs):
-            pass
-
-        state = {"enabled": True, "phase": 2, "step": 0, "log": []}
-        with patch("app._away_send_and_wait", capture), \
-             patch("app.asyncio.sleep", noop_sleep):
-            await _app._away_phase_execute("my-session", state)
-        assert state["phase"] == 3
-        assert len(calls) == 3  # One call per round
-
-    @pytest.mark.asyncio
-    async def test_phase_execute_stops_when_disabled(self):
-        """Line 3438-3439: _away_phase_execute exits early if state disabled mid-loop."""
-        import app as _app
-
-        call_count = 0
-
-        # Use a plain async def (not a Mock) to avoid AsyncMock internal coroutine leaks
-        async def fake_send(session_name, prompt, state, step_name, timeout=900):
-            nonlocal call_count
-            call_count += 1
-            state["enabled"] = False  # Disable after first round
-
-        async def noop_sleep(_secs):
-            pass
-
-        state = {"enabled": True, "phase": 2, "step": 0, "log": []}
-        with patch("app._away_send_and_wait", fake_send), \
-             patch("app.asyncio.sleep", noop_sleep):
-            await _app._away_phase_execute("my-session", state)
-        assert call_count == 1  # Stopped after first round
-
-
-# ─── Go Nuts Phase Functions ───
-
-
-class TestGoNutsPhaseFunctions:
-    """Cover lines 3817-3841: _go_nuts_phase_discover, _go_nuts_phase_backlog, _go_nuts_phase_build."""
-
-    @pytest.mark.asyncio
-    async def test_phase_discover_sets_state_and_sends(self):
-        """Lines 3817-3822: _go_nuts_phase_discover sets phase/step and calls send."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        state = {"enabled": True, "phase": 0, "step": 0, "log": []}
-        with patch("app._go_nuts_send_and_wait", capture):
-            await _app._go_nuts_phase_discover("gn-session", state)
-        assert state["phase"] == 1
-        assert state["step"] == 1
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_phase_backlog_sets_phase_2(self):
-        """Lines 3827-3832: _go_nuts_phase_backlog sets phase 2."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        state = {"enabled": True, "phase": 1, "step": 0, "log": []}
-        with patch("app._go_nuts_send_and_wait", capture):
-            await _app._go_nuts_phase_backlog("gn-session", state)
-        assert state["phase"] == 2
-        assert len(calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_phase_build_sets_phase_3(self):
-        """Lines 3837-3842: _go_nuts_phase_build sets phase 3."""
-        import app as _app
-
-        calls = []
-
-        async def capture(*args, **kwargs):
-            calls.append(args)
-
-        state = {"enabled": True, "phase": 2, "step": 0, "log": []}
-        with patch("app._go_nuts_send_and_wait", capture):
-            await _app._go_nuts_phase_build("gn-session", state)
-        assert state["phase"] == 3
-        assert len(calls) == 1
-
-
-# ─── _away_wait_for_idle ───
-
-
-class TestAwayWaitForIdle:
-    """Cover lines 3206-3234: _away_wait_for_idle."""
-
-    def _make_time_mock(self, values, default=None):
-        """Return a callable that yields from values then repeats the last value."""
-        import itertools
-        if default is None:
-            default = values[-1]
-        seq = iter(itertools.chain(values, itertools.repeat(default)))
-        return lambda: next(seq)
-
-    @pytest.mark.asyncio
-    async def test_becomes_busy_then_idle_returns_true(self):
-        """Normal path: session becomes busy then returns to idle."""
-        import app as _app
-
-        # time.time() calls: start=0, phA-cond1=0 (enter), phB-cond1=1, phB-cond2=2
-        activity_vals = [
-            {"status": "busy"},   # Phase A: session is busy → break
-            {"status": "idle"},   # Phase B: idle count 1
-            {"status": "idle"},   # Phase B: idle count 2 → return True
-        ]
-        act_idx = [0]
-
-        async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]
-            act_idx[0] += 1
-            return v
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.time.time", side_effect=self._make_time_mock([0, 0, 1, 2])), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity):
-            result = await _app._away_wait_for_idle("sess")
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_never_becomes_busy_but_idles_returns_true(self):
-        """Session never becomes busy (Phase A times out), but Phase B detects idle."""
-        import app as _app
-
-        # time: start=0, phA-cond=0 (enter), phA-cond=31 (exit), phB-cond=32 (enter), phB-cond=33 (enter)
-        activity_vals = [
-            {"status": "idle"},  # Phase A: never busy
-            {"status": "idle"},  # Phase B: idle count 1
-            {"status": "idle"},  # Phase B: idle count 2 → return True
-        ]
-        act_idx = [0]
-
-        async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]
-            act_idx[0] += 1
-            return v
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.time.time", side_effect=self._make_time_mock([0, 0, 31, 32, 33])), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity):
-            result = await _app._away_wait_for_idle("sess")
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_phase_b_resets_idle_count_and_times_out(self):
-        """Phase B resets idle_count when session is non-idle and eventually returns False."""
-        import app as _app
-
-        # time: start=0, phA-cond1=0, phA-cond2=31, phB×4 within timeout, then exceed timeout
-        activity_vals = [
-            {"status": "idle"},   # Phase A: not busy
-            {"status": "idle"},   # Phase B: idle count 1
-            {"status": "busy"},   # Phase B: reset → idle_count=0
-            {"status": "idle"},   # Phase B: idle count 1 again
-            # loop exits via timeout after this
-        ]
-        act_idx = [0]
-
-        async def mock_activity(session_name):
-            v = activity_vals[act_idx[0]]
-            act_idx[0] += 1
-            return v
-
-        async def noop_sleep(_secs):
-            pass
-
-        # Enough time values: start, phA×2, phB×4, then high value to exit phB
-        with patch("app.time.time", side_effect=self._make_time_mock(
-                [0, 0, 31, 32, 33, 34, 35, 950], default=950)), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity):
-            result = await _app._away_wait_for_idle("sess", timeout=900)
-        assert result is False  # Timed out before reaching idle_count=2
-
-
-# ─── _restore_autonomous_mode ───
-
-
-class TestRestoreAutonomousMode:
-    """Cover lines 2664-2723: _restore_autonomous_mode."""
-
-    @pytest.mark.asyncio
-    async def test_restore_away_mode_success(self):
-        """Normal restore: session exists, idle, sends prompt, enters continuous loop."""
-        import app as _app
-
-        loop_called = []
-
-        async def noop_sleep(_secs):
-            pass
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def mock_ensure_codex(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_send_prompt(session_name, prompt):
-            pass
-
-        async def mock_continuous_loop(session_name):
-            loop_called.append(session_name)
-
-        state = {"enabled": True, "phase": 4, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_codex_running", mock_ensure_codex), \
-             patch("app._away_send_prompt", mock_send_prompt), \
-             patch("app._away_mode_continuous_loop", mock_continuous_loop):
-            await _app._restore_autonomous_mode("my-sess", state, "away")
-        assert loop_called == ["my-sess"]
-        assert state["task"] is None  # Cleared in finally
-
-    @pytest.mark.asyncio
-    async def test_restore_disabled_before_send_stops_early(self):
-        """If state disabled during restore sleep, exits without sending prompt."""
-        import app as _app
-
-        loop_called = []
-
-        async def disabling_sleep(_secs):
-            state["enabled"] = False  # Disable during the initial 15s sleep
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def mock_continuous_loop(session_name):
-            loop_called.append(session_name)
-
-        state = {"enabled": True, "phase": 0, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", disabling_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app._away_mode_continuous_loop", mock_continuous_loop):
-            await _app._restore_autonomous_mode("my-sess", state, "away")
-        assert loop_called == []  # Should not have entered loop
-
-    @pytest.mark.asyncio
-    async def test_restore_session_not_found_stops(self):
-        """If async_detect_activity raises (session gone), restore stops."""
-        import app as _app
-
-        async def noop_sleep(_secs):
-            pass
-
-        async def failing_activity(session_name):
-            raise RuntimeError("session not found")
-
-        state = {"enabled": True, "phase": 0, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", failing_activity), \
-             patch("app._save_autonomous_state"):
-            await _app._restore_autonomous_mode("my-sess", state, "away")
-        assert state["enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_restore_go_nuts_mode_uses_gonuts_loop(self):
-        """Restore for go-nuts mode enters _go_nuts_continuous_loop."""
-        import app as _app
-
-        loop_called = []
-
-        async def noop_sleep(_secs):
-            pass
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def mock_ensure_codex(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_send_prompt(session_name, prompt):
-            pass
-
-        async def mock_gonuts_loop(session_name):
-            loop_called.append(("gonuts", session_name))
-
-        state = {"enabled": True, "phase": 2, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_codex_running", mock_ensure_codex), \
-             patch("app._away_send_prompt", mock_send_prompt), \
-             patch("app._go_nuts_continuous_loop", mock_gonuts_loop):
-            await _app._restore_autonomous_mode("my-sess", state, "gonuts")
-        assert loop_called == [("gonuts", "my-sess")]
+        import subprocess
+        from pathlib import Path
+
+        common = (
+            Path.home() / ".claude-browser" / "bin" / "chrome-common.sh"
+        )
+        if not common.exists():
+            pytest.skip("host browser launcher is not installed")
+        root = tmp_path / ".claude-browser"
+        root.mkdir()
+        (root / "proxy.json").write_text(
+            json.dumps({
+                "sessions": {
+                    "acct-test": {
+                        "local_port": 3129,
+                        "enabled": True,
+                    },
+                },
+            })
+        )
+        command = (
+            f"source {common}; "
+            "cb_chrome_flags /tmp/member-profile 9223 acct-test"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            env={
+                "PATH": os.environ["PATH"],
+                "CB_HOME": str(tmp_path),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+
+        assert "--proxy-bypass-list=<-loopback>" in result.stdout.splitlines()
 
 
 # ─── _watchdog_loop (no-active-sessions path) ───
-
-
-class TestWatchdogLoop:
-    """Cover lines 2728-2770: _watchdog_loop no-active-sessions and zombie detection."""
-
-    @pytest.mark.asyncio
-    async def test_no_active_sessions_clears_snapshots(self):
-        """Lines 2742-2745: when no active sessions, snapshots are cleared then loop runs once."""
-        import asyncio as _asyncio
-
-        import app as _app
-
-        sleep_count = 0
-
-        async def counting_sleep(secs):
-            nonlocal sleep_count
-            sleep_count += 1
-            if sleep_count >= 2:
-                raise _asyncio.CancelledError()
-
-        _app._watchdog_snapshots["stale"] = {"content_hash": "abc", "first_seen": 0}
-
-        try:
-            with patch("app.asyncio.sleep", counting_sleep):
-                try:
-                    await _app._watchdog_loop()
-                except _asyncio.CancelledError:
-                    pass
-        finally:
-            _app._watchdog_snapshots.pop("stale", None)
-
-        # Snapshots cleared when no active sessions
-        assert "stale" not in _app._watchdog_snapshots
-
-    @pytest.mark.asyncio
-    async def test_zombie_away_mode_detected_and_restarted(self):
-        """Lines 2756-2759: zombie away mode (enabled but task done) triggers restart.
-
-        Zombie detection only runs when active_sessions is non-empty (the watchdog
-        'continue' skips it when there are zero live sessions), so we need both a
-        live session and a zombie session.
-        """
-        import asyncio as _asyncio
-
-        import app as _app
-
-        sleep_count = 0
-        restart_calls = []
-
-        async def counting_sleep(secs):
-            nonlocal sleep_count
-            sleep_count += 1
-            if sleep_count >= 2:
-                raise _asyncio.CancelledError()
-
-        async def mock_restart(name, state, mode, wlog):
-            restart_calls.append((name, mode))
-
-        async def mock_check_session(session_name, state, mode, wlog):
-            pass  # No-op: don't try to capture terminal content
-
-        live_task = MagicMock()
-        live_task.done.return_value = False  # Active session
-        dead_task = MagicMock()
-        dead_task.done.return_value = True   # Zombie session (task finished)
-
-        live_state = {"enabled": True, "phase": 1, "step": 0, "log": [], "task": live_task}
-        zombie_state = {"enabled": True, "phase": 1, "step": 0, "log": [], "task": dead_task}
-
-        _app._away_mode_state["live-sess"] = live_state
-        _app._away_mode_state["zombie-sess"] = zombie_state
-        try:
-            with patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app._watchdog_restart_mode", mock_restart), \
-                 patch("app._watchdog_check_session", mock_check_session):
-                try:
-                    await _app._watchdog_loop()
-                except _asyncio.CancelledError:
-                    pass
-        finally:
-            _app._away_mode_state.pop("live-sess", None)
-            _app._away_mode_state.pop("zombie-sess", None)
-
-        assert any(name == "zombie-sess" and mode == "away"
-                   for name, mode in restart_calls)
-
-
-# ─── _away_send_prompt ───
-
-
-class TestAwaySendPrompt:
-    """Cover lines 3107-3201: _away_send_prompt."""
-
-    @pytest.mark.asyncio
-    async def test_busy_detected_returns_early(self):
-        """Lines 3160-3162: if session is busy after paste, returns immediately."""
-        import app as _app
-
-        async def mock_to_thread(fn, *args, **kwargs):
-            if fn is _app.capture_pane_recent:
-                return "snapshot"
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        async def mock_activity(session_name):
-            return {"status": "busy"}
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.asyncio.to_thread", mock_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            await _app._away_send_prompt("test-sess", "hello prompt")
-        # If we reach here without exception, the function returned successfully
-
-    @pytest.mark.asyncio
-    async def test_terminal_changed_detected(self):
-        """Lines 3165-3168: if pre/post snapshot differs, returns without retry."""
-        import app as _app
-
-        snapshot_count = [0]
-
-        async def mock_to_thread(fn, *args, **kwargs):
-            if fn is _app.capture_pane_recent:
-                snapshot_count[0] += 1
-                # pre-snapshot returns "before", post-snapshot returns "after"
-                return "before" if snapshot_count[0] == 1 else "after"
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}  # Not busy — will check snapshot diff
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.asyncio.to_thread", mock_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            await _app._away_send_prompt("test-sess", "hello prompt")
-        # Terminal content changed → function returned early (line 3168)
-
-    @pytest.mark.asyncio
-    async def test_all_retries_fail_logs_and_returns(self):
-        """Lines 3170-3175: all 3 Enter retries fail (same content), function returns."""
-        import app as _app
-
-        async def mock_to_thread(fn, *args, **kwargs):
-            if fn is _app.capture_pane_recent:
-                return "same content"  # Never changes
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}  # Always idle
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.asyncio.to_thread", mock_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            await _app._away_send_prompt("test-sess", "hello " * 200)
-        # All retries failed, "Pasted text" not detected, function returns normally
-
-    @pytest.mark.asyncio
-    async def test_stuck_paste_preview_cleared(self):
-        """Lines 3179-3191: 'Pasted text' in recent output triggers Escape + resend."""
-        import app as _app
-
-        call_count = [0]
-        tmux_commands = []
-
-        async def mock_to_thread(fn, *args, **kwargs):
-            if fn is _app.capture_pane_recent:
-                call_count[0] += 1
-                # Pre-snapshot (call 1) and post-snapshot (calls 2,3,4) and recent check (call 5)
-                if call_count[0] == 5:
-                    return "Pasted text +10 lines in buffer"  # Stuck paste!
-                return "same"
-            if fn is _app.subprocess.run and args:
-                tmux_commands.append(args[0])
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.asyncio.to_thread", mock_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            await _app._away_send_prompt("test-sess", "hello prompt")
-        assert any("C-c" in command for command in tmux_commands)
-
-    @pytest.mark.asyncio
-    async def test_activity_exception_treated_as_unknown(self):
-        """Lines 3157-3158: when async_detect_activity raises, activity = unknown."""
-        import app as _app
-
-        async def mock_to_thread(fn, *args, **kwargs):
-            if fn is _app.capture_pane_recent:
-                return "snapshot"
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        async def failing_activity(session_name):
-            raise RuntimeError("tmux connection lost")
-
-        async def noop_sleep(_secs):
-            pass
-
-        # If unknown status → not busy → snapshot check → same → retry loop × 3
-        # Function should return without error despite activity failure
-        with patch("app.asyncio.to_thread", mock_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", failing_activity), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            await _app._away_send_prompt("test-sess", "hello prompt")
-        # Function completes normally (3 retries attempted, no crash)
-
-    @pytest.mark.asyncio
-    async def test_exception_during_paste_logged(self):
-        """Lines 3193-3200: exception during send is caught and logged, finally cleans up."""
-        import app as _app
-
-        async def failing_to_thread(fn, *args, **kwargs):
-            raise OSError("tmux not found")
-
-        async def noop_sleep(_secs):
-            pass
-
-        with patch("app.asyncio.to_thread", failing_to_thread), \
-             patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.tempfile.mkstemp", return_value=(0, "/tmp/test-prompt.md")), \
-             patch("app.os.close"), \
-             patch("app.os.unlink"):
-            # Should not raise — exception caught internally
-            await _app._away_send_prompt("test-sess", "hello prompt")
-
-
-# ─── _restore_autonomous_mode additional paths ───
-
-
-class TestRestoreAutonomousModeExtra:
-    """Cover lines 2686-2698, 2713-2720: busy-wait path and claude-dead path in restore."""
-
-    @pytest.mark.asyncio
-    async def test_restore_waits_when_busy(self):
-        """Lines 2686-2687: if session is busy on restore, wait for idle before sending."""
-        import app as _app
-
-        wait_called = []
-
-        async def noop_sleep(_secs):
-            pass
-
-        async def mock_activity(session_name):
-            return {"status": "busy"}  # Session is busy when restoring
-
-        async def mock_wait_idle(session_name, timeout=900):
-            wait_called.append(session_name)
-
-        async def mock_ensure_claude(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_send_prompt(session_name, prompt):
-            pass
-
-        async def mock_loop(session_name):
-            pass
-
-        state = {"enabled": True, "phase": 4, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app._away_wait_for_idle", mock_wait_idle), \
-             patch("app._ensure_claude_running", mock_ensure_claude), \
-             patch("app._away_send_prompt", mock_send_prompt), \
-             patch("app._away_mode_continuous_loop", mock_loop):
-            await _app._restore_autonomous_mode("busy-sess", state, "away")
-        assert wait_called == ["busy-sess"]  # _away_wait_for_idle was called
-
-    @pytest.mark.asyncio
-    async def test_restore_stops_when_claude_dead(self):
-        """Lines 2694-2698: if Codex can't be restarted, restore stops."""
-        import app as _app
-
-        loop_called = []
-
-        async def noop_sleep(_secs):
-            pass
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def mock_ensure_dead(session_name, log_fn=None, state=None):
-            return False  # Codex couldn't restart
-
-        async def mock_loop(session_name):
-            loop_called.append(session_name)
-
-        state = {"enabled": True, "phase": 4, "step": 0, "log": []}
-        with patch("app.asyncio.sleep", noop_sleep), \
-             patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_claude_running", mock_ensure_dead), \
-             patch("app._away_mode_continuous_loop", mock_loop), \
-             patch("app._save_autonomous_state"):
-            await _app._restore_autonomous_mode("dead-sess", state, "away")
-        assert loop_called == []  # Loop NOT entered
-        assert state["enabled"] is False  # Disabled
-
-
-# ─── Watchdog go-nuts zombie detection ───
-
-
-class TestWatchdogGoNutsZombie:
-    """Cover lines 2760-2762: zombie go-nuts mode detection in _watchdog_loop."""
-
-    @pytest.mark.asyncio
-    async def test_zombie_go_nuts_detected_and_restarted(self):
-        """Lines 2760-2762: zombie go-nuts (enabled but task done) triggers restart."""
-        import asyncio as _asyncio
-
-        import app as _app
-
-        sleep_count = 0
-        restart_calls = []
-
-        async def counting_sleep(secs):
-            nonlocal sleep_count
-            sleep_count += 1
-            if sleep_count >= 2:
-                raise _asyncio.CancelledError()
-
-        async def mock_restart(name, state, mode, wlog):
-            restart_calls.append((name, mode))
-
-        async def mock_check_session(session_name, state, mode, wlog):
-            pass
-
-        live_task = MagicMock()
-        live_task.done.return_value = False
-        dead_task = MagicMock()
-        dead_task.done.return_value = True
-
-        live_state = {"enabled": True, "phase": 1, "step": 0, "log": [], "task": live_task}
-        zombie_gn_state = {"enabled": True, "phase": 2, "step": 0, "log": [], "task": dead_task}
-
-        _app._away_mode_state["live-sess-gn"] = live_state
-        _app._go_nuts_state["zombie-gn"] = zombie_gn_state
-        try:
-            with patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app._watchdog_restart_mode", mock_restart), \
-                 patch("app._watchdog_check_session", mock_check_session):
-                try:
-                    await _app._watchdog_loop()
-                except _asyncio.CancelledError:
-                    pass
-        finally:
-            _app._away_mode_state.pop("live-sess-gn", None)
-            _app._go_nuts_state.pop("zombie-gn", None)
-
-        assert any(name == "zombie-gn" and mode == "gonuts"
-                   for name, mode in restart_calls)
-
-
-# ─── _away_mode_worker paths ───
-
-
-class TestAwayModeWorkerPaths:
-    """Cover lines 3499-3610: _away_mode_worker exception, disabled, and cancel paths."""
-
-    @pytest.mark.asyncio
-    async def test_phase1_exception_is_skipped(self):
-        """Lines 3505-3507: exception in phase 1 is caught and logged, phase 2 continues."""
-        import app as _app
-
-        phase2_called = []
-
-        async def failing_phase1(session_name, state):
-            raise RuntimeError("Phase 1 broke!")
-
-        async def success_phase2(session_name, state):
-            phase2_called.append(True)
-
-        async def instant_execute(session_name, state):
-            pass  # Phase 3 does nothing
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["worker-test"] = state
-        try:
-            with patch("app._away_phase_study", failing_phase1), \
-                 patch("app._away_phase_select", success_phase2), \
-                 patch("app._away_phase_execute", instant_execute), \
-                 patch("app._away_mode_continuous_loop", None):
-                # Disable after phase 2 so worker exits before continuous loop
-                async def execute_and_disable(session_name, state):
-                    state["enabled"] = False
-
-                with patch("app._away_phase_execute", execute_and_disable):
-                    await _app._away_mode_worker("worker-test")
-        finally:
-            _app._away_mode_state.pop("worker-test", None)
-
-        assert phase2_called  # Phase 2 ran despite phase 1 error
-        assert state["task"] is None  # Cleaned up in finally
-
-    @pytest.mark.asyncio
-    async def test_disabled_after_phase1_exits_early(self):
-        """Lines 3509-3510: if disabled after phase 1, worker exits before phase 2."""
-        import app as _app
-
-        phase2_called = []
-
-        async def phase1_that_disables(session_name, state):
-            state["enabled"] = False  # Simulate user disabling during phase 1
-
-        async def phase2(session_name, state):
-            phase2_called.append(True)
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["worker-test2"] = state
-        try:
-            with patch("app._away_phase_study", phase1_that_disables), \
-                 patch("app._away_phase_select", phase2):
-                await _app._away_mode_worker("worker-test2")
-        finally:
-            _app._away_mode_state.pop("worker-test2", None)
-
-        assert not phase2_called  # Phase 2 was NOT reached
-
-    @pytest.mark.asyncio
-    async def test_cancelled_error_sets_disabled_and_reraises(self):
-        """Lines 3594-3598: CancelledError from phase sets enabled=False and re-raises."""
-        import asyncio as _asyncio
-
-        import app as _app
-
-        async def cancelling_phase1(session_name, state):
-            raise _asyncio.CancelledError()
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["worker-cancel"] = state
-        try:
-            with patch("app._away_phase_study", cancelling_phase1), \
-                 patch("app._save_autonomous_state"):
-                with pytest.raises(_asyncio.CancelledError):
-                    await _app._away_mode_worker("worker-cancel")
-        finally:
-            _app._away_mode_state.pop("worker-cancel", None)
-
-        assert state["enabled"] is False  # Set to False on cancel
-        assert state["task"] is None      # Cleared in finally
 
 # ---------------------------------------------------------------------------
 # Phase 23 — High-coverage tests for remaining uncovered async paths
@@ -4280,520 +5573,3 @@ class TestAutoResponderLoop:
                     await _app._auto_responder_loop()
         finally:
             _app._auto_respond_cooldown.clear()
-
-
-class TestGoNutsModeWorkerPaths:
-    """Tests for _go_nuts_mode_worker top-level paths (lines 3849-3870)."""
-
-    @pytest.mark.asyncio
-    async def test_phase1_exception_skipped_phase2_runs(self):
-        """Lines 3857-3862: phase 1 exception is caught and skipped."""
-        import app as _app
-
-        async def failing_phase1(session_name, state):
-            raise RuntimeError("Phase 1 boom")
-
-        phase2_called = [False]
-
-        async def noop_phase2(session_name, state):
-            phase2_called[0] = True
-
-        async def noop_phase(session_name, state):
-            pass
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._go_nuts_state["gn-test1"] = state
-
-        try:
-            with patch("app._go_nuts_phase_discover", failing_phase1), \
-                 patch("app._go_nuts_phase_backlog", noop_phase2), \
-                 patch("app._go_nuts_phase_build", noop_phase), \
-                 patch("app._save_autonomous_state"), \
-                 patch("app.asyncio.sleep", side_effect=RuntimeError("break")), \
-                 patch("app.async_detect_activity", return_value={"status": "idle"}):
-                try:
-                    await _app._go_nuts_mode_worker("gn-test1")
-                except RuntimeError:
-                    pass
-        finally:
-            _app._go_nuts_state.pop("gn-test1", None)
-
-        assert phase2_called[0]
-
-    @pytest.mark.asyncio
-    async def test_disabled_after_phase1_exits_early(self):
-        """Lines 3863-3864: worker exits early if disabled after phase 1."""
-        import app as _app
-
-        phase2_called = [False]
-
-        async def disabling_phase1(session_name, state):
-            state["enabled"] = False
-
-        async def noop_phase2(session_name, state):
-            phase2_called[0] = True
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._go_nuts_state["gn-test2"] = state
-
-        try:
-            with patch("app._go_nuts_phase_discover", disabling_phase1), \
-                 patch("app._go_nuts_phase_backlog", noop_phase2), \
-                 patch("app._save_autonomous_state"):
-                await _app._go_nuts_mode_worker("gn-test2")
-        finally:
-            _app._go_nuts_state.pop("gn-test2", None)
-
-        assert not phase2_called[0]
-
-    @pytest.mark.asyncio
-    async def test_cancelled_error_sets_disabled_and_reraises(self):
-        """Lines 3945-3950: CancelledError propagates with enabled=False."""
-        import asyncio as _asyncio
-
-        import app as _app
-
-        async def cancelling_phase1(session_name, state):
-            raise _asyncio.CancelledError()
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._go_nuts_state["gn-cancel"] = state
-
-        try:
-            with patch("app._go_nuts_phase_discover", cancelling_phase1), \
-                 patch("app._save_autonomous_state"):
-                with pytest.raises(_asyncio.CancelledError):
-                    await _app._go_nuts_mode_worker("gn-cancel")
-        finally:
-            _app._go_nuts_state.pop("gn-cancel", None)
-
-        assert state["enabled"] is False
-        assert state["task"] is None
-
-
-class TestAwayModeWorkerContinuousLoop:
-    """Tests for the phase 4+ continuous loop in _away_mode_worker (lines 3538-3594)."""
-
-    @pytest.mark.asyncio
-    async def test_one_cycle_then_disabled(self):
-        """Lines 3538-3594: runs one full ping cycle then exits when disabled."""
-        import app as _app
-
-        sleep_count = [0]
-        time_values = [0.0, 91.0, 91.0]
-        time_idx = [0]
-
-        async def counting_sleep(secs):
-            sleep_count[0] += 1
-            if secs == 5:  # sleep after successful cycle → disable
-                state["enabled"] = False
-
-        def mock_time():
-            val = time_values[min(time_idx[0], len(time_values) - 1)]
-            time_idx[0] += 1
-            return val
-
-        send_calls = [0]
-
-        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
-            send_calls[0] += 1
-
-        async def noop_ensure(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_phase(session_name, state):
-            pass
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["cont-away"] = state
-
-        try:
-            with patch("app._away_phase_study", noop_phase), \
-                 patch("app._away_phase_select", noop_phase), \
-                 patch("app._away_phase_execute", noop_phase), \
-                 patch("app._away_log"), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_codex_running", noop_ensure), \
-                 patch("app._away_send_and_wait", mock_send_wait), \
-                 patch("app._save_autonomous_state"):
-                await _app._away_mode_worker("cont-away")
-        finally:
-            _app._away_mode_state.pop("cont-away", None)
-
-        assert send_calls[0] == 1
-        assert state["step"] == 1
-        assert state["phase"] == 4
-        assert state["task"] is None
-
-    @pytest.mark.asyncio
-    async def test_claude_dead_stops_loop(self):
-        """Lines 3554-3559: Codex dead and can't restart → stop."""
-        import app as _app
-
-        async def counting_sleep(secs):
-            pass  # all sleeps are instant
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        time_idx = [0]
-        time_vals = [0.0, 91.0]
-
-        def mock_time():
-            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
-            time_idx[0] += 1
-            return val
-
-        async def dead_ensure(session_name, log_fn=None, state=None):
-            return False  # Codex dead, can't restart
-
-        async def noop_phase(session_name, state):
-            pass
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._away_mode_state["dead-away"] = state
-
-        try:
-            with patch("app._away_phase_study", noop_phase), \
-                 patch("app._away_phase_select", noop_phase), \
-                 patch("app._away_phase_execute", noop_phase), \
-                 patch("app._away_log"), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_codex_running", dead_ensure), \
-                 patch("app._save_autonomous_state"):
-                await _app._away_mode_worker("dead-away")
-        finally:
-            _app._away_mode_state.pop("dead-away", None)
-
-        assert state["enabled"] is False
-        assert state["task"] is None
-
-
-class TestGoNutsModeWorkerContinuousLoop:
-    """Tests for the phase 4+ continuous loop in _go_nuts_mode_worker (lines 3883-3958)."""
-
-    @pytest.mark.asyncio
-    async def test_one_cycle_then_disabled(self):
-        """Lines 3883-3958: go-nuts runs one full build cycle then exits."""
-        import app as _app
-
-        time_values = [0.0, 91.0, 91.0]
-        time_idx = [0]
-
-        async def counting_sleep(secs):
-            if secs == 5:
-                state["enabled"] = False
-
-        def mock_time():
-            val = time_values[min(time_idx[0], len(time_values) - 1)]
-            time_idx[0] += 1
-            return val
-
-        send_calls = [0]
-
-        async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
-            send_calls[0] += 1
-
-        async def noop_ensure(session_name, log_fn=None, state=None):
-            return True
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_phase(session_name, state):
-            pass
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._go_nuts_state["cont-gn"] = state
-
-        try:
-            with patch("app._go_nuts_phase_discover", noop_phase), \
-                 patch("app._go_nuts_phase_backlog", noop_phase), \
-                 patch("app._go_nuts_phase_build", noop_phase), \
-                 patch("app._go_nuts_log"), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_codex_running", noop_ensure), \
-                 patch("app._go_nuts_send_and_wait", mock_send_wait), \
-                 patch("app._save_autonomous_state"):
-                await _app._go_nuts_mode_worker("cont-gn")
-        finally:
-            _app._go_nuts_state.pop("cont-gn", None)
-
-        assert send_calls[0] == 1
-        assert state["step"] == 1
-        assert state["phase"] == 4
-        assert state["task"] is None
-
-    @pytest.mark.asyncio
-    async def test_claude_dead_stops_loop(self):
-        """Go-nuts: Codex dead → stops loop."""
-        import app as _app
-
-        async def counting_sleep(secs):
-            pass
-
-        time_idx = [0]
-        time_vals = [0.0, 91.0]
-
-        def mock_time():
-            val = time_vals[min(time_idx[0], len(time_vals) - 1)]
-            time_idx[0] += 1
-            return val
-
-        async def dead_ensure(session_name, log_fn=None, state=None):
-            return False
-
-        async def mock_activity(session_name):
-            return {"status": "idle"}
-
-        async def noop_phase(session_name, state):
-            pass
-
-        state = {
-            "enabled": True, "phase": 0, "phase_name": "Init",
-            "step": 0, "step_name": "", "started_at": 0.0,
-            "log": [], "report": "", "task": None,
-        }
-        _app._go_nuts_state["dead-gn"] = state
-
-        try:
-            with patch("app._go_nuts_phase_discover", noop_phase), \
-                 patch("app._go_nuts_phase_backlog", noop_phase), \
-                 patch("app._go_nuts_phase_build", noop_phase), \
-                 patch("app._go_nuts_log"), \
-                 patch("app.asyncio.sleep", counting_sleep), \
-                 patch("app.async_detect_activity", mock_activity), \
-                 patch("app.time.time", mock_time), \
-                 patch("app._ensure_codex_running", dead_ensure), \
-                 patch("app._save_autonomous_state"):
-                await _app._go_nuts_mode_worker("dead-gn")
-        finally:
-            _app._go_nuts_state.pop("dead-gn", None)
-
-        assert state["enabled"] is False
-
-
-class TestWatchdogCheckSession:
-    """Tests for _watchdog_check_session (lines 2774-2882)."""
-
-    @pytest.mark.asyncio
-    async def test_empty_pane_returns_early(self):
-        """Lines 2775-2779: empty pane → return immediately."""
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-        state = {"enabled": True, "log": []}
-
-        with patch("app.asyncio.to_thread", return_value="   "):
-            await _app._watchdog_check_session("empty-sess", state, "away", wlog)
-        # No assertion needed — function returned without error
-
-    @pytest.mark.asyncio
-    async def test_new_content_resets_snapshot(self):
-        """Lines 2781-2790: new content hash → reset snapshot, return."""
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-        state = {"enabled": True, "log": []}
-
-        _app._watchdog_snapshots.pop("snap-sess", None)
-        try:
-            with patch("app.asyncio.to_thread", return_value="new terminal content here"), \
-                 patch("app.time.time", return_value=1000.0):
-                await _app._watchdog_check_session("snap-sess", state, "away", wlog)
-            snap = _app._watchdog_snapshots.get("snap-sess")
-            assert snap is not None
-            assert snap["nudge_count"] == 0
-        finally:
-            _app._watchdog_snapshots.pop("snap-sess", None)
-
-    @pytest.mark.asyncio
-    async def test_stall_below_threshold_returns_early(self):
-        """Lines 2793-2795: stall detected but < _STALL_THRESHOLD → return."""
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-        state = {"enabled": True, "log": []}
-
-        # Pre-seed a snapshot with same content hash
-        import hashlib
-
-        content = "unchanged terminal output"
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        _app._watchdog_snapshots["thresh-sess"] = {
-            "content_hash": content_hash,
-            "first_seen": 900.0,  # 100s ago at now=1000
-            "nudge_count": 0,
-            "last_nudge": 0,
-        }
-        try:
-            with patch("app.asyncio.to_thread", return_value=content), \
-                 patch("app.time.time", return_value=1000.0), \
-                 patch("app._STALL_THRESHOLD", 600):  # threshold = 600s, stall = 100s < 600
-                await _app._watchdog_check_session("thresh-sess", state, "away", wlog)
-        finally:
-            _app._watchdog_snapshots.pop("thresh-sess", None)
-
-    @pytest.mark.asyncio
-    async def test_stall_llm_says_stuck_triggers_nudge(self):
-        """Lines 2801-2879: LLM says STUCK → nudge sent."""
-        import hashlib
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-        state = {"enabled": True, "log": []}
-
-        content = "stuck terminal output"
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        _app._watchdog_snapshots["nudge-sess"] = {
-            "content_hash": content_hash,
-            "first_seen": 0.0,  # 1000s ago
-            "nudge_count": 0,
-            "last_nudge": 0.0,
-        }
-
-        nudge_called = [False]
-
-        async def mock_send_prompt(session_name, prompt):
-            nudge_called[0] = True
-
-        try:
-            with patch("app.asyncio.to_thread", return_value=content), \
-                 patch("app.time.time", return_value=1000.0), \
-                 patch("app._STALL_THRESHOLD", 10), \
-                 patch("app._async_is_claude_running", return_value=True), \
-                 patch("app.llm_call", return_value="STUCK"), \
-                 patch("app.async_detect_activity",
-                       return_value={"status": "idle"}), \
-                 patch("app._away_send_prompt", mock_send_prompt), \
-                 patch("app._NUDGE_COOLDOWN", 0), \
-                 patch("app._MAX_NUDGES_BEFORE_RESTART", 3):
-                await _app._watchdog_check_session("nudge-sess", state, "away", wlog)
-        finally:
-            _app._watchdog_snapshots.pop("nudge-sess", None)
-
-        assert nudge_called[0]
-
-
-class TestWatchdogRestartMode:
-    """Tests for _watchdog_restart_mode (lines 2887-2950)."""
-
-    @pytest.mark.asyncio
-    async def test_away_mode_restart_launches_continuous_loop(self):
-        """Lines 2887-2950: restart cancels old task, sends unstick, creates new task."""
-        import asyncio as _asyncio
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-
-        old_task = MagicMock()
-        old_task.done.return_value = False
-        old_task.cancel = MagicMock()
-
-        state = {
-            "enabled": True, "log": ["existing log"],
-            "started_at": 100.0, "step": 3,
-            "phase": 2, "phase_name": "Phase 2",
-            "task": old_task,
-        }
-        _app._away_mode_state["restart-test"] = state
-
-        send_calls = [0]
-
-        async def mock_send_prompt(session_name, prompt):
-            send_calls[0] += 1
-
-        async def mock_ensure(session_name, log_fn=None, state=None):
-            return True
-
-        async def instant_continuous(session_name):
-            pass
-
-        try:
-            with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
-                 patch("app.asyncio.sleep", return_value=None), \
-                 patch("app._ensure_codex_running", mock_ensure), \
-                 patch("app._away_send_prompt", mock_send_prompt), \
-                 patch("app._away_mode_continuous_loop", instant_continuous), \
-                 patch("app._save_autonomous_state"), \
-                 patch("app.asyncio.wait_for", side_effect=_asyncio.TimeoutError()):
-                await _app._watchdog_restart_mode("restart-test", state, "away", wlog)
-        finally:
-            _app._away_mode_state.pop("restart-test", None)
-
-        assert send_calls[0] == 1
-        assert state["phase"] == 4
-        assert state["enabled"] is True
-
-    @pytest.mark.asyncio
-    async def test_restart_codex_dead_sets_disabled(self):
-        """If Codex cannot be restarted, the autonomous mode is disabled."""
-        import logging
-
-        import app as _app
-
-        wlog = logging.getLogger("watchdog-test")
-
-        state = {
-            "enabled": True, "log": [],
-            "started_at": 0.0, "step": 0,
-            "task": None,
-        }
-        _app._away_mode_state["restart-dead"] = state
-
-        async def dead_ensure(session_name, log_fn=None, state=None):
-            return False
-
-        try:
-            with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
-                 patch("app.asyncio.sleep", return_value=None), \
-                 patch("app._ensure_codex_running", dead_ensure), \
-                 patch("app._save_autonomous_state"):
-                await _app._watchdog_restart_mode("restart-dead", state, "away", wlog)
-        finally:
-            _app._away_mode_state.pop("restart-dead", None)
-
-        assert state["enabled"] is False

@@ -10,8 +10,6 @@ Claude Code runs beautifully inside a `tmux` session, but once you start jugglin
 
 - A **tabbed view of every session** with live terminal output and a parallel chat transcript
 - **AI-generated titles, descriptions, and progress summaries** (OpenAI) so you know what each session is doing at a glance
-- **Away Mode** — multi-phase autonomous prompt sequences that keep Claude working while you're AFK
-- **Go Nuts Mode** — an autonomous feature-building loop that plans, implements, tests, and commits in a tight cycle
 - **System stats**, per-session cost, token usage, idle detection, context-window warnings, and activity sparklines
 - **Keyboard-first navigation** — rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
 - **File upload**, **CLAUDE.md viewer/editor** (home-dir-scoped, path-traversal protected), **sticky notes**, **message bookmarks**, **quick-reply templates**, toast notifications, and sound alerts
@@ -59,7 +57,6 @@ All persistent data is stored in `~/.tmux-dashboard/` (permissions: `700`):
 |------|-------------|
 | `messages.json` | Per-session chat message history |
 | `notes.json` | AI-extracted session notes |
-| `autonomous-modes.json` | Persisted Away Mode / Go Nuts Mode state |
 | `anthropic_api_key` | Encrypted-at-rest API key (chmod 600) |
 
 ## Running via Supervisor
@@ -122,7 +119,6 @@ make restore-check
 make backup
 ```
 
-**Crash recovery**: The server restores active Away Mode and Go Nuts Mode sessions automatically on restart. No action needed — just restart the supervisor process.
 
 **Corrupted state**: If `~/.tmux-dashboard/*.json` becomes corrupt (server crash during write), restore from a backup. You can also delete the corrupt file — the app recreates it on next write with empty state.
 
@@ -169,8 +165,6 @@ Current usage in `app.py` (all standard, minimal API surface):
 | GET | `/api/auth/claude-status` | Claude Code OAuth status |
 | POST | `/api/auth/logout` | Revoke Claude Code OAuth session |
 | GET | `/api/auth/usage` | Today's Claude Code token usage |
-| GET/POST | `/api/sessions/{name}/away-mode` | Get/toggle Away Mode |
-| GET/POST | `/api/sessions/{name}/go-nuts-mode` | Get/toggle Go Nuts Mode |
 
 ---
 
