@@ -71,6 +71,25 @@ class ClaudeAdapter(BackendAdapter):
             note="model, thinking budget and permission rules",
         ))
 
+        # First-run state. Claude Code shows two blocking screens the first time a
+        # config dir is used — the login picker (until hasCompletedOnboarding)
+        # and, with --dangerously-skip-permissions, a bypass-mode acceptance
+        # (until numStartups > 0). Neither is answerable by a dashboard pane:
+        # they just look like a hung session. Seeding them is only honest at
+        # full-access, which is the level that already says "unattended".
+        if claude_policy.get("default_mode") == "bypassPermissions":
+            out.append(RenderedFile(
+                path=home / ".claude.json",
+                content=json.dumps({
+                    "hasCompletedOnboarding": True,
+                    "numStartups": 1,
+                    "installMethod": "global",
+                    "autoUpdates": False,
+                }, indent=2) + "\n",
+                mode=0o600,
+                note="first-run state, so an unattended session does not stop on a prompt",
+            ))
+
         servers = {}
         for name, spec in (mcp or {}).items():
             entry = {"command": spec["command"], "args": list(spec.get("args") or [])}

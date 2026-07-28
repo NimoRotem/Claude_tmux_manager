@@ -362,8 +362,15 @@ def render(backend: str, home: Path, *, level: str | None = None,
             rendered.path.write_text(_merge_toml(rendered.path, rendered.content))
         elif rendered.path.name == "settings.json":
             rendered.path.write_text(_merge_json_settings(rendered.path, rendered.content))
+        elif rendered.path.name == ".claude.json":
+            # Claude's own state file: seed the keys we care about and never
+            # touch the rest (it holds per-project history and MCP approvals).
+            rendered.path.write_text(
+                _merge_json_settings(rendered.path, rendered.content, owned=()))
         else:
             rendered.path.write_text(rendered.content)
+        if rendered.mode != 0o644:
+            rendered.path.chmod(rendered.mode)
         written.append(str(rendered.path))
 
     # --- 7. events ---------------------------------------------------------
