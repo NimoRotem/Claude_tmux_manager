@@ -7714,6 +7714,36 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
 
 # --- System stats ---
 
+# Real CPU utilisation, sampled as a delta between two /proc/stat reads. The
+# dashboard used to report `loadavg / ncpu` as "CPU Usage", which is a different
+# quantity: load average counts runnable *and* uninterruptible tasks, so a box
+# with several agents waiting on disk or network shows "100% CPU" while most
+# cores are idle. On a 4-vCPU box running four Codex sessions that misfires
+# constantly. Keep the two apart.
+_CPU_SAMPLE = {"total": 0, "idle": 0, "pct": 0.0}
+_CPU_SAMPLE_LOCK = threading.Lock()
+
+
+def _cpu_utilisation_pct() -> float:
+    """Percentage of all cores busy since the previous call (0 on first call)."""
+    try:
+        with open("/proc/stat") as fh:
+            fields = [int(x) for x in fh.readline().split()[1:]]
+    except Exception:
+        return 0.0
+    total = sum(fields)
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # idle + iowait
+    with _CPU_SAMPLE_LOCK:
+        prev_total, prev_idle = _CPU_SAMPLE["total"], _CPU_SAMPLE["idle"]
+        _CPU_SAMPLE["total"], _CPU_SAMPLE["idle"] = total, idle
+        d_total, d_idle = total - prev_total, idle - prev_idle
+        # Too small a window (or the first call) gives a meaningless ratio —
+        # reuse the last good reading rather than printing noise.
+        if prev_total and d_total > 50:
+            _CPU_SAMPLE["pct"] = max(0.0, min(100.0, round(100.0 * (1 - d_idle / d_total), 1)))
+        return _CPU_SAMPLE["pct"]
+
+
 @app.get("/api/stats")
 async def api_stats():
     """System stats: CPU, disk, memory, tmux sessions, Claude processes."""
@@ -7730,12 +7760,16 @@ async def api_stats():
                 stats["threads_total"] = int(total)
     except Exception:
         stats["cpu_load"] = {}
-    # CPU count and approximate usage percent
+    # CPU count and usage percent
     try:
         cpu_count = os.cpu_count() or 1
         stats["cpu_count"] = cpu_count
+        stats["cpu_percent"] = _cpu_utilisation_pct()
+        # Load average is a queue length, not a utilisation — a box with four
+        # agents blocked on I/O reads "100%" while three cores sit idle. Report
+        # it as its own number so the two are never confused again.
         load_1m = float(stats.get("cpu_load", {}).get("1m", 0))
-        stats["cpu_percent"] = min(round(load_1m / cpu_count * 100, 1), 100.0)
+        stats["cpu_load_pct"] = min(round(load_1m / cpu_count * 100, 1), 999.0)
     except Exception:
         stats["cpu_count"] = 1
         stats["cpu_percent"] = 0
@@ -13443,51 +13477,86 @@ const activeTabs={};
 const rawState={};
 function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
 
-// --- "Hide Bash/Fetch" filter ---
-function getHideBashPref(){
-  try{const v=localStorage.getItem('hideBashLines');return v===null?true:v==='true'}catch(e){return true}
-}
-function setHideBashPref(v){
-  try{localStorage.setItem('hideBashLines',v?'true':'false')}catch(e){}
-}
-// Independently hide tool OUTPUT — the `⎿ …` result blocks (file dumps, command
-// output, "Shell cwd was reset…") plus their indented continuation rows — so the
-// terminal shows only Claude's spoken text, not the plumbing. Default on.
-function getHideOutputPref(){
-  try{const v=localStorage.getItem('hideOutputLines');return v===null?true:v==='true'}catch(e){return true}
-}
-function setHideOutputPref(v){
-  try{localStorage.setItem('hideOutputLines',v?'true':'false')}catch(e){}
-}
-// Claude Code's TUI lays out tool calls like:
-//   ● Bash(sleep 540 && gcloud ...
-//         --command="date; ...")        <- wrap continuation, indented, no marker
-//     ⎿  Mon May 11 ...                 <- output
+// --- "Clean view" terminal filter ---
+// One switch. On, the terminal shows only what the agent SAID to you and drops
+// everything that is plumbing: tool-call headers (Claude's `Bash(…)`, Codex's
+// `Ran …` / `Edited …` / `Explored` / `Called …`), their wrapped command rows,
+// every tool-output block (`⎿ …` for Claude, `└ …` for Codex) plus its indented
+// continuation rows, package/self-update chatter, per-turn bookkeeping, and the
+// shell plumbing the dashboard types to launch a session. Off, the pane is
+// passed through untouched.
 //
-// The user wants the "specific commands the agent is writing" hidden — so we
-// hide the bullet header line AND its wrap-continuation lines (indented, no
-// bullet/output marker). We KEEP the `⎿` output lines so the user can still
-// see what the command produced.
-// Tool-call headers Claude Code renders as "● ToolName(args)". We require the
-// "(" so we never hide ordinary prose that happens to start with a word like
-// "Read"/"Write"/"Update"/"Add"/"Task". Covers file ops (Write/Edit/Read/...),
-// shell, web, search and mcp__ tools so the terminal shows the conversation, not
-// the plumbing.
-const _BASH_FILTER_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add)\s*\(|mcp__[^(\s]+\s*\()/i;
-const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
-const _OUTPUT_MARKER_RE=/^[\s]*⎿/;
-const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
-function _isBashFetchHeader(line){
-  const stripped=line.replace(_ANY_DECORATION_RE,'');
-  return _BASH_FILTER_RE.test(stripped);
+// This replaced two separate toggles ("hide tool calls" / "hide tool output"),
+// which could be set to combinations nobody wanted — hiding the command but
+// keeping its 400-line output, say. Migrate: if either old pref was explicitly
+// off, clean view starts off. Default on.
+function getCleanViewPref(){
+  try{
+    const v=localStorage.getItem('terminalCleanView');
+    if(v!==null)return v==='true';
+    const a=localStorage.getItem('hideBashLines');
+    const b=localStorage.getItem('hideOutputLines');
+    if(a===null&&b===null)return true;
+    return a!=='false'&&b!=='false';
+  }catch(e){return true}
 }
-// Part 5: also hide noisy "update" output (claude/npm self-update logs). These are
-// long, low-value, and clutter the terminal. Folded into the same Hide toggle.
-const _UPDATE_NOISE_RES=[
+function setCleanViewPref(v){
+  try{
+    localStorage.setItem('terminalCleanView',v?'true':'false');
+    // Keep the legacy keys in step so an older tab left open agrees with us.
+    localStorage.setItem('hideBashLines',v?'true':'false');
+    localStorage.setItem('hideOutputLines',v?'true':'false');
+  }catch(e){}
+}
+// Back-compat aliases for any caller still asking for the two old prefs.
+function getHideBashPref(){return getCleanViewPref()}
+function getHideOutputPref(){return getCleanViewPref()}
+
+// Claude Code lays a tool call out as:
+//   ● Bash(sleep 540 && gcloud ...
+//         --command="date; ...")     <- wrap continuation, indented, no marker
+//     ⎿  Mon May 11 ...              <- output
+// Codex lays the same thing out as:
+//   • Ran pwd && rg --files -g '*.
+//     │ {jpg,png}' .                 <- wrapped command, `│` marker
+//     └ /home/nimrod_rotem/...       <- output
+//   • Edited test_api.py (+2 -0)
+//         233   ),                   <- diff rows, indented, no marker
+// Prose bullets ("• I'm tracing both issues…") are kept along with their
+// indented sub-bullets, so the conversation still reads as prose.
+const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
+// Output markers: Claude's ⎿, Codex's └. `│` is a wrapped *command* row. The
+// box-drawing ones must be indented — Codex's start-up banner draws its frame
+// with │ at column 0 and we do not want to eat that.
+const _OUTPUT_MARKER_RE=/^[\s]*⎿|^\s+[└╰]\s/;
+const _CALL_CONT_RE=/^\s+│/;
+const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
+// Claude-style `ToolName(args)`. The "(" is required so ordinary prose starting
+// with a word like "Read"/"Write"/"Update"/"Add"/"Task" is never swallowed.
+const _TOOL_PAREN_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add|Agent|Artifact|Skill|Workflow|ToolSearch)\s*\(|mcp__[^(\s]+\s*\()/i;
+// Codex verbs that are only ever emitted as a tool header, never as prose.
+const _CODEX_VERB_RE=/^(?:Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
+// Codex file ops carry a diff stat: "Edited app.py (+12 -3)", "Added x.md (+40)".
+// The stat is what tells them apart from prose ("Added swap and a monitor").
+const _CODEX_FILEOP_RE=/^(?:Edited|Added|Created|Wrote|Updated|Deleted|Removed|Renamed|Moved|Read|Patched)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
+function _isToolHeader(line,followerIsMarker){
+  const stripped=line.replace(_ANY_DECORATION_RE,'');
+  if(_TOOL_PAREN_RE.test(stripped))return true;
+  if(_CODEX_VERB_RE.test(stripped))return true;
+  if(_CODEX_FILEOP_RE.test(stripped))return true;
+  // Structural fallback: a bullet whose next non-empty row is a `│`/`└`/`⎿`
+  // marker is a tool block whatever the verb is. Prose bullets never are.
+  return !!followerIsMarker;
+}
+// Kept for compatibility with the old two-toggle helper name.
+function _isBashFetchHeader(line){return _isToolHeader(line,false)}
+// Package/self-update chatter, plus the per-turn bookkeeping and footer hint
+// bars both CLIs print. These wrap, so a match opens a suppression block.
+const _NOISE_RES=[
   /^checking for updates?/i,
-  /^installing\b.*\b(claude|update|npm|node|package|version|v?\d)/i,
-  /^downloading\b.*\b(claude|update|npm|version|package|v?\d)/i,
-  /\b(update (installed|complete|available)|successfully updated|already up to date|claude code v?\d[\d.]* installed)\b/i,
+  /^installing\b.*\b(claude|codex|update|npm|node|package|version|v?\d)/i,
+  /^downloading\b.*\b(claude|codex|update|npm|version|package|v?\d)/i,
+  /\b(update (installed|complete|available)|successfully updated|already up to date|(claude code|codex) v?\d[\d.]* installed)\b/i,
   /^npm\b/i,
   /\bnpm (warn|notice|info|err|http|verb|sill|deprecated|audit|fund)\b/i,
   /^(added|changed|removed|audited)\s+\d+\s+packages?\b/i,
@@ -13495,54 +13564,107 @@ const _UPDATE_NOISE_RES=[
   /^found \d+ vulnerabilit/i,
   /\bnpm audit\b/i,
   /\bto (apply|finish|complete) the update\b/i,
-  /^restart claude\b/i,
+  /^restart (claude|codex)\b/i,
   /^[\[(][#=>\-.\s]{3,}[\])]/,
+  /^token usage:\s/i,
+  /^to continue this session, run (codex|claude) resume\b/i,
+  /^…\s*\+\d+\s+lines?\b/,
+  /^\+\d+\s+lines?\b/,
+  /^tip:\s/i,
+  /^context (left|remaining|window):/i,
+  /^esc to interrupt\b/i,
+  /^shell cwd was reset\b/i,
+  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,
+  /^made \d+\s+\S+.*\b(edit|change)/i,
+  /^⏵/,
+  /\bnew task\?\s*\/clear to save\b/i,
+  /^shift\+tab to cycle\b/i,
 ];
-function _isUpdateNoise(line){
+function _isNoise(line){
   if(!line)return false;
-  const s=line.replace(/^[\s⎿●⏺•·>*\-]+/,'').trim();
+  const s=line.replace(/^[\s⎿●⏺•·│└├>*\-]+/,'').trim();
   if(!s)return false;
-  for(let i=0;i<_UPDATE_NOISE_RES.length;i++){if(_UPDATE_NOISE_RES[i].test(s))return true;}
+  for(let i=0;i<_NOISE_RES.length;i++){if(_NOISE_RES[i].test(s))return true;}
   return false;
 }
+// Kept for compatibility with the old two-toggle helper name.
+function _isUpdateNoise(line){return _isNoise(line)}
+// Structural furniture the pane draws at column 0: the `›`/`❯` composer prompt,
+// the start-up banner box, and the horizontal rules between turns. These always
+// end a hidden block.
+const _PANE_STRUCTURE_RE=/^[›❯>]\s|^[╭╰╮╯│├┤─━═]/;
+// A shell prompt line ("nimo@host:~/dir$ codex --yolo") and the `export DASH_…`
+// / `cd -- …` plumbing the dashboard types to start a session. Only stripped in
+// panes that are actually running an agent — a plain shell session would
+// otherwise render as an empty page.
+const _SHELL_PROMPT_RE=/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s]*\s*[$#]\s?/;
+function _looksLikeAgentPane(text){
+  return /^[\s]*[●⏺•]/m.test(text)||text.indexOf('⎿')>=0||
+         text.indexOf('OpenAI Codex')>=0||text.indexOf('Claude Code')>=0;
+}
 function applyRawFilter(text){
-  const hideBash=getHideBashPref();
-  const hideOut=getHideOutputPref();
-  if(!hideBash&&!hideOut)return text;
+  if(!getCleanViewPref())return text;
   if(!text)return text;
   const lines=text.split('\n');
+  const agentPane=_looksLikeAgentPane(text);
+  // Index of the next non-empty line, for the structural tool-block test and
+  // for deciding whether a blank row ends a hidden block or sits inside one.
+  const nextNonEmpty=new Array(lines.length).fill(-1);
+  for(let i=lines.length-2;i>=0;i--){
+    nextNonEmpty[i]=lines[i+1].trim()===''?nextNonEmpty[i+1]:i+1;
+  }
   const out=[];
-  // A single suppression state machine that composes two independent filters:
-  //   'call'   — a hidden tool-call header (● Bash(…), Read(…), mcp__…(…)) and
-  //              its wrap-continuation rows (indented, no marker).
-  //   'output' — a hidden `⎿ …` result block and its indented continuation rows
-  //              (file dumps, "Shell cwd was reset…", "… +N lines" markers).
-  // Suppression ends at the next bullet, blank line, another ⎿, or a column-0
-  // line — so Claude's spoken text and paragraph breaks are always kept.
+  // One suppression state machine:
+  //   'call'   — a hidden tool-call header and its wrapped command rows.
+  //   'output' — a hidden ⎿/└ result block and its indented continuation rows.
+  //   'noise'  — a hidden bookkeeping/update line and its wrapped rows.
+  //   'shell'  — a hidden shell command and its wrapped rows.
+  // Suppression ends at a bullet, at pane structure, or at a blank row that is
+  // followed by something starting at column 0 — so the agent's spoken text and
+  // its paragraph breaks always survive.
   let mode='';
-  for(const line of lines){
-    if(hideBash&&_isUpdateNoise(line))continue;
-    // Start of a ⎿ output block.
-    if(_OUTPUT_MARKER_RE.test(line)){
-      if(hideOut){mode='output';continue;}   // hide the ⎿ line itself
-      mode='';out.push(line);continue;        // keep output; end any call-suppression
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(_isNoise(line)){mode='noise';continue;}
+    if(_CALL_CONT_RE.test(line)){mode='call';continue;}
+    if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
+    if(_LEADING_BULLET_RE.test(line)){
+      const nx=nextNonEmpty[i];
+      const followerIsMarker=nx>=0&&(_OUTPUT_MARKER_RE.test(lines[nx])||_CALL_CONT_RE.test(lines[nx]));
+      if(_isToolHeader(line,followerIsMarker)){mode='call';continue;}
+      mode='';out.push(line);continue;   // prose bullet
     }
-    const isBullet=_LEADING_BULLET_RE.test(line);
-    // Start of a hidden tool-call header.
-    if(hideBash&&isBullet&&_isBashFetchHeader(line)){
-      mode='call';continue;
+    if(agentPane&&_SHELL_PROMPT_RE.test(line)){mode='shell';continue;}
+    if(line.trim()===''){
+      // A blank row inside a hidden block (command output routinely has them)
+      // must not end the suppression, or the tail of the block leaks out. It
+      // ends when the block does — when the next real row is a bullet or
+      // starts at column 0.
+      const nx=nextNonEmpty[i];
+      if(mode&&nx>=0&&/^\s/.test(lines[nx])&&!_LEADING_BULLET_RE.test(lines[nx]))continue;
+      mode='';out.push(line);continue;
     }
-    // A different bullet (Claude's spoken text) — always kept, ends suppression.
-    if(isBullet){mode='';out.push(line);continue;}
-    // Blank line — keep so paragraph breaks stay intact, ends suppression.
-    if(line.trim()===''){mode='';out.push(line);continue;}
-    // Column-0 non-space — not a wrap continuation, kept, ends suppression.
-    if(/^\S/.test(line)){mode='';out.push(line);continue;}
-    // Indented continuation row — drop it if it belongs to a hidden block.
+    if(/^\S/.test(line)){
+      // Column-0 non-space. Inside an agent pane every spoken word sits inside
+      // a `•` bullet at an indent, so a column-0 row reached while a block is
+      // being hidden is that block's wrapped tail, not prose — drop it. Pane
+      // structure (rules, banner, `›` prompt) still breaks out.
+      if(mode&&agentPane&&!_PANE_STRUCTURE_RE.test(line))continue;
+      if(mode==='shell')continue;
+      mode='';out.push(line);continue;
+    }
+    // Indented continuation row — dropped if it belongs to a hidden block.
     if(mode)continue;
     out.push(line);
   }
-  return out.join('\n');
+  // Removing whole blocks leaves ragged runs of blank rows behind. Collapse
+  // them to a single separator so the conversation reads as prose.
+  const tidy=[];
+  for(const l of out){
+    if(l.trim()===''&&(!tidy.length||tidy[tidy.length-1].trim()===''))continue;
+    tidy.push(l);
+  }
+  return tidy.join('\n');
 }
 function _escTermHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -13803,16 +13925,18 @@ function rerenderAllRaw(){
     if(rawState[n]&&rawState[n].fullText)renderRawText(n);
   }
 }
-function toggleHideBash(name,checked){
-  setHideBashPref(checked);
-  const lbl=document.getElementById('hidebash-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool calls + update logs':'Off — showing all output';
-  rerenderAllRaw();
-}
-function toggleHideOutput(name,checked){
-  setHideOutputPref(checked);
-  const lbl=document.getElementById('hideoutput-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool output (⎿ …)':'Off — showing tool output';
+const CLEAN_VIEW_ON='On — only the agent\'s replies';
+const CLEAN_VIEW_OFF='Off — showing the full terminal';
+function toggleCleanView(name,checked){
+  setCleanViewPref(checked);
+  // Every open session detail panel carries its own copy of this switch, and
+  // the pref is global — keep them all in step instead of just the clicked one.
+  document.querySelectorAll('[id^="cleanview-toggle-"]').forEach(function(el){
+    if(el.checked!==checked)el.checked=checked;
+  });
+  document.querySelectorAll('[id^="cleanview-status-"]').forEach(function(el){
+    el.textContent=checked?CLEAN_VIEW_ON:CLEAN_VIEW_OFF;
+  });
   rerenderAllRaw();
 }
 const lastStatus={};
@@ -14205,31 +14329,22 @@ function renderDetail(){
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
       </div>
-      <div class="tier" style="margin-top:12px" id="hidebash-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool calls</div>
+      <div class="tier" style="margin-top:12px" id="cleanview-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Clean view</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
           <label class="watchdog-toggle">
-            <input type="checkbox" id="hidebash-toggle-${s.name}"
-              onchange="toggleHideBash('${esc(s.name)}',this.checked)"
-              ${getHideBashPref()?'checked':''}>
+            <input type="checkbox" id="cleanview-toggle-${s.name}"
+              onchange="toggleCleanView('${esc(s.name)}',this.checked)"
+              ${getCleanViewPref()?'checked':''}>
             <span class="watchdog-toggle-slider"></span>
           </label>
-          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
+          <span id="cleanview-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getCleanViewPref()?CLEAN_VIEW_ON:CLEAN_VIEW_OFF}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Use <b>Hide tool output</b> below to also drop the <code style="color:#79c0ff">⎿</code> result blocks. Setting is shared across all sessions.</div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="hideoutput-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool output</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="watchdog-toggle">
-            <input type="checkbox" id="hideoutput-toggle-${s.name}"
-              onchange="toggleHideOutput('${esc(s.name)}',this.checked)"
-              ${getHideOutputPref()?'checked':''}>
-            <span class="watchdog-toggle-slider"></span>
-          </label>
-          <span id="hideoutput-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideOutputPref()?'On — hiding tool output (⎿ …)':'Off — showing tool output'}</span>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">
+          <b style="color:#8b949e">On</b> — the terminal shows only what the agent said to you. Everything else is hidden: tool calls (<code style="color:#79c0ff">Ran …</code>, <code style="color:#79c0ff">Edited …</code>, <code style="color:#79c0ff">Explored</code>, <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code>), their tool output (<code style="color:#79c0ff">⎿</code> / <code style="color:#79c0ff">└</code> blocks, file dumps, diffs, "<code style="color:#79c0ff">… +N lines</code>"), npm/update chatter, token-usage lines and the shell commands used to start the session.<br>
+          <b style="color:#8b949e">Off</b> — the raw terminal, exactly as the agent draws it.<br>
+          Setting is shared across all sessions.
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Claude's spoken text. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
@@ -18675,6 +18790,11 @@ function renderStats(s,usage){
   }
   if(s.cpu_percent!=null){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Usage</span><span class="stats-row-value">'+s.cpu_percent+'% ('+s.cpu_count+' CPUs)</span></div>';
+  }
+  if(s.cpu_load_pct!=null){
+    // Load average as a percentage of the core count. Over 100% means tasks are
+    // queueing, which is not the same as the cores being busy.
+    html+='<div class="stats-row"><span class="stats-row-label">Run Queue</span><span class="stats-row-value">'+s.cpu_load_pct+'% of '+s.cpu_count+' cores</span></div>';
   }
   if(s.threads_running!=null){
     html+='<div class="stats-row"><span class="stats-row-label">Threads</span><span class="stats-row-value">'+s.threads_running+' running / '+s.threads_total+' total</span></div>';
