@@ -15701,13 +15701,15 @@ def _session_model_fields(session_name: str) -> dict:
         if confirmed or time.time() - pend.get("ts", 0) > 900:
             _session_model_pending.pop(session_name, None)
             pend = None
-    effort = _CODEX_DEFAULT_REASONING_EFFORT
-    try:
-        profile = _find_profile(_get_session_profile_id(session_name), _load_roles())
-        if profile and profile.get("effort"):
-            effort = profile["effort"]
-    except Exception:
-        pass
+    spec = _session_provider(session_name)
+    effort = _CODEX_DEFAULT_REASONING_EFFORT if spec.supports_effort else ""
+    if spec.supports_effort:
+        try:
+            profile = _find_profile(_get_session_profile_id(session_name), _load_roles())
+            if profile and profile.get("effort"):
+                effort = profile["effort"]
+        except Exception:
+            pass
     return {
         "model": model,
         "model_pending": (pend or {}).get("model", ""),
@@ -15715,12 +15717,51 @@ def _session_model_fields(session_name: str) -> dict:
     }
 
 
+def _claude_session_model(session_name: str) -> str:
+    """Newest model id recorded in this session's Claude transcript, if any."""
+    try:
+        cwd = get_session_cwd(session_name) or ""
+        if not cwd:
+            return ""
+        base = _session_config_base(session_name)
+        proj = base / "projects" / _encode_project_path(cwd)
+        files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in files[:2]:
+            try:
+                lines = path.read_text(errors="replace").strip().split("\n")
+            except Exception:
+                continue
+            for line in reversed(lines[-400:]):
+                if '"model"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                model = ((obj.get("message") or {}).get("model")
+                         if isinstance(obj.get("message"), dict) else None) or obj.get("model")
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
+    except Exception:
+        logger.debug("Claude model lookup failed for %s", session_name, exc_info=True)
+    return ""
+
+
 def _get_session_model(session_name: str) -> str:
-    """Detect the current model for a session by reading its latest codex rollout."""
+    """Detect the current model for a session, from its own backend's transcript."""
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
         return cached.get("model", "")
+    spec = _session_provider(session_name)
+    if spec.key == "claude":
+        # Claude records the model per assistant message in its project
+        # transcript. Reading the Codex rollouts for a Claude session reported
+        # whatever the Codex default was, which is how every Claude session in
+        # the list came to claim it was running gpt-5.6-sol.
+        model = _claude_session_model(session_name) or spec.default_model
+        _session_model_cache[session_name] = {"model": model, "ts": now}
+        return model
     files = _find_session_jsonl_files(session_name)
     if not files:
         # Fall back to the model from codex config.toml
