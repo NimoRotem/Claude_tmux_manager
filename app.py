@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -669,6 +670,11 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(autopark_task)
     logger.info("Browser auto-park watchdog started (idle %.0fmin + >%.0f%% CPU)",
                 BROWSER_AUTOPARK_IDLE_S / 60, BROWSER_BUSY_CPU_PCT)
+
+    orphan_reaper_task = asyncio.create_task(orphan_browser_reaper())
+    _background_tasks.append(orphan_reaper_task)
+    logger.info("Orphan-browser reaper started (nice %d always, kill after %.0fmin orphaned)",
+                BROWSER_NICE, ORPHAN_BROWSER_GRACE_S / 60)
 
     yield  # Application is running
 
@@ -9301,6 +9307,142 @@ async def browser_autopark_watchdog():
         except Exception:
             logger.debug("browser_autopark_watchdog cycle failed", exc_info=True)
         await asyncio.sleep(60)
+
+
+# --- Orphaned agent-browser reaper ------------------------------------------
+# browser_autopark_watchdog above only sees *registered* browser sessions
+# (_load_browser_sessions). Agents doing browser QA don't use those: they launch
+# their own Chrome with --user-data-dir inside the session scratchpad,
+# /tmp/claude-<uid>/<project>/<session-uuid>/scratchpad/... . Those trees are
+# invisible to the watchdog, so they are never reniced off nice 0, and when the
+# Claude session that spawned them exits nothing kills them — Chrome's browser
+# process goes away but its renderers and SwiftShader GPU process are reparented
+# to init and rasterise on the CPU forever.
+#
+# Measured 2026-07-27 on builder: 43 such processes from one dead session, 4.6 GiB
+# RSS, 8% of a 4-vCPU box, plus the swap pressure that RSS caused — while the
+# dashboard, top and the user all read "nothing is running". They accumulate one
+# tree per browser-QA session until the box saturates.
+#
+# Two rungs, mirroring the registered-browser guard:
+#   1. renice every scratchpad Chrome tree to BROWSER_NICE, always. A live QA
+#      browser still runs, it just yields instead of starving sshd/the dashboard.
+#   2. kill trees whose session is provably gone. "Gone" needs both signals:
+#      no live process references the session uuid, *and* the process has been
+#      reparented to init. Either alone is not enough — a browser launched with
+#      setsid by a live session also has ppid 1.
+_SCRATCH_CHROME_RE = re.compile(r"--user-data-dir=/tmp/claude-[^/\s]+/[^/\s]+/"
+                                r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                                r"[0-9a-f]{4}-[0-9a-f]{12})")
+_SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                              r"[0-9a-f]{4}-[0-9a-f]{12}")
+# Don't touch a tree younger than this — a session mid-launch has not yet wired
+# up whatever will reference it.
+ORPHAN_BROWSER_GRACE_S = float(os.environ.get("CB_ORPHAN_GRACE_S") or 600)
+
+
+def _live_session_uuids(exclude_pids: set = frozenset()) -> set:
+    """Session UUIDs referenced by any live process's environment or cmdline.
+
+    `exclude_pids` must contain the scratchpad-Chrome processes themselves.
+    Their own cmdline carries the scratchpad path — and therefore the session
+    UUID — so scanning them would make every orphan vouch for its own session
+    and the reaper would never fire. Chrome also inherits the spawning session's
+    CLAUDE_* environment, so excluding by pid is what covers both.
+    """
+    live = set()
+    for entry in globmod.glob("/proc/[0-9]*"):
+        pid = entry.rsplit("/", 1)[1]
+        if not pid.isdigit() or int(pid) in exclude_pids:
+            continue
+        for part in ("environ", "cmdline"):
+            try:
+                with open(f"{entry}/{part}", "rb") as fh:
+                    blob = fh.read(65536).decode("utf-8", "replace")
+            except Exception:
+                continue
+            live.update(_SESSION_UUID_RE.findall(blob))
+    return live
+
+
+def _scratchpad_chrome_procs() -> list:
+    """(pid, ppid, age_s, session_uuid) for every scratchpad-Chrome process."""
+    out, now, clk = [], time.time(), _CLK_TCK
+    try:
+        boot = 0.0
+        for line in open("/proc/stat"):
+            if line.startswith("btime"):
+                boot = float(line.split()[1])
+                break
+    except Exception:
+        return out
+    for entry in globmod.glob("/proc/[0-9]*"):
+        pid = entry.rsplit("/", 1)[1]
+        if not pid.isdigit():
+            continue
+        try:
+            cmd = open(f"{entry}/cmdline", "rb").read().decode("utf-8", "replace").replace("\0", " ")
+            if "chrome" not in cmd:
+                continue
+            m = _SCRATCH_CHROME_RE.search(cmd)
+            if not m:
+                continue
+            stat = open(f"{entry}/stat").read()
+            fields = stat[stat.rindex(")") + 2:].split()
+            ppid = int(fields[1])
+            started = boot + (int(fields[19]) / clk)
+        except Exception:
+            continue
+        out.append((int(pid), ppid, now - started, m.group(1)))
+    return out
+
+
+def _reap_orphan_browsers() -> tuple:
+    """Renice all scratchpad Chrome; kill the trees whose session is gone."""
+    procs = _scratchpad_chrome_procs()
+    if not procs:
+        return 0, 0
+    niced = 0
+    for pid, _ppid, _age, _sid in procs:
+        try:
+            if os.getpriority(os.PRIO_PROCESS, pid) < BROWSER_NICE:
+                os.setpriority(os.PRIO_PROCESS, pid, BROWSER_NICE)
+                niced += 1
+        except Exception:
+            continue
+    live = _live_session_uuids(exclude_pids={p[0] for p in procs})
+    doomed = [(pid, sid) for pid, ppid, age, sid in procs
+              if ppid == 1 and age > ORPHAN_BROWSER_GRACE_S and sid not in live]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        alive = []
+        for pid, sid in doomed:
+            try:
+                os.kill(pid, sig)
+                alive.append((pid, sid))
+            except ProcessLookupError:
+                continue
+            except Exception:
+                continue
+        if not alive:
+            break
+        doomed = alive
+        time.sleep(3)
+    return niced, len({sid for _pid, sid in doomed})
+
+
+async def orphan_browser_reaper():
+    """Periodically renice, and reap, agent-spawned scratchpad Chrome trees."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            niced, sessions = await asyncio.to_thread(_reap_orphan_browsers)
+            if niced or sessions:
+                logger.warning("Orphan-browser reaper: reniced %d process(es) to nice %d, "
+                               "killed leftovers from %d dead session(s)",
+                               niced, BROWSER_NICE, sessions)
+        except Exception:
+            logger.debug("orphan_browser_reaper cycle failed", exc_info=True)
+        await asyncio.sleep(300)
 
 
 @app.get("/api/browser/auth-status")
