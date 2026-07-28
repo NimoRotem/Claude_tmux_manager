@@ -16051,6 +16051,43 @@ class SendKeys(BaseModel):
 class AuthModeBody(BaseModel):
     mode: str  # "api" or "subscription"
 
+async def _submit_composer(session_name: str, text: str, tries: int = 6) -> bool:
+    """Press submit until the agent's composer actually takes the message.
+
+    Two things make a single keypress unreliable:
+
+    * Codex reads a real carriage return as "submit" and a bare line feed as
+      "newline", and tmux's `Enter` is not always the former — `C-m` is.
+    * Either CLI can be busy for tens of seconds at startup (Codex blocks on MCP
+      server handshakes), during which keystrokes queue up in the composer
+      instead of submitting. A fixed sleep cannot cover that; only checking the
+      pane can.
+
+    So: press, look, press again. Returns True once the text is no longer parked
+    in the composer.
+    """
+    marker = (text or "").strip().split("\n")[0][:60]
+    for attempt in range(tries):
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "C-m"],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.sleep(0.35 + attempt * 0.5)
+        try:
+            tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
+        except Exception:
+            return True                      # cannot check — assume it landed
+        if not marker or marker not in tail:
+            return True
+        # Still on screen, but if the agent is visibly working it has taken it
+        # and is echoing the prompt back above its own output.
+        low = tail.lower()
+        if any(m in low for m in ("esc to interrupt", "working", "worked for", "tokens used")):
+            return True
+    logger.warning("Composer for '%s' did not clear after %d submit attempts",
+                   session_name, tries)
+    return False
+
+
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(request: Request, session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
@@ -16114,26 +16151,9 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             # before pressing Enter. Scale with length; cap at 5s.
             wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
             await asyncio.sleep(wait_secs)
-            # Press Enter to submit
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-            # Belt-and-braces: if a bracketed paste preview is still showing
-            # (because the escape sequence arrived too late, or bracketed paste
-            # was re-enabled mid-flight), a second Enter usually dismisses the
-            # preview and submits. Check the pane, only re-press Enter if we
-            # still see paste preview markers.
-            await asyncio.sleep(0.4)
-            try:
-                tail = await asyncio.to_thread(capture_pane_recent, session_name, 6)
-                if "Pasted text" in tail or "[Pasted" in tail:
-                    await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "Enter"],
-                        capture_output=True, text=True, timeout=5
-                    )
-            except Exception:
-                logger.debug("Post-paste verification failed", exc_info=True)
+            # Submit, and keep checking until the composer clears — a paste
+            # preview or a busy startup can swallow the first press.
+            await _submit_composer(session_name, cmd_text)
         else:
             # Short messages: send-keys -l is fine, but Codex's TUI needs one
             # render tick before Enter. Sending text and Enter back-to-back can
@@ -16143,11 +16163,8 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
                 capture_output=True, text=True, timeout=5
             )
             await asyncio.sleep(0.25)
-            # Press Enter as a separate key event
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            # Submit as a separate key event, verified — see _submit_composer.
+            await _submit_composer(session_name, cmd_text)
         # Record user message in chat history
         now = time.time()
         entry = cache.setdefault(session_name, {})
