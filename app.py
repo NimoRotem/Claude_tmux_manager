@@ -1129,13 +1129,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
      /browser/<sid>/login and the sign-in silently did nothing. -->
 <form class="login-box" method="POST" action="__ROOT_PATH__/login">
   <h2>__BRAND__ Dashboard</h2>
-  <p>Enter credentials to continue.</p>
+  <p>Log in to continue.</p>
   <div class="err" id="err">Invalid username or password.</div>
 __GOOGLE_BTN__
-  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
-  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+__PASSWORD_LOGIN__
   <input type="hidden" name="next" id="next">
-  <button class="login-btn" type="submit">Log in</button>
 </form>
 <script>
 var q=new URLSearchParams(location.search),e=document.getElementById('err');
@@ -1160,8 +1158,11 @@ if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
 _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
     <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
     Continue with Google</a>
-  <div class="ghint">__GOOGLE_HINT__</div>
-  <div class="sep">or sign in with a password</div>"""
+  <div class="ghint">__GOOGLE_HINT__</div>"""
+
+_PASSWORD_LOGIN_HTML = """  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
+  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
+  <button class="login-btn" type="submit">Log in</button>"""
 
 
 def _login_page() -> str:
@@ -1172,10 +1173,19 @@ def _login_page() -> str:
     load instead of needing the app restarted.
     """
     if not _google_login_enabled():
-        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+        return (
+            LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+            .replace("__PASSWORD_LOGIN__", _PASSWORD_LOGIN_HTML)
+        )
     domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
     hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
-    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
+    return (
+        LOGIN_PAGE.replace(
+            "__GOOGLE_BTN__",
+            _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint),
+        )
+        .replace("__PASSWORD_LOGIN__", "")
+    )
 
 
 def _apply_security_headers(request: Request, response: Response) -> Response:
@@ -1437,10 +1447,13 @@ async def do_login(request: Request):
     return resp
 
 
-@app.post("/logout")
+@app.api_route("/logout", methods=["GET", "POST"])
 async def do_logout(request: Request):
-    resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
-    resp.delete_cookie(AUTH_COOKIE)
+    root = request.scope.get("root_path", "").rstrip("/") + "/"
+    resp = RedirectResponse(url=root, status_code=303)
+    resp.delete_cookie(AUTH_COOKIE, path="/")
+    resp.delete_cookie("tmux_imp_orig", path="/")
+    resp.delete_cookie(AUTH_COOKIE + "_google_state", path="/")
     return resp
 
 
@@ -17320,7 +17333,7 @@ function renderAuthPanel(){
       ${usageHtml}
       <hr class="auth-divider">
       ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-bottom:8px" onclick="clearApiKey()">Clear stored API key</button>':''}
-      <button class="auth-btn auth-btn-danger" onclick="codexLogout()">Sign out of Codex</button>
+      <button class="auth-btn auth-btn-danger" onclick="doLogout()">Sign out</button>
     `;
   }else{
     el.innerHTML=`
