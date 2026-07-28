@@ -273,16 +273,31 @@ def _merge_managed(path: Path, body: str) -> str:
     return block + ("\n" + existing.lstrip("\n") if existing.strip() else "")
 
 
-def _merge_toml(path: Path, managed: str) -> str:
-    """Same idea for TOML, using comment markers."""
-    begin, end = "# >>> agentctx managed >>>", "# <<< agentctx managed <<<"
+_TOML_SCALARS = ("# >>> agentctx managed >>>", "# <<< agentctx managed <<<")
+_TOML_TABLES = ("# >>> agentctx mcp >>>", "# <<< agentctx mcp <<<")
+
+
+def _merge_toml(path: Path, managed: str, markers: tuple = _TOML_SCALARS,
+                at_end: bool = False) -> str:
+    """Splice a managed block into a TOML file, in place if it is already there.
+
+    `at_end` matters: TOML assigns every key after a [table] header to that
+    table, so a block containing tables has to be last and a block of bare
+    scalars has to be first. Getting this backwards silently reparents the
+    file's own top-level keys into someone else's table.
+    """
+    begin, end = markers
     existing = path.read_text() if path.exists() else ""
     block = f"{begin}\n{managed.strip()}\n{end}\n"
     if begin in existing and end in existing:
         head = existing.split(begin, 1)[0]
         tail = existing.split(end, 1)[1]
         return head + block + tail.lstrip("\n")
-    return block + ("\n" + existing.lstrip("\n") if existing.strip() else "")
+    if not existing.strip():
+        return block
+    if at_end:
+        return existing.rstrip("\n") + "\n\n" + block
+    return block + "\n" + existing.lstrip("\n")
 
 
 def render(backend: str, home: Path, *, level: str | None = None,
@@ -358,6 +373,13 @@ def render(backend: str, home: Path, *, level: str | None = None,
     servers = mcp_servers(env)
     for rendered in adapter.render_settings(home, policy=policy, tier=tier_cfg,
                                             mcp=servers, ignore=ignore, render_env=env):
+        if rendered.path.name == "config.mcp.toml":
+            # MCP tables belong at the very end of config.toml — see _merge_toml.
+            target = home / "config.toml"
+            target.write_text(_merge_toml(target, rendered.content,
+                                          markers=_TOML_TABLES, at_end=True))
+            written.append(str(target))
+            continue
         if rendered.path.suffix == ".toml":
             rendered.path.write_text(_merge_toml(rendered.path, rendered.content))
         elif rendered.path.name == "settings.json":
@@ -436,11 +458,24 @@ def _merge_json_settings(path: Path, new_content: str,
 
 
 def _merge_toml_notify(path: Path, line: str) -> str:
-    """`notify` is a top-level key; replace it in place if present."""
+    """`notify` is a top-level key, so it must land BEFORE the first table.
+
+    Appending it to the end of the file made it a member of whatever table came
+    last — in practice `[mcp_servers.memory.env]`, which Codex then rejected.
+    """
     existing = path.read_text() if path.exists() else ""
     if re.search(r"^notify\s*=", existing, re.M):
         return re.sub(r"^notify\s*=.*$", line.strip(), existing, count=1, flags=re.M)
-    return (existing.rstrip("\n") + "\n" + line.strip() + "\n") if existing.strip() else line
+    if not existing.strip():
+        return line.strip() + "\n"
+    lines = existing.split("\n")
+    insert_at = len(lines)
+    for i, row in enumerate(lines):
+        if row.lstrip().startswith("["):
+            insert_at = i
+            break
+    lines.insert(insert_at, line.strip())
+    return "\n".join(lines)
 
 
 def render_all(homes: dict[str, Path], **kwargs) -> list[RenderResult]:

@@ -73,14 +73,21 @@ class CodexAdapter(BackendAdapter):
         if codex_policy.get("approval_policy"):
             managed["approval_policy"] = codex_policy["approval_policy"]
 
-        lines = [
+        # TOML is position-sensitive: every key after a [table] header belongs to
+        # that table. So managed SCALARS and managed TABLES cannot live in one
+        # block — writing the block at the top swallowed the file's own
+        # top-level keys into our last MCP env table ("invalid type: boolean
+        # false, expected a string"), and writing it at the bottom would swallow
+        # ours into the user's. They are emitted separately; the renderer puts
+        # scalars first and tables last.
+        scalars = [
             "# Managed by agentctx — edits between the markers are overwritten.",
             "# Source: agentctx/core/{runtime,policy,mcp}.yaml",
         ]
         for key, value in managed.items():
-            lines.append(f"{key} = {_toml_value(value)}")
-        lines.append("")
+            scalars.append(f"{key} = {_toml_value(value)}")
 
+        lines = []
         for name, spec in (mcp or {}).items():
             lines.append(f"[mcp_servers.{name}]")
             lines.append(f"command = {_toml_value(spec['command'])}")
@@ -95,11 +102,18 @@ class CodexAdapter(BackendAdapter):
                     lines.append(f"{k} = {_toml_value(v)}")
             lines.append("")
 
-        return [RenderedFile(
-            path=home / self.settings_filename,
-            content="\n".join(lines),
-            note="managed model/effort/sandbox keys + MCP tables (merged, not overwritten)",
-        )]
+        return [
+            RenderedFile(
+                path=home / self.settings_filename,
+                content="\n".join(scalars),
+                note="managed top-level keys (model, effort, sandbox, approval)",
+            ),
+            RenderedFile(
+                path=home / "config.mcp.toml",
+                content="\n".join(lines),
+                note="managed [mcp_servers.*] tables — appended after all scalars",
+            ),
+        ]
 
     def render_event_hooks(self, home: Path, emit_script: Path) -> list[RenderedFile]:
         """Codex has one notify program where Claude has four hook points.
