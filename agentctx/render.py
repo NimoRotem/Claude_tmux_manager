@@ -277,8 +277,30 @@ _TOML_SCALARS = ("# >>> agentctx managed >>>", "# <<< agentctx managed <<<")
 _TOML_TABLES = ("# >>> agentctx mcp >>>", "# <<< agentctx mcp <<<")
 
 
+def _strip_top_level_keys(text: str, keys) -> str:
+    """Drop the file's own copies of keys we now manage, above the first table.
+
+    TOML forbids defining a key twice, so leaving the original `model = ...`
+    beside our managed one makes the whole file unparseable: "Cannot overwrite
+    a value". Only the top-level region is touched — an identically named key
+    inside a [table] is a different key and stays.
+    """
+    if not keys:
+        return text
+    out, in_tables = [], False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("["):
+            in_tables = True
+        if not in_tables:
+            name = line.split("=", 1)[0].strip() if "=" in line else ""
+            if name in keys:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _merge_toml(path: Path, managed: str, markers: tuple = _TOML_SCALARS,
-                at_end: bool = False) -> str:
+                at_end: bool = False, owned_keys=()) -> str:
     """Splice a managed block into a TOML file, in place if it is already there.
 
     `at_end` matters: TOML assigns every key after a [table] header to that
@@ -290,11 +312,12 @@ def _merge_toml(path: Path, managed: str, markers: tuple = _TOML_SCALARS,
     existing = path.read_text() if path.exists() else ""
     block = f"{begin}\n{managed.strip()}\n{end}\n"
     if begin in existing and end in existing:
-        head = existing.split(begin, 1)[0]
-        tail = existing.split(end, 1)[1]
+        head = _strip_top_level_keys(existing.split(begin, 1)[0], owned_keys)
+        tail = _strip_top_level_keys(existing.split(end, 1)[1], owned_keys)
         return head + block + tail.lstrip("\n")
     if not existing.strip():
         return block
+    existing = _strip_top_level_keys(existing, owned_keys)
     if at_end:
         return existing.rstrip("\n") + "\n\n" + block
     return block + "\n" + existing.lstrip("\n")
@@ -381,7 +404,11 @@ def render(backend: str, home: Path, *, level: str | None = None,
             written.append(str(target))
             continue
         if rendered.path.suffix == ".toml":
-            rendered.path.write_text(_merge_toml(rendered.path, rendered.content))
+            owned = tuple(l.split("=", 1)[0].strip()
+                          for l in rendered.content.split("\n")
+                          if "=" in l and not l.lstrip().startswith("#"))
+            rendered.path.write_text(
+                _merge_toml(rendered.path, rendered.content, owned_keys=owned))
         elif rendered.path.name == "settings.json":
             rendered.path.write_text(_merge_json_settings(rendered.path, rendered.content))
         elif rendered.path.name == ".claude.json":
