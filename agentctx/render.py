@@ -370,7 +370,10 @@ def render(backend: str, home: Path, *, level: str | None = None,
     for rendered in adapter.render_event_hooks(home, EMIT_SCRIPT):
         if rendered.path.name == "settings.hooks.json":
             target = home / "settings.json"
-            target.write_text(_merge_json_settings(target, rendered.content))
+            # Hooks are a second write into the same file and carry no
+            # permissions block — merging them must not be read as "agentctx
+            # rendered no permissions", or it deletes the ones just written.
+            target.write_text(_merge_json_settings(target, rendered.content, owned=()))
             written.append(str(target))
         elif rendered.path.name == "notify.toml":
             target = home / "config.toml"
@@ -388,8 +391,17 @@ def render(backend: str, home: Path, *, level: str | None = None,
     return RenderResult(adapter.key, home, written, skipped)
 
 
-def _merge_json_settings(path: Path, new_content: str) -> str:
-    """Deep-merge managed JSON settings into whatever is already there."""
+# Keys agentctx owns outright. Everything else in a settings file is merged, so a
+# user's own additions survive a re-render — but an OWNED key is replaced whole.
+# Deep-merging these was wrong in a way that only showed up on a level change:
+# switching workspace-write -> full-access left the old deny list sitting beside
+# the new `allow: ["*"]`, so the rendered policy was neither level.
+_OWNED_JSON_KEYS = ("permissions",)
+
+
+def _merge_json_settings(path: Path, new_content: str,
+                         owned: tuple = _OWNED_JSON_KEYS) -> str:
+    """Merge managed JSON settings into whatever is already there."""
     try:
         existing = json.loads(path.read_text()) if path.exists() else {}
     except Exception:
@@ -399,10 +411,21 @@ def _merge_json_settings(path: Path, new_content: str) -> str:
     def merge(a: dict, b: dict) -> dict:
         out = dict(a)
         for k, v in b.items():
-            out[k] = merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = merge(out[k], v)
+            else:
+                out[k] = v
         return out
 
-    return json.dumps(merge(existing, incoming), indent=2) + "\n"
+    merged = merge(existing, incoming)
+    for key in owned:
+        if key in incoming:
+            merged[key] = incoming[key]
+        elif key in existing:
+            # We own it and rendered nothing for it: drop the stale value rather
+            # than leaving a previous level's rules in force.
+            merged.pop(key, None)
+    return json.dumps(merged, indent=2) + "\n"
 
 
 def _merge_toml_notify(path: Path, line: str) -> str:
