@@ -234,12 +234,13 @@ def _agent_launch_cmd(cmd: str, pin_model: bool = True, resume: bool = False,
     """
     spec = provider or provider_for_command(cmd) or DEFAULT_PROVIDER
     base = (cmd or "").strip() or NEW_SESSION_CMD
-    chosen_model = model or (DEFAULT_MODEL if pin_model else "")
+    # DEFAULT_MODEL belongs to the dashboard's DEFAULT backend. Handing it to the
+    # other one launches e.g. `claude --model gpt-5.6-sol`, which drops straight
+    # to the login picker and looks exactly like an auth failure.
+    fallback = DEFAULT_MODEL if spec is DEFAULT_PROVIDER else spec.default_model
+    chosen_model = model or (fallback if pin_model else "")
     known = _models_for(spec)
     if chosen_model and known and chosen_model not in known:
-        # A model pinned for the other backend must not leak across; fall back
-        # to that backend's own default rather than passing a name it rejects.
-        # An empty catalog means "we do not know yet" — pass the name through.
         chosen_model = spec.default_model if pin_model else ""
     if resume:
         return spec.resume_cmd(base=base, session_id=session_id, model=chosen_model)
@@ -332,9 +333,13 @@ PUBLIC_BASE_URL = os.environ.get(
     "TMUX_DASH_PUBLIC_URL",
     "",
 ).rstrip("/")  # e.g. https://build.grabo.tools
-PUB_URL = (
-    PUBLIC_BASE_URL or f"http://127.0.0.1:{PORT}"
-) + ROOT_PATH  # external base including any configured root path
+# External base including the root path — but only appended once. A configured
+# TMUX_DASH_PUBLIC_URL that already ends in the root path (the natural way to
+# write it) used to produce ".../build/build/<user>/<project>" in every project
+# link the agent was told to publish to.
+PUB_URL = PUBLIC_BASE_URL or f"http://127.0.0.1:{PORT}"
+if ROOT_PATH and not PUB_URL.endswith(ROOT_PATH):
+    PUB_URL += ROOT_PATH
 HOST_MACHINE = os.environ.get(
     "TMUX_DASH_HOSTNAME",
     os.uname().nodename,
