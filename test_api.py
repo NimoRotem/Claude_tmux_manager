@@ -1,6 +1,7 @@
 """Integration tests for tmux Dashboard API endpoints using FastAPI TestClient."""
 import json
 import os
+import re
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1933,6 +1934,124 @@ class TestSecurityHeaders:
 
 
 class TestDashboardFrontendRegressions:
+    def test_voice_button_names_recording_and_transcribing_states(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        recording_start = html.index("async function toggleRecording(key)")
+        recording_end = html.index("async function sendChat(name)", recording_start)
+
+        assert (
+            "btn.setAttribute('aria-label','Stop recording and transcribe')"
+            in html[recording_start:recording_end],
+            "btn.setAttribute('aria-label','Transcribing voice message')"
+            in html[recording_start:recording_end],
+        ) == (True, True)
+
+    def test_voice_recording_has_visible_recording_and_transcribing_feedback(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        recording_rule = re.search(
+            r"\.composer-action\.is-recording\{([^}]*)\}",
+            html,
+        )
+        spinner_rule = re.search(r"\.composer-spin\{([^}]*)\}", html)
+
+        assert (
+            bool(recording_rule and "background:#da3633" in recording_rule.group(1)),
+            bool(spinner_rule and "animation:" in spinner_rule.group(1)),
+        ) == (True, True)
+
+    def test_composer_button_accessible_name_tracks_its_current_action(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        update_start = html.index("function updateComposerBtn(key)")
+        update_end = html.index("function composerAction(key)", update_start)
+
+        assert "btn.setAttribute('aria-label',label)" in html[update_start:update_end]
+
+    def test_successful_sends_return_both_buttons_to_microphone_state(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        chat_start = html.index("async function sendChat(name)")
+        chat_end = html.index("function setOptimisticBusy", chat_start)
+        raw_start = html.index("async function sendCmd(name,source)")
+        raw_end = html.index("function startRawPolling", raw_start)
+
+        assert (
+            "updateComposerBtn('chat-'+name)" in html[chat_start:chat_end],
+            "updateComposerBtn(source+'-'+name)" in html[raw_start:raw_end],
+        ) == (True, True)
+
+    def test_restored_drafts_restore_the_send_button_state(self, authed_client):
+        html = authed_client.get("/").text
+        restore_start = html.index("function restoreDrafts()")
+        restore_end = html.index("function updateFavicon", restore_start)
+
+        assert "updateComposerBtn(key)" in html[restore_start:restore_end]
+
+    def test_composer_action_is_a_round_record_button(self, authed_client):
+        html = authed_client.get("/").text
+        action_rule = re.search(r"\.btn\.composer-action\{([^}]*)\}", html)
+
+        assert (
+            action_rule
+            and "width:48px" in action_rule.group(1)
+            and "height:48px" in action_rule.group(1)
+            and "border-radius:50%" in action_rule.group(1)
+        )
+
+    def test_composer_action_stays_green_when_hovered(self, authed_client):
+        html = authed_client.get("/").text
+        hover_rule = re.search(r"\.btn\.composer-action:hover\{([^}]*)\}", html)
+
+        assert hover_rule and "background:#2ea043" in hover_rule.group(1)
+
+    def test_typed_message_state_styles_the_action_button_green(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        send_rule = re.search(r"\.composer-action\.is-send\{([^}]*)\}", html)
+
+        assert send_rule and "background:#238636" in send_rule.group(1)
+
+    def test_typing_updates_both_composer_buttons(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert html.count('oninput="autoGrow(this);updateComposerBtn(\'') == 2
+
+    def test_empty_chat_and_terminal_composers_render_microphone_buttons(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+
+        assert html.count('class="btn cmd-send composer-action is-mic"') == 2
+
+    def test_message_composer_is_tall_enough_for_multiple_lines(self, authed_client):
+        html = authed_client.get("/").text
+        composer_rule = re.search(r"\.cmd-input\{[^}]*min-height:(\d+)px", html)
+
+        assert composer_rule and int(composer_rule.group(1)) >= 80
+
+    def test_terminal_reload_is_in_the_session_header(self, authed_client):
+        html = authed_client.get("/").text
+        header_start = html.index('<div class="detail-badges">')
+        header_end = html.index(
+            '\n      </div>\n    </div>\n\n    <div class="tab-content',
+            header_start,
+        )
+
+        assert "onclick=\"loadRaw('${s.name}')\"" in html[header_start:header_end]
+
     def test_terminal_renderer_defines_update_filter_before_use(self, authed_client):
         html = authed_client.get("/").text
         definition = html.index("function _isNoise(line)")
@@ -3415,6 +3534,11 @@ class TestExtendedSecurityHeaders:
         pp = resp.headers.get("Permissions-Policy", "")
         assert pp, "Permissions-Policy header should be set"
         assert "camera=()" in pp
+
+    def test_permissions_policy_allows_same_origin_microphone(self, authed_client):
+        resp = authed_client.get("/")
+
+        assert "microphone=(self)" in resp.headers.get("Permissions-Policy", "")
 
     def test_csp_on_api_endpoints(self, authed_client):
         with patch("app.get_tmux_sessions", return_value=[]):
