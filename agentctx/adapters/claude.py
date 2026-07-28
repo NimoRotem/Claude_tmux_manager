@@ -37,11 +37,17 @@ class ClaudeAdapter(BackendAdapter):
         claude_tier = (tier or {}).get("claude", {}) or {}
 
         permissions = {}
+        if claude_policy.get("default_mode"):
+            permissions["defaultMode"] = claude_policy["default_mode"]
         if claude_policy.get("allow"):
             permissions["allow"] = list(claude_policy["allow"])
         # The ignore list is enforceable here, so enforce it as well as saying it.
+        # Not at full access though: a deny rule beside `allow: ["*"]` reopens the
+        # acceptance prompt this level exists to avoid, and the prose in the
+        # context file still carries the same instruction.
         deny = list(claude_policy.get("deny") or [])
-        deny += [f"Read({p})" for p in ignore if not p.startswith("/home/*")]
+        if claude_policy.get("default_mode") != "bypassPermissions":
+            deny += [f"Read({p})" for p in ignore if not p.startswith("/home/*")]
         if deny:
             permissions["deny"] = deny
 
@@ -50,11 +56,14 @@ class ClaudeAdapter(BackendAdapter):
             settings["permissions"] = permissions
         if claude_tier.get("model"):
             settings["model"] = claude_tier["model"]
+        env_block = dict(claude_policy.get("env") or {})
         budget = claude_tier.get("thinking_budget")
         if budget:
             # Claude expresses depth as a token budget; Codex as an enum. The
             # tier name is the only thing that maps — see core/runtime.yaml.
-            settings["env"] = {"MAX_THINKING_TOKENS": str(budget)}
+            env_block["MAX_THINKING_TOKENS"] = str(budget)
+        if env_block:
+            settings["env"] = env_block
 
         out.append(RenderedFile(
             path=home / self.settings_filename,

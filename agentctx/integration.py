@@ -29,6 +29,10 @@ logger = logging.getLogger("agentctx")
 
 ROOT = Path(__file__).resolve().parent
 STATE = Path(os.environ.get("AGENTCTX_STATE") or (ROOT / "state"))
+# The dashboard launches every session with its backend's full-access flags, so
+# the rendered policy has to match. A mismatch is not a security posture, it is
+# a hung pane: Claude stops on an acceptance prompt, Codex on an approval.
+DEFAULT_LEVEL = os.environ.get("AGENTCTX_POLICY_LEVEL", "full-access")
 EMIT = ROOT / "runtime" / "events" / "emit.sh"
 
 
@@ -43,7 +47,7 @@ def prepare_session(backend: str, home: Path, cwd: str | None, *,
     except Exception as exc:
         digest, _ = "", out["errors"].append(f"digest: {exc}")
     try:
-        result = render.render(backend, Path(home), level=level, tier=tier,
+        result = render.render(backend, Path(home), level=level or DEFAULT_LEVEL, tier=tier,
                                memory_digest=digest, render_env=render_env)
         out["rendered"] = result.written
     except Exception as exc:

@@ -40,8 +40,15 @@ levels:
   full-access:
     description: Unattended, no sandbox. What the dashboard launches by default.
     claude:
-      allow: []
+      # `--dangerously-skip-permissions` alone still stops on an acceptance
+      # prompt the first time, which looks exactly like a hung session in a
+      # dashboard pane. defaultMode + the env var are what actually make it
+      # unattended.
+      default_mode: bypassPermissions
+      allow: ["*"]
       deny:  []
+      env:
+        CLAUDE_CODE_PERMISSION_MODE: bypassPermissions
       extra_flags: ["--dangerously-skip-permissions"]
     codex:
       sandbox_mode: danger-full-access
