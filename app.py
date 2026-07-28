@@ -5785,20 +5785,20 @@ NOTES_TTL = 600        # 10 minutes
 
 # Sessions whose pane is running Codex belong in this dashboard. Bare shells are
 # also shown so a crashed/exited Codex session can be restarted from the UI.
-_CODEX_DASH_VISIBILITY_CACHE: dict[str, tuple] = {}
-_CODEX_DASH_VISIBILITY_TTL = 5.0
+_AGENT_DASH_VISIBILITY_CACHE: dict[str, tuple] = {}
+_AGENT_DASH_VISIBILITY_TTL = 5.0
 
 
-def _session_is_codex(name: str) -> bool:
-    """Return True if this tmux session belongs to the codex dashboard.
+def _session_is_managed_agent(name: str) -> bool:
+    """Return True if this tmux session belongs to this dashboard.
 
-    A codex process means show it here. A bare shell is also shown because it is
-    the state left behind after Codex exits or crashes. Other active foreground
-    programs are hidden.
+    Any managed backend's process means show it. A bare shell is also shown
+    because that is the state left behind after an agent exits or crashes.
+    Other active foreground programs (someone's own vim, a build) stay hidden.
     """
     now = time.time()
-    cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
-    if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
+    cached = _AGENT_DASH_VISIBILITY_CACHE.get(name)
+    if cached and now - cached[1] < _AGENT_DASH_VISIBILITY_TTL:
         return cached[0]
     try:
         pp = subprocess.run(
@@ -5806,11 +5806,11 @@ def _session_is_codex(name: str) -> bool:
             capture_output=True, text=True, timeout=3,
         )
         if pp.returncode != 0:
-            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
+            _AGENT_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
         pane_pid = (pp.stdout or "").strip()
         if not pane_pid.isdigit():
-            _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
+            _AGENT_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
         to_check = [pane_pid]
         seen = {pane_pid}
@@ -5831,17 +5831,23 @@ def _session_is_codex(name: str) -> bool:
                     seen.add(pid)
                     descendants.append(pid)
                     to_check.append(pid)
-        has_codex = False
+        # ANY managed backend counts, not just Codex. This gate is what decides
+        # whether a tmux session appears in the dashboard at all, so hard-coding
+        # one CLI here hides every session of the other one — including from the
+        # delete route, which then 404s on a session that plainly exists.
+        has_agent = False
         for pid in descendants:
             try:
                 with open(f"/proc/{pid}/comm") as f:
                     comm = f.read().strip().lower()
+                argv = open(f"/proc/{pid}/cmdline", "rb").read().replace(
+                    b"\0", b" ").decode(errors="replace").lower()
             except Exception:
                 continue
-            if comm == "codex":
-                has_codex = True
+            if any(spec.is_process(comm, argv) for spec in PROVIDERS.values()):
+                has_agent = True
                 break
-        if has_codex:
+        if has_agent:
             decision = True
         else:
             cmd_res = subprocess.run(
@@ -5852,7 +5858,7 @@ def _session_is_codex(name: str) -> bool:
             decision = cmd in {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
     except Exception:
         decision = False
-    _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
+    _AGENT_DASH_VISIBILITY_CACHE[name] = (decision, now)
     return decision
 
 
@@ -5873,8 +5879,8 @@ def get_tmux_sessions() -> list[dict]:
             name = parts[0]
             if name.startswith("__") and name.endswith("__"):
                 continue  # Skip internal sessions (e.g. __auth_login_tmp__)
-            if not _session_is_codex(name):
-                continue  # Hide non-Codex tmux sessions from the codex dashboard
+            if not _session_is_managed_agent(name):
+                continue  # Not one of ours — someone else's tmux session
             sessions.append({
                 "name": name,
                 "windows": parts[1] if len(parts) > 1 else "?",
