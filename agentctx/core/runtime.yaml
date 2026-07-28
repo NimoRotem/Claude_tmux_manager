@@ -1,0 +1,45 @@
+# Model + runtime tuning (abstraction 9).
+#
+#   Claude → .claude/settings.json   model, and a thinking budget
+#   Codex  → config.toml             model, model_reasoning_effort
+#
+# These are semantically parallel but there is no honest numeric mapping between
+# a token thinking budget and an effort enum. So the source of truth is a set of
+# NAMED TIERS, and each adapter says what that tier means for its backend. Ask
+# for a tier, never for a raw number.
+
+default_tier: default
+
+tiers:
+  fast:
+    description: Short turnaround, shallow reasoning. Mechanical edits, lookups.
+    claude:
+      model: claude-haiku-4-5-20251001
+      thinking_budget: 0
+    codex:
+      model: gpt-5.6-sol
+      model_reasoning_effort: low
+
+  default:
+    description: The everyday tier. Most sessions should stay here.
+    claude:
+      model: claude-opus-5[1m]
+      thinking_budget: 8000
+    codex:
+      model: gpt-5.6-sol
+      model_reasoning_effort: medium
+
+  deep:
+    description: Hard debugging, architecture, anything worth waiting for.
+    claude:
+      model: claude-opus-5[1m]
+      thinking_budget: 32000
+    codex:
+      model: gpt-5.6-sol
+      model_reasoning_effort: max
+
+# Applied to every tier on both backends.
+common:
+  # Keep a session's own output out of its next prompt where the backend
+  # supports it; both truncate very long tool output by default anyway.
+  max_output_tokens: 0        # 0 = leave the backend's own default alone

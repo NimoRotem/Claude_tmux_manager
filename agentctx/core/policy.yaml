@@ -1,0 +1,59 @@
+# Permissions / sandbox (abstraction 5).
+#
+# The two backends do not model this the same way and the mapping IS lossy:
+#
+#   Claude  per-tool rule lists   -> .claude/settings.json  permissions.allow/deny
+#   Codex   one sandbox mode      -> config.toml  sandbox_mode + approval_policy
+#           plus an approval policy
+#
+# So we define three levels and give each adapter an explicit table. Treat the
+# levels as approximate equivalents, not as identical guarantees: a Claude deny
+# rule blocks one tool call, while a Codex sandbox mode constrains the whole
+# process. Where they disagree, the Codex side is the coarser one.
+
+default_level: workspace-write
+
+levels:
+  read-only:
+    description: Can read the workspace and search; no writes, no network writes.
+    claude:
+      allow: ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status:*)",
+              "Bash(git log:*)", "Bash(git diff:*)", "Bash(ls:*)", "Bash(cat:*)"]
+      deny:  ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(rm:*)",
+              "Bash(git push:*)", "Bash(git commit:*)"]
+    codex:
+      sandbox_mode: read-only
+      approval_policy: never
+
+  workspace-write:
+    description: Full read/write inside the session's workspace; network allowed.
+    claude:
+      # No deny list beyond the always-denied set: Claude is launched with
+      # permissions pre-granted, and a partial allow list here would silently
+      # block tools the agent needs mid-task.
+      allow: []
+      deny:  ["Bash(sudo rm:*)", "Bash(mkfs:*)", "Bash(git push --force:*)"]
+    codex:
+      sandbox_mode: workspace-write
+      approval_policy: never
+
+  full-access:
+    description: Unattended, no sandbox. What the dashboard launches by default.
+    claude:
+      allow: []
+      deny:  []
+      extra_flags: ["--dangerously-skip-permissions"]
+    codex:
+      sandbox_mode: danger-full-access
+      approval_policy: never
+      extra_flags: ["--dangerously-bypass-approvals-and-sandbox"]
+
+# Applied at every level, on both backends, as instruction text as well as
+# config — the wording lands in the rendered context file so an agent that can
+# technically do these still knows not to.
+always_confirm:
+  - Deleting or overwriting data that is not in version control
+  - Dropping or truncating a database table
+  - Force-pushing, or rewriting history on a shared branch
+  - Sending mail or messages to anyone outside this machine
+  - Spending money

@@ -1,0 +1,45 @@
+# MCP servers — one definition, transcoded per backend.
+#
+#   Claude → .mcp.json            {"mcpServers": {"<name>": {...}}}
+#   Codex  → config.toml          [mcp_servers.<name>]
+#
+# Only the shape differs; the servers, their commands and their env are the same,
+# which is the point — this is where all shared custom capability lives, so a
+# session that switches backend keeps every tool it had.
+#
+# env values support ${VAR} interpolation from the render environment. A value
+# that resolves to empty is dropped rather than written as "", because an empty
+# credential is worse than an absent one: the server starts and then fails.
+
+servers:
+  memory:
+    # The shared memory store (abstraction 6). Neither backend's native memory
+    # feature is used — both read and write through here, so a mid-task switch
+    # from Claude to Codex loses nothing.
+    command: python3
+    args: ["-m", "agentctx.memory_server"]
+    # -m needs the package's PARENT on the path, not the package itself.
+    cwd: "${AGENTCTX_HOME}"
+    env:
+      AGENTCTX_STATE: "${AGENTCTX_STATE}"
+      PYTHONPATH: "${AGENTCTX_HOME}"
+    description: Durable cross-session memory, shared by both backends.
+    startup_timeout_s: 20
+
+  docvault:
+    command: python3
+    args: ["${AGENTCTX_HOME}/docvault_mcp.py"]
+    env:
+      DOCVAULT_MCP_URL: "${DOCVAULT_MCP_URL}"
+      DOCVAULT_MCP_KEY: "${DOCVAULT_MCP_KEY}"
+    description: Full-text search over the company document vault.
+    enabled_when_env: DOCVAULT_MCP_KEY
+
+  google:
+    command: python3
+    args: ["${AGENTCTX_HOME}/google_workspace_mcp.py"]
+    env:
+      GOOGLE_MCP_TOKENS: "${GOOGLE_MCP_TOKENS}"
+      GOOGLE_MCP_SUBJECT: "${GOOGLE_MCP_SUBJECT}"
+    description: Company Gmail, Drive and Calendar (read-only).
+    enabled_when_env: GOOGLE_MCP_TOKENS

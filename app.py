@@ -35,6 +35,11 @@ import browser_resource_guard
 from providers import (DEFAULT_PROVIDER, PROVIDERS, enabled_providers, get_provider,
                        provider_for_command, public_dict)
 
+try:
+    from agentctx import integration as agentctx
+except Exception:  # the dashboard must boot even with a broken context toolkit
+    agentctx = None
+
 logger = logging.getLogger("agent-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
@@ -7442,6 +7447,28 @@ async def api_create_session(request: Request, body: CreateSession):
         # Optionally launch a command in the new session. Team members keep the
         # model pinned in their isolated Codex config; admins use the dashboard default.
         _record_session_backend(created, spec.key)
+        # Give the session its context before the CLI starts reading it:
+        # instructions, skills, prompts, MCP servers, policy, runtime tier and
+        # the memory digest, all rendered from agentctx/core for THIS backend.
+        if agentctx is not None:
+            try:
+                session_cwd = get_session_cwd(created) or ""
+                ctx_home = _agent_home_for(user, spec)
+                prep = agentctx.prepare_session(
+                    spec.key, ctx_home, session_cwd, session_name=created,
+                    render_env={spec.config_home_env: str(ctx_home)})
+                if prep.get("errors"):
+                    logger.warning("agentctx for '%s': %s", created, prep["errors"])
+                # Without these the event stream cannot attribute a line to a
+                # session or a backend, which makes it useless for the watchdogs.
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", created, "-l",
+                     agentctx.export_lines(spec.key, created, session_cwd)],
+                    capture_output=True, text=True, timeout=5)
+                subprocess.run(["tmux", "send-keys", "-t", created, "Enter"],
+                               capture_output=True, text=True, timeout=5)
+            except Exception:
+                logger.exception("agentctx session preparation failed for '%s'", created)
         if NEW_SESSION_CMD or spec is not DEFAULT_PROVIDER:
             _pin_model = not (user and not _is_admin(user))
             subprocess.run(
@@ -14600,6 +14627,48 @@ def _agent_home_for(user: dict | None, provider=None) -> Path:
     if user and not _is_admin(user):
         return _user_agent_config_dir(user, spec)
     return CLAUDE_HOME if spec.key == "claude" else CODEX_HOME
+
+
+# --- agentctx: the shared context toolkit ---------------------------------
+
+@app.get("/api/context/summary")
+async def api_context_summary(request: Request):
+    """What agentctx currently defines: skills, prompts, policy levels, tiers."""
+    if agentctx is None:
+        return JSONResponse({"error": "agentctx is not installed"}, status_code=503)
+    return JSONResponse(agentctx.summary())
+
+
+@app.post("/api/context/render")
+async def api_context_render(request: Request):
+    """Re-render every backend home after someone edits agentctx/core.
+
+    Live sessions pick the change up on their next turn — neither CLI caches its
+    instruction file across turns — so this does not need a session restart.
+    """
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if agentctx is None:
+        return JSONResponse({"error": "agentctx is not installed"}, status_code=503)
+    homes = {}
+    for spec in enabled_providers():
+        homes[spec.key] = CLAUDE_HOME if spec.key == "claude" else CODEX_HOME
+    for user in _load_users():
+        if _is_admin(user):
+            continue
+        for spec in enabled_providers():
+            homes[f"{spec.key}:{user['id']}"] = _user_agent_config_dir(user, spec)
+    written = []
+    for key, home in homes.items():
+        backend = key.split(":", 1)[0]
+        try:
+            result = await asyncio.to_thread(
+                agentctx.render.render, backend, Path(home),
+                render_env={get_provider(backend).config_home_env: str(home)})
+            written.append({"home": str(home), "files": len(result.written)})
+        except Exception as exc:
+            written.append({"home": str(home), "error": str(exc)})
+    return JSONResponse({"ok": True, "rendered": written})
 
 
 @app.get("/api/providers")

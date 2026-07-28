@@ -1,0 +1,45 @@
+# Paths agents should not read, write, or search (abstraction 12).
+#
+# Enforcement differs and one side is weaker: Claude honours a deny list in
+# settings.json, Codex has no equivalent ignore file, so the renderer writes
+# BOTH a config entry (where supported) and an explicit instruction line into the
+# rendered context file. Same intent on both, enforced on one, instructed on both.
+#
+# Syntax: one gitignore-style pattern per line. Blank lines and # comments ignored.
+
+# Secrets — never read these, never echo them into a transcript.
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+**/.credentials.json
+**/auth.json
+**/.git-credentials
+~/.claude/.credentials.json
+~/.codex/auth.json
+~/CLAUDE_API_KEYS.md
+
+# Other people's work on this shared box.
+/home/*/web-projects/*
+
+# Noise: large, generated, or regenerable. Reading these wastes the context
+# window and rarely answers anything.
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+.next/
+target/
+*.min.js
+*.map
+package-lock.json
+pnpm-lock.yaml
+poetry.lock
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.tar.gz
+*.zip

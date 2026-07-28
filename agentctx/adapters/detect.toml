@@ -1,0 +1,33 @@
+# TUI-scraping fallback for the event stream (abstraction 7).
+#
+# Only used when the real hook sources cannot answer: an interactive pane the
+# dashboard attached to after launch, or a backend whose notify program does not
+# fire for the transition we need. Everything here is a heuristic over what the
+# CLI draws, so it belongs in an adapter and nowhere else — no shared code may
+# match on these strings.
+#
+# The dashboard's own activity detection (app.py::_detect_activity_raw) uses the
+# same markers. Keep the two in step: if a CLI changes its footer, both go blind.
+
+[claude]
+busy          = ["esc to interrupt"]
+tool_header   = '^(?:Bash|Read|Edit|Write|Grep|Glob|Task|WebFetch|TodoWrite|mcp__[^(\s]+)\s*\('
+tool_output   = '^\s*⎿'
+turn_end      = ['\(thought for \d+', '^[A-Z][a-zé]+ for \d+[ms]']
+waiting       = ["Do you want to", "❯ 1.", "Select login method", "paste the code"]
+idle_prompt   = '^[❯>]\s*$'
+login_needed  = ["Please run /login", "Invalid API key", "OAuth token has expired"]
+
+[codex]
+busy          = ["esc to interrupt", "Worked for ", "tokens used"]
+tool_header   = '^(?:Ran|Edited|Explored|Called|Read|Searched|Applied)\s'
+tool_output   = '^\s*[└│]'
+turn_end      = ['^Worked for \d', 'tokens used']
+waiting       = ["Allow this command", "▌ y/n", "Select an option"]
+idle_prompt   = '^[❯>]\s*$'
+login_needed  = ["Not signed in", "run `codex login`", "401 Unauthorized"]
+
+# Both CLIs draw a spinner from this set while a turn is in flight. Shared only
+# because it is a property of terminal UIs generally, not of either product.
+[common]
+spinner_icons = ["✻", "✽", "✳", "✢", "·", "✶", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
