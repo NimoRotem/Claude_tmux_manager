@@ -1186,7 +1186,7 @@ def _apply_security_headers(request: Request, response: Response) -> Response:
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
     if (
         request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower() == "https"
         or request.url.scheme == "https"
@@ -14424,12 +14424,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 /* Command bar */
 .cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:visible;flex-shrink:0}
 .cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
+.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
+.btn.composer-action{width:48px;height:48px;flex:0 0 48px;display:flex;align-items:center;justify-content:center;border:none;border-radius:50%;padding:0;margin:0 10px 10px 6px;background:#238636;color:#fff}
+.btn.composer-action:hover{background:#2ea043}
+.composer-action svg{display:block}
+.composer-action.is-mic{background:#238636;color:#fff}
+.composer-action.is-send{background:#238636;color:#fff}
+.composer-action.is-recording{background:#da3633;color:#fff;animation:composer-recording 1.2s ease-in-out infinite}
+.composer-action.is-recording:hover{background:#f85149}
+.composer-action.is-transcribing{background:#30363d;color:#c9d1d9;cursor:wait}
+.composer-spin{width:18px;height:18px;border:2px solid #8b949e;border-top-color:#f0f6fc;border-radius:50%;animation:composer-spin .8s linear infinite}
+@keyframes composer-recording{0%,100%{box-shadow:0 0 0 0 #da363355}50%{box-shadow:0 0 0 7px #da363300}}
+@keyframes composer-spin{to{transform:rotate(360deg)}}
 
 /* Raw tab */
 .tab-raw{padding-top:16px}
@@ -15613,6 +15624,7 @@ function restoreDrafts(){
       const key=tab+'-'+s.name;
       const el=document.getElementById('cmd-'+tab+'-'+s.name);
       if(el&&draftText[key]){el.value=draftText[key];autoGrow(el)}
+      if(el)updateComposerBtn(key);
     });
   });
 }
@@ -15883,6 +15895,7 @@ function renderDetail(){
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
@@ -15901,9 +15914,12 @@ function renderDetail(){
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
             placeholder="Send a message..."
             onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this)"
+            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send" onclick="sendChat('${s.name}')">Send</button>
+          <button class="btn cmd-send composer-action is-mic"
+            id="cmd-send-chat-${s.name}"
+            onclick="composerAction('chat-${s.name}')"
+            aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
         ${buildKeyBar(s.name,'chat')}
@@ -15915,7 +15931,6 @@ function renderDetail(){
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
-        <button class="btn" onclick="loadRaw('${s.name}')">Reload</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
@@ -15924,9 +15939,12 @@ function renderDetail(){
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
           placeholder="Type a command and press Enter..."
           onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this)"
+          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send" onclick="sendCmd('${s.name}','raw')">Send</button>
+        <button class="btn cmd-send composer-action is-mic"
+          id="cmd-send-raw-${s.name}"
+          onclick="composerAction('raw-${s.name}')"
+          aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
         <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
       ${buildKeyBar(s.name,'raw')}
@@ -16325,7 +16343,9 @@ function updateComposerBtn(key){
   btn.classList.toggle('is-send',hasText);
   btn.classList.toggle('is-mic',!hasText);
   btn.innerHTML=hasText?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
-  btn.title=hasText?'Send message':'Record voice message';
+  const label=hasText?'Send message':'Record voice message';
+  btn.title=label;
+  btn.setAttribute('aria-label',label);
 }
 function composerAction(key){
   const inp=document.getElementById('cmd-'+key);
@@ -16351,7 +16371,12 @@ async function toggleRecording(key){
     const btn=document.getElementById('cmd-send-'+key);
     if(btn)btn.classList.remove('is-recording');
     if(!blob.size){updateComposerBtn(key);return;}
-    if(btn){btn.classList.add('is-transcribing');btn.innerHTML='<span class="composer-spin"></span>';btn.title='Transcribing…';}
+    if(btn){
+      btn.classList.add('is-transcribing');
+      btn.innerHTML='<span class="composer-spin"></span>';
+      btn.title='Transcribing voice message…';
+      btn.setAttribute('aria-label','Transcribing voice message');
+    }
     try{
       const fd=new FormData();fd.append('audio',blob,'voice.webm');
       const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
@@ -16367,7 +16392,13 @@ async function toggleRecording(key){
   try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
   _recording[key]=true;
   const btn=document.getElementById('cmd-send-'+key);
-  if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
+  if(btn){
+    btn.classList.remove('is-mic','is-send');
+    btn.classList.add('is-recording');
+    btn.innerHTML=_COMPOSER_STOP_SVG;
+    btn.title='Stop recording and transcribe';
+    btn.setAttribute('aria-label','Stop recording and transcribe');
+  }
 }
 
 async function sendChat(name){
@@ -16387,6 +16418,7 @@ async function sendChat(name){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
+    updateComposerBtn('chat-'+name);
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
   input.focus();
@@ -16556,6 +16588,7 @@ async function sendCmd(name,source){
       body:JSON.stringify({command:cmd})
     });
     input.value='';input.style.height='auto';
+    updateComposerBtn(source+'-'+name);
     delete draftText[source+'-'+name];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
