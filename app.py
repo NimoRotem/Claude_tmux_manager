@@ -30,8 +30,9 @@ logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import openai
 import uvicorn
 import httpx
@@ -287,6 +288,7 @@ def _restore_default_model_setting():
         s = json.loads(sp.read_text()) if sp.exists() else {}
         if isinstance(s, dict) and s.get("model") != DEFAULT_MODEL:
             s["model"] = DEFAULT_MODEL
+            _backup_before_dashboard_write(sp)
             sp.write_text(json.dumps(s, indent=2))
             logger.info("Restored default model in %s -> %s", sp, DEFAULT_MODEL)
     except Exception:
@@ -343,6 +345,59 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
 _stored_anthropic_key: str = ""
+
+
+# --- Backup-before-write -----------------------------------------------------
+# Whenever the dashboard rewrites a file Claude Code reads (CLAUDE.md,
+# settings.json, MEMORY.md, a project or skill file), keep a copy first. These
+# writes are how a bad context sync silently eats a hand-edited file.
+#
+# Capped: config writes happen on every member provision, context sync and
+# settings save, so without a limit this grows without bound (the Codex build
+# accumulated 718 of these before the cap landed). Identical content is skipped
+# so idempotent re-syncs don't each leave a duplicate.
+_DASHBOARD_BACKUP_KEEP = 5
+
+
+def _prune_dashboard_backups(path: Path, keep: int = _DASHBOARD_BACKUP_KEEP):
+    """Drop all but the newest `keep` dashboard backups of `path`."""
+    try:
+        stale = sorted(
+            path.parent.glob(f"{path.name}.bak-dashboard-*"),
+            key=lambda p: p.name,
+        )
+        for old in (stale[:-keep] if keep > 0 else stale):
+            try:
+                old.unlink()
+            except OSError:
+                logger.debug("Could not remove stale backup %s", old, exc_info=True)
+    except Exception:
+        logger.debug("Failed to prune backups for %s", path, exc_info=True)
+
+
+def _backup_before_dashboard_write(path):
+    """Back up an existing file before the dashboard overwrites it."""
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        existing = sorted(
+            path.parent.glob(f"{path.name}.bak-dashboard-*"),
+            key=lambda p: p.name,
+        )
+        if existing:
+            try:
+                newest = existing[-1]
+                if newest.stat().st_size == path.stat().st_size and \
+                        newest.read_bytes() == path.read_bytes():
+                    return
+            except OSError:
+                pass
+        backup = path.with_name(f"{path.name}.bak-dashboard-{int(time.time() * 1000)}")
+        shutil.copy2(path, backup)
+        _prune_dashboard_backups(path)
+    except Exception:
+        logger.debug("Failed to back up %s before dashboard write", path, exc_info=True)
 
 # --- Long-lived (non-rotating) Claude auth token ----------------------------
 # A token minted with `claude setup-token` (subscription-backed, ~1yr, does NOT
@@ -649,6 +704,17 @@ async def lifespan(_app: FastAPI):
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
+    try:
+        migrated_prompts = await asyncio.to_thread(_backfill_prompt_audit, _load_users())
+        if migrated_prompts:
+            logger.info("Prompt audit: migrated %d historical user prompts",
+                        migrated_prompts)
+    except Exception:
+        logger.exception("Prompt audit history migration failed")
+    try:
+        await asyncio.to_thread(_ensure_all_user_browser_sessions)
+    except Exception:
+        logger.exception("Account browser provisioning failed")
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
     logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
@@ -699,6 +765,19 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(_request: Request, exc: RequestValidationError):
+    """Keep API validation errors compatible with the dashboard's JS client.
+
+    Do not serialize Pydantic's full error structure here: it can include the
+    submitted value, which is especially undesirable on credential routes.
+    """
+    errors = exc.errors()
+    message = errors[0].get("msg", "Invalid request") if errors else "Invalid request"
+    return JSONResponse({"error": message}, status_code=422)
+
 
 # --- Auth ---
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
@@ -809,6 +888,18 @@ def _user_from_token(token: Optional[str]) -> Optional[dict]:
     return _find_user_by_id(user_id)
 
 
+# How long after their last authenticated request an account still counts as
+# "online" in the admin users table.
+_USER_ONLINE_WINDOW_SECONDS = 120
+_user_presence: dict = {}
+
+
+def _touch_user_presence(user: Optional[dict]) -> None:
+    """Record authenticated dashboard activity for lightweight presence."""
+    if user and user.get("id"):
+        _user_presence[str(user["id"])] = time.time()
+
+
 def _current_user(request: Request) -> Optional[dict]:
     """Resolve the user for an HTTP request via the tmux_auth cookie.
 
@@ -819,17 +910,38 @@ def _current_user(request: Request) -> Optional[dict]:
     if not AUTH_PASS:
         admin = _find_user_by_id("admin")
         if admin:
+            _touch_user_presence(admin)
             return admin
-        return {
+        synthetic = {
             "id": "admin", "username": AUTH_USER or "admin",
             "role": "admin", "_synthetic": True,
         }
+        _touch_user_presence(synthetic)
+        return synthetic
     # Stash on request.state to avoid re-loading users.json per request.
+    if getattr(request.state, "_current_user_resolved", False):
+        return getattr(request.state, "_current_user", None) or None
     cached = getattr(request.state, "_current_user", None)
-    if cached is not None:
-        return cached or None  # explicit None vs sentinel
-    user = _user_from_token(request.cookies.get("tmux_auth"))
+    base_user = getattr(request.state, "_authenticated_user", None)
+    if base_user is None:
+        base_user = (cached or None) if cached is not None else _user_from_token(
+            request.cookies.get("tmux_auth"))
+    user = base_user
+    # Tab-scoped impersonation: the cookie still identifies the admin; the
+    # header says which account this tab is acting as.
+    impersonation_token = request.headers.get("X-Tmux-Impersonate", "").strip()
+    if impersonation_token:
+        target = None
+        if _is_admin(base_user):
+            target = _user_from_impersonation_session(impersonation_token, base_user)
+        if target:
+            request.state._impersonator = base_user
+            user = target
+        else:
+            request.state._invalid_impersonation = True
     request.state._current_user = user or {}
+    request.state._current_user_resolved = True
+    _touch_user_presence(user)
     return user
 
 
@@ -927,6 +1039,33 @@ def _ensure_user_claude_config_dir(user: dict):
             _sync_git_rules_into(claude_md)
         except Exception:
             logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
+    # Last: clamp the whole tree private. Every session runs as the same OS
+    # user, so this is defence in depth rather than a boundary — but a member's
+    # credentials, memory and transcripts have no business being world-readable.
+    _set_member_claude_permissions(d)
+
+
+def _set_member_claude_permissions(cfg_dir: Path) -> None:
+    """Keep every account-owned Claude file private at the filesystem level."""
+    try:
+        cfg_dir.chmod(0o700)
+        for root, dir_names, file_names in os.walk(cfg_dir, followlinks=False):
+            root_path = Path(root)
+            for name in dir_names:
+                path = root_path / name
+                if not path.is_symlink():
+                    path.chmod(0o700)
+            for name in file_names:
+                path = root_path / name
+                if path.is_symlink():
+                    continue
+                current_mode = path.stat().st_mode
+                path.chmod(0o700 if current_mode & 0o111 else 0o600)
+    except OSError:
+        logger.exception(
+            "Failed to set private permissions on member Claude home %s",
+            cfg_dir,
+        )
 
 
 # --- Session ownership ---
@@ -1129,6 +1268,14 @@ async def session_ownership_middleware(request: Request, call_next):
     else:
         rel = path
     user = _current_user(request)
+    # A stale or forged impersonation token must fail loudly. Falling back to
+    # the cookie identity would silently hand an admin their own view while the
+    # tab still looks like it is viewing as someone else.
+    if getattr(request.state, "_invalid_impersonation", False):
+        return JSONResponse(
+            {"error": "Impersonation session expired or invalid"},
+            status_code=401,
+        )
     # Admin-only routes (Profiles, global CLAUDE.md, etc.)
     for prefix in _ADMIN_ONLY_PREFIXES:
         if rel == prefix or rel.startswith(prefix + "/"):
@@ -1196,7 +1343,12 @@ async def auth_middleware(request: Request, call_next):
         resp = HTMLResponse(_login_page())
         resp.delete_cookie("tmux_auth")
         return resp
-    request.state._current_user = user
+    # Hand the resolved cookie identity to _current_user() as the *base* user;
+    # it still has to inspect X-Tmux-Impersonate, so don't mark it resolved.
+    request.state._authenticated_user = user
+    # The route's own _current_user() call may return early from cache, so
+    # presence is recorded here too or it never fires.
+    _touch_user_presence(user)
     return await call_next(request)
 
 
@@ -1320,7 +1472,7 @@ async def do_login(request: Request):
     return resp
 
 
-@app.post("/logout")
+@app.api_route("/logout", methods=["GET", "POST"])
 async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
     resp.delete_cookie("tmux_auth")
@@ -1624,12 +1776,60 @@ async def api_admin_list_users(request: Request):
     if not _is_admin(user):
         return JSONResponse({"error": "Admin only"}, status_code=403)
     users = _load_users()
+    sessions = get_tmux_sessions()
+    owners = _load_session_owners()
+    activities = await asyncio.gather(
+        *(async_detect_activity(session["name"]) for session in sessions)
+    )
+    live_by_user: dict = {}
+    busy_by_user: dict = {}
+    for session, activity in zip(sessions, activities):
+        user_id = owners.get(session["name"], "admin")
+        live_by_user.setdefault(user_id, []).append(session["name"])
+        if activity.get("status") == "busy":
+            busy_by_user.setdefault(user_id, []).append(session["name"])
+
+    usage_rows = await asyncio.gather(
+        *(asyncio.to_thread(_user_usage_summary, account) for account in users)
+    )
+    prompt_summary = await asyncio.to_thread(_prompt_audit_summary)
+    generated_at = time.time()
     out = []
-    for u in users:
+    for u, usage in zip(users, usage_rows):
+        user_id = str(u.get("id", ""))
+        live_sessions = live_by_user.get(user_id, [])
+        busy_sessions = busy_by_user.get(user_id, [])
+        last_seen = float(_user_presence.get(user_id, 0) or 0)
+        prompts = prompt_summary.get(user_id, {})
         rec = _public_user(u)
-        rec["session_count"] = _user_session_count(u["id"])
+        rec.update({
+            "session_count": len(live_sessions),
+            "live_session_count": len(live_sessions),
+            "busy_session_count": len(busy_sessions),
+            "session_names": live_sessions,
+            "busy_session_names": busy_sessions,
+            "working": bool(busy_sessions),
+            "last_seen": last_seen,
+            "online": bool(last_seen
+                           and generated_at - last_seen <= _USER_ONLINE_WINDOW_SECONDS),
+            "usage": usage,
+            "prompt_count": int(prompts.get("count", 0) or 0),
+            "last_prompt_at": float(prompts.get("last_ts", 0) or 0),
+        })
         out.append(rec)
-    return JSONResponse({"users": out})
+    return JSONResponse({
+        "users": out,
+        "summary": {
+            "user_count": len(out),
+            "online_count": sum(1 for item in out if item["online"]),
+            "working_count": sum(1 for item in out if item["working"]),
+            "live_session_count": sum(item["live_session_count"] for item in out),
+            "total_tokens": sum(int(item["usage"].get("total_tokens", 0) or 0)
+                                for item in out),
+            "total_prompts": sum(item["prompt_count"] for item in out),
+        },
+        "generated_at": generated_at,
+    })
 
 
 @app.post("/api/admin/users")
@@ -1760,6 +1960,12 @@ async def api_admin_delete_user(request: Request, user_id: str):
     # Remove the user record.
     users = [u for u in users if u["id"] != user_id]
     _save_users(users)
+    # Stop and remove the browser stack this account owned, and release its
+    # proxy identity — otherwise the display/port slot stays allocated forever.
+    try:
+        await asyncio.to_thread(_delete_user_browser_session, user_id)
+    except Exception:
+        logger.exception("Failed to remove browser for deleted account '%s'", user_id)
     # Tear down per-user data + Claude config dirs.
     try:
         data_dir = MESSAGES_DIR / "users" / user_id
@@ -1785,10 +1991,82 @@ def _set_auth_cookie(resp, request: Request, token: str):
     return resp
 
 
+# --- Impersonation ----------------------------------------------------------
+# Tab-scoped, not cookie-swapping. The old flow replaced the admin's own
+# tmux_auth cookie with the target's, which logged the admin out of their own
+# account browser-wide and made "who actually typed this" unanswerable. Now:
+# a one-time ticket opens a new tab, the tab exchanges it for an opaque token
+# held in sessionStorage and sent as X-Tmux-Impersonate. The admin's session is
+# untouched, every other tab stays admin, and the prompt audit records both the
+# acting user and the admin behind them.
+_IMPERSONATION_TICKET_TTL = 60
+_IMPERSONATION_SESSION_TTL = 8 * 60 * 60
+_impersonation_lock = threading.Lock()
+_impersonation_tickets: Dict[str, dict] = {}
+_impersonation_sessions: Dict[str, dict] = {}
+IMPERSONATION_SESSIONS_FILE = MESSAGES_DIR / "impersonation-sessions.json"
+_impersonation_sessions_loaded = False
+
+
+def _load_impersonation_sessions_locked() -> None:
+    """Load active opaque tab sessions once; caller holds the lock."""
+    global _impersonation_sessions_loaded
+    if _impersonation_sessions_loaded:
+        return
+    loaded = {}
+    try:
+        data = json.loads(IMPERSONATION_SESSIONS_FILE.read_text())
+        rows = data.get("sessions", {}) if isinstance(data, dict) else {}
+        if isinstance(rows, dict):
+            loaded = {str(t): r for t, r in rows.items() if isinstance(r, dict)}
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        loaded = {}
+    _impersonation_sessions.clear()
+    _impersonation_sessions.update(loaded)
+    _impersonation_sessions_loaded = True
+
+
+def _save_impersonation_sessions_locked() -> None:
+    """Persist opaque tab sessions privately; caller holds the lock."""
+    _atomic_write_json(IMPERSONATION_SESSIONS_FILE,
+                       {"sessions": _impersonation_sessions})
+
+
+def _purge_expired_impersonation_tokens(now: Optional[float] = None) -> None:
+    """Purge expired records; caller holds ``_impersonation_lock``."""
+    _load_impersonation_sessions_locked()
+    timestamp = now or time.time()
+    sessions_changed = False
+    for store in (_impersonation_tickets, _impersonation_sessions):
+        for token, record in list(store.items()):
+            if float(record.get("expires_at", 0) or 0) <= timestamp:
+                store.pop(token, None)
+                if store is _impersonation_sessions:
+                    sessions_changed = True
+    if sessions_changed:
+        _save_impersonation_sessions_locked()
+
+
+def _user_from_impersonation_session(token: str,
+                                     authenticated_admin: dict) -> Optional[dict]:
+    """Resolve a tab-scoped session only when its original admin is logged in."""
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens()
+        record = _impersonation_sessions.get(token)
+        if not record or record.get("admin_id") != authenticated_admin.get("id"):
+            return None
+        target_id = str(record.get("target_id", ""))
+    target = _find_user_by_id(target_id)
+    return target if target and target.get("id") != authenticated_admin.get("id") else None
+
+
+class ImpersonationExchangeBody(BaseModel):
+    ticket: str = Field(min_length=20, max_length=200)
+
+
 @app.post("/api/admin/users/{user_id}/impersonate")
 async def api_admin_impersonate(request: Request, user_id: str):
-    """Admin 'log in as' a user to see their work. Stashes the admin's own token
-    in a side cookie so they can return; swaps tmux_auth to the target."""
+    """Issue a short-lived ticket for an isolated impersonation browser tab."""
     admin = _current_user(request)
     if not _is_admin(admin):
         return JSONResponse({"error": "Admin only"}, status_code=403)
@@ -1797,33 +2075,89 @@ async def api_admin_impersonate(request: Request, user_id: str):
         return JSONResponse({"error": "User not found"}, status_code=404)
     if target["id"] == admin["id"]:
         return JSONResponse({"error": "That's already you"}, status_code=400)
-    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp = JSONResponse({"ok": True, "username": target.get("username", "")})
-    # Keep the EARLIEST admin token if already impersonating, so a chain of
-    # impersonations still returns to the real admin.
-    orig = request.cookies.get("tmux_imp_orig")
-    if not (orig and _is_admin(_user_from_token(orig))):
-        orig = _make_token(admin["id"])
-    resp.set_cookie("tmux_imp_orig", orig, max_age=86400,
-                    httponly=True, samesite="lax", secure=is_https)
-    _set_auth_cookie(resp, request, _make_token(target["id"]))
-    logger.info("Admin '%s' is now impersonating '%s'", admin.get("username"), target.get("username"))
-    return resp
+    ticket = secrets.token_urlsafe(32)
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens()
+        _impersonation_tickets[ticket] = {
+            "admin_id": admin["id"],
+            "target_id": target["id"],
+            "expires_at": time.time() + _IMPERSONATION_TICKET_TTL,
+        }
+    url = (f"{ROOT_PATH or ''}/?impersonate_ticket="
+           f"{urllib.parse.quote(ticket, safe='')}")
+    logger.info("Admin '%s' issued an impersonation ticket for '%s'",
+                admin.get("username"), target.get("username"))
+    return JSONResponse({
+        "ok": True,
+        "username": target.get("username", ""),
+        "url": url,
+        "expires_in": _IMPERSONATION_TICKET_TTL,
+    })
+
+
+@app.post("/api/admin/impersonation/exchange")
+async def api_admin_impersonation_exchange(request: Request,
+                                           body: ImpersonationExchangeBody):
+    """Consume a one-time ticket and return a token kept in tab sessionStorage."""
+    admin = _current_user(request)
+    if not _is_admin(admin):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    now = time.time()
+    with _impersonation_lock:
+        _purge_expired_impersonation_tokens(now)
+        record = _impersonation_tickets.get(body.ticket)
+        if not record:
+            return JSONResponse(
+                {"error": "Impersonation ticket expired or already used"},
+                status_code=410)
+        if record.get("admin_id") != admin.get("id"):
+            return JSONResponse({"error": "Ticket belongs to another admin"},
+                                status_code=403)
+        _impersonation_tickets.pop(body.ticket, None)
+        token = secrets.token_urlsafe(48)
+        _impersonation_sessions[token] = {
+            "admin_id": admin["id"],
+            "target_id": record["target_id"],
+            "expires_at": now + _IMPERSONATION_SESSION_TTL,
+        }
+        _save_impersonation_sessions_locked()
+    target = _find_user_by_id(str(record["target_id"]))
+    if not target:
+        with _impersonation_lock:
+            _impersonation_sessions.pop(token, None)
+            _save_impersonation_sessions_locked()
+        return JSONResponse({"error": "User no longer exists"}, status_code=404)
+    return JSONResponse({
+        "ok": True,
+        "token": token,
+        "expires_in": _IMPERSONATION_SESSION_TTL,
+        "user": _public_user(target),
+    })
+
+
+@app.post("/api/impersonation/end")
+async def api_end_impersonation(request: Request):
+    """Revoke the current tab-scoped impersonation token."""
+    token = request.headers.get("X-Tmux-Impersonate", "").strip()
+    impersonator = getattr(request.state, "_impersonator", None)
+    target = _current_user(request)
+    if not token or not _is_admin(impersonator) or not target:
+        return JSONResponse({"error": "Not impersonating"}, status_code=400)
+    with _impersonation_lock:
+        record = _impersonation_sessions.get(token)
+        if (not record
+                or record.get("admin_id") != impersonator.get("id")
+                or record.get("target_id") != target.get("id")):
+            return JSONResponse({"error": "Not impersonating"}, status_code=400)
+        _impersonation_sessions.pop(token, None)
+        _save_impersonation_sessions_locked()
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/unimpersonate")
 async def api_unimpersonate(request: Request):
-    """Return to the admin account. Authorized by possessing a valid admin token
-    in the tmux_imp_orig cookie, so the impersonated (non-admin) session can call it."""
-    orig = request.cookies.get("tmux_imp_orig")
-    admin = _user_from_token(orig) if orig else None
-    if not admin or not _is_admin(admin):
-        return JSONResponse({"error": "Not impersonating"}, status_code=400)
-    resp = JSONResponse({"ok": True, "username": admin.get("username", "")})
-    _set_auth_cookie(resp, request, orig)
-    resp.delete_cookie("tmux_imp_orig")
-    logger.info("Returned to admin '%s' from impersonation", admin.get("username"))
-    return resp
+    """Backwards-compatible alias for /api/impersonation/end."""
+    return await api_end_impersonation(request)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2339,6 +2673,49 @@ class ApiEntryBody(BaseModel):
     status: Optional[str] = None
 
 
+def _member_api_entry(e: dict) -> dict:
+    """Return only the API catalog fields useful to members.
+
+    Provider credentials, masked key fragments, environment variable names,
+    internal notes, billing detail, and admin-console links stay private.
+    """
+    status = e.get("status", "active")
+    configured = bool(e.get("key")) or not bool(e.get("env_var"))
+    docs_url = str(e.get("docs_url") or "").strip()
+    try:
+        parsed_docs = urllib.parse.urlsplit(docs_url)
+        if parsed_docs.scheme not in ("http", "https") or not parsed_docs.netloc:
+            docs_url = ""
+    except ValueError:
+        docs_url = ""
+    return {
+        "id": e.get("id", ""),
+        "name": e.get("name", ""),
+        "provider": e.get("provider", ""),
+        "category": e.get("category", "other"),
+        "available": status == "active" and configured,
+        "plan": e.get("plan", ""),
+        "limits": e.get("limits", ""),
+        "docs_url": docs_url,
+        "status": status,
+    }
+
+
+@app.get("/api/my/apis")
+async def api_member_list_apis(request: Request):
+    """Compatibility route; global API settings are visible to admins only."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    return JSONResponse({
+        "apis": [_member_api_entry(e) for e in _load_api_registry()],
+        "category_order": _API_CATEGORY_ORDER,
+        "category_labels": _API_CATEGORY_LABELS,
+    })
+
+
 @app.get("/api/admin/apis")
 async def api_admin_list_apis(request: Request):
     user = _current_user(request)
@@ -2642,10 +3019,13 @@ async def api_me(request: Request):
             })
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     is_admin = _is_admin(user)
-    # Impersonation: an admin "logged in as" this user has their real token in
-    # the side cookie, so we can surface a "return to admin" banner.
-    imp_orig = request.cookies.get("tmux_imp_orig")
-    imp_admin = _user_from_token(imp_orig) if imp_orig else None
+    # Impersonation: the acting admin is resolved from this tab's
+    # X-Tmux-Impersonate header (see _current_user). The legacy side cookie is
+    # still honoured so a tab open from before the switch keeps working.
+    imp_admin = getattr(request.state, "_impersonator", None)
+    if imp_admin is None:
+        imp_orig = request.cookies.get("tmux_imp_orig")
+        imp_admin = _user_from_token(imp_orig) if imp_orig else None
     impersonating = bool(imp_admin and _is_admin(imp_admin) and imp_admin["id"] != user["id"])
     return JSONResponse({
         "id": user["id"],
@@ -2743,6 +3123,7 @@ def _sync_global_context_into(claude_md: Path):
         user_part = (pre + post).lstrip("\n")
     else:
         user_part = existing.lstrip("\n")
+    _backup_before_dashboard_write(claude_md)
     claude_md.write_text(block + "\n" + user_part)
 
 
@@ -2767,6 +3148,7 @@ def _sync_projects_note_into(claude_md: Path):
     block = _PROJ_NOTE_BEGIN + "\n" + _PROJ_NOTE.replace("__PUBURL__", PUB_URL) + "\n" + _PROJ_NOTE_END + "\n"
     try:
         claude_md.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(claude_md)
         claude_md.write_text(block + "\n" + existing)
     except Exception:
         logger.debug("Failed to sync projects note into %s", claude_md, exc_info=True)
@@ -2799,8 +3181,10 @@ def _sync_git_rules_into(claude_md: Path):
         claude_md.parent.mkdir(parents=True, exist_ok=True)
         if _PROJ_NOTE_END in existing:
             head, tail = existing.split(_PROJ_NOTE_END, 1)
+            _backup_before_dashboard_write(claude_md)
             claude_md.write_text(head + _PROJ_NOTE_END + "\n\n" + block + tail.lstrip("\n"))
         else:
+            _backup_before_dashboard_write(claude_md)
             claude_md.write_text(block + "\n" + existing.lstrip("\n"))
     except Exception:
         logger.debug("Failed to sync git rules into %s", claude_md, exc_info=True)
@@ -2880,6 +3264,7 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
     s["customApiKeyResponses"] = car
     try:
         sp.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(sp)
         sp.write_text(json.dumps(s, indent=2))
     except Exception:
         logger.debug("Failed to write customApiKeyResponses into %s", sp, exc_info=True)
@@ -2900,6 +3285,7 @@ def _set_api_key_helper(cfg_dir: Path):
     s["apiKeyHelper"] = "cat " + shlex.quote(str(ANTHROPIC_API_KEY_FILE))
     try:
         sp.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(sp)
         sp.write_text(json.dumps(s, indent=2))
     except Exception:
         logger.debug("Failed to set apiKeyHelper in %s", sp, exc_info=True)
@@ -2948,6 +3334,7 @@ def _remove_api_key_helper(cfg_dir: Path):
         s.pop("apiKeyHelper", None)
         s.pop("customApiKeyResponses", None)
         try:
+            _backup_before_dashboard_write(sp)
             sp.write_text(json.dumps(s, indent=2))
         except Exception:
             logger.debug("Failed to strip apiKeyHelper from %s", sp, exc_info=True)
@@ -2978,6 +3365,7 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
         s["disableClaudeAiConnectors"] = True
         try:
             sp.parent.mkdir(parents=True, exist_ok=True)
+            _backup_before_dashboard_write(sp)
             sp.write_text(json.dumps(s, indent=2))
         except Exception:
             logger.debug("Failed to set disableClaudeAiConnectors in %s", sp, exc_info=True)
@@ -3007,6 +3395,7 @@ def _set_team_model_effort(cfg_dir: Path):
     if changed:
         try:
             sp.parent.mkdir(parents=True, exist_ok=True)
+            _backup_before_dashboard_write(sp)
             sp.write_text(json.dumps(s, indent=2))
         except Exception:
             logger.debug("Failed to set team model/effort in %s", sp, exc_info=True)
@@ -3038,6 +3427,7 @@ def _seed_trust(cfg_dir: Path, cwd: str):
     d["projects"] = projects
     d.setdefault("hasCompletedOnboarding", True)
     try:
+        _backup_before_dashboard_write(cj)
         cj.write_text(json.dumps(d, indent=2))
     except Exception:
         logger.debug("Failed to seed trust into %s", cj, exc_info=True)
@@ -3215,6 +3605,7 @@ def _install_sandbox_hook(cfg_dir: Path, user: dict):
     hooks["PreToolUse"] = pre
     settings["hooks"] = hooks
     try:
+        _backup_before_dashboard_write(settings_path)
         settings_path.write_text(json.dumps(settings, indent=2))
     except Exception:
         logger.debug("Failed to install sandbox hook into %s", settings_path, exc_info=True)
@@ -3348,6 +3739,7 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
     }
     data["mcpServers"] = servers
     try:
+        _backup_before_dashboard_write(cj)
         cj.write_text(json.dumps(data, indent=2))
     except Exception:
         logger.debug("Failed to write google MCP entry into %s", cj, exc_info=True)
@@ -3477,6 +3869,7 @@ async def api_save_global_context(request: Request):
     except Exception:
         body = {}
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _backup_before_dashboard_write(GLOBAL_CONTEXT_FILE)
     GLOBAL_CONTEXT_FILE.write_text(body.get("content", "") or "")
     # Re-sync the managed block into every existing member's CLAUDE.md immediately.
     synced = 0
@@ -3558,6 +3951,7 @@ def _sync_group_context_into(claude_md: Path, group_id: str):
         post = existing.split(_GROUP_CTX_END, 1)[1]
         existing = pre.rstrip("\n") + "\n" + post.lstrip("\n")
     if not group_id:
+        _backup_before_dashboard_write(claude_md)
         claude_md.write_text(existing)
         return
     block = _GROUP_CTX_BEGIN + "\n" + _read_group_context(group_id).rstrip() + "\n" + _GROUP_CTX_END + "\n"
@@ -3566,6 +3960,7 @@ def _sync_group_context_into(claude_md: Path, group_id: str):
         existing = head + _GLOBAL_CTX_END + "\n\n" + block + tail.lstrip("\n")
     else:
         existing = block + "\n" + existing.lstrip("\n")
+    _backup_before_dashboard_write(claude_md)
     claude_md.write_text(existing)
 
 
@@ -3695,6 +4090,7 @@ async def api_admin_context_write(request: Request, scope: str, ident: str, body
             return JSONResponse({"error": "Invalid JSON: " + e.msg}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(target)
         target.write_text(body.content or "")
     except Exception:
         return JSONResponse({"error": "Write failed"}, status_code=500)
@@ -4190,6 +4586,228 @@ cache: Dict[str, dict] = {}
 MESSAGES_FILE = MESSAGES_DIR / "messages.json"
 NOTES_FILE = MESSAGES_DIR / "notes.json"
 
+# --- Prompt audit ------------------------------------------------------------
+# An append-only record of every human prompt, kept independently of session
+# chat history (which a user can clear, and which rotates with the session).
+# 0600, fsync'd, never rewritten in place.
+PROMPT_AUDIT_FILE = MESSAGES_DIR / "prompt-history.jsonl"
+PROMPT_AUDIT_BACKFILL_MARKER = MESSAGES_DIR / "prompt-history-backfill-v1.json"
+_prompt_audit_lock = threading.Lock()
+
+
+def _append_prompt_audit(
+    user: dict,
+    session_name: str,
+    prompt: str,
+    *,
+    source: str = "dashboard",
+    impersonator: Optional[dict] = None,
+    timestamp: Optional[float] = None,
+) -> dict:
+    """Append one immutable human prompt record to the private audit log."""
+    entry = {
+        "id": secrets.token_hex(12),
+        "ts": float(timestamp if timestamp is not None else time.time()),
+        "user_id": user.get("id", ""),
+        "username": user.get("username", ""),
+        "role": user.get("role", "user"),
+        "session_name": session_name,
+        "prompt": prompt,
+        "source": source,
+    }
+    if impersonator:
+        entry["impersonated_by_id"] = impersonator.get("id", "")
+        entry["impersonated_by"] = impersonator.get("username", "")
+    encoded = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    with _prompt_audit_lock:
+        PROMPT_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(PROMPT_AUDIT_FILE, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return entry
+
+
+def _iter_prompt_audit_reverse():
+    """Yield valid prompt records newest-first without loading the whole log."""
+    if not PROMPT_AUDIT_FILE.exists():
+        return
+    block_size = 64 * 1024
+    with _prompt_audit_lock, PROMPT_AUDIT_FILE.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        position = stream.tell()
+        remainder = b""
+        while position > 0:
+            size = min(block_size, position)
+            position -= size
+            stream.seek(position)
+            chunk = stream.read(size) + remainder
+            lines = chunk.split(b"\n")
+            remainder = lines[0]
+            for raw in reversed(lines[1:]):
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+        if remainder.strip():
+            try:
+                entry = json.loads(remainder)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                entry = None
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _read_prompt_audit(*, user_id: str = "", limit: int = 100,
+                       before: float = 0, cursor: str = "") -> list:
+    prompts = []
+    cursor_found = not cursor
+    for entry in _iter_prompt_audit_reverse() or ():
+        if user_id and entry.get("user_id") != user_id:
+            continue
+        if not cursor_found:
+            if str(entry.get("id", "")) == cursor:
+                cursor_found = True
+            continue
+        timestamp = float(entry.get("ts") or 0)
+        if before and timestamp >= before:
+            continue
+        prompts.append(entry)
+        if len(prompts) >= limit:
+            break
+    return prompts
+
+
+_prompt_audit_summary_cache: dict = {"signature": None, "data": {}}
+
+
+def _prompt_audit_summary() -> dict:
+    """Count prompts by account, reusing results while the audit file is unchanged."""
+    try:
+        stat = PROMPT_AUDIT_FILE.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return {}
+    if _prompt_audit_summary_cache["signature"] == signature:
+        return {k: dict(v) for k, v in _prompt_audit_summary_cache["data"].items()}
+    summary: dict = {}
+    with _prompt_audit_lock:
+        try:
+            with PROMPT_AUDIT_FILE.open(errors="replace") as stream:
+                for raw in stream:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    user_id = str(entry.get("user_id", ""))
+                    if not user_id:
+                        continue
+                    row = summary.setdefault(user_id, {"count": 0, "last_ts": 0})
+                    row["count"] += 1
+                    row["last_ts"] = max(float(row["last_ts"]),
+                                         float(entry.get("ts", 0) or 0))
+        except OSError:
+            return {}
+    _prompt_audit_summary_cache["signature"] = signature
+    _prompt_audit_summary_cache["data"] = summary
+    return {k: dict(v) for k, v in summary.items()}
+
+
+def _backfill_prompt_audit(users: Optional[list] = None) -> int:
+    """Migrate existing per-user chat prompts into the global audit once."""
+    if PROMPT_AUDIT_BACKFILL_MARKER.exists():
+        return 0
+    users = users if users is not None else _load_users()
+    existing_ids = {
+        str(entry.get("id", ""))
+        for entry in (_iter_prompt_audit_reverse() or ())
+        if entry.get("id")
+    }
+    records = []
+    for user in users:
+        try:
+            per_session = _load_messages(user)
+        except Exception:
+            logger.debug("Prompt backfill: could not read messages for %s",
+                         user.get("id"), exc_info=True)
+            continue
+        for session_name, messages in (per_session or {}).items():
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                prompt = message.get("text")
+                if not isinstance(prompt, str) or not prompt:
+                    continue
+                timestamp = float(message.get("ts", 0) or 0)
+                identity = "\0".join((str(user.get("id", "")), str(session_name),
+                                      repr(timestamp), prompt))
+                entry_id = "legacy_" + hashlib.sha256(
+                    identity.encode("utf-8")).hexdigest()[:24]
+                if entry_id in existing_ids:
+                    continue
+                existing_ids.add(entry_id)
+                records.append({
+                    "id": entry_id, "ts": timestamp,
+                    "user_id": user.get("id", ""),
+                    "username": user.get("username", ""),
+                    "role": user.get("role", "user"),
+                    "session_name": str(session_name),
+                    "prompt": prompt,
+                    "source": "legacy_messages_backfill",
+                })
+    if records:
+        encoded = "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                          for r in records).encode("utf-8")
+        with _prompt_audit_lock:
+            PROMPT_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(PROMPT_AUDIT_FILE, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                remaining = memoryview(encoded)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    remaining = remaining[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    _atomic_write_json(PROMPT_AUDIT_BACKFILL_MARKER,
+                       {"completed_at": time.time(), "migrated": len(records)})
+    _prompt_audit_summary_cache["signature"] = None
+    _prompt_audit_summary_cache["data"] = {}
+    return len(records)
+
+
+@app.get("/api/admin/prompts")
+async def api_admin_prompts(request: Request, user_id: str = "", limit: int = 100,
+                            before: float = 0, cursor: str = ""):
+    """Return the private, append-only human prompt audit to administrators."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    safe_limit = max(1, min(int(limit or 100), 500))
+    prompts = await asyncio.to_thread(
+        _read_prompt_audit,
+        user_id=(user_id or "").strip(),
+        limit=safe_limit,
+        before=max(0, float(before or 0)),
+        cursor=(cursor or "").strip()[:200],
+    )
+    next_before = float(prompts[-1].get("ts") or 0) if len(prompts) == safe_limit else 0
+    next_cursor = str(prompts[-1].get("id", "")) if len(prompts) == safe_limit else ""
+    return JSONResponse({
+        "prompts": prompts,
+        "next_before": next_before,
+        "next_cursor": next_cursor,
+    })
+
 
 def _read_json_file(path: Path) -> dict:
     try:
@@ -4354,9 +4972,14 @@ def _session_is_claude(name: str) -> bool:
 
 def get_tmux_sessions() -> list[dict]:
     try:
+        # The active pane's path rides along on the SAME list-sessions call, so
+        # knowing which project every session belongs to costs nothing extra.
+        # It goes after a TAB because a path may contain ':' and the first four
+        # fields are colon-separated.
         result = subprocess.run(
             ["tmux", "list-sessions", "-F",
-             "#{session_name}:#{session_windows}:#{session_created}:#{session_attached}"],
+             "#{session_name}:#{session_windows}:#{session_created}:#{session_attached}"
+             "\t#{pane_current_path}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -4365,7 +4988,8 @@ def get_tmux_sessions() -> list[dict]:
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
-            parts = line.split(":")
+            head, _, cwd = line.partition("\t")
+            parts = head.split(":")
             name = parts[0]
             if name.startswith("__") and name.endswith("__"):
                 continue  # Skip internal sessions (e.g. __auth_login_tmp__)
@@ -4376,6 +5000,7 @@ def get_tmux_sessions() -> list[dict]:
                 "windows": parts[1] if len(parts) > 1 else "?",
                 "created": parts[2] if len(parts) > 2 else "",
                 "attached": parts[3] == "1" if len(parts) > 3 else False,
+                "cwd": cwd.strip(),
             })
         return sessions
     except Exception:
@@ -5577,6 +6202,7 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "name": sess["name"],
         "windows": sess["windows"],
         "attached": sess["attached"],
+        "cwd": sess.get("cwd", ""),     # the project this session belongs to
         "title": data.get("title", ""),
         "description": data.get("description", ""),
         "description_at": data.get("description_at", 0),
@@ -5646,6 +6272,11 @@ async def api_sessions_fast(request: Request):
             "name": sess["name"],
             "windows": sess["windows"],
             "attached": sess["attached"],
+            # The working directory IS the project: it selects the CLAUDE.md,
+            # MCP servers and auto-memories this session loads, so the nav needs
+            # it to group sessions by workspace. It rides along free on the same
+            # tmux list-sessions call.
+            "cwd": sess.get("cwd", ""),
             "owner": _uid_to_name.get(_owners_map.get(sess["name"], "admin"), "") or AUTH_USER,
             "title": entry.get("title", ""),
             "description": entry.get("description", ""),
@@ -5820,6 +6451,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 class CreateSession(BaseModel):
     name: str = ""
     profile_id: str = ""
+    cwd: str = ""       # start the session in this project directory
 
 
 @app.post("/api/sessions/create")
@@ -5834,10 +6466,29 @@ async def api_create_session(request: Request, body: CreateSession):
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
             return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+    # The project the session belongs to. A session's cwd is what decides which
+    # CLAUDE.md, .mcp.json and auto-memories Claude Code loads, so "open a session
+    # in project B" has to mean starting tmux there — everything else follows.
+    start_cwd = ""
+    raw_cwd = (body.cwd or "").strip()
+    if raw_cwd:
+        try:
+            cand = Path(raw_cwd).expanduser().resolve()
+        except Exception:
+            cand = None
+        if cand is None or not cand.is_dir():
+            return JSONResponse({"error": f"{raw_cwd} is not an existing directory."}, status_code=400)
+        # Only somewhere Claude Code already knows as a project, so this can't be
+        # turned into "start a shell anywhere on the box" by a crafted request.
+        if str(cand) not in await asyncio.to_thread(_known_project_dirs):
+            return JSONResponse({"error": "Not a known project directory."}, status_code=400)
+        start_cwd = str(cand)
     try:
         cmd = ["tmux", "new-session", "-d"]
         if name:
             cmd += ["-s", name]
+        if start_cwd:
+            cmd += ["-c", start_cwd]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
@@ -6372,6 +7023,7 @@ async def api_save_session_memory_md(session_name: str, body: SaveClaudeMd):
         return JSONResponse({"error": "Path mismatch"}, status_code=400)
     try:
         mem_dir.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(mpath)
         mpath.write_text(body.content)
         return JSONResponse({"ok": True, "path": str(mpath)})
     except Exception:
@@ -6420,6 +7072,7 @@ async def api_save_session_memory_extra(session_name: str, body: SkillFileBody):
     if not str(fpath.resolve()).startswith(str(mem_dir.resolve()) + os.sep):
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
+        _backup_before_dashboard_write(fpath)
         fpath.write_text(body.content)
         return JSONResponse({"ok": True, "name": fname})
     except Exception:
@@ -6483,17 +7136,29 @@ _CONTEXT_FILES = [
      "note": "Infrastructure index: VMs, domains, and pointers to the per-host detail files."},
     {"id": "droplets", "path": Path.home() / "claude_droplets_access.md", "load": "ondemand",
      "note": "SSH access to the legacy DigitalOcean droplets."},
-    {"id": "infra-keeper", "path": MESSAGES_DIR / "skills" / "_global" / "infra-directory-keeper.md",
-     "load": "ondemand", "note": "Rules for keeping the infrastructure index current."},
-    {"id": "browser-qa", "path": MESSAGES_DIR / "skills" / "_global" / "browser-qa.md",
-     "load": "ondemand", "note": "agent-browser QA procedure to run after a large change."},
+]
+
+# Enterprise policy, if this host ever gets any. Root-owned and outranking every
+# profile and project setting, so they belong in the picture even while absent —
+# "nothing here" is the answer to "what else could be changing Claude's behaviour".
+_POLICY_CONTEXT_FILES = [
+    {"id": "managed-settings", "path": Path("/etc/claude-code/managed-settings.json"),
+     "load": "policy", "label": "/etc/claude-code/managed-settings.json", "readonly": True,
+     "note": "Enterprise policy settings. Outrank every profile and project setting when present."},
+    {"id": "managed-claude-md", "path": Path("/etc/claude-code/CLAUDE.md"),
+     "load": "policy", "label": "/etc/claude-code/CLAUDE.md", "readonly": True,
+     "note": "Enterprise policy rules, read before any profile or project CLAUDE.md."},
 ]
 
 _INFRA_DETAIL_DIR = Path.home() / ".claude" / "infra"
+_GLOBAL_SKILLS_DIR = MESSAGES_DIR / "skills" / "_global"
+_HOST_HOOKS_DIR = Path.home() / ".claude" / "hooks"
 
 
 def _context_file_entries():
-    """Registry entries plus the per-host infra detail files, existing ones only."""
+    """Registry entries plus the globbed sets that grow on their own: per-host
+    infra detail, the dashboard's global skills, and the hook scripts. Existing
+    files only, except the enterprise policy paths, which are listed either way."""
     entries = list(_CONTEXT_FILES)
     try:
         for p in sorted(_INFRA_DETAIL_DIR.glob("*.md")):
@@ -6506,7 +7171,37 @@ def _context_file_entries():
             })
     except Exception:
         logger.debug("Failed to list infra detail files", exc_info=True)
-    return [e for e in entries if e["path"].exists()]
+    try:
+        for p in sorted(_GLOBAL_SKILLS_DIR.glob("*.md")):
+            entries.append({
+                "id": "gskill-" + p.stem, "path": p, "load": "ondemand",
+                "label": "skills/_global/" + p.name,
+                "note": "Global skill file, linked from CLAUDE.md and readable by every profile.",
+            })
+    except Exception:
+        logger.debug("Failed to list global skill files", exc_info=True)
+    try:
+        for p in sorted(_HOST_HOOKS_DIR.iterdir()):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            entries.append({
+                "id": "hook-" + p.stem, "path": p, "load": "hook",
+                "label": "hooks/" + p.name,
+                "note": ("Hook script. Runs on whichever tool events a settings.json "
+                         "`hooks` entry points at it — it can block a tool call outright."),
+            })
+    except Exception:
+        logger.debug("Failed to list hook scripts", exc_info=True)
+    existing = [e for e in entries if e["path"].exists()]
+    # Dedupe: the fixed registry names two files the globs also pick up.
+    seen, out = set(), []
+    for e in existing:
+        key = str(e["path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out + list(_POLICY_CONTEXT_FILES)
 
 
 @app.get("/api/context-files")
@@ -6514,15 +7209,21 @@ async def api_list_context_files():
     files = []
     for e in _context_file_entries():
         p = e["path"]
-        try:
-            content = p.read_text(errors="replace")
-        except Exception:
-            logger.debug("Failed to read context file %s", p, exc_info=True)
-            continue
+        exists = p.exists()
+        content = ""
+        if exists:
+            try:
+                content = p.read_text(errors="replace")
+            except Exception:
+                logger.debug("Failed to read context file %s", p, exc_info=True)
+                if not e.get("readonly"):
+                    continue
+                content = "(unreadable from the dashboard — root-owned)"
         files.append({
             "id": e["id"], "name": e.get("label") or p.name, "path": str(p),
             "load": e["load"], "note": e["note"], "secret": bool(e.get("secret")),
-            "content": content, "size": p.stat().st_size,
+            "readonly": bool(e.get("readonly")), "exists": exists,
+            "content": content, "size": p.stat().st_size if exists else 0,
         })
     auto = sum(f["size"] for f in files if f["load"] == "auto")
     return JSONResponse({"files": files, "auto_bytes": auto})
@@ -6535,6 +7236,9 @@ async def api_save_context_file(body: ContextFileBody):
     entry = next((e for e in _context_file_entries() if e["id"] == body.name), None)
     if entry is None:
         return JSONResponse({"error": "Unknown context file"}, status_code=404)
+    if entry.get("readonly"):
+        return JSONResponse({"error": "Read-only here — this file is owned by the machine, not the dashboard."},
+                            status_code=400)
     p = entry["path"]
     try:
         p.write_text(body.content)
@@ -6709,6 +7413,121 @@ class SkillLibraryBody(BaseModel):
     session_name: str = ""
 
 
+def _account_skills_dir(user: dict) -> Path:
+    skills_dir = _user_claude_config_dir(user) / "skills"
+    if skills_dir.is_symlink():
+        raise ValueError("Account skills root cannot be a symlink")
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    skills_dir.chmod(0o700)
+    return skills_dir
+
+
+@app.get("/api/my/skills")
+async def api_list_my_skills(request: Request):
+    """List only the canonical skills loaded by the signed-in account."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    skills_dir = _account_skills_dir(user)
+    skills = []
+    legacy_files = []
+    for entry in sorted(skills_dir.iterdir()):
+        info = _read_skill_dir(entry)
+        if info:
+            info["from_library"] = False
+            skills.append(info)
+        elif entry.is_file() and entry.suffix == ".md":
+            legacy_files.append(entry.name)
+    return JSONResponse({
+        "skills": skills,
+        "legacy_files": legacy_files,
+        "path": str(skills_dir),
+        "scope": "account",
+    })
+
+
+@app.post("/api/my/skills/{skill_name}")
+async def api_save_my_skill(request: Request, skill_name: str,
+                            body: SaveLibrarySkillBody):
+    """Create or update one skill inside the signed-in account's Claude home."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    skills_dir = _account_skills_dir(user)
+    target = skills_dir / name
+    if target.is_symlink() or target.resolve().parent != skills_dir.resolve():
+        return JSONResponse({"error": "Invalid personal skill path"}, status_code=400)
+    description = (body.description or "").strip().replace("\n", " ").replace("\r", " ")
+    raw = (body.content or "").lstrip()
+    if raw.startswith("---"):
+        content = raw if raw.endswith("\n") else raw + "\n"
+    else:
+        content = (f"---\nname: {name}\ndescription: {description}\n---\n\n"
+                   f"{raw.rstrip()}\n")
+    target.mkdir(parents=True, exist_ok=True)
+    target.chmod(0o700)
+    skill_md = target / "SKILL.md"
+    if skill_md.exists():
+        _backup_before_dashboard_write(skill_md)
+    skill_md.write_text(content)
+    skill_md.chmod(0o600)
+    return JSONResponse({"ok": True, "name": name, "scope": "account"})
+
+
+@app.get("/api/my/skills/{skill_name}")
+async def api_get_my_skill(request: Request, skill_name: str):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    skills_dir = _account_skills_dir(user)
+    target = skills_dir / name
+    if target.is_symlink() or target.resolve().parent != skills_dir.resolve():
+        return JSONResponse({"error": "Invalid personal skill path"}, status_code=400)
+    info = _read_skill_dir(target)
+    if not info:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    info["scope"] = "account"
+    return JSONResponse(info)
+
+
+@app.delete("/api/my/skills/{skill_name}")
+async def api_delete_my_skill(request: Request, skill_name: str):
+    """Move a personal skill to a trash dir — recoverable, not destroyed."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    name = _sanitize_skill_dir_name(skill_name)
+    if not name:
+        return JSONResponse({"error": "Invalid skill name"}, status_code=400)
+    if not _is_admin(user):
+        _ensure_user_claude_config_dir(user)
+    skills_dir = _account_skills_dir(user)
+    target = skills_dir / name
+    if target.is_symlink() or target.resolve().parent != skills_dir.resolve():
+        return JSONResponse({"error": "Invalid personal skill path"}, status_code=400)
+    if not target.is_dir():
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    trash_dir = _user_claude_config_dir(user) / ".skill-trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    trash_dir.chmod(0o700)
+    trash_target = trash_dir / f"{name}-{int(time.time() * 1000)}"
+    shutil.move(str(target), str(trash_target))
+    _set_member_claude_permissions(trash_target)
+    return JSONResponse({"ok": True, "name": name, "recoverable": True})
+
+
 @app.get("/api/sessions/{session_name}/skills")
 async def api_list_skills(session_name: str):
     """List .md skill files for a session."""
@@ -6748,6 +7567,7 @@ async def api_save_skill(session_name: str, body: SkillFileBody):
     if not str(fpath.resolve()).startswith(str(d.resolve())):
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
+        _backup_before_dashboard_write(fpath)
         fpath.write_text(body.content)
         return JSONResponse({"ok": True, "name": fname, "path": str(fpath)})
     except Exception:
@@ -7331,10 +8151,14 @@ def _materialize_profile(profile: dict):
                 # If user blanked the field via the editor, drop it from settings
                 elif key in merged and not profile.get(key) and key in ("model",):
                     merged.pop(key, None)
+            _backup_before_dashboard_write(settings_path)
             settings_path.write_text(json.dumps(merged, indent=2))
         else:
+            _backup_before_dashboard_write(settings_path)
             settings_path.write_text(json.dumps(managed, indent=2))
+        _backup_before_dashboard_write(claudemd_path)
         claudemd_path.write_text(profile.get("claude_md") or "")
+        _backup_before_dashboard_write(memorymd_path)
         memorymd_path.write_text(profile.get("memory_md") or "")
         # Seed initial skill files only when they are missing -- never overwrite,
         # so the user (or a fresh `agent-browser skills get` pull) can edit them.
@@ -7356,6 +8180,7 @@ def _materialize_profile(profile: dict):
                 if target.exists():
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
+                _backup_before_dashboard_write(target)
                 target.write_text(content)
     except Exception:
         logger.exception("Failed to materialize profile %s at %s", pid, d)
@@ -7426,6 +8251,21 @@ async def api_get_profile(profile_id: str):
     if not p:
         return JSONResponse({"error": "Profile not found"}, status_code=404)
     out = dict(p)
+    # CLAUDE.md / MEMORY.md on disk are what Claude Code actually loads, and the
+    # editor writes straight back to them, so read them from disk rather than
+    # from the stored record. The record goes stale the moment anyone edits a
+    # file directly, and for the default profile it was never populated at all —
+    # saving from the editor would have blanked ~/.claude/CLAUDE.md.
+    d = _profile_dir(profile_id)
+    for field, fname in (("claude_md", "CLAUDE.md"), ("memory_md", "MEMORY.md")):
+        f = d / fname
+        if f.exists():
+            try:
+                out[field] = f.read_text()
+                continue
+            except Exception:
+                logger.debug("Failed to read %s", f, exc_info=True)
+        out[field] = out.get(field) or ""
     out["dir"] = "" if profile_id == DEFAULT_PROFILE_ID else str(_profile_dir(profile_id))
     return JSONResponse(out)
 
@@ -7664,6 +8504,7 @@ async def api_save_profile_skill(profile_id: str, body: SkillFileBody):
     if not str(fpath.resolve()).startswith(str(d.resolve())):
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     try:
+        _backup_before_dashboard_write(fpath)
         fpath.write_text(body.content)
         return JSONResponse({"ok": True, "name": fname})
     except Exception:
@@ -7730,6 +8571,11 @@ def _safe_profile_path(profile_id: str, rel: str) -> Optional[Path]:
     rel = (rel or "").lstrip("/").replace("\\", "/")
     if not rel or ".." in rel.split("/"):
         return None
+    # The default profile runs with CLAUDE_CONFIG_DIR unset, so Claude Code keeps
+    # its big config at ~/.claude.json — not inside ~/.claude/. Edit the file that
+    # is actually read, otherwise the MCP tab silently edits a dead copy.
+    if rel == ".claude.json":
+        return _profile_claude_json(_profile_dir(profile_id))
     base = _profile_dir(profile_id).resolve()
     target = (base / rel).resolve()
     try:
@@ -7782,7 +8628,7 @@ async def api_list_profile_files(profile_id: str):
                        ("mcp", _PROFILE_FILE_CATEGORIES["mcp"])):
         files = []
         for rel, kind in items:
-            p = base / rel
+            p = _safe_profile_path(profile_id, rel) or (base / rel)
             files.append({
                 "path": rel, "kind": kind,
                 "exists": p.exists(),
@@ -7859,6 +8705,7 @@ async def api_save_profile_file(profile_id: str, body: ProfileFileBody):
             return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(target)
         target.write_text(body.content)
         return JSONResponse({"ok": True, "path": body.path,
                              "size": target.stat().st_size})
@@ -7876,11 +8723,13 @@ async def api_delete_profile_file(profile_id: str, path: str):
     if target is None:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     # Refuse to delete the singletons settings.json / .claude.json — they're
-    # managed by Claude Code itself. Only files inside agents/ or commands/ are
-    # safely deletable here.
+    # managed by Claude Code itself. Only files inside agents/, commands/ or a
+    # project's auto-memory dir are safely deletable here.
     rel_parts = path.split("/")
-    if rel_parts[0] not in ("agents", "commands"):
-        return JSONResponse({"error": "Only files under agents/ or commands/ can be deleted here"},
+    is_memory = (len(rel_parts) >= 4 and rel_parts[0] == "projects"
+                 and rel_parts[2] == "memory" and path.endswith(".md"))
+    if rel_parts[0] not in ("agents", "commands") and not is_memory:
+        return JSONResponse({"error": "Only files under agents/, commands/ or projects/<project>/memory/ can be deleted here"},
                             status_code=400)
     if target.exists():
         try:
@@ -7892,6 +8741,95 @@ async def api_delete_profile_file(profile_id: str, path: str):
             logger.exception("Failed to delete profile file %s", target)
             return JSONResponse({"error": "Failed to delete"}, status_code=500)
     return JSONResponse({"ok": True})
+
+
+# --- Profile auto-memories --------------------------------------------------
+# Claude Code writes auto-memory to <config-dir>/projects/<encoded-cwd>/memory/.
+# Per live session that dir is reachable from the More menu, but a profile
+# accumulates one per project it has ever run in — including projects with no
+# session open right now. The Profiles editor lists them all so every memory the
+# profile can load is visible in one place.
+
+_MEMORY_LIST_CAP = 4000
+
+
+def _profile_memory_projects(profile_id: str) -> list:
+    base = _profile_dir(profile_id) / "projects"
+    if not base.exists():
+        return []
+    # The encoded dir name is lossy (both "/" and "_" become "-"), so recover the
+    # real cwd from the live sessions where we can and show the encoding otherwise.
+    cwd_by_encoded: dict = {}
+    try:
+        for s in get_tmux_sessions():
+            c = get_session_cwd(s["name"]) or ""
+            if c:
+                cwd_by_encoded.setdefault(_encode_project_path(c), c)
+    except Exception:
+        logger.debug("Failed to map session cwds to project dirs", exc_info=True)
+
+    out = []
+    budget = _MEMORY_LIST_CAP
+    for proj in sorted(base.iterdir()):
+        mem = proj / "memory"
+        if not mem.is_dir():
+            continue
+        index = mem / "MEMORY.md"
+        files = []
+        truncated = False
+        # Two levels: memory/*.md plus one level of subdirectories (archive/, …).
+        for p in sorted(mem.rglob("*.md")):
+            try:
+                rel_in_mem = p.relative_to(mem)
+            except ValueError:
+                continue
+            if len(rel_in_mem.parts) > 2 or not p.is_file():
+                continue
+            if str(rel_in_mem).upper() == "MEMORY.MD":
+                continue
+            if budget <= 0:
+                truncated = True
+                break
+            budget -= 1
+            try:
+                files.append({
+                    "name": str(rel_in_mem),
+                    "size": p.stat().st_size,
+                    "rel": f"projects/{proj.name}/memory/{rel_in_mem.as_posix()}",
+                })
+            except Exception:
+                logger.debug("Failed to stat memory file %s", p, exc_info=True)
+        out.append({
+            "project": proj.name,
+            "cwd": cwd_by_encoded.get(proj.name, ""),
+            "dir": str(mem),
+            "index_rel": f"projects/{proj.name}/memory/MEMORY.md",
+            "index_exists": index.exists(),
+            "index_size": index.stat().st_size if index.exists() else 0,
+            "files": files,
+            "truncated": truncated,
+        })
+    return out
+
+
+@app.get("/api/profiles/{profile_id}/memories")
+async def api_list_profile_memories(profile_id: str):
+    """Every project auto-memory directory this profile has, names and sizes only.
+
+    Content is fetched per file through /api/profiles/{id}/file — one project dir
+    here holds nearly 300 topic files, so returning bodies would be pointless
+    weight on a listing that is mostly navigation.
+    """
+    data = _load_roles()
+    if not _find_profile(profile_id, data):
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    projects = _profile_memory_projects(profile_id)
+    return JSONResponse({
+        "dir": str(_profile_dir(profile_id) / "projects"),
+        "projects": projects,
+        "total_files": sum(len(p["files"]) + (1 if p["index_exists"] else 0)
+                           for p in projects),
+    })
 
 
 @app.get("/api/profiles/{profile_id}/credentials")
@@ -8037,6 +8975,7 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
             return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(target)
         target.write_text(body.content)
         return JSONResponse({"ok": True, "path": body.path,
                              "abs_path": str(target),
@@ -8044,6 +8983,398 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
     except Exception:
         logger.exception("Failed to write project file %s", target)
         return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+# --- Project scope, host-wide ---
+#
+# The per-session endpoints above show one project through one session. The
+# Profiles window needs the whole set, because "which files reach Claude" is a
+# property of this box, not of whichever tab happens to be open. Discovery is the
+# union of every config dir's `.claude.json` projects map (Claude Code records
+# one entry per directory it has ever run in) and the cwd of every live session.
+
+_PROJECT_SCOPE_FILES = [
+    ("CLAUDE.md", "md", "always",
+     "Project rules, loaded on top of the profile's CLAUDE.md for every session in this directory."),
+    ("CLAUDE.local.md", "md", "always",
+     "Personal project rules, never committed. Still read; superseded by .claude/settings.local.json."),
+    (".claude/settings.json", "json", "settings",
+     "Project settings (model, env, hooks, permissions). Override the profile's settings.json."),
+    (".claude/settings.local.json", "json", "settings",
+     "Project-local settings, never committed. Loaded last, so these win over everything."),
+    (".mcp.json", "json", "mcp",
+     "Project-scope MCP servers, added to the profile's."),
+]
+
+_PROJECT_SCOPE_DIRS = [
+    (".claude/agents", "Subagents that exist only in this directory."),
+    (".claude/commands", "Slash commands that exist only in this directory."),
+    (".claude/skills", "Skills that load only in this directory."),
+    (".claude/hooks", "Hook scripts this project's settings.json can point at."),
+    (".claude/output-styles", "Output styles selectable in this directory."),
+]
+
+_PROJECT_SCOPE_DIR_CAP = 60
+_PROJECT_SCOPE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write JSON via a temp file + rename, so a reader never sees a half-file.
+
+    Claude Code rewrites `.claude.json` from under us while it runs. A plain
+    write_text leaves a window where the file is truncated; landing it with a
+    rename on the same filesystem makes the swap atomic, so the worst case is
+    losing our edit to a concurrent write rather than corrupting the config."""
+    tmp = path.with_name(path.name + ".tmp-dash")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def _config_dirs() -> list:
+    """Every CLAUDE_CONFIG_DIR on this host: ~/.claude plus each ~/.claude-*."""
+    out = [Path.home() / ".claude"]
+    try:
+        out += sorted(p for p in Path.home().glob(".claude-*") if p.is_dir())
+    except Exception:
+        logger.debug("Failed to glob profile dirs", exc_info=True)
+    return out
+
+
+def _profile_claude_json(config_dir: Path) -> Path:
+    """`.claude.json` for a config dir. The default profile runs with
+    CLAUDE_CONFIG_DIR unset, so its config is the home-level ~/.claude.json."""
+    if config_dir == Path.home() / ".claude":
+        return Path.home() / ".claude.json"
+    return config_dir / ".claude.json"
+
+
+def _known_project_dirs() -> dict:
+    """{abs cwd: [live session names]} for every directory Claude Code has a
+    project scope for. Directories that no longer exist are dropped."""
+    found: dict = {}
+
+    def add(path: str):
+        if not path or not path.startswith("/"):
+            return
+        try:
+            p = Path(path)
+            if p.is_dir():
+                found.setdefault(str(p), [])
+        except Exception:
+            logger.debug("Bad project path %r", path, exc_info=True)
+
+    for cfg in _config_dirs():
+        cj = _profile_claude_json(cfg)
+        if not cj.exists():
+            continue
+        try:
+            for path in (json.loads(cj.read_text()).get("projects") or {}):
+                add(path)
+        except Exception:
+            logger.debug("Failed to read projects from %s", cj, exc_info=True)
+
+    try:
+        for s in get_tmux_sessions():
+            cwd = get_session_cwd(s["name"]) or ""
+            add(cwd)
+            if cwd and str(Path(cwd)) in found:
+                found[str(Path(cwd))].append(s["name"])
+    except Exception:
+        logger.debug("Failed to map live session cwds", exc_info=True)
+
+    return found
+
+
+def _project_scope_inventory(base: Path) -> tuple:
+    """(files, dirs) for one project dir: the fixed cwd-bound files Claude Code
+    reads plus the contents of the per-project .claude subdirectories."""
+    files = []
+    for rel, kind, group, note in _PROJECT_SCOPE_FILES:
+        p = base / rel
+        exists = p.is_file()
+        files.append({
+            "rel": rel, "kind": kind, "group": group, "note": note,
+            "exists": exists, "size": p.stat().st_size if exists else 0,
+        })
+    dirs = []
+    for rel, note in _PROJECT_SCOPE_DIRS:
+        d = base / rel
+        entries = []
+        truncated = False
+        if d.is_dir():
+            for entry in sorted(d.iterdir()):
+                if entry.name.startswith("."):
+                    continue
+                if len(entries) >= _PROJECT_SCOPE_DIR_CAP:
+                    truncated = True
+                    break
+                try:
+                    is_dir = entry.is_dir()
+                    # A skill is a directory holding SKILL.md; point the row at it.
+                    target = entry / "SKILL.md" if is_dir and (entry / "SKILL.md").is_file() else entry
+                    if target.is_dir():
+                        entries.append({"name": entry.name, "rel": "", "size": 0, "dir": True})
+                        continue
+                    entries.append({
+                        "name": entry.name + ("/SKILL.md" if target != entry else ""),
+                        "rel": str(target.relative_to(base)),
+                        "size": target.stat().st_size, "dir": False,
+                    })
+                except Exception:
+                    logger.debug("Failed to stat %s", entry, exc_info=True)
+        if entries or d.is_dir():
+            dirs.append({"rel": rel, "note": note, "files": entries,
+                         "truncated": truncated})
+    return files, dirs
+
+
+def _safe_project_scope_path(project: str, rel: str) -> Optional[Path]:
+    """Resolve <project>/<rel>, refusing anything outside the known project dirs
+    or outside the cwd-bound file set Claude Code actually reads."""
+    project = (project or "").rstrip("/") or "/"
+    if project not in _known_project_dirs():
+        return None
+    rel_clean = (rel or "").lstrip("/").replace("\\", "/")
+    if not rel_clean or ".." in rel_clean.split("/"):
+        return None
+    allowed_files = {p for p, _, _, _ in _PROJECT_SCOPE_FILES}
+    if rel_clean not in allowed_files:
+        # Otherwise it has to sit inside one of the per-project .claude dirs.
+        parent = rel_clean.rsplit("/", 1)[0] if "/" in rel_clean else ""
+        tail = rel_clean[len(parent) + 1:] if parent else rel_clean
+        dir_rels = {d for d, _ in _PROJECT_SCOPE_DIRS}
+        # Skills nest one level deeper: .claude/skills/<name>/SKILL.md
+        if parent not in dir_rels:
+            grand = parent.rsplit("/", 1)[0] if "/" in parent else ""
+            if grand not in dir_rels or not _PROJECT_SCOPE_NAME_RE.match(parent.rsplit("/", 1)[-1]):
+                return None
+        if not _PROJECT_SCOPE_NAME_RE.match(tail):
+            return None
+    base = Path(project).resolve()
+    if not base.is_dir():
+        return None
+    target = (base / rel_clean).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return None
+    return target
+
+
+@app.get("/api/project-scope")
+async def api_project_scope(request: Request):
+    """Every project directory on this host with the cwd-bound files Claude Code
+    loads on top of whichever profile a session runs on."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    known = await asyncio.to_thread(_known_project_dirs)
+    config_dirs = {str(d) for d in _config_dirs()}
+    projects = []
+    for path in sorted(known):
+        files, dirs = await asyncio.to_thread(_project_scope_inventory, Path(path))
+        present = sum(1 for f in files if f["exists"]) + sum(len(d["files"]) for d in dirs)
+        # A session whose cwd is ~ reads ~/.claude/ as its project scope — the very
+        # dir that is also the Default profile. Same files, counted twice by Claude
+        # Code; say so rather than let the duplicate look like a bug.
+        overlap = str(Path(path) / ".claude")
+        projects.append({
+            "path": path, "sessions": sorted(known[path]),
+            "files": files, "dirs": dirs, "present": present,
+            "config_overlap": overlap if overlap in config_dirs else "",
+        })
+    # Directories that carry no cwd-bound files at all sink to the bottom: they
+    # are still real projects, just nothing here overrides the profile.
+    projects.sort(key=lambda p: (p["present"] == 0, p["path"]))
+    return JSONResponse({"projects": projects, "home": str(Path.home()),
+                         "total_present": sum(p["present"] for p in projects)})
+
+
+@app.get("/api/project-scope/file")
+async def api_project_scope_read(request: Request, project: str, path: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = await asyncio.to_thread(_safe_project_scope_path, project, path)
+    if target is None:
+        return JSONResponse({"error": "Not a known project file"}, status_code=400)
+    exists = target.is_file()
+    content = ""
+    if exists:
+        try:
+            content = target.read_text(errors="replace")
+        except Exception:
+            logger.debug("Failed to read %s", target, exc_info=True)
+            return JSONResponse({"error": "Could not read file"}, status_code=500)
+    return JSONResponse({"project": project, "path": path, "abs_path": str(target),
+                         "content": content, "exists": exists,
+                         "size": target.stat().st_size if exists else 0})
+
+
+class ProjectScopeFileBody(BaseModel):
+    project: str
+    path: str
+    content: str
+
+
+@app.put("/api/project-scope/file")
+async def api_project_scope_save(request: Request, body: ProjectScopeFileBody):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = await asyncio.to_thread(_safe_project_scope_path, body.project, body.path)
+    if target is None:
+        return JSONResponse({"error": "Not a known project file"}, status_code=400)
+    if target.suffix.lower() == ".json" and body.content.strip():
+        try:
+            json.loads(body.content)
+        except Exception as e:
+            return JSONResponse({"error": f"Invalid JSON: {e}"}, status_code=400)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(target)
+        target.write_text(body.content)
+        return JSONResponse({"ok": True, "path": body.path, "abs_path": str(target),
+                            "size": target.stat().st_size})
+    except Exception:
+        logger.exception("Failed to write project-scope file %s", target)
+        return JSONResponse({"error": "Failed to save"}, status_code=500)
+
+
+@app.delete("/api/project-scope/file")
+async def api_project_scope_delete(request: Request, project: str, path: str):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    target = await asyncio.to_thread(_safe_project_scope_path, project, path)
+    if target is None:
+        return JSONResponse({"error": "Not a known project file"}, status_code=400)
+    if target.is_file():
+        try:
+            target.unlink()
+        except Exception:
+            logger.exception("Failed to delete project-scope file %s", target)
+            return JSONResponse({"error": "Failed to delete"}, status_code=500)
+    return JSONResponse({"ok": True})
+
+
+class ProjectRegisterBody(BaseModel):
+    path: str
+
+
+@app.post("/api/project-scope/project")
+async def api_project_scope_add(request: Request, body: ProjectRegisterBody):
+    """Register a working directory as a project.
+
+    Claude Code adds a directory to its projects map the first time it runs
+    there; this lets the dashboard get ahead of that, so a workspace can be set
+    up (CLAUDE.md, .mcp.json) before the first session ever starts in it."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    raw = (body.path or "").strip()
+    if not raw:
+        return JSONResponse({"error": "A directory path is required"}, status_code=400)
+    try:
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            return JSONResponse({"error": "Use an absolute path"}, status_code=400)
+        target = target.resolve()
+    except Exception:
+        return JSONResponse({"error": "Not a usable path"}, status_code=400)
+    if not target.is_dir():
+        return JSONResponse({"error": f"{target} is not an existing directory"}, status_code=400)
+
+    def _register() -> str:
+        cj = _profile_claude_json(Path.home() / ".claude")
+        try:
+            data = json.loads(cj.read_text()) if cj.exists() else {}
+        except Exception:
+            logger.debug("Unreadable %s — starting a fresh projects map", cj, exc_info=True)
+            data = {}
+        projects = data.setdefault("projects", {})
+        if str(target) in projects:
+            return "existing"
+        # Claude Code fills this in itself; an empty object is the shape it
+        # expects and it rewrites the file on its next run anyway.
+        projects[str(target)] = {}
+        _atomic_write_json(cj, data)
+        return "added"
+
+    try:
+        state = await asyncio.to_thread(_register)
+    except Exception:
+        logger.exception("Failed to register project %s", target)
+        return JSONResponse({"error": "Failed to register the project"}, status_code=500)
+    return JSONResponse({"ok": True, "path": str(target), "state": state})
+
+
+@app.delete("/api/project-scope/project")
+async def api_project_scope_remove(request: Request, project: str, purge: int = 0):
+    """Forget a project, and optionally delete the Claude files inside it.
+
+    Default (`purge=0`) only drops the directory from every profile's projects
+    map, so it stops being listed here. The working directory and everything in
+    it are untouched. `purge=1` additionally removes the cwd-bound files Claude
+    Code reads there (CLAUDE.md, .mcp.json, .claude/) — and nothing else: the
+    project's actual source files are never in scope for this."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    raw = (project or "").strip()
+    if not raw.startswith("/"):
+        return JSONResponse({"error": "Not a known project"}, status_code=400)
+    target = Path(raw)
+    known = await asyncio.to_thread(_known_project_dirs)
+    if str(target) not in known:
+        return JSONResponse({"error": "Not a known project"}, status_code=400)
+    live = known.get(str(target)) or []
+    if live:
+        return JSONResponse(
+            {"error": f"{len(live)} live session(s) are running in this directory "
+                      f"({', '.join(live[:3])}). Close them first."}, status_code=409)
+
+    def _forget() -> dict:
+        dropped = 0
+        for cfg in _config_dirs():
+            cj = _profile_claude_json(cfg)
+            if not cj.exists():
+                continue
+            try:
+                data = json.loads(cj.read_text())
+            except Exception:
+                logger.debug("Unreadable %s — skipping", cj, exc_info=True)
+                continue
+            projects = data.get("projects") or {}
+            if str(target) in projects:
+                projects.pop(str(target), None)
+                data["projects"] = projects
+                _atomic_write_json(cj, data)
+                dropped += 1
+        removed = []
+        # The home directory is a project like any other (a session with cwd ~
+        # reads it), but ~/CLAUDE.md is the host context file every profile
+        # loads and every other doc points at. Purging it from here would take
+        # out the global instructions for the whole box, which is never what
+        # "remove this project from the list" is asking for.
+        if purge and target == Path.home():
+            return {"dropped_from": dropped, "removed": [],
+                    "note": "Home directory: forgotten from the project list, but its context "
+                            "files (~/CLAUDE.md, ~/.claude/) were kept. Those are host-wide."}
+        if purge:
+            for rel in ("CLAUDE.md", "CLAUDE.local.md", ".mcp.json"):
+                p = target / rel
+                if p.is_file():
+                    p.unlink()
+                    removed.append(rel)
+            d = target / ".claude"
+            # Never follow a symlink out of the project, and never touch a
+            # .claude that is itself a profile directory.
+            if d.is_dir() and not d.is_symlink() and d not in _config_dirs():
+                shutil.rmtree(d)
+                removed.append(".claude/")
+        return {"dropped_from": dropped, "removed": removed}
+
+    try:
+        out = await asyncio.to_thread(_forget)
+    except Exception:
+        logger.exception("Failed to remove project %s", target)
+        return JSONResponse({"error": "Failed to remove the project"}, status_code=500)
+    return JSONResponse({"ok": True, "path": str(target), **out})
 
 
 def _send_profile_export(session_name: str, profile_id: str):
@@ -8118,8 +9449,17 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
 # --- System stats ---
 
 @app.get("/api/stats")
-async def api_stats():
-    """System stats: CPU, disk, memory, tmux sessions, Claude processes."""
+async def api_stats(request: Request):
+    """System stats: CPU, disk, memory, tmux sessions, Claude processes.
+
+    Host-level figures (CPU/RAM/disk/uptime) stay visible to everyone because
+    the nav bar's server indicator polls this for every signed-in user. The
+    parts that name other people's work — the tmux session list and the raw
+    `pgrep -a` command lines, which carry each session's cwd and model — are
+    scoped to the caller.
+    """
+    user = _current_user(request)
+    is_admin = _is_admin(user)
     stats = {}
     # CPU load
     try:
@@ -8167,18 +9507,18 @@ async def api_stats():
     except Exception:
         stats["disk"] = {}
     # tmux sessions
-    stats["tmux_sessions"] = get_tmux_sessions()
-    # Claude processes
+    stats["tmux_sessions"] = _filter_sessions_for_user(get_tmux_sessions(), user)
+    # Claude processes. Command lines leak other members' cwd/model, so members
+    # get the count only.
     try:
         result = subprocess.run(
             ["pgrep", "-a", "claude"],
             capture_output=True, text=True, timeout=5
         )
-        stats["claude_processes"] = [
-            l.strip() for l in result.stdout.strip().split("\n") if l.strip()
-        ]
+        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+        stats["claude_processes"] = lines if is_admin else len(lines)
     except Exception:
-        stats["claude_processes"] = []
+        stats["claude_processes"] = [] if is_admin else 0
     # Node processes (Claude Code runs as node)
     try:
         result = subprocess.run(
@@ -8457,12 +9797,19 @@ def _login_switch_time(config_dir, ident: dict) -> float:
 
 
 @app.get("/api/login-health")
-async def api_login_health():
+async def api_login_health(request: Request):
     """Per-session Claude login health: flags sessions whose live `claude`
     process started before the current account became active (i.e. its in-TUI
-    5-hour usage bar reflects a previous account)."""
+    5-hour usage bar reflects a previous account).
+
+    Scoped to the caller's own sessions — the payload carries session names and
+    the account email behind each one, so an unfiltered list would let any
+    member enumerate every other member's sessions.
+    """
+    user = _current_user(request)
+
     def _compute():
-        sessions = get_tmux_sessions()
+        sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
         children, comm = _build_proc_tree()
         panes = _all_pane_pids_by_session()
         ident_by_dir: dict = {}
@@ -8491,7 +9838,8 @@ async def api_login_health():
                 "plan": ident["plan"],
                 "account": ident["email"] or ident["sub"],
             })
-        active = _account_identity(Path.home() / ".claude")
+        # The caller's own Claude home — admin sees ~/.claude, a member theirs.
+        active = _account_identity(_user_claude_config_dir(user))
         return {
             "account": {"email": active["email"], "plan": active["plan"],
                         "sub": active["sub"], "tier": active["tier"]},
@@ -8946,6 +10294,751 @@ async def api_browser_workload_stop(pid: int, request: Request, start_ticks: int
                        "%s process(es) targeted", pid, result.get("workload_root"),
                        result.get("targeted"))
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+# --- Per-account browsers ----------------------------------------------------
+# Each non-admin account gets its own persistent Chrome/noVNC stack, bound to
+# that account's Claude via a Playwright MCP entry pointing at its CDP port.
+# Without this every member drives the same Chrome, so one member's sign-in
+# state (and open tabs) is visible to all of them.
+_browser_sessions_lock = threading.Lock()
+_browser_starting: Dict[str, float] = {}   # sid -> last spawn attempt
+_BROWSER_START_RETRY_SECONDS = 30
+_ACCOUNT_BROWSER_CTX_BEGIN = "<!-- ACCOUNT BROWSER (managed) -->"
+_ACCOUNT_BROWSER_CTX_END = "<!-- END ACCOUNT BROWSER -->"
+
+
+def _release_browser_proxy_sessions(session_ids: set) -> None:
+    """Remove relay identities that belonged to deleted browser sessions."""
+    if not session_ids:
+        return
+    conf = _proxy_conf()
+    proxy_sessions = conf.get("sessions")
+    if not isinstance(proxy_sessions, dict):
+        return
+    changed = False
+    for sid in session_ids:
+        if proxy_sessions.pop(sid, None) is not None:
+            changed = True
+    if changed:
+        _proxy_save(conf)
+PLAYWRIGHT_MCP_CLI = Path(
+    os.environ.get("TMUX_DASH_PLAYWRIGHT_MCP_CLI", "")
+    or (Path.home() / ".claude-browser" / "node_modules" / "@playwright"
+        / "mcp" / "cli.js")
+)
+
+
+def _configure_member_browser_mcp(cfg_dir: Path, user: dict, browser: dict) -> None:
+    """Point this member's Playwright MCP at their own browser, and only theirs.
+
+    Written into the member's ``.claude.json`` beside the google MCP entry.
+    Removed again if the browser stops belonging to them, so a recycled browser
+    never leaves a stale binding behind.
+    """
+    cj = cfg_dir / ".claude.json"
+    try:
+        data = json.loads(cj.read_text()) if cj.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
+    owns = (
+        browser
+        and str(browser.get("owner_id", "")) == str(user.get("id", ""))
+        and browser.get("account_browser")
+        and int(browser.get("cdp_port", 0) or 0) > 0
+    )
+    if owns and PLAYWRIGHT_MCP_CLI.exists():
+        browser_output = cfg_dir / "browser-output"
+        browser_output.mkdir(parents=True, exist_ok=True)
+        try:
+            browser_output.chmod(0o700)
+        except OSError:
+            logger.debug("Could not set private permissions on %s",
+                         browser_output, exc_info=True)
+        servers["playwright-browser"] = {
+            "command": "node",
+            "args": [
+                str(PLAYWRIGHT_MCP_CLI),
+                "--cdp-endpoint", f"http://127.0.0.1:{int(browser['cdp_port'])}",
+                "--output-dir", str(browser_output),
+            ],
+        }
+    else:
+        servers.pop("playwright-browser", None)
+    data["mcpServers"] = servers
+    try:
+        _backup_before_dashboard_write(cj)
+        cj.write_text(json.dumps(data, indent=2))
+    except Exception:
+        logger.debug("Failed to write browser MCP entry into %s", cj, exc_info=True)
+
+
+def _browser_owner_id(session: dict) -> str:
+    """Return the account that owns a browser, including legacy metadata."""
+    owner_id = str(session.get("owner_id", "")).strip()
+    if owner_id:
+        return owner_id
+    # All browser records created before per-account isolation were admin tools.
+    return "admin"
+
+
+def _browser_profile_dir(session: dict) -> Path:
+    """Return the persistent Chrome user-data directory for a browser session."""
+    if session.get("id") == "default":
+        return CB_ROOT / "profile"
+    return CB_ROOT / "sessions" / str(session.get("id", "")) / "profile"
+
+
+def _browser_signin_state(session: dict) -> dict:
+    """Read Chrome's local account metadata without returning cookies or tokens."""
+    profile_root = _browser_profile_dir(session)
+    local_state: dict = {}
+    try:
+        local_state = json.loads((profile_root / "Local State").read_text())
+        if not isinstance(local_state, dict):
+            local_state = {}
+    except Exception:
+        local_state = {}
+
+    profile_meta = local_state.get("profile") or {}
+    ordered_names = []
+    last_used = profile_meta.get("last_used")
+    if isinstance(last_used, str) and last_used:
+        ordered_names.append(last_used)
+    for name in profile_meta.get("profiles_order") or []:
+        if isinstance(name, str) and name not in ordered_names:
+            ordered_names.append(name)
+    info_cache = profile_meta.get("info_cache") or {}
+    if isinstance(info_cache, dict):
+        for name in info_cache:
+            if isinstance(name, str) and name not in ordered_names:
+                ordered_names.append(name)
+    for fallback in ("Default", "Profile 1"):
+        if fallback not in ordered_names:
+            ordered_names.append(fallback)
+
+    for name in ordered_names:
+        try:
+            preferences = json.loads((profile_root / name / "Preferences").read_text())
+        except Exception:
+            continue
+        account_info = preferences.get("account_info") if isinstance(preferences, dict) else []
+        if isinstance(account_info, dict):
+            account_info = list(account_info.values())
+        if not isinstance(account_info, list):
+            continue
+        for account in account_info:
+            if not isinstance(account, dict):
+                continue
+            email = str(account.get("email") or "").strip()
+            if email or account.get("gaia"):
+                return {"signed_in": True, "email": email}
+
+    # Chrome can briefly update Local State before Preferences. Count it only
+    # when the account is also listed as active, which avoids stale profile
+    # display names looking like a current sign-in after logout.
+    active_accounts = (local_state.get("signin") or {}).get("active_accounts") or {}
+    if active_accounts and isinstance(info_cache, dict):
+        for name in ordered_names:
+            meta = info_cache.get(name) or {}
+            if not isinstance(meta, dict):
+                continue
+            email = str(meta.get("user_name") or "").strip()
+            if email and meta.get("gaia_id"):
+                return {"signed_in": True, "email": email}
+    return {"signed_in": False, "email": ""}
+
+
+def _spawn_browser_session(session: dict) -> None:
+    """Start one managed Chrome/noVNC stack without waiting for readiness."""
+    _ensure_browser_launcher()
+    subprocess.Popen(
+        [
+            "setsid",
+            "bash",
+            BROWSER_LAUNCHER,
+            "start",
+            str(session["id"]),
+            str(session["display"]),
+            str(session["rfb_port"]),
+            str(session["vnc_port"]),
+            str(session["cdp_port"]),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _claim_browser_proxy_session(session: dict) -> None:
+    """Give one browser exclusive ownership of its loopback proxy port."""
+    sid = str(session.get("id", "")).strip()
+    display = int(session.get("display", 0) or 0)
+    if not sid or display < 99:
+        return
+    local_port = 3128 + display - 99
+    conf = _proxy_conf()
+    proxy_sessions = conf.setdefault("sessions", {})
+    if not isinstance(proxy_sessions, dict):
+        proxy_sessions = {}
+        conf["sessions"] = proxy_sessions
+    changed = False
+    for other_sid, other in list(proxy_sessions.items()):
+        if (
+            other_sid != sid
+            and isinstance(other, dict)
+            and int(other.get("local_port", 0) or 0) == local_port
+        ):
+            proxy_sessions.pop(other_sid, None)
+            changed = True
+    proxy_session = proxy_sessions.setdefault(sid, {})
+    if int(proxy_session.get("local_port", 0) or 0) != local_port:
+        proxy_session["local_port"] = local_port
+        changed = True
+    if not proxy_session.get("session_id"):
+        proxy_session["session_id"] = secrets.token_hex(5)
+        changed = True
+    if "enabled" not in proxy_session:
+        proxy_session["enabled"] = True
+        changed = True
+    if changed:
+        _proxy_save(conf)
+
+
+def _sync_account_browser_context(
+    claude_md: Path,
+    user: dict,
+    browser: dict,
+) -> None:
+    """Tell Claude which owner-bound browser its Playwright MCP controls."""
+    original = claude_md.read_text() if claude_md.exists() else ""
+    existing = original
+    if _ACCOUNT_BROWSER_CTX_BEGIN in existing and _ACCOUNT_BROWSER_CTX_END in existing:
+        pre = existing.split(_ACCOUNT_BROWSER_CTX_BEGIN, 1)[0]
+        post = existing.split(_ACCOUNT_BROWSER_CTX_END, 1)[1]
+        existing = pre.rstrip("\n") + "\n" + post.lstrip("\n")
+    if (
+        str(browser.get("owner_id", "")) != str(user.get("id", ""))
+        or not browser.get("account_browser")
+    ):
+        updated = existing
+    else:
+        block = (
+            f"{_ACCOUNT_BROWSER_CTX_BEGIN}\n"
+            "## Your private account browser\n"
+            "Use the `playwright-browser` MCP for browser work. It is bound to "
+            f"this dashboard account's browser `{browser.get('id', '')}`.\n"
+            "Never connect to another account's browser, Chrome profile, CDP "
+            "port, noVNC session, or browser output directory.\n"
+            f"{_ACCOUNT_BROWSER_CTX_END}\n"
+        )
+        updated = block + "\n" + existing.lstrip("\n")
+    if updated != original:
+        claude_md.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(claude_md)
+        claude_md.write_text(updated)
+
+
+def _ensure_user_browser_session(
+    user: dict,
+    *,
+    start: bool = True,
+) -> dict:
+    """Allocate and, on access, start one persistent browser for an account."""
+    user_id = str(user.get("id", "")).strip()
+    if not user_id:
+        return {}
+    with _browser_sessions_lock:
+        sessions = _load_browser_sessions()
+        owned = [
+            session
+            for session in sessions
+            if _browser_owner_id(session) == user_id
+            and session.get("account_browser", session.get("id") == "default")
+        ]
+        session = next(
+            (item for item in owned if item.get("use_for_login")),
+            owned[0] if owned else None,
+        )
+        if session is None:
+            slot = _next_browser_slot(sessions)
+            sid_base = "acct-" + hashlib.sha256(
+                user_id.encode("utf-8")
+            ).hexdigest()[:16]
+            sid = sid_base
+            suffix = 2
+            existing_ids = {str(item.get("id", "")) for item in sessions}
+            while sid in existing_ids:
+                sid = f"{sid_base}-{suffix}"
+                suffix += 1
+            session = {
+                "id": sid,
+                "name": f"{user.get('username') or 'User'} browser"[:80],
+                "slot": slot,
+                "display": 99 + slot,
+                "rfb_port": 5900 + slot,
+                "vnc_port": 6080 + slot,
+                "cdp_port": 9222 + slot,
+                "managed": True,
+                "owner_id": user_id,
+                "account_browser": True,
+                "created_at": time.time(),
+            }
+            sessions.append(session)
+            _save_browser_sessions(sessions)
+            logger.info(
+                "Allocated browser '%s' to account '%s'",
+                sid,
+                user_id,
+            )
+        if not _is_admin(user):
+            try:
+                _configure_member_browser_mcp(
+                    _user_claude_config_dir(user),
+                    user,
+                    session,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to bind browser '%s' to account '%s'",
+                    session.get("id", ""),
+                    user_id,
+                )
+        try:
+            _sync_account_browser_context(
+                _user_claude_config_dir(user) / "CLAUDE.md",
+                user,
+                session,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to write browser context for account '%s'",
+                user_id,
+            )
+        if start and session.get("managed"):
+            try:
+                _claim_browser_proxy_session(session)
+            except Exception:
+                logger.debug(
+                    "Failed to claim proxy port for browser '%s'",
+                    session.get("id", ""),
+                    exc_info=True,
+                )
+        if (
+            start
+            and session.get("managed")
+            and not _browser_port_alive(session.get("vnc_port", 0))
+        ):
+            sid = str(session.get("id", ""))
+            last_start = float(_browser_starting.get(sid, 0) or 0)
+            if time.time() - last_start >= _BROWSER_START_RETRY_SECONDS:
+                _browser_starting[sid] = time.time()
+                try:
+                    _spawn_browser_session(session)
+                except Exception:
+                    _browser_starting.pop(sid, None)
+                    logger.exception(
+                        "Failed to start browser '%s' for account '%s'",
+                        sid,
+                        user_id,
+                    )
+        return session
+
+
+def _ensure_all_user_browser_sessions() -> None:
+    """Refresh member context and restore every account browser at startup."""
+    for user in _load_users():
+        if not _is_admin(user):
+            try:
+                _ensure_user_claude_config_dir(user)
+            except Exception:
+                logger.exception(
+                    "Failed to refresh Claude context for account '%s'",
+                    user.get("id", ""),
+                )
+        try:
+            _ensure_user_browser_session(user)
+        except Exception:
+            logger.exception(
+                "Failed to provision browser for account '%s'",
+                user.get("id", ""),
+            )
+
+
+def _delete_user_browser_session(user_id: str) -> None:
+    """Stop and remove browser stacks owned by a deleted account."""
+    with _browser_sessions_lock:
+        sessions = _load_browser_sessions()
+        owned = [
+            session
+            for session in sessions
+            if _browser_owner_id(session) == user_id
+            and session.get("account_browser")
+        ]
+        for session in owned:
+            sid = str(session.get("id", ""))
+            if session.get("managed"):
+                subprocess.run(
+                    ["bash", BROWSER_LAUNCHER, "stop", sid],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            _browser_starting.pop(sid, None)
+            if (
+                sid not in (".", "..")
+                and re.fullmatch(r"[A-Za-z0-9._-]+", sid)
+            ):
+                session_dir = CB_ROOT / "sessions" / sid
+                if session_dir.exists():
+                    shutil.rmtree(session_dir, ignore_errors=True)
+        if owned:
+            owned_ids = {id(session) for session in owned}
+            _save_browser_sessions([
+                session
+                for session in sessions
+                if id(session) not in owned_ids
+            ])
+        try:
+            _release_browser_proxy_sessions({
+                str(session.get("id", ""))
+                for session in owned
+                if session.get("id")
+            })
+        except Exception:
+            logger.debug(
+                "Failed to release browser proxy sessions for user '%s'",
+                user_id,
+                exc_info=True,
+            )
+
+
+def _account_browser_for_user(user: dict | None) -> dict:
+    """Return the persistent account browser owned by ``user``."""
+    if not user:
+        return {}
+    user_id = str(user.get("id", ""))
+    owned = [
+        session
+        for session in _load_browser_sessions()
+        if _browser_owner_id(session) == user_id
+        and session.get("account_browser", session.get("id") == "default")
+    ]
+    return next(
+        (session for session in owned if session.get("use_for_login")),
+        owned[0] if owned else {},
+    )
+
+
+async def _park_browser_tabs(session: dict) -> dict:
+    """Close loaded pages while preserving the Chrome profile and sign-in."""
+    sid = str(session.get("id", ""))
+    cdp_port = int(session.get("cdp_port", 0) or 0)
+    if not cdp_port:
+        return {"ok": False, "error": "Browser control port is unavailable"}
+    base = f"http://127.0.0.1:{cdp_port}"
+    closed = 0
+    async with _browser_busy_ctx(sid, "parking browser"):
+        async with httpx.AsyncClient(timeout=20) as client:
+            try:
+                targets = (await client.get(f"{base}/json/list")).json()
+            except Exception as exc:
+                return {"ok": False, "error": f"Browser is unreachable: {exc}"}
+            pages = [target for target in targets if target.get("type") == "page"]
+            keep_blank = ""
+            for target in pages:
+                if target.get("url", "").startswith("about:blank") and not keep_blank:
+                    keep_blank = str(target.get("id", ""))
+                    continue
+                try:
+                    await client.get(f"{base}/json/close/{target['id']}")
+                    closed += 1
+                except Exception:
+                    logger.debug(
+                        "Failed to close browser tab %s",
+                        target.get("id"),
+                        exc_info=True,
+                    )
+            if not keep_blank:
+                try:
+                    await client.put(f"{base}/json/new?about:blank")
+                except Exception:
+                    logger.debug("Failed to create placeholder browser tab", exc_info=True)
+    logger.info("Parked browser '%s' after closing %d tab(s)", sid, closed)
+    return {"ok": True, "closed": closed}
+
+
+async def _freeze_browser_tabs(session: dict) -> dict:
+    """Suspend background pages without closing them or changing the profile."""
+    sid = str(session.get("id", ""))
+    cdp_port = int(session.get("cdp_port", 0) or 0)
+    if not cdp_port:
+        return {"ok": False, "error": "Browser control port is unavailable"}
+    base = f"http://127.0.0.1:{cdp_port}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            targets = (await client.get(f"{base}/json/list")).json()
+    except Exception as exc:
+        return {"ok": False, "error": f"Browser is unreachable: {exc}"}
+    frozen = []
+    skipped = 0
+    async with _browser_busy_ctx(sid, "freezing browser tabs"):
+        for target in targets:
+            if (
+                target.get("type") != "page"
+                or not target.get("webSocketDebuggerUrl")
+                or str(target.get("url", "")).startswith("about:blank")
+            ):
+                continue
+            try:
+                ws = await websockets.connect(
+                    target["webSocketDebuggerUrl"],
+                    max_size=None,
+                    ping_interval=None,
+                    open_timeout=10,
+                )
+                try:
+                    tab = _CdpTab(ws)
+                    await tab.call(
+                        "Page.setWebLifecycleState",
+                        {"state": "frozen"},
+                        timeout=10,
+                    )
+                    frozen.append(
+                        str(target.get("title") or target.get("url") or "")[:60]
+                    )
+                finally:
+                    await ws.close()
+            except Exception:
+                skipped += 1
+    logger.info("Froze %d tab(s) on browser '%s'", len(frozen), sid)
+    return {
+        "ok": True,
+        "frozen": len(frozen),
+        "skipped": skipped,
+        "tabs": frozen,
+    }
+
+
+async def _fingerprint_browser(session: dict) -> dict:
+    sid = str(session.get("id", ""))
+    if not BROWSER_FINGERPRINT_TOOL.exists():
+        return {"ok": False, "error": "Fingerprint audit is not installed"}
+
+    def _run():
+        return subprocess.run(
+            [
+                "python3",
+                str(BROWSER_FINGERPRINT_TOOL),
+                "--cdp",
+                str(session.get("cdp_port", 0)),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    async with _browser_busy_ctx(sid, "fingerprint check"):
+        try:
+            completed = await asyncio.to_thread(_run)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "error": (completed.stderr or "Audit failed").strip()[:300],
+        }
+    try:
+        data = json.loads(completed.stdout)
+    except Exception:
+        return {"ok": False, "error": "Could not parse audit output"}
+    if isinstance(data, dict):
+        data.setdefault("ok", True)
+        return data
+    return {"ok": False, "error": "Could not parse audit output"}
+
+
+async def _member_browser_status(user: dict) -> dict:
+    """Return the non-secret state shared by the member tab and header badge."""
+    session = await asyncio.to_thread(_ensure_user_browser_session, user)
+    if not session:
+        return {
+            "session": None,
+            "connected": False,
+            "signed_in": False,
+            "working": False,
+            "needs_sign_in": True,
+            "state": "disconnected",
+        }
+    running = await asyncio.to_thread(
+        _browser_port_alive,
+        session.get("vnc_port", 0),
+    )
+    signin = (
+        await asyncio.to_thread(_browser_signin_state, session)
+        if running
+        else {"signed_in": False, "email": ""}
+    )
+    signed_in = bool(signin.get("signed_in"))
+    sid = str(session.get("id", ""))
+    driven = sid in _browser_busy
+    idle_ms = (
+        await asyncio.to_thread(_display_idle_ms, session.get("display", 0))
+        if running
+        else -1
+    )
+    connected = running and signed_in
+    working = connected and (driven or 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS)
+    return {
+        "session": {
+            "id": sid,
+            "name": session.get("name", "") or "Browser",
+            "running": running,
+            "viewer_url": _browser_viewer_url(session),
+        },
+        "connected": connected,
+        "signed_in": signed_in,
+        "working": working,
+        "needs_sign_in": not connected,
+        "state": "working" if working else "connected" if connected else "disconnected",
+    }
+
+
+async def _member_proxy_payload(user: dict, check: bool = False) -> dict:
+    """Safe proxy state for one account; never includes provider credentials."""
+    conf = _proxy_conf()
+    usage = _proxy_usage()
+    session = _account_browser_for_user(user)
+    rows = []
+    if session:
+        sid = str(session.get("id", ""))
+        proxy_session = (conf.get("sessions") or {}).get(sid) or {}
+        proxy_usage = usage.get(sid) or {}
+        row = {
+            "id": sid,
+            "name": session.get("name", "") or "Browser",
+            "country": proxy_session.get("country") or conf.get("country") or "",
+            "enabled": bool(proxy_session.get("enabled", True))
+            and bool(proxy_session.get("local_port")),
+            "bytes": int(proxy_usage.get("bytes_up", 0))
+            + int(proxy_usage.get("bytes_down", 0)),
+            "conns": int(proxy_usage.get("conns", 0)),
+        }
+        if (
+            check
+            and conf.get("enabled")
+            and proxy_session.get("local_port")
+        ):
+            row["exit"] = await _proxy_exit_info(proxy_session["local_port"])
+        rows.append(row)
+    return {
+        "installed": BROWSER_PROXY_CONF.parent.exists()
+        and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
+        "enabled": bool(conf.get("enabled")),
+        "provider": str(conf.get("provider", ""))[:80],
+        "country": str(conf.get("country", ""))[:12],
+        "browsers": rows,
+        "total_bytes": sum(row["bytes"] for row in rows),
+    }
+
+
+async def _rotate_proxy_for_browser(session: dict) -> dict:
+    conf = _proxy_conf()
+    if not conf.get("enabled"):
+        return {"ok": False, "error": "Residential proxy is currently off"}
+    sid = str(session.get("id", ""))
+    proxy_session = (conf.get("sessions") or {}).get(sid)
+    if not proxy_session or not proxy_session.get("local_port"):
+        return {"ok": False, "error": "This browser has no proxy route"}
+    proxy_session["session_id"] = secrets.token_hex(5)
+    _proxy_save(conf)
+    try:
+        (CB_ROOT / "state" / f"{sid}.geo.json").unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.debug("Failed to clear proxy geography cache for %s", sid, exc_info=True)
+    await asyncio.sleep(6)
+    exit_info = await _proxy_exit_info(proxy_session["local_port"])
+    logger.info("Browser '%s' rotated its residential proxy identity", sid)
+    return {
+        "ok": True,
+        "session_id": proxy_session["session_id"],
+        "exit": exit_info,
+    }
+
+
+async def _member_browser_action(request: Request, action: str) -> JSONResponse:
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    session = _account_browser_for_user(user)
+    if not session:
+        return JSONResponse({"error": "No browser is configured"}, status_code=404)
+    if not _browser_port_alive(session.get("vnc_port", 0)):
+        return JSONResponse({"error": "Browser is not running"}, status_code=409)
+    result = (
+        await _freeze_browser_tabs(session)
+        if action == "freeze"
+        else await _park_browser_tabs(session)
+    )
+    return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+
+@app.get("/api/my/browser")
+async def api_my_browser(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    return JSONResponse(await _member_browser_status(user))
+
+
+@app.get("/api/my/browser/proxy")
+async def api_my_browser_proxy(request: Request, check: int = 0):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    return JSONResponse(await _member_proxy_payload(user, bool(check)))
+
+
+@app.post("/api/my/browser/proxy/rotate")
+async def api_my_browser_proxy_rotate(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    session = _account_browser_for_user(user)
+    if not session:
+        return JSONResponse({"error": "No browser is configured"}, status_code=404)
+    result = await _rotate_proxy_for_browser(session)
+    if result.get("ok"):
+        result = {"ok": True, "exit": result.get("exit") or {}}
+    return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+@app.get("/api/my/browser/fingerprint")
+async def api_my_browser_fingerprint(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    session = _account_browser_for_user(user)
+    if not session:
+        return JSONResponse({"error": "No browser is configured"}, status_code=404)
+    result = await _fingerprint_browser(session)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 502)
+
+
+@app.post("/api/my/browser/freeze")
+async def api_my_browser_freeze(request: Request):
+    return await _member_browser_action(request, "freeze")
+
+
+@app.post("/api/my/browser/park")
+async def api_my_browser_park(request: Request):
+    return await _member_browser_action(request, "park")
 
 
 @app.post("/api/browser/sessions")
@@ -11602,6 +13695,88 @@ async def api_claude_usage():
 
 _stats_usage_cache: dict = {"ts": 0, "data": {}}
 
+# --- Per-account usage roll-up (admin users table) ---------------------------
+# Sums every assistant turn recorded in one account's transcripts. Cached,
+# because a busy account has thousands of JSONL lines and the users table polls.
+_user_usage_cache: dict = {}
+_USER_USAGE_CACHE_TTL = 120
+
+
+def _user_usage_summary(user: dict, *, force: bool = False) -> dict:
+    """Aggregate all Claude transcript usage stored in one account's config dir."""
+    user_id = user.get("id", "")
+    now = time.time()
+    cached = _user_usage_cache.get(user_id)
+    if not force and cached and now - cached.get("ts", 0) < _USER_USAGE_CACHE_TTL:
+        return dict(cached["data"])
+
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_create_tokens": 0,
+        "total_tokens": 0,
+        "tokens_24h": 0,
+        "tokens_7d": 0,
+        "turns": 0,
+        "estimated_cost": 0.0,
+        "estimated_cost_7d": 0.0,
+        "last_active": "",
+    }
+    projects_dir = _user_claude_config_dir(user) / "projects"
+    if projects_dir.exists():
+        cutoff_24h = now - 86400
+        cutoff_7d = now - 7 * 86400
+        for transcript in projects_dir.rglob("*.jsonl"):
+            try:
+                with transcript.open(errors="replace") as stream:
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("type") != "assistant":
+                            continue
+                        message = event.get("message", {}) or {}
+                        usage = message.get("usage") or {}
+                        if not usage:
+                            continue
+                        inp = int(usage.get("input_tokens", 0) or 0)
+                        out = int(usage.get("output_tokens", 0) or 0)
+                        cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+                        cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                        token_total = inp + out + cache_read + cache_create
+                        timestamp = str(event.get("timestamp") or "")
+                        try:
+                            epoch = datetime.fromisoformat(
+                                timestamp.replace("Z", "+00:00")).timestamp()
+                        except (TypeError, ValueError):
+                            epoch = 0
+                        cost = _estimate_cost(inp, out, cache_read, cache_create,
+                                              str(message.get("model") or ""))
+                        totals["input_tokens"] += inp
+                        totals["output_tokens"] += out
+                        totals["cache_read_tokens"] += cache_read
+                        totals["cache_create_tokens"] += cache_create
+                        totals["total_tokens"] += token_total
+                        totals["turns"] += 1
+                        totals["estimated_cost"] += cost
+                        if epoch >= cutoff_24h:
+                            totals["tokens_24h"] += token_total
+                        if epoch >= cutoff_7d:
+                            totals["tokens_7d"] += token_total
+                            totals["estimated_cost_7d"] += cost
+                        if timestamp > totals["last_active"]:
+                            totals["last_active"] = timestamp
+            except (OSError, UnicodeError):
+                logger.debug("Failed to parse usage transcript %s", transcript,
+                             exc_info=True)
+    totals["estimated_cost"] = round(totals["estimated_cost"], 4)
+    totals["estimated_cost_7d"] = round(totals["estimated_cost_7d"], 4)
+    _user_usage_cache[user_id] = {"ts": now, "data": dict(totals)}
+    return totals
+
+
 def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
     """Estimate cost in USD from token counts and model name."""
     if "opus" in model:
@@ -12163,7 +14338,7 @@ class AuthModeBody(BaseModel):
 
 
 @app.post("/api/sessions/{session_name}/send")
-async def api_send_command(session_name: str, body: SendCommand):
+async def api_send_command(session_name: str, body: SendCommand, request: Request):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
     _, sess = _find_session(session_name)
     if not sess:
@@ -12246,10 +14421,31 @@ async def api_send_command(session_name: str, body: SendCommand):
         entry = cache.setdefault(session_name, {})
         if "messages" not in entry:
             entry["messages"] = _load_session_messages(session_name)
+        # Record what the human typed, not the upload preamble the dashboard
+        # prepended — the audit answers "what did they ask for".
         entry["messages"].append({
-            "role": "user", "text": cmd_text, "ts": now
+            "role": "user", "text": body.command, "ts": now
         })
         _save_messages()
+        try:
+            prompt_user = _current_user(request) or _user_for_session(session_name)
+            if prompt_user:
+                impersonator = getattr(request.state, "_impersonator", None)
+                if impersonator is None:
+                    original = request.cookies.get("tmux_imp_orig")
+                    original_user = _user_from_token(original) if original else None
+                    if original_user and _is_admin(original_user):
+                        impersonator = original_user
+                _append_prompt_audit(
+                    prompt_user,
+                    session_name,
+                    body.command,
+                    impersonator=impersonator,
+                    timestamp=now,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to append prompt audit for session '%s'", session_name)
         return JSONResponse({"ok": True, "sent": cmd_text,
                              "attached": [i.get("path") for i in pending]})
     except Exception as e:
@@ -13159,26 +15355,39 @@ async def _login_watchdog_loop():
 
                 if not needs_login and not login_flow_open:
                     state.pop("flow_since", None)
+                    state.pop("flow_sig", None)
                     continue
 
                 # A login prompt on screen might be a HUMAN typing /login right
                 # now — never yank that out from under them. Only once the same
                 # prompt has sat unchanged for a while is it stale and ours.
+                #
+                # "Unchanged" has to mean the pane really is frozen, not just that
+                # time passed since we first matched. Timing alone declared a busy
+                # session stale: anything that keeps a trigger word on screen while
+                # actively working (debugging someone else's OAuth flow, say) got
+                # /exit'd every few minutes. A live session's pane keeps changing,
+                # so a digest of it tells the two apart — an abandoned prompt is
+                # byte-for-byte static.
                 if login_flow_open:
+                    sig = hashlib.sha1((recent or "").encode("utf-8", "replace")).hexdigest()
                     since = state.get("flow_since")
-                    if not since:
+                    if not since or state.get("flow_sig") != sig:
                         state["flow_since"] = now
+                        state["flow_sig"] = sig
                         continue
                     if now - since < _LOGIN_FLOW_STALE_AFTER:
                         continue
                 else:
                     state.pop("flow_since", None)
+                    state.pop("flow_sig", None)
 
                 # Primary recovery: restore the machine's valid credential and
                 # relaunch. No OAuth, no browser, no clicks — a stranded /login
                 # clears itself within ~15s.
                 state["last_action"] = now
                 state.pop("flow_since", None)
+                state.pop("flow_sig", None)
                 llog.warning("Auto-fixing login for '%s' (%s)", name,
                              "stale login prompt" if login_flow_open else "login required")
                 res = await _auto_fix_login(name)
@@ -13678,7 +15887,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .top-nav::-webkit-scrollbar{height:0}
 /* Pinned right section */
 .nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
-.nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
+/* Wordmark removed; kept as a zero-width anchor for renderNav's tab insertion. */
+.nav-brand{display:inline-block;width:0;padding:0;margin:0;border:none}
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
@@ -13729,6 +15939,37 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
+/* Workspace (project) switcher in the main nav */
+.nav-proj{position:relative;flex-shrink:0;margin-right:8px}
+.nav-proj-btn{display:flex;align-items:center;gap:6px;max-width:280px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;cursor:pointer;font-size:.78rem;line-height:1.2;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.nav-proj-btn:hover{border-color:#58a6ff;color:#e6edf3}
+.nav-proj.scoped .nav-proj-btn{border-color:#58a6ff66;color:#79c0ff;background:#0d1520}
+.nav-proj-ico{font-size:.85rem;flex-shrink:0;filter:grayscale(1) opacity(.8)}
+.nav-proj.scoped .nav-proj-ico{filter:none}
+.nav-proj-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav-proj-caret{color:#6e7681;flex-shrink:0;font-size:.7rem}
+/* FIXED, not absolute: .top-nav is an overflow-x:auto scroller, which clips any
+   absolutely-positioned child (the menu had a correct 340x302 box and was still
+   invisible). Fixed takes it out of that clip; JS pins it under the button. */
+.nav-proj-menu{display:none;position:fixed;top:0;left:0;z-index:260;min-width:340px;max-width:min(560px,90vw);background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.55);overflow:hidden}
+.nav-proj-menu.open{display:block}
+.nav-proj-list{max-height:min(420px,60vh);overflow-y:auto;padding:5px}
+.nav-proj-item{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:6px;cursor:pointer;color:#c9d1d9;font-size:.78rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.nav-proj-item:hover{background:#1c2128}
+.nav-proj-item.active{background:#1f6feb22;color:#79c0ff}
+.nav-proj-item .npi-path{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav-proj-item .npi-meta{flex-shrink:0;color:#6e7681;font-size:.66rem;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+.nav-proj-item .npi-meta b{color:#3fb950;font-weight:600}
+.nav-proj-sep{height:1px;background:#21262d;margin:5px 0}
+.nav-proj-foot{display:flex;gap:6px;padding:7px 9px;border-top:1px solid #21262d;background:#0d1117}
+.nav-proj-foot button{flex:1;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 8px;font-size:.74rem;cursor:pointer}
+.nav-proj-foot button:hover{background:#30363d;border-color:#58a6ff}
+.nav-proj-foot button.danger:hover{color:#f85149;border-color:#f8514966}
+.nav-proj-foot button:disabled{opacity:.45;cursor:not-allowed}
+/* Banner shown when the project filter is hiding sessions */
+.proj-scope-note{display:flex;align-items:center;gap:8px;padding:6px 12px;background:#0d1520;border-bottom:1px solid #1f3552;color:#79c0ff;font-size:.74rem}
+.proj-scope-note button{background:transparent;border:1px solid #58a6ff44;color:#79c0ff;border-radius:5px;padding:2px 8px;font-size:.7rem;cursor:pointer}
+.proj-scope-note button:hover{background:#1f6feb22}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -13780,6 +16021,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
 .tab-more-item:hover{background:#1c2128;color:#c9d1d9}
 .tab-more-item.active{color:#58a6ff}
+/* Role-split rows in the More menu. The menu re-renders on every poll, so these
+   are body-class rules rather than the one-shot display toggle used in the nav.
+   Admins get one link into the Profiles window, which holds every one of these
+   files; members, who cannot open that window, keep the per-file entries. */
+.more-admin-only{display:none}
+body.member-admin .more-admin-only{display:block}
+body.member-admin .more-member-only{display:none}
 .tab-more-model-block{display:none}
 .tab-more-model-row{padding:6px 16px;font-size:.7rem;color:#8b949e;cursor:default}
 .tab-more-model-row .tab-more-model-label{color:#6e7681;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em}
@@ -13925,14 +16173,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tier:last-of-type{margin-bottom:0}
 .tier-label{font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;display:flex;align-items:center;gap:6px}
 .tier-label .dot{width:6px;height:6px;border-radius:50%;display:inline-block}
-.tier-description .tier-label{color:#8b949e}
-.tier-description .dot{background:#8b949e}
-.tier-description .tier-text{color:#c9d1d9;font-weight:500}
-.tier-progress .tier-label{color:#d2a8ff}
-.tier-progress .dot{background:#d2a8ff}
-.tier-notes .tier-label{color:#e3b341}
-.tier-notes .dot{background:#e3b341}
-.tier-notes .tier-text{white-space:pre-wrap;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;max-height:300px;overflow-y:auto}
 .tier-text{color:#b1bac4;line-height:1.6;font-size:1.05rem}
 .tier-text.loading{color:#6e7681;font-style:italic}
 
@@ -14160,14 +16400,33 @@ body.member-simple .hide-in-simple{display:none!important}
 .profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
 .profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
 
-/* Profile editor modal */
-.profiles-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
+/* Profile editor modal — this is a working window, not a dialog: it holds file
+   trees, editors and a project list, so it takes the whole viewport. */
+.profiles-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:12px}
 .profiles-overlay.active{display:flex}
-.profiles-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;width:900px;max-width:calc(100vw - 32px);max-height:calc(100vh - 80px);overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
-.profiles-panel h3{color:#f0f6fc;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.profiles-panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px 20px;width:calc(100vw - 24px);max-width:none;height:calc(100vh - 24px);max-height:calc(100vh - 24px);overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.profiles-panel h3{color:#f0f6fc;font-size:1.1rem;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px}
 .profiles-hint{font-size:.72rem;color:#6e7681;margin-bottom:12px;line-height:1.4}
+.profiles-hint.hidden{display:none}
+/* Panel toolbar: sidebar collapse, the project scope selector, the ⓘ toggle */
+.pf-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.pf-toolbar .pf-tb-label{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
+.pf-tb-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:4px 9px;cursor:pointer;font-size:.78rem;line-height:1.2}
+.pf-tb-btn:hover{color:#c9d1d9;background:#30363d;border-color:#58a6ff}
+.pf-tb-btn.on{color:#58a6ff;border-color:#58a6ff66}
+.pf-tb-btn.danger:hover{color:#f85149;border-color:#f8514966}
+.pf-tb-sep{flex:1}
+.pf-tb-scope{font-size:.78rem;color:#79c0ff;font-family:'SF Mono','Fira Code',Consolas,monospace;background:#0d1520;border:1px solid #58a6ff44;border-radius:6px;padding:4px 9px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf-tb-scope.all{color:#8b949e;background:#0d1117;border-color:#30363d}
 .profiles-body{display:flex;gap:14px;flex:1;min-height:0}
-.profiles-list{width:240px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;border-right:1px solid #21262d;padding-right:14px;overflow-y:auto}
+/* Collapsed sidebar: keeps a narrow rail so the active profile is still visible
+   and one click brings the list back. */
+/* min-width:0 is load-bearing: a flex item defaults to min-width:auto, whose
+   automatic minimum size is the content's min-content width — so `width:0`
+   alone leaves the sidebar sitting at its full 240px and the collapse silently
+   does nothing. */
+.profiles-body.rail .profiles-list{width:0;min-width:0;padding-right:0;border-right:none;overflow:hidden;opacity:0}
+.profiles-list{width:240px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;border-right:1px solid #21262d;padding-right:14px;overflow-y:auto;transition:width .14s ease,padding .14s ease,opacity .14s ease}
 .profile-row{padding:8px 10px;border:1px solid #21262d;border-radius:6px;cursor:pointer;background:#0d1117;display:flex;flex-direction:column;gap:2px}
 .profile-row:hover{background:#1c2128}
 .profile-row.selected{border-color:#58a6ff;background:#0d2340}
@@ -14183,6 +16442,10 @@ body.member-simple .hide-in-simple{display:none!important}
 .profile-edit textarea{resize:vertical;line-height:1.5}
 .profile-edit .ed-claude{min-height:200px}
 .profile-edit .ed-memory{min-height:120px}
+.profile-edit .ed-memory[hidden]{display:none}
+.pf-sub{text-transform:none;letter-spacing:0;font-weight:400;color:#6e7681}
+/* One line where an empty file used to render as a tall blank textarea. */
+.pf-emptyfile{display:flex;align-items:center;gap:10px;font-size:.76rem;color:#6e7681;background:#0d1117;border:1px dashed #21262d;border-radius:6px;padding:8px 10px}
 .profile-edit .ed-permissions{min-height:80px}
 .profile-edit .extras-section{border:1px solid #21262d;border-radius:6px;padding:8px;background:#0d1117}
 .profile-edit .extras-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #161b22}
@@ -14227,6 +16490,27 @@ body.member-simple .hide-in-simple{display:none!important}
 .pf-section .pf-status.err{border-color:#da3633;color:#ff7b72}
 .pf-section .pf-banner{font-size:.72rem;color:#6e7681;padding:6px 8px;background:#0d1117;border:1px dashed #21262d;border-radius:6px;line-height:1.4}
 .pf-section .pf-help{font-size:.7rem;color:#6e7681;font-style:italic}
+/* "shared by every profile" divider — host-wide files shown inside the profile view */
+.pf-shared-head{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:10px;border-top:1px solid #21262d;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;font-weight:700;color:#8b949e}
+.pf-shared-tag{color:#e3b341;border:1px solid #e3b34144;border-radius:3px;padding:1px 6px;font-size:.6rem;letter-spacing:.05em}
+.pf-section .skills-panel{height:auto;padding:0}
+.pf-section .skills-list{max-height:200px}
+.pf-filter{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 9px;font-size:.8rem;outline:none;width:100%}
+.pf-filter:focus{border-color:#58a6ff}
+.pf-mem-proj{border:1px solid #21262d;border-radius:6px;background:#0d1117;margin-bottom:8px}
+.pf-mem-head{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer}
+.pf-mem-head:hover{background:#161b22}
+.pf-mem-caret{color:#6e7681;font-size:.7rem;width:10px;flex:none}
+.pf-mem-name{flex:1;color:#c9d1d9;font-size:.8rem;font-family:'SF Mono','Fira Code',Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf-mem-count{color:#6e7681;font-size:.68rem;flex:none}
+.pf-mem-body{padding:0 10px 8px;border-top:1px solid #161b22}
+.pf-mem-index .pf-row-name{color:#e3b341}
+/* Projects tab: cwd-bound files, one card per project directory */
+.pf-mem-proj.current{border-color:#1f6feb66}
+.pf-proj-tag{flex:none;color:#3fb950;border:1px solid #3fb95044;border-radius:3px;padding:1px 5px;font-size:.6rem;letter-spacing:.04em;text-transform:uppercase}
+.pf-group-head{color:#6e7681;font-size:.66rem;letter-spacing:.04em;font-weight:700;padding:8px 0 2px;border-bottom:1px solid #161b22;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.pf-row.absent .pf-row-name{color:#484f58}
+.pf-row.absent .pf-row-name:hover{color:#8b949e}
 
 /* Settings tabs */
 .settings-tabs{display:flex;gap:2px;border-bottom:1px solid #21262d;flex-shrink:0;flex-wrap:wrap}
@@ -14349,6 +16633,66 @@ body.member-simple .hide-in-simple{display:none!important}
 .users-table th{text-align:left;color:#8b949e;text-transform:uppercase;font-size:.68rem;letter-spacing:.06em;padding:6px 8px;border-bottom:1px solid #21262d}
 .users-table td{padding:8px;border-bottom:1px solid #161b22;color:#c9d1d9;vertical-align:middle}
 .users-table tr:last-child td{border-bottom:none}
+/* Users table: sortable + resizable + reorderable columns, persisted per
+   browser. Ported from the Codex build so both dashboards manage members
+   the same way. */
+.users-summary{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:8px}
+.users-summary-card{background:#0d1117;border:1px solid #21262d;border-radius:7px;padding:9px 11px;min-width:0}
+.users-summary-label{display:block;color:#6e7681;font-size:.62rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+.users-summary-value{display:block;color:#e6edf3;font-size:1.05rem;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
+.users-summary-card.live .users-summary-value{color:#3fb950}
+.users-summary-card.working .users-summary-value{color:#f85149}
+.users-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;position:relative}
+.users-search{flex:1;min-width:180px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 10px;font-size:.8rem;outline:none}
+.users-search:focus{border-color:#58a6ff}
+.users-status-chips{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.users-toolbar-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 10px;font-size:.75rem;cursor:pointer}
+.users-toolbar-btn:hover{background:#30363d}
+.users-columns-wrap{position:relative}
+.users-columns-menu{display:none;position:absolute;right:0;top:calc(100% + 5px);z-index:40;width:230px;background:#161b22;border:1px solid #30363d;border-radius:7px;box-shadow:0 10px 28px rgba(0,0,0,.5);padding:8px}
+.users-columns-menu.open{display:block}
+.users-columns-menu label{display:flex;align-items:center;gap:8px;padding:5px 4px;margin:0;color:#c9d1d9;text-transform:none;letter-spacing:0;font-size:.75rem;cursor:pointer}
+.users-columns-menu label:hover{background:#21262d;border-radius:4px}
+.users-columns-menu input{accent-color:#58a6ff}
+.users-columns-reset{width:100%;margin-top:6px}
+.users-top-scroll{height:12px;overflow-x:auto;overflow-y:hidden;border:1px solid #21262d;border-bottom:0;border-radius:6px 6px 0 0;background:#0d1117}
+.users-top-scroll>div{height:1px}
+.users-table-scroll{overflow:auto;max-height:calc(100vh - 430px);min-height:230px;border:1px solid #21262d;border-radius:0 0 6px 6px;background:#0d1117}
+.users-top-scroll,.users-table-scroll{scrollbar-width:thin;scrollbar-color:#484f58 #0d1117}
+.users-top-scroll::-webkit-scrollbar,.users-table-scroll::-webkit-scrollbar{width:10px;height:10px}
+.users-top-scroll::-webkit-scrollbar-track,.users-table-scroll::-webkit-scrollbar-track{background:#0d1117}
+.users-top-scroll::-webkit-scrollbar-thumb,.users-table-scroll::-webkit-scrollbar-thumb{background:#484f58;border:2px solid #0d1117;border-radius:6px}
+.users-top-scroll::-webkit-scrollbar-thumb:hover,.users-table-scroll::-webkit-scrollbar-thumb:hover{background:#6e7681}
+.users-table{table-layout:fixed;min-width:100%;width:max-content;border-collapse:separate;border-spacing:0;font-size:.78rem}
+.users-table th{position:sticky;top:0;z-index:4;background:#161b22;height:32px;padding:5px 22px 5px 8px;border-bottom:1px solid #30363d;border-right:1px solid #21262d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none}
+.users-table th[data-tip]:hover::after{content:attr(data-tip);position:fixed;z-index:100;background:#010409;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:5px 7px;font-size:.68rem;text-transform:none;letter-spacing:0;white-space:normal;max-width:240px;margin-top:23px;margin-left:-40px;box-shadow:0 6px 16px rgba(0,0,0,.45)}
+.users-table td{height:58px;max-height:58px;padding:7px 8px;border-bottom:1px solid #161b22;border-right:1px solid #161b22;vertical-align:middle;overflow:hidden;text-overflow:ellipsis}
+.users-table tbody tr{cursor:pointer;background:#0d1117}
+.users-table tbody tr:nth-child(even){background:#10151d}
+.users-table tbody tr:hover{background:#1c2128}
+.users-table .user-row-number{position:sticky;left:0;z-index:3;width:42px;min-width:42px;max-width:42px;text-align:center;background:inherit;color:#6e7681;font-variant-numeric:tabular-nums}
+.users-table th.user-row-number{z-index:6;background:#161b22}
+.user-col-resizer{position:absolute;right:-3px;top:0;width:7px;height:100%;cursor:col-resize;z-index:8}
+.user-col-resizer:hover{background:#58a6ff66}
+.users-sort{color:#58a6ff;margin-left:4px;font-size:.62rem}
+.users-presence-dot{width:8px;height:8px;border-radius:50%;background:#6e7681;flex:0 0 auto}
+.users-presence.online .users-presence-dot{background:#3fb950;box-shadow:0 0 6px #3fb95088}
+.users-presence.working .users-presence-dot{background:#f85149;box-shadow:0 0 7px #f8514999;animation:pulse-glow 1.5s ease-in-out infinite}
+.users-cell-main{display:block;color:#e6edf3;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.users-cell-sub{display:block;color:#6e7681;font-size:.66rem;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.users-token{font-variant-numeric:tabular-nums}
+.users-table-footer{display:flex;justify-content:space-between;gap:10px;color:#6e7681;font-size:.68rem;padding:5px 2px;flex-wrap:wrap}
+.user-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0}
+.user-detail-item{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px}
+.user-detail-item span{display:block;color:#6e7681;font-size:.64rem;text-transform:uppercase;letter-spacing:.04em}
+.user-detail-item strong{display:block;color:#e6edf3;margin-top:3px;font-size:.82rem;overflow-wrap:anywhere}
+.users-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+.users-table-scroll{max-height:calc(100vh - 360px)}
+.user-detail-grid{grid-template-columns:1fr}
+.prompt-audit-list{display:flex;flex-direction:column;gap:8px;max-height:65vh;overflow:auto;margin-top:10px}
+.prompt-audit-row{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:9px 10px}
+.prompt-audit-meta{color:#6e7681;font-size:.68rem;margin-bottom:5px;display:flex;gap:8px;flex-wrap:wrap}
+.prompt-audit-text{color:#e6edf3;font-size:.82rem;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
 .users-actions{display:flex;gap:6px;justify-content:flex-end}
 .users-actions button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:3px 8px;border-radius:5px;font-size:.72rem;cursor:pointer}
 .users-actions button:hover{background:#30363d}
@@ -14490,7 +16834,30 @@ body.member-simple .hide-in-simple{display:none!important}
 <div id="imp-banner" style="display:none"></div>
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
-  <span class="nav-brand">__BRAND__</span>
+  <!-- The wordmark is gone: it said the same thing on every page load and the
+       header is the scarcest space in the app. The project switcher takes the
+       slot, which is the one thing here that actually changes. `.nav-brand` is
+       kept (empty, zero-width) because renderNav anchors the session tabs to it
+       when the switcher is hidden for non-admins. -->
+  <span class="nav-brand"></span>
+  <!-- Workspace switcher. The project is the cwd a session runs in, which is what
+       decides the CLAUDE.md, .mcp.json and auto-memories Claude loads — so it is
+       app-level state, not a filter inside some window. Switching it filters the
+       session list and starts new sessions there. -->
+  <div class="nav-proj" id="nav-proj-wrap">
+    <button class="nav-proj-btn" id="nav-proj-btn" onclick="toggleProjectMenu(event)" title="Working project — filters sessions and sets where new ones start">
+      <span class="nav-proj-ico">&#128193;</span>
+      <span class="nav-proj-name" id="nav-proj-name">All projects</span>
+      <span class="nav-proj-caret">&#9662;</span>
+    </button>
+    <div class="nav-proj-menu" id="nav-proj-menu">
+      <div class="nav-proj-list" id="nav-proj-list"></div>
+      <div class="nav-proj-foot">
+        <button onclick="addProjectFromNav()">&#43; Add project</button>
+        <button class="danger" id="nav-proj-del" onclick="removeProjectFromNav()">&#128465; Remove</button>
+      </div>
+    </div>
+  </div>
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
   <span class="nav-spacer"></span>
 </nav>
@@ -14538,9 +16905,7 @@ body.member-simple .hide-in-simple{display:none!important}
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openClaudeMd();closeToolsMenu()"><span class="icon">&#x1F4DD;</span> Context Files</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Claude Profiles</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -14604,29 +16969,23 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
 </div>
 
-<!-- Context files overlay -->
-<div class="claudemd-overlay" id="claudemd-overlay" onclick="if(event.target===this)closeClaudeMd()">
-  <div class="claudemd-panel" id="claudemd-panel">
-    <h3>Context Files <button class="stats-close" onclick="closeClaudeMd()">&times;</button></h3>
-    <div class="profiles-hint" style="margin-bottom:10px">
-      Every file Claude Code reads for context on this host. <b>Always loaded</b> files are injected into
-      each session's context window — keep them tight. <b>On demand</b> files cost nothing until
-      <code>CLAUDE.md</code> sends a session to them, so detail belongs there.
-      <span id="ctxfiles-budget"></span>
-    </div>
-    <div class="extras-section claudemd-extras" id="context-files">
-      <div class="extras-empty">Loading...</div>
-    </div>
-    <div class="claudemd-actions">
-      <button class="btn" onclick="closeClaudeMd()">Close</button>
-    </div>
-  </div>
-</div>
-<!-- Profiles editor overlay -->
+<!-- Profiles editor overlay: the single window for everything that reaches Claude.
+     Per-profile config lives in the tabs; host-wide files (~/CLAUDE.md, the
+     reference docs, the team global block) appear under Context, identical
+     whichever profile is selected, because that is what they are. -->
 <div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
   <div class="profiles-panel">
-    <h3>Claude Profiles <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
-    <div class="profiles-hint">Each profile is a fully isolated Claude Code config (settings.json, CLAUDE.md, MEMORY.md, skills/, plus any extra <code>.md</code> sidecar files you add) under <code>~/.claude-&lt;id&gt;/</code> selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>. The <strong>Default</strong> profile uses the standard <code>~/.claude</code>.</div>
+    <h3><span>Claude Profiles</span> <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
+    <div class="pf-toolbar">
+      <button class="pf-tb-btn" id="pf-rail-btn" onclick="toggleProfilesRail()" title="Collapse the profile list to widen the editor">&#9664; Profiles</button>
+      <button class="pf-tb-btn" id="pf-hint-btn" onclick="toggleProfilesHint()" title="Show or hide the explainer">&#9432;</button>
+      <span class="pf-tb-sep"></span>
+      <!-- The project is chosen in the MAIN nav; this window follows it. Showing a
+           second picker here would be two controls for one piece of state. -->
+      <span class="pf-tb-label">Project</span>
+      <span class="pf-tb-scope" id="pf-proj-scope" title="Set the working project in the top navigation bar">All projects</span>
+    </div>
+    <div class="profiles-hint" id="profiles-hint">Everything Claude Code reads on this host, in one place — nothing that changes its behaviour lives anywhere else in this dashboard. Each profile is a fully isolated config (settings.json, CLAUDE.md, MEMORY.md, auto-memories, skills, agents, commands, MCP, login) under <code>~/.claude-&lt;id&gt;/</code>, selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>; the <strong>Default</strong> profile uses the standard <code>~/.claude</code>. Anything marked <b>shared</b> is host-wide and reads the same under every profile: the host context files (<code>~/CLAUDE.md</code> and what it points at), the hook scripts, and the <b>Projects</b> tab's working-directory files, which load on top of whichever profile a session runs on.</div>
     <div class="profiles-body">
       <div class="profiles-list" id="profiles-list">Loading...</div>
       <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
@@ -14651,6 +17010,51 @@ const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
 
+// ── Tab-scoped impersonation ────────────────────────────────────────────────
+// The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
+// the admin's other tabs stay admin, and closing the tab ends the view. Every
+// same-origin fetch from this tab carries it as a header — patching window.fetch
+// once is what keeps the ~200 existing call sites from each needing to know.
+const _nativeFetch=window.fetch.bind(window);
+function _storedImpersonationToken(){
+  try{return sessionStorage.getItem('tmuxImpersonationToken')||''}catch(e){return''}
+}
+window.fetch=function(input,init){
+  const token=_storedImpersonationToken();
+  if(!token)return _nativeFetch(input,init);
+  try{
+    const raw=typeof input==='string'?input:input.url;
+    const url=new URL(raw,window.location.href);
+    if(url.origin===window.location.origin){
+      const next=Object.assign({},init||{});
+      const baseHeaders=(init&&init.headers)||(typeof Request!=='undefined'&&input instanceof Request?input.headers:undefined);
+      const headers=new Headers(baseHeaders||{});
+      headers.set('X-Tmux-Impersonate',token);
+      next.headers=headers;
+      return _nativeFetch(input,next);
+    }
+  }catch(e){}
+  return _nativeFetch(input,init);
+};
+async function bootstrapImpersonation(){
+  const url=new URL(window.location.href);
+  const ticket=url.searchParams.get('impersonate_ticket');
+  if(!ticket)return;
+  try{
+    const resp=await _nativeFetch(BASE+'/api/admin/impersonation/exchange',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket})
+    });
+    const data=await resp.json();
+    if(!resp.ok)throw new Error(data.error||'Could not start impersonation');
+    sessionStorage.setItem('tmuxImpersonationToken',data.token);
+  }catch(e){
+    alert('Could not open the user view: '+(e.message||e));
+  }finally{
+    url.searchParams.delete('impersonate_ticket');
+    history.replaceState(null,'',url.pathname+url.search+url.hash);
+  }
+}
+
 // Transient one-line feedback in the header. There is no toast system here and
 // one line beats a modal for "done, here's what happened".
 let _toastTimer=null;
@@ -14668,21 +17072,28 @@ const activeTabs={};
 const rawState={};
 function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
 
-// --- "Hide Bash/Fetch" filter ---
-function getHideBashPref(){
-  try{const v=localStorage.getItem('hideBashLines');return v===null?true:v==='true'}catch(e){return true}
+// --- "Hide the dev plumbing" filter ---
+// One switch, one meaning: on, the terminal shows only what Claude writes to the
+// user — tool-call headers (● Bash(…), Read(…), mcp__…(…)), their `⎿ …` result
+// blocks (file dumps, command output, "Shell cwd was reset…") and self-update
+// logs all go. Off shows the pane verbatim. Default on.
+function getHideDevPref(){
+  try{
+    const v=localStorage.getItem('hideDevOutput');
+    if(v!==null)return v==='true';
+    // Migrate the two old independent toggles: if either was off, the user
+    // wanted to see that half, so the merged switch starts off.
+    const b=localStorage.getItem('hideBashLines');
+    const o=localStorage.getItem('hideOutputLines');
+    if(b==='false'||o==='false')return false;
+    return true;
+  }catch(e){return true}
 }
-function setHideBashPref(v){
-  try{localStorage.setItem('hideBashLines',v?'true':'false')}catch(e){}
+function setHideDevPref(v){
+  try{localStorage.setItem('hideDevOutput',v?'true':'false')}catch(e){}
 }
-// Independently hide tool OUTPUT — the `⎿ …` result blocks (file dumps, command
-// output, "Shell cwd was reset…") plus their indented continuation rows — so the
-// terminal shows only Claude's spoken text, not the plumbing. Default on.
-function getHideOutputPref(){
-  try{const v=localStorage.getItem('hideOutputLines');return v===null?true:v==='true'}catch(e){return true}
-}
-function setHideOutputPref(v){
-  try{localStorage.setItem('hideOutputLines',v?'true':'false')}catch(e){}
+function hideDevDesc(v){
+  return v?'On: showing only what Claude writes to you':'Off: showing the terminal as usual';
 }
 // Claude Code's TUI lays out tool calls like:
 //   ● Bash(sleep 540 && gcloud ...
@@ -14731,30 +17142,25 @@ function _isUpdateNoise(line){
   return false;
 }
 function applyRawFilter(text){
-  const hideBash=getHideBashPref();
-  const hideOut=getHideOutputPref();
-  if(!hideBash&&!hideOut)return text;
+  if(!getHideDevPref())return text;
   if(!text)return text;
   const lines=text.split('\n');
   const out=[];
-  // A single suppression state machine that composes two independent filters:
-  //   'call'   — a hidden tool-call header (● Bash(…), Read(…), mcp__…(…)) and
+  // A single suppression state machine covering both halves of the plumbing:
+  //   'call'   — a tool-call header (● Bash(…), Read(…), mcp__…(…)) and
   //              its wrap-continuation rows (indented, no marker).
-  //   'output' — a hidden `⎿ …` result block and its indented continuation rows
+  //   'output' — a `⎿ …` result block and its indented continuation rows
   //              (file dumps, "Shell cwd was reset…", "… +N lines" markers).
   // Suppression ends at the next bullet, blank line, another ⎿, or a column-0
   // line — so Claude's spoken text and paragraph breaks are always kept.
   let mode='';
   for(const line of lines){
-    if(hideBash&&_isUpdateNoise(line))continue;
-    // Start of a ⎿ output block.
-    if(_OUTPUT_MARKER_RE.test(line)){
-      if(hideOut){mode='output';continue;}   // hide the ⎿ line itself
-      mode='';out.push(line);continue;        // keep output; end any call-suppression
-    }
+    if(_isUpdateNoise(line))continue;
+    // Start of a ⎿ output block — hide the ⎿ line itself and what follows it.
+    if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
     const isBullet=_LEADING_BULLET_RE.test(line);
     // Start of a hidden tool-call header.
-    if(hideBash&&isBullet&&_isBashFetchHeader(line)){
+    if(isBullet&&_isBashFetchHeader(line)){
       mode='call';continue;
     }
     // A different bullet (Claude's spoken text) — always kept, ends suppression.
@@ -15028,16 +17434,10 @@ function rerenderAllRaw(){
     if(rawState[n]&&rawState[n].fullText)renderRawText(n);
   }
 }
-function toggleHideBash(name,checked){
-  setHideBashPref(checked);
-  const lbl=document.getElementById('hidebash-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool calls + update logs':'Off — showing all output';
-  rerenderAllRaw();
-}
-function toggleHideOutput(name,checked){
-  setHideOutputPref(checked);
-  const lbl=document.getElementById('hideoutput-status-'+name);
-  if(lbl)lbl.textContent=checked?'On — hiding tool output (⎿ …)':'Off — showing tool output';
+function toggleHideDev(name,checked){
+  setHideDevPref(checked);
+  const lbl=document.getElementById('hidedev-status-'+name);
+  if(lbl)lbl.textContent=hideDevDesc(checked);
   rerenderAllRaw();
 }
 const lastStatus={};
@@ -15224,8 +17624,9 @@ function authBadge(s){
 
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
-  const brand=navEl.querySelector('.nav-brand');
-  sessions.forEach(s=>{
+  // Session tabs sit AFTER the project switcher, not between it and the brand.
+  const anchor=navEl.querySelector('#nav-proj-wrap')||navEl.querySelector('.nav-brand');
+  projectSessions().forEach(s=>{
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
@@ -15235,10 +17636,220 @@ function renderNav(){
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
       </span>`;
-    brand.after(item);
+    anchor.after(item);
   });
   const items=Array.from(navEl.querySelectorAll('.nav-item'));
-  items.reverse().forEach(item=>brand.after(item));
+  items.reverse().forEach(item=>anchor.after(item));
+  renderProjectNav();
+}
+
+/* ── Workspace (project) switcher ────────────────────────────────────────────
+   A "project" here is a working directory. It is the axis everything else hangs
+   off: a tmux session's cwd decides which CLAUDE.md, .mcp.json and auto-memory
+   directory Claude Code loads, so picking a project up here means "I am working
+   in B now" — the session list shows B's sessions, a new session starts in B,
+   and the profiles window stops showing every other project's files. */
+let PROJECTS = [];
+let PROJ_HOME = '';
+let CURRENT_PROJECT = (function(){ try{ return localStorage.getItem('navProject')||''; }catch(e){ return ''; } })();
+
+// The dashboard's own repo is the home base you land in, so it reads as "default"
+// rather than as its on-disk name. Display only — nothing is renamed on disk,
+// which would break supervisor, git, the running sessions' cwd and the 292-file
+// memory directory keyed to the real path.
+const PROJ_ALIAS = {'/home/nimrod_rotem/tmux-dashboard-original': '~/default'};
+// The home directory is not a workspace: sessions should run in a project, not in ~.
+function projHidden(p){ return !p || p === PROJ_HOME; }
+
+function projShort(p){
+  if(!p) return p;
+  if(PROJ_ALIAS[p]) return PROJ_ALIAS[p];
+  return (PROJ_HOME && p.indexOf(PROJ_HOME)===0) ? '~'+p.slice(PROJ_HOME.length) : p;
+}
+
+// Projects offered in the switcher.
+function projectList(){ return (PROJECTS||[]).filter(p => !projHidden(p.path)); }
+
+// The real directory of the current selection, or '' for the pseudo-entries.
+// Anything that hands a path to the backend (new session cwd, profile scoping,
+// project removal) must go through this, never CURRENT_PROJECT directly.
+function projectCwd(){
+  return (!CURRENT_PROJECT || CURRENT_PROJECT === '__other__') ? '' : CURRENT_PROJECT;
+}
+
+// Sessions whose cwd is not any offered project. There is no "All projects" entry
+// any more, so without this a session started outside every project would be
+// filtered out of the tab bar and become unreachable from the UI.
+function orphanSessions(){
+  const known = new Set(projectList().map(p => p.path));
+  return sessions.filter(s => !known.has(s.cwd||''));
+}
+
+function projectSessions(){
+  if(CURRENT_PROJECT === '__other__') return orphanSessions();
+  if(!CURRENT_PROJECT) return sessions;
+  return sessions.filter(s => (s.cwd||'') === CURRENT_PROJECT);
+}
+
+async function loadProjectsNav(){
+  try{
+    const resp = await fetch(BASE+'/api/project-scope');
+    if(!resp.ok){                       // members are not admins; no switcher for them
+      const w=document.getElementById('nav-proj-wrap'); if(w) w.style.display='none';
+      return;
+    }
+    const data = await resp.json();
+    PROJECTS = data.projects || [];
+    PROJ_HOME = data.home || '';
+    // A remembered project that has since gone away (or is now hidden, like ~)
+    // must not silently hide every session behind a filter nothing matches.
+    const offered = projectList();
+    const ok = CURRENT_PROJECT === '__other__'
+      ? orphanSessions().length > 0
+      : offered.some(p => p.path === CURRENT_PROJECT);
+    if(!ok){
+      // Land on the dashboard's own repo; else the project with live sessions;
+      // else the first one. There is no "everything" view to fall back to.
+      const pick = offered.find(p => PROJ_ALIAS[p.path])
+                || offered.find(p => sessions.some(s => s.cwd === p.path))
+                || offered[0];
+      setCurrentProject(pick ? pick.path : (orphanSessions().length ? '__other__' : ''), true);
+    }
+    renderProjectNav();
+  }catch(e){ /* leave the switcher as-is */ }
+}
+
+function renderProjectNav(){
+  const wrap = document.getElementById('nav-proj-wrap');
+  const nameEl = document.getElementById('nav-proj-name');
+  const listEl = document.getElementById('nav-proj-list');
+  if(!wrap || !nameEl || !listEl) return;
+  wrap.classList.add('scoped');
+  const isOther = CURRENT_PROJECT === '__other__';
+  nameEl.textContent = isOther ? 'Other sessions'
+                     : (CURRENT_PROJECT ? projShort(CURRENT_PROJECT) : 'No project');
+  const btn = document.getElementById('nav-proj-btn');
+  if(btn) btn.title = isOther
+    ? 'Sessions running outside every registered project.'
+    : (CURRENT_PROJECT
+        ? 'Working in '+CURRENT_PROJECT+'. New sessions start here and the tab bar shows only this project.'
+        : 'No project available. Add one to start working.');
+  const del = document.getElementById('nav-proj-del');
+  if(del) del.disabled = !CURRENT_PROJECT || isOther;
+  // Live session counts make the list a workspace picker rather than a path list.
+  const counts = {};
+  sessions.forEach(s => { const c=s.cwd||''; if(c) counts[c]=(counts[c]||0)+1; });
+  const offered = projectList();
+  let html = '';
+  if(!offered.length){
+    html += '<div class="nav-proj-item" style="cursor:default;color:#6e7681">No projects yet</div>';
+  }
+  offered.forEach(p => {
+    const n = counts[p.path]||0;
+    html += '<div class="nav-proj-item'+(p.path===CURRENT_PROJECT?' active':'')+'"'
+      + ' onclick="setCurrentProject(\''+esc(p.path)+'\')" title="'+esc(p.path)+'">'
+      + '<span class="npi-path">'+esc(projShort(p.path))+'</span>'
+      + '<span class="npi-meta">'+(n?'<b>'+n+' live</b> · ':'')+p.present+' file'+(p.present===1?'':'s')+'</span></div>';
+  });
+  // Only when it would otherwise strand something: a session running outside every
+  // project still has to be reachable.
+  const orphans = orphanSessions();
+  if(orphans.length){
+    html += '<div class="nav-proj-sep"></div>'
+      + '<div class="nav-proj-item'+(isOther?' active':'')+'" onclick="setCurrentProject(\'__other__\')"'
+      + ' title="Sessions whose directory is not a registered project">'
+      + '<span class="npi-path">Other sessions</span>'
+      + '<span class="npi-meta"><b>'+orphans.length+' live</b></span></div>';
+  }
+  listEl.innerHTML = html;
+}
+
+function toggleProjectMenu(ev){
+  if(ev) ev.stopPropagation();
+  const m = document.getElementById('nav-proj-menu');
+  const btn = document.getElementById('nav-proj-btn');
+  if(!m || !btn) return;
+  const open = m.classList.toggle('open');
+  if(open){
+    // Pin it under the button: the menu is position:fixed to escape the nav's
+    // overflow clipping, so it has to be placed by hand.
+    const r = btn.getBoundingClientRect();
+    m.style.top = Math.round(r.bottom + 6) + 'px';
+    m.style.left = Math.round(Math.min(r.left, innerWidth - m.offsetWidth - 8)) + 'px';
+    loadProjectsNav();
+    setTimeout(()=>document.addEventListener('click', _closeProjMenuOnce), 0);
+  }
+}
+function _closeProjMenuOnce(){
+  const m = document.getElementById('nav-proj-menu');
+  if(m) m.classList.remove('open');
+  document.removeEventListener('click', _closeProjMenuOnce);
+}
+
+function setCurrentProject(path, quiet){
+  CURRENT_PROJECT = path || '';
+  try{ localStorage.setItem('navProject', CURRENT_PROJECT); }catch(e){}
+  _closeProjMenuOnce();
+  // Keep the selection inside the project you just switched to, otherwise the
+  // terminal keeps showing a session that is no longer in the tab bar.
+  const inScope = projectSessions();
+  if(CURRENT_PROJECT && !inScope.some(s => s.name === selectedSession)){
+    selectedSession = inScope.length ? inScope[0].name : null;
+  }
+  // The profiles window scopes to the same project — that is the whole point of
+  // choosing one: stop showing every other project's memories and files.
+  // "__other__" is a session view, not a directory, so it scopes to nothing.
+  if(typeof _pfProjSetScope === 'function') _pfProjSetScope(projectCwd());
+  renderProjectNav();
+  renderNav();
+  renderDetail();
+  if(!quiet) showToast(CURRENT_PROJECT === '__other__'
+    ? 'Showing sessions outside every project.'
+    : (CURRENT_PROJECT
+        ? 'Working in '+projShort(CURRENT_PROJECT)+' — new sessions start here.'
+        : 'No project selected.'));
+}
+
+async function addProjectFromNav(){
+  const path = prompt('Register a working directory as a project.\n\n'
+    + 'Absolute path. Claude Code adds one itself the first time it runs there; '
+    + 'this gets ahead of it so you can set the directory up first.');
+  if(!path) return;
+  try{
+    const resp = await fetch(BASE+'/api/project-scope/project', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: path.trim()})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to add'); return; }
+    await loadProjectsNav();
+    setCurrentProject(data.path);
+  }catch(e){ alert('Failed to add the project'); }
+}
+
+async function removeProjectFromNav(){
+  const path = projectCwd();
+  if(!path){ alert('Pick a project first.'); return; }
+  const proj = PROJECTS.find(p => p.path === path);
+  const present = proj ? proj.present : 0;
+  if(!confirm('Remove project\n\n'+path+'\n\nIt stops being listed. The directory and everything '
+      + 'in it stay on disk.')) return;
+  let purge = 0;
+  if(present > 0){
+    purge = confirm('Also DELETE the '+present+' Claude file(s) in that directory?\n\n'
+      + 'CLAUDE.md, .mcp.json and .claude/ would be removed for good. Your own source files '
+      + 'are never touched.\n\nOK = delete them   ·   Cancel = keep them') ? 1 : 0;
+  }
+  try{
+    const resp = await fetch(BASE+'/api/project-scope/project?project='+encodeURIComponent(path)
+                             +'&purge='+purge, {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to remove'); return; }
+    setCurrentProject('', true);
+    await loadProjectsNav();
+    showToast('Removed '+projShort(path)
+      + (data.removed && data.removed.length ? ' (deleted '+data.removed.join(', ')+')' : ''));
+  }catch(e){ alert('Failed to remove the project'); }
 }
 
 function renderChatBubbles(name){
@@ -15296,12 +17907,13 @@ function renderDetail(){
           <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
           ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
-          <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
-          <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','CLAUDE.md');closeTabMore()">Project CLAUDE.md</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.json');closeTabMore()">Project settings.json</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.claude/settings.local.json');closeTabMore()">Project settings.local.json</div>
-          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>`}
+          <div class="tab-more-item more-admin-only" onclick="openProfilesAt('projects');closeTabMore()" title="Every file that reaches Claude — this directory's files, the host context, and this profile's config">Context &amp; project files&hellip;</div>
+          <div class="more-member-only" style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
+          <div class="tab-more-item more-member-only" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
+          <div class="tab-more-item more-member-only" onclick="openProjectFile('${esc(s.name)}','CLAUDE.md');closeTabMore()">Project CLAUDE.md</div>
+          <div class="tab-more-item more-member-only" onclick="openProjectFile('${esc(s.name)}','.claude/settings.json');closeTabMore()">Project settings.json</div>
+          <div class="tab-more-item more-member-only" onclick="openProjectFile('${esc(s.name)}','.claude/settings.local.json');closeTabMore()">Project settings.local.json</div>
+          <div class="tab-more-item more-member-only" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>`}
         </div>
       </div>
       <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
@@ -15315,7 +17927,10 @@ function renderDetail(){
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
-        <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
+        <!-- The terminal line count lived here. It is a number nobody acts on, sitting
+             between the model chip and the buttons, so it is kept in the DOM (the raw
+             view still writes to it) but not shown. -->
+        <span class="raw-info" id="raw-info-${s.name}" hidden>Loading terminal...</span>
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="reloadActive('${esc(s.name)}')" title="Re-read this session's terminal from tmux">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
@@ -15393,19 +18008,7 @@ function renderDetail(){
     </div>
 
     <div class="tab-content tab-info ${tab==='info'?'active':''}" id="tab-info-${s.name}">
-      <div class="tier tier-description">
-        <div class="tier-label"><span class="dot"></span>Project</div>
-        <div class="tier-text" id="desc-${s.name}">${esc(s.description)||'Loading...'}</div>
-      </div>
-      <div class="tier tier-progress">
-        <div class="tier-label"><span class="dot"></span>Progress</div>
-        <div class="tier-text" id="prog-${s.name}">${esc(s.progress)||'Loading...'}</div>
-      </div>
-      <div class="tier tier-notes">
-        <div class="tier-label"><span class="dot"></span>Key Info</div>
-        <div class="tier-text" id="notes-${s.name}">${esc(s.notes)||'Click "Full" to extract...'}</div>
-      </div>
-      <div class="tier" style="margin-top:12px">
+      <div class="tier">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
@@ -15428,31 +18031,18 @@ function renderDetail(){
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
       </div>
-      <div class="tier" style="margin-top:12px" id="hidebash-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool calls</div>
+      <div class="tier" style="margin-top:12px" id="hidedev-tier-${s.name}">
+        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool calls &amp; output</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
           <label class="watchdog-toggle">
-            <input type="checkbox" id="hidebash-toggle-${s.name}"
-              onchange="toggleHideBash('${esc(s.name)}',this.checked)"
-              ${getHideBashPref()?'checked':''}>
+            <input type="checkbox" id="hidedev-toggle-${s.name}"
+              onchange="toggleHideDev('${esc(s.name)}',this.checked)"
+              ${getHideDevPref()?'checked':''}>
             <span class="watchdog-toggle-slider"></span>
           </label>
-          <span id="hidebash-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideBashPref()?'On — hiding tool calls + update logs':'Off — showing all output'}</span>
+          <span id="hidedev-status-${s.name}" style="font-size:.82rem;color:#8b949e">${hideDevDesc(getHideDevPref())}</span>
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides tool-call lines like <code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Edit(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">Fetch(…)</code>, <code style="color:#79c0ff">add(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code> (and their wrapped lines + update logs) so you can focus on the conversation. Use <b>Hide tool output</b> below to also drop the <code style="color:#79c0ff">⎿</code> result blocks. Setting is shared across all sessions.</div>
-      </div>
-      <div class="tier" style="margin-top:12px" id="hideoutput-tier-${s.name}">
-        <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Hide tool output</div>
-        <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label class="watchdog-toggle">
-            <input type="checkbox" id="hideoutput-toggle-${s.name}"
-              onchange="toggleHideOutput('${esc(s.name)}',this.checked)"
-              ${getHideOutputPref()?'checked':''}>
-            <span class="watchdog-toggle-slider"></span>
-          </label>
-          <span id="hideoutput-status-${s.name}" style="font-size:.82rem;color:#8b949e">${getHideOutputPref()?'On — hiding tool output (⎿ …)':'Off — showing tool output'}</span>
-        </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the <code style="color:#79c0ff">⎿</code> tool-output blocks — file dumps, command results, "<code style="color:#79c0ff">Shell cwd was reset…</code>", "<code style="color:#79c0ff">… +N lines</code>" — and their indented continuation rows, leaving only Claude's spoken text. Setting is shared across all sessions.</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Hides the plumbing: tool-call lines (<code style="color:#79c0ff">Bash(…)</code>, <code style="color:#79c0ff">Write(…)</code>, <code style="color:#79c0ff">Read(…)</code>, <code style="color:#79c0ff">mcp__…(…)</code>), their <code style="color:#79c0ff">⎿</code> result blocks (file dumps, command output, "<code style="color:#79c0ff">… +N lines</code>") and update logs. What's left is only what Claude writes to you. Off shows the terminal as usual. Setting is shared across all sessions.</div>
       </div>
       <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
@@ -15467,9 +18057,6 @@ function renderDetail(){
       </div>
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
-          <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
-          <div class="ts">progress: <span id="ts-prog-${s.name}">${timeAgo(s.progress_at)}</span></div>
-          <div class="ts">notes: <span id="ts-notes-${s.name}">${timeAgo(s.notes_at)}</span></div>
           <div class="ts">live: <span id="ts-rt-${s.name}">${timeAgo(s.realtime_at)}</span></div>
         </div>
         <div class="btn-group">
@@ -16137,20 +18724,8 @@ function updateCard(s){
   if(s.name!==selectedSession)return;
   const rawTitle=document.getElementById('raw-title-'+s.name);
   if(rawTitle&&s.title)rawTitle.textContent=s.title;
-  const desc=document.getElementById('desc-'+s.name);
-  const prog=document.getElementById('prog-'+s.name);
-  const notesEl=document.getElementById('notes-'+s.name);
-  if(desc)desc.textContent=s.description||'';
-  if(prog)prog.textContent=s.progress||'';
-  if(notesEl&&s.notes)notesEl.textContent=s.notes;
   renderSavedKeys(s.name, s);
-  const tsDesc=document.getElementById('ts-desc-'+s.name);
-  const tsProg=document.getElementById('ts-prog-'+s.name);
-  const tsNotes=document.getElementById('ts-notes-'+s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
-  if(tsDesc)tsDesc.textContent=timeAgo(s.description_at);
-  if(tsProg)tsProg.textContent=timeAgo(s.progress_at);
-  if(tsNotes)tsNotes.textContent=timeAgo(s.notes_at);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
   updateStatusPill(s.name,s.activity_status,s.activity_detail);
 
@@ -16183,9 +18758,15 @@ async function loadAll(){
       lastStatus[s.name]=s.activity_status;
       if(s.messages&&s.messages.length)mergeChatMessages(s.name, s.messages);
     });
-    if(!selectedSession&&sessions.length>0)selectedSession=sessions[0].name;
+    // Default the selection to the CURRENT project's sessions, not the global
+    // first one, or switching workspaces would land you on a foreign session.
+    const _inScope=projectSessions();
+    if((!selectedSession || !_inScope.some(s=>s.name===selectedSession)) && _inScope.length>0){
+      selectedSession=_inScope[0].name;
+    }
     renderNav();
     renderDetail();
+    loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
   // Phase 2: Background LLM refresh for each session
@@ -16217,18 +18798,13 @@ async function refreshOne(name){
 
 async function refreshFull(name){
   const btn=document.getElementById('btn-full-'+name);
-  const desc=document.getElementById('desc-'+name);
-  const prog=document.getElementById('prog-'+name);
-  const notesEl=document.getElementById('notes-'+name);
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Full'}
-  [desc,prog,notesEl].forEach(el=>{if(el)el.classList.add('loading')});
   try{
     const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh-all',{method:'POST'});
     const data=await resp.json();
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
   }catch(e){}
-  [desc,prog,notesEl].forEach(el=>{if(el)el.classList.remove('loading')});
   if(btn){btn.disabled=false;btn.textContent='Full'}
 }
 
@@ -16472,9 +19048,15 @@ function showCreateModal(){
   const modal=document.getElementById('modal-content');
   // Members get a name pre-filled with 5 random chars (overridable); admins blank.
   const pre = MEMBER_SIMPLE ? _randName(5) : '';
+  // Say where it will start. A session's cwd decides which project context it
+  // loads, so this is the most consequential thing about the new session.
+  const where = projectCwd()
+    ? `<p class="conn-note">Starts in <code>${esc(projShort(CURRENT_PROJECT))}</code> — it loads that project's CLAUDE.md, MCP servers and memories.</p>`
+    : `<p class="conn-note">No project selected, so it starts in the default directory. Pick one in the top bar to open sessions inside a project.</p>`;
   modal.innerHTML=`
     <h3>New __BRAND__ session</h3>
     <p>${MEMBER_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
+    ${where}
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
       placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
@@ -16500,7 +19082,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
+      body:JSON.stringify({name, cwd: projectCwd()})
     });
     const data=await resp.json();
     if(!resp.ok){
@@ -16526,7 +19108,8 @@ async function createSessionAuto(){
     const name=_randName(5);
     try{
       const resp=await fetch(BASE+'/api/sessions/create',{
-        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name, cwd: projectCwd()})});
       const data=await resp.json();
       if(resp.ok){selectedSession=data.name;await loadAll();return}
       if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
@@ -16568,29 +19151,17 @@ async function disconnectService(svc){
 }
 
 // ── Global context (admin) ──
-async function openGlobalContext(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Loading…</p>`;
-  document.getElementById('modal-overlay').classList.add('active');
-  try{
-    const r=await fetch(BASE+'/api/global-context'); const d=await r.json();
-    modal.innerHTML=`<h3>Global Context — every member's Claude</h3>
-      <p class="conn-note">Prepended as a managed block to each member's CLAUDE.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
-      <textarea id="gctx-ta" class="modal-input" style="height:320px;font-family:monospace;white-space:pre;width:100%">${esc(d.content||'')}</textarea>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="saveGlobalContext()">Save &amp; sync</button></div>`;
-  }catch(e){
-    modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Failed to load.</p>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
-  }
-}
+// Loaded/edited inside the Profiles window's Context tab (see loadGlobalContext);
+// it is host-wide, so it reads the same under every profile.
 async function saveGlobalContext(){
   const ta=document.getElementById('gctx-ta'); if(!ta) return;
   try{
     const r=await fetch(BASE+'/api/global-context',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ta.value})});
     const d=await r.json();
-    if(r.ok){ closeModal(); alert('Saved & synced to '+(d.synced||0)+' member(s).'); }
-    else alert(d.error||'Failed');
+    if(!r.ok){ alert(d.error||'Failed'); return; }
+    ta.style.borderColor='#3fb950';
+    setTimeout(()=>{ta.style.borderColor='';},600);
+    showToast('Global context saved & synced to '+(d.synced||0)+' member(s).');
   }catch(e){ alert('Failed to save.'); }
 }
 
@@ -16673,7 +19244,14 @@ function renderAuthIndicator(){
     const email=_authCache.email||'';
     const plan=_authCache.plan||(_authCache.subscriptionType?_authCache.subscriptionType.charAt(0).toUpperCase()+_authCache.subscriptionType.slice(1):'');
     const stale=(_loginHealth&&_loginHealth.stale_count)||0;
-    label.textContent=(stale>0?'⚠ '+stale+' on old login · ':'')+email+(plan?' · '+plan:'');
+    // Just the username: the domain is the same every time and the plan rarely
+    // changes, so both were spending header width to say nothing. Full address
+    // and plan move to the tooltip (and the dropdown already lists them).
+    const user=email.split('@')[0]||email;
+    label.textContent=(stale>0?'⚠ '+stale+' on old login · ':'')+user;
+    const parent=label.parentElement;
+    if(parent) parent.title=(email?email:'Signed in')+(plan?' · '+plan:'')
+      +(stale>0?'\n⚠ '+stale+' session(s) still on the previous login':'');
     if(stale>0){dot.className='status-dot';dot.style.background='#f85149';}
   }else{
     dot.className='status-dot busy';dot.style.background='';
@@ -17106,16 +19684,11 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Claude Code's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['q'])" title="q — quit pager">q</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['n'])" title="n — no">n</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Tab'])" title="Tab">Tab</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
@@ -17127,10 +19700,6 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
     <span class="key-bar-sep"></span>
-    <span class="key-bar-label">Opts:</span>
-    <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
-    <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
@@ -17318,7 +19887,7 @@ function renderSavedKeys(name,sessionObj){
     const tog=document.createElement('div');
     tog.className='key-saved-toggle'+(isOpen?' open':'');
     const chev=document.createElement('span');chev.className='chevron';chev.textContent='▼';tog.appendChild(chev);
-    tog.appendChild(document.createTextNode('Saved for this project '));
+    tog.appendChild(document.createTextNode('Saved from this project '));
     const cnt=document.createElement('span');cnt.className='key-saved-count';cnt.textContent='('+summary+')';tog.appendChild(cnt);
     tog.addEventListener('click',toggleSavedKeys);
     box.appendChild(tog);
@@ -17328,12 +19897,12 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='No project URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
+      empty.textContent='Nothing captured yet. This is the quick-reference for THIS session: files it created, external URLs, and any logins or passwords it set up, so you do not have to scroll back through the terminal. Press "Full" on the Info tab to extract them.';
       body.appendChild(empty);
     }else{
-      if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
-      if(info.creds.length)body.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
-      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1))));
+      if(info.urls.length)body.appendChild(_savedGroup('Links & URLs',info.urls.map(u=>_savedLinkRow(u,u))));
+      if(info.creds.length)body.appendChild(_savedGroup('Logins & passwords',info.creds.map(_savedCredRow)));
+      if(info.files.length)body.appendChild(_savedGroup('Files created',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1))));
     }
     box.appendChild(body);
   });
@@ -17513,13 +20082,22 @@ function _profileForSession(name){
   return (s&&s.profile_id)||'default';
 }
 
+// The skills UI is keyed by an element-id suffix. A session tab passes the
+// session name and the profile is looked up from it; the Profiles window passes
+// PF_SKILL_KEY and registers the profile it is editing here, so one set of
+// render/mutate functions drives both places.
+const _skillScopePid={};
+function _skillPid(key){
+  return (key in _skillScopePid) ? _skillScopePid[key] : _profileForSession(key);
+}
+
 async function loadProfileSkills(name){
   const meta=document.getElementById('skills-meta-'+name);
   const activeEl=document.getElementById('skills-active-'+name);
   const libEl=document.getElementById('skills-library-'+name);
   const builtinEl=document.getElementById('skills-builtin-'+name);
   if(!activeEl||!libEl||!builtinEl)return;
-  const pid=_profileForSession(name);
+  const pid=_skillPid(name);
   if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>';
   activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
   libEl.innerHTML='<div class="skills-empty">Loading...</div>';
@@ -17632,7 +20210,7 @@ function _renderBuiltinSkills(name,skills){
 }
 
 async function toggleLibrarySkill(sessionName,skillDirName,enable){
-  const pid=_profileForSession(sessionName);
+  const pid=_skillPid(sessionName);
   const url=BASE+'/api/profiles/'+encodeURIComponent(pid)+'/skills/library/'+encodeURIComponent(skillDirName);
   try{
     const resp=await fetch(url,{method:enable?'POST':'DELETE'});
@@ -17647,7 +20225,7 @@ async function toggleLibrarySkill(sessionName,skillDirName,enable){
 }
 
 async function promoteProfileSkill(sessionName, skillDirName){
-  const pid=_profileForSession(sessionName);
+  const pid=_skillPid(sessionName);
   if(!confirm('Promote "'+skillDirName+'" to the shared library?\n\n' +
               'It will move to ~/.tmux-dashboard/skill-library/ and the current profile ' +
               'will keep it active via a symlink. Other profiles can then toggle it on ' +
@@ -17661,7 +20239,7 @@ async function promoteProfileSkill(sessionName, skillDirName){
 }
 
 async function removeProfileSkill(sessionName, skillDirName, fromLibrary){
-  const pid=_profileForSession(sessionName);
+  const pid=_skillPid(sessionName);
   const verb=fromLibrary?'Disable':'Delete';
   const desc=fromLibrary
     ? 'This removes the symlink from this profile. The library copy is kept and can be re-enabled later.'
@@ -17923,11 +20501,12 @@ let _settingsHistoryDetail = null; // {session_name, ...} or null when showing l
 
 async function openSettings(tab){
   await loadCurrentUser();
-  _settingsActiveTab = tab || 'mycontext';
+  const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
+  _settingsActiveTab = tab || (isAdmin ? 'history' : 'mycontext');
   _settingsHistoryDetail = null;
   const overlay = document.getElementById('settings-overlay');
   overlay.classList.add('active');
-  renderSettingsTabs();
+  renderSettingsTabs();   // snaps _settingsActiveTab to a tab this role is offered
   renderSettingsContent();
 }
 
@@ -17940,14 +20519,19 @@ function closeSettings(){
 function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
-  const tabs = [
-    {id:'mycontext', label:'My Context'},
-    {id:'history',   label:'History'},
-  ];
+  const tabs = [];
+  // "My Context" is an admin's ~/.claude — the same CLAUDE.md, MEMORY.md and
+  // settings.json the Claude Profiles window shows under Default, so it would be
+  // the one file editor living in two places. Members have no profiles window,
+  // and their config dir is their own, so they keep the tab.
+  if(!isAdmin) tabs.push({id:'mycontext', label:'My Context'});
+  tabs.push({id:'history', label:'History'});
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
   if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
+  // Snap to a real tab if the remembered one isn't offered to this role.
+  if(!tabs.some(t => t.id === _settingsActiveTab)) _settingsActiveTab = tabs[0].id;
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
@@ -19039,67 +21623,297 @@ async function refreshAllApiUsage(){
 
 // --- Users tab (admin only) ---
 let _groupsCache=[];
+let _usersCache=[];
+let _usersSummary={};
+let _usersGeneratedAt=0;
+let _usersPollTimer=null;
+let _usersDragColumn='';
+let _usersFilter={status:'all',query:''};
+let _usersSort={key:'status',dir:'desc'};
+const _USER_COLUMNS={
+  username:{label:'Username',tip:'Account display/login name',width:190},
+  status:{label:'Status',tip:'Online means dashboard activity in the last 2 minutes; Working means an owned session is busy',width:130},
+  role:{label:'Role',tip:'Administrator or standard user',width:86},
+  group:{label:'Group',tip:'Organizational label only; no shared context or skills',width:145},
+  sessions:{label:'Sessions',tip:'Busy and currently running owned sessions',width:130},
+  tokens:{label:'Total tokens',tip:'All-time tokens across this user’s transcripts',width:130},
+  prompts:{label:'Prompts',tip:'Human prompts retained in the append-only audit log',width:90},
+  lastLogin:{label:'Last login',tip:'Most recent successful login, address, browser, and method',width:205},
+  created:{label:'Created',tip:'Account creation timestamp',width:145},
+  google:{label:'Google sign-in',tip:'Google account linked to this dashboard account',width:190},
+  actions:{label:'Actions',tip:'Open the user view, prompts, context, or details',width:265},
+};
+const _USER_DEFAULT_ORDER=['username','status','role','group','sessions','tokens','prompts','lastLogin','created','google','actions'];
+let _usersColumnOrder=_USER_DEFAULT_ORDER.slice();
+let _usersVisibleColumns=new Set(['username','status','role','group','sessions','tokens','prompts','lastLogin','actions']);
+let _usersColumnWidths=Object.fromEntries(Object.entries(_USER_COLUMNS).map(([key,col])=>[key,col.width]));
+
+function _loadUsersTablePrefs(){
+  try{
+    const prefs=JSON.parse(localStorage.getItem('adminUsersTablePrefs')||'{}');
+    if(Array.isArray(prefs.order)){
+      const valid=prefs.order.filter(key=>_USER_COLUMNS[key]);
+      _usersColumnOrder=[...valid,..._USER_DEFAULT_ORDER.filter(key=>!valid.includes(key))];
+    }
+    if(Array.isArray(prefs.visible)){
+      _usersVisibleColumns=new Set(prefs.visible.filter(key=>_USER_COLUMNS[key]));
+    }
+    if(prefs.widths&&typeof prefs.widths==='object'){
+      Object.keys(_USER_COLUMNS).forEach(key=>{
+        const width=Number(prefs.widths[key]);
+        if(width>=70&&width<=520)_usersColumnWidths[key]=width;
+      });
+    }
+    if(prefs.filter&&['all','online','working','offline'].includes(prefs.filter))_usersFilter.status=prefs.filter;
+    if(typeof prefs.query==='string')_usersFilter.query=prefs.query.slice(0,200);
+    if(prefs.sort&&_USER_COLUMNS[prefs.sort.key])_usersSort={key:prefs.sort.key,dir:prefs.sort.dir==='asc'?'asc':'desc'};
+  }catch(e){}
+}
+function _saveUsersTablePrefs(){
+  try{localStorage.setItem('adminUsersTablePrefs',JSON.stringify({
+    order:_usersColumnOrder,visible:[..._usersVisibleColumns],widths:_usersColumnWidths,
+    filter:_usersFilter.status,query:_usersFilter.query,sort:_usersSort,
+  }))}catch(e){}
+}
+_loadUsersTablePrefs();
+
 function _browserName(ua){ua=ua||'';if(/Edg\//.test(ua))return'Edge';if(/OPR\//.test(ua))return'Opera';if(/Chrome\//.test(ua))return'Chrome';if(/Firefox\//.test(ua))return'Firefox';if(/Safari\//.test(ua))return'Safari';return (ua.slice(0,16)||'?');}
 function _groupOpts(sel){return '<option value="">— no group —</option>'+_groupsCache.map(g=>`<option value="${esc(g.id)}" ${g.id===sel?'selected':''}>${esc(g.name)}</option>`).join('');}
-async function loadUsersAdmin(){
+function _fmtUserTokens(value){const n=Number(value||0);if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n);}
+function _fmtUserCost(value){const n=Number(value||0);return n?'$'+n.toFixed(n<1?3:2):'$0';}
+function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString()}catch(e){return'Never'}}
+function _userPresenceName(user){return user.working?'working':(user.online?'online':'offline')}
+function _userStatusRank(user){return user.working?3:(user.online?2:1)}
+function _userSortValue(user,key){
+  if(key==='status')return _userStatusRank(user);
+  if(key==='tokens')return Number((user.usage||{}).total_tokens||0);
+  if(key==='prompts')return Number(user.prompt_count||0);
+  if(key==='sessions')return Number(user.live_session_count||0);
+  if(key==='lastLogin')return Number(user.last_login||0);
+  if(key==='created')return Number(user.created_at||0);
+  if(key==='group')return user.group||'';
+  if(key==='role')return user.role||'';
+  if(key==='google')return user.google_email||'';
+  return (user.username||'').toLowerCase();
+}
+function _filteredUsers(){
+  const query=(_usersFilter.query||'').trim().toLowerCase();
+  return _usersCache.filter(user=>{
+    const state=_userPresenceName(user);
+    if(_usersFilter.status!=='all'&&state!==_usersFilter.status){
+      if(!(_usersFilter.status==='online'&&user.online))return false;
+    }
+    if(!query)return true;
+    const hay=[user.username,user.role,user.group,user.google_email,...(user.session_names||[])].join(' ').toLowerCase();
+    return hay.includes(query);
+  }).sort((a,b)=>{
+    const av=_userSortValue(a,_usersSort.key),bv=_userSortValue(b,_usersSort.key);
+    let result=typeof av==='number'&&typeof bv==='number'?av-bv:String(av).localeCompare(String(bv));
+    if(!result)result=(a.username||'').localeCompare(b.username||'');
+    return _usersSort.dir==='asc'?result:-result;
+  });
+}
+function setUsersPolling(active){
+  if(_usersPollTimer){clearInterval(_usersPollTimer);_usersPollTimer=null;}
+  if(active){
+    _usersPollTimer=setInterval(()=>{
+      const overlay=document.getElementById('settings-overlay');
+      if(_settingsActiveTab==='users'&&overlay&&overlay.classList.contains('active'))loadUsersAdmin(true);
+    },15000);
+  }
+}
+async function loadUsersAdmin(silent){
   let data, gdata={groups:[]};
   try{
-    const resp = await fetch(BASE+'/api/admin/users');
+    const [resp,gr] = await Promise.all([
+      fetch(BASE+'/api/admin/users'),
+      fetch(BASE+'/api/admin/groups'),
+    ]);
     data = await resp.json();
     if(!resp.ok){ throw new Error(data.error||'Failed'); }
-    const gr = await fetch(BASE+'/api/admin/groups'); if(gr.ok) gdata = await gr.json();
+    if(gr.ok) gdata = await gr.json();
   }catch(e){
-    document.getElementById('settings-content').innerHTML =
-      '<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    if(!silent){
+      const host=document.getElementById('settings-content');
+      if(host)host.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load users: '+esc(e.message||e)+'</div></div>';
+    }
     return;
   }
   _groupsCache = gdata.groups||[];
-  const users = data.users || [];
-  const rows = users.map(u => {
-    const roleTag = u.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
-    const ll = u.last_login ? (timeAgo(u.last_login)+(u.last_login_ip?(' · '+esc(u.last_login_ip)):'')+(u.last_login_ua?(' · '+esc(_browserName(u.last_login_ua))):'')+(u.last_login_via==='google'?' · Google':'')) : 'never';
-    const isMe = (_currentUser && _currentUser.id===u.id);
-    const meTag = isMe ? ' <span style="font-size:.62rem;color:#79c0ff;border:1px solid #79c0ff44;border-radius:3px;padding:1px 5px;text-transform:uppercase">you</span>' : '';
-    const grpCell = u.role==='admin' ? '<span class="muted">—</span>' :
-      `<select class="grp-sel" onchange="setUserGroup('${esc(u.id)}',this.value)">${_groupOpts(u.group||'')}</select>`;
-    let acts = `<button class="imp" onclick="openContextEditor('user','${esc(u.id)}','${esc(u.username)}')">Context</button>
-      <button onclick="openUserHistory('${esc(u.id)}','${esc(u.username)}')">History</button>
-      <button onclick="resetUserPassword('${esc(u.id)}','${esc(u.username)}')">Reset pw</button>`;
-    if(!(u.id==='admin'||isMe)) acts += `<button class="imp" onclick="impersonateUser('${esc(u.id)}','${esc(u.username)}')">Log in as</button>
-      <button onclick="toggleUserRole('${esc(u.id)}','${u.role}')">${u.role==='admin'?'Demote':'Promote'}</button>
-      <button class="danger" onclick="deleteUser('${esc(u.id)}','${esc(u.username)}')">Delete</button>`;
-    const gCell = `<span style="font-size:.72rem">${u.google_email?esc(u.google_email):'<span class="muted">—</span>'}</span>
-      <button style="margin-left:6px" onclick="setUserGoogle('${esc(u.id)}','${esc(u.google_email||'')}')">${u.google_email?'Edit':'Link'}</button>`;
-    return `<tr>
-      <td><strong>${esc(u.username||'')}</strong>${meTag}</td>
-      <td>${roleTag}</td>
-      <td>${grpCell}</td>
-      <td>${gCell}</td>
-      <td>${u.session_count||0}</td>
-      <td style="font-size:.72rem">${ll}</td>
-      <td><div class="users-actions">${acts}</div></td>
-    </tr>`;
-  }).join('');
-  const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="openContextEditor('group','${esc(g.id)}','${esc(g.name)}');return false">ctx</a> <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
-  document.getElementById('settings-content').innerHTML = `<div class="settings-section">
-    <div class="pf-banner">Create users, place them in work groups, and view/edit each user's &amp; group's context files (CLAUDE.md, skills, MEMORY.md, settings.json…). Each user has an isolated config + history.</div>
-    <div class="users-new-bar">
-      <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
-      <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
-      <select id="users-new-role"><option value="user">user</option><option value="admin">admin</option></select>
-      <select id="users-new-group">${_groupOpts('')}</select>
-      <button onclick="createUserFromForm()">+ Create user</button>
+  _usersCache=data.users||[];
+  _usersSummary=data.summary||{};
+  _usersGeneratedAt=data.generated_at||Date.now()/1000;
+  if(_settingsActiveTab==='users')renderUsersAdmin();
+}
+function _usersStatusChips(){
+  const counts={
+    all:_usersCache.length,
+    online:_usersCache.filter(user=>user.online).length,
+    working:_usersCache.filter(user=>user.working).length,
+    offline:_usersCache.filter(user=>!user.online).length,
+  };
+  return ['all','online','working','offline'].map(state=>
+    `<button class="users-status-chip ${_usersFilter.status===state?'active':''}" onclick="setUsersStatusFilter('${state}')">${state[0].toUpperCase()+state.slice(1)} ${counts[state]}</button>`
+  ).join('');
+}
+function _usersSummaryHtml(){
+  const s=_usersSummary;
+  return [
+    ['Users',s.user_count||0,''],
+    ['Online now',s.online_count||0,'live'],
+    ['Working now',s.working_count||0,'working'],
+    ['Total tokens',_fmtUserTokens(s.total_tokens||0),''],
+    ['Prompts',_fmtUserTokens(s.total_prompts||0),''],
+  ].map(([label,value,cls])=>`<div class="users-summary-card ${cls}"><span class="users-summary-label">${label}</span><span class="users-summary-value">${value}</span></div>`).join('');
+}
+function _userColumnsMenu(){
+  return _usersColumnOrder.map(key=>`<label><input type="checkbox" ${_usersVisibleColumns.has(key)?'checked':''} onchange="toggleUserColumn('${key}',this.checked)"> ${esc(_USER_COLUMNS[key].label)}</label>`).join('')+
+    '<button class="users-toolbar-btn users-columns-reset" onclick="resetUsersTable()">Reset columns</button>';
+}
+function renderUsersAdmin(){
+  const host=document.getElementById('settings-content');
+  if(!host||_settingsActiveTab!=='users')return;
+  const groupsBar = _groupsCache.map(g=>`<span class="grp-chip">${esc(g.name)} (${g.member_count||0}) <a href="#" onclick="deleteGroup('${esc(g.id)}','${esc(g.name)}');return false" style="color:#f85149">×</a></span>`).join(' ') || '<span class="muted">No groups yet.</span>';
+  host.innerHTML = `<div class="settings-section">
+    <div id="users-summary" class="users-summary">${_usersSummaryHtml()}</div>
+    <div class="users-toolbar">
+      <input class="users-search" id="users-search" value="${esc(_usersFilter.query)}" placeholder="Search users, groups, sessions…" oninput="setUsersSearch(this.value)">
+      <div id="users-status-chips" class="users-status-chips">${_usersStatusChips()}</div>
+      <button class="users-toolbar-btn" onclick="openPromptAudit('','All users')">All prompts</button>
+      <button class="users-toolbar-btn" onclick="loadUsersAdmin()">Refresh</button>
+      <div class="users-columns-wrap">
+        <button class="users-toolbar-btn" onclick="toggleUsersColumnsMenu(event)">Columns ▾</button>
+        <div id="users-columns-menu" class="users-columns-menu" onclick="event.stopPropagation()">${_userColumnsMenu()}</div>
+      </div>
     </div>
-    <div class="users-new-bar" style="margin-top:8px;flex-wrap:wrap">
-      <input id="new-group-name" placeholder="new work group name" autocomplete="off">
-      <button onclick="createGroup()">+ Group</button>
-      <span style="margin-left:8px;font-size:.8rem">Work groups: ${groupsBar}</span>
+    <details>
+      <summary style="cursor:pointer;color:#8b949e;font-size:.75rem">Create accounts and manage organizational labels</summary>
+      <div class="users-new-bar" style="margin-top:8px">
+        <input id="users-new-username" placeholder="username (2-40 chars)" autocomplete="off">
+        <input id="users-new-password" placeholder="password (min 6 chars)" type="password" autocomplete="new-password">
+        <select id="users-new-role"><option value="user">user</option><option value="admin">admin</option></select>
+        <select id="users-new-group">${_groupOpts('')}</select>
+        <button onclick="createUserFromForm()">+ Create user</button>
+      </div>
+      <div class="users-new-bar" style="margin-top:8px;flex-wrap:wrap">
+        <input id="new-group-name" placeholder="new work group name" autocomplete="off">
+        <button onclick="createGroup()">+ Group</button>
+        <span style="margin-left:8px;font-size:.8rem">Organizational labels only — no shared context or skills: ${groupsBar}</span>
+      </div>
+    </details>
+    <div id="users-top-scroll" class="users-top-scroll"><div></div></div>
+    <div id="users-table-scroll" class="users-table-scroll">
+      <table class="users-table" id="users-table"><colgroup id="users-colgroup"></colgroup><thead id="users-thead"></thead><tbody id="users-tbody"></tbody></table>
     </div>
-    <table class="users-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Group</th><th>Google sign-in</th><th>Sess.</th><th>Last login (time · IP · browser)</th><th></th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="7" class="history-empty">No users yet.</td></tr>'}</tbody>
-    </table>
+    <div class="users-table-footer"><span id="users-table-count"></span><span>Drag headers to reorder · drag header edges to resize · preferences are saved</span></div>
   </div>`;
+  renderUsersRows();
+}
+function _userCell(user,key){
+  const usage=user.usage||{};
+  const isMe=!!(_currentUser&&_currentUser.id===user.id);
+  if(key==='username')return `<span class="users-cell-main">${esc(user.username||'')}${isMe?' <span class="users-role-user">you</span>':''}</span><span class="users-cell-sub">${esc(user.id||'')}</span>`;
+  if(key==='status'){
+    const state=_userPresenceName(user),label=state==='working'?'Working':(user.online?'Online':'Offline');
+    const sub=user.last_seen?(state==='offline'?'Seen '+timeAgo(user.last_seen):'Active '+timeAgo(user.last_seen)):'No recent activity';
+    return `<span class="users-presence ${state}"><span class="users-presence-dot"></span><strong>${label}</strong></span><span class="users-cell-sub">${esc(sub)}</span>`;
+  }
+  if(key==='role')return user.role==='admin'?'<span class="users-role-admin">admin</span>':'<span class="users-role-user">user</span>';
+  if(key==='group')return user.role==='admin'?'<span class="muted">—</span>':`<select class="grp-sel" onclick="event.stopPropagation()" onchange="setUserGroup('${esc(user.id)}',this.value)">${_groupOpts(user.group||'')}</select>`;
+  if(key==='sessions'){
+    const busy=Number(user.busy_session_count||0),live=Number(user.live_session_count||0);
+    return `<span class="users-cell-main">${busy?busy+' working':live+' running'}</span><span class="users-cell-sub" title="${esc((user.session_names||[]).join(', '))}">${esc((user.session_names||[]).join(', ')||'No live sessions')}</span>`;
+  }
+  if(key==='tokens')return `<span class="users-cell-main users-token">${_fmtUserTokens(usage.total_tokens||0)}</span><span class="users-cell-sub">${_fmtUserTokens(usage.tokens_7d||0)} in 7d · ${_fmtUserCost(usage.estimated_cost||0)}</span>`;
+  if(key==='prompts')return `<button class="users-toolbar-btn" onclick="event.stopPropagation();openPromptAudit('${esc(user.id)}','${esc(user.username)}')">${_fmtUserTokens(user.prompt_count||0)}</button><span class="users-cell-sub">${user.last_prompt_at?'Last '+timeAgo(user.last_prompt_at):'No prompts yet'}</span>`;
+  if(key==='lastLogin'){
+    const detail=[user.last_login_ip,_browserName(user.last_login_ua),user.last_login_via==='google'?'Google':''].filter(Boolean).join(' · ');
+    return `<span class="users-cell-main">${user.last_login?timeAgo(user.last_login):'Never'}</span><span class="users-cell-sub" title="${esc(_fmtUserDate(user.last_login)+(detail?' · '+detail:''))}">${esc(detail||_fmtUserDate(user.last_login))}</span>`;
+  }
+  if(key==='created')return `<span class="users-cell-main">${user.created_at?timeAgo(user.created_at):'Unknown'}</span><span class="users-cell-sub">${esc(_fmtUserDate(user.created_at))}</span>`;
+  if(key==='google')return `<span class="users-cell-main">${user.google_email?esc(user.google_email):'—'}</span><button class="users-toolbar-btn" onclick="event.stopPropagation();setUserGoogle('${esc(user.id)}','${esc(user.google_email||'')}')">${user.google_email?'Edit':'Link'}</button>`;
+  if(key==='actions'){
+    let login='';
+    if(!(user.id==='admin'||isMe))login=`<button class="imp" onclick="impersonateUser('${esc(user.id)}','${esc(user.username)}')">Log in as ↗</button>`;
+    return `<div class="users-actions" onclick="event.stopPropagation()">${login}<button onclick="openPromptAudit('${esc(user.id)}','${esc(user.username)}')">Prompts</button><button onclick="openContextEditor('user','${esc(user.id)}','${esc(user.username)}')">Context</button><button onclick="openUserDetail('${esc(user.id)}')">Details</button></div>`;
+  }
+  return'';
+}
+function renderUsersRows(){
+  const tbody=document.getElementById('users-tbody'),thead=document.getElementById('users-thead'),colgroup=document.getElementById('users-colgroup');
+  if(!tbody||!thead||!colgroup)return;
+  const visible=_usersColumnOrder.filter(key=>_usersVisibleColumns.has(key));
+  const users=_filteredUsers();
+  colgroup.innerHTML='<col style="width:42px">'+visible.map(key=>`<col data-user-col="${key}" style="width:${_usersColumnWidths[key]}px">`).join('');
+  thead.innerHTML='<tr><th class="user-row-number" data-tip="Visible row number">#</th>'+visible.map(key=>{
+    const col=_USER_COLUMNS[key],sorted=_usersSort.key===key?`<span class="users-sort">${_usersSort.dir==='asc'?'▲':'▼'}</span>`:'';
+    return `<th draggable="true" data-user-col="${key}" data-tip="${esc(col.tip)}" onclick="sortUserColumn('${key}')" ondragstart="dragUserColumnStart(event,'${key}')" ondragover="event.preventDefault()" ondrop="dropUserColumn(event,'${key}')">${esc(col.label)}${sorted}<span class="user-col-resizer" onmousedown="startUserColResize(event,'${key}')"></span></th>`;
+  }).join('')+'</tr>';
+  tbody.innerHTML=users.map((user,index)=>`<tr onclick="openUserDetail('${esc(user.id)}')"><td class="user-row-number">${index+1}</td>${visible.map(key=>`<td data-user-col="${key}" title="${key==='actions'?'':esc(String(_userSortValue(user,key)||''))}">${_userCell(user,key)}</td>`).join('')}</tr>`).join('')||
+    `<tr><td class="history-empty" colspan="${visible.length+1}">No users match this filter.</td></tr>`;
+  const count=document.getElementById('users-table-count');
+  if(count)count.textContent=`Showing ${users.length} of ${_usersCache.length} users · updated ${timeAgo(_usersGeneratedAt)}`;
+  const chips=document.getElementById('users-status-chips');
+  if(chips)chips.innerHTML=_usersStatusChips();
+  requestAnimationFrame(setupUsersTableUX);
+}
+function setupUsersTableUX(){
+  const top=document.getElementById('users-top-scroll'),body=document.getElementById('users-table-scroll'),table=document.getElementById('users-table');
+  if(!top||!body||!table)return;
+  const visible=_usersColumnOrder.filter(key=>_usersVisibleColumns.has(key));
+  const width=42+visible.reduce((sum,key)=>sum+Number(_usersColumnWidths[key]||100),0);
+  table.style.width=Math.max(width,body.clientWidth)+'px';
+  top.firstElementChild.style.width=table.style.width;
+  let syncing=false;
+  top.onscroll=()=>{if(syncing)return;syncing=true;body.scrollLeft=top.scrollLeft;syncing=false};
+  body.onscroll=()=>{if(syncing)return;syncing=true;top.scrollLeft=body.scrollLeft;syncing=false};
+}
+function setUsersStatusFilter(status){_usersFilter.status=status;_saveUsersTablePrefs();renderUsersRows();}
+function setUsersSearch(query){_usersFilter.query=query.slice(0,200);_saveUsersTablePrefs();renderUsersRows();}
+function sortUserColumn(key){
+  if(key==='actions')return;
+  if(_usersSort.key===key)_usersSort.dir=_usersSort.dir==='asc'?'desc':'asc';else _usersSort={key,dir:key==='username'?'asc':'desc'};
+  _saveUsersTablePrefs();renderUsersRows();
+}
+function toggleUsersColumnsMenu(event){event.stopPropagation();const menu=document.getElementById('users-columns-menu');if(menu)menu.classList.toggle('open');}
+function toggleUserColumn(key,visible){if(visible)_usersVisibleColumns.add(key);else _usersVisibleColumns.delete(key);_saveUsersTablePrefs();renderUsersRows();}
+function resetUsersTable(){
+  _usersColumnOrder=_USER_DEFAULT_ORDER.slice();
+  _usersVisibleColumns=new Set(['username','status','role','group','sessions','tokens','prompts','lastLogin','actions']);
+  _usersColumnWidths=Object.fromEntries(Object.entries(_USER_COLUMNS).map(([key,col])=>[key,col.width]));
+  _usersFilter={status:'all',query:''};_usersSort={key:'status',dir:'desc'};_saveUsersTablePrefs();renderUsersAdmin();
+}
+function dragUserColumnStart(event,key){_usersDragColumn=key;event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',key);}
+function dropUserColumn(event,target){
+  event.preventDefault();const source=_usersDragColumn||event.dataTransfer.getData('text/plain');if(!source||source===target)return;
+  const order=_usersColumnOrder.filter(key=>key!==source),index=order.indexOf(target);order.splice(index,0,source);_usersColumnOrder=order;_saveUsersTablePrefs();renderUsersRows();
+}
+function startUserColResize(event,key){
+  event.preventDefault();event.stopPropagation();
+  const startX=event.clientX,startWidth=Number(_usersColumnWidths[key]||100);
+  function move(ev){_usersColumnWidths[key]=Math.max(70,Math.min(520,startWidth+ev.clientX-startX));const col=document.querySelector(`col[data-user-col="${key}"]`);if(col)col.style.width=_usersColumnWidths[key]+'px';setupUsersTableUX();}
+  function up(){window.removeEventListener('mousemove',move);window.removeEventListener('mouseup',up);_saveUsersTablePrefs();renderUsersRows();}
+  window.addEventListener('mousemove',move);window.addEventListener('mouseup',up);
+}
+document.addEventListener('click',()=>{const menu=document.getElementById('users-columns-menu');if(menu)menu.classList.remove('open');});
+
+function openUserDetail(userId){
+  const user=_usersCache.find(item=>item.id===userId);if(!user)return;
+  const usage=user.usage||{},isMe=!!(_currentUser&&_currentUser.id===user.id);
+  let actions=`<button class="modal-cancel" onclick="openUserHistory('${esc(user.id)}','${esc(user.username)}')">Session history</button><button class="modal-cancel" onclick="openPromptAudit('${esc(user.id)}','${esc(user.username)}')">Prompt audit</button><button class="modal-cancel" onclick="openContextEditor('user','${esc(user.id)}','${esc(user.username)}')">Context</button><button class="modal-cancel" onclick="resetUserPassword('${esc(user.id)}','${esc(user.username)}')">Reset password</button>`;
+  if(!(user.id==='admin'||isMe))actions=`<button class="modal-confirm-create" onclick="impersonateUser('${esc(user.id)}','${esc(user.username)}')">Log in as ↗</button>`+actions+`<button class="modal-cancel" onclick="toggleUserRole('${esc(user.id)}','${esc(user.role)}')">${user.role==='admin'?'Demote':'Promote'}</button><button class="danger modal-cancel" onclick="deleteUser('${esc(user.id)}','${esc(user.username)}')">Delete</button>`;
+  const state=_userPresenceName(user);
+  const modal=document.getElementById('modal-content');modal.classList.add('modal-wide');
+  modal.innerHTML=`<h3>${esc(user.username)} <span class="${user.role==='admin'?'users-role-admin':'users-role-user'}">${esc(user.role)}</span></h3>
+    <div class="user-detail-grid">
+      <div class="user-detail-item"><span>Status</span><strong>${state==='working'?'Working now':(user.online?'Online':'Offline')}</strong></div>
+      <div class="user-detail-item"><span>Sessions</span><strong>${user.busy_session_count||0} working · ${user.live_session_count||0} running</strong></div>
+      <div class="user-detail-item"><span>Total tokens</span><strong>${_fmtUserTokens(usage.total_tokens||0)} · ${_fmtUserCost(usage.estimated_cost||0)} estimated</strong></div>
+      <div class="user-detail-item"><span>Prompts</span><strong>${user.prompt_count||0}</strong></div>
+      <div class="user-detail-item"><span>Last login</span><strong>${esc(_fmtUserDate(user.last_login))}</strong></div>
+      <div class="user-detail-item"><span>Login details</span><strong>${esc([user.last_login_ip,_browserName(user.last_login_ua),user.last_login_via].filter(Boolean).join(' · ')||'None')}</strong></div>
+    </div><div class="modal-actions" style="flex-wrap:wrap">${actions}<button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  document.getElementById('modal-overlay').classList.add('active');
 }
 
 async function setUserGoogle(userId, current){
@@ -19213,6 +22027,41 @@ async function _ctxDelete(path){
   _ctxState.cur=''; _ctxRefresh();
 }
 
+// ── Admin: append-only prompt audit ──
+// Distinct from session history: chat history is per-session and disappears with
+// the session, this is a permanent record of who typed what, including prompts
+// typed while an admin was impersonating someone.
+function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString()}catch(e){return'Never'}}
+let _promptAuditState={userId:'',label:'',items:[],nextBefore:0,nextCursor:''};
+async function openPromptAudit(userId,label,before,append){
+  if(!append){
+    _promptAuditState={userId:userId||'',label:label||'All users',items:[],nextBefore:0,nextCursor:''};
+    const modal=document.getElementById('modal-content');modal.classList.add('modal-wide');
+    modal.innerHTML=`<h3>Prompt audit — ${esc(_promptAuditState.label)}</h3><p class="conn-note">Loading append-only prompt history…</p>`;
+    document.getElementById('modal-overlay').classList.add('active');
+  }
+  const params=new URLSearchParams({limit:'100'});
+  if(_promptAuditState.userId)params.set('user_id',_promptAuditState.userId);
+  if(append&&_promptAuditState.nextCursor)params.set('cursor',_promptAuditState.nextCursor);
+  else if(before)params.set('before',String(before));
+  try{
+    const resp=await fetch(BASE+'/api/admin/prompts?'+params);
+    const data=await resp.json();if(!resp.ok)throw new Error(data.error||'Failed');
+    _promptAuditState.items=append?_promptAuditState.items.concat(data.prompts||[]):(data.prompts||[]);
+    _promptAuditState.nextBefore=data.next_before||0;
+    _promptAuditState.nextCursor=data.next_cursor||'';
+    renderPromptAudit();
+  }catch(e){
+    document.getElementById('modal-content').innerHTML=`<h3>Prompt audit</h3><p class="conn-note">Failed: ${esc(e.message||e)}</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+  }
+}
+function renderPromptAudit(){
+  const state=_promptAuditState;
+  const rows=state.items.map(item=>`<div class="prompt-audit-row"><div class="prompt-audit-meta"><strong>${esc(item.username||item.user_id||'Unknown')}</strong><span>${esc(item.session_name||'')}</span><span>${esc(_fmtUserDate(item.ts))}</span>${item.impersonated_by?`<span>via ${esc(item.impersonated_by)}</span>`:''}</div><div class="prompt-audit-text">${esc(item.prompt||'')}</div></div>`).join('')||'<div class="history-empty">No prompts recorded yet.</div>';
+  document.getElementById('modal-content').innerHTML=`<h3>Prompt audit — ${esc(state.label)}</h3><p class="conn-note">Human prompts from users and administrators. Records are append-only and retained independently of session chat history.</p><div class="prompt-audit-list">${rows}</div><div class="modal-actions">${state.nextCursor?'<button class="modal-cancel" onclick="loadMorePromptAudit()">Load older</button>':''}<button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+}
+function loadMorePromptAudit(){openPromptAudit(_promptAuditState.userId,_promptAuditState.label,0,true);}
+
 // ── Admin: view a user's full history ──
 async function openUserHistory(userId, username){
   const modal=document.getElementById('modal-content');
@@ -19274,17 +22123,19 @@ async function deleteUser(userId, username){
 }
 
 async function impersonateUser(userId, username){
-  if(!confirm('Log in as "'+username+'"? You\'ll see the dashboard exactly as they do (their sessions, their view). Use the "Return to admin" bar at the bottom to come back.')) return;
+  if(!confirm('Open a view as "'+username+'"? It opens in a NEW TAB — this tab stays signed in as you. Close that tab, or use its "Return to admin" bar, to end it.')) return;
   try{
     const resp = await fetch(BASE+'/api/admin/users/'+encodeURIComponent(userId)+'/impersonate', {method:'POST'});
     const data = await resp.json();
     if(!resp.ok){ alert(data.error||'Failed'); return; }
-    window.location.href = BASE + '/';  // reload as the impersonated user
+    // The ticket is single-use and expires in a minute; the new tab redeems it.
+    window.open(data.url, '_blank', 'noopener');
   }catch(e){ alert('Failed: '+e.message); }
 }
 
 async function returnToAdmin(){
-  try{ await fetch(BASE+'/api/unimpersonate', {method:'POST'}); }catch(e){}
+  try{ await fetch(BASE+'/api/impersonation/end', {method:'POST'}); }catch(e){}
+  try{ sessionStorage.removeItem('tmuxImpersonationToken'); }catch(e){}
   window.location.href = BASE + '/';
 }
 
@@ -19301,13 +22152,71 @@ function renderImpersonationBanner(){
   }
 }
 
+// ── Panel chrome: sidebar rail, explainer, project scope ───────────────────
+// All three persist: this window is opened many times a day, and re-collapsing
+// the sidebar and re-hiding the blurb on every open is exactly the kind of
+// small tax that makes a tool annoying.
+function _pfPrefGet(k, d){ try{ const v=localStorage.getItem(k); return v===null?d:v==='1'; }catch(e){ return d; } }
+function _pfPrefSet(k, v){ try{ localStorage.setItem(k, v?'1':'0'); }catch(e){} }
+
+function applyProfilesChrome(){
+  const rail = _pfPrefGet('pfRail', false);
+  const hint = _pfPrefGet('pfHint', false);   // the long explainer stays hidden by default
+  const body = document.querySelector('#profiles-overlay .profiles-body');
+  if(body) body.classList.toggle('rail', rail);
+  const rb = document.getElementById('pf-rail-btn');
+  if(rb){
+    rb.classList.toggle('on', rail);
+    rb.innerHTML = (rail ? '&#9654;' : '&#9664;') + ' Profiles';
+    rb.title = rail ? 'Show the profile list' : 'Collapse the profile list to widen the editor';
+  }
+  const hEl = document.getElementById('profiles-hint');
+  // The explainer is hidden whenever the sidebar is collapsed: collapsing is a
+  // request for room, and a six-line paragraph is the biggest thing in the way.
+  if(hEl) hEl.classList.toggle('hidden', !hint || rail);
+  const hb = document.getElementById('pf-hint-btn');
+  if(hb){
+    hb.classList.toggle('on', hint && !rail);
+    hb.title = rail ? 'Expand the profile list to show the explainer'
+                    : (hint ? 'Hide the explainer' : 'What is this window?');
+  }
+}
+function toggleProfilesRail(){
+  _pfPrefSet('pfRail', !_pfPrefGet('pfRail', false));
+  applyProfilesChrome();
+}
+function toggleProfilesHint(){
+  // Asking for the explainer while collapsed should give it to you, not no-op.
+  if(_pfPrefGet('pfRail', false)) _pfPrefSet('pfRail', false);
+  _pfPrefSet('pfHint', !_pfPrefGet('pfHint', false));
+  applyProfilesChrome();
+}
+
 async function openProfiles(){
   const overlay = document.getElementById('profiles-overlay');
   overlay.classList.add('active');
+  applyProfilesChrome();
   await loadProfiles(true);
   renderProfilesList();
+  // Open on a profile rather than an empty pane: the shared host context and the
+  // global block live inside the profile view, so an empty pane hides them.
+  const list = _profilesCache || [];
+  const want = (_profilesEditing && list.some(p=>p.id===_profilesEditing.id))
+    ? _profilesEditing.id
+    : (selectedSession ? _profileForSession(selectedSession) : '');
+  const pick = list.find(p=>p.id===want) || list.find(p=>p.id==='default') || list[0];
+  if(pick){ await editProfile(pick.id); return; }
   document.getElementById('profile-edit').innerHTML =
     '<div class="profile-empty">Select a profile on the left, or create a new one.</div>';
+}
+
+// Deep link into a specific tab. The session "More" menu uses this instead of
+// carrying its own copies of the cwd-bound files: they belong to a directory,
+// not to a session, and one window that shows all of them beats five entry
+// points that each show one.
+async function openProfilesAt(tabId){
+  if(tabId) _profileActiveTab = tabId;
+  await openProfiles();
 }
 
 function closeProfiles(){
@@ -19345,16 +22254,93 @@ async function editProfile(profileId){
 }
 
 let _profileActiveTab = 'identity';
+// Every surface that reaches Claude Code, in load order: who the profile is, the
+// context it always loads, the memories it wrote itself, then the capabilities
+// (skills/agents/commands/MCP) and the raw config behind them.
 const _PROFILE_TABS = [
   {id:'identity', label:'Identity'},
-  {id:'memory',   label:'Memory'},
-  {id:'login',    label:'Login'},
-  {id:'settings', label:'Settings'},
-  {id:'mcp',      label:'MCP'},
+  {id:'context',  label:'Context'},
+  {id:'projects', label:'Projects'},
+  {id:'memories', label:'Memories'},
+  {id:'skills',   label:'Skills'},
   {id:'agents',   label:'Agents'},
   {id:'commands', label:'Commands'},
+  {id:'mcp',      label:'MCP'},
+  {id:'settings', label:'Settings'},
+  {id:'login',    label:'Login'},
   {id:'plugins',  label:'Plugins'},
 ];
+// Element-id suffix the shared skills UI uses when it renders inside this panel
+// rather than inside a session tab.
+const PF_SKILL_KEY = '__profile__';
+
+/* The profile-root CLAUDE.md / MEMORY.md editors.
+
+   Two things were wrong on this tab. For the DEFAULT profile the profile root IS
+   ~/.claude, so "CLAUDE.md — this profile" edited ~/.claude/CLAUDE.md — the very
+   same file listed again a few inches below under Host context. One file, two
+   editors, on one screen. And MEMORY.md is empty for most profiles, so it showed
+   as a tall blank box taking a third of the tab for nothing.
+
+   So: Default points at the Host context row instead of duplicating it, and an
+   empty MEMORY.md collapses to one line with a Create button. */
+function profileRootFilesHtml(p){
+  const isDefault = (p.id === 'default');
+  const mem = (p.memory_md||'');
+  const memBox = mem.trim()
+    ? `<label>MEMORY.md <span class="pf-sub">— this profile</span></label>
+       <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(mem)}</textarea>`
+    : `<label>MEMORY.md <span class="pf-sub">— this profile</span></label>
+       <div class="pf-emptyfile">Empty. Claude writes this itself as it learns.
+         <button class="extras-btn" onclick="pfShowMemoryEditor()">Write one</button></div>
+       <textarea id="ed-memory" class="ed-memory" spellcheck="false" hidden></textarea>`;
+  if(isDefault){
+    // No profile-root editor at all: it would be a second view of a file that is
+    // already listed, with its real path, under Host context below.
+    return `<div class="pf-banner">This profile runs on the standard <code>~/.claude</code>, so its
+        <code>CLAUDE.md</code> is the host file <code>~/.claude/CLAUDE.md</code> — edit it under
+        <b>Host context</b> below rather than in two places.</div>
+      ${memBox}
+      <div class="pf-actions"><button class="extras-btn" onclick="saveProfile()">Save MEMORY.md</button></div>`;
+  }
+  return `<div class="pf-banner">CLAUDE.md and MEMORY.md at the profile root
+      (<code>~/.claude-${esc(p.id)}/</code>). Claude Code loads both at every launch in this profile.</div>
+    <label>CLAUDE.md <span class="pf-sub">— this profile</span></label>
+    <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
+    ${memBox}
+    <div class="pf-actions"><button class="extras-btn" onclick="saveProfile()">Save CLAUDE.md + MEMORY.md</button></div>`;
+}
+
+/* The profile's model, from the SAME live catalog the session model chip uses
+   (MODEL_CHOICES, refreshed from /api/models). It used to be a free-text box whose
+   placeholder still advertised Sonnet 4.6 and Opus 4.8, so the newest models were
+   invisible here and a typo silently produced an unusable profile.
+
+   A model the catalog does not know (hand-set, or retired since) is kept as its own
+   option rather than being dropped on the next save. */
+function profileModelSelectHtml(current){
+  const cur = (current||'').trim();
+  const known = MODEL_CHOICES.some(c => c[0] === cur);
+  let html = `<select id="ed-model">`;
+  html += `<option value=""${cur?'':' selected'}>Default (inherit)</option>`;
+  MODEL_CHOICES.forEach(([id,label]) => {
+    html += `<option value="${esc(id)}"${id===cur?' selected':''}>${esc(label)}</option>`;
+  });
+  if(cur && !known){
+    html += `<option value="${esc(cur)}" selected>${esc(cur)} (not in catalog)</option>`;
+  }
+  html += `</select>`;
+  return html;
+}
+
+function pfShowMemoryEditor(){
+  const ta = document.getElementById('ed-memory');
+  if(!ta) return;
+  ta.hidden = false;
+  const note = ta.previousElementSibling;
+  if(note && note.classList.contains('pf-emptyfile')) note.remove();
+  ta.focus();
+}
 
 function renderProfileEdit(){
   const p = _profilesEditing;
@@ -19400,7 +22386,7 @@ function renderProfileEdit(){
       <div class="row2">
         <div>
           <label>Model</label>
-          <input id="ed-model" value="${esc(p.model||'')}" placeholder="claude-sonnet-4-6 / claude-opus-4-8[1m] / blank">
+          ${profileModelSelectHtml(p.model||'')}
         </div>
         <div>
           <label>Effort level</label>
@@ -19413,12 +22399,64 @@ function renderProfileEdit(){
       <textarea id="ed-env" class="ed-permissions" spellcheck="false">${esc(envJson)}</textarea>
     </div>
 
-    <div class="pf-section${_profileActiveTab==='memory'?' active':''}" id="pf-section-memory">
-      <div class="pf-banner">CLAUDE.md and MEMORY.md live at the profile root. Claude Code loads them at every launch in this profile.</div>
-      <label>CLAUDE.md</label>
-      <textarea id="ed-claude" class="ed-claude" spellcheck="false">${esc(p.claude_md||'')}</textarea>
-      <label>MEMORY.md</label>
-      <textarea id="ed-memory" class="ed-memory" spellcheck="false">${esc(p.memory_md||'')}</textarea>
+    <div class="pf-section${_profileActiveTab==='context'?' active':''}" id="pf-section-context">
+      ${profileRootFilesHtml(p)}
+
+      <div class="pf-shared-head">Host context <span class="pf-shared-tag">shared</span></div>
+      <div class="pf-banner">Every file Claude Code reads for context on this host, whichever profile a session runs on. <b>Always</b> files are injected into each session's context window — keep them tight. <b>On demand</b> files cost nothing until <code>CLAUDE.md</code> sends a session to them, so detail belongs there. <b>Hook</b> scripts run on tool events and can block a call outright. <b>Policy</b> is enterprise config that would outrank every profile and project setting; it is listed even when absent, because "nothing there" is the answer. <span id="ctxfiles-budget"></span></div>
+      <div class="extras-section" id="context-files"><div class="extras-empty">Loading...</div></div>
+
+      <div class="pf-shared-head">Global context block <span class="pf-shared-tag">shared</span></div>
+      <div class="pf-banner">Prepended as a managed block to every non-admin member's <code>CLAUDE.md</code>; their own notes and memory stay below it. Admin profiles are not touched. Lives at <code id="gctx-path">…</code>.</div>
+      <textarea id="gctx-ta" class="ed-claude" spellcheck="false">Loading...</textarea>
+      <div class="pf-actions">
+        <button class="extras-btn" onclick="saveGlobalContext()">Save &amp; sync to members</button>
+        <button class="extras-btn" onclick="loadGlobalContext()">Reload</button>
+      </div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='projects'?' active':''}" id="pf-section-projects">
+      <div class="pf-banner">Working-directory files, <b>shared</b> by every profile: Claude Code loads these on top of the profile's own config for any session whose cwd is that directory, and <code>.claude/settings.local.json</code> is loaded last, so it wins over everything. Every directory Claude Code has run in is listed — a project with nothing here simply does not override the profile. <span id="pf-proj-total"></span></div>
+      <input class="pf-filter" id="pf-proj-filter" placeholder="Filter directories and files…" oninput="renderProjectScope()" spellcheck="false">
+      <div id="pf-projects-list"><div class="pf-empty">Loading...</div></div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='memories'?' active':''}" id="pf-section-memories">
+      <div class="pf-banner">Auto-memory Claude writes for itself, one directory per project this profile has run in (<code>projects/&lt;encoded-cwd&gt;/memory/</code>). <code>MEMORY.md</code> is the index loaded into context; the topic files beside it load on demand. Sessions on the same profile <i>and</i> the same cwd share a directory.</div>
+      <input class="pf-filter" id="pf-mem-filter" placeholder="Filter projects and memory files…" oninput="renderProfileMemories()" spellcheck="false">
+      <div id="pf-memories-list"><div class="pf-empty">Loading...</div></div>
+    </div>
+
+    <div class="pf-section${_profileActiveTab==='skills'?' active':''}" id="pf-section-skills">
+      <div class="pf-banner">Skills Claude Code loads in this profile. The <b>Library</b> is shared by every profile — toggling a skill only changes this one; editing or deleting a library skill changes it everywhere.</div>
+      <div class="skills-panel">
+        <div class="skills-meta" id="skills-meta-${PF_SKILL_KEY}">Loading...</div>
+        <div class="skills-toolbar">
+          <button class="extras-btn" onclick="newLibrarySkill('${PF_SKILL_KEY}')">+ New Library Skill</button>
+          <button class="extras-btn" onclick="loadProfileSkills('${PF_SKILL_KEY}')">Refresh</button>
+        </div>
+        <div class="skills-section">
+          <div class="skills-section-header">Active skills <span class="skills-section-hint">(loaded by Claude in this profile)</span></div>
+          <div class="skills-list" id="skills-active-${PF_SKILL_KEY}"></div>
+        </div>
+        <div class="skills-section">
+          <div class="skills-section-header">Library <span class="skills-section-hint">(shared; toggle on/off for this profile)</span></div>
+          <div class="skills-list" id="skills-library-${PF_SKILL_KEY}"></div>
+        </div>
+        <div class="skills-section">
+          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with Claude Code; always available)</span></div>
+          <div class="skills-list" id="skills-builtin-${PF_SKILL_KEY}"></div>
+        </div>
+        <div class="skills-editor-wrap" id="skills-editor-wrap-${PF_SKILL_KEY}" style="display:none">
+          <div class="skills-editor-header">
+            <input id="skills-filename-${PF_SKILL_KEY}" placeholder="skill-name (e.g. my-skill)">
+            <input id="skills-description-${PF_SKILL_KEY}" placeholder="One-line description (used by Claude to discover the skill)">
+            <button class="extras-btn" onclick="saveLibrarySkill('${PF_SKILL_KEY}')">Save</button>
+            <button class="extras-btn" onclick="closeSkillEditor('${PF_SKILL_KEY}')">Cancel</button>
+          </div>
+          <textarea class="skills-editor" id="skills-editor-${PF_SKILL_KEY}" placeholder="# Skill body (markdown)..."></textarea>
+        </div>
+      </div>
     </div>
 
     <div class="pf-section${_profileActiveTab==='login'?' active':''}" id="pf-section-login">
@@ -19442,7 +22480,7 @@ function renderProfileEdit(){
     </div>
 
     <div class="pf-section${_profileActiveTab==='mcp'?' active':''}" id="pf-section-mcp">
-      <div class="pf-banner">Profile-scope MCP servers + per-project approvals. Lives at <code>.claude.json</code>. Project-scope <code>.mcp.json</code> is edited per session via the More dropdown.</div>
+      <div class="pf-banner">Profile-scope MCP servers + per-project approvals, at <code>.claude.json</code> — <code>~/.claude.json</code> for Default, which runs with <code>CLAUDE_CONFIG_DIR</code> unset. Claude Code rewrites this file while it runs, so save it when no session is mid-flight or your edit can be overwritten. Project-scope <code>.mcp.json</code> lives in the <b>Projects</b> tab.</div>
       <label>.claude.json</label>
       <textarea id="ed-mcp-json" class="ed-mcp" spellcheck="false">Loading...</textarea>
       <div class="pf-actions">
@@ -19476,7 +22514,7 @@ function renderProfileEdit(){
       ${deleteBtn || '<span></span>'}
       <div style="display:flex;gap:8px">
         <button class="modal-cancel" onclick="closeProfiles()">Close</button>
-        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + memory</button>
+        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + context</button>
       </div>
     </div>
   `;
@@ -19496,12 +22534,460 @@ function switchProfileTab(tabId){
 
 // ── Section loaders ─────────────────────────────────────────────────────────
 async function loadProfileSectionData(pid, tab){
+  if(tab==='context'){ loadContextFiles(); loadGlobalContext(); return; }
+  if(tab==='projects'){ loadProjectScope(); return; }
+  if(tab==='memories'){ loadProfileMemories(pid); return; }
+  if(tab==='skills'){ _skillScopePid[PF_SKILL_KEY]=pid; loadProfileSkills(PF_SKILL_KEY); return; }
   if(tab==='login'){ refreshProfileCredentials(pid); return; }
   if(tab==='settings'){ loadProfileRawFile(pid, 'settings.json', 'ed-settings-json'); return; }
   if(tab==='mcp'){ loadProfileRawFile(pid, '.claude.json', 'ed-mcp-json'); return; }
   if(tab==='agents'){ loadProfileDirSection(pid, 'agents', 'pf-agents-list'); return; }
   if(tab==='commands'){ loadProfileDirSection(pid, 'commands', 'pf-commands-list'); return; }
   if(tab==='plugins'){ loadProfilePluginsList(pid); return; }
+}
+
+// ── Project scope (cwd-bound, shared by every profile) ──────────────────────
+// These files belong to a directory, not to a session — a session is only how
+// you happen to be looking at them. Listed here so the window answers "what
+// reaches Claude on this box" without opening a session first.
+let _pfProj = {projects:[], open:{}, editing:''};
+
+// The selected project is the WORKSPACE the window is scoped to: '' means "all
+// directories" (the old behaviour). Picking one filters the Projects and
+// Memories tabs down to that directory, which is the whole point — you are
+// working in one place at a time, and 30 collapsed directories is noise.
+// Mirrors the nav's CURRENT_PROJECT. One piece of state, chosen in one place;
+// this window just reflects whatever workspace you are in.
+let _pfProjScope = CURRENT_PROJECT || '';
+
+function _pfProjSetScope(v){
+  _pfProjScope = v || '';
+  if(_pfProjScope) _pfProj.open[_pfProjScope] = true;
+  _pfProj.editing = ''; _pfMem.editing = '';
+  renderProjectSelector();
+  const listEl = document.getElementById('pf-projects-list');
+  if(listEl && listEl.children.length) renderProjectScope();
+  const memEl = document.getElementById('pf-memories-list');
+  if(memEl && memEl.children.length) renderProfileMemories();
+}
+
+// The read-only scope chip in the panel toolbar. The picker lives in the main
+// nav bar; duplicating it here would be two controls for one value.
+function renderProjectSelector(){
+  const el = document.getElementById('pf-proj-scope');
+  if(!el) return;
+  const scoped = !!_pfProjScope;
+  el.classList.toggle('all', !scoped);
+  el.textContent = scoped ? projShort(_pfProjScope) : 'All projects';
+  el.title = scoped
+    ? 'Showing only '+_pfProjScope+'. Change the working project in the top navigation bar.'
+    : 'Showing every project. Pick one in the top navigation bar to scope this window to it.';
+}
+
+function _pfProjWantedCwd(){
+  // The session list carries no cwd — that would cost a tmux call per session on
+  // every poll — but the inventory does, so read it back from there.
+  const hit = (_pfProj.projects||[]).find(p => (p.sessions||[]).indexOf(selectedSession) !== -1);
+  return hit ? hit.path : '';
+}
+
+async function loadProjectScope(){
+  const el = document.getElementById('pf-projects-list');
+  if(!el) return;
+  el.innerHTML = '<div class="pf-empty">Loading...</div>';
+  try{
+    const resp = await fetch(BASE+'/api/project-scope');
+    const data = await resp.json();
+    if(!resp.ok){ el.innerHTML='<div class="pf-empty">'+esc(data.error||'Failed to load')+'</div>'; return; }
+    _pfProj.projects = data.projects || [];
+    if(!PROJ_HOME) PROJ_HOME = data.home || '';   // so paths render as ~/foo
+    const totalEl = document.getElementById('pf-proj-total');
+    if(totalEl) totalEl.innerHTML = ' <b>'+(data.total_present||0)+'</b> file'
+      + ((data.total_present===1)?'':'s') + ' across ' + _pfProj.projects.length + ' director'
+      + ((_pfProj.projects.length===1)?'y':'ies') + '.';
+    // Always open the selected session's directory: that is the one being asked
+    // about, and re-opening the window from a different session should follow.
+    const cwd = _pfProjWantedCwd();
+    if(cwd) _pfProj.open[cwd] = true;
+    else if(!Object.keys(_pfProj.open).some(k => _pfProj.open[k])){
+      const first = _pfProj.projects.find(p => p.present > 0);
+      if(first) _pfProj.open[first.path] = true;
+    }
+    renderProjectSelector();
+    renderProjectScope();
+  }catch(e){ el.innerHTML='<div class="pf-empty">Failed to load</div>'; }
+}
+
+function renderProjectScope(){
+  const el = document.getElementById('pf-projects-list');
+  if(!el) return;
+  const filterEl = document.getElementById('pf-proj-filter');
+  const q = ((filterEl && filterEl.value)||'').trim().toLowerCase();
+  const cwd = _pfProjWantedCwd();
+  let projects = _pfProj.projects || [];
+  if(!projects.length){
+    el.innerHTML = '<div class="pf-empty">No project directories found. Claude Code records one as soon as it runs somewhere.</div>';
+    return;
+  }
+  // Scoped to one workspace: show that directory only, and open it.
+  if(_pfProjScope){
+    projects = projects.filter(p => p.path === _pfProjScope);
+    if(!projects.length){
+      el.innerHTML = '<div class="pf-empty">'+esc(_pfProjScope)+' has no project-scope files yet. '
+        + 'Switch to <b>All projects</b> in the selector above to see the rest.</div>';
+      return;
+    }
+  }
+  let html = '';
+  projects.forEach((proj) => {
+    // The row/editor keys index into the UNFILTERED list (_pfProjSplit resolves
+    // them back through it), so this must be the real index — using the filtered
+    // one would open the wrong file the moment a scope or filter is applied.
+    const pi = (_pfProj.projects||[]).indexOf(proj);
+    const projHit = !q || proj.path.toLowerCase().includes(q);
+    // A filter is a search for files that are there — the "not created" rows are
+    // only useful when you are already looking at the directory.
+    const files = (proj.files||[]).filter(f => projHit || (f.exists && f.rel.toLowerCase().includes(q)));
+    const dirs = (proj.dirs||[]).map(d => ({
+      rel: d.rel, note: d.note, truncated: d.truncated,
+      files: (d.files||[]).filter(f => projHit || (d.rel+'/'+f.name).toLowerCase().includes(q)),
+    })).filter(d => projHit || d.files.length);
+    if(q && !projHit && !files.length && !dirs.length) return;
+    const isOpen = !!_pfProj.open[proj.path] || (!!q && !projHit);
+    const isCurrent = proj.path === cwd;
+    const tags = (proj.sessions||[]).length
+      ? '<span class="pf-proj-tag" title="Live sessions in this directory">'+proj.sessions.length+' session'+(proj.sessions.length===1?'':'s')+'</span>'
+      : '';
+    html += '<div class="pf-mem-proj'+(isCurrent?' current':'')+'">'
+      + '<div class="pf-mem-head" onclick="toggleProjectScope(\''+esc(proj.path)+'\')">'
+      + '<span class="pf-mem-caret">'+(isOpen?'&#9662;':'&#9656;')+'</span>'
+      + '<span class="pf-mem-name" title="'+esc(proj.path)+'">'+esc(proj.path)+'</span>'
+      + tags
+      + '<span class="pf-mem-count">'+proj.present+' file'+(proj.present===1?'':'s')+'</span>'
+      + '</div>';
+    if(isOpen){
+      html += '<div class="pf-mem-body">';
+      if(proj.config_overlap){
+        html += '<div class="pf-empty" style="color:#e3b341">Heads up: <code>'+esc(proj.config_overlap)
+             +'</code> is also a profile directory, so a session with this cwd reads the same files twice '
+             +'— once as its profile, once as its project scope. Editing either row edits one file.</div>';
+      }
+      files.forEach(f => { html += _pfProjRow(pi, proj.path, f.rel, f.rel, f.size, f.exists, f.note); });
+      dirs.forEach(d => {
+        if(!d.files.length && q) return;
+        html += '<div class="pf-group-head" title="'+esc(d.note)+'">'+esc(d.rel)+'/</div>';
+        if(!d.files.length){ html += '<div class="pf-empty">Empty &mdash; '+esc(d.note)+'</div>'; }
+        d.files.forEach(f => {
+          if(f.dir){ html += '<div class="pf-row"><span class="pf-row-name">'+esc(f.name)+'/</span><span class="pf-row-meta">directory</span></div>'; return; }
+          html += _pfProjRow(pi, proj.path, f.rel, d.rel+'/'+f.name, f.size, true, '');
+        });
+        if(d.truncated) html += '<div class="pf-empty" style="color:#e3b341">More files on disk than listed here.</div>';
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+  if(!html) html = '<div class="pf-empty">Nothing matches "'+esc(q)+'".</div>';
+  el.innerHTML = html;
+  if(_pfProj.editing) loadProjectScopeContent(_pfProj.editing);
+}
+
+// The editor is keyed by "<project index>:<rel>" rather than by the absolute
+// path: the key goes into an HTML attribute, and a short opaque one keeps both
+// the markup and the querySelector out of trouble.
+function _pfProjKey(pi, rel){ return pi+':'+rel; }
+function _pfProjSplit(key){
+  const i = key.indexOf(':');
+  const proj = (_pfProj.projects||[])[parseInt(key.slice(0,i),10)];
+  return [proj ? proj.path : '', key.slice(i+1)];
+}
+
+function _pfProjRow(pi, project, rel, label, size, exists, note){
+  const key = _pfProjKey(pi, rel);
+  const isEditing = _pfProj.editing === key;
+  const meta = exists ? (size+' B') : 'not created';
+  const del = exists
+    ? '<button class="extras-del" onclick="deleteProjectScopeFile(\''+esc(project)+'\',\''+esc(rel)+'\')" title="Delete">&times;</button>'
+    : '';
+  return '<div class="pf-row'+(exists?'':' absent')+'"'+(note?' title="'+esc(note)+'"':'')+'>'
+    + '<span class="pf-row-name" onclick="toggleProjectScopeFile('+pi+',\''+esc(rel)+'\')">'+esc(label)+'</span>'
+    + '<span class="pf-row-meta">'+meta+'</span>'
+    + '<button class="extras-btn" onclick="toggleProjectScopeFile('+pi+',\''+esc(rel)+'\')">'+(isEditing?'Hide':(exists?'Edit':'Create'))+'</button>'
+    + del
+    + '</div>'
+    + '<div class="extras-editor'+(isEditing?' active':'')+'">'
+    + (isEditing
+        ? '<textarea spellcheck="false" data-proj-key="'+esc(key)+'">Loading...</textarea>'
+          + '<div style="display:flex;gap:6px;justify-content:flex-end">'
+          + '<button class="extras-btn" onclick="saveProjectScopeFile('+pi+',\''+esc(rel)+'\')">Save changes</button>'
+          + '</div>'
+        : '')
+    + '</div>';
+}
+
+function toggleProjectScope(path){
+  _pfProj.open[path] = !_pfProj.open[path];
+  renderProjectScope();
+}
+
+function toggleProjectScopeFile(pi, rel){
+  const key = _pfProjKey(pi, rel);
+  _pfProj.editing = (_pfProj.editing === key) ? '' : key;
+  renderProjectScope();
+}
+
+async function loadProjectScopeContent(key){
+  const ta = document.querySelector('textarea[data-proj-key="'+CSS.escape(key)+'"]');
+  if(!ta) return;
+  const [project, rel] = _pfProjSplit(key);
+  if(!project){ ta.value = 'Unknown project'; return; }
+  try{
+    const resp = await fetch(BASE+'/api/project-scope/file?project='+encodeURIComponent(project)
+                             +'&path='+encodeURIComponent(rel));
+    const data = await resp.json();
+    ta.value = resp.ok ? (data.content||'') : (data.error||'Failed to load');
+  }catch(e){ ta.value = 'Failed to load'; }
+}
+
+async function saveProjectScopeFile(pi, rel){
+  const key = _pfProjKey(pi, rel);
+  const project = _pfProjSplit(key)[0];
+  const ta = document.querySelector('textarea[data-proj-key="'+CSS.escape(key)+'"]');
+  if(!ta || !project) return;
+  try{
+    const resp = await fetch(BASE+'/api/project-scope/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({project: project, path: rel, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+    _pfProjPatchSize(project, rel, data.size);
+    renderProjectScope();
+  }catch(e){ alert('Failed to save'); }
+}
+
+// Keep the listing honest after a write without refetching the whole inventory.
+function _pfProjPatchSize(project, rel, size){
+  const proj = (_pfProj.projects||[]).find(p => p.path === project);
+  if(!proj) return;
+  const f = (proj.files||[]).find(x => x.rel === rel);
+  if(f){ if(!f.exists) proj.present++; f.exists = true; f.size = size; return; }
+  (proj.dirs||[]).forEach(d => {
+    const e = (d.files||[]).find(x => x.rel === rel);
+    if(e) e.size = size;
+  });
+}
+
+async function deleteProjectScopeFile(project, rel){
+  if(!confirm('Delete '+rel+'\\n\\nfrom '+project+'?\\n\\nClaude stops loading it in this directory.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/project-scope/file?project='+encodeURIComponent(project)
+                             +'&path='+encodeURIComponent(rel), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    _pfProj.editing = '';
+    loadProjectScope();
+  }catch(e){ alert('Failed to delete'); }
+}
+
+// ── Auto-memories (per project, inside this profile) ────────────────────────
+// The listing carries names and sizes only — one project dir here holds ~300
+// topic files — so a body is fetched through the generic profile file API when
+// a row is opened.
+let _pfMem = {pid:'', projects:[], open:{}, editing:'', dir:''};
+const _PF_MEM_ROW_CAP = 250;
+
+async function loadProfileMemories(pid){
+  const el = document.getElementById('pf-memories-list');
+  if(!el) return;
+  el.innerHTML = '<div class="pf-empty">Loading...</div>';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/memories');
+    const data = await resp.json();
+    if(!resp.ok){ el.innerHTML='<div class="pf-empty">'+esc(data.error||'Failed to load')+'</div>'; return; }
+    // Keep open/edit state only while staying on the same profile.
+    if(_pfMem.pid !== pid) _pfMem = {pid:pid, projects:[], open:{}, editing:'', dir:''};
+    _pfMem.pid = pid;
+    _pfMem.projects = data.projects || [];
+    _pfMem.dir = data.dir || '';
+    renderProjectSelector();   // memories can name directories the Projects tab hasn't listed
+    renderProfileMemories();
+  }catch(e){ el.innerHTML='<div class="pf-empty">Failed to load</div>'; }
+}
+
+function renderProfileMemories(){
+  const el = document.getElementById('pf-memories-list');
+  if(!el) return;
+  const pid = _pfMem.pid;
+  const filterEl = document.getElementById('pf-mem-filter');
+  const q = ((filterEl && filterEl.value)||'').trim().toLowerCase();
+  let projects = _pfMem.projects || [];
+  if(!projects.length){
+    el.innerHTML = '<div class="pf-empty">No auto-memories yet for this profile. Claude writes them itself; they appear here as soon as it does. Directory: <code>'+esc(_pfMem.dir||'')+'</code></div>';
+    return;
+  }
+  // Same workspace scope as the Projects tab — memories are per (profile, cwd),
+  // so "which project am I in" is exactly the right axis to filter them on.
+  if(_pfProjScope){
+    const scoped = projects.filter(p => p.cwd === _pfProjScope);
+    if(!scoped.length){
+      el.innerHTML = '<div class="pf-empty">This profile has written no memories in <code>'
+        + esc(_pfProjScope)+'</code> yet. Switch to <b>All projects</b> above to see the others.</div>';
+      return;
+    }
+    projects = scoped;
+    if(!_pfMem.open[scoped[0].project]) _pfMem.open[scoped[0].project] = true;
+  }
+  let html = '';
+  projects.forEach(proj => {
+    const projHit = !q || proj.project.toLowerCase().includes(q) || (proj.cwd||'').toLowerCase().includes(q);
+    const files = (proj.files||[]).filter(f => projHit || f.name.toLowerCase().includes(q));
+    if(q && !projHit && !files.length) return;
+    const isOpen = !!_pfMem.open[proj.project] || (!!q && !projHit);
+    const total = files.length + (proj.index_exists ? 1 : 0);
+    const label = proj.cwd || proj.project;
+    html += '<div class="pf-mem-proj">'
+      + '<div class="pf-mem-head" onclick="toggleProfileMemProject(\''+esc(proj.project)+'\')">'
+      + '<span class="pf-mem-caret">'+(isOpen?'&#9662;':'&#9656;')+'</span>'
+      + '<span class="pf-mem-name" title="'+esc(proj.dir)+'">'+esc(label)+'</span>'
+      + '<span class="pf-mem-count">'+total+' file'+(total===1?'':'s')+'</span>'
+      + '</div>';
+    if(isOpen){
+      html += '<div class="pf-mem-body">';
+      html += _pfMemRow(pid, proj.index_rel, 'MEMORY.md', proj.index_size,
+                        proj.index_exists ? 'index' : 'index &middot; not created yet', true);
+      const capped = files.slice(0, _PF_MEM_ROW_CAP);
+      capped.forEach(f => { html += _pfMemRow(pid, f.rel, f.name, f.size, '', false); });
+      if(files.length > capped.length){
+        html += '<div class="pf-empty">'+(files.length-capped.length)+' more file'
+             + (files.length-capped.length===1?'':'s')+' not shown — type in the filter box to narrow the list.</div>';
+      }
+      if(proj.truncated){
+        html += '<div class="pf-empty" style="color:#e3b341">This profile has more memory files than the listing returns; the rest are on disk at '+esc(proj.dir)+'.</div>';
+      }
+      html += '<div class="pf-actions"><button class="extras-btn" onclick="addProfileMemoryFile(\''+esc(pid)+'\',\''+esc(proj.project)+'\')">+ New memory file</button></div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+  if(!html) html = '<div class="pf-empty">Nothing matches "'+esc(q)+'".</div>';
+  el.innerHTML = html;
+  if(_pfMem.editing) loadProfileMemoryContent(pid, _pfMem.editing);
+}
+
+function _pfMemRow(pid, rel, name, size, tag, isIndex){
+  const isEditing = _pfMem.editing === rel;
+  const delBtn = isIndex ? ''
+    : '<button class="extras-del" onclick="deleteProfileMemoryFile(\''+esc(pid)+'\',\''+esc(rel)+'\')" title="Delete">&times;</button>';
+  return '<div class="pf-row'+(isIndex?' pf-mem-index':'')+'">'
+    + '<span class="pf-row-name" onclick="toggleProfileMemoryFile(\''+esc(rel)+'\')">'+esc(name)+'</span>'
+    + (tag?'<span class="pf-row-meta">'+tag+'</span>':'')
+    + '<span class="pf-row-meta">'+size+' B</span>'
+    + '<button class="extras-btn" onclick="toggleProfileMemoryFile(\''+esc(rel)+'\')">'+(isEditing?'Hide':'Edit')+'</button>'
+    + delBtn
+    + '</div>'
+    + '<div class="extras-editor'+(isEditing?' active':'')+'">'
+    + (isEditing
+        ? '<textarea spellcheck="false" data-mem-rel="'+esc(rel)+'">Loading...</textarea>'
+          + '<div style="display:flex;gap:6px;justify-content:flex-end">'
+          + '<button class="extras-btn" onclick="saveProfileMemoryFile(\''+esc(pid)+'\',\''+esc(rel)+'\')">Save changes</button>'
+          + '</div>'
+        : '')
+    + '</div>';
+}
+
+function toggleProfileMemProject(project){
+  _pfMem.open[project] = !_pfMem.open[project];
+  renderProfileMemories();
+}
+
+function toggleProfileMemoryFile(rel){
+  _pfMem.editing = (_pfMem.editing === rel) ? '' : rel;
+  renderProfileMemories();
+}
+
+async function loadProfileMemoryContent(pid, rel){
+  const ta = document.querySelector('textarea[data-mem-rel="'+CSS.escape(rel)+'"]');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(rel));
+    const data = await resp.json();
+    ta.value = resp.ok ? (data.content||'') : (data.error||'Failed to load');
+  }catch(e){ ta.value = 'Failed to load'; }
+}
+
+async function saveProfileMemoryFile(pid, rel){
+  const ta = document.querySelector('textarea[data-mem-rel="'+CSS.escape(rel)+'"]');
+  if(!ta) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: rel, content: ta.value})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to save'); return; }
+    ta.style.borderColor = '#3fb950';
+    setTimeout(()=>{ ta.style.borderColor=''; }, 600);
+    const proj = (_pfMem.projects||[]).find(p => rel.startsWith('projects/'+p.project+'/'));
+    if(proj){
+      if(rel === proj.index_rel){ proj.index_size = data.size; proj.index_exists = true; }
+      else { const f=(proj.files||[]).find(x=>x.rel===rel); if(f) f.size = data.size; }
+    }
+  }catch(e){ alert('Failed to save'); }
+}
+
+async function deleteProfileMemoryFile(pid, rel){
+  const name = rel.split('/memory/').pop();
+  if(!confirm('Delete memory file "'+name+'"?\\n\\nClaude loses this fact permanently — MEMORY.md may still link to it.')) return;
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file?path='+encodeURIComponent(rel), {method:'DELETE'});
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
+    if(_pfMem.editing === rel) _pfMem.editing = '';
+    loadProfileMemories(pid);
+  }catch(e){ alert('Failed to delete'); }
+}
+
+async function addProfileMemoryFile(pid, project){
+  const raw = window.prompt('New memory file name (must end in .md):', 'my-note.md');
+  if(raw === null) return;
+  let name = (raw||'').trim();
+  if(!name) return;
+  if(!name.toLowerCase().endsWith('.md')) name += '.md';
+  if(!/^[A-Za-z0-9._-]+\\.md$/.test(name)){
+    alert('Use alphanumerics, dashes, underscores and dots only; must end in .md.');
+    return;
+  }
+  const slug = name.replace(/\\.md$/,'');
+  const stub = '---\\nname: '+slug+'\\ndescription: One-line summary — used to decide relevance during recall.\\nmetadata:\\n  type: project\\n---\\n\\n';
+  try{
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(pid)+'/file', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: 'projects/'+project+'/memory/'+name, content: stub})
+    });
+    const data = await resp.json();
+    if(!resp.ok){ alert(data.error||'Failed to create'); return; }
+    _pfMem.open[project] = true;
+    _pfMem.editing = 'projects/'+project+'/memory/'+name;
+    await loadProfileMemories(pid);
+  }catch(e){ alert('Failed to create'); }
+}
+
+// ── Global context block (shared by every profile) ──────────────────────────
+async function loadGlobalContext(){
+  const ta = document.getElementById('gctx-ta');
+  if(!ta) return;
+  ta.value = 'Loading...';
+  try{
+    const resp = await fetch(BASE+'/api/global-context');
+    const data = await resp.json();
+    if(!resp.ok){ ta.value = data.error||'Failed to load'; return; }
+    ta.value = data.content || '';
+    const pathEl = document.getElementById('gctx-path');
+    if(pathEl) pathEl.textContent = data.path || '';
+  }catch(e){ ta.value = 'Failed to load'; }
 }
 
 async function refreshProfileCredentials(pid){
@@ -19724,8 +23210,12 @@ async function saveProfile(){
   const name = (document.getElementById('ed-name').value||'').trim();
   const model = (document.getElementById('ed-model').value||'').trim();
   const effort = document.getElementById('ed-effort').value;
-  const claudeMd = document.getElementById('ed-claude').value;
-  const memoryMd = document.getElementById('ed-memory').value;
+  // Default has no profile-root CLAUDE.md editor (it is the host file, edited under
+  // Host context), so send the value back unchanged rather than blanking it.
+  const _cm = document.getElementById('ed-claude');
+  const _mm = document.getElementById('ed-memory');
+  const claudeMd = _cm ? _cm.value : (p.claude_md||'');
+  const memoryMd = _mm ? _mm.value : (p.memory_md||'');
   let permissions, env;
   try{ permissions = JSON.parse(document.getElementById('ed-permissions').value||'{}'); }
   catch(e){ alert('Permissions JSON is invalid: '+e.message); return; }
@@ -20014,28 +23504,27 @@ async function deleteSessionMemoryExtra(name){
 
 // ── Context Files editor ──
 // A fixed registry of the files Claude Code actually reads. Read/edit only —
-// creating new sidecar CLAUDE_*.md files was removed on purpose.
+// creating new sidecar CLAUDE_*.md files was removed on purpose. Rendered inside
+// the Profiles window's Context tab: these are host-wide, so they read the same
+// whichever profile is selected.
 let _ctxFiles={files:[], editing:''};
 
-async function openClaudeMd(){
-  document.getElementById('claudemd-overlay').classList.add('active');
-  document.getElementById('context-files').innerHTML='<div class="extras-empty">Loading...</div>';
-  document.getElementById('ctxfiles-budget').textContent='';
-  await loadContextFiles();
-}
-
 async function loadContextFiles(){
+  const listEl=document.getElementById('context-files');
+  const budgetEl=document.getElementById('ctxfiles-budget');
+  if(listEl)listEl.innerHTML='<div class="extras-empty">Loading...</div>';
+  if(budgetEl)budgetEl.textContent='';
   try{
     const resp=await fetch(BASE+'/api/context-files');
     const data=await resp.json();
     if(!resp.ok) throw new Error(data.error||'load failed');
     _ctxFiles.files=data.files||[];
     const kb=(data.auto_bytes/1024).toFixed(1), tok=Math.round(data.auto_bytes/4);
-    document.getElementById('ctxfiles-budget').innerHTML=
+    if(budgetEl)budgetEl.innerHTML=
       ' Always-loaded total: <b>'+kb+' KB</b> (~'+tok.toLocaleString()+' tokens per session).';
   }catch(e){
     _ctxFiles.files=[];
-    document.getElementById('context-files').innerHTML='<div class="extras-empty">Failed to load context files.</div>';
+    if(listEl)listEl.innerHTML='<div class="extras-empty">Failed to load context files.</div>';
     return;
   }
   renderContextFiles();
@@ -20046,17 +23535,27 @@ function renderContextFiles(){
   if(!el) return;
   const files=_ctxFiles.files||[];
   if(!files.length){ el.innerHTML='<div class="extras-empty">No context files found.</div>'; return; }
+  const BADGE={auto:['ALWAYS','#d29922'], ondemand:['ON DEMAND','#1f6feb'],
+               hook:['HOOK','#1b7f79'], policy:['POLICY','#484f58']};
   el.innerHTML=files.map(f=>{
-    const isEditing=_ctxFiles.editing===f.id;
-    const auto=f.load==='auto';
+    const missing=(f.exists===false);
+    const isEditing=_ctxFiles.editing===f.id && !missing;
+    const b=BADGE[f.load]||BADGE.ondemand;
     const badge='<span style="font-size:.62rem;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:3px;color:#fff;background:'
-      +(auto?'#d29922':'#1f6feb')+'">'+(auto?'ALWAYS':'ON DEMAND')+'</span>';
+      +b[1]+'">'+b[0]+'</span>';
     const lock=f.secret?' <span title="contains secrets" style="color:#f0883e">&#128274;</span>':'';
-    return '<div class="extras-row">'
+    const meta=missing?'not present'
+      :(f.size+' B &middot; ~'+Math.round(f.size/4)+' tok');
+    const btn=missing
+      ? '<span class="extras-meta" style="opacity:.7">nothing to edit</span>'
+      : (f.readonly
+          ? '<span class="extras-meta" style="opacity:.7">read-only</span>'
+          : '<button class="extras-btn" onclick="toggleContextFile(\''+esc(f.id)+'\')">'+(isEditing?'Hide':'Edit')+'</button>');
+    return '<div class="extras-row"'+(missing?' style="opacity:.55"':'')+'>'
       + badge
       + '<span class="extras-name" onclick="toggleContextFile(\''+esc(f.id)+'\')">'+esc(f.name)+lock+'</span>'
-      + '<span class="extras-meta">'+f.size+' B &middot; ~'+Math.round(f.size/4)+' tok</span>'
-      + '<button class="extras-btn" onclick="toggleContextFile(\''+esc(f.id)+'\')">'+(isEditing?'Hide':'Edit')+'</button>'
+      + '<span class="extras-meta">'+meta+'</span>'
+      + btn
       + '</div>'
       + '<div class="extras-row" style="border:none;padding:0 0 4px 0"><span class="extras-meta" style="flex:1">'
       + esc(f.path)+' — '+esc(f.note)+'</span></div>'
@@ -20088,10 +23587,6 @@ async function saveContextFile(id){
     ta.style.borderColor='#3fb950';
     setTimeout(()=>{ta.style.borderColor='';},600);
   }catch(e){ alert('Failed to save.'); }
-}
-
-function closeClaudeMd(){
-  document.getElementById('claudemd-overlay').classList.remove('active');
 }
 
 // ── Stats Window ──
@@ -20190,10 +23685,17 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
-loadCurrentUser().then(applyRoleVisibility);
-loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
-loadAll();
-checkClaudeAuth();
+// The impersonation ticket must be redeemed BEFORE the first identity fetch,
+// otherwise the page boots as the admin and then flips.
+async function bootstrapDashboard(){
+  await bootstrapImpersonation();
+  await loadCurrentUser();
+  await applyRoleVisibility();
+  loadProfiles().then(()=>{ if(selectedSession) renderDetail(); });
+  loadAll();
+  checkClaudeAuth();
+}
+bootstrapDashboard();
 </script>
 </body></html>
 """
