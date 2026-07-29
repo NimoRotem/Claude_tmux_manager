@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import hashlib
@@ -746,6 +747,12 @@ async def lifespan(_app: FastAPI):
                 "park >%.0fmin idle, threshold %.0f%% of a core)",
                 BROWSER_NICE, BROWSER_FREEZE_IDLE_S,
                 BROWSER_AUTOPARK_IDLE_S / 60, BROWSER_BUSY_CPU_PCT)
+
+    browser_monitor_task = asyncio.create_task(browser_monitor_watchdog())
+    _background_tasks.append(browser_monitor_task)
+    logger.info("Browser monitor started (thumbnail every %.0fs while active, "
+                "event shots >=%.0fs apart, keep %d, live view auto-stops after %.0fmin idle)",
+                SHOT_PERIODIC_S, SHOT_EVENT_S, SHOT_KEEP, LIVE_IDLE_STOP_S / 60)
 
     orphan_reaper_task = asyncio.create_task(orphan_browser_reaper())
     _background_tasks.append(orphan_reaper_task)
@@ -10075,6 +10082,12 @@ async def api_auth_setup_submit(body: CodeBody, request: Request):
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+# Streaming caps for a WATCHED browser. defer/wait are x11vnc's frame pacing in
+# ms (80 => ~12 fps, enough to work in, far cheaper than uncapped); compression
+# and quality are noVNC's client-side JPEG knobs.
+VNC_DEFER_MS = int(os.environ.get("CB_VNC_DEFER_MS") or 80)
+VNC_COMPRESSION = int(os.environ.get("CB_VNC_COMPRESSION") or 2)
+VNC_QUALITY = int(os.environ.get("CB_VNC_QUALITY") or 5)
 # Auto-auth: drive the OAuth click-through in the designated login browser and
 # type the code back.
 #
@@ -10096,16 +10109,59 @@ _BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
 # display, fluxbox, x11vnc, websockify (localhost — reached via the tmux-dashboard
 # reverse proxy) and a persistent headful Chrome with its own CDP + profile,
 # and its own proxy identity (its own residential exit IP).
-#   start:  browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport>
-#   stop:   browser-session.sh stop  <id>
+#   start:      browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport>
+#   stop:       browser-session.sh stop  <id>
+#   vnc-start:  browser-session.sh vnc-start <id> <display> <rfbport> <vncport>
+#   vnc-stop:   browser-session.sh vnc-stop  <id> <display> <rfbport> <vncport>
+#
+# The vnc-* actions exist because the VNC bridge is the expensive half and it is
+# only worth running while a person is actually watching: x11vnc costs ~2% of a
+# core per attached viewer, continuously, and nothing at all with none. Chrome,
+# the profile and any agent driving it over CDP are untouched either way.
 set -uo pipefail
 export HOME=/home/nimrod_rotem
 # shellcheck source=/home/nimrod_rotem/.claude-browser/bin/chrome-common.sh
 source "$HOME/.claude-browser/bin/chrome-common.sh"
 ACTION="${1:-}"; ID="${2:-}"
-[ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop <id> ..."; exit 2; }
+[ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop|vnc-start|vnc-stop <id> ..."; exit 2; }
 BASE="$CB_ROOT/sessions/$ID"
 LOGS="$BASE/logs"; PROFILE="$BASE/profile"; PIDS="$BASE/pids"
+VNC_DEFER_MS="${CB_VNC_DEFER_MS:-80}"
+
+# Frame pacing (-defer/-wait, ms) bounds what a watched desktop can cost:
+# 80ms is ~12 fps, which reads fine and is a fraction of uncapped x11vnc.
+cb_vnc_start() {   # <display> <rfbport> <vncport>
+  mkdir -p "$LOGS"
+  if ! pgrep -f "x11vnc -display :$1 " >/dev/null 2>&1; then
+    x11vnc -display ":$1" -localhost -rfbport "$2" -nopw -forever -shared -noxdamage \
+      -defer "$VNC_DEFER_MS" -wait "$VNC_DEFER_MS" \
+      >>"$LOGS/x11vnc.log" 2>&1 & echo $! >> "$PIDS"
+  fi
+  if ! pgrep -f "websockify --web=[^ ]* 127.0.0.1:$3 " >/dev/null 2>&1; then
+    websockify --web=/usr/share/novnc "127.0.0.1:$3" "127.0.0.1:$2" \
+      >>"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
+  fi
+}
+
+cb_vnc_stop() {    # <display> <vncport>
+  pkill -f "x11vnc -display :$1 " 2>/dev/null || true
+  pkill -f "websockify --web=[^ ]* 127.0.0.1:$2 " 2>/dev/null || true
+}
+
+if [ "$ACTION" = "vnc-start" ]; then
+  DISP="${3:?display}"; RFB="${4:?rfbport}"; VNC="${5:?vncport}"
+  export DISPLAY=":$DISP"
+  cb_vnc_start "$DISP" "$RFB" "$VNC"
+  echo "vnc up for $ID (display :$DISP rfb $RFB vnc $VNC)"
+  exit 0
+fi
+
+if [ "$ACTION" = "vnc-stop" ]; then
+  DISP="${3:?display}"; VNC="${5:?vncport}"
+  cb_vnc_stop "$DISP" "$VNC"
+  echo "vnc down for $ID"
+  exit 0
+fi
 
 if [ "$ACTION" = "stop" ]; then
   if [ -f "$PIDS" ]; then
@@ -10136,10 +10192,7 @@ Xvfb ":$DISP" -screen 0 "${CB_SCREEN_W}x${CB_SCREEN_H}x24" -nolisten tcp -ac >"$
 for i in $(seq 1 50); do [ -S "/tmp/.X11-unix/X${DISP}" ] && break; sleep 0.2; done
 fluxbox >"$LOGS/fluxbox.log" 2>&1 & echo $! >> "$PIDS"
 
-x11vnc -display ":$DISP" -localhost -rfbport "$RFB" -nopw -forever -shared -noxdamage \
-  >"$LOGS/x11vnc.log" 2>&1 & echo $! >> "$PIDS"
-websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
-  >"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
+cb_vnc_start "$DISP" "$RFB" "$VNC"
 
 cb_chrome_env "$ID"
 mapfile -t FLAGS < <(cb_chrome_flags "$PROFILE" "$CDP" "$ID")
@@ -10246,6 +10299,18 @@ def _browser_port_alive(port: int) -> bool:
         return False
 
 
+def _browser_alive(s: dict) -> bool:
+    """Is the BROWSER up?
+
+    Liveness used to be read off the noVNC port. That stopped being the same
+    question once the stream became something we start and stop on demand: a
+    browser nobody is watching has no noVNC and is still perfectly alive, and
+    reading it the old way made the dashboard call it dead, respawn it, and
+    refuse to drive it. The control port is the browser.
+    """
+    return _browser_port_alive(int(s.get("cdp_port") or 0))
+
+
 def _next_browser_slot(sessions: list) -> int:
     used = {int(s.get("slot", 0)) for s in sessions}
     k = 1
@@ -10267,8 +10332,13 @@ def _browser_viewer_url(s: dict) -> str:
     sid = s.get("id")
     root = ROOT_PATH.strip("/")
     wspath = (root + "/" if root else "") + f"browser/{sid}/websockify"
+    # compression/quality: a watched stream is the one genuinely expensive thing
+    # here, so cap it rather than letting noVNC negotiate a lossless 24-bit feed
+    # of a 1920x1080 desktop. 2/5 is visually fine for reading a page and costs a
+    # fraction of the default in both CPU and bandwidth.
     return (f"{ROOT_PATH}/browser/{sid}/vnc.html?path={wspath}"
             "&autoconnect=true&resize=scale&shared=true"
+            f"&compression={VNC_COMPRESSION}&quality={VNC_QUALITY}"
             "&reconnect=true&reconnect_delay=2000")
 
 
@@ -10284,8 +10354,19 @@ async def api_browser_sessions(request: Request):
     out = []
     for s in sessions:
         row = dict(s)
-        row["running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        # "running" is the BROWSER, which is what the card is about. It used to
+        # be the noVNC port, so a browser whose stream had been stopped read as
+        # stopped while an agent was busy driving it.
+        row["running"] = await asyncio.to_thread(_browser_alive, s)
+        row["live_running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        row["live_autostop"] = _live_autostop_enabled(s)
+        row["live_viewers"] = int(_live_viewers.get(str(s.get("id") or ""), 0))
         row["viewer_url"] = _browser_viewer_url(s)
+        shot = await asyncio.to_thread(_latest_shot, str(s.get("id") or ""))
+        row["shot_at"] = shot.stat().st_mtime if shot else 0
+        st = _monitor_state.get(str(s.get("id") or "")) or {}
+        row["last_url"] = str(st.get("url") or "")[:300]
+        row["tabs"] = st.get("tabs")
         out.append(row)
     extra = sum(1 for s in sessions if s.get("managed"))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
@@ -10333,6 +10414,69 @@ async def api_browser_workload_stop(pid: int, request: Request, start_ticks: int
                        "%s process(es) targeted", pid, result.get("workload_root"),
                        result.get("targeted"))
     return JSONResponse(result, status_code=200 if result.get("ok") else 409)
+
+
+# --- Monitoring: thumbnails, audit trail, live view --------------------------
+@app.get("/api/browser/activity")
+async def api_browser_activity(request: Request, sid: str = "", limit: int = 120):
+    """Chronological record of what each browser did, newest first."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    rows = await asyncio.to_thread(_activity_read, sid, max(1, min(int(limit), 500)))
+    return JSONResponse({"activity": rows, "shot_base": f"{ROOT_PATH}/api/browser/shot"})
+
+
+@app.get("/api/browser/shot/{sid}/{name}")
+async def api_browser_shot(sid: str, name: str, request: Request):
+    """One stored thumbnail. `latest` resolves to the newest for that browser."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if name == "latest":
+        path = await asyncio.to_thread(_latest_shot, sid)
+    else:
+        # Names come from our own listing; refuse anything that could traverse.
+        if not re.fullmatch(r"\d+\.jpg", name):
+            return JSONResponse({"error": "bad name"}, status_code=400)
+        path = _shots_dir(sid) / name
+    if not path or not path.exists():
+        return JSONResponse({"error": "no screenshot yet"}, status_code=404)
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=30"})
+
+
+@app.post("/api/browser/shot/{sid}")
+async def api_browser_shot_now(sid: str, request: Request):
+    """Capture on demand: the Refresh button, and agents recording evidence."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = _browser_session_by_id(sid)
+    if not s:
+        return JSONResponse({"error": "Unknown browser"}, status_code=404)
+    clients = await asyncio.to_thread(_cdp_clients)
+    agents = _monitor_agents(clients.get(int(s.get("cdp_port") or 0)) or [])
+    res = await _capture_browser_shot(s, "requested", agents)
+    if res.get("ok"):
+        _monitor_state.setdefault(sid, {}).update(shot_ts=time.time())
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
+
+class BrowserLiveBody(BaseModel):
+    start: bool = True
+
+
+@app.post("/api/browser/live/{sid}")
+async def api_browser_live(sid: str, body: BrowserLiveBody, request: Request):
+    """Start or stop the VNC stream for one browser. Nothing else is touched:
+    the browser, its tabs and any agent driving it carry on either way."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    s = _browser_session_by_id(sid)
+    if not s:
+        return JSONResponse({"error": "Unknown browser"}, status_code=404)
+    res = await _live_view_set(s, bool(body.start))
+    if res.get("ok") and body.start:
+        _live_last_seen[sid] = time.time()   # grace before the reaper looks at it
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
 # --- Per-account browsers ----------------------------------------------------
@@ -10669,7 +10813,7 @@ def _ensure_user_browser_session(
         if (
             start
             and session.get("managed")
-            and not _browser_port_alive(session.get("vnc_port", 0))
+            and not _browser_alive(session)
         ):
             sid = str(session.get("id", ""))
             last_start = float(_browser_starting.get(sid, 0) or 0)
@@ -10780,6 +10924,13 @@ async def _park_browser_tabs(session: dict) -> dict:
         return {"ok": False, "error": "Browser control port is unavailable"}
     base = f"http://127.0.0.1:{cdp_port}"
     closed = 0
+    # Parking closes tabs, so it is the one routine action here that destroys
+    # something a person cared about. Photograph it going in and coming out; a
+    # failed capture must never stop the park itself.
+    try:
+        await _capture_browser_shot(session, "before park")
+    except Exception:
+        logger.debug("Pre-park capture failed", exc_info=True)
     async with _browser_busy_ctx(sid, "parking browser"):
         async with httpx.AsyncClient(timeout=20) as client:
             try:
@@ -10806,6 +10957,10 @@ async def _park_browser_tabs(session: dict) -> dict:
                     await client.put(f"{base}/json/new?about:blank")
                 except Exception:
                     logger.debug("Failed to create placeholder browser tab", exc_info=True)
+    try:
+        await _capture_browser_shot(session, f"after park ({closed} tab(s) closed)")
+    except Exception:
+        logger.debug("Post-park capture failed", exc_info=True)
     logger.info("Parked browser '%s' after closing %d tab(s)", sid, closed)
     return {"ok": True, "closed": closed}
 
@@ -10853,6 +11008,8 @@ async def _freeze_browser_tabs(session: dict) -> dict:
                     await ws.close()
             except Exception:
                 skipped += 1
+    _activity_append({"sid": sid, "event": f"froze {len(frozen)} background tab(s)",
+                      "url": "", "agents": []})
     logger.info("Froze %d tab(s) on browser '%s'", len(frozen), sid)
     return {
         "ok": True,
@@ -10901,6 +11058,338 @@ async def _fingerprint_browser(session: dict) -> dict:
     return {"ok": False, "error": "Could not parse audit output"}
 
 
+# ================= Browser monitoring: thumbnails + audit trail ==============
+# The dashboard used to embed a live noVNC <iframe> per browser. That is a full
+# VNC stream rendered continuously for as long as the Settings tab is open:
+# measured here at ~2% of a core per viewer, permanently, for a picture nobody
+# was looking at. What replaces it is a still thumbnail captured over CDP (no
+# VNC, no X11 grab, no cost to the browser between captures) plus a written
+# trail of what the browser did.
+#
+# Capture budget, deliberately small:
+#   · at most one periodic shot a minute, and only while the session is ACTIVE
+#     (an agent driving it over CDP, or a human at its display)
+#   · one extra on an event worth auditing: a navigation, a domain change, tabs
+#     opening or closing, and either side of the destructive actions this
+#     dashboard performs itself (park closes tabs, stop kills the browser)
+#   · nothing at all while the session is idle
+BROWSER_SHOTS_DIR = MESSAGES_DIR / "browser_shots"
+BROWSER_ACTIVITY_FILE = MESSAGES_DIR / "browser_activity.jsonl"
+SHOT_PERIODIC_S = float(os.environ.get("CB_SHOT_PERIODIC_S") or 60)
+SHOT_EVENT_S = float(os.environ.get("CB_SHOT_EVENT_S") or 10)
+SHOT_KEEP = int(os.environ.get("CB_SHOT_KEEP") or 80)
+SHOT_KEEP_S = float(os.environ.get("CB_SHOT_KEEP_DAYS") or 7) * 86400
+SHOT_SCALE = float(os.environ.get("CB_SHOT_SCALE") or 0.4)
+SHOT_QUALITY = int(os.environ.get("CB_SHOT_QUALITY") or 55)
+BROWSER_MONITOR_INTERVAL_S = float(os.environ.get("CB_MONITOR_INTERVAL_S") or 20)
+ACTIVITY_KEEP_ROWS = 4000
+_monitor_state: Dict[str, dict] = {}
+
+
+def _activity_append(row: dict) -> None:
+    """Append one audited browser event. Cheap, append-only, greppable."""
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        row.setdefault("ts", time.time())
+        with BROWSER_ACTIVITY_FILE.open("a") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+        if BROWSER_ACTIVITY_FILE.stat().st_size > 2_000_000:
+            kept = BROWSER_ACTIVITY_FILE.read_text().splitlines()[-ACTIVITY_KEEP_ROWS:]
+            BROWSER_ACTIVITY_FILE.write_text("\n".join(kept) + "\n")
+    except Exception:
+        logger.debug("Failed to record browser activity", exc_info=True)
+
+
+def _activity_read(sid: str = "", limit: int = 120) -> list:
+    """Newest first. `sid` empty reads every browser."""
+    try:
+        if not BROWSER_ACTIVITY_FILE.exists():
+            return []
+        rows = []
+        for line in BROWSER_ACTIVITY_FILE.read_text().splitlines()[-ACTIVITY_KEEP_ROWS:]:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if sid and r.get("sid") != sid:
+                continue
+            rows.append(r)
+        return rows[-limit:][::-1]
+    except Exception:
+        logger.debug("Failed to read browser activity", exc_info=True)
+        return []
+
+
+def _shots_dir(sid: str) -> Path:
+    # No dots in the sanitised name: a session id of ".." would otherwise walk
+    # out of the shots directory. Real ids are "default", "s2", ...
+    d = BROWSER_SHOTS_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", sid) or "default")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _prune_shots(sid: str) -> None:
+    """Retention: newest SHOT_KEEP per browser, nothing older than SHOT_KEEP_S."""
+    try:
+        files = sorted(_shots_dir(sid).glob("*.jpg"))
+        cutoff = time.time() - SHOT_KEEP_S
+        stale = set(files[:-SHOT_KEEP] if len(files) > SHOT_KEEP else [])
+        for f in files:
+            try:
+                if f in stale or f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception:
+        logger.debug("Failed to prune browser shots", exc_info=True)
+
+
+def _latest_shot(sid: str) -> Optional[Path]:
+    try:
+        files = sorted(_shots_dir(sid).glob("*.jpg"))
+        return files[-1] if files else None
+    except Exception:
+        return None
+
+
+def _url_domain(url: str) -> str:
+    m = re.match(r"[a-z]+://([^/:?#]+)", str(url or ""), re.I)
+    return (m.group(1) if m else "").lower()
+
+
+async def _cdp_pages(cdp_port: int, timeout: float = 6) -> list:
+    """This browser's page targets. /json/list is a plain HTTP read: it costs the
+    browser nothing and, unlike a screenshot, works even while a page is busy."""
+    if not cdp_port:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            targets = (await client.get(f"http://127.0.0.1:{cdp_port}/json/list")).json()
+    except Exception:
+        return []
+    return [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
+
+
+def _visible_page(pages: list) -> dict:
+    """The tab a viewer would be looking at. /json/list comes back
+    most-recently-used first, so the first page with real content wins."""
+    for p in pages:
+        if not str(p.get("url") or "").startswith(("about:blank", "chrome://new")):
+            return p
+    return pages[0] if pages else {}
+
+
+async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
+                                page: dict = None) -> dict:
+    """Thumbnail the visible tab over CDP and write one audit row for it."""
+    sid = str(session.get("id") or "")
+    cdp = int(session.get("cdp_port") or 0)
+    if not cdp:
+        return {"ok": False, "error": "This browser has no control port"}
+    pages = [page] if page else await _cdp_pages(cdp)
+    target = _visible_page([p for p in pages if p])
+    ws_url = str((target or {}).get("webSocketDebuggerUrl") or "")
+    if not ws_url:
+        return {"ok": False, "error": "No page to capture"}
+    try:
+        ws = await websockets.connect(ws_url, max_size=None, ping_interval=None,
+                                      open_timeout=10)
+    except Exception as exc:
+        return {"ok": False, "error": f"Browser is unreachable: {exc}"[:200]}
+    try:
+        tab = _CdpTab(ws)
+        try:
+            metrics = await tab.call("Page.getLayoutMetrics", {}, timeout=10)
+            vp = metrics.get("cssVisualViewport") or metrics.get("layoutViewport") or {}
+            w = int(vp.get("clientWidth") or vp.get("width") or 1280)
+            h = int(vp.get("clientHeight") or vp.get("height") or 720)
+            clip = {"x": 0, "y": 0, "width": w, "height": h, "scale": SHOT_SCALE}
+        except Exception:
+            clip = None
+        params = {"format": "jpeg", "quality": SHOT_QUALITY}
+        if clip:
+            params["clip"] = clip
+        shot = await tab.call("Page.captureScreenshot", params, timeout=25)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    data = shot.get("data") or ""
+    if not data:
+        return {"ok": False, "error": "Empty screenshot"}
+    ts = time.time()
+    name = f"{int(ts * 1000)}.jpg"
+    try:
+        (_shots_dir(sid) / name).write_bytes(base64.b64decode(data))
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not store screenshot: {exc}"[:200]}
+    _prune_shots(sid)
+    row = {"ts": ts, "sid": sid, "event": reason, "shot": name,
+           "url": str(target.get("url") or "")[:400],
+           "title": str(target.get("title") or "")[:200],
+           "tabs": len(pages), "agents": list(agents or [])}
+    _activity_append(row)
+    return {"ok": True, **row}
+
+
+def _monitor_agents(clients: list) -> list:
+    """Human-readable owners of the CDP connections driving a browser: the tmux
+    session (our task id) where we can attribute it, else the process name."""
+    out = []
+    for c in clients or []:
+        label = str(c.get("session") or c.get("comm") or "").strip()
+        if label and label not in out:
+            out.append(label)
+    return out[:6]
+
+
+async def _monitor_browser_session(s: dict, active: bool, agents: list) -> None:
+    sid = str(s.get("id") or "")
+    st = _monitor_state.setdefault(sid, {"url": None, "tabs": None, "shot_ts": 0.0,
+                                         "active": None})
+    pages = await _cdp_pages(int(s.get("cdp_port") or 0))
+    if not pages:
+        return
+    top = _visible_page(pages)
+    url, tabs, now = str(top.get("url") or ""), len(pages), time.time()
+    events = []
+    if st["url"] is not None and url != st["url"]:
+        events.append("domain change" if _url_domain(url) != _url_domain(st["url"])
+                      else "navigation")
+    if st["tabs"] is not None and tabs != st["tabs"]:
+        events.append(f"tabs {st['tabs']} -> {tabs}")
+    st["url"], st["tabs"] = url, tabs
+    if active != st.get("active"):
+        st["active"] = active
+        _activity_append({"sid": sid, "event": "session active" if active else "session idle",
+                          "url": url[:400], "tabs": tabs, "agents": agents})
+    # Idle sessions record nothing further: no shots, no noise in the trail.
+    if not active:
+        return
+    if events:
+        if now - st["shot_ts"] >= SHOT_EVENT_S:
+            if (await _capture_browser_shot(s, ", ".join(events), agents, page=top)).get("ok"):
+                st["shot_ts"] = now
+                return
+        _activity_append({"sid": sid, "event": ", ".join(events), "url": url[:400],
+                          "tabs": tabs, "agents": agents})
+        return
+    if now - st["shot_ts"] >= SHOT_PERIODIC_S:
+        if (await _capture_browser_shot(s, "periodic", agents, page=top)).get("ok"):
+            st["shot_ts"] = now
+
+
+# --- Live view (noVNC) on demand ---------------------------------------------
+# A VNC stream only exists while somebody is watching it. Every viewer reaches
+# noVNC through this dashboard's own websocket proxy, so the count is exact:
+# when the last one disconnects, the stream is stopped after a short grace.
+#
+# The DEFAULT browser is exempt unless CB_LIVE_AUTOSTOP_DEFAULT=1, because
+# rotem.ai/browsertool (nginx on another VM) proxies straight to its noVNC and
+# would 502 for a viewer this dashboard cannot see.
+LIVE_IDLE_STOP_S = float(os.environ.get("CB_LIVE_IDLE_STOP_S") or 300)
+LIVE_VNC_UNIT = os.environ.get("CB_VNC_UNIT", "claude-vnc")
+_live_viewers: Dict[str, int] = {}
+_live_last_seen: Dict[str, float] = {}
+
+
+def _live_autostop_enabled(s: dict) -> bool:
+    if "live_autostop" in s:
+        return bool(s.get("live_autostop"))
+    if s.get("managed"):
+        return True
+    return os.environ.get("CB_LIVE_AUTOSTOP_DEFAULT", "0") == "1"
+
+
+def _live_view_running(s: dict) -> bool:
+    return _browser_port_alive(int(s.get("vnc_port") or 0))
+
+
+def _live_view_cmd(s: dict, start: bool) -> list:
+    if s.get("managed"):
+        return [BROWSER_LAUNCHER, "vnc-start" if start else "vnc-stop",
+                str(s.get("id") or ""), str(s.get("display") or 0),
+                str(s.get("rfb_port") or 0), str(s.get("vnc_port") or 0)]
+    return ["sudo", "-n", "systemctl", "start" if start else "stop", LIVE_VNC_UNIT]
+
+
+async def _live_view_set(s: dict, start: bool) -> dict:
+    """Start or stop this browser's VNC bridge. The browser itself is untouched:
+    only the streaming half goes away, so nothing an agent is doing is affected."""
+    sid = str(s.get("id") or "")
+    running = await asyncio.to_thread(_live_view_running, s)
+    if running == start:
+        return {"ok": True, "running": running, "already": True}
+    # The launcher is rewritten from the copy in this file whenever it differs,
+    # and it only used to happen on spawn: without this a box whose script
+    # predates the vnc-start/vnc-stop actions would fail here with "usage:".
+    await asyncio.to_thread(_ensure_browser_launcher)
+    cmd = _live_view_cmd(s, start)
+    try:
+        res = await asyncio.to_thread(
+            lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=45))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    if res.returncode != 0:
+        return {"ok": False, "error": (res.stderr or res.stdout or "failed").strip()[:300]}
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        if await asyncio.to_thread(_live_view_running, s) == start:
+            break
+    running = await asyncio.to_thread(_live_view_running, s)
+    _activity_append({"sid": sid, "event": "live view started" if start else "live view stopped",
+                      "url": "", "agents": []})
+    logger.info("Live view %s for browser '%s'", "started" if start else "stopped", sid)
+    return {"ok": running == start, "running": running}
+
+
+async def _live_view_reap(sessions: list) -> None:
+    """Stop streams nobody is watching."""
+    now = time.time()
+    for s in sessions:
+        sid = str(s.get("id") or "")
+        if not _live_autostop_enabled(s) or _live_viewers.get(sid):
+            continue
+        if not await asyncio.to_thread(_live_view_running, s):
+            continue
+        last = _live_last_seen.get(sid)
+        if last is None:
+            # Started before this process, or by hand. Give it the same grace.
+            _live_last_seen[sid] = now
+            continue
+        if now - last >= LIVE_IDLE_STOP_S:
+            await _live_view_set(s, False)
+            _live_last_seen.pop(sid, None)
+
+
+async def browser_monitor_watchdog():
+    """Thumbnails, the audit trail and the live-stream reaper, one cheap loop."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            sessions = _load_browser_sessions()
+            clients = await asyncio.to_thread(_cdp_clients)
+            for s in sessions:
+                cdp = int(s.get("cdp_port") or 0)
+                if not cdp or not await asyncio.to_thread(_browser_port_alive, cdp):
+                    continue
+                attached = clients.get(cdp) or []
+                working = (await asyncio.to_thread(_cdp_clients_working, attached)
+                           if attached else [])
+                idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0))
+                human = 0 <= idle_ms < BROWSER_ACTIVE_IDLE_MS
+                active = bool(working) or human or str(s.get("id") or "") in _browser_busy
+                await _monitor_browser_session(
+                    s, active, _monitor_agents(working or attached))
+            await _live_view_reap(sessions)
+        except Exception:
+            logger.debug("browser_monitor_watchdog cycle failed", exc_info=True)
+        await asyncio.sleep(BROWSER_MONITOR_INTERVAL_S)
+
+
 async def _member_browser_status(user: dict) -> dict:
     """Return the non-secret state shared by the member tab and header badge."""
     session = await asyncio.to_thread(_ensure_user_browser_session, user)
@@ -10913,10 +11402,7 @@ async def _member_browser_status(user: dict) -> dict:
             "needs_sign_in": True,
             "state": "disconnected",
         }
-    running = await asyncio.to_thread(
-        _browser_port_alive,
-        session.get("vnc_port", 0),
-    )
+    running = await asyncio.to_thread(_browser_alive, session)
     signin = (
         await asyncio.to_thread(_browser_signin_state, session)
         if running
@@ -11018,7 +11504,7 @@ async def _member_browser_action(request: Request, action: str) -> JSONResponse:
     session = _account_browser_for_user(user)
     if not session:
         return JSONResponse({"error": "No browser is configured"}, status_code=404)
-    if not _browser_port_alive(session.get("vnc_port", 0)):
+    if not _browser_alive(session):
         return JSONResponse({"error": "Browser is not running"}, status_code=409)
     result = (
         await _freeze_browser_tabs(session)
@@ -11103,7 +11589,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     ok = False
     for _ in range(25):
         await asyncio.sleep(1)
-        if await asyncio.to_thread(_browser_port_alive, vnc):
+        if await asyncio.to_thread(_browser_port_alive, cdp):
             ok = True
             break
     entry = {"id": sid, "name": name, "slot": slot, "display": disp, "rfb_port": rfb,
@@ -11134,7 +11620,15 @@ async def api_browser_delete(sid: str, request: Request):
         subprocess.run(["bash", BROWSER_LAUNCHER, "stop", sid],
                        capture_output=True, text=True, timeout=30)
 
+    # Irreversible from the trail's point of view: after this there is no
+    # browser left to ask what it was doing.
+    try:
+        await _capture_browser_shot(target, "before browser removed")
+    except Exception:
+        logger.debug("Pre-delete capture failed", exc_info=True)
     await asyncio.to_thread(_stop)
+    _activity_append({"sid": sid, "event": "browser stopped and removed",
+                      "url": "", "agents": []})
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
     # Give its proxy port + sticky identity back, so a later browser reusing the
     # slot doesn't inherit a stranger's exit IP or its bandwidth counter.
@@ -11152,6 +11646,7 @@ class BrowserPatchBody(BaseModel):
     name: Optional[str] = None
     notes: Optional[str] = None
     use_for_login: Optional[bool] = None
+    live_autostop: Optional[bool] = None
 
 
 @app.patch("/api/browser/sessions/{sid}")
@@ -11176,10 +11671,14 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
         for s in sessions:
             s["use_for_login"] = False
         target["use_for_login"] = bool(body.use_for_login)
+    if body.live_autostop is not None:
+        target["live_autostop"] = bool(body.live_autostop)
     _save_browser_sessions(sessions)
     _browser_auth_cache.pop(sid, None)   # re-check on next poll
     row = dict(target)
-    row["running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
+    row["running"] = await asyncio.to_thread(_browser_alive, target)
+    row["live_running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
+    row["live_autostop"] = _live_autostop_enabled(target)
     row["viewer_url"] = _browser_viewer_url(target)
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
@@ -11660,7 +12159,7 @@ def _pick_login_browser() -> dict:
         blob = f"{s.get('name','')} {s.get('notes','')}".lower()
         if "login" in blob or "auth" in blob or "sign in" in blob:
             return s
-    running = [s for s in sessions if _browser_port_alive(s.get("vnc_port", 0))]
+    running = [s for s in sessions if _browser_alive(s)]
     return running[0] if len(running) == 1 else {}
 
 
@@ -12395,7 +12894,7 @@ async def browser_autopark_watchdog():
             configured = _load_browser_sessions()
             for s in configured:
                 sid, cdp = s.get("id"), s.get("cdp_port", 0)
-                if not await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0)):
+                if not await asyncio.to_thread(_browser_alive, s):
                     continue
                 idle_ms = await asyncio.to_thread(_display_idle_ms, s.get("display", 0))
                 attached = bool(clients.get(cdp))
@@ -12571,7 +13070,7 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
     out = []
     for s in sessions:
         sid = s.get("id")
-        alive = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        alive = await asyncio.to_thread(_browser_alive, s)
         acct = {"logged_in": False, "email": "", "can_authorize": False,
                 "capabilities": [], "error": "not running"}
         if alive:
@@ -12871,7 +13370,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
         return {"ok": False, "error": "no browser is marked for login — open Settings → "
                                       "Browser and tick 'use for Claude login' on one"}
     sid, cdp = browser.get("id"), browser.get("cdp_port", 0)
-    if not await asyncio.to_thread(_browser_port_alive, browser.get("vnc_port", 0)):
+    if not await asyncio.to_thread(_browser_alive, browser):
         return {"ok": False, "error": f"the login browser '{browser.get('name')}' isn't running"}
     st.update({"ts": time.time(), "running": True, "status": "starting"})
     try:
@@ -12987,6 +13486,13 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
         await ws.close(code=1011)
         return
     port = int(s.get("vnc_port") or 0)
+    # A stream nobody watches is still a stream: x11vnc measured ~2% of a core
+    # for every attached viewer, around the clock. Every viewer comes through
+    # here, so count them and let the reaper stop the bridge when the last one
+    # goes. Counted before the upstream connect so a failed attempt still
+    # refreshes the grace window rather than looking like "nobody came".
+    _live_viewers[sid] = _live_viewers.get(sid, 0) + 1
+    _live_last_seen[sid] = time.time()
     offered = ws.scope.get("subprotocols") or []
     accept_sub = "binary" if "binary" in offered else None
     await ws.accept(subprotocol=accept_sub)
@@ -13050,6 +13556,9 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
             await ws.close()
         except Exception:
             pass
+    finally:
+        _live_viewers[sid] = max(0, _live_viewers.get(sid, 1) - 1)
+        _live_last_seen[sid] = time.time()
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
@@ -16318,13 +16827,16 @@ body.member-admin .more-member-only{display:none}
 .key-saved-v{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .key-saved-copy{margin-left:auto;flex-shrink:0;padding:1px 8px;font-size:.62rem;color:#8b949e;background:#21262d;border:1px solid #30363d;border-radius:4px;cursor:pointer}
 .key-saved-copy:hover{background:#30363d;color:#f0f6fc}
-.key-btn.key-toggle{font-size:.65rem;padding:3px 8px}
-.key-btn.key-toggle.off{background:#da3633;border-color:#da3633;color:#fff}
 .drop-zone{width:100%;margin-top:4px;padding:12px;border:2px dashed #30363d;border-radius:6px;text-align:center;color:#6e7681;font-size:.72rem;cursor:pointer;transition:all .2s;background:transparent}
 .drop-zone:hover{border-color:#58a6ff;color:#8b949e;background:#58a6ff08}
 .drop-zone.drag-over{border-color:#58a6ff;background:#58a6ff15;color:#58a6ff}
 .drop-zone-icon{font-size:1.2rem;margin-bottom:2px;pointer-events:none}
 .drop-zone-text{pointer-events:none}
+/* Overlay drawn over the whole session pane while files are dragged over it.
+   Fixed + pointer-events:none so it never touches layout or steals the drop. */
+#pane-drop-cue{position:fixed;z-index:9000;display:none;pointer-events:none;border:2px dashed #58a6ff;border-radius:8px;background:#58a6ff10;align-items:flex-start;justify-content:center}
+#pane-drop-cue.visible{display:flex}
+#pane-drop-cue span{margin-top:12px;background:#1f6feb;color:#fff;font-size:.72rem;font-weight:600;padding:5px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.5)}
 .upload-progress{width:100%;margin-top:6px;display:none}
 .upload-progress.active{display:block}
 .upload-progress-filename{font-size:.68rem;color:#8b949e;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -16751,8 +17263,19 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-dot.on{background:#3fb950;box-shadow:0 0 6px #3fb95088}
 .bs-dot.off{background:#6e7681}
 .bs-preview{aspect-ratio:16/9;background:#010409;border-top:1px solid #21262d;border-bottom:1px solid #21262d;position:relative}
-.bs-preview iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
-.bs-off{display:flex;align-items:center;justify-content:center;height:100%;color:#6e7681;font-size:.8rem}
+/* A still, not a stream. See renderBrowserTab() for why. */
+.bs-preview img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:top center;display:block}
+.bs-shotmeta{display:flex;gap:6px;align-items:center;padding:5px 10px;font-size:.66rem;color:#6e7681;border-bottom:1px solid #21262d;background:#0b1017}
+.bs-shotmeta .bs-shoturl{color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bs-shotmeta .bs-shotage{margin-left:auto;flex:0 0 auto}
+.bs-off{display:flex;align-items:center;justify-content:center;height:100%;color:#6e7681;font-size:.8rem;text-align:center;padding:0 12px;line-height:1.5}
+.bs-hist{padding:8px 10px;border-bottom:1px solid #21262d;background:#0b1017;max-height:230px;overflow-y:auto}
+.bs-hist-row{display:flex;gap:8px;align-items:flex-start;padding:4px 0;font-size:.7rem;color:#8b949e;border-bottom:1px solid #161b22}
+.bs-hist-row:last-child{border-bottom:0}
+.bs-hist-row img{width:64px;height:36px;object-fit:cover;object-position:top center;border:1px solid #21262d;border-radius:3px;cursor:pointer;flex:0 0 auto;background:#010409}
+.bs-hist-when{color:#6e7681;font-family:'SF Mono','Fira Code',Consolas,monospace;flex:0 0 auto}
+.bs-hist-what{color:#c9d1d9;min-width:0}
+.bs-hist-what span{color:#6e7681;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bs-actions{display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap}
 .bs-notes{padding:8px 10px;font-size:.76rem;color:#c9d1d9;white-space:pre-wrap;word-break:break-word;border-bottom:1px solid #21262d;background:#0b1017}
 .bs-notes.empty{color:#6e7681;font-style:italic}
@@ -18814,6 +19337,81 @@ function handleDrop(event,name,tab){
   uploadFile(name,{files:files});
 }
 
+// ── Pane-wide drag & drop ──
+// The dashed drop zone lives at the bottom of the Keys & Commands drawer, so
+// reaching it means scrolling past the terminal. These document-level listeners
+// make the whole session pane (terminal, composer, chat log, drawer) take a
+// file drop and route it to the same uploader. Nothing changes at rest: the
+// outline and hint exist only while files are being dragged over the pane.
+// Dropping a file anywhere else in the window is swallowed too, otherwise the
+// browser navigates to it and the dashboard state is lost.
+let _paneDropHideTimer=null;
+function _dragHasFiles(e){
+  const dt=e.dataTransfer;
+  if(!dt)return false;
+  if(dt.types&&Array.prototype.indexOf.call(dt.types,'Files')>=0)return true;
+  return !!(dt.files&&dt.files.length);
+}
+function _dropEl(e){
+  return (e.target&&e.target.nodeType===1)?e.target:null;
+}
+// The pane that owns the drop: the visible tab of the selected session. Skills
+// and Info have nothing to upload to, so they opt out.
+function _paneDropTarget(){
+  if(!selectedSession)return null;
+  const tab=activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw');
+  if(tab!=='raw'&&tab!=='chat')return null;
+  const el=document.getElementById('tab-'+tab+'-'+selectedSession);
+  return el?{name:selectedSession,tab:tab,el:el}:null;
+}
+function _showPaneDropCue(el){
+  let cue=document.getElementById('pane-drop-cue');
+  if(!cue){
+    cue=document.createElement('div');
+    cue.id='pane-drop-cue';
+    cue.innerHTML='<span>Drop files to upload</span>';
+    document.body.appendChild(cue);
+  }
+  const r=el.getBoundingClientRect();
+  cue.style.left=r.left+'px';cue.style.top=r.top+'px';
+  cue.style.width=r.width+'px';cue.style.height=r.height+'px';
+  cue.classList.add('visible');
+  // dragleave fires on every child boundary, so pairing enter/leave flickers.
+  // Expire on silence instead: dragover repeats while the drag is live.
+  clearTimeout(_paneDropHideTimer);
+  _paneDropHideTimer=setTimeout(_hidePaneDropCue,300);
+}
+function _hidePaneDropCue(){
+  clearTimeout(_paneDropHideTimer);
+  const cue=document.getElementById('pane-drop-cue');
+  if(cue)cue.classList.remove('visible');
+}
+document.addEventListener('dragover',e=>{
+  if(!_dragHasFiles(e))return;   // column reordering etc. drags no files, leave it alone
+  const el=_dropEl(e);
+  if(el&&el.closest('input[type=file]'))return;
+  e.preventDefault();            // also stops the browser opening files dropped anywhere else
+  if(e.dataTransfer)e.dataTransfer.dropEffect='copy';
+  const t=_paneDropTarget();
+  if(!t||!el||!mainEl.contains(el)){_hidePaneDropCue();return}
+  // The dashed zone lights itself up; two cues at once looks broken.
+  if(el.closest('.drop-zone,.upload-drop'))_hidePaneDropCue();
+  else _showPaneDropCue(t.el);
+});
+document.addEventListener('drop',e=>{
+  if(!_dragHasFiles(e))return;
+  const el=_dropEl(e);
+  if(el&&el.closest('input[type=file]'))return;
+  e.preventDefault();
+  _hidePaneDropCue();
+  if(!el||!mainEl.contains(el))return;
+  if(el.closest('.drop-zone,.upload-drop'))return;  // its own ondrop already uploaded it
+  const t=_paneDropTarget();
+  if(t)handleDrop(e,t.name,t.tab);
+});
+document.addEventListener('dragleave',e=>{if(!e.relatedTarget)_hidePaneDropCue()});
+document.addEventListener('dragend',_hidePaneDropCue);
+
 async function sendCmd(name,source){
   const inputId='cmd-'+source+'-'+name;
   const input=document.getElementById(inputId);
@@ -19736,24 +20334,9 @@ async function sendRawKeys(name,keys){
   }catch(e){console.error('Failed to send keys:',e)}
 }
 
-// ── Bracketed Paste Toggle ──
-// Tracks per-session state. Default is ON (true). Click toggles.
-let _bracketedPaste={};
-async function toggleBracketedPaste(name,btn){
-  if(!(name in _bracketedPaste))_bracketedPaste[name]=true;
-  _bracketedPaste[name]=!_bracketedPaste[name];
-  const enabled=_bracketedPaste[name];
-  try{
-    await fetch(BASE+'/api/sessions/'+name+'/bracketed-paste',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:enabled})
-    });
-  }catch(e){console.error('Bracketed paste toggle failed:',e)}
-  if(btn){
-    btn.textContent='Paste Mode: '+(enabled?'ON':'OFF');
-    btn.classList.toggle('off',!enabled);
-  }
-}
+// The Paste Mode toggle that used to live in the key bar is gone; sessions keep
+// tmux's default (bracketed paste ON). POST /api/sessions/{name}/bracketed-paste
+// still flips it for anyone driving the dashboard over its API.
 
 // ── Auth Mode Toggle ──
 async function setAuthMode(name,mode){
@@ -19973,8 +20556,6 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model sonnet')" title="Switch to Sonnet">/model sonnet</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model opus')" title="Switch to Opus">/model opus</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
     <span class="key-bar-sep"></span>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
@@ -20978,7 +21559,17 @@ function renderBrowserTab(data){
     const status = s.running ? 'running' : 'stopped';
     const editing = _bsEditId === s.id;
     const openBtns =
-      '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
+      '<button class="btn" onclick="openBrowserSession(\''+id+'\')"'+
+        ' title="Start the VNC stream if it is not up and open it in a new tab. The stream'+
+        ' stops on its own once nobody is watching.">View live&nbsp;↗</button>'+
+      (s.live_running? ' <button class="btn btn-ghost" onclick="stopBrowserLive(\''+id+'\')"'+
+        ' title="Stop the VNC stream now. The browser, its tabs and anything driving it'+
+        ' carry on untouched.">Stop stream</button>':'')+
+      ' <button class="btn btn-ghost" onclick="refreshBrowserShot(\''+id+'\')"'+
+        ' title="Capture a fresh screenshot over CDP.">Refresh shot</button>'+
+      ' <button class="btn btn-ghost" onclick="toggleBrowserHistory(\''+id+'\')"'+
+        ' title="What this browser has been doing: navigations, tab changes, park/freeze,'+
+        ' with the screenshot taken at the time.">History</button>'+
       (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'')+
       (s.running? ' <button class="btn btn-ghost" onclick="freezeBrowser(\''+id+'\')"'+
         ' title="Suspend this browser\'s background tabs so they stop rendering. Reversible —'+
@@ -20988,9 +21579,25 @@ function renderBrowserTab(data){
         ' claude.ai session, extension state — is untouched, so nothing signs in again.">Park</button>':'');
     const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
     const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
-    const preview = s.running
-      ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
-      : '<div class="bs-off">Session stopped</div>';
+    // A still, never a stream. The card used to hold a live noVNC <iframe> per
+    // browser, which is a full VNC session rendered for as long as this tab is
+    // open (~2% of a core each, measured, around the clock) for a picture
+    // nobody is watching. The thumbnail is captured over CDP at most once a
+    // minute while the browser is actually doing something.
+    const shotSrc = BASE+'/api/browser/shot/'+encodeURIComponent(s.id)+'/latest?v='+(s.shot_at||0);
+    const preview = !s.running
+      ? '<div class="bs-off">Browser stopped</div>'
+      : (s.shot_at
+          ? '<img src="'+esc(shotSrc)+'" alt="Last screenshot of '+esc(s.name)+'" loading="lazy"'+
+            ' onclick="openBrowserSession(\''+id+'\')" style="cursor:pointer"'+
+            ' title="Click to watch it live">'
+          : '<div class="bs-off">No screenshot yet.<br>Taken automatically while this browser is in use.</div>');
+    const shotMeta = (s.running && s.shot_at)
+      ? '<div class="bs-shotmeta"><span class="bs-shoturl">'+
+          esc(_bsHost(s.last_url)||'-')+(s.tabs?' · '+s.tabs+' tab'+(s.tabs===1?'':'s'):'')+
+        '</span><span class="bs-shotage">'+_bsAgo(s.shot_at)+'</span></div>'
+      : '';
+    const histBlock = (_bsHistOpen===s.id) ? renderBrowserHistory(s.id) : '';
     const notes = (s.notes||'').trim();
     const notesBlock = notes
       ? '<div class="bs-notes">'+esc(notes)+'</div>'
@@ -21038,6 +21645,15 @@ function renderBrowserTab(data){
     if(a.parked_ago!=null && !a.rendering){
       badges += '<span class="bs-badge">parked '+(a.parked_ago<90?a.parked_ago+'s':Math.round(a.parked_ago/60)+'m')+' ago</span>';
     }
+    // Whether an unwatched VNC stream is allowed to keep running. Off for the
+    // main browser by default: rotem.ai/browsertool proxies straight to its
+    // noVNC from another VM, and this dashboard cannot see those viewers.
+    badges += '<span class="bs-badge'+(s.live_autostop?'':' warn')+'" style="cursor:pointer" '+
+      'onclick="toggleLiveAutostop(\''+id+'\','+(s.live_autostop?'false':'true')+')" '+
+      'title="When on, the VNC stream stops by itself once nobody has watched it for a few '+
+      'minutes. Turn it off only for a browser reached through some other viewer this '+
+      'dashboard cannot count, like rotem.ai/browsertool.">'+
+      (s.live_autostop?'stream auto-stop on':'stream auto-stop off')+'</span>';
     // What this browser looks like from outside: its own exit IP + what it has
     // spent of the (per-GB billed) residential quota.
     const px = ((_bsProxy&&_bsProxy.browsers)||[]).find(x=>x.id===s.id) || null;
@@ -21053,7 +21669,7 @@ function renderBrowserTab(data){
       }
       if(px.bytes) badges += '<span class="bs-badge">'+_fmtBytes(px.bytes)+' used</span>';
     }else if(px && _bsProxy && _bsProxy.installed && !_bsProxy.enabled){
-      badges += '<span class="bs-badge warn">direct — no proxy</span>';
+      badges += '<span class="bs-badge warn">direct, no proxy</span>';
     }
     const badgeRow = badges ? '<div class="bs-badges">'+badges+'</div>' : '';
     const fp = _bsFp[s.id];
@@ -21071,13 +21687,18 @@ function renderBrowserTab(data){
             '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
           '</div>'+
         '</div>'
-      : '<div class="bs-preview">'+preview+'</div>'+badgeRow+fpBlock+notesBlock;
+      : '<div class="bs-preview">'+preview+'</div>'+shotMeta+histBlock+badgeRow+fpBlock+notesBlock;
     const fpBtn = s.running ? ' <button class="btn btn-ghost" onclick="checkBrowserFingerprint(\''+id+'\')">Fingerprint</button>' : '';
     const ipBtn = (_bsProxy&&_bsProxy.enabled)
       ? ' <button class="btn btn-ghost" onclick="rotateBrowserIp(\''+id+'\')">New IP</button>' : '';
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
-        '<span class="bs-meta">'+status+' · display :'+s.display+' · CDP '+s.cdp_port+(s.managed?'':' · systemd')+'</span></div>'+
+        '<span class="bs-meta">'+status+' · headed, display :'+s.display+' · CDP '+s.cdp_port+
+        (s.live_running? ' · <b title="A VNC stream is running'+
+          (s.live_viewers? ' with '+s.live_viewers+' viewer'+(s.live_viewers===1?'':'s'):
+           ', with nobody watching'+(s.live_autostop?', it will stop itself shortly':''))+
+          '">live '+(s.live_viewers||0)+'&#128065;</b>' : ' · no stream')+
+        (s.managed?'':' · systemd')+'</span></div>'+
       body+
       '<div class="bs-actions">'+openBtns+editBtn+fpBtn+ipBtn+rm+'</div>'+
     '</div>';
@@ -21087,7 +21708,11 @@ function renderBrowserTab(data){
     : '<div class="bs-add"><input id="bs-new-name" placeholder="New session name (optional)"><button class="btn btn-primary" onclick="createBrowserSession()">+ New browser session</button></div>';
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
-      '<div class="pf-banner">Independent browsers you (or Claude) can drive. <b>Open ↗</b> launches the live view in a new tab; the preview below is live too. Extra sessions run their own Chrome + noVNC on this server, proxied here so they work same-origin.</div>'+
+      '<div class="pf-banner">Independent browsers you (or Claude) can drive. Each card shows the '+
+        '<b>last screenshot</b>, not a live stream: shots are taken over the browser\'s own control '+
+        'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
+        'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
+        'once nobody is watching. <b>History</b> is the audit trail.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -21314,10 +21939,113 @@ async function checkBrowserFingerprint(id){
 
 function _bsFind(id){ return (_browserSessions||[]).find(x=>x.id===id); }
 
-function openBrowserSession(id){
+// ── Still thumbnails, live view on demand, audit history ──
+// The rule this implements: the dashboard never streams. It shows a screenshot
+// and, if you ask to watch, opens the stream in its own tab, which is also
+// where it stops, because the stream lives exactly as long as a viewer does.
+let _bsHistOpen = null;      // browser id whose history is expanded
+const _bsHist = {};          // id -> activity rows
+
+function _bsAgo(ts){
+  if(!ts) return '';
+  const d = Math.max(0, Date.now()/1000 - ts);
+  if(d < 60) return Math.round(d)+'s ago';
+  if(d < 3600) return Math.round(d/60)+'m ago';
+  if(d < 86400) return Math.round(d/3600)+'h ago';
+  return Math.round(d/86400)+'d ago';
+}
+
+function _bsHost(url){
+  const m = /^[a-z]+:\/\/([^/:?#]+)/i.exec(url||'');
+  return m ? m[1] : (url||'').slice(0, 40);
+}
+
+// Open the live view: start the stream first (it is normally not running), then
+// open the viewer tab. Opening the tab first would race the bridge coming up.
+async function openBrowserSession(id){
   const s=_bsFind(id);
   if(!s) return;
+  if(!s.live_running){
+    showToast('Starting the live stream…');
+    try{
+      const r = await fetch(BASE+'/api/browser/live/'+encodeURIComponent(id),{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({start:true})});
+      const d = await r.json();
+      if(!r.ok || !d.ok) throw new Error(d.error||'could not start the stream');
+    }catch(e){ showToast('Live view failed: '+(e.message||e)); return; }
+  }
   window.open(s.viewer_url, '_blank');
+  loadBrowserTab();
+}
+
+async function stopBrowserLive(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/live/'+encodeURIComponent(id),{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({start:false})});
+    const d = await r.json();
+    if(!r.ok || !d.ok) throw new Error(d.error||'could not stop the stream');
+    showToast('Stream stopped. The browser is still running.');
+  }catch(e){ showToast('Could not stop the stream: '+(e.message||e)); }
+  loadBrowserTab();
+}
+
+async function refreshBrowserShot(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/shot/'+encodeURIComponent(id),{method:'POST'});
+    const d = await r.json();
+    if(!r.ok || !d.ok) throw new Error(d.error||'capture failed');
+  }catch(e){ showToast('Screenshot failed: '+(e.message||e)); }
+  if(_bsHistOpen===id) await loadBrowserHistory(id);
+  loadBrowserTab();
+}
+
+async function toggleLiveAutostop(id, enabled){
+  try{
+    const r = await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({live_autostop: enabled})});
+    if(!r.ok) throw new Error((await r.json()).error||'failed');
+    showToast(enabled? 'This stream will stop itself when nobody is watching.'
+                     : 'This stream will be left running. Stop it by hand when you are done.');
+  }catch(e){ showToast('Could not change it: '+(e.message||e)); }
+  loadBrowserTab();
+}
+
+async function loadBrowserHistory(id){
+  try{
+    const r = await fetch(BASE+'/api/browser/activity?limit=40&sid='+encodeURIComponent(id));
+    const d = await r.json();
+    _bsHist[id] = d.activity||[];
+  }catch(e){ _bsHist[id] = []; }
+}
+
+async function toggleBrowserHistory(id){
+  if(_bsHistOpen===id){ _bsHistOpen=null; renderBrowserTab(_bsData||{}); return; }
+  _bsHistOpen=id;
+  await loadBrowserHistory(id);
+  renderBrowserTab(_bsData||{});
+}
+
+function renderBrowserHistory(id){
+  const rows = _bsHist[id];
+  if(!rows) return '<div class="bs-hist"><div class="bs-hist-row">Loading…</div></div>';
+  if(!rows.length) return '<div class="bs-hist"><div class="bs-hist-row">Nothing recorded yet. '+
+    'The trail fills while this browser is in use.</div></div>';
+  const base = BASE+'/api/browser/shot/'+encodeURIComponent(id)+'/';
+  return '<div class="bs-hist">'+rows.map(r=>{
+    const when = new Date((r.ts||0)*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const who = (r.agents||[]).length ? ' · '+esc((r.agents||[]).join(', ')) : '';
+    const thumb = r.shot
+      ? '<img src="'+esc(base+encodeURIComponent(r.shot))+'" loading="lazy" alt="" '+
+        'onclick="window.open(this.src,\'_blank\')" title="Open full size">'
+      : '<img alt="" style="visibility:hidden">';
+    return '<div class="bs-hist-row">'+thumb+
+      '<span class="bs-hist-when">'+esc(when)+'</span>'+
+      '<span class="bs-hist-what">'+esc(r.event||'')+who+
+        '<span>'+esc(r.url||'')+'</span></span></div>';
+  }).join('')+'</div>';
 }
 
 function openBrowserDirect(id){
