@@ -21965,6 +21965,10 @@ function _bsHost(url){
 async function openBrowserSession(id){
   const s=_bsFind(id);
   if(!s) return;
+  // Not every card is a VNC-backed Chrome. The Android device viewers (builder)
+  // proxy an adb screen over plain HTTP: there is no stream to start, and the
+  // live endpoint would 404 on an id that is not a browser session.
+  if(s.kind && s.kind !== 'browser'){ window.open(s.viewer_url, '_blank'); return; }
   if(!s.live_running){
     showToast('Starting the live stream…');
     try{
