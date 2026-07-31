@@ -4492,6 +4492,49 @@ NOTES_TTL = 600        # 10 minutes
 # also shown so a crashed/exited Codex session can be restarted from the UI.
 _CODEX_DASH_VISIBILITY_CACHE: dict[str, tuple] = {}
 _CODEX_DASH_VISIBILITY_TTL = 5.0
+_PROCESS_TREE_CACHE: tuple[float, dict[str, list[str]], dict[str, str]] | None = None
+_PROCESS_TREE_TTL = 2.0
+
+
+def _process_tree_snapshot() -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Return the process tree from one ``ps`` call, briefly cached.
+
+    The dashboard used to run ``pgrep -P`` once per descendant for every tmux
+    session. On a busy builder that meant hundreds of full /proc scans while
+    handling a single request. Build the same tree once and walk it in memory.
+    """
+    global _PROCESS_TREE_CACHE
+    now = time.monotonic()
+    cached = _PROCESS_TREE_CACHE
+    if cached and now - cached[0] < _PROCESS_TREE_TTL:
+        return cached[1], cached[2]
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("ps failed")
+        children: dict[str, list[str]] = {}
+        commands: dict[str, str] = {}
+        for line in (result.stdout or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            pid, parent_pid, command = parts
+            commands[pid] = command.lower()
+            children.setdefault(parent_pid, []).append(pid)
+        _PROCESS_TREE_CACHE = (now, children, commands)
+        return children, commands
+    except Exception:
+        # A stale snapshot is safer than hiding all live Codex sessions because
+        # of one transient process-table failure.
+        if cached:
+            return cached[1], cached[2]
+        return {}, {}
 
 
 def _session_is_codex(name: str) -> bool:
@@ -4507,54 +4550,35 @@ def _session_is_codex(name: str) -> bool:
         return cached[0]
     try:
         pp = subprocess.run(
-            ["tmux", "display-message", "-t", name, "-p", "#{pane_pid}"],
+            [
+                "tmux", "display-message", "-t", name, "-p",
+                "#{pane_pid}\t#{pane_current_command}",
+            ],
             capture_output=True, text=True, timeout=3,
         )
         if pp.returncode != 0:
             _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
-        pane_pid = (pp.stdout or "").strip()
+        pane_pid, _, pane_command = (pp.stdout or "").strip().partition("\t")
         if not pane_pid.isdigit():
             _CODEX_DASH_VISIBILITY_CACHE[name] = (False, now)
             return False
+        children, commands = _process_tree_snapshot()
         to_check = [pane_pid]
-        seen = {pane_pid}
-        descendants = []
-        for _ in range(50):
-            if not to_check:
-                break
-            current = to_check.pop(0)
-            try:
-                child_res = subprocess.run(
-                    ["pgrep", "-P", current],
-                    capture_output=True, text=True, timeout=2,
-                )
-            except Exception:
-                continue
-            for pid in (child_res.stdout or "").strip().split():
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    descendants.append(pid)
-                    to_check.append(pid)
+        seen: set[str] = set()
         has_codex = False
-        for pid in descendants:
-            try:
-                with open(f"/proc/{pid}/comm") as f:
-                    comm = f.read().strip().lower()
-            except Exception:
+        while to_check and len(seen) < 10000:
+            current = to_check.pop()
+            if current in seen:
                 continue
-            if comm == "codex":
+            seen.add(current)
+            if commands.get(current) == "codex":
                 has_codex = True
                 break
-        if has_codex:
-            decision = True
-        else:
-            cmd_res = subprocess.run(
-                ["tmux", "display-message", "-t", name, "-p", "#{pane_current_command}"],
-                capture_output=True, text=True, timeout=2,
-            )
-            cmd = (cmd_res.stdout or "").strip().lower() if cmd_res.returncode == 0 else ""
-            decision = cmd in {"bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh"}
+            to_check.extend(children.get(current, ()))
+        decision = has_codex or pane_command.lower() in {
+            "bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh",
+        }
     except Exception:
         decision = False
     _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
@@ -15261,7 +15285,7 @@ let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,inFlight:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
 
 // --- "Hide Bash/Fetch" filter ---
 function getHideBashPref(){
@@ -16666,6 +16690,8 @@ async function pollRawDelta(name){
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
   if(!rawEl)return;
+  if(st.inFlight)return;
+  st.inFlight=true;
   _ensureRawScrollTracking(rawEl,st);
   try{
     const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'');
@@ -16720,6 +16746,7 @@ async function pollRawDelta(name){
       }
     }
   }catch(e){}
+  finally{st.inFlight=false}
 }
 
 async function loadRaw(name){

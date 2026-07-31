@@ -532,6 +532,55 @@ class TestGetTmuxSessions:
         assert sessions[0]["name"] == "my"
 
 
+class TestSessionVisibility:
+    """The hot path must inspect the process table once, not once per child."""
+
+    @patch("app.subprocess.run")
+    def test_one_process_snapshot_serves_multiple_sessions(self, mock_run):
+        import app
+
+        app._CODEX_DASH_VISIBILITY_CACHE.clear()
+        app._PROCESS_TREE_CACHE = None
+
+        def fake_run(command, **_kwargs):
+            if command[0] == "ps":
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "100 1 bash\n"
+                        "101 100 node\n"
+                        "102 101 codex\n"
+                        "200 1 bash\n"
+                        "201 200 codex\n"
+                    ),
+                )
+            if command[0] == "tmux":
+                session = command[3]
+                pane = {"first": "100\tnode\n", "second": "200\tbash\n"}[session]
+                return MagicMock(returncode=0, stdout=pane)
+            raise AssertionError(f"unexpected subprocess: {command}")
+
+        mock_run.side_effect = fake_run
+
+        assert app._session_is_codex("first") is True
+        assert app._session_is_codex("second") is True
+
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert sum(command[0] == "ps" for command in commands) == 1
+        assert all(command[0] != "pgrep" for command in commands)
+
+        app._CODEX_DASH_VISIBILITY_CACHE.clear()
+        app._PROCESS_TREE_CACHE = None
+
+    def test_raw_polling_does_not_overlap_requests(self):
+        import app
+
+        assert "inFlight:false" in app.HTML_PAGE
+        assert "if(st.inFlight)return;" in app.HTML_PAGE
+        assert "st.inFlight=true;" in app.HTML_PAGE
+        assert "finally{st.inFlight=false}" in app.HTML_PAGE
+
+
 # ─── get_pane_position Tests ───
 
 
