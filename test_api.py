@@ -2612,29 +2612,28 @@ class TestIsCodexRunning:
     """A pane counts as active only when one of its descendants is Codex."""
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/codex\0")
-    @patch("pathlib.Path.read_text", return_value="codex\n")
-    def test_returns_true_for_codex_descendant(self, mock_text, mock_bytes, mock_run):
+    @patch(
+        "app._process_tree_snapshot",
+        return_value=({"100": ["101"]}, {"100": "bash", "101": "codex"}),
+    )
+    def test_returns_true_for_codex_descendant(self, mock_snapshot, mock_run):
         import app as _app
 
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
-        ]
+        mock_run.return_value = MagicMock(returncode=0, stdout="100\n", stderr="")
         assert _app._is_codex_running("test-session") is True
+        mock_snapshot.assert_called_once()
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/node\0server.js\0")
-    @patch("pathlib.Path.read_text", return_value="node\n")
-    def test_returns_false_for_unrelated_node_descendant(self, mock_text, mock_bytes, mock_run):
+    @patch(
+        "app._process_tree_snapshot",
+        return_value=({"100": ["101"]}, {"100": "bash", "101": "node"}),
+    )
+    def test_returns_false_for_unrelated_node_descendant(self, mock_snapshot, mock_run):
         import app as _app
 
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
-            MagicMock(returncode=1, stdout="", stderr=""),
-        ]
+        mock_run.return_value = MagicMock(returncode=0, stdout="100\n", stderr="")
         assert _app._is_codex_running("test-session") is False
+        mock_snapshot.assert_called_once()
 
     @patch("app.subprocess.run")
     def test_returns_false_on_nonzero_returncode(self, mock_run):

@@ -572,13 +572,37 @@ class TestSessionVisibility:
         app._CODEX_DASH_VISIBILITY_CACHE.clear()
         app._PROCESS_TREE_CACHE = None
 
-    def test_raw_polling_does_not_overlap_requests(self):
+    def test_raw_terminal_uses_one_websocket_and_pauses_when_hidden(self):
         import app
 
-        assert "inFlight:false" in app.HTML_PAGE
-        assert "if(st.inFlight)return;" in app.HTML_PAGE
-        assert "st.inFlight=true;" in app.HTML_PAGE
-        assert "finally{st.inFlight=false}" in app.HTML_PAGE
+        assert "new WebSocket(" in app.HTML_PAGE
+        assert "/ws/sessions/" in app.HTML_PAGE
+        assert "document.hidden" in app.HTML_PAGE
+        assert "setInterval(()=>pollRawDelta" not in app.HTML_PAGE
+        assert "raw-tail?known_lines=" not in app.HTML_PAGE
+
+    def test_browser_mcp_migration_preserves_unrelated_tables(self, tmp_path):
+        import app
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model = "test"\n\n'
+            "[mcp_servers.playwright-browser]\n"
+            'command = "node"\n'
+            'args = ["old-direct-cdp"]\n\n'
+            "[mcp_servers.google]\n"
+            'command = "python"\n\n'
+            "[mcp_servers.google.env]\n"
+            'TOKEN = "preserve-me"\n'
+        )
+        with patch("app._backup_before_dashboard_write"):
+            assert app._ensure_browser_mcp(tmp_path) is True
+        migrated = config.read_text()
+        assert "BEGIN GRABO PLAYWRIGHT MCP" in migrated
+        assert "browser_mcp_lease_proxy.py" in migrated
+        assert "old-direct-cdp" not in migrated
+        assert '[mcp_servers.google]\ncommand = "python"' in migrated
+        assert 'TOKEN = "preserve-me"' in migrated
 
 
 # ─── get_pane_position Tests ───
