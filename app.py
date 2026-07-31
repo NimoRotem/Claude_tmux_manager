@@ -239,7 +239,7 @@ def _session_launch_base(session_name: str = "", user: dict | None = None) -> st
     """Use a sandboxed launch for team members; admins keep the configured command."""
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
-        if TEAM_MODE and owner and not _is_admin(owner):
+        if _multi_tenant_enabled() and owner and not _is_admin(owner):
             return "codex --sandbox workspace-write --ask-for-approval never"
     except Exception:
         pass
@@ -638,7 +638,7 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
         try:
-            if TEAM_MODE:
+            if _multi_tenant_enabled():
                 _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
                 if _owner and not _is_admin(_owner):
                     _apply_member_auth(_user_codex_config_dir(_owner))
@@ -728,7 +728,7 @@ async def lifespan(_app: FastAPI):
         yield
         return
 
-    if TEAM_MODE:
+    if _multi_tenant_enabled():
         try:
             _setup_shared_git_config()
             logger.info("Team mode: shared git config applied")
@@ -739,8 +739,14 @@ async def lifespan(_app: FastAPI):
         if not member:
             continue
         config_dir = _user_codex_config_dir(member)
+        if _multi_tenant_enabled() and not _is_admin(member):
+            # Self-heal the full tenant config on startup, including global and
+            # group instructions. Previously only the browser MCP was repaired,
+            # so a host that accidentally omitted TEAM_MODE never received the
+            # admin's shared policy until that user was edited or recreated.
+            _ensure_user_codex_config_dir(member)
         if (config_dir / "config.toml").exists():
-            synced_browser_mcp += int(_ensure_browser_mcp(config_dir))
+            synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
     logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
@@ -979,6 +985,23 @@ def _is_admin(user: dict | None) -> bool:
     return bool(user) and user.get("role") == "admin"
 
 
+def _multi_tenant_enabled() -> bool:
+    """Enable tenant behavior whenever real member accounts exist.
+
+    Older deployments relied only on ``TMUX_DASH_TEAM_MODE``. That made a
+    multi-user users.json silently run with the single-user security/UI policy
+    when the environment flag was omitted. The explicit flag remains useful
+    for provisioning a fresh team host, while persisted non-admin accounts are
+    now sufficient to keep tenant isolation enabled after every restart.
+    """
+    if TEAM_MODE:
+        return True
+    try:
+        return any(not _is_admin(user) for user in _load_users())
+    except Exception:
+        return False
+
+
 # Initialize the users store on import so the admin always exists.
 try:
     _load_users()
@@ -1066,7 +1089,7 @@ def _ensure_user_codex_config_dir(user: dict):
     # Team mode: shared Codex auth, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
-    if TEAM_MODE:
+    if _multi_tenant_enabled():
         try:
             _apply_member_auth(d)
             _sync_global_context_into(codex_md)
@@ -1074,7 +1097,7 @@ def _ensure_user_codex_config_dir(user: dict):
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
-            _ensure_browser_mcp(d)
+            _ensure_browser_mcp(d, user)
             _set_team_model_effort(d)
             _sync_git_rules_into(codex_md)
         except Exception:
@@ -1088,31 +1111,21 @@ _ensure_user_claude_config_dir = _ensure_user_codex_config_dir
 
 # --- Session ownership ---
 SESSION_OWNERS_FILE = MESSAGES_DIR / "session_owners.json"
-_session_owners_cache: dict[str, str] | None = None
 
 
 def _load_session_owners() -> dict[str, str]:
-    global _session_owners_cache
-    if _session_owners_cache is not None:
-        return _session_owners_cache
+    """Read the ownership map fresh under a cross-process shared lock.
+
+    API workers and the controller are separate processes. The old permanent
+    in-process cache could therefore keep stale owners indefinitely and its
+    read/modify/write updates could overwrite another worker's assignment.
+    """
     try:
-        if SESSION_OWNERS_FILE.exists():
-            data = json.loads(SESSION_OWNERS_FILE.read_text())
-            if isinstance(data, dict):
-                _session_owners_cache = {str(k): str(v) for k, v in data.items()}
-                return _session_owners_cache
+        data = LockedJsonStore(SESSION_OWNERS_FILE, dict).read()
+        return {str(k): str(v) for k, v in data.items()}
     except Exception:
         logger.debug("Failed to load session owners", exc_info=True)
-    _session_owners_cache = {}
-    return _session_owners_cache
-
-
-def _save_session_owners():
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        SESSION_OWNERS_FILE.write_text(json.dumps(_load_session_owners(), indent=2))
-    except Exception:
-        logger.debug("Failed to save session owners", exc_info=True)
+    return {}
 
 
 def _session_owner_id(session_name: str) -> str:
@@ -1123,16 +1136,17 @@ def _session_owner_id(session_name: str) -> str:
 
 
 def _set_session_owner(session_name: str, user_id: str):
-    owners = _load_session_owners()
-    owners[session_name] = user_id
-    _save_session_owners()
+    def mutate(owners: dict):
+        owners[str(session_name)] = str(user_id)
+
+    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _clear_session_owner(session_name: str):
-    owners = _load_session_owners()
-    if session_name in owners:
-        owners.pop(session_name, None)
-        _save_session_owners()
+    def mutate(owners: dict):
+        owners.pop(str(session_name), None)
+
+    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _user_for_session(session_name: str) -> dict | None:
@@ -1283,11 +1297,30 @@ _SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)(?:/.*)?$")
 
 
 _ADMIN_ONLY_PREFIXES = (
+    "/qa-output",
+    "/api/admin",
     "/api/profiles",
     "/api/skill-library",
+    "/api/context-files",
+    "/api/global-context",
     "/api/global-codex",
     "/api/global",
     "/api/all-sessions",
+    "/api/stats",
+    "/api/login-health",
+    "/api/auto-respond-log",
+    "/api/browser",
+    "/api/auth/status",
+    "/api/auth/token",
+    "/api/auth/setup",
+    "/api/auth/chatgpt",
+    "/api/auth/api-key",
+    "/api/auth/logout",
+    "/api/auth/codex-status",
+    "/api/auth/claude-status",
+    "/api/auth/usage",
+    "/api/usage/limits",
+    "/api/models/refresh",
 )
 
 
@@ -1296,8 +1329,10 @@ async def session_ownership_middleware(request: Request, call_next):
     """Block per-session API calls when the caller doesn't own the session
     and reject admin-only routes for non-admin users.
 
-    Admins always pass. Sessions with no recorded owner default to admin, so
-    legacy sessions stay accessible by the admin without migration.
+    Admins always pass individual-session checks. Session list endpoints still
+    default them to their own sessions; ``scope=all`` enables the explicit
+    operational view. Sessions with no recorded owner default to admin so
+    legacy sessions stay with the built-in account.
     """
     if not AUTH_PASS:
         return await call_next(request)
@@ -1345,9 +1380,6 @@ async def auth_middleware(request: Request, call_next):
     # fallback (auth_request only treats a real 2xx as authenticated).
     if path.endswith("/api/auth/verify"):
         return await call_next(request)
-    # Allow qa-output files without auth
-    if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
-        return await call_next(request)
     # Sandbox guard hook calls this from localhost with no cookie (it checks the
     # client host itself). OAuth callback self-verifies a signed state param and
     # must work even when the cross-site redirect from Google drops the cookie.
@@ -1361,7 +1393,7 @@ async def auth_middleware(request: Request, call_next):
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
     if _is_public_project_request(rel_path):
         return await call_next(request)
-    token = request.cookies.get("tmux_auth")
+    token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
         resp = HTMLResponse(_login_page())
         return _apply_security_headers(request, resp)
@@ -1371,7 +1403,7 @@ async def auth_middleware(request: Request, call_next):
     user = _user_from_token(token)
     if not user:
         resp = HTMLResponse(_login_page())
-        resp.delete_cookie("tmux_auth")
+        resp.delete_cookie(AUTH_COOKIE)
         return _apply_security_headers(request, resp)
     request.state._current_user = user
     return await call_next(request)
@@ -1381,7 +1413,7 @@ async def auth_middleware(request: Request, call_next):
 async def api_auth_verify(request: Request):
     """SSO check for nginx ``auth_request`` from sibling knowva.ai apps.
 
-    Returns 200 when the shared ``tmux_auth`` cookie is valid, else 401 — so a
+    Returns 200 when this dashboard's configured auth cookie is valid, else 401 — so a
     single login to this dashboard unlocks the other knowva.ai apps (matcher,
     crypto, zoom, ...) which gate on this endpoint instead of separate logins.
 
@@ -1389,7 +1421,7 @@ async def api_auth_verify(request: Request):
     here on purpose: letting anyone with a company address into the dashboard
     should not also hand them the crypto/sales/matcher apps.
     """
-    u = _user_from_token(request.cookies.get("tmux_auth"))
+    u = _user_from_token(request.cookies.get(AUTH_COOKIE))
     if u and u.get("sso", True) is not False:
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False}, status_code=401)
@@ -1961,7 +1993,7 @@ async def api_admin_delete_user(request: Request, user_id: str):
 
 def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30,
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
     return resp
 
@@ -1969,7 +2001,7 @@ def _set_auth_cookie(resp, request: Request, token: str):
 @app.post("/api/admin/users/{user_id}/impersonate")
 async def api_admin_impersonate(request: Request, user_id: str):
     """Admin 'log in as' a user to see their work. Stashes the admin's own token
-    in a side cookie so they can return; swaps tmux_auth to the target."""
+    in a side cookie so they can return; swaps the configured auth cookie to the target."""
     admin = _current_user(request)
     if not _is_admin(admin):
         return JSONResponse({"error": "Admin only"}, status_code=403)
@@ -2711,7 +2743,12 @@ async def api_my_context_save(request: Request, filename: str, body: SaveMyConte
                 tomllib.loads(body.content or "")
             except tomllib.TOMLDecodeError as e:
                 return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
+        _backup_before_dashboard_write(p)
         p.write_text(body.content or "")
+        if not _is_admin(user):
+            # A member may edit their private content, but cannot accidentally
+            # strip the admin/group policy or their isolated browser binding.
+            _ensure_user_codex_config_dir(user)
         return JSONResponse({"ok": True, "path": str(p)})
     except Exception:
         logger.exception("Failed to save my-context %s for %s", filename, user["id"])
@@ -2826,7 +2863,7 @@ async def api_me(request: Request):
             return JSONResponse({
                 "id": "admin", "username": AUTH_USER or "admin",
                 "role": "admin", "auth_disabled": True,
-                "team_mode": TEAM_MODE, "brand": BRAND_NAME, "simple": False,
+                "team_mode": _multi_tenant_enabled(), "brand": BRAND_NAME, "simple": False,
             })
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     is_admin = _is_admin(user)
@@ -2840,18 +2877,18 @@ async def api_me(request: Request):
         "username": user.get("username", ""),
         "role": user.get("role", "user"),
         "auth_disabled": False,
-        "team_mode": TEAM_MODE,
+        "team_mode": _multi_tenant_enabled(),
         "brand": BRAND_NAME,
         # "simple" = the heavily-stripped team UI shown to non-admin members.
-        "simple": bool(TEAM_MODE and not is_admin),
+        "simple": bool(_multi_tenant_enabled() and not is_admin),
         "impersonating": impersonating,
         "impersonator": imp_admin.get("username", "") if impersonating else "",
     })
 
 
 # ===========================================================================
-# Team mode: shared auth, global context, soft sandbox, Google connections.
-# All gated behind TEAM_MODE; no effect on personal boxes.
+# Multi-tenant mode: shared auth, global context, soft sandbox, Google connections.
+# Enabled explicitly or automatically once a non-admin account exists.
 # ===========================================================================
 import base64
 import urllib.parse
@@ -3561,18 +3598,89 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
         logger.debug("Failed to write Google MCP entry into %s", cfg, exc_info=True)
 
 
-def _ensure_browser_mcp(cfg_dir: Path) -> bool:
-    """Give each isolated Codex home the call-scoped Playwright lease proxy."""
+def _tenant_browser_id(user: dict) -> str:
+    """Stable, non-identifying browser id for one dashboard member."""
+    user_id = str((user or {}).get("id") or "member")
+    return "acct-" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _ensure_tenant_browser(user: dict) -> dict:
+    """Provision a parked, persistent browser profile for one member.
+
+    Records are cheap: Chrome/Xvfb are still started only while a lease exists.
+    The transaction prevents two API workers creating the same account browser
+    with different ports.
+    """
+    if not user or _is_admin(user):
+        return dict(_DEFAULT_BROWSER_SESSION)
+    sid = _tenant_browser_id(user)
+    snapshot = _load_browser_sessions()
+    store = LockedJsonStore(BROWSER_SESSIONS_FILE, lambda: {"sessions": snapshot})
+
+    def mutate(data: dict) -> dict:
+        sessions = data.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = [dict(row) for row in snapshot]
+            data["sessions"] = sessions
+        found = next((row for row in sessions if row.get("id") == sid), None)
+        if found:
+            found["tenant_user_id"] = str(user.get("id") or "")
+            found["lifecycle_managed"] = True
+            return dict(found)
+        used = {int(row.get("slot", 0) or 0) for row in sessions}
+        slot = 1
+        while slot in used:
+            slot += 1
+        row = {
+            "id": sid,
+            "name": f"{str(user.get('username') or 'member')[:40]} browser",
+            "slot": slot,
+            "display": 99 + slot,
+            "rfb_port": 5900 + slot,
+            "vnc_port": 6080 + slot,
+            "cdp_port": 9222 + slot,
+            "managed": True,
+            "lifecycle_managed": True,
+            "tenant_user_id": str(user.get("id") or ""),
+            "created_at": time.time(),
+        }
+        sessions.append(row)
+        return dict(row)
+
+    _data, browser = store.update(mutate)
+    return browser
+
+
+def _user_can_access_browser(user: dict | None, browser_id: str) -> bool:
+    """Admins manage every browser; members can view only their own profile."""
+    if _is_admin(user):
+        return True
+    if not user or browser_id != _tenant_browser_id(user):
+        return False
+    browser = _browser_session_by_id(browser_id)
+    return bool(browser) and browser.get("tenant_user_id") == user.get("id")
+
+
+def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
+    """Give each Codex home a call-scoped, account-isolated browser lease."""
     cfg = cfg_dir / "config.toml"
     begin = "# BEGIN GRABO PLAYWRIGHT MCP (managed)"
     end = "# END GRABO PLAYWRIGHT MCP"
     try:
+        browser = _ensure_tenant_browser(user) if user and not _is_admin(user) else dict(_DEFAULT_BROWSER_SESSION)
+        browser_id = _toml_escape(str(browser.get("id") or "default"))
+        cdp_port = int(browser.get("cdp_port") or 9222)
+        output_dir = _toml_escape(str(Path.home() / ".playwright-mcp" / browser_id))
         proxy = _toml_escape(str(Path(__file__).resolve().parent / "browser_mcp_lease_proxy.py"))
         block = (
             f"{begin}\n"
             "[mcp_servers.playwright-browser]\n"
             'command = "python3"\n'
             f'args = ["{proxy}"]\n'
+            "\n[mcp_servers.playwright-browser.env]\n"
+            f'TMUX_DASH_BROWSER_ID = "{browser_id}"\n'
+            f'TMUX_DASH_BROWSER_CDP_PORT = "{cdp_port}"\n'
+            f'TMUX_DASH_BROWSER_OUTPUT_DIR = "{output_dir}"\n'
             f"{end}\n"
         )
         existing = cfg.read_text() if cfg.exists() else ""
@@ -3980,6 +4088,13 @@ async def api_admin_context_write(request: Request, scope: str, ident: str, body
                     _ensure_user_codex_config_dir(u)
                 except Exception:
                     pass
+    elif scope == "user":
+        target_user = _find_user_by_id(ident)
+        if target_user and not _is_admin(target_user):
+            try:
+                _ensure_user_codex_config_dir(target_user)
+            except Exception:
+                logger.debug("Failed to re-apply managed member context", exc_info=True)
     return JSONResponse({"ok": True})
 
 
@@ -4003,6 +4118,13 @@ async def api_admin_context_delete(request: Request, scope: str, ident: str, pat
             target.unlink()
     except Exception:
         return JSONResponse({"error": "Delete failed"}, status_code=500)
+    if scope == "user":
+        target_user = _find_user_by_id(ident)
+        if target_user and not _is_admin(target_user):
+            try:
+                _ensure_user_codex_config_dir(target_user)
+            except Exception:
+                logger.debug("Failed to restore managed member files", exc_info=True)
     return JSONResponse({"ok": True})
 
 
@@ -4183,6 +4305,51 @@ _FILE_SERVE_DENYLIST = {
 _FILE_SERVE_DENY_PREFIXES = (
     "/proc/", "/sys/", "/dev/",
 )
+_FILE_SERVE_DENY_NAMES = {
+    ".git-credentials", ".credentials.json", "auth.json",
+    "claude_api_keys.md", "credentials.json",
+}
+
+
+def _file_path_is_sensitive(path: Path) -> bool:
+    """Reject credential-shaped paths even when a terminal prints a link."""
+    for part in path.parts:
+        lowered = part.lower()
+        if lowered == ".env" or lowered.startswith(".env."):
+            return True
+        if lowered in _FILE_SERVE_DENY_NAMES:
+            return True
+        if lowered.endswith((".pem", ".key")) or lowered.startswith("id_rsa"):
+            return True
+    return False
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        return path == resolved_root or resolved_root in path.parents
+    except Exception:
+        return False
+
+
+def _member_can_serve_file(user: dict, session_name: str, target: Path) -> bool:
+    """Limit member file links to their account and owned session workspace."""
+    if not session_name or _session_owner_id(session_name) != user.get("id"):
+        return False
+    roots = [
+        _user_data_dir(user),
+        _user_codex_config_dir(user),
+        PROJECTS_ROOT / str(user.get("username") or user.get("id") or "member"),
+    ]
+    cwd = get_session_cwd(session_name)
+    if cwd:
+        cwd_path = Path(cwd).resolve()
+        # A pane at / or the shared OS home must not turn /file into a browser
+        # for every tenant's data. Once the pane enters a project, that project
+        # becomes an allowed root for its owner.
+        if cwd_path not in (Path("/"), Path.home().resolve()):
+            roots.append(cwd_path)
+    return any(_path_within(target, root) for root in roots)
 
 # Some paths the terminal linkifier turns into <BASE>/file?path=... links are
 # not absolute filesystem paths but URL routes on sister apps (typically the
@@ -4306,12 +4473,16 @@ def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
     the dashboard's auth middleware — same login as the dashboard itself."""
     rp = request.scope.get("root_path", "") or ""
     real = str(dir_path)
+    session_name = request.query_params.get("session", "")
 
     def _attr(s: str) -> str:
         return _html_escape(s).replace('"', "&quot;")
 
     def _link(p: Path) -> str:
-        return rp + "/file?path=" + urllib.parse.quote(str(p), safe="")
+        link = rp + "/file?path=" + urllib.parse.quote(str(p), safe="")
+        if session_name:
+            link += "&session=" + urllib.parse.quote(session_name, safe="")
+        return link
 
     try:
         kids = list(dir_path.iterdir())
@@ -4393,7 +4564,9 @@ def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
 
 
 @app.get("/file")
-async def serve_terminal_file(request: Request, path: str = "", download: int = 0):
+async def serve_terminal_file(
+    request: Request, path: str = "", download: int = 0, session: str = ""
+):
     """Serve a file (or directory listing) referenced from terminal output.
 
     The terminal linkifier (frontend) discovers file paths — absolute
@@ -4405,8 +4578,15 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
     protected by the same login as the dashboard itself.
     """
     orig_path = path
+    user = _current_user(request)
     if not path:
         return _file_error(request, 400, "Bad request", "A file path is required.", orig_path)
+    if not _is_admin(user):
+        if not user or not session or _session_owner_id(session) != user.get("id"):
+            return _file_error(
+                request, 403, "Forbidden",
+                "Member file links require one of your own sessions.", orig_path,
+            )
     # Expand ~ / ~user home-relative paths (terminal output prints these a lot,
     # e.g. "Deliverables in ~/PROBST_LAWSUIT_2026-07-10/").
     if path.startswith("~"):
@@ -4424,6 +4604,8 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
         return _file_error(request, 400, "Bad request", "That path could not be resolved.", orig_path)
     # Re-check denylist against the resolved real path (defeats symlink tricks).
     real = str(target)
+    if _file_path_is_sensitive(target):
+        return _file_error(request, 403, "Forbidden", "Credential files are never served.", orig_path)
     if real in _FILE_SERVE_DENYLIST:
         return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", orig_path)
     for pref in _FILE_SERVE_DENY_PREFIXES:
@@ -4434,6 +4616,11 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
         if upstream:
             return RedirectResponse(url=upstream, status_code=302)
         return _file_error(request, 404, "Not found", "No such file or directory on this host.", orig_path)
+    if not _is_admin(user) and not _member_can_serve_file(user, session, target):
+        return _file_error(
+            request, 403, "Forbidden",
+            "That path is outside this session's workspace.", orig_path,
+        )
     # Directories → a clickable listing (each row stays behind this auth route).
     if target.is_dir():
         return _render_dir_listing(request, target)
@@ -4747,14 +4934,28 @@ def _find_session(session_name: str) -> tuple:
 
 
 def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
-    """Restrict a session list to the ones the given user is allowed to see."""
-    if _is_admin(user):
-        return sessions
+    """Restrict a session list to sessions owned by the signed-in account.
+
+    Administrators intentionally get the same default here. Their operational
+    all-users view is an explicit ``scope=all`` request, so logging in never
+    drops other people's terminals into the normal dashboard by surprise.
+    """
     if not user:
         return []
     owners = _load_session_owners()
     uid = user["id"]
     return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+
+
+def _session_list_for_request(request: Request, sessions: list) -> tuple[list | None, str]:
+    """Apply the requested list scope; ``None`` means an unauthorized scope."""
+    user = _current_user(request)
+    scope = (request.query_params.get("scope") or "mine").strip().lower()
+    if scope == "all":
+        if not _is_admin(user):
+            return None, "all"
+        return sessions, "all"
+    return _filter_sessions_for_user(sessions, user), "mine"
 
 
 def _find_session_for_user(session_name: str, user: dict | None) -> tuple:
@@ -5957,14 +6158,15 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
 async def index(request: Request):
     # Inject the per-user "simple" flag so the member UI is correct from the very
     # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
-    simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
+    simple = bool(_multi_tenant_enabled() and not _is_admin(_current_user(request)))
     return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
 async def api_sessions(request: Request):
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     results, activities = await asyncio.gather(
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
@@ -5979,7 +6181,15 @@ async def api_sessions(request: Request):
 async def api_sessions_fast(request: Request):
     """Return session list with cached data only — no LLM calls. Fast startup."""
     user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    if scope == "all":
+        logger.info(
+            "Admin '%s' opened the all-users session view (%d sessions)",
+            (user or {}).get("username", "admin"),
+            len(sessions),
+        )
     # Run activity detection for all sessions in parallel threads
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
@@ -6052,8 +6262,9 @@ async def api_refresh_all_tiers(session_name: str):
 @app.get("/api/status")
 async def api_status(request: Request):
     """Lightweight: return only activity status per session, no LLM calls."""
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
@@ -6463,7 +6674,7 @@ def _restore_parked_tmux_shell(session_name: str, lifecycle: dict) -> bool:
     """Reanimate a dead/virtual pane without changing its worktree or transcript."""
     owner = _user_for_session(session_name)
     cwd = str(lifecycle.get("cwd") or "")
-    if not cwd and TEAM_MODE and owner and not _is_admin(owner):
+    if not cwd and _multi_tenant_enabled() and owner and not _is_admin(owner):
         cwd = str(PROJECTS_ROOT / str(owner.get("username") or "member") / session_name)
     if not cwd or not Path(cwd).is_dir():
         cwd = str(Path(__file__).resolve().parent)
@@ -7060,7 +7271,7 @@ async def api_create_session(request: Request, body: CreateSession):
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
-            if TEAM_MODE and _is_admin(user):
+            if _multi_tenant_enabled() and _is_admin(user):
                 acfg = _user_codex_config_dir(user)
                 _sync_projects_note_into(acfg / "AGENTS.md")
                 _ensure_google_mcp(acfg, user)
@@ -7255,6 +7466,10 @@ def get_session_cwd(session_name: str) -> str:
 UPLOADS_DIR = MESSAGES_DIR / "uploads"
 
 
+def _session_uploads_dir(session_name: str) -> Path:
+    return _user_uploads_dir(_user_for_session(session_name)) / session_name
+
+
 @app.post("/api/sessions/{session_name}/upload")
 async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     """Upload a file to a session-specific uploads dir; record only in this session's chat history."""
@@ -7267,8 +7482,8 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    # Save to fixed session-specific uploads dir under ~/.tmux-dashboard/uploads/<session>/
-    uploads_dir = UPLOADS_DIR / session_name
+    # Save under the owning account's data root, never another tenant's tree.
+    uploads_dir = _session_uploads_dir(session_name)
     uploads_dir.mkdir(parents=True, exist_ok=True)
     dest = str(uploads_dir / filename)
     try:
@@ -7299,7 +7514,7 @@ async def api_list_uploads(session_name: str):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    uploads_dir = UPLOADS_DIR / session_name
+    uploads_dir = _session_uploads_dir(session_name)
     files = []
     if uploads_dir.exists():
         for entry in uploads_dir.iterdir():
@@ -7328,7 +7543,7 @@ async def api_delete_upload(session_name: str, filename: str):
     safe_name = os.path.basename(filename)
     if not safe_name or safe_name.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    target = UPLOADS_DIR / session_name / safe_name
+    target = _session_uploads_dir(session_name) / safe_name
     try:
         if target.exists() and target.is_file():
             target.unlink()
@@ -7342,7 +7557,7 @@ async def api_delete_upload(session_name: str, filename: str):
 
 @app.get("/api/sessions/{session_name}/codex-md")
 async def api_get_codex_md(session_name: str):
-    """Read AGENTS.md from the session's working directory and home dir."""
+    """Read project and account AGENTS.md files for this session."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -7359,8 +7574,14 @@ async def api_get_codex_md(session_name: str):
             except Exception:
                 logger.debug("Failed to read AGENTS.md at %s", md_path, exc_info=True)
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
-    # Check home dir
-    home_md = os.path.join(str(Path.home()), "AGENTS.md")
+    # Members get their isolated CODEX_HOME instructions. Keep the legacy
+    # ~/AGENTS.md location for admin sessions for backwards compatibility.
+    owner = _user_for_session(session_name)
+    home_md = str(
+        (_user_codex_config_dir(owner) / "AGENTS.md")
+        if owner and not _is_admin(owner)
+        else (Path.home() / "AGENTS.md")
+    )
     home_content = ""
     if os.path.exists(home_md):
         try:
@@ -7383,20 +7604,32 @@ async def api_save_codex_md(session_name: str, body: SaveCodexMd):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    # Safety: only allow writing AGENTS.md files within home directory
+    # Safety: only the project AGENTS.md and this account's own global file are
+    # valid. Merely being somewhere under the shared OS home is not isolation.
     if not body.path.endswith("AGENTS.md"):
         return JSONResponse({"error": "Can only write AGENTS.md files"}, status_code=400)
     real_path = os.path.realpath(body.path)
-    home_dir = str(Path.home())
-    if not real_path.startswith(home_dir + "/") and real_path != home_dir:
-        return JSONResponse({"error": "Path must be within home directory"}, status_code=403)
     if not real_path.endswith("/AGENTS.md"):
         return JSONResponse({"error": "Invalid path after resolution"}, status_code=400)
+    owner = _user_for_session(session_name)
+    global_path = (
+        _user_codex_config_dir(owner) / "AGENTS.md"
+        if owner and not _is_admin(owner)
+        else Path.home() / "AGENTS.md"
+    )
+    allowed = {os.path.realpath(str(global_path))}
+    cwd = get_session_cwd(session_name)
+    if cwd:
+        allowed.add(os.path.realpath(str(Path(cwd) / "AGENTS.md")))
+    if real_path not in allowed:
+        return JSONResponse({"error": "Path is outside this session's project and account"}, status_code=403)
     try:
         os.makedirs(os.path.dirname(real_path), exist_ok=True)
         _backup_before_dashboard_write(Path(real_path))
         with open(real_path, "w") as f:
             f.write(body.content)
+        if owner and not _is_admin(owner) and real_path == os.path.realpath(str(global_path)):
+            _ensure_user_codex_config_dir(owner)
         return JSONResponse({"ok": True, "path": real_path})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -9875,7 +10108,7 @@ async def api_login_health():
 # --- Codex authentication status --------------------------------------------
 def _auth_admin_ok(request: Request) -> bool:
     user = _current_user(request)
-    return not TEAM_MODE or bool(user and _is_admin(user))
+    return bool(user and _is_admin(user))
 
 
 def _load_longlived_token() -> str:
@@ -10433,6 +10666,36 @@ class BrowserLeaseBody(BaseModel):
     ttl: int = BROWSER_LEASE_TTL
 
 
+@app.get("/api/my/browser")
+async def api_my_browser(request: Request):
+    """Return only the signed-in member's persistent, on-demand browser."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    browser = (
+        dict(_DEFAULT_BROWSER_SESSION)
+        if _is_admin(user)
+        else await asyncio.to_thread(_ensure_tenant_browser, user)
+    )
+    row = _browser_response_row(browser)
+    runtime = _browser_runtime_row(str(browser.get("id") or ""))
+    row["running"] = await asyncio.to_thread(_browser_process_alive, browser)
+    row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
+    row["parked"] = not row["running"]
+    leases = await asyncio.to_thread(_browser_leases.snapshot)
+    row["active_leases"] = int(
+        leases.get("by_browser", {}).get(browser.get("id"), 0)
+    )
+    public = {
+        key: row.get(key)
+        for key in (
+            "id", "name", "viewer_url", "running", "mode", "parked",
+            "active_leases",
+        )
+    }
+    return JSONResponse({"browser": public})
+
+
 @app.get("/api/browser/sessions")
 async def api_browser_sessions(request: Request):
     if not _auth_admin_ok(request):
@@ -10448,7 +10711,9 @@ async def api_browser_sessions(request: Request):
         row["parked"] = not row["running"]
         row["active_leases"] = int(leases.get("by_browser", {}).get(s.get("id"), 0))
         out.append(row)
-    extra = sum(1 for s in sessions if s.get("managed"))
+    extra = sum(
+        1 for s in sessions if s.get("managed") and not s.get("tenant_user_id")
+    )
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
 
@@ -10458,7 +10723,9 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
-    if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
+    if sum(
+        1 for s in sessions if s.get("managed") and not s.get("tenant_user_id")
+    ) >= BROWSER_MAX_EXTRA:
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
     slot = _next_browser_slot(sessions)
     sid = f"s{slot}"
@@ -11399,6 +11666,10 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
     if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
         await ws.close(code=1008)
         return
+    user = _current_user(ws)
+    if not _user_can_access_browser(user, sid):
+        await ws.close(code=1008)
+        return
     s = _browser_session_by_id(sid)
     if not s:
         await ws.close(code=1011)
@@ -11504,6 +11775,8 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
 async def browser_proxy_http(sid: str, path: str, request: Request):
     """Reverse-proxy noVNC static assets (vnc.html + app/core/vendor) to the
     session's local websockify, so the viewer is same-origin with the dashboard."""
+    if not _user_can_access_browser(_current_user(request), sid):
+        return Response("browser not found", status_code=404)
     s = _browser_session_by_id(sid)
     if not s:
         return Response("unknown browser session", status_code=404)
@@ -13027,7 +13300,7 @@ async def api_models():
 async def api_models_refresh(request: Request):
     """Force an immediate refresh from the installed Codex CLI (admin)."""
     user = _current_user(request)
-    if TEAM_MODE and not (user and _is_admin(user)):
+    if not (user and _is_admin(user)):
         return JSONResponse({"error": "admin only"}, status_code=403)
     changed = await _refresh_model_catalog(force=True)
     return JSONResponse({"ok": True, "changed": changed, "models": MODEL_CATALOG})
@@ -15729,6 +16002,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
 .nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
+.nav-session-owner{font-size:.62rem;color:#6e7681;max-width:100px;overflow:hidden;text-overflow:ellipsis}
 .nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
 .nav-indicators{display:flex;align-items:center;gap:5px}
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
@@ -15769,6 +16043,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
+.nav-session-scope{display:none;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 8px;font-size:.72rem;margin-right:8px;max-width:130px}
+.nav-session-scope.visible{display:block}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -16526,6 +16802,10 @@ body.member-simple .hide-in-simple{display:none!important}
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">__BRAND__</span>
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
+  <select class="nav-session-scope" id="nav-session-scope" onchange="changeSessionScope(this.value)" aria-label="Session view">
+    <option value="mine">My sessions</option>
+    <option value="all">All users</option>
+  </select>
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
@@ -16572,7 +16852,7 @@ body.member-simple .hide-in-simple{display:none!important}
       <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -16580,6 +16860,7 @@ body.member-simple .hide-in-simple{display:none!important}
     </div>
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
+  <button class="nav-icon-btn member-only" id="nav-my-browser-btn" onclick="openSettings('browser')" title="My private browser"><span class="icon">&#x1F310;</span></button>
   <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
@@ -16665,12 +16946,26 @@ const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
+let ADMIN_SESSION_SCOPE='mine';
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
 function getRawState(n){if(!rawState[n])rawState[n]={polling:false,socket:null,reconnectTimer:null,backoff:500,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
+function sessionListUrl(path){
+  const all=ADMIN_SESSION_SCOPE==='all'&&_currentUser&&_currentUser.role==='admin';
+  return BASE+path+(all?(path.includes('?')?'&':'?')+'scope=all':'');
+}
+async function changeSessionScope(scope){
+  ADMIN_SESSION_SCOPE=(scope==='all'?'all':'mine');
+  selectedSession=null;
+  stopAllRawPolling();
+  sessions=[];
+  renderNav();
+  mainEl.innerHTML='<div class="empty">Loading sessions…</div>';
+  await loadAll();
+}
 
 // --- "Hide Bash/Fetch" filter ---
 function getHideBashPref(){
@@ -16950,7 +17245,8 @@ function _renderPathSpan(text,start,paneWidth){
   if(pathJoined.length<2||(!_isHome&&!_isDir&&!_hasExt)){
     return {html:_escTermHtml(text.slice(start,j)),end:j};
   }
-  const href=BASE+'/file?path='+encodeURIComponent(pathJoined);
+  const href=BASE+'/file?path='+encodeURIComponent(pathJoined)
+    +(selectedSession?'&session='+encodeURIComponent(selectedSession):'');
   const hrefEsc=_escTermHtml(href);
   const dataEsc=_escTermHtml(pathJoined);
   // Emit each non-whitespace chunk as its own <a> pointing at the joined href,
@@ -17234,6 +17530,7 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
+      ${ADMIN_SESSION_SCOPE==='all'?`<span class="nav-session-owner">${esc(s.owner||'admin')}</span>`:''}
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
@@ -17875,7 +18172,7 @@ function scheduleBusyVerification(name){
   // First check after 5 seconds
   setTimeout(async()=>{
     try{
-      const resp=await fetch(BASE+'/api/status');
+      const resp=await fetch(sessionListUrl('/api/status'));
       const statuses=await resp.json();
       const st=statuses.find(s=>s.name===name);
       if(!st)return;
@@ -17888,7 +18185,7 @@ function scheduleBusyVerification(name){
       // Server says idle — but might be a brief gap.  Check once more after 3s.
       setTimeout(async()=>{
         try{
-          const resp2=await fetch(BASE+'/api/status');
+          const resp2=await fetch(sessionListUrl('/api/status'));
           const statuses2=await resp2.json();
           const st2=statuses2.find(s=>s.name===name);
           if(!st2)return;
@@ -18216,7 +18513,7 @@ async function loadAll(){
     MEMBER_SIMPLE=!!(_currentUser&&_currentUser.simple);
     document.body.classList.toggle('member-simple',MEMBER_SIMPLE);
     // Phase 1: Fast load — cached data + activity status, no LLM calls
-    const resp=await fetch(BASE+'/api/sessions-fast');
+    const resp=await fetch(sessionListUrl('/api/sessions-fast'));
     sessions=await resp.json();
     sessions.forEach(s=>{
       lastStatus[s.name]=s.activity_status;
@@ -18279,7 +18576,7 @@ function startStatusPolling(){
 async function pollStatus(){
   if(document.hidden)return;
   try{
-    const resp=await fetch(BASE+'/api/status');
+    const resp=await fetch(sessionListUrl('/api/status'));
     const statuses=await resp.json();
     let changed=false;
     for(const st of statuses){
@@ -18317,6 +18614,7 @@ async function pollStatus(){
 // --- Inline server stats in nav header ---
 const navStatsEl=document.getElementById('nav-server-stats');
 async function refreshNavStats(){
+  if(MEMBER_SIMPLE)return;
   try{
     const resp=await fetch(BASE+'/api/stats');
     const s=await resp.json();
@@ -18577,32 +18875,36 @@ async function disconnectService(svc){
   openConnections();
 }
 
-// ── Global context (admin) ──
+// ── Global instructions (admin) ──
 async function openGlobalContext(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Loading…</p>`;
-  document.getElementById('modal-overlay').classList.add('active');
+  return openSettings('global');
+}
+async function loadGlobalInstructions(){
   try{
     const r=await fetch(BASE+'/api/global-context'); const d=await r.json();
-    modal.innerHTML=`<h3>Global Context — every member's Codex</h3>
-      <p class="conn-note">Prepended as a managed block to each member's AGENTS.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
-      <textarea id="gctx-ta" class="modal-input" style="height:320px;font-family:monospace;white-space:pre;width:100%">${esc(d.content||'')}</textarea>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="saveGlobalContext()">Save &amp; sync</button></div>`;
+    if(!r.ok)throw new Error(d.error||'Failed to load global instructions');
+    document.getElementById('settings-content').innerHTML=`<div class="settings-section">
+      <div class="pf-banner"><b>Applies to every non-admin account.</b> This managed block is prepended to each member's <code>AGENTS.md</code> now and whenever their Codex home is repaired or recreated. Their private and group instructions remain below it.</div>
+      <label>Global AGENTS.md instructions</label>
+      <div class="my-ctx-path">${esc(d.path||'')}</div>
+      <textarea id="global-instructions-editor" class="my-ctx-codex" spellcheck="false">${esc(d.content||'')}</textarea>
+      <div class="my-ctx-actions"><span id="global-instructions-status" style="color:#7ee787;font-size:.75rem;align-self:center"></span><button class="btn btn-full" onclick="saveGlobalInstructions()">Save &amp; sync to all members</button></div>
+    </div>`;
   }catch(e){
-    modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Failed to load.</p>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+    document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load global instructions: '+esc(e.message||e)+'</div></div>';
   }
 }
-async function saveGlobalContext(){
-  const ta=document.getElementById('gctx-ta'); if(!ta) return;
+async function saveGlobalInstructions(){
+  const ta=document.getElementById('global-instructions-editor'); if(!ta) return;
   try{
     const r=await fetch(BASE+'/api/global-context',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ta.value})});
     const d=await r.json();
-    if(r.ok){ closeModal(); alert('Saved & synced to '+(d.synced||0)+' member(s).'); }
-    else alert(d.error||'Failed');
-  }catch(e){ alert('Failed to save.'); }
+    if(!r.ok)throw new Error(d.error||'Failed to save');
+    const status=document.getElementById('global-instructions-status');
+    if(status){status.textContent='Saved and synced to '+(d.synced||0)+' member'+((d.synced||0)===1?'':'s')+' ✓';setTimeout(()=>{status.textContent=''},3500);}
+  }catch(e){ alert('Failed to save global instructions: '+(e.message||e)); }
 }
+async function saveGlobalContext(){ return saveGlobalInstructions(); }
 
 // Surface a one-time toast after returning from a Google OAuth connect flow.
 (function(){
@@ -18649,6 +18951,7 @@ let _usageCache=null;
 let _authPollCount=0;
 
 async function checkCodexAuth(){
+  if(MEMBER_SIMPLE)return;
   // Fetch auth and usage independently so one failure doesn't break the other
   try{
     const authResp=await fetch(BASE+'/api/auth/codex-status');
@@ -19290,14 +19593,14 @@ function _savedCredRow(c){
   r.appendChild(_savedCopyBtn(c.value));
   return r;
 }
-function _savedFileRow(p,disambiguate){
+function _savedFileRow(p,disambiguate,sessionName){
   const r=_savedRow();
   const linkable=/^(\/|~\/)/.test(p);
   const parts=p.replace(/\/+$/,'').split('/');
   const nm=(disambiguate&&parts.length>1?parts.slice(-2).join('/'):parts[parts.length-1])||p;
   if(linkable){
     const a=document.createElement('a');
-    a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p);a.target='_blank';a.rel='noopener noreferrer';
+    a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p)+'&session='+encodeURIComponent(sessionName||'');a.target='_blank';a.rel='noopener noreferrer';
     a.textContent=nm;a.title=p;
     r.appendChild(a);
   }else{
@@ -19342,7 +19645,7 @@ function renderSavedKeys(name,sessionObj){
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
       if(info.creds.length)body.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
-      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1))));
+      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1,name))));
     }
     box.appendChild(body);
   });
@@ -19890,6 +20193,11 @@ async function applyRoleVisibility(){
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
+  const scopeEl = document.getElementById('nav-session-scope');
+  if(scopeEl){
+    scopeEl.classList.toggle('visible', isAdmin);
+    scopeEl.value = ADMIN_SESSION_SCOPE;
+  }
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
@@ -19938,11 +20246,12 @@ function renderSettingsTabs(){
   const tabs = [
     {id:'mycontext', label:'My Context'},
     {id:'history',   label:'History'},
+    {id:'browser',   label:'Browser'},
   ];
+  if(isAdmin) tabs.splice(1,0,{id:'global', label:'Global Instructions'});
   if(isAdmin) tabs.push({id:'context', label:'Context Files'});
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
-  if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
@@ -19961,6 +20270,9 @@ function renderSettingsContent(){
   if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
+  }else if(_settingsActiveTab === 'global'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading global instructions...</div></div>';
+    loadGlobalInstructions();
   }else if(_settingsActiveTab === 'history'){
     if(_settingsHistoryDetail){
       renderHistoryDetail();
@@ -20033,9 +20345,16 @@ let _bsFp = {};         // sid -> last fingerprint audit result
 async function loadBrowserTab(){
   let data;
   try{
-    const r = await fetch(BASE+'/api/browser/sessions');
+    const isAdmin=!!(_currentUser&&_currentUser.role==='admin');
+    const r = await fetch(BASE+(isAdmin?'/api/browser/sessions':'/api/my/browser'));
     data = await r.json();
     if(!r.ok) throw new Error(data.error||'Failed');
+    if(!isAdmin){
+      _browserSessions=data.browser?[data.browser]:[];
+      _bsData={sessions:_browserSessions,member:true};
+      renderMemberBrowserTab();
+      return;
+    }
   }catch(e){
     document.getElementById('settings-content').innerHTML =
       '<div class="settings-section"><div class="pf-banner">Failed to load browser sessions: '+esc(e.message||e)+'</div></div>';
@@ -20048,6 +20367,23 @@ async function loadBrowserTab(){
   // cards paint first and fill the badges in when they land.
   loadBrowserProxy(true);
   refreshBrowserAuthBadge();
+}
+
+function renderMemberBrowserTab(){
+  const s=(_browserSessions||[])[0];
+  if(!s){
+    document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="history-empty">Your browser could not be provisioned.</div></div>';
+    return;
+  }
+  const state=s.running?'running':'parked';
+  document.getElementById('settings-content').innerHTML=`<div class="settings-section">
+    <div class="pf-banner"><b>This browser profile belongs only to your account.</b> Its cookies and local profile persist, but Chrome stays parked until you or a browser-agent tool actually uses it.</div>
+    <div class="bs-card" style="max-width:640px">
+      <div class="bs-head"><span class="bs-dot ${s.running?'on':'off'}"></span><span class="bs-name">${esc(s.name||'My browser')}</span><span class="bs-meta">${state}${s.active_leases?' · '+s.active_leases+' active lease':''}</span></div>
+      <div class="bs-off" style="min-height:150px">${s.running?'Browser is ready. Open the viewer to interact with it.':'Parked to save memory. It restores automatically when opened.'}</div>
+      <div class="bs-actions"><button class="btn btn-primary" onclick="openBrowserSession('${esc(s.id)}')">Open private browser ↗</button></div>
+    </div>
+  </div>`;
 }
 
 // Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY

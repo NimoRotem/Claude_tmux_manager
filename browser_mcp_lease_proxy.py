@@ -26,6 +26,16 @@ CONTROLLER_SOCKET = Path(
     )
 )
 BROWSER_ID = os.environ.get("TMUX_DASH_BROWSER_ID", "default")
+try:
+    BROWSER_CDP_PORT = int(os.environ.get("TMUX_DASH_BROWSER_CDP_PORT", "9222"))
+except ValueError:
+    BROWSER_CDP_PORT = 9222
+BROWSER_OUTPUT_DIR = Path(
+    os.environ.get(
+        "TMUX_DASH_BROWSER_OUTPUT_DIR",
+        str(Path.home() / ".playwright-mcp" / BROWSER_ID),
+    )
+)
 LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
 
 
@@ -127,9 +137,9 @@ def main() -> int:
         "node",
         str(Path.home() / ".claude-browser" / "node_modules" / "@playwright" / "mcp" / "cli.js"),
         "--cdp-endpoint",
-        "http://127.0.0.1:9222",
+        f"http://127.0.0.1:{BROWSER_CDP_PORT}",
         "--output-dir",
-        str(Path.home() / ".playwright-mcp"),
+        str(BROWSER_OUTPUT_DIR),
     ]
     upstream = subprocess.Popen(
         upstream_command,

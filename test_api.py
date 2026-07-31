@@ -14,12 +14,13 @@ os.environ.setdefault("TMUX_DASH_USER", "admin")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-real")
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, _make_token, app
 
 # Auth cookies carry the stable user id, not the configurable display/login name.
 AUTH_TOKEN = _make_token("admin")
-AUTH_COOKIES = {"tmux_auth": AUTH_TOKEN}
+AUTH_COOKIES = {AUTH_COOKIE: AUTH_TOKEN}
 
 # Mock session data
 MOCK_SESSIONS = [
@@ -41,7 +42,7 @@ def authed_client():
     DeprecationWarning about per-request cookie semantics.
     """
     c = TestClient(app)
-    c.cookies.set("tmux_auth", AUTH_TOKEN)
+    c.cookies.set(AUTH_COOKIE, AUTH_TOKEN)
     return c
 
 
@@ -52,7 +53,7 @@ class TestAuthMiddleware:
     def test_unauthenticated_returns_login_page(self, client):
         resp = client.get("/", follow_redirects=False)
         assert resp.status_code == 200
-        assert "tmux Dashboard" in resp.text
+        assert "Dashboard — Login" in resp.text
         assert "Log in" in resp.text
 
     def test_authenticated_returns_app(self, authed_client):
@@ -64,7 +65,7 @@ class TestAuthMiddleware:
     def test_invalid_token_returns_login(self):
         from fastapi.testclient import TestClient
         bad_client = TestClient(app)
-        bad_client.cookies.set("tmux_auth", "admin:invalidsig00000000000")
+        bad_client.cookies.set(AUTH_COOKIE, "admin:invalidsig00000000000")
         resp = bad_client.get("/")
         assert resp.status_code == 200
         assert "Log in" in resp.text
@@ -242,6 +243,14 @@ class TestDashboardFrontendRegressions:
         assert "getElementById('config-content')" not in html
         assert "Usage resets on a 5-hour rolling window" not in html
 
+    def test_admin_controls_include_explicit_scope_and_global_instructions(self, authed_client):
+        html = authed_client.get("/").text
+        assert 'id="nav-session-scope"' in html
+        assert '<option value="mine">My sessions</option>' in html
+        assert '<option value="all">All users</option>' in html
+        assert "{id:'global', label:'Global Instructions'}" in html
+        assert "Save &amp; sync to all members" in html
+
 
 # ─── Session List API Tests ───
 
@@ -290,6 +299,271 @@ class TestSessionListEndpoints:
         with patch("app._session_config_base", return_value=codex_home):
             result = app_module.build_session_response(session, {}, activity)
         assert result["auth_mode"] == "api"
+
+
+class TestMultiTenantIsolation:
+    @pytest.fixture
+    def tenant_state(self, tmp_path):
+        import app as app_module
+
+        users = [
+            {"id": "admin", "username": "root-admin", "role": "admin"},
+            {"id": "u_alice", "username": "alice", "role": "user"},
+            {"id": "u_bob", "username": "bob", "role": "user"},
+        ]
+        owners_file = tmp_path / "session_owners.json"
+        owners_file.write_text(json.dumps({
+            "admin-session": "admin",
+            "alice-session": "u_alice",
+            "bob-session": "u_bob",
+        }))
+        sessions = [
+            {"name": "admin-session", "windows": "1", "created": "1", "attached": False},
+            {"name": "alice-session", "windows": "1", "created": "2", "attached": False},
+            {"name": "bob-session", "windows": "1", "created": "3", "attached": False},
+        ]
+        with (
+            patch.object(app_module, "SESSION_OWNERS_FILE", owners_file),
+            patch.object(app_module, "TEAM_MODE", False),
+            patch("app._load_users", return_value=users),
+        ):
+            yield app_module, users, sessions
+
+    @staticmethod
+    def _client_for(app_module, user_id):
+        client = TestClient(app_module.app)
+        client.cookies.set(AUTH_COOKIE, app_module._make_token(user_id))
+        return client
+
+    def test_each_account_defaults_to_only_its_own_sessions(self, tenant_state):
+        app_module, _users, sessions = tenant_state
+        idle = {"status": "idle", "command": "", "detail": ""}
+        with (
+            patch("app.get_tmux_sessions", return_value=sessions),
+            patch("app.async_detect_activity", new=AsyncMock(return_value=idle)),
+            patch("app._session_model_fields", return_value={}),
+            patch.object(app_module._session_lifecycle, "get", return_value={}),
+        ):
+            alice = self._client_for(app_module, "u_alice")
+            admin = self._client_for(app_module, "admin")
+            assert [row["name"] for row in alice.get("/api/status").json()] == ["alice-session"]
+            assert [row["name"] for row in admin.get("/api/status").json()] == ["admin-session"]
+            assert {row["name"] for row in admin.get("/api/status?scope=all").json()} == {
+                "admin-session", "alice-session", "bob-session",
+            }
+
+    def test_member_cannot_request_admin_all_users_scope(self, tenant_state):
+        app_module, _users, sessions = tenant_state
+        with patch("app.get_tmux_sessions", return_value=sessions):
+            response = self._client_for(app_module, "u_alice").get("/api/status?scope=all")
+        assert response.status_code == 403
+
+    def test_member_cannot_open_another_users_session_route(self, tenant_state):
+        app_module, _users, sessions = tenant_state
+        with patch("app.get_tmux_sessions", return_value=sessions):
+            response = self._client_for(app_module, "u_alice").get(
+                "/api/sessions/bob-session/raw"
+            )
+        assert response.status_code == 404
+
+    def test_member_cannot_subscribe_to_another_users_terminal_websocket(self, tenant_state):
+        app_module, _users, _sessions = tenant_state
+        client = self._client_for(app_module, "u_alice")
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect("/ws/sessions/bob-session/raw"):
+                pass
+        assert closed.value.code == 1008
+
+    def test_member_ui_automatically_enters_tenant_mode(self, tenant_state):
+        app_module, _users, _sessions = tenant_state
+        response = self._client_for(app_module, "u_alice").get("/api/me")
+        assert response.status_code == 200
+        assert response.json()["team_mode"] is True
+        assert response.json()["simple"] is True
+
+    @pytest.mark.parametrize("path", [
+        "/qa-output/member-must-not-see.html",
+        "/api/admin/users",
+        "/api/browser/sessions",
+        "/api/context-files",
+        "/api/global-context",
+        "/api/stats",
+        "/api/auth/codex-status",
+        "/api/auth/usage",
+    ])
+    def test_member_cannot_read_admin_or_global_endpoints(self, tenant_state, path):
+        app_module, _users, _sessions = tenant_state
+        response = self._client_for(app_module, "u_alice").get(path)
+        assert response.status_code == 403
+
+    def test_member_cannot_mutate_shared_codex_credentials(self, tenant_state):
+        app_module, _users, _sessions = tenant_state
+        with patch("app._save_openai_key") as save_key:
+            response = self._client_for(app_module, "u_alice").post(
+                "/api/auth/api-key", json={"apiKey": "sk-member-must-not-write"}
+            )
+        assert response.status_code == 403
+        save_key.assert_not_called()
+
+    def test_member_file_links_are_limited_to_owned_session_workspace(
+        self, tenant_state, tmp_path
+    ):
+        app_module, _users, _sessions = tenant_state
+        alice_root = tmp_path / "alice-work"
+        bob_root = tmp_path / "bob-work"
+        alice_root.mkdir()
+        bob_root.mkdir()
+        own_file = alice_root / "result.txt"
+        other_file = bob_root / "private.txt"
+        own_file.write_text("alice result")
+        other_file.write_text("bob private")
+        client = self._client_for(app_module, "u_alice")
+        with (
+            patch("app.get_session_cwd", return_value=str(alice_root)),
+            patch("app._user_data_dir", return_value=tmp_path / "alice-data"),
+            patch("app._user_codex_config_dir", return_value=tmp_path / "alice-codex"),
+        ):
+            own = client.get("/file", params={"path": str(own_file), "session": "alice-session"})
+            other = client.get("/file", params={"path": str(other_file), "session": "alice-session"})
+            wrong_session = client.get("/file", params={"path": str(own_file), "session": "bob-session"})
+        assert own.status_code == 200
+        assert own.text == "alice result"
+        assert other.status_code == 403
+        assert wrong_session.status_code == 403
+
+    def test_member_agents_editor_uses_only_its_private_account_file(
+        self, tenant_state, tmp_path
+    ):
+        app_module, users, sessions = tenant_state
+        alice, bob = users[1], users[2]
+        project = tmp_path / "alice-project"
+        project.mkdir()
+        account_dirs = {
+            alice["id"]: tmp_path / "alice-codex",
+            bob["id"]: tmp_path / "bob-codex",
+        }
+        for directory in account_dirs.values():
+            directory.mkdir()
+        alice_agents = account_dirs[alice["id"]] / "AGENTS.md"
+        bob_agents = account_dirs[bob["id"]] / "AGENTS.md"
+        alice_agents.write_text("alice instructions")
+        bob_agents.write_text("bob instructions")
+        client = self._client_for(app_module, alice["id"])
+
+        with (
+            patch("app.get_tmux_sessions", return_value=sessions),
+            patch("app.get_session_cwd", return_value=str(project)),
+            patch(
+                "app._user_codex_config_dir",
+                side_effect=lambda user: account_dirs[user["id"]],
+            ),
+            patch("app._ensure_user_codex_config_dir"),
+            patch("app._backup_before_dashboard_write"),
+        ):
+            viewed = client.get("/api/sessions/alice-session/codex-md")
+            rejected = client.post(
+                "/api/sessions/alice-session/codex-md",
+                json={"path": str(bob_agents), "content": "stolen"},
+            )
+            saved = client.post(
+                "/api/sessions/alice-session/codex-md",
+                json={"path": str(alice_agents), "content": "alice updated"},
+            )
+
+        global_file = next(
+            item for item in viewed.json()["files"] if item["label"] == "Global"
+        )
+        assert global_file["path"] == str(alice_agents)
+        assert global_file["content"] == "alice instructions"
+        assert rejected.status_code == 403
+        assert saved.status_code == 200
+        assert alice_agents.read_text() == "alice updated"
+        assert bob_agents.read_text() == "bob instructions"
+
+    def test_member_uploads_are_stored_under_its_private_data_root(
+        self, tenant_state, tmp_path
+    ):
+        from io import BytesIO
+
+        app_module, users, sessions = tenant_state
+        alice, bob = users[1], users[2]
+        upload_roots = {
+            alice["id"]: tmp_path / "alice-data" / "uploads",
+            bob["id"]: tmp_path / "bob-data" / "uploads",
+        }
+        client = self._client_for(app_module, alice["id"])
+        app_module.cache.pop("alice-session", None)
+
+        with (
+            patch("app.get_tmux_sessions", return_value=sessions),
+            patch(
+                "app._user_uploads_dir",
+                side_effect=lambda user: upload_roots[user["id"]],
+            ),
+            patch("app._load_session_messages", return_value=[]),
+            patch("app._save_messages"),
+        ):
+            uploaded = client.post(
+                "/api/sessions/alice-session/upload",
+                files={"file": ("result.txt", BytesIO(b"alice result"), "text/plain")},
+            )
+            listed = client.get("/api/sessions/alice-session/uploads")
+
+        expected = upload_roots[alice["id"]] / "alice-session" / "result.txt"
+        assert uploaded.status_code == 200
+        assert uploaded.json()["path"] == str(expected)
+        assert expected.read_bytes() == b"alice result"
+        assert listed.json()["files"][0]["path"] == str(expected)
+        assert not upload_roots[bob["id"]].exists()
+
+    def test_member_browser_access_is_bound_to_its_account(self, tenant_state):
+        app_module, users, _sessions = tenant_state
+        alice, bob = users[1], users[2]
+        alice_id = app_module._tenant_browser_id(alice)
+        bob_id = app_module._tenant_browser_id(bob)
+        browsers = [
+            {"id": alice_id, "tenant_user_id": alice["id"]},
+            {"id": bob_id, "tenant_user_id": bob["id"]},
+        ]
+        with patch("app._load_browser_sessions", return_value=browsers):
+            assert app_module._user_can_access_browser(alice, alice_id) is True
+            assert app_module._user_can_access_browser(alice, bob_id) is False
+            response = self._client_for(app_module, alice["id"]).get(
+                f"/browser/{bob_id}/vnc.html"
+            )
+        assert response.status_code == 404
+
+    def test_member_cannot_open_another_users_browser_websocket(self, tenant_state):
+        app_module, users, _sessions = tenant_state
+        alice, bob = users[1], users[2]
+        bob_id = app_module._tenant_browser_id(bob)
+        browsers = [{"id": bob_id, "tenant_user_id": bob["id"]}]
+        client = self._client_for(app_module, alice["id"])
+        with patch("app._load_browser_sessions", return_value=browsers):
+            with pytest.raises(WebSocketDisconnect) as closed:
+                with client.websocket_connect(f"/browser/{bob_id}/websockify"):
+                    pass
+        assert closed.value.code == 1008
+
+    def test_admin_global_instructions_sync_every_member(self, tenant_state, tmp_path):
+        app_module, users, _sessions = tenant_state
+        global_file = tmp_path / "global-context.md"
+        member_dirs = {
+            user["id"]: tmp_path / user["id"] for user in users if user["role"] != "admin"
+        }
+        with (
+            patch.object(app_module, "GLOBAL_CONTEXT_FILE", global_file),
+            patch("app._user_codex_config_dir", side_effect=lambda user: member_dirs[user["id"]]),
+        ):
+            response = self._client_for(app_module, "admin").post(
+                "/api/global-context", json={"content": "# Company rules\nKeep tenant data private.\n"}
+            )
+        assert response.status_code == 200
+        assert response.json()["synced"] == 2
+        for directory in member_dirs.values():
+            agents = (directory / "AGENTS.md").read_text()
+            assert "Keep tenant data private." in agents
+            assert "TEAM GLOBAL CONTEXT" in agents
 
 
 # ─── Session-Specific Endpoint Tests ───

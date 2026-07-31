@@ -604,6 +604,46 @@ class TestSessionVisibility:
         assert '[mcp_servers.google]\ncommand = "python"' in migrated
         assert 'TOKEN = "preserve-me"' in migrated
 
+    def test_member_browser_mcp_is_bound_to_private_profile_and_port(self, tmp_path):
+        import app
+
+        config = tmp_path / "config.toml"
+        config.write_text('model = "test"\n')
+        user = {"id": "u_member", "username": "member", "role": "user"}
+        browser = {"id": "acct-private", "cdp_port": 9247}
+        with (
+            patch("app._ensure_tenant_browser", return_value=browser),
+            patch("app._backup_before_dashboard_write"),
+        ):
+            assert app._ensure_browser_mcp(tmp_path, user) is True
+        content = config.read_text()
+        assert 'TMUX_DASH_BROWSER_ID = "acct-private"' in content
+        assert 'TMUX_DASH_BROWSER_CDP_PORT = "9247"' in content
+        assert '.playwright-mcp/acct-private' in content
+
+    def test_tenant_browser_ids_are_stable_and_distinct(self):
+        import app
+
+        alice = {"id": "u_alice", "role": "user"}
+        bob = {"id": "u_bob", "role": "user"}
+        assert app._tenant_browser_id(alice) == app._tenant_browser_id(alice)
+        assert app._tenant_browser_id(alice) != app._tenant_browser_id(bob)
+
+    def test_session_owners_refresh_across_process_writes(self, tmp_path):
+        import app
+        from runtime_control import LockedJsonStore
+
+        owners_file = tmp_path / "owners.json"
+        with patch.object(app, "SESSION_OWNERS_FILE", owners_file):
+            app._set_session_owner("first", "u_one")
+            LockedJsonStore(owners_file, dict).update(
+                lambda owners: owners.__setitem__("second", "u_two")
+            )
+            assert app._load_session_owners() == {
+                "first": "u_one",
+                "second": "u_two",
+            }
+
 
 # ─── get_pane_position Tests ───
 
