@@ -12,7 +12,9 @@ import secrets
 import select
 import shlex
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,9 +41,22 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
+from runtime_control import (
+    BrowserLeaseStore,
+    LockedJsonStore,
+    SessionLifecycleStore,
+    browser_start_argv,
+    browser_unit_name,
+    scoped_codex_command,
+    user_systemd_argv,
+)
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
+PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
+if PROCESS_ROLE not in {"combined", "api", "controller"}:
+    PROCESS_ROLE = "combined"
 # Default launch command for codex sessions. config.toml already sets
 # sandbox_mode=danger-full-access and approval_policy=never so bare `codex`
 # is non-interactive; we still pass the explicit flag for safety on hosts that
@@ -224,11 +239,30 @@ def _session_launch_base(session_name: str = "", user: dict | None = None) -> st
     """Use a sandboxed launch for team members; admins keep the configured command."""
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
-        if TEAM_MODE and owner and not _is_admin(owner):
+        if _multi_tenant_enabled() and owner and not _is_admin(owner):
             return "codex --sandbox workspace-write --ask-for-approval never"
     except Exception:
         pass
     return NEW_SESSION_CMD
+
+
+def _session_launch_command(
+    session_name: str,
+    base: str,
+    *,
+    pin_model: bool = True,
+    resume: bool = False,
+) -> str:
+    """Build the Codex command and keep its process tree in a session scope."""
+    launch = _launch_codex_cmd(base, pin_model=pin_model, resume=resume)
+    return scoped_codex_command(
+        session_name,
+        launch,
+        memory_high_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_HIGH_MB", "2048")),
+        memory_max_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_MAX_MB", "4096")),
+        tasks_max=int(os.environ.get("TMUX_DASH_CODEX_TASKS_MAX", "768")),
+        cpu_weight=int(os.environ.get("TMUX_DASH_CODEX_CPU_WEIGHT", "100")),
+    )
 
 
 # Compatibility aliases used by newer Grabo paths while the implementation is Codex.
@@ -293,6 +327,27 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 # Keep Grabo's established dashboard state directory so users, history, browser
 # sessions, and settings survive the runtime migration.
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
+CONTROLLER_SOCKET = Path(
+    os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
+)
+BROWSER_LEASES_FILE = MESSAGES_DIR / "browser-leases.json"
+BROWSER_RUNTIME_FILE = MESSAGES_DIR / "browser-runtime.json"
+SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
+CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
+BROWSER_LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
+BROWSER_PARK_AFTER = max(300, int(os.environ.get("TMUX_DASH_BROWSER_PARK_AFTER", "1200")))
+SESSION_PARK_AFTER = max(3600, int(os.environ.get("TMUX_DASH_SESSION_PARK_AFTER", "86400")))
+SESSION_LIFECYCLE_INTERVAL = max(
+    30, int(os.environ.get("TMUX_DASH_LIFECYCLE_INTERVAL", "300"))
+)
+_browser_leases = BrowserLeaseStore(BROWSER_LEASES_FILE)
+_browser_runtime = LockedJsonStore(
+    BROWSER_RUNTIME_FILE, lambda: {"version": 1, "browsers": {}}
+)
+_session_lifecycle = SessionLifecycleStore(SESSION_LIFECYCLE_FILE)
+_controller_snapshot = LockedJsonStore(
+    CONTROLLER_SNAPSHOT_FILE, lambda: {"version": 1}
+)
 OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
 _stored_openai_key: str = ""
 
@@ -536,29 +591,17 @@ def _is_codex_running(session_name: str) -> bool:
         pane_pid = (result.stdout or "").strip()
         if not pane_pid.isdigit():
             return False
+        children, commands = _process_tree_snapshot()
         pending = [pane_pid]
-        seen = {pane_pid}
-        for _ in range(64):
-            if not pending:
-                break
-            parent = pending.pop(0)
-            children = subprocess.run(
-                ["pgrep", "-P", parent], capture_output=True, text=True, timeout=2
-            )
-            for child in (children.stdout or "").split():
-                if child in seen:
-                    continue
-                seen.add(child)
-                pending.append(child)
-                try:
-                    comm = Path(f"/proc/{child}/comm").read_text().strip().lower()
-                    argv = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ").decode(
-                        errors="replace"
-                    ).lower()
-                except Exception:
-                    continue
-                if comm == "codex" or re.search(r"(?:^|[/\s])codex(?:\s|$)", argv):
-                    return True
+        seen: set[str] = set()
+        while pending and len(seen) < 10000:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if commands.get(current) == "codex":
+                return True
+            pending.extend(children.get(current, ()))
         return False
     except Exception:
         return False
@@ -595,7 +638,7 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
         try:
-            if TEAM_MODE:
+            if _multi_tenant_enabled():
                 _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
                 if _owner and not _is_admin(_owner):
                     _apply_member_auth(_user_codex_config_dir(_owner))
@@ -612,7 +655,9 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # Codex stores local threads under CODEX_HOME. Resume the newest thread
         # for this working directory instead of opening the interactive picker.
         launch_base = _session_launch_base(session_name)
-        launch = _launch_codex_cmd(launch_base, pin_model=True, resume=True)
+        launch = _session_launch_command(
+            session_name, launch_base, pin_model=True, resume=True
+        )
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -656,12 +701,13 @@ _background_tasks: list = []
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Manage startup and shutdown for the Codex Dashboard FastAPI application."""
-    # --- Startup ---
+    """Start watchdogs only in the controller; API workers stay stateless."""
+    global _shutting_down
+    _shutting_down = False
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=20))
-    logger.info("Codex Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
-                PORT, ROOT_PATH,
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8 if PROCESS_ROLE == "api" else 20))
+    logger.info("Codex Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
+                PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
                 "configured" if OPENAI_API_KEY else "missing")
     if not AUTH_PASS:
@@ -672,36 +718,54 @@ async def lifespan(_app: FastAPI):
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
-    if TEAM_MODE:
+    _load_simple_watchdog_disabled()
+    _load_autopush_mode()
+    _restore_default_model_setting()
+
+    if PROCESS_ROLE == "api":
+        # All mutation/watchdog ownership lives across the Unix socket in the
+        # controller. API workers only serve HTTP and relay streams.
+        yield
+        return
+
+    if _multi_tenant_enabled():
         try:
             _setup_shared_git_config()
             logger.info("Team mode: shared git config applied")
         except Exception:
             logger.debug("shared git config setup failed", exc_info=True)
+    synced_browser_mcp = 0
+    for member in _load_users():
+        if not member:
+            continue
+        config_dir = _user_codex_config_dir(member)
+        if _multi_tenant_enabled() and not _is_admin(member):
+            # Self-heal the full tenant config on startup, including global and
+            # group instructions. Previously only the browser MCP was repaired,
+            # so a host that accidentally omitted TEAM_MODE never received the
+            # admin's shared policy until that user was edited or recreated.
+            _ensure_user_codex_config_dir(member)
+        if (config_dir / "config.toml").exists():
+            synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
+    logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
-    # Auto-responder: presses Enter ONLY when the visible pane shows a
-    # Codex selection prompt with ❯ directly on a numbered option.
-    # The detection refuses to fire when ❯ is followed by free text — that
-    # is the user input box and Enter would submit it (the "phantom
-    # message" bug). Approves plan/permission prompts hands-free.
-    task = asyncio.create_task(_auto_responder_loop())
-    _background_tasks.append(task)
-    logger.info("Auto-responder background task started")
-    watchdog_task = asyncio.create_task(_watchdog_loop())
-    _background_tasks.append(watchdog_task)
-    logger.info("Autonomous mode watchdog started")
-
-    _load_simple_watchdog_disabled()
-    _load_autopush_mode()
-    _restore_default_model_setting()
-    simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
-    _background_tasks.append(simple_watchdog_task)
-    logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
-
-    tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
-    _background_tasks.append(tmp_watchdog_task)
-    logger.info("Tmp watchdog started")
+    _background_tasks.clear()
+    await _start_controller_socket()
+    controller_loops = (
+        ("auto-responder", _auto_responder_loop()),
+        ("autonomous watchdog", _watchdog_loop()),
+        ("simple watchdog", _simple_watchdog_loop()),
+        ("tmp watchdog", _tmp_watchdog_loop()),
+        ("crash recovery", _crash_recovery_loop()),
+        ("model refresh", _model_refresh_loop()),
+        ("browser lifecycle", _browser_lifecycle_loop()),
+        ("session lifecycle", _session_lifecycle_loop()),
+        ("controller snapshot", _controller_snapshot_loop()),
+    )
+    for label, coroutine in controller_loops:
+        _background_tasks.append(asyncio.create_task(coroutine))
+        logger.info("%s started", label)
 
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
@@ -738,20 +802,10 @@ async def lifespan(_app: FastAPI):
     # but file still has their old state). Re-save now based on in-memory dicts only.
     _save_autonomous_state()
 
-    crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
-    _background_tasks.append(crash_recovery_task)
-    logger.info("Crash-recovery watchdog started")
-
-    model_refresh_task = asyncio.create_task(_model_refresh_loop())
-    _background_tasks.append(model_refresh_task)
-    logger.info("Model auto-detect started (default=%s, %d models)", DEFAULT_MODEL, len(MODEL_CATALOG))
-
     yield  # Application is running
 
-    # --- Shutdown ---
-    global _shutting_down
     _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
-    logger.info("Codex Dashboard shutting down — cancelling %d background tasks", len(_background_tasks))
+    logger.info("Controller shutting down — cancelling %d background tasks", len(_background_tasks))
     # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
     _save_autonomous_state()
     logger.info("Autonomous mode state saved to disk for restore on next startup")
@@ -768,6 +822,7 @@ async def lifespan(_app: FastAPI):
         if state.get("task") and not state["task"].done():
             state["task"].cancel()
             logger.info("Cancelled go-nuts-mode worker for '%s'", name)
+    await _stop_controller_socket()
     try:
         _cancel_codex_chatgpt_login()
     except Exception:
@@ -930,6 +985,23 @@ def _is_admin(user: dict | None) -> bool:
     return bool(user) and user.get("role") == "admin"
 
 
+def _multi_tenant_enabled() -> bool:
+    """Enable tenant behavior whenever real member accounts exist.
+
+    Older deployments relied only on ``TMUX_DASH_TEAM_MODE``. That made a
+    multi-user users.json silently run with the single-user security/UI policy
+    when the environment flag was omitted. The explicit flag remains useful
+    for provisioning a fresh team host, while persisted non-admin accounts are
+    now sufficient to keep tenant isolation enabled after every restart.
+    """
+    if TEAM_MODE:
+        return True
+    try:
+        return any(not _is_admin(user) for user in _load_users())
+    except Exception:
+        return False
+
+
 # Initialize the users store on import so the admin always exists.
 try:
     _load_users()
@@ -1017,7 +1089,7 @@ def _ensure_user_codex_config_dir(user: dict):
     # Team mode: shared Codex auth, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
-    if TEAM_MODE:
+    if _multi_tenant_enabled():
         try:
             _apply_member_auth(d)
             _sync_global_context_into(codex_md)
@@ -1025,6 +1097,7 @@ def _ensure_user_codex_config_dir(user: dict):
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
             _ensure_google_mcp(d, user)
+            _ensure_browser_mcp(d, user)
             _set_team_model_effort(d)
             _sync_git_rules_into(codex_md)
         except Exception:
@@ -1038,31 +1111,21 @@ _ensure_user_claude_config_dir = _ensure_user_codex_config_dir
 
 # --- Session ownership ---
 SESSION_OWNERS_FILE = MESSAGES_DIR / "session_owners.json"
-_session_owners_cache: dict[str, str] | None = None
 
 
 def _load_session_owners() -> dict[str, str]:
-    global _session_owners_cache
-    if _session_owners_cache is not None:
-        return _session_owners_cache
+    """Read the ownership map fresh under a cross-process shared lock.
+
+    API workers and the controller are separate processes. The old permanent
+    in-process cache could therefore keep stale owners indefinitely and its
+    read/modify/write updates could overwrite another worker's assignment.
+    """
     try:
-        if SESSION_OWNERS_FILE.exists():
-            data = json.loads(SESSION_OWNERS_FILE.read_text())
-            if isinstance(data, dict):
-                _session_owners_cache = {str(k): str(v) for k, v in data.items()}
-                return _session_owners_cache
+        data = LockedJsonStore(SESSION_OWNERS_FILE, dict).read()
+        return {str(k): str(v) for k, v in data.items()}
     except Exception:
         logger.debug("Failed to load session owners", exc_info=True)
-    _session_owners_cache = {}
-    return _session_owners_cache
-
-
-def _save_session_owners():
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        SESSION_OWNERS_FILE.write_text(json.dumps(_load_session_owners(), indent=2))
-    except Exception:
-        logger.debug("Failed to save session owners", exc_info=True)
+    return {}
 
 
 def _session_owner_id(session_name: str) -> str:
@@ -1073,16 +1136,17 @@ def _session_owner_id(session_name: str) -> str:
 
 
 def _set_session_owner(session_name: str, user_id: str):
-    owners = _load_session_owners()
-    owners[session_name] = user_id
-    _save_session_owners()
+    def mutate(owners: dict):
+        owners[str(session_name)] = str(user_id)
+
+    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _clear_session_owner(session_name: str):
-    owners = _load_session_owners()
-    if session_name in owners:
-        owners.pop(session_name, None)
-        _save_session_owners()
+    def mutate(owners: dict):
+        owners.pop(str(session_name), None)
+
+    LockedJsonStore(SESSION_OWNERS_FILE, dict).update(mutate)
 
 
 def _user_for_session(session_name: str) -> dict | None:
@@ -1233,11 +1297,30 @@ _SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)(?:/.*)?$")
 
 
 _ADMIN_ONLY_PREFIXES = (
+    "/qa-output",
+    "/api/admin",
     "/api/profiles",
     "/api/skill-library",
+    "/api/context-files",
+    "/api/global-context",
     "/api/global-codex",
     "/api/global",
     "/api/all-sessions",
+    "/api/stats",
+    "/api/login-health",
+    "/api/auto-respond-log",
+    "/api/browser",
+    "/api/auth/status",
+    "/api/auth/token",
+    "/api/auth/setup",
+    "/api/auth/chatgpt",
+    "/api/auth/api-key",
+    "/api/auth/logout",
+    "/api/auth/codex-status",
+    "/api/auth/claude-status",
+    "/api/auth/usage",
+    "/api/usage/limits",
+    "/api/models/refresh",
 )
 
 
@@ -1246,8 +1329,10 @@ async def session_ownership_middleware(request: Request, call_next):
     """Block per-session API calls when the caller doesn't own the session
     and reject admin-only routes for non-admin users.
 
-    Admins always pass. Sessions with no recorded owner default to admin, so
-    legacy sessions stay accessible by the admin without migration.
+    Admins always pass individual-session checks. Session list endpoints still
+    default them to their own sessions; ``scope=all`` enables the explicit
+    operational view. Sessions with no recorded owner default to admin so
+    legacy sessions stay with the built-in account.
     """
     if not AUTH_PASS:
         return await call_next(request)
@@ -1295,9 +1380,6 @@ async def auth_middleware(request: Request, call_next):
     # fallback (auth_request only treats a real 2xx as authenticated).
     if path.endswith("/api/auth/verify"):
         return await call_next(request)
-    # Allow qa-output files without auth
-    if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
-        return await call_next(request)
     # Sandbox guard hook calls this from localhost with no cookie (it checks the
     # client host itself). OAuth callback self-verifies a signed state param and
     # must work even when the cross-site redirect from Google drops the cookie.
@@ -1311,7 +1393,7 @@ async def auth_middleware(request: Request, call_next):
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
     if _is_public_project_request(rel_path):
         return await call_next(request)
-    token = request.cookies.get("tmux_auth")
+    token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
         resp = HTMLResponse(_login_page())
         return _apply_security_headers(request, resp)
@@ -1321,7 +1403,7 @@ async def auth_middleware(request: Request, call_next):
     user = _user_from_token(token)
     if not user:
         resp = HTMLResponse(_login_page())
-        resp.delete_cookie("tmux_auth")
+        resp.delete_cookie(AUTH_COOKIE)
         return _apply_security_headers(request, resp)
     request.state._current_user = user
     return await call_next(request)
@@ -1331,7 +1413,7 @@ async def auth_middleware(request: Request, call_next):
 async def api_auth_verify(request: Request):
     """SSO check for nginx ``auth_request`` from sibling knowva.ai apps.
 
-    Returns 200 when the shared ``tmux_auth`` cookie is valid, else 401 — so a
+    Returns 200 when this dashboard's configured auth cookie is valid, else 401 — so a
     single login to this dashboard unlocks the other knowva.ai apps (matcher,
     crypto, zoom, ...) which gate on this endpoint instead of separate logins.
 
@@ -1339,7 +1421,7 @@ async def api_auth_verify(request: Request):
     here on purpose: letting anyone with a company address into the dashboard
     should not also hand them the crypto/sales/matcher apps.
     """
-    u = _user_from_token(request.cookies.get("tmux_auth"))
+    u = _user_from_token(request.cookies.get(AUTH_COOKIE))
     if u and u.get("sso", True) is not False:
         return JSONResponse({"ok": True})
     return JSONResponse({"ok": False}, status_code=401)
@@ -1911,7 +1993,7 @@ async def api_admin_delete_user(request: Request, user_id: str):
 
 def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30,
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
     return resp
 
@@ -1919,7 +2001,7 @@ def _set_auth_cookie(resp, request: Request, token: str):
 @app.post("/api/admin/users/{user_id}/impersonate")
 async def api_admin_impersonate(request: Request, user_id: str):
     """Admin 'log in as' a user to see their work. Stashes the admin's own token
-    in a side cookie so they can return; swaps tmux_auth to the target."""
+    in a side cookie so they can return; swaps the configured auth cookie to the target."""
     admin = _current_user(request)
     if not _is_admin(admin):
         return JSONResponse({"error": "Admin only"}, status_code=403)
@@ -2661,7 +2743,12 @@ async def api_my_context_save(request: Request, filename: str, body: SaveMyConte
                 tomllib.loads(body.content or "")
             except tomllib.TOMLDecodeError as e:
                 return JSONResponse({"error": f"Invalid TOML: {e}"}, status_code=400)
+        _backup_before_dashboard_write(p)
         p.write_text(body.content or "")
+        if not _is_admin(user):
+            # A member may edit their private content, but cannot accidentally
+            # strip the admin/group policy or their isolated browser binding.
+            _ensure_user_codex_config_dir(user)
         return JSONResponse({"ok": True, "path": str(p)})
     except Exception:
         logger.exception("Failed to save my-context %s for %s", filename, user["id"])
@@ -2776,7 +2863,7 @@ async def api_me(request: Request):
             return JSONResponse({
                 "id": "admin", "username": AUTH_USER or "admin",
                 "role": "admin", "auth_disabled": True,
-                "team_mode": TEAM_MODE, "brand": BRAND_NAME, "simple": False,
+                "team_mode": _multi_tenant_enabled(), "brand": BRAND_NAME, "simple": False,
             })
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     is_admin = _is_admin(user)
@@ -2790,18 +2877,18 @@ async def api_me(request: Request):
         "username": user.get("username", ""),
         "role": user.get("role", "user"),
         "auth_disabled": False,
-        "team_mode": TEAM_MODE,
+        "team_mode": _multi_tenant_enabled(),
         "brand": BRAND_NAME,
         # "simple" = the heavily-stripped team UI shown to non-admin members.
-        "simple": bool(TEAM_MODE and not is_admin),
+        "simple": bool(_multi_tenant_enabled() and not is_admin),
         "impersonating": impersonating,
         "impersonator": imp_admin.get("username", "") if impersonating else "",
     })
 
 
 # ===========================================================================
-# Team mode: shared auth, global context, soft sandbox, Google connections.
-# All gated behind TEAM_MODE; no effect on personal boxes.
+# Multi-tenant mode: shared auth, global context, soft sandbox, Google connections.
+# Enabled explicitly or automatically once a non-admin account exists.
 # ===========================================================================
 import base64
 import urllib.parse
@@ -3511,6 +3598,125 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
         logger.debug("Failed to write Google MCP entry into %s", cfg, exc_info=True)
 
 
+def _tenant_browser_id(user: dict) -> str:
+    """Stable, non-identifying browser id for one dashboard member."""
+    user_id = str((user or {}).get("id") or "member")
+    return "acct-" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _ensure_tenant_browser(user: dict) -> dict:
+    """Provision a parked, persistent browser profile for one member.
+
+    Records are cheap: Chrome/Xvfb are still started only while a lease exists.
+    The transaction prevents two API workers creating the same account browser
+    with different ports.
+    """
+    if not user or _is_admin(user):
+        return dict(_DEFAULT_BROWSER_SESSION)
+    sid = _tenant_browser_id(user)
+    snapshot = _load_browser_sessions()
+    store = LockedJsonStore(BROWSER_SESSIONS_FILE, lambda: {"sessions": snapshot})
+
+    def mutate(data: dict) -> dict:
+        sessions = data.get("sessions")
+        if not isinstance(sessions, list):
+            sessions = [dict(row) for row in snapshot]
+            data["sessions"] = sessions
+        found = next((row for row in sessions if row.get("id") == sid), None)
+        if found:
+            found["tenant_user_id"] = str(user.get("id") or "")
+            found["lifecycle_managed"] = True
+            return dict(found)
+        used = {int(row.get("slot", 0) or 0) for row in sessions}
+        slot = 1
+        while slot in used:
+            slot += 1
+        row = {
+            "id": sid,
+            "name": f"{str(user.get('username') or 'member')[:40]} browser",
+            "slot": slot,
+            "display": 99 + slot,
+            "rfb_port": 5900 + slot,
+            "vnc_port": 6080 + slot,
+            "cdp_port": 9222 + slot,
+            "managed": True,
+            "lifecycle_managed": True,
+            "tenant_user_id": str(user.get("id") or ""),
+            "created_at": time.time(),
+        }
+        sessions.append(row)
+        return dict(row)
+
+    _data, browser = store.update(mutate)
+    return browser
+
+
+def _user_can_access_browser(user: dict | None, browser_id: str) -> bool:
+    """Admins manage every browser; members can view only their own profile."""
+    if _is_admin(user):
+        return True
+    if not user or browser_id != _tenant_browser_id(user):
+        return False
+    browser = _browser_session_by_id(browser_id)
+    return bool(browser) and browser.get("tenant_user_id") == user.get("id")
+
+
+def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
+    """Give each Codex home a call-scoped, account-isolated browser lease."""
+    cfg = cfg_dir / "config.toml"
+    begin = "# BEGIN GRABO PLAYWRIGHT MCP (managed)"
+    end = "# END GRABO PLAYWRIGHT MCP"
+    try:
+        browser = _ensure_tenant_browser(user) if user and not _is_admin(user) else dict(_DEFAULT_BROWSER_SESSION)
+        browser_id = _toml_escape(str(browser.get("id") or "default"))
+        cdp_port = int(browser.get("cdp_port") or 9222)
+        output_dir = _toml_escape(str(Path.home() / ".playwright-mcp" / browser_id))
+        proxy = _toml_escape(str(Path(__file__).resolve().parent / "browser_mcp_lease_proxy.py"))
+        block = (
+            f"{begin}\n"
+            "[mcp_servers.playwright-browser]\n"
+            'command = "python3"\n'
+            f'args = ["{proxy}"]\n'
+            "\n[mcp_servers.playwright-browser.env]\n"
+            f'TMUX_DASH_BROWSER_ID = "{browser_id}"\n'
+            f'TMUX_DASH_BROWSER_CDP_PORT = "{cdp_port}"\n'
+            f'TMUX_DASH_BROWSER_OUTPUT_DIR = "{output_dir}"\n'
+            f"{end}\n"
+        )
+        existing = cfg.read_text() if cfg.exists() else ""
+        if begin in existing and end in existing:
+            current = re.search(
+                rf"{re.escape(begin)}.*?{re.escape(end)}",
+                existing,
+                flags=re.DOTALL,
+            )
+            if current and current.group(0).strip() == block.strip():
+                return False
+            existing = re.sub(
+                rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?",
+                "\n",
+                existing,
+                flags=re.DOTALL,
+            ).rstrip() + "\n"
+        elif re.search(r"^\s*\[mcp_servers\.playwright-browser\]\s*$", existing, re.MULTILINE):
+            # Migrate the old direct, always-connected CDP server. Stop at the
+            # next TOML table so unrelated MCP credentials remain byte-for-byte.
+            existing = re.sub(
+                r"\n?^\s*\[mcp_servers\.playwright-browser\]\s*$.*?(?=^\s*\[|\Z)",
+                "\n",
+                existing,
+                flags=re.MULTILINE | re.DOTALL,
+            ).rstrip() + "\n"
+        updated = existing.rstrip() + "\n\n" + block if existing.strip() else block
+        _backup_before_dashboard_write(cfg)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(updated)
+        return True
+    except Exception:
+        logger.debug("Failed to write Playwright MCP entry into %s", cfg, exc_info=True)
+        return False
+
+
 def _write_google_mcp(user: dict, service: str):
     """Called after a successful connect; ensures the google MCP server is registered."""
     _ensure_google_mcp(_user_codex_config_dir(user), user)
@@ -3882,6 +4088,13 @@ async def api_admin_context_write(request: Request, scope: str, ident: str, body
                     _ensure_user_codex_config_dir(u)
                 except Exception:
                     pass
+    elif scope == "user":
+        target_user = _find_user_by_id(ident)
+        if target_user and not _is_admin(target_user):
+            try:
+                _ensure_user_codex_config_dir(target_user)
+            except Exception:
+                logger.debug("Failed to re-apply managed member context", exc_info=True)
     return JSONResponse({"ok": True})
 
 
@@ -3905,6 +4118,13 @@ async def api_admin_context_delete(request: Request, scope: str, ident: str, pat
             target.unlink()
     except Exception:
         return JSONResponse({"error": "Delete failed"}, status_code=500)
+    if scope == "user":
+        target_user = _find_user_by_id(ident)
+        if target_user and not _is_admin(target_user):
+            try:
+                _ensure_user_codex_config_dir(target_user)
+            except Exception:
+                logger.debug("Failed to restore managed member files", exc_info=True)
     return JSONResponse({"ok": True})
 
 
@@ -4085,6 +4305,51 @@ _FILE_SERVE_DENYLIST = {
 _FILE_SERVE_DENY_PREFIXES = (
     "/proc/", "/sys/", "/dev/",
 )
+_FILE_SERVE_DENY_NAMES = {
+    ".git-credentials", ".credentials.json", "auth.json",
+    "claude_api_keys.md", "credentials.json",
+}
+
+
+def _file_path_is_sensitive(path: Path) -> bool:
+    """Reject credential-shaped paths even when a terminal prints a link."""
+    for part in path.parts:
+        lowered = part.lower()
+        if lowered == ".env" or lowered.startswith(".env."):
+            return True
+        if lowered in _FILE_SERVE_DENY_NAMES:
+            return True
+        if lowered.endswith((".pem", ".key")) or lowered.startswith("id_rsa"):
+            return True
+    return False
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        return path == resolved_root or resolved_root in path.parents
+    except Exception:
+        return False
+
+
+def _member_can_serve_file(user: dict, session_name: str, target: Path) -> bool:
+    """Limit member file links to their account and owned session workspace."""
+    if not session_name or _session_owner_id(session_name) != user.get("id"):
+        return False
+    roots = [
+        _user_data_dir(user),
+        _user_codex_config_dir(user),
+        PROJECTS_ROOT / str(user.get("username") or user.get("id") or "member"),
+    ]
+    cwd = get_session_cwd(session_name)
+    if cwd:
+        cwd_path = Path(cwd).resolve()
+        # A pane at / or the shared OS home must not turn /file into a browser
+        # for every tenant's data. Once the pane enters a project, that project
+        # becomes an allowed root for its owner.
+        if cwd_path not in (Path("/"), Path.home().resolve()):
+            roots.append(cwd_path)
+    return any(_path_within(target, root) for root in roots)
 
 # Some paths the terminal linkifier turns into <BASE>/file?path=... links are
 # not absolute filesystem paths but URL routes on sister apps (typically the
@@ -4208,12 +4473,16 @@ def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
     the dashboard's auth middleware — same login as the dashboard itself."""
     rp = request.scope.get("root_path", "") or ""
     real = str(dir_path)
+    session_name = request.query_params.get("session", "")
 
     def _attr(s: str) -> str:
         return _html_escape(s).replace('"', "&quot;")
 
     def _link(p: Path) -> str:
-        return rp + "/file?path=" + urllib.parse.quote(str(p), safe="")
+        link = rp + "/file?path=" + urllib.parse.quote(str(p), safe="")
+        if session_name:
+            link += "&session=" + urllib.parse.quote(session_name, safe="")
+        return link
 
     try:
         kids = list(dir_path.iterdir())
@@ -4295,7 +4564,9 @@ def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
 
 
 @app.get("/file")
-async def serve_terminal_file(request: Request, path: str = "", download: int = 0):
+async def serve_terminal_file(
+    request: Request, path: str = "", download: int = 0, session: str = ""
+):
     """Serve a file (or directory listing) referenced from terminal output.
 
     The terminal linkifier (frontend) discovers file paths — absolute
@@ -4307,8 +4578,15 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
     protected by the same login as the dashboard itself.
     """
     orig_path = path
+    user = _current_user(request)
     if not path:
         return _file_error(request, 400, "Bad request", "A file path is required.", orig_path)
+    if not _is_admin(user):
+        if not user or not session or _session_owner_id(session) != user.get("id"):
+            return _file_error(
+                request, 403, "Forbidden",
+                "Member file links require one of your own sessions.", orig_path,
+            )
     # Expand ~ / ~user home-relative paths (terminal output prints these a lot,
     # e.g. "Deliverables in ~/PROBST_LAWSUIT_2026-07-10/").
     if path.startswith("~"):
@@ -4326,6 +4604,8 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
         return _file_error(request, 400, "Bad request", "That path could not be resolved.", orig_path)
     # Re-check denylist against the resolved real path (defeats symlink tricks).
     real = str(target)
+    if _file_path_is_sensitive(target):
+        return _file_error(request, 403, "Forbidden", "Credential files are never served.", orig_path)
     if real in _FILE_SERVE_DENYLIST:
         return _file_error(request, 403, "Forbidden", "This file is on the dashboard's protected list.", orig_path)
     for pref in _FILE_SERVE_DENY_PREFIXES:
@@ -4336,6 +4616,11 @@ async def serve_terminal_file(request: Request, path: str = "", download: int = 
         if upstream:
             return RedirectResponse(url=upstream, status_code=302)
         return _file_error(request, 404, "Not found", "No such file or directory on this host.", orig_path)
+    if not _is_admin(user) and not _member_can_serve_file(user, session, target):
+        return _file_error(
+            request, 403, "Forbidden",
+            "That path is outside this session's workspace.", orig_path,
+        )
     # Directories → a clickable listing (each row stays behind this auth route).
     if target.is_dir():
         return _render_dir_listing(request, target)
@@ -4593,7 +4878,7 @@ def get_tmux_sessions() -> list[dict]:
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
-            return []
+            result.stdout = ""
         sessions = []
         for line in result.stdout.strip().split("\n"):
             if not line:
@@ -4610,6 +4895,24 @@ def get_tmux_sessions() -> list[dict]:
                 "created": parts[2] if len(parts) > 2 else "",
                 "attached": parts[3] == "1" if len(parts) > 3 else False,
             })
+        live_names = {session["name"] for session in sessions}
+        lifecycle_rows = _session_lifecycle.snapshot().get("sessions", {})
+        for name, row in lifecycle_rows.items():
+            if (
+                name in live_names
+                or not row.get("parked")
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", str(name))
+            ):
+                continue
+            sessions.append(
+                {
+                    "name": name,
+                    "windows": "0",
+                    "created": str(int(row.get("parked_at") or 0)),
+                    "attached": False,
+                    "virtual": bool(row.get("virtual")),
+                }
+            )
         return sessions
     except Exception:
         return []
@@ -4631,14 +4934,28 @@ def _find_session(session_name: str) -> tuple:
 
 
 def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
-    """Restrict a session list to the ones the given user is allowed to see."""
-    if _is_admin(user):
-        return sessions
+    """Restrict a session list to sessions owned by the signed-in account.
+
+    Administrators intentionally get the same default here. Their operational
+    all-users view is an explicit ``scope=all`` request, so logging in never
+    drops other people's terminals into the normal dashboard by surprise.
+    """
     if not user:
         return []
     owners = _load_session_owners()
     uid = user["id"]
     return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+
+
+def _session_list_for_request(request: Request, sessions: list) -> tuple[list | None, str]:
+    """Apply the requested list scope; ``None`` means an unauthorized scope."""
+    user = _current_user(request)
+    scope = (request.query_params.get("scope") or "mine").strip().lower()
+    if scope == "all":
+        if not _is_admin(user):
+            return None, "all"
+        return sessions, "all"
+    return _filter_sessions_for_user(sessions, user), "mine"
 
 
 def _find_session_for_user(session_name: str, user: dict | None) -> tuple:
@@ -5804,6 +6121,8 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
 def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
     if activity is None:
         activity = detect_activity(sess["name"])
+    lifecycle = _session_lifecycle.get(sess["name"])
+    autonomous = _load_autonomous_state().get(sess["name"], {})
     return {
         "name": sess["name"],
         "windows": sess["windows"],
@@ -5818,12 +6137,16 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "realtime": data.get("realtime", ""),
         "realtime_at": data.get("realtime_at", 0),
         "messages": data.get("messages", []),
-        "activity_status": activity["status"],
+        "activity_status": "parked" if lifecycle.get("parked") else activity["status"],
         "activity_command": activity["command"],
         "activity_detail": activity["detail"],
         "auth_mode": _session_real_auth_mode(sess["name"]),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+        "away_mode": bool(autonomous.get("away_mode")),
+        "go_nuts_mode": bool(autonomous.get("go_nuts_mode")),
+        "parked": bool(lifecycle.get("parked")),
+        "parked_at": float(lifecycle.get("parked_at") or 0),
         **_session_model_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
     }
@@ -5835,14 +6158,15 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
 async def index(request: Request):
     # Inject the per-user "simple" flag so the member UI is correct from the very
     # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
-    simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
+    simple = bool(_multi_tenant_enabled() and not _is_admin(_current_user(request)))
     return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
 async def api_sessions(request: Request):
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     results, activities = await asyncio.gather(
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
@@ -5857,7 +6181,15 @@ async def api_sessions(request: Request):
 async def api_sessions_fast(request: Request):
     """Return session list with cached data only — no LLM calls. Fast startup."""
     user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    if scope == "all":
+        logger.info(
+            "Admin '%s' opened the all-users session view (%d sessions)",
+            (user or {}).get("username", "admin"),
+            len(sessions),
+        )
     # Run activity detection for all sessions in parallel threads
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
@@ -5872,6 +6204,8 @@ async def api_sessions_fast(request: Request):
         if "notes" not in entry:
             entry["notes"] = _load_session_notes(sess["name"])
         cache[sess["name"]] = entry
+        lifecycle = _session_lifecycle.get(sess["name"])
+        autonomous = _load_autonomous_state().get(sess["name"], {})
         out.append({
             "name": sess["name"],
             "windows": sess["windows"],
@@ -5887,12 +6221,16 @@ async def api_sessions_fast(request: Request):
             "realtime": entry.get("realtime", ""),
             "realtime_at": entry.get("realtime_at", 0),
             "messages": entry.get("messages", []),
-            "activity_status": activity["status"],
+            "activity_status": "parked" if lifecycle.get("parked") else activity["status"],
             "activity_command": activity.get("command", ""),
             "activity_detail": activity.get("detail", ""),
             "auth_mode": _session_real_auth_mode(sess["name"]),
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "away_mode": bool(autonomous.get("away_mode")),
+            "go_nuts_mode": bool(autonomous.get("go_nuts_mode")),
+            "parked": bool(lifecycle.get("parked")),
+            "parked_at": float(lifecycle.get("parked_at") or 0),
             **_session_model_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
         })
@@ -5924,19 +6262,22 @@ async def api_refresh_all_tiers(session_name: str):
 @app.get("/api/status")
 async def api_status(request: Request):
     """Lightweight: return only activity status per session, no LLM calls."""
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
     for sess, activity in zip(sessions, activities):
+        lifecycle = _session_lifecycle.get(sess["name"])
         out.append({
             "name": sess["name"],
-            "activity_status": activity["status"],
+            "activity_status": "parked" if lifecycle.get("parked") else activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "parked": bool(lifecycle.get("parked")),
             **_session_model_fields(sess["name"]),
         })
     return JSONResponse(out)
@@ -6045,6 +6386,811 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     })
 
 
+# --- Shared terminal stream + controller IPC -------------------------------
+# One controller process owns one tmux capture loop per viewed session. API
+# workers only relay its line-delimited JSON over authenticated WebSockets.
+_terminal_channels: dict[str, dict] = {}
+_controller_server = None
+
+
+class _TerminalQueueWriter:
+    """StreamWriter-shaped adapter used by the in-process development server."""
+
+    def __init__(self):
+        self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise ConnectionError("terminal subscriber closed")
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull as exc:
+            # A browser that cannot drain 100 terminal events is stale. Closing
+            # it prevents one slow client from retaining an unbounded backlog.
+            self.closed = True
+            raise ConnectionError("terminal subscriber fell behind") from exc
+
+    async def drain(self) -> None:
+        if self.closed:
+            raise ConnectionError("terminal subscriber closed")
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+def _terminal_full_payload(session_name: str) -> tuple[dict, str, int, str, int]:
+    pos = get_pane_position(session_name)
+    pane_total = int(pos.get("total_lines", 0))
+    visible_hash = _visible_pane_hash(session_name)
+    pane_width = get_pane_width(session_name)
+    raw = capture_pane_full(session_name)
+    payload = {
+        "mode": "full",
+        "raw": raw,
+        "total_lines": len(raw.split("\n")),
+        "pane_total": pane_total,
+        "pane_width": pane_width,
+        "visible_hash": visible_hash,
+    }
+    return payload, raw, pane_total, visible_hash, pane_width
+
+
+def _terminal_next_payload(session_name: str, channel: dict) -> dict | None:
+    """Capture one shared delta while maintaining a full reconnect snapshot."""
+    pos = get_pane_position(session_name)
+    current_total = int(pos.get("total_lines", 0))
+    visible_hash = _visible_pane_hash(session_name)
+    pane_width = get_pane_width(session_name)
+    known = int(channel.get("pane_total", 0))
+    full_text = str(channel.get("full_text", ""))
+
+    if not full_text or current_total < known:
+        payload, raw, total, vis, width = _terminal_full_payload(session_name)
+        channel.update(
+            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
+        )
+        return payload
+
+    if current_total > known:
+        overlap = 5
+        lines_from_end = (current_total - known) + overlap
+        raw = capture_pane_recent(session_name, lines_from_end)
+        incoming = raw.split("\n")
+        existing = full_text.split("\n")
+        if len(existing) >= overlap and existing[-overlap:] == incoming[:overlap]:
+            tail = incoming[overlap:]
+            if tail:
+                channel["full_text"] = full_text + "\n" + "\n".join(tail)
+            channel.update(
+                pane_total=current_total,
+                visible_hash=visible_hash,
+                pane_width=pane_width,
+            )
+            return {
+                "mode": "delta",
+                "raw": raw,
+                "total_lines": current_total,
+                "pane_total": current_total,
+                "pane_width": pane_width,
+                "overlap": overlap,
+                "visible_hash": visible_hash,
+            }
+        payload, raw, total, vis, width = _terminal_full_payload(session_name)
+        channel.update(
+            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
+        )
+        return payload
+
+    if visible_hash and visible_hash != channel.get("visible_hash"):
+        payload, raw, total, vis, width = _terminal_full_payload(session_name)
+        channel.update(
+            full_text=raw, pane_total=total, visible_hash=vis, pane_width=width
+        )
+        return payload
+
+    channel.update(visible_hash=visible_hash, pane_width=pane_width)
+    return None
+
+
+async def _terminal_send(writer: asyncio.StreamWriter, payload: dict) -> bool:
+    try:
+        writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        await asyncio.wait_for(writer.drain(), timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+async def _terminal_broadcast(session_name: str, payload: dict) -> None:
+    channel = _terminal_channels.get(session_name)
+    if not channel:
+        return
+    writers = list(channel.get("writers", set()))
+    if not writers:
+        return
+    results = await asyncio.gather(
+        *(_terminal_send(writer, payload) for writer in writers),
+        return_exceptions=True,
+    )
+    for writer, ok in zip(writers, results):
+        if ok is not True:
+            channel["writers"].discard(writer)
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _terminal_producer(session_name: str) -> None:
+    channel = _terminal_channels[session_name]
+    quiet_ticks = 0
+    try:
+        while channel.get("writers"):
+            try:
+                payload = await asyncio.to_thread(
+                    _terminal_next_payload, session_name, channel
+                )
+                if payload:
+                    quiet_ticks = 0
+                    channel["last_emit"] = time.time()
+                    await _terminal_broadcast(session_name, payload)
+                else:
+                    quiet_ticks += 1
+                    if time.time() - channel.get("last_emit", 0) >= 20:
+                        channel["last_emit"] = time.time()
+                        await _terminal_broadcast(
+                            session_name,
+                            {
+                                "mode": "ping",
+                                "pane_total": channel.get("pane_total", 0),
+                                "pane_width": channel.get("pane_width", 0),
+                                "visible_hash": channel.get("visible_hash", ""),
+                            },
+                        )
+            except Exception as exc:
+                await _terminal_broadcast(
+                    session_name, {"mode": "error", "error": str(exc)[:240]}
+                )
+                quiet_ticks += 1
+            await asyncio.sleep(0.6 if quiet_ticks < 5 else min(2.0, 0.8 + quiet_ticks / 10))
+    finally:
+        channel["task"] = None
+        if not channel.get("writers"):
+            _terminal_channels.pop(session_name, None)
+
+
+async def _terminal_subscribe(
+    session_name: str, writer: asyncio.StreamWriter
+) -> dict:
+    channel = _terminal_channels.setdefault(
+        session_name,
+        {
+            "writers": set(),
+            "task": None,
+            "full_text": "",
+            "pane_total": 0,
+            "visible_hash": "",
+            "pane_width": 0,
+            "last_emit": 0.0,
+        },
+    )
+    channel["writers"].add(writer)
+    if channel.get("full_text"):
+        await _terminal_send(
+            writer,
+            {
+                "mode": "full",
+                "raw": channel["full_text"],
+                "total_lines": len(channel["full_text"].split("\n")),
+                "pane_total": channel.get("pane_total", 0),
+                "pane_width": channel.get("pane_width", 0),
+                "visible_hash": channel.get("visible_hash", ""),
+            },
+        )
+    if not channel.get("task") or channel["task"].done():
+        channel["task"] = asyncio.create_task(_terminal_producer(session_name))
+    return channel
+
+
+async def _terminal_unsubscribe(session_name: str, writer: asyncio.StreamWriter) -> None:
+    channel = _terminal_channels.get(session_name)
+    if not channel:
+        return
+    channel.get("writers", set()).discard(writer)
+    if not channel.get("writers") and channel.get("task"):
+        channel["task"].cancel()
+
+
+def _session_tmux_activity(session_name: str) -> float:
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{session_activity}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return float((result.stdout or "0").strip() or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _session_last_activity(session_name: str, created: float = 0) -> float:
+    lifecycle = _session_lifecycle.get(session_name)
+    return max(
+        float(created or 0),
+        _session_tmux_activity(session_name),
+        float(lifecycle.get("last_interaction") or 0),
+        float(lifecycle.get("resumed_at") or 0),
+    )
+
+
+def _session_has_autonomous_work(session_name: str) -> bool:
+    if _away_mode_state.get(session_name, {}).get("enabled"):
+        return True
+    if _go_nuts_state.get(session_name, {}).get("enabled"):
+        return True
+    saved = _load_autonomous_state().get(session_name, {})
+    return bool(saved.get("away_mode") or saved.get("go_nuts_mode"))
+
+
+def _pane_is_dead(session_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_dead}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0 and (result.stdout or "").strip() == "1"
+    except Exception:
+        return False
+
+
+def _archive_tmux_scrollback(session_name: str) -> str:
+    """Persist a mode-600 copy in addition to tmux's remain-on-exit history."""
+    try:
+        target_dir = MESSAGES_DIR / "parked-scrollback"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{session_name}.log"
+        content = capture_pane_full(session_name)
+        if content:
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(content)
+            tmp.chmod(0o600)
+            os.replace(tmp, target)
+            return str(target)
+    except Exception:
+        logger.exception("Could not archive tmux scrollback for '%s'", session_name)
+    return ""
+
+
+def _restore_parked_tmux_shell(session_name: str, lifecycle: dict) -> bool:
+    """Reanimate a dead/virtual pane without changing its worktree or transcript."""
+    owner = _user_for_session(session_name)
+    cwd = str(lifecycle.get("cwd") or "")
+    if not cwd and _multi_tenant_enabled() and owner and not _is_admin(owner):
+        cwd = str(PROJECTS_ROOT / str(owner.get("username") or "member") / session_name)
+    if not cwd or not Path(cwd).is_dir():
+        cwd = str(Path(__file__).resolve().parent)
+    try:
+        has_session = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).returncode == 0
+        if has_session and _pane_is_dead(session_name):
+            result = subprocess.run(
+                ["tmux", "respawn-pane", "-k", "-t", session_name, "-c", cwd],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        elif not has_session:
+            result = subprocess.run(
+                ["tmux", "new-session", "-d", "-s", session_name, "-c", cwd],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        else:
+            return True
+        if result.returncode != 0:
+            logger.error("Could not restore parked tmux '%s': %s", session_name, result.stderr.strip())
+            return False
+        subprocess.run(
+            ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        owner_name = ((owner or {}).get("username") or AUTH_USER or "admin")
+        project_dir = str(PROJECTS_ROOT / owner_name / session_name)
+        git_email = f"{owner_name}@{GIT_EMAIL_DOMAIN}"
+        assignments = {
+            "DASH_USER": owner_name,
+            "DASH_SESSION": session_name,
+            "DASH_PROJECT_DIR": project_dir,
+            "DASH_PROJECT_URL": f"{PUB_URL}/{owner_name}/{session_name}",
+            "GIT_AUTHOR_NAME": owner_name,
+            "GIT_AUTHOR_EMAIL": git_email,
+            "GIT_COMMITTER_NAME": owner_name,
+            "GIT_COMMITTER_EMAIL": git_email,
+        }
+        if owner and not _is_admin(owner):
+            assignments["CODEX_HOME"] = str(_user_codex_config_dir(owner))
+        export = "export " + " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in assignments.items()
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "-l", export],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to restore parked tmux shell '%s'", session_name)
+        return False
+
+
+async def _park_session_local(session_name: str, last_activity: float) -> dict:
+    """Checkpoint by gracefully exiting Codex; tmux, Git and rollouts remain intact."""
+    if _terminal_channels.get(session_name, {}).get("writers"):
+        return {"ok": False, "skipped": "terminal is being viewed"}
+    if _session_has_autonomous_work(session_name):
+        return {"ok": False, "skipped": "autonomous work is enabled"}
+    activity = await async_detect_activity(session_name)
+    if activity.get("status") != "idle":
+        return {"ok": False, "skipped": f"session is {activity.get('status', 'unknown')}"}
+    scrollback_file = await asyncio.to_thread(_archive_tmux_scrollback, session_name)
+    session_cwd = await asyncio.to_thread(get_session_cwd, session_name)
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if not await _async_is_codex_running(session_name):
+        row = await asyncio.to_thread(
+            _session_lifecycle.mark_parked,
+            session_name,
+            reason="inactive Codex was already stopped",
+            last_activity=last_activity,
+            cwd=session_cwd,
+            scrollback_file=scrollback_file,
+        )
+        return {"ok": True, "parked": True, "session": row}
+
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    for _ in range(15):
+        await asyncio.sleep(1)
+        if not await _async_is_codex_running(session_name):
+            break
+    if await _async_is_codex_running(session_name):
+        # Codex may require one interrupt to leave an empty composer before it
+        # accepts /quit. This is used only after an idle re-check.
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "C-c"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        await asyncio.sleep(0.5)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for _ in range(10):
+            await asyncio.sleep(1)
+            if not await _async_is_codex_running(session_name):
+                break
+    if await _async_is_codex_running(session_name):
+        return {"ok": False, "error": "Codex did not exit cleanly; left running"}
+    row = await asyncio.to_thread(
+        _session_lifecycle.mark_parked,
+        session_name,
+        reason=f"inactive for at least {SESSION_PARK_AFTER}s",
+        last_activity=last_activity,
+        cwd=session_cwd,
+        scrollback_file=scrollback_file,
+    )
+    _seen_claude_running.discard(session_name)
+    logger.info("Parked inactive Codex session '%s' without removing tmux or state", session_name)
+    return {"ok": True, "parked": True, "session": row}
+
+
+async def _resume_parked_session(session_name: str, source: str = "dashboard") -> dict:
+    row = await asyncio.to_thread(
+        _session_lifecycle.touch, session_name, source=source
+    )
+    if not row.get("parked"):
+        return {"ok": True, "parked": False, "resumed": False, "session": row}
+    if row.get("virtual") or _pane_is_dead(session_name):
+        restored = await asyncio.to_thread(
+            _restore_parked_tmux_shell, session_name, row
+        )
+        if not restored:
+            return {"ok": False, "error": "parked tmux shell could not be restored"}
+    if not _find_session(session_name)[1]:
+        return {"ok": False, "error": "session not found"}
+    resumed = await _ensure_codex_running(session_name)
+    if not resumed:
+        return {"ok": False, "error": "Codex resume failed; tmux and state are intact"}
+    row = await asyncio.to_thread(
+        _session_lifecycle.mark_resumed, session_name, source=source
+    )
+    _seen_claude_running.add(session_name)
+    logger.info("Resumed parked Codex session '%s' on demand", session_name)
+    return {"ok": True, "parked": False, "resumed": True, "session": row}
+
+
+async def _session_lifecycle_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = time.time()
+            sessions = await asyncio.to_thread(get_tmux_sessions)
+            for session in sessions:
+                name = session["name"]
+                lifecycle = _session_lifecycle.get(name)
+                if lifecycle.get("parked") or _session_has_autonomous_work(name):
+                    continue
+                if _terminal_channels.get(name, {}).get("writers"):
+                    continue
+                last_activity = await asyncio.to_thread(
+                    _session_last_activity, name, float(session.get("created") or 0)
+                )
+                if not last_activity or now - last_activity < SESSION_PARK_AFTER:
+                    continue
+                result = await _park_session_local(name, last_activity)
+                if not result.get("ok") and result.get("error"):
+                    logger.warning("Could not park '%s': %s", name, result["error"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session lifecycle pass failed")
+        await asyncio.sleep(SESSION_LIFECYCLE_INTERVAL)
+
+
+def _controller_runtime_data() -> dict:
+    leases = _browser_leases.snapshot()
+    lifecycle = _session_lifecycle.snapshot().get("sessions", {})
+    browser_runtime = _browser_runtime.read().get("browsers", {})
+    return {
+        "version": 1,
+        "controller_pid": os.getpid(),
+        "updated_at": time.time(),
+        "process_role": PROCESS_ROLE,
+        "active_browser_leases": leases["active"],
+        "browser_leases_by_session": leases["by_browser"],
+        "browser_runtime": browser_runtime,
+        "parked_sessions": sum(1 for row in lifecycle.values() if row.get("parked")),
+        "session_lifecycle": lifecycle,
+        "terminal_streams": len(_terminal_channels),
+        "terminal_subscribers": sum(
+            len(channel.get("writers", ())) for channel in _terminal_channels.values()
+        ),
+    }
+
+
+async def _controller_snapshot_loop() -> None:
+    while True:
+        try:
+            snapshot = _controller_runtime_data()
+
+            def replace(value: dict, current: dict = snapshot) -> None:
+                value.clear()
+                value.update(current)
+
+            await asyncio.to_thread(_controller_snapshot.update, replace)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Failed to write controller runtime snapshot", exc_info=True)
+        await asyncio.sleep(10)
+
+
+async def _controller_dispatch(message: dict) -> dict:
+    op = str(message.get("op") or "")
+    if op == "ping":
+        return {"ok": True, "pid": os.getpid(), "role": PROCESS_ROLE}
+    if op == "runtime":
+        return {"ok": True, **_controller_runtime_data()}
+    if op == "session_touch":
+        row = await asyncio.to_thread(
+            _session_lifecycle.touch,
+            str(message.get("session") or ""),
+            source=str(message.get("source") or "dashboard"),
+        )
+        return {"ok": True, "session": row}
+    if op == "session_resume":
+        return await _resume_parked_session(
+            str(message.get("session") or ""),
+            source=str(message.get("source") or "dashboard"),
+        )
+    if op == "session_register_virtual":
+        name = str(message.get("session") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
+            return {"ok": False, "error": "invalid session name"}
+        row = await asyncio.to_thread(
+            _session_lifecycle.mark_parked,
+            name,
+            reason=str(message.get("reason") or "recovered parked session"),
+            last_activity=float(message.get("last_activity") or 0),
+            cwd=str(message.get("cwd") or ""),
+            virtual=True,
+        )
+        return {"ok": True, "session": row}
+    if op == "browser_acquire":
+        return await _acquire_browser_lease_local(
+            str(message.get("browser_id") or ""),
+            kind=str(message.get("kind") or "agent"),
+            owner=str(message.get("owner") or ""),
+            ttl=int(message.get("ttl") or BROWSER_LEASE_TTL),
+            mode=str(message.get("mode") or "headless"),
+        )
+    if op == "browser_renew":
+        lease = await asyncio.to_thread(
+            _browser_leases.renew,
+            str(message.get("token") or ""),
+            int(message.get("ttl") or BROWSER_LEASE_TTL),
+        )
+        return {"ok": bool(lease), "lease": lease or {}}
+    if op == "browser_release":
+        released = await asyncio.to_thread(
+            _browser_leases.release, str(message.get("token") or "")
+        )
+        return {"ok": released}
+    if op == "browser_stop":
+        sid = str(message.get("browser_id") or "")
+        browser = _browser_session_by_id(sid)
+        if not browser:
+            return {"ok": False, "error": "browser session not found"}
+        stopped = await _stop_browser_controlled(
+            browser, reason=str(message.get("reason") or "requested")
+        )
+        return {"ok": stopped, "stopped": stopped}
+    if op == "away_toggle":
+        return await _away_toggle_local(
+            str(message.get("session") or ""), bool(message.get("enabled"))
+        )
+    if op == "away_status":
+        return {"ok": True, **_away_state_summary(
+            _away_mode_state.get(str(message.get("session") or ""), {})
+        )}
+    if op == "go_nuts_toggle":
+        return await _go_nuts_toggle_local(
+            str(message.get("session") or ""), bool(message.get("enabled"))
+        )
+    if op == "go_nuts_status":
+        return {"ok": True, **_go_nuts_state_summary(
+            _go_nuts_state.get(str(message.get("session") or ""), {})
+        )}
+    if op == "watchdog_status":
+        name = str(message.get("session") or "")
+        return {
+            "ok": True,
+            "mode": _get_autopush_mode(name),
+            "log": list(_simple_watchdog_log.get(name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+        }
+    if op == "autopush_set":
+        name = str(message.get("session") or "")
+        mode = str(message.get("mode") or "").lower()
+        if mode not in AUTOPUSH_MODES:
+            return {"ok": False, "error": f"mode must be one of {list(AUTOPUSH_MODES)}", "_status": 400}
+        _autopush_mode[name] = mode
+        _save_autopush_mode()
+        if mode != "full":
+            _simple_watchdog_state.pop(name, None)
+        return {
+            "ok": True,
+            "mode": mode,
+            "enabled": mode == "full",
+            "log": list(_simple_watchdog_log.get(name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
+        }
+    return {"ok": False, "error": f"unknown controller operation: {op}"}
+
+
+async def _controller_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    session_name = ""
+    subscribed = False
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=10)
+        message = json.loads(line.decode("utf-8", "replace"))
+        if message.get("op") == "terminal_subscribe":
+            session_name = str(message.get("session") or "")
+            if not _is_valid_session_name(session_name) or not _find_session(session_name)[1]:
+                await _terminal_send(writer, {"mode": "error", "error": "Session not found"})
+                return
+            await _resume_parked_session(session_name, source="terminal-stream")
+            await _terminal_subscribe(session_name, writer)
+            subscribed = True
+            await reader.read()
+            return
+        response = await _controller_dispatch(message)
+        writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode())
+        await writer.drain()
+    except Exception as exc:
+        try:
+            writer.write((json.dumps({"ok": False, "error": str(exc)[:240]}) + "\n").encode())
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        if subscribed:
+            await _terminal_unsubscribe(session_name, writer)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _start_controller_socket() -> None:
+    global _controller_server
+    CONTROLLER_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        CONTROLLER_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+    _controller_server = await asyncio.start_unix_server(
+        _controller_client, path=str(CONTROLLER_SOCKET), limit=1024 * 1024
+    )
+    CONTROLLER_SOCKET.chmod(0o600)
+    logger.info("Controller IPC listening on %s", CONTROLLER_SOCKET)
+
+
+async def _stop_controller_socket() -> None:
+    global _controller_server
+    if _controller_server:
+        _controller_server.close()
+        await _controller_server.wait_closed()
+        _controller_server = None
+    try:
+        CONTROLLER_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+
+
+async def _controller_call(op: str, **fields) -> dict:
+    """Call the controller from an API worker, or dispatch locally in dev."""
+    message = {"op": op, **fields}
+    if PROCESS_ROLE != "api":
+        return await _controller_dispatch(message)
+    last_error = "controller unavailable"
+    for _ in range(10):
+        try:
+            reader, writer = await asyncio.open_unix_connection(
+                str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
+            )
+            writer.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=30)
+            writer.close()
+            await writer.wait_closed()
+            return json.loads(line.decode("utf-8", "replace"))
+        except Exception as exc:
+            last_error = str(exc)
+            await asyncio.sleep(0.2)
+    return {"ok": False, "error": last_error}
+
+
+async def _controller_terminal_connection(session_name: str):
+    if PROCESS_ROLE != "api":
+        return None, None
+    reader, writer = await asyncio.open_unix_connection(
+        str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
+    )
+    writer.write((json.dumps({"op": "terminal_subscribe", "session": session_name}) + "\n").encode())
+    await writer.drain()
+    return reader, writer
+
+
+@app.websocket("/ws/sessions/{session_name}/raw")
+async def ws_session_raw(ws: WebSocket, session_name: str):
+    if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
+        await ws.close(code=1008)
+        return
+    user = _current_user(ws)
+    if not _user_can_access_session(user, session_name):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    reader = writer = None
+    local_writer = None
+    try:
+        if PROCESS_ROLE == "api":
+            reader, writer = await _controller_terminal_connection(session_name)
+
+            async def forward_terminal():
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        raise ConnectionError("controller stream closed")
+                    await ws.send_text(line.decode("utf-8", "replace").rstrip("\n"))
+        else:
+            local_writer = _TerminalQueueWriter()
+            await _resume_parked_session(session_name, source="terminal-stream")
+            await _terminal_subscribe(session_name, local_writer)
+
+            async def forward_terminal():
+                while True:
+                    line = await local_writer.queue.get()
+                    await ws.send_text(line.decode("utf-8", "replace").rstrip("\n"))
+
+        async def watch_client():
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+
+        tasks = {asyncio.create_task(forward_terminal()), asyncio.create_task(watch_client())}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("raw websocket ended for '%s': %s: %s", session_name, type(exc).__name__, exc)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        if writer:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        if local_writer:
+            await _terminal_unsubscribe(session_name, local_writer)
+            local_writer.close()
+
+
 class CreateSession(BaseModel):
     name: str = ""
     profile_id: str = ""
@@ -6125,7 +7271,7 @@ async def api_create_session(request: Request, body: CreateSession):
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
-            if TEAM_MODE and _is_admin(user):
+            if _multi_tenant_enabled() and _is_admin(user):
                 acfg = _user_codex_config_dir(user)
                 _sync_projects_note_into(acfg / "AGENTS.md")
                 _ensure_google_mcp(acfg, user)
@@ -6189,7 +7335,9 @@ async def api_create_session(request: Request, body: CreateSession):
                 logger.debug("Profile model lookup failed on create", exc_info=True)
             subprocess.run(
                 ["tmux", "send-keys", "-t", created, "-l",
-                 _launch_codex_cmd(_session_launch_base(created, user), pin_model=_pin_model)],
+                 _session_launch_command(
+                     created, _session_launch_base(created, user), pin_model=_pin_model
+                 )],
                 capture_output=True, text=True, timeout=5
             )
             subprocess.run(
@@ -6210,6 +7358,10 @@ async def api_delete_session(request: Request, session_name: str):
     _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    if sess.get("virtual"):
+        await asyncio.to_thread(_session_lifecycle.remove, session_name)
+        _clear_session_owner(session_name)
+        return JSONResponse({"ok": True, "killed": session_name, "virtual": True})
     try:
         # First, find and kill all processes in the session's panes.
         # This ensures Codex (node) processes are terminated cleanly
@@ -6290,6 +7442,7 @@ async def api_delete_session(request: Request, session_name: str):
         # Drop the ownership record. Messages/notes are kept on disk so they
         # show up in the user's History tab even after the live session dies.
         _clear_session_owner(session_name)
+        await asyncio.to_thread(_session_lifecycle.remove, session_name)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -6313,6 +7466,10 @@ def get_session_cwd(session_name: str) -> str:
 UPLOADS_DIR = MESSAGES_DIR / "uploads"
 
 
+def _session_uploads_dir(session_name: str) -> Path:
+    return _user_uploads_dir(_user_for_session(session_name)) / session_name
+
+
 @app.post("/api/sessions/{session_name}/upload")
 async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     """Upload a file to a session-specific uploads dir; record only in this session's chat history."""
@@ -6325,8 +7482,8 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    # Save to fixed session-specific uploads dir under ~/.tmux-dashboard/uploads/<session>/
-    uploads_dir = UPLOADS_DIR / session_name
+    # Save under the owning account's data root, never another tenant's tree.
+    uploads_dir = _session_uploads_dir(session_name)
     uploads_dir.mkdir(parents=True, exist_ok=True)
     dest = str(uploads_dir / filename)
     try:
@@ -6357,7 +7514,7 @@ async def api_list_uploads(session_name: str):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    uploads_dir = UPLOADS_DIR / session_name
+    uploads_dir = _session_uploads_dir(session_name)
     files = []
     if uploads_dir.exists():
         for entry in uploads_dir.iterdir():
@@ -6386,7 +7543,7 @@ async def api_delete_upload(session_name: str, filename: str):
     safe_name = os.path.basename(filename)
     if not safe_name or safe_name.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    target = UPLOADS_DIR / session_name / safe_name
+    target = _session_uploads_dir(session_name) / safe_name
     try:
         if target.exists() and target.is_file():
             target.unlink()
@@ -6400,7 +7557,7 @@ async def api_delete_upload(session_name: str, filename: str):
 
 @app.get("/api/sessions/{session_name}/codex-md")
 async def api_get_codex_md(session_name: str):
-    """Read AGENTS.md from the session's working directory and home dir."""
+    """Read project and account AGENTS.md files for this session."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -6417,8 +7574,14 @@ async def api_get_codex_md(session_name: str):
             except Exception:
                 logger.debug("Failed to read AGENTS.md at %s", md_path, exc_info=True)
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
-    # Check home dir
-    home_md = os.path.join(str(Path.home()), "AGENTS.md")
+    # Members get their isolated CODEX_HOME instructions. Keep the legacy
+    # ~/AGENTS.md location for admin sessions for backwards compatibility.
+    owner = _user_for_session(session_name)
+    home_md = str(
+        (_user_codex_config_dir(owner) / "AGENTS.md")
+        if owner and not _is_admin(owner)
+        else (Path.home() / "AGENTS.md")
+    )
     home_content = ""
     if os.path.exists(home_md):
         try:
@@ -6441,20 +7604,32 @@ async def api_save_codex_md(session_name: str, body: SaveCodexMd):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    # Safety: only allow writing AGENTS.md files within home directory
+    # Safety: only the project AGENTS.md and this account's own global file are
+    # valid. Merely being somewhere under the shared OS home is not isolation.
     if not body.path.endswith("AGENTS.md"):
         return JSONResponse({"error": "Can only write AGENTS.md files"}, status_code=400)
     real_path = os.path.realpath(body.path)
-    home_dir = str(Path.home())
-    if not real_path.startswith(home_dir + "/") and real_path != home_dir:
-        return JSONResponse({"error": "Path must be within home directory"}, status_code=403)
     if not real_path.endswith("/AGENTS.md"):
         return JSONResponse({"error": "Invalid path after resolution"}, status_code=400)
+    owner = _user_for_session(session_name)
+    global_path = (
+        _user_codex_config_dir(owner) / "AGENTS.md"
+        if owner and not _is_admin(owner)
+        else Path.home() / "AGENTS.md"
+    )
+    allowed = {os.path.realpath(str(global_path))}
+    cwd = get_session_cwd(session_name)
+    if cwd:
+        allowed.add(os.path.realpath(str(Path(cwd) / "AGENTS.md")))
+    if real_path not in allowed:
+        return JSONResponse({"error": "Path is outside this session's project and account"}, status_code=403)
     try:
         os.makedirs(os.path.dirname(real_path), exist_ok=True)
         _backup_before_dashboard_write(Path(real_path))
         with open(real_path, "w") as f:
             f.write(body.content)
+        if owner and not _is_admin(owner) and real_path == os.path.realpath(str(global_path)):
+            _ensure_user_codex_config_dir(owner)
         return JSONResponse({"ok": True, "path": real_path})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -8596,6 +9771,20 @@ async def api_stats():
             stats["uptime"] = f"{days}d {hours}h"
     except Exception:
         stats["uptime"] = "unknown"
+    controller = _controller_snapshot.read()
+    by_browser = controller.get("browser_leases_by_session", {})
+    stats["capacity"] = {
+        # This is the scheduling signal. Parked/idle tmux sessions retain user
+        # state but consume no browser capacity.
+        "active_browser_leases": int(controller.get("active_browser_leases") or 0),
+        "active_browsers": sum(1 for count in by_browser.values() if int(count) > 0),
+        "browser_leases_by_session": by_browser,
+        "parked_sessions": int(controller.get("parked_sessions") or 0),
+        "terminal_streams": int(controller.get("terminal_streams") or 0),
+        "terminal_subscribers": int(controller.get("terminal_subscribers") or 0),
+        "total_tmux_sessions": len(stats["tmux_sessions"]),
+        "controller_age_seconds": round(max(0, time.time() - float(controller.get("updated_at") or 0)), 1),
+    }
     return JSONResponse(stats)
 
 
@@ -8622,7 +9811,9 @@ async def api_health():
         checks["tmux"] = False
     codex_ready, codex_reason, codex_details = await asyncio.to_thread(_codex_cli_readiness)
     checks["codex_cli"] = {"ready": codex_ready, "reason": codex_reason, **codex_details}
-    if not checks["tmux"] or not codex_ready or not checks["data_dir"]:
+    controller = await _controller_call("ping")
+    checks["controller"] = controller
+    if not checks["tmux"] or not codex_ready or not checks["data_dir"] or not controller.get("ok"):
         checks["status"] = "degraded"
     return JSONResponse(checks)
 
@@ -8917,7 +10108,7 @@ async def api_login_health():
 # --- Codex authentication status --------------------------------------------
 def _auth_admin_ok(request: Request) -> bool:
     user = _current_user(request)
-    return not TEAM_MODE or bool(user and _is_admin(user))
+    return bool(user and _is_admin(user))
 
 
 def _load_longlived_token() -> str:
@@ -8973,6 +10164,7 @@ async def api_legacy_claude_auth_removed(request: Request):
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+_browser_operation_locks: dict[str, asyncio.Lock] = {}
 # Auto-auth: drive the OAuth click-through in the designated login browser and
 # type the code back.
 #
@@ -8994,7 +10186,7 @@ _BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
 # display, fluxbox, x11vnc, websockify (localhost — reached via the tmux-dashboard
 # reverse proxy) and a persistent headful Chrome with its own CDP + profile,
 # and its own proxy identity (its own residential exit IP).
-#   start:  browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport>
+#   start:  browser-session.sh start <id> <display> <rfbport> <vncport> <cdpport> <headed|headless>
 #   stop:   browser-session.sh stop  <id>
 set -uo pipefail
 export HOME=/home/nimrod_rotem
@@ -9004,6 +10196,7 @@ ACTION="${1:-}"; ID="${2:-}"
 [ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop <id> ..."; exit 2; }
 BASE="$CB_ROOT/sessions/$ID"
 LOGS="$BASE/logs"; PROFILE="$BASE/profile"; PIDS="$BASE/pids"
+if [ "$ID" = "default" ]; then PROFILE="$CB_ROOT/profile"; fi
 
 if [ "$ACTION" = "stop" ]; then
   if [ -f "$PIDS" ]; then
@@ -9011,6 +10204,11 @@ if [ "$ACTION" = "stop" ]; then
     sleep 1
     while read -r p; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done < "$PIDS"
   fi
+  # The default profile lives outside sessions/default, so its command line
+  # does not match the historical session-directory pkill below. Match the
+  # exact persistent profile flag as a recovery net for a stale/missing PID
+  # file; this never removes the profile itself.
+  pkill -f -- "--user-data-dir=$PROFILE" 2>/dev/null || true
   pkill -f "\.claude-browser/sessions/$ID/" 2>/dev/null || true
   rm -f "$PIDS"
   echo "stopped session $ID"
@@ -9018,10 +10216,16 @@ if [ "$ACTION" = "stop" ]; then
 fi
 
 DISP="${3:?display}"; RFB="${4:?rfbport}"; VNC="${5:?vncport}"; CDP="${6:?cdpport}"
+MODE="${7:-headless}"
 mkdir -p "$LOGS" "$PROFILE"
-export DISPLAY=":$DISP"
 : > "$PIDS"
-rm -f "/tmp/.X${DISP}-lock" 2>/dev/null || true
+
+cleanup() {
+  if [ -f "$PIDS" ]; then
+    while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done < "$PIDS"
+  fi
+}
+trap cleanup EXIT TERM INT
 
 # Own loopback proxy port => own sticky residential IP, so two browsers look
 # like two different people to any site they both visit.
@@ -9030,22 +10234,32 @@ if [ -x "$CB_BIN/proxy-ctl.py" ]; then
   sleep 6   # let the relay notice the config change and bind the port
 fi
 
-Xvfb ":$DISP" -screen 0 "${CB_SCREEN_W}x${CB_SCREEN_H}x24" -nolisten tcp -ac >"$LOGS/xvfb.log" 2>&1 & echo $! >> "$PIDS"
-for i in $(seq 1 50); do [ -S "/tmp/.X11-unix/X${DISP}" ] && break; sleep 0.2; done
-fluxbox >"$LOGS/fluxbox.log" 2>&1 & echo $! >> "$PIDS"
-
-x11vnc -display ":$DISP" -localhost -rfbport "$RFB" -nopw -forever -shared -noxdamage \
-  >"$LOGS/x11vnc.log" 2>&1 & echo $! >> "$PIDS"
-websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
-  >"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
+if [ "$MODE" = "headed" ]; then
+  export DISPLAY=":$DISP"
+  rm -f "/tmp/.X${DISP}-lock" 2>/dev/null || true
+  Xvfb ":$DISP" -screen 0 "${CB_SCREEN_W}x${CB_SCREEN_H}x24" -nolisten tcp -ac >"$LOGS/xvfb.log" 2>&1 & echo $! >> "$PIDS"
+  for i in $(seq 1 50); do [ -S "/tmp/.X11-unix/X${DISP}" ] && break; sleep 0.2; done
+  fluxbox >"$LOGS/fluxbox.log" 2>&1 & echo $! >> "$PIDS"
+  x11vnc -display ":$DISP" -localhost -rfbport "$RFB" -nopw -forever -shared -noxdamage \
+    >"$LOGS/x11vnc.log" 2>&1 & echo $! >> "$PIDS"
+  websockify --web=/usr/share/novnc "127.0.0.1:$VNC" "127.0.0.1:$RFB" \
+    >"$LOGS/novnc.log" 2>&1 & echo $! >> "$PIDS"
+else
+  unset DISPLAY
+fi
 
 cb_chrome_env "$ID"
 mapfile -t FLAGS < <(cb_chrome_flags "$PROFILE" "$CDP" "$ID")
 printf '[%s] %s\n' "$(date -Is)" "${FLAGS[*]}" >>"$LOGS/chrome-flags.log"
-dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
-  "about:blank" >"$LOGS/chrome.log" 2>&1 & echo $! >> "$PIDS"
+EXTRA_FLAGS=()
+if [ "$MODE" = "headless" ]; then
+  EXTRA_FLAGS+=(--headless=new --disable-gpu --window-size="${CB_SCREEN_W},${CB_SCREEN_H}")
+fi
+dbus-run-session -- google-chrome-stable "${FLAGS[@]}" "${EXTRA_FLAGS[@]}" \
+  "about:blank" >"$LOGS/chrome.log" 2>&1 & CHROME_PID=$!; echo "$CHROME_PID" >> "$PIDS"
 
-echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
+echo "started session $ID mode $MODE display :$DISP rfb $RFB vnc $VNC cdp $CDP"
+wait "$CHROME_PID"
 '''
 
 
@@ -9075,7 +10289,10 @@ _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222, "managed": False,
+    "cdp_port": int(os.environ.get("CB_DEFAULT_CDP_PORT") or 9222),
+    "managed": False,
+    "lifecycle_managed": True,
+    "systemd_unit": os.environ.get("CB_DEFAULT_SYSTEMD_UNIT", "claude-vnc.service"),
 }
 
 
@@ -9129,6 +10346,271 @@ def _browser_port_alive(port: int) -> bool:
         return False
 
 
+def _browser_runtime_row(sid: str) -> dict:
+    return dict(_browser_runtime.read().get("browsers", {}).get(sid, {}))
+
+
+def _set_browser_runtime(sid: str, **fields) -> dict:
+    now = time.time()
+
+    def mutate(value: dict) -> dict:
+        row = value.setdefault("browsers", {}).setdefault(sid, {})
+        row.update(fields)
+        row["updated_at"] = now
+        return dict(row)
+
+    _value, row = _browser_runtime.update(mutate)
+    return row
+
+
+def _browser_process_alive(browser: dict) -> bool:
+    """Headless browsers expose CDP; headed browsers additionally expose VNC."""
+    return _browser_port_alive(int(browser.get("cdp_port") or 0))
+
+
+def _default_browser_systemctl(action: str, browser: dict) -> bool:
+    candidates = []
+    for unit in (
+        str(browser.get("systemd_unit") or "").strip(),
+        "claude-browser.service",
+        "claude-vnc.service",
+    ):
+        if unit and unit not in candidates:
+            candidates.append(unit)
+    for unit in candidates:
+        commands = (["systemctl", action, unit], ["sudo", "-n", "systemctl", action, unit])
+        for command in commands:
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+                if result.returncode == 0:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _stop_browser_local(browser: dict, *, reason: str) -> bool:
+    sid = str(browser.get("id") or "")
+    if browser.get("managed") or browser.get("lifecycle_managed"):
+        unit = browser_unit_name(sid)
+        subprocess.run(
+            user_systemd_argv("systemctl", "--user", "stop", unit),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if sid == "default":
+            # Retire the old always-on system units. The controller's transient
+            # user unit restores the same persistent profile on the next lease.
+            _default_browser_systemctl("stop", browser)
+            for desktop_unit in ("claude-desktop.service", "claude-vnc-desktop.service"):
+                subprocess.run(
+                    ["sudo", "-n", "systemctl", "stop", desktop_unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+        subprocess.run(
+            ["bash", BROWSER_LAUNCHER, "stop", sid],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    else:
+        _default_browser_systemctl("stop", browser)
+    stopped = not _browser_process_alive(browser)
+    _set_browser_runtime(
+        sid,
+        running=not stopped,
+        mode="parked" if stopped else _browser_runtime_row(sid).get("mode", "headed"),
+        parked_at=time.time() if stopped else 0,
+        park_reason=reason,
+    )
+    return stopped
+
+
+def _browser_operation_lock(sid: str) -> asyncio.Lock:
+    lock = _browser_operation_locks.get(sid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _browser_operation_locks[sid] = lock
+    return lock
+
+
+async def _stop_browser_controlled(browser: dict, *, reason: str) -> bool:
+    """Serialize shutdown and never stop a browser with a live lease."""
+    sid = str(browser.get("id") or "")
+    async with _browser_operation_lock(sid):
+        leases = await asyncio.to_thread(_browser_leases.snapshot)
+        if leases.get("by_browser", {}).get(sid):
+            return False
+        return await asyncio.to_thread(_stop_browser_local, browser, reason=reason)
+
+
+async def _start_browser_unlocked(browser: dict, mode: str) -> bool:
+    sid = str(browser.get("id") or "")
+    mode = "headed" if mode == "headed" else "headless"
+    # The legacy default browser is a host unit. It remains headed until that
+    # unit is migrated, but it still obeys explicit leases and idle shutdown.
+    desired_mode = mode if browser.get("managed") or browser.get("lifecycle_managed") else "headed"
+    runtime = _browser_runtime_row(sid)
+    alive = await asyncio.to_thread(_browser_process_alive, browser)
+    if alive and not runtime:
+        current_mode = (
+            "headed"
+            if await asyncio.to_thread(_browser_port_alive, int(browser.get("vnc_port") or 0))
+            else "headless"
+        )
+        runtime = _set_browser_runtime(
+            sid, running=True, mode=current_mode, last_used_at=time.time(), adopted=True
+        )
+    if alive and runtime.get("mode") == desired_mode:
+        _set_browser_runtime(sid, running=True, last_used_at=time.time())
+        return True
+    if alive and runtime.get("mode") not in (None, desired_mode):
+        await asyncio.to_thread(_stop_browser_local, browser, reason="mode switch")
+
+    if browser.get("managed") or browser.get("lifecycle_managed"):
+        _ensure_browser_launcher()
+        # Clear a failed/finished transient unit before reusing its stable name.
+        await asyncio.to_thread(
+            subprocess.run,
+            user_systemd_argv(
+                "systemctl", "--user", "reset-failed", browser_unit_name(sid)
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        argv = browser_start_argv(BROWSER_LAUNCHER, browser, mode=desired_mode)
+        manager = await asyncio.to_thread(
+            subprocess.run,
+            user_systemd_argv("systemctl", "--user", "show-environment"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # A scope keeps the foreground launcher and its full Chrome/Xvfb tree in
+        # one cgroup. systemd-run therefore remains alive for the browser's
+        # lifetime and must itself be launched asynchronously.
+        launch_argv = argv if manager.returncode == 0 else argv[-9:]
+        await asyncio.to_thread(
+            subprocess.Popen,
+            launch_argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    else:
+        await asyncio.to_thread(_default_browser_systemctl, "start", browser)
+
+    ready_ports = [int(browser.get("cdp_port") or 0)]
+    if desired_mode == "headed":
+        ready_ports.append(int(browser.get("vnc_port") or 0))
+    ready = False
+    for _ in range(40):
+        port_states = await asyncio.gather(
+            *(asyncio.to_thread(_browser_port_alive, port) for port in ready_ports)
+        )
+        if all(port_states):
+            ready = True
+            break
+        await asyncio.sleep(0.5)
+    _set_browser_runtime(
+        sid,
+        running=ready,
+        mode=desired_mode if ready else "failed",
+        started_at=time.time() if ready else 0,
+        last_used_at=time.time(),
+        parked_at=0,
+        unit=browser_unit_name(sid) if ready else "",
+    )
+    return ready
+
+
+async def _start_browser_local(browser: dict, mode: str) -> bool:
+    """Serialize starts/mode switches and discard stale lifecycle decisions."""
+    sid = str(browser.get("id") or "")
+    async with _browser_operation_lock(sid):
+        leases = await asyncio.to_thread(_browser_leases.snapshot)
+        if not leases.get("by_browser", {}).get(sid):
+            return False
+        return await _start_browser_unlocked(browser, mode)
+
+
+async def _acquire_browser_lease_local(
+    sid: str, *, kind: str, owner: str, ttl: int, mode: str
+) -> dict:
+    browser = _browser_session_by_id(sid)
+    if not browser:
+        return {"ok": False, "error": "browser session not found"}
+    lease = await asyncio.to_thread(
+        _browser_leases.acquire, sid, kind=kind, owner=owner, ttl=ttl
+    )
+    leases = await asyncio.to_thread(_browser_leases.snapshot)
+    browser_leases = [
+        row for row in leases.get("leases", []) if row.get("browser_id") == sid
+    ]
+    mode = (
+        "headed"
+        if mode == "headed" or any(row.get("kind") == "viewer" for row in browser_leases)
+        else "headless"
+    )
+    ready = await _start_browser_local(browser, mode)
+    if not ready:
+        await asyncio.to_thread(_browser_leases.release, lease["token"])
+        return {"ok": False, "error": f"browser {sid} failed to start"}
+    _set_browser_runtime(
+        sid,
+        running=True,
+        last_used_at=time.time(),
+        mode=(mode if browser.get("managed") or browser.get("lifecycle_managed") else "headed"),
+    )
+    return {"ok": True, "lease": lease, "browser": _browser_response_row(browser)}
+
+
+async def _browser_lifecycle_loop() -> None:
+    """Park Chrome/Xvfb only after every explicit lease is gone and grace elapsed."""
+    while True:
+        try:
+            snapshot = await asyncio.to_thread(_browser_leases.snapshot)
+            active = snapshot.get("by_browser", {})
+            lease_rows = snapshot.get("leases", [])
+            now = time.time()
+            for browser in _load_browser_sessions():
+                sid = str(browser.get("id") or "")
+                alive = await asyncio.to_thread(_browser_process_alive, browser)
+                runtime = _browser_runtime_row(sid)
+                if alive and not runtime:
+                    runtime = _set_browser_runtime(
+                        sid, running=True, mode="headed", last_used_at=now, adopted=True
+                    )
+                if active.get(sid):
+                    wanted = (
+                        "headed"
+                        if any(
+                            row.get("browser_id") == sid and row.get("kind") == "viewer"
+                            for row in lease_rows
+                        )
+                        else "headless"
+                    )
+                    if runtime.get("mode") != wanted:
+                        alive = await _start_browser_local(browser, wanted)
+                    _set_browser_runtime(sid, running=alive, last_used_at=now)
+                    continue
+                last_used = float(runtime.get("last_used_at") or now)
+                if alive and now - last_used >= BROWSER_PARK_AFTER:
+                    stopped = await _stop_browser_controlled(
+                        browser, reason=f"no active lease for {BROWSER_PARK_AFTER}s"
+                    )
+                    logger.info("Browser '%s' idle-parked=%s", sid, stopped)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Browser lifecycle pass failed")
+        await asyncio.sleep(min(60, max(15, BROWSER_PARK_AFTER // 4)))
+
+
 def _next_browser_slot(sessions: list) -> int:
     used = {int(s.get("slot", 0)) for s in sessions}
     k = 1
@@ -9177,17 +10659,61 @@ class BrowserCreateBody(BaseModel):
     name: str = ""
 
 
+class BrowserLeaseBody(BaseModel):
+    kind: str = "agent"
+    mode: str = "headless"
+    owner: str = ""
+    ttl: int = BROWSER_LEASE_TTL
+
+
+@app.get("/api/my/browser")
+async def api_my_browser(request: Request):
+    """Return only the signed-in member's persistent, on-demand browser."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    browser = (
+        dict(_DEFAULT_BROWSER_SESSION)
+        if _is_admin(user)
+        else await asyncio.to_thread(_ensure_tenant_browser, user)
+    )
+    row = _browser_response_row(browser)
+    runtime = _browser_runtime_row(str(browser.get("id") or ""))
+    row["running"] = await asyncio.to_thread(_browser_process_alive, browser)
+    row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
+    row["parked"] = not row["running"]
+    leases = await asyncio.to_thread(_browser_leases.snapshot)
+    row["active_leases"] = int(
+        leases.get("by_browser", {}).get(browser.get("id"), 0)
+    )
+    public = {
+        key: row.get(key)
+        for key in (
+            "id", "name", "viewer_url", "running", "mode", "parked",
+            "active_leases",
+        )
+    }
+    return JSONResponse({"browser": public})
+
+
 @app.get("/api/browser/sessions")
 async def api_browser_sessions(request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
     out = []
+    leases = await asyncio.to_thread(_browser_leases.snapshot)
     for s in sessions:
         row = _browser_response_row(s)
-        row["running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
+        runtime = _browser_runtime_row(str(s.get("id") or ""))
+        row["running"] = await asyncio.to_thread(_browser_process_alive, s)
+        row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
+        row["parked"] = not row["running"]
+        row["active_leases"] = int(leases.get("by_browser", {}).get(s.get("id"), 0))
         out.append(row)
-    extra = sum(1 for s in sessions if s.get("managed"))
+    extra = sum(
+        1 for s in sessions if s.get("managed") and not s.get("tenant_user_id")
+    )
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
 
@@ -9197,36 +10723,36 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
-    if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
+    if sum(
+        1 for s in sessions if s.get("managed") and not s.get("tenant_user_id")
+    ) >= BROWSER_MAX_EXTRA:
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
     slot = _next_browser_slot(sessions)
     sid = f"s{slot}"
     disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
     name = (body.name or "").strip() or f"Browser {slot + 1}"
-    _ensure_browser_launcher()
-
-    def _spawn():
-        subprocess.Popen(
-            ["setsid", "bash", BROWSER_LAUNCHER, "start", sid,
-             str(disp), str(rfb), str(vnc), str(cdp)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-
-    await asyncio.to_thread(_spawn)
-    ok = False
-    for _ in range(25):
-        await asyncio.sleep(1)
-        if await asyncio.to_thread(_browser_port_alive, vnc):
-            ok = True
-            break
     entry = {"id": sid, "name": name, "slot": slot, "display": disp, "rfb_port": rfb,
              "vnc_port": vnc, "cdp_port": cdp, "managed": True, "created_at": time.time()}
     sessions.append(entry)
     _save_browser_sessions(sessions)
+    acquired = await _controller_call(
+        "browser_acquire",
+        browser_id=sid,
+        kind="create",
+        owner="dashboard",
+        ttl=BROWSER_LEASE_TTL,
+        mode="headless",
+    )
+    ok = bool(acquired.get("ok"))
     row = _browser_response_row(entry)
     row["running"] = ok
+    row["mode"] = "headless" if ok else "failed"
+    row["active_leases"] = 1 if ok else 0
     logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
                 sid, disp, vnc, cdp, ok)
-    return JSONResponse({"ok": True, "session": row, "started": ok})
+    return JSONResponse({"ok": ok, "session": row, "started": ok,
+                         "lease": acquired.get("lease", {})},
+                        status_code=200 if ok else 502)
 
 
 @app.delete("/api/browser/sessions/{sid}")
@@ -9241,11 +10767,10 @@ async def api_browser_delete(sid: str, request: Request):
         return JSONResponse({"error": "The default browser is managed by systemd and can't be removed here."},
                             status_code=400)
 
-    def _stop():
-        subprocess.run(["bash", BROWSER_LAUNCHER, "stop", sid],
-                       capture_output=True, text=True, timeout=30)
-
-    await asyncio.to_thread(_stop)
+    await asyncio.to_thread(_browser_leases.release_browser, sid)
+    stopped = await _controller_call("browser_stop", browser_id=sid, reason="browser removed")
+    if not stopped.get("ok"):
+        return JSONResponse({"error": stopped.get("error", "browser did not stop")}, status_code=502)
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
     # Give its proxy port + sticky identity back, so a later browser reusing the
     # slot doesn't inherit a stranger's exit IP or its bandwidth counter.
@@ -9257,6 +10782,38 @@ async def api_browser_delete(sid: str, request: Request):
         logger.debug("Failed to drop proxy session for %s", sid, exc_info=True)
     logger.info("Browser session '%s' stopped and removed", sid)
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/browser/sessions/{sid}/lease")
+async def api_browser_lease_acquire(sid: str, body: BrowserLeaseBody, request: Request):
+    """Acquire an explicit renewable browser lease and restore it on demand."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    result = await _controller_call(
+        "browser_acquire",
+        browser_id=sid,
+        kind=body.kind,
+        owner=body.owner or str(_current_user(request) or "dashboard"),
+        ttl=body.ttl,
+        mode=body.mode,
+    )
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+
+
+@app.put("/api/browser/leases/{token}")
+async def api_browser_lease_renew(token: str, body: BrowserLeaseBody, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    result = await _controller_call("browser_renew", token=token, ttl=body.ttl)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 404)
+
+
+@app.delete("/api/browser/leases/{token}")
+async def api_browser_lease_release(token: str, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    result = await _controller_call("browser_release", token=token)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 404)
 
 
 class BrowserPatchBody(BaseModel):
@@ -9520,11 +11077,25 @@ _browser_busy: dict[str, dict] = {}   # sid -> {"what": str, "since": float}
 
 @asynccontextmanager
 async def _browser_busy_ctx(sid: str, what: str):
-    """Mark a browser as driven programmatically (this is what spins the header icon)."""
+    """Hold a headless lease for programmatic work and release it on exit."""
     _browser_busy[sid] = {"what": what, "since": time.time()}
+    lease_token = ""
     try:
+        result = await _controller_call(
+            "browser_acquire",
+            browser_id=sid,
+            kind="agent",
+            owner=what,
+            ttl=max(BROWSER_LEASE_TTL, 600),
+            mode="headless",
+        )
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or f"browser {sid} is unavailable")
+        lease_token = str((result.get("lease") or {}).get("token") or "")
         yield
     finally:
+        if lease_token:
+            await _controller_call("browser_release", token=lease_token)
         _browser_busy.pop(sid, None)
 
 
@@ -10092,18 +11663,48 @@ async def api_auto_auth(session_name: str, request: Request):
 async def browser_proxy_ws(ws: WebSocket, sid: str):
     """Reverse-proxy the noVNC WebSocket to the session's local websockify. The
     HTTP auth middleware doesn't run for websockets, so re-check the cookie here."""
-    if AUTH_PASS and not _check_token(ws.cookies.get("tmux_auth")):
+    if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
+        await ws.close(code=1008)
+        return
+    user = _current_user(ws)
+    if not _user_can_access_browser(user, sid):
         await ws.close(code=1008)
         return
     s = _browser_session_by_id(sid)
     if not s:
         await ws.close(code=1011)
         return
+    owner = "viewer"
+    if ws.client:
+        owner = f"viewer:{ws.client.host}"
+    acquired = await _controller_call(
+        "browser_acquire",
+        browser_id=sid,
+        kind="viewer",
+        owner=owner,
+        ttl=BROWSER_LEASE_TTL,
+        mode="headed",
+    )
+    if not acquired.get("ok"):
+        await ws.close(code=1013)
+        return
+    lease_token = str((acquired.get("lease") or {}).get("token") or "")
     port = int(s.get("vnc_port") or 0)
     offered = ws.scope.get("subprotocols") or []
     accept_sub = "binary" if "binary" in offered else None
     await ws.accept(subprotocol=accept_sub)
+    renew_task = None
     try:
+        async def renew_viewer_lease():
+            while True:
+                await asyncio.sleep(max(30, BROWSER_LEASE_TTL // 2))
+                renewed = await _controller_call(
+                    "browser_renew", token=lease_token, ttl=BROWSER_LEASE_TTL
+                )
+                if not renewed.get("ok"):
+                    raise ConnectionError("browser viewer lease expired")
+
+        renew_task = asyncio.create_task(renew_viewer_lease())
         async with websockets.connect(
             f"ws://127.0.0.1:{port}/websockify",
             subprotocols=["binary"], max_size=None, ping_interval=None,
@@ -10163,15 +11764,36 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
             await ws.close()
         except Exception:
             pass
+    finally:
+        if renew_task:
+            renew_task.cancel()
+        if lease_token:
+            await _controller_call("browser_release", token=lease_token)
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
 async def browser_proxy_http(sid: str, path: str, request: Request):
     """Reverse-proxy noVNC static assets (vnc.html + app/core/vendor) to the
     session's local websockify, so the viewer is same-origin with the dashboard."""
+    if not _user_can_access_browser(_current_user(request), sid):
+        return Response("browser not found", status_code=404)
     s = _browser_session_by_id(sid)
     if not s:
         return Response("unknown browser session", status_code=404)
+    if not path or path.endswith("vnc.html"):
+        # The HTML must be reachable before noVNC can open its WebSocket. Hold a
+        # short bootstrap viewer lease; the socket replaces it with a renewable
+        # lease and this one naturally expires if the page never connects.
+        acquired = await _controller_call(
+            "browser_acquire",
+            browser_id=sid,
+            kind="viewer",
+            owner="viewer-bootstrap",
+            ttl=60,
+            mode="headed",
+        )
+        if not acquired.get("ok"):
+            return Response(acquired.get("error", "browser unavailable"), status_code=503)
     port = int(s.get("vnc_port") or 0)
     target = f"http://127.0.0.1:{port}/{path}"
     try:
@@ -11449,12 +13071,27 @@ class GoNutsModeBody(BaseModel):
     enabled: bool
 
 
+@app.post("/api/sessions/{session_name}/resume")
+async def api_resume_session(session_name: str):
+    if not _find_session(session_name)[1]:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    result = await _controller_call(
+        "session_resume", session=session_name, source="explicit-resume"
+    )
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+
+
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    resumed = await _controller_call(
+        "session_resume", session=session_name, source="send-command"
+    )
+    if not resumed.get("ok"):
+        return JSONResponse({"error": resumed.get("error", "session resume failed")}, status_code=503)
     try:
         cmd_text = body.command
         if len(cmd_text) > 200:
@@ -11544,6 +13181,7 @@ async def api_interrupt_session(session_name: str):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    await _controller_call("session_touch", session=session_name, source="interrupt")
     try:
         await asyncio.to_thread(subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "Escape"],
@@ -11572,6 +13210,11 @@ async def api_send_keys(session_name: str, body: SendKeys):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    resumed = await _controller_call(
+        "session_resume", session=session_name, source="send-keys"
+    )
+    if not resumed.get("ok"):
+        return JSONResponse({"error": resumed.get("error", "session resume failed")}, status_code=503)
     try:
         for key in body.keys:
             # Allow single printable characters (q, y, n, etc.) and known tmux key names
@@ -11657,7 +13300,7 @@ async def api_models():
 async def api_models_refresh(request: Request):
     """Force an immediate refresh from the installed Codex CLI (admin)."""
     user = _current_user(request)
-    if TEAM_MODE and not (user and _is_admin(user)):
+    if not (user and _is_admin(user)):
         return JSONResponse({"error": "admin only"}, status_code=403)
     changed = await _refresh_model_catalog(force=True)
     return JSONResponse({"ok": True, "changed": changed, "models": MODEL_CATALOG})
@@ -11680,8 +13323,11 @@ async def _restart_codex_with_active_profile(session_name: str, profile_id: str)
                 break
         exported = _send_profile_export(session_name, profile_id)
         await asyncio.sleep(0.3)
-        launch = _launch_codex_cmd(
-            _session_launch_base(session_name), pin_model=False, resume=True
+        launch = _session_launch_command(
+            session_name,
+            _session_launch_base(session_name),
+            pin_model=False,
+            resume=True,
         )
         await asyncio.to_thread(
             subprocess.run,
@@ -12568,6 +14214,8 @@ async def _crash_recovery_loop():
             owners = _load_session_owners()
             for sess in sessions_list:
                 name = sess["name"]
+                if _session_lifecycle.get(name).get("parked"):
+                    continue
                 if await _async_is_claude_running(name):
                     _seen_claude_running.add(name)
                     st = _crash_recovery_state.get(name)
@@ -12667,10 +14315,8 @@ def _looks_like_fresh_claude_session(visible: str) -> bool:
 @app.get("/api/sessions/{session_name}/autopush")
 async def api_autopush_status(session_name: str):
     """Return the per-session auto-push mode ('off'|'basic'|'full') + recent log."""
-    return JSONResponse({
-        "mode": _get_autopush_mode(session_name),
-        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
-    })
+    result = await _controller_call("watchdog_status", session=session_name)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
 
 
 class AutopushBody(BaseModel):
@@ -12692,15 +14338,9 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
         return JSONResponse(
             {"error": f"mode must be one of {list(AUTOPUSH_MODES)}"}, status_code=400
         )
-    _autopush_mode[session_name] = mode
-    _save_autopush_mode()
-    # Anything below "full" stops the free-form watchdog right away.
-    if mode != "full":
-        _simple_watchdog_state.pop(session_name, None)
-    return JSONResponse({
-        "mode": mode,
-        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
-    })
+    result = await _controller_call("autopush_set", session=session_name, mode=mode)
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 # --- Legacy simple-watchdog endpoints. Kept for back-compat and now mapped onto
@@ -12708,12 +14348,9 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
 @app.get("/api/sessions/{session_name}/simple-watchdog")
 async def api_simple_watchdog_status(session_name: str):
     """Return per-session simple-watchdog state (legacy shape)."""
-    mode = _get_autopush_mode(session_name)
-    return JSONResponse({
-        "enabled": mode == "full",
-        "mode": mode,
-        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
-    })
+    result = await _controller_call("watchdog_status", session=session_name)
+    result["enabled"] = result.get("mode") == "full"
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
 
 
 class SimpleWatchdogBody(BaseModel):
@@ -12724,15 +14361,9 @@ class SimpleWatchdogBody(BaseModel):
 async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody):
     """Enable/disable the free-form watchdog (legacy). Maps to auto-push full/basic."""
     mode = "full" if body.enabled else "basic"
-    _autopush_mode[session_name] = mode
-    _save_autopush_mode()
-    if mode != "full":
-        _simple_watchdog_state.pop(session_name, None)
-    return JSONResponse({
-        "enabled": mode == "full",
-        "mode": mode,
-        "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
-    })
+    result = await _controller_call("autopush_set", session=session_name, mode=mode)
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 # --- Autonomous Mode Watchdog ---
@@ -13892,21 +15523,23 @@ async def _away_mode_worker(session_name: str):
         log.info(f"Away mode finished for '{session_name}'")
 
 
-@app.post("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
-    """Toggle away mode on or off for a session."""
+async def _away_toggle_local(session_name: str, enabled: bool) -> dict:
     _, sess = _find_session(session_name)
     if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
+        return {"ok": False, "error": "Session not found", "_status": 404}
 
-    if body.enabled:
+    if enabled:
         # Don't allow both away mode and go-nuts mode at the same time on same session
         if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Go Nuts Mode is active on this session. Disable it first."}, status_code=409)
+            return {"ok": False, "error": "Go Nuts Mode is active on this session. Disable it first.", "_status": 409}
 
         # Check if already running for this session
         if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_away_state_summary(_away_mode_state[session_name]))
+            return {"ok": True, **_away_state_summary(_away_mode_state[session_name])}
+
+        resumed = await _resume_parked_session(session_name, source="away-mode")
+        if not resumed.get("ok"):
+            return {"ok": False, "error": resumed.get("error", "session resume failed"), "_status": 503}
 
         # Initialize and launch
         state = {
@@ -13925,7 +15558,7 @@ async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
         task = asyncio.create_task(_away_mode_worker(session_name))
         state["task"] = task
         _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
+        return {"ok": True, **_away_state_summary(state)}
     else:
         # Disable
         state = _away_mode_state.get(session_name, {})
@@ -13935,14 +15568,24 @@ async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
         state["task"] = None
         _away_log(state, "Away mode disabled by user")
         _save_autonomous_state()
-        return JSONResponse(_away_state_summary(state))
+        return {"ok": True, **_away_state_summary(state)}
+
+
+@app.post("/api/sessions/{session_name}/away-mode")
+async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
+    """Toggle controller-owned away mode on or off for a session."""
+    result = await _controller_call(
+        "away_toggle", session=session_name, enabled=body.enabled
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 @app.get("/api/sessions/{session_name}/away-mode")
 async def api_away_mode_status(session_name: str):
     """Get current away-mode state for a session."""
-    state = _away_mode_state.get(session_name, {})
-    return JSONResponse(_away_state_summary(state))
+    result = await _controller_call("away_status", session=session_name)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
 
 
 # --- Go Nuts Mode ---
@@ -14275,20 +15918,22 @@ async def _go_nuts_mode_worker(session_name: str):
         log.info(f"Go Nuts mode finished for '{session_name}'")
 
 
-@app.post("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
-    """Toggle go-nuts mode on or off for a session."""
+async def _go_nuts_toggle_local(session_name: str, enabled: bool) -> dict:
     _, sess = _find_session(session_name)
     if not sess:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
+        return {"ok": False, "error": "Session not found", "_status": 404}
 
-    if body.enabled:
+    if enabled:
         # Don't allow both away mode and go-nuts mode at the same time on same session
         if _away_mode_state.get(session_name, {}).get("enabled"):
-            return JSONResponse({"error": "Away Mode is active on this session. Disable it first."}, status_code=409)
+            return {"ok": False, "error": "Away Mode is active on this session. Disable it first.", "_status": 409}
 
         if _go_nuts_state.get(session_name, {}).get("enabled"):
-            return JSONResponse(_go_nuts_state_summary(_go_nuts_state[session_name]))
+            return {"ok": True, **_go_nuts_state_summary(_go_nuts_state[session_name])}
+
+        resumed = await _resume_parked_session(session_name, source="go-nuts-mode")
+        if not resumed.get("ok"):
+            return {"ok": False, "error": resumed.get("error", "session resume failed"), "_status": 503}
 
         state = {
             "enabled": True,
@@ -14306,7 +15951,7 @@ async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
         task = asyncio.create_task(_go_nuts_mode_worker(session_name))
         state["task"] = task
         _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
+        return {"ok": True, **_go_nuts_state_summary(state)}
     else:
         state = _go_nuts_state.get(session_name, {})
         if state.get("task") and not state["task"].done():
@@ -14315,14 +15960,24 @@ async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
         state["task"] = None
         _go_nuts_log(state, "Go Nuts mode disabled by user")
         _save_autonomous_state()
-        return JSONResponse(_go_nuts_state_summary(state))
+        return {"ok": True, **_go_nuts_state_summary(state)}
+
+
+@app.post("/api/sessions/{session_name}/go-nuts-mode")
+async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
+    """Toggle controller-owned go-nuts mode on or off for a session."""
+    result = await _controller_call(
+        "go_nuts_toggle", session=session_name, enabled=body.enabled
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 @app.get("/api/sessions/{session_name}/go-nuts-mode")
 async def api_go_nuts_mode_status(session_name: str):
     """Get current go-nuts-mode state for a session."""
-    state = _go_nuts_state.get(session_name, {})
-    return JSONResponse(_go_nuts_state_summary(state))
+    result = await _controller_call("go_nuts_status", session=session_name)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -14347,11 +16002,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
 .nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
+.nav-session-owner{font-size:.62rem;color:#6e7681;max-width:100px;overflow:hidden;text-overflow:ellipsis}
 .nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
 .nav-indicators{display:flex;align-items:center;gap:5px}
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
 .nav-dot.busy{width:10px;height:10px;background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #f8514988}
 .nav-dot.idle{background:#3fb950}
+.nav-dot.parked{background:#6e7681}
 .nav-dot.unknown{background:#d2a8ff}
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
 .nav-attached.yes{background:#238636;color:#fff}
@@ -14386,6 +16043,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
+.nav-session-scope{display:none;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 8px;font-size:.72rem;margin-right:8px;max-width:130px}
+.nav-session-scope.visible{display:block}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
@@ -14395,10 +16054,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .status-pill{font-size:.75rem;padding:3px 12px;border-radius:12px;font-weight:600;display:flex;align-items:center;gap:5px;transition:all .3s ease}
 .status-pill.busy{background:#f8514930;color:#f85149;border:2px solid #f8514966;font-size:.85rem;padding:5px 16px;animation:pulse-glow 1.5s ease-in-out infinite}
 .status-pill.idle{background:#3fb95022;color:#3fb950;border:1px solid #3fb95044}
+.status-pill.parked{background:#6e768122;color:#8b949e;border:1px solid #6e768144}
 .status-pill.unknown{background:#d2a8ff22;color:#d2a8ff;border:1px solid #d2a8ff44}
 .status-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
 .status-pill.busy .status-dot{background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite}
 .status-pill.idle .status-dot{background:#3fb950}
+.status-pill.parked .status-dot{background:#6e7681}
 .status-pill.unknown .status-dot{background:#d2a8ff}
 .badge{font-size:.7rem;padding:2px 8px;border-radius:12px;font-weight:500}
 .badge.attached{background:#238636;color:#fff}
@@ -15141,6 +16802,10 @@ body.member-simple .hide-in-simple{display:none!important}
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">__BRAND__</span>
   <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
+  <select class="nav-session-scope" id="nav-session-scope" onchange="changeSessionScope(this.value)" aria-label="Session view">
+    <option value="mine">My sessions</option>
+    <option value="all">All users</option>
+  </select>
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
@@ -15187,7 +16852,7 @@ body.member-simple .hide-in-simple{display:none!important}
       <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Profiles</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openGlobalContext();closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Context</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -15195,6 +16860,7 @@ body.member-simple .hide-in-simple{display:none!important}
     </div>
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
+  <button class="nav-icon-btn member-only" id="nav-my-browser-btn" onclick="openSettings('browser')" title="My private browser"><span class="icon">&#x1F310;</span></button>
   <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
@@ -15280,12 +16946,26 @@ const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
+let ADMIN_SESSION_SCOPE='mine';
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,inFlight:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,socket:null,reconnectTimer:null,backoff:500,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
+function sessionListUrl(path){
+  const all=ADMIN_SESSION_SCOPE==='all'&&_currentUser&&_currentUser.role==='admin';
+  return BASE+path+(all?(path.includes('?')?'&':'?')+'scope=all':'');
+}
+async function changeSessionScope(scope){
+  ADMIN_SESSION_SCOPE=(scope==='all'?'all':'mine');
+  selectedSession=null;
+  stopAllRawPolling();
+  sessions=[];
+  renderNav();
+  mainEl.innerHTML='<div class="empty">Loading sessions…</div>';
+  await loadAll();
+}
 
 // --- "Hide Bash/Fetch" filter ---
 function getHideBashPref(){
@@ -15565,7 +17245,8 @@ function _renderPathSpan(text,start,paneWidth){
   if(pathJoined.length<2||(!_isHome&&!_isDir&&!_hasExt)){
     return {html:_escTermHtml(text.slice(start,j)),end:j};
   }
-  const href=BASE+'/file?path='+encodeURIComponent(pathJoined);
+  const href=BASE+'/file?path='+encodeURIComponent(pathJoined)
+    +(selectedSession?'&session='+encodeURIComponent(selectedSession):'');
   const hrefEsc=_escTermHtml(href);
   const dataEsc=_escTermHtml(pathJoined);
   // Emit each non-whitespace chunk as its own <a> pointing at the joined href,
@@ -15835,6 +17516,7 @@ async function setSessionEffort(name,effort){
 function statusLabel(s){
   if(s==='busy')return'Working...';
   if(s==='idle')return'Idle';
+  if(s==='parked')return'Parked · resumes on demand';
   return'...';
 }
 
@@ -15848,6 +17530,7 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
+      ${ADMIN_SESSION_SCOPE==='all'?`<span class="nav-session-owner">${esc(s.owner||'admin')}</span>`:''}
       <span class="nav-indicators">
         <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
@@ -16489,7 +18172,7 @@ function scheduleBusyVerification(name){
   // First check after 5 seconds
   setTimeout(async()=>{
     try{
-      const resp=await fetch(BASE+'/api/status');
+      const resp=await fetch(sessionListUrl('/api/status'));
       const statuses=await resp.json();
       const st=statuses.find(s=>s.name===name);
       if(!st)return;
@@ -16502,7 +18185,7 @@ function scheduleBusyVerification(name){
       // Server says idle — but might be a brief gap.  Check once more after 3s.
       setTimeout(async()=>{
         try{
-          const resp2=await fetch(BASE+'/api/status');
+          const resp2=await fetch(sessionListUrl('/api/status'));
           const statuses2=await resp2.json();
           const st2=statuses2.find(s=>s.name===name);
           if(!st2)return;
@@ -16631,7 +18314,7 @@ async function sendCmd(name,source){
       // User just sent a command — they want to see the output, reset scroll lock
       const st=getRawState(name);
       st.userScrolledUp=false;
-      setTimeout(()=>pollRawDelta(name),500);
+      startRawPolling(name);
     }
   }catch(e){alert('Failed to send.')}
   input.disabled=false;
@@ -16642,29 +18325,45 @@ async function sendCmd(name,source){
 // ── Raw Output Streaming ──
 function startRawPolling(name){
   const st=getRawState(name);
-  if(st.polling)return;
+  const pane=document.getElementById('tab-raw-'+name);
+  if(document.hidden||!pane||!pane.classList.contains('active'))return;
   st.polling=true;
-  pollRawDelta(name);
-  // Poll fast (300ms) for the first ~6s while Codex's TUI is booting,
-  // then drop to 1s steady-state polling.
-  let ticks=0;
-  st.timer=setInterval(()=>{
-    pollRawDelta(name);
-    ticks++;
-    if(ticks===20){ // ~6s of fast polling
-      clearInterval(st.timer);
-      st.timer=setInterval(()=>pollRawDelta(name),1000);
-    }
-  },300);
+  if(st.socket&&(st.socket.readyState===WebSocket.OPEN||st.socket.readyState===WebSocket.CONNECTING))return;
+  if(st.reconnectTimer){clearTimeout(st.reconnectTimer);st.reconnectTimer=null}
+  const scheme=location.protocol==='https:'?'wss://':'ws://';
+  const socket=new WebSocket(scheme+location.host+BASE+'/ws/sessions/'+encodeURIComponent(name)+'/raw');
+  st.socket=socket;
+  socket.onopen=()=>{st.backoff=500};
+  socket.onmessage=(event)=>{
+    try{applyRawPayload(name,JSON.parse(event.data))}catch(e){console.debug('terminal stream payload error',e)}
+  };
+  socket.onclose=()=>{
+    if(st.socket===socket)st.socket=null;
+    if(!st.polling||document.hidden)return;
+    const active=document.getElementById('tab-raw-'+name);
+    if(!active||!active.classList.contains('active'))return;
+    st.reconnectTimer=setTimeout(()=>startRawPolling(name),st.backoff);
+    st.backoff=Math.min(10000,st.backoff*2);
+  };
 }
 function stopRawPolling(name){
   const st=getRawState(name);
   st.polling=false;
-  if(st.timer){clearInterval(st.timer);st.timer=null}
+  if(st.reconnectTimer){clearTimeout(st.reconnectTimer);st.reconnectTimer=null}
+  if(st.socket){
+    const socket=st.socket;st.socket=null;
+    try{socket.close(1000,'terminal hidden')}catch(e){}
+  }
 }
 function stopAllRawPolling(){
   for(const n in rawState)stopRawPolling(n);
 }
+
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){stopAllRawPolling();return}
+  const pane=selectedSession&&document.getElementById('tab-raw-'+selectedSession);
+  if(pane&&pane.classList.contains('active'))startRawPolling(selectedSession);
+});
 
 function _ensureRawScrollTracking(rawEl,st){
   if(rawEl._scrollTracked)return;
@@ -16685,18 +18384,13 @@ function _ensureRawScrollTracking(rawEl,st){
   },{passive:true});
 }
 
-async function pollRawDelta(name){
+function applyRawPayload(name,data){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
   if(!rawEl)return;
-  if(st.inFlight)return;
-  st.inFlight=true;
   _ensureRawScrollTracking(rawEl,st);
   try{
-    const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'');
-    const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail'+q);
-    const data=await resp.json();
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
     if(data.mode==='full'){
@@ -16724,29 +18418,20 @@ async function pollRawDelta(name){
         renderRawText(name);
         if(infoEl)infoEl.textContent=data.total_lines+' lines';
       }else{
-        // Overlap mismatch — fetch a full snapshot to resync
-        st.knownLines=0;
-        const fullResp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail?known_lines=0');
-        const fullData=await fullResp.json();
-        if(fullData.mode==='full'){
-          st.fullText=fullData.raw||'';
-          st.knownLines=fullData.pane_total;
-          if(typeof fullData.pane_width==='number'&&fullData.pane_width>0)st.paneWidth=fullData.pane_width;
-          renderRawText(name);
-          if(infoEl)infoEl.textContent=fullData.total_lines+' lines';
-        }
+        // Reconnect: the shared reader always sends a full snapshot to a new
+        // subscriber, so recovery never starts a per-client polling loop.
+        st.knownLines=0;st.fullText='';
+        if(st.socket)st.socket.close(4000,'resync');
       }
-    }else if(data.mode==='none'){
-      // No change upstream — but if the info label still says "Loading..."
-      // (e.g. first poll after restoring cached content) make sure it's
-      // replaced so the user doesn't see a stuck loading indicator.
+    }else if(data.mode==='ping'){
       if(infoEl&&/loading/i.test(infoEl.textContent)){
         const lineCount=(st.fullText||'').split('\n').length;
-        infoEl.textContent=(data.total_lines||lineCount)+' lines';
+        infoEl.textContent=lineCount+' lines';
       }
+    }else if(data.mode==='error'&&infoEl){
+      infoEl.textContent='Terminal stream reconnecting…';
     }
   }catch(e){}
-  finally{st.inFlight=false}
 }
 
 async function loadRaw(name){
@@ -16760,7 +18445,8 @@ async function loadRaw(name){
   if(rawEl)rawEl.textContent='Loading Codex...';
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
-  await pollRawDelta(name);
+  stopRawPolling(name);
+  startRawPolling(name);
 }
 
 function updateStatusPill(name,status,detail){
@@ -16827,7 +18513,7 @@ async function loadAll(){
     MEMBER_SIMPLE=!!(_currentUser&&_currentUser.simple);
     document.body.classList.toggle('member-simple',MEMBER_SIMPLE);
     // Phase 1: Fast load — cached data + activity status, no LLM calls
-    const resp=await fetch(BASE+'/api/sessions-fast');
+    const resp=await fetch(sessionListUrl('/api/sessions-fast'));
     sessions=await resp.json();
     sessions.forEach(s=>{
       lastStatus[s.name]=s.activity_status;
@@ -16888,8 +18574,9 @@ function startStatusPolling(){
 }
 
 async function pollStatus(){
+  if(document.hidden)return;
   try{
-    const resp=await fetch(BASE+'/api/status');
+    const resp=await fetch(sessionListUrl('/api/status'));
     const statuses=await resp.json();
     let changed=false;
     for(const st of statuses){
@@ -16927,6 +18614,7 @@ async function pollStatus(){
 // --- Inline server stats in nav header ---
 const navStatsEl=document.getElementById('nav-server-stats');
 async function refreshNavStats(){
+  if(MEMBER_SIMPLE)return;
   try{
     const resp=await fetch(BASE+'/api/stats');
     const s=await resp.json();
@@ -16936,7 +18624,8 @@ async function refreshNavStats(){
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
     const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
     const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span>';
+    const leases=s.capacity?s.capacity.active_browser_leases:0;
+    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span> &middot; browsers <span class="stat-val">'+leases+'</span></span>';
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
@@ -17186,32 +18875,36 @@ async function disconnectService(svc){
   openConnections();
 }
 
-// ── Global context (admin) ──
+// ── Global instructions (admin) ──
 async function openGlobalContext(){
-  const modal=document.getElementById('modal-content');
-  modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Loading…</p>`;
-  document.getElementById('modal-overlay').classList.add('active');
+  return openSettings('global');
+}
+async function loadGlobalInstructions(){
   try{
     const r=await fetch(BASE+'/api/global-context'); const d=await r.json();
-    modal.innerHTML=`<h3>Global Context — every member's Codex</h3>
-      <p class="conn-note">Prepended as a managed block to each member's AGENTS.md (their own notes &amp; memory stay below it). Edit the company rules / sandbox policy here.</p>
-      <textarea id="gctx-ta" class="modal-input" style="height:320px;font-family:monospace;white-space:pre;width:100%">${esc(d.content||'')}</textarea>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" onclick="saveGlobalContext()">Save &amp; sync</button></div>`;
+    if(!r.ok)throw new Error(d.error||'Failed to load global instructions');
+    document.getElementById('settings-content').innerHTML=`<div class="settings-section">
+      <div class="pf-banner"><b>Applies to every non-admin account.</b> This managed block is prepended to each member's <code>AGENTS.md</code> now and whenever their Codex home is repaired or recreated. Their private and group instructions remain below it.</div>
+      <label>Global AGENTS.md instructions</label>
+      <div class="my-ctx-path">${esc(d.path||'')}</div>
+      <textarea id="global-instructions-editor" class="my-ctx-codex" spellcheck="false">${esc(d.content||'')}</textarea>
+      <div class="my-ctx-actions"><span id="global-instructions-status" style="color:#7ee787;font-size:.75rem;align-self:center"></span><button class="btn btn-full" onclick="saveGlobalInstructions()">Save &amp; sync to all members</button></div>
+    </div>`;
   }catch(e){
-    modal.innerHTML=`<h3>Global Context</h3><p class="conn-note">Failed to load.</p>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
+    document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load global instructions: '+esc(e.message||e)+'</div></div>';
   }
 }
-async function saveGlobalContext(){
-  const ta=document.getElementById('gctx-ta'); if(!ta) return;
+async function saveGlobalInstructions(){
+  const ta=document.getElementById('global-instructions-editor'); if(!ta) return;
   try{
     const r=await fetch(BASE+'/api/global-context',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ta.value})});
     const d=await r.json();
-    if(r.ok){ closeModal(); alert('Saved & synced to '+(d.synced||0)+' member(s).'); }
-    else alert(d.error||'Failed');
-  }catch(e){ alert('Failed to save.'); }
+    if(!r.ok)throw new Error(d.error||'Failed to save');
+    const status=document.getElementById('global-instructions-status');
+    if(status){status.textContent='Saved and synced to '+(d.synced||0)+' member'+((d.synced||0)===1?'':'s')+' ✓';setTimeout(()=>{status.textContent=''},3500);}
+  }catch(e){ alert('Failed to save global instructions: '+(e.message||e)); }
 }
+async function saveGlobalContext(){ return saveGlobalInstructions(); }
 
 // Surface a one-time toast after returning from a Google OAuth connect flow.
 (function(){
@@ -17258,6 +18951,7 @@ let _usageCache=null;
 let _authPollCount=0;
 
 async function checkCodexAuth(){
+  if(MEMBER_SIMPLE)return;
   // Fetch auth and usage independently so one failure doesn't break the other
   try{
     const authResp=await fetch(BASE+'/api/auth/codex-status');
@@ -17496,7 +19190,7 @@ async function sendRawKeys(name,keys){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({keys:keys})
     });
-    setTimeout(()=>pollRawDelta(name),400);
+    startRawPolling(name);
   }catch(e){console.error('Failed to send keys:',e)}
 }
 
@@ -17899,14 +19593,14 @@ function _savedCredRow(c){
   r.appendChild(_savedCopyBtn(c.value));
   return r;
 }
-function _savedFileRow(p,disambiguate){
+function _savedFileRow(p,disambiguate,sessionName){
   const r=_savedRow();
   const linkable=/^(\/|~\/)/.test(p);
   const parts=p.replace(/\/+$/,'').split('/');
   const nm=(disambiguate&&parts.length>1?parts.slice(-2).join('/'):parts[parts.length-1])||p;
   if(linkable){
     const a=document.createElement('a');
-    a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p);a.target='_blank';a.rel='noopener noreferrer';
+    a.className='key-saved-link';a.href=BASE+'/file?path='+encodeURIComponent(p)+'&session='+encodeURIComponent(sessionName||'');a.target='_blank';a.rel='noopener noreferrer';
     a.textContent=nm;a.title=p;
     r.appendChild(a);
   }else{
@@ -17951,7 +19645,7 @@ function renderSavedKeys(name,sessionObj){
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
       if(info.creds.length)body.appendChild(_savedGroup('Credentials',info.creds.map(_savedCredRow)));
-      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1))));
+      if(info.files.length)body.appendChild(_savedGroup('Files & paths',info.files.map(p=>_savedFileRow(p,baseCount[p.replace(/\/+$/,'').split('/').pop()]>1,name))));
     }
     box.appendChild(body);
   });
@@ -18499,6 +20193,11 @@ async function applyRoleVisibility(){
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
+  const scopeEl = document.getElementById('nav-session-scope');
+  if(scopeEl){
+    scopeEl.classList.toggle('visible', isAdmin);
+    scopeEl.value = ADMIN_SESSION_SCOPE;
+  }
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
@@ -18547,11 +20246,12 @@ function renderSettingsTabs(){
   const tabs = [
     {id:'mycontext', label:'My Context'},
     {id:'history',   label:'History'},
+    {id:'browser',   label:'Browser'},
   ];
+  if(isAdmin) tabs.splice(1,0,{id:'global', label:'Global Instructions'});
   if(isAdmin) tabs.push({id:'context', label:'Context Files'});
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
-  if(isAdmin) tabs.push({id:'browser', label:'Browser'});
   if(isAdmin) tabs.push({id:'login', label:'Login'});
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
@@ -18570,6 +20270,9 @@ function renderSettingsContent(){
   if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
+  }else if(_settingsActiveTab === 'global'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading global instructions...</div></div>';
+    loadGlobalInstructions();
   }else if(_settingsActiveTab === 'history'){
     if(_settingsHistoryDetail){
       renderHistoryDetail();
@@ -18603,6 +20306,7 @@ let _browserAuth = null;
 let _browserAuthTimer = null;
 
 async function refreshBrowserAuthBadge(){
+  if(document.hidden)return;
   const el = document.getElementById('nav-browser-badge');
   if(!el) return;
   if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
@@ -18641,9 +20345,16 @@ let _bsFp = {};         // sid -> last fingerprint audit result
 async function loadBrowserTab(){
   let data;
   try{
-    const r = await fetch(BASE+'/api/browser/sessions');
+    const isAdmin=!!(_currentUser&&_currentUser.role==='admin');
+    const r = await fetch(BASE+(isAdmin?'/api/browser/sessions':'/api/my/browser'));
     data = await r.json();
     if(!r.ok) throw new Error(data.error||'Failed');
+    if(!isAdmin){
+      _browserSessions=data.browser?[data.browser]:[];
+      _bsData={sessions:_browserSessions,member:true};
+      renderMemberBrowserTab();
+      return;
+    }
   }catch(e){
     document.getElementById('settings-content').innerHTML =
       '<div class="settings-section"><div class="pf-banner">Failed to load browser sessions: '+esc(e.message||e)+'</div></div>';
@@ -18656,6 +20367,23 @@ async function loadBrowserTab(){
   // cards paint first and fill the badges in when they land.
   loadBrowserProxy(true);
   refreshBrowserAuthBadge();
+}
+
+function renderMemberBrowserTab(){
+  const s=(_browserSessions||[])[0];
+  if(!s){
+    document.getElementById('settings-content').innerHTML='<div class="settings-section"><div class="history-empty">Your browser could not be provisioned.</div></div>';
+    return;
+  }
+  const state=s.running?'running':'parked';
+  document.getElementById('settings-content').innerHTML=`<div class="settings-section">
+    <div class="pf-banner"><b>This browser profile belongs only to your account.</b> Its cookies and local profile persist, but Chrome stays parked until you or a browser-agent tool actually uses it.</div>
+    <div class="bs-card" style="max-width:640px">
+      <div class="bs-head"><span class="bs-dot ${s.running?'on':'off'}"></span><span class="bs-name">${esc(s.name||'My browser')}</span><span class="bs-meta">${state}${s.active_leases?' · '+s.active_leases+' active lease':''}</span></div>
+      <div class="bs-off" style="min-height:150px">${s.running?'Browser is ready. Open the viewer to interact with it.':'Parked to save memory. It restores automatically when opened.'}</div>
+      <div class="bs-actions"><button class="btn btn-primary" onclick="openBrowserSession('${esc(s.id)}')">Open private browser ↗</button></div>
+    </div>
+  </div>`;
 }
 
 // Session ids are safe slugs we generate ('default', 's1', …), so they're the ONLY
@@ -20593,6 +22321,15 @@ function renderStats(s,usage){
     html+='<div class="stats-bar"><div class="stats-bar-fill" style="width:'+s.disk.pct+'%;background:'+diskColor+'"></div></div>';
     html+='</div>';
   }
+  // Retained tmux sessions are state. Active browser leases are capacity.
+  if(s.capacity){
+    const c=s.capacity;
+    html+='<div class="stats-section"><div class="stats-section-title">Live Capacity</div>';
+    html+='<div class="stats-row"><span class="stats-row-label">Active browser leases</span><span class="stats-row-value">'+c.active_browser_leases+' across '+c.active_browsers+' browsers</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label">Terminal streams</span><span class="stats-row-value">'+c.terminal_streams+' readers / '+c.terminal_subscribers+' viewers</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label">Parked sessions</span><span class="stats-row-value">'+c.parked_sessions+' of '+c.total_tmux_sessions+' retained tmux sessions</span></div>';
+    html+='</div>';
+  }
   // tmux Sessions
   if(s.tmux_sessions&&s.tmux_sessions.length){
     html+='<div class="stats-section"><div class="stats-section-title">tmux Sessions ('+s.tmux_sessions.length+')</div>';
@@ -20741,7 +22478,19 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
     return FileResponse(str(target), media_type=mime)
 
 
-if __name__ == "__main__":
+async def _controller_forever() -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
+    async with lifespan(app):
+        await stop.wait()
+
+
+def _run_api_server(workers: int) -> None:
     # WebSocket keepalive — this is what stopped the noVNC viewers dropping every
     # ~minute. A viewer watching a STATIC desktop sends/receives nothing, and
     # uvicorn's default ws implementation on websockets>=14 ("websockets_sansio")
@@ -20752,11 +22501,50 @@ if __name__ == "__main__":
     # so a Ping/Pong flows every 25s and every hop keeps the tunnel open. The
     # generous ping_timeout avoids killing a healthy viewer over one late pong.
     try:
-        uvicorn.run(app, host="0.0.0.0", port=PORT,
+        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers,
                     ws="websockets", ws_ping_interval=25, ws_ping_timeout=120)
     except (ValueError, ImportError, KeyError):
         # The legacy implementation is deprecated upstream; if a future uvicorn
         # drops it, fall back to the default rather than failing to boot.
         logger.warning("uvicorn ws='websockets' unavailable — falling back to the default "
                        "implementation (WebSocket keepalive pings will be disabled)")
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
+        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers)
+
+
+if __name__ == "__main__":
+    if PROCESS_ROLE == "controller":
+        asyncio.run(_controller_forever())
+    elif PROCESS_ROLE == "api":
+        _run_api_server(1)
+    else:
+        # One controller owns watchdogs, lifecycle and tmux readers. Uvicorn's
+        # workers are stateless HTTP/WebSocket relays and can scale independently.
+        workers = max(2, min(8, int(os.environ.get("TMUX_DASH_WEB_WORKERS", "2"))))
+        controller_env = os.environ.copy()
+        controller_env["TMUX_DASH_PROCESS_ROLE"] = "controller"
+        controller = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve())],
+            env=controller_env,
+            start_new_session=True,
+        )
+        os.environ["TMUX_DASH_PROCESS_ROLE"] = "api"
+        controller_stopping = threading.Event()
+
+        def watch_controller() -> None:
+            code = controller.wait()
+            if not controller_stopping.is_set():
+                logger.error("Lifecycle controller exited unexpectedly with code %s", code)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=watch_controller, daemon=True).start()
+        try:
+            _run_api_server(workers)
+        finally:
+            controller_stopping.set()
+            if controller.poll() is None:
+                controller.terminate()
+                try:
+                    controller.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    controller.kill()
+                    controller.wait(timeout=5)

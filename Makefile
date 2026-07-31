@@ -25,22 +25,22 @@ help:
 	@echo "  OPENAI_API_KEY     OpenAI key for LLM summaries"
 
 test:
-	python3 -m pytest test_app.py test_api.py -v
+	python3 -m pytest test_app.py test_api.py test_runtime_control.py test_browser_mcp_lease_proxy.py -v
 
 test-fast:
-	python3 -m pytest test_app.py test_api.py -q
+	python3 -m pytest test_app.py test_api.py test_runtime_control.py test_browser_mcp_lease_proxy.py -q
 
 coverage:
-	python3 -m pytest test_app.py test_api.py --cov=app --cov-report=term-missing --cov-report=html -q
+	python3 -m pytest test_app.py test_api.py test_runtime_control.py test_browser_mcp_lease_proxy.py --cov=app --cov-report=term-missing --cov-report=html -q
 	@echo "HTML report written to htmlcov/index.html"
 
 check: lint test
 
 lint:
-	python3 -m ruff check app.py test_app.py test_api.py
+	python3 -m ruff check app.py runtime_control.py browser_mcp_lease_proxy.py test_app.py test_api.py test_runtime_control.py test_browser_mcp_lease_proxy.py
 
 lint-fix:
-	python3 -m ruff check --fix app.py test_app.py test_api.py
+	python3 -m ruff check --fix app.py runtime_control.py browser_mcp_lease_proxy.py test_app.py test_api.py test_runtime_control.py test_browser_mcp_lease_proxy.py
 
 run:
 	@if [ -z "$(TMUX_DASH_PASS)" ]; then \
