@@ -75,6 +75,14 @@ _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
     _CODEX_DEFAULT_REASONING_EFFORT = "max"
 
+# Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
+# OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
+# access for documentation lookups, so keep that optional MCP out of the
+# interactive startup path unless an operator explicitly opts back in.
+_DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
+    "TMUX_DASH_DISABLE_OPENAI_DOCS_MCP", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
 MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
@@ -217,6 +225,9 @@ def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) ->
             out += " --sandbox workspace-write --ask-for-approval never"
     if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
         out += " --model " + shlex.quote(DEFAULT_MODEL)
+    docs_override = "mcp_servers.openaiDeveloperDocs.enabled=false"
+    if _DISABLE_STALLED_OPENAI_DOCS_MCP and docs_override not in out:
+        out += " -c " + shlex.quote(docs_override)
     return out
 
 
@@ -4651,6 +4662,44 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+_CODEX_MODEL_LOADING_RE = re.compile(
+    r"(?im)^[ \t]*[│|]\s*model:\s*loading\b"
+)
+_CODEX_INPUT_READY_TIMEOUT = 15.0
+
+
+async def _wait_for_codex_input_ready(
+    session_name: str,
+    timeout: float = _CODEX_INPUT_READY_TIMEOUT,
+) -> bool:
+    """Wait out Codex's initial ``model: loading`` state before typing.
+
+    Codex 0.146 accepts input while its model and MCP servers are still
+    starting, but doing so interrupts MCP startup. Its welcome card can also
+    keep the literal ``model: loading`` text after startup is usable, so the
+    marker activates a bounded grace period rather than a permanent block.
+    Established busy sessions continue to accept queued follow-ups immediately.
+    """
+    pane = await asyncio.to_thread(capture_pane_recent, session_name, 40)
+    if not _CODEX_MODEL_LOADING_RE.search(pane):
+        return True
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        pane = await asyncio.to_thread(capture_pane_recent, session_name, 40)
+        if pane and not _CODEX_MODEL_LOADING_RE.search(pane):
+            return True
+
+    logger.info(
+        "Codex still shows its loading welcome card for session '%s' after "
+        "%.1fs; submitting after the startup grace period",
+        session_name,
+        timeout,
+    )
+    return True
 
 
 def get_pane_width(session_name: str) -> int:
@@ -11431,6 +11480,16 @@ async def api_send_command(session_name: str, body: SendCommand):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    if not await _wait_for_codex_input_ready(session_name):
+        return JSONResponse(
+            {
+                "error": (
+                    "Codex is still starting. Your message was not sent; "
+                    "wait a moment and retry."
+                )
+            },
+            status_code=503,
+        )
     try:
         cmd_text = body.command
         if len(cmd_text) > 200:
@@ -11465,9 +11524,9 @@ async def api_send_command(session_name: str, body: SendCommand):
             # before pressing Enter. Scale with length; cap at 5s.
             wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
             await asyncio.sleep(wait_secs)
-            # Press Enter to submit
+            # C-m is an explicit carriage return, which Codex treats as submit.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                ["tmux", "send-keys", "-t", session_name, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
             # Belt-and-braces: if a bracketed paste preview is still showing
@@ -11480,7 +11539,7 @@ async def api_send_command(session_name: str, body: SendCommand):
                 tail = await asyncio.to_thread(capture_pane_recent, session_name, 6)
                 if "Pasted text" in tail or "[Pasted" in tail:
                     await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "Enter"],
+                        ["tmux", "send-keys", "-t", session_name, "C-m"],
                         capture_output=True, text=True, timeout=5
                     )
             except Exception:
@@ -11494,9 +11553,9 @@ async def api_send_command(session_name: str, body: SendCommand):
                 capture_output=True, text=True, timeout=5
             )
             await asyncio.sleep(0.25)
-            # Press Enter as a separate key event
+            # Submit as a separate, explicit carriage-return key event.
             await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                ["tmux", "send-keys", "-t", session_name, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
         # Record user message in chat history
@@ -15621,6 +15680,27 @@ const draftText={};
 // Cache terminal content + scroll position across session switches
 const rawCache={}; // name -> {text, scrollTop, scrollHeight}
 
+function captureComposerFocus(){
+  const el=document.activeElement;
+  if(!el||!el.id||!el.classList||!el.classList.contains('cmd-input'))return null;
+  if(!/^cmd-(chat|raw)-/.test(el.id))return null;
+  return {
+    id:el.id,
+    start:Number.isInteger(el.selectionStart)?el.selectionStart:null,
+    end:Number.isInteger(el.selectionEnd)?el.selectionEnd:null,
+    direction:el.selectionDirection||'none'
+  };
+}
+function restoreComposerFocus(saved){
+  if(!saved)return;
+  const el=document.getElementById(saved.id);
+  if(!el)return;
+  try{el.focus({preventScroll:true})}catch(e){el.focus()}
+  if(saved.start===null||typeof el.setSelectionRange!=='function')return;
+  const max=el.value.length;
+  el.setSelectionRange(Math.min(saved.start,max),Math.min(saved.end,max),saved.direction);
+}
+
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
     sessions.forEach(s=>{
@@ -15862,6 +15942,7 @@ function saveRawCache(){
   });
 }
 function renderDetail(){
+  const composerFocus=captureComposerFocus();
   saveDrafts();
   saveRawCache();
   const s=sessions.find(x=>x.name===selectedSession);
@@ -16098,6 +16179,9 @@ function renderDetail(){
 
   // Restore draft text in textareas
   restoreDrafts();
+  // Status/role refreshes rebuild the detail DOM. Keep the active composer and
+  // caret attached so Enter still reaches its key handler after that rebuild.
+  restoreComposerFocus(composerFocus);
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
@@ -16420,23 +16504,25 @@ async function sendChat(name){
   const cmd=input.value.trim();
   if(!cmd)return;
   input.disabled=true;
-  // Show user bubble immediately
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  // Immediately show busy state — user just sent a message so it must be working
-  setOptimisticBusy(name);
+  let sent=false;
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
     input.value='';input.style.height='auto';
     updateComposerBtn('chat-'+name);
-  }catch(e){alert('Failed to send.')}
+    sent=true;
+  }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
   input.focus();
   // After a delay, verify the busy state from the actual terminal
-  scheduleBusyVerification(name);
+  if(sent)scheduleBusyVerification(name);
 }
 
 function setOptimisticBusy(name){
@@ -16590,16 +16676,17 @@ async function sendCmd(name,source){
   const cmd=input.value.trim();
   if(!cmd)return;
   input.disabled=true;
-  // Also record in chat
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  // Immediately show busy state
-  setOptimisticBusy(name);
+  let sent=false;
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
     input.value='';input.style.height='auto';
     updateComposerBtn(source+'-'+name);
     delete draftText[source+'-'+name];
@@ -16609,10 +16696,11 @@ async function sendCmd(name,source){
       st.userScrolledUp=false;
       setTimeout(()=>pollRawDelta(name),500);
     }
-  }catch(e){alert('Failed to send.')}
+    sent=true;
+  }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
   input.focus();
-  scheduleBusyVerification(name);
+  if(sent)scheduleBusyVerification(name);
 }
 
 // ── Raw Output Streaming ──
@@ -18066,15 +18154,17 @@ function toggleKeyBar(barId,toggleEl){
 }
 
 async function sendSlashCommand(name,cmd){
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  setOptimisticBusy(name);
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-  }catch(e){alert('Failed to send command.')}
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Failed to send command.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
+  }catch(e){alert(e&&e.message?e.message:'Failed to send command.');return}
   scheduleBusyVerification(name);
 }
 
