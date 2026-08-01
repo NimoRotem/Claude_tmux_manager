@@ -17172,7 +17172,6 @@ body.member-simple .nav-tools-wrap{display:none}
 body.member-simple .claude-auth{display:none}
 body.member-simple .nav-server-stats{display:none}
 body.member-simple .nav-usage{display:none}
-body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
 body.member-simple .hide-in-simple{display:none!important}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
@@ -17262,14 +17261,6 @@ body.member-simple .hide-in-simple{display:none!important}
 .skills-editor:focus{border-color:#58a6ff}
 .skills-empty{color:#6e7681;font-size:.8rem;padding:12px 0;text-align:center}
 /* Profile selector — inside the "More" menu (it used to sit on the tab bar) */
-.profile-wrap{display:flex;align-items:center;gap:6px;padding:4px 16px 6px}
-.profile-wrap .profile-select{flex:1;min-width:0}
-.profile-label{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
-.profile-select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-size:.78rem;padding:4px 22px 4px 8px;border-radius:6px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%238b949e' d='M5 7L1 3h8z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center}
-.profile-select:focus{border-color:#58a6ff}
-.profile-restart-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:.85rem;line-height:1}
-.profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
-.profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
 
 /* Profile editor modal — this is a working window, not a dialog: it holds file
    trees, editors and a project list, so it takes the whole viewport. */
@@ -17296,16 +17287,6 @@ body.member-simple .hide-in-simple{display:none!important}
    automatic minimum size is the content's min-content width — so `width:0`
    alone leaves the sidebar sitting at its full 240px and the collapse silently
    does nothing. */
-.profiles-body.rail .profiles-list{width:0;min-width:0;padding-right:0;border-right:none;overflow:hidden;opacity:0}
-.profiles-list{width:240px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;border-right:1px solid #21262d;padding-right:14px;overflow-y:auto;transition:width .14s ease,padding .14s ease,opacity .14s ease}
-.profile-row{padding:8px 10px;border:1px solid #21262d;border-radius:6px;cursor:pointer;background:#0d1117;display:flex;flex-direction:column;gap:2px}
-.profile-row:hover{background:#1c2128}
-.profile-row.selected{border-color:#58a6ff;background:#0d2340}
-.profile-row-name{color:#c9d1d9;font-size:.85rem;font-weight:500}
-.profile-row-meta{color:#6e7681;font-size:.7rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
-.profile-row-builtin{color:#d2a8ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em}
-.profile-new-btn{background:#1c2333;border:1px solid #388bfd44;color:#58a6ff;padding:7px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500}
-.profile-new-btn:hover{background:#253049}
 .profile-edit{flex:1;display:flex;flex-direction:column;gap:8px;overflow-y:auto;min-width:0}
 .profile-edit label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-top:4px}
 .profile-edit input,.profile-edit textarea,.profile-edit select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace}
@@ -17804,7 +17785,7 @@ body.member-simple .hide-in-simple{display:none!important}
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Claude Profiles</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x2699;</span> Claude Config</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -17877,9 +17858,8 @@ body.member-simple .hide-in-simple{display:none!important}
      whichever profile is selected, because that is what they are. -->
 <div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
   <div class="profiles-panel">
-    <h3><span>Claude Profiles</span> <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
+    <h3><span>Claude Config</span> <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
     <div class="pf-toolbar">
-      <button class="pf-tb-btn" id="pf-rail-btn" onclick="toggleProfilesRail()" title="Collapse the profile list to widen the editor">&#9664; Profiles</button>
       <button class="pf-tb-btn" id="pf-hint-btn" onclick="toggleProfilesHint()" title="Show or hide the explainer">&#9432;</button>
       <span class="pf-tb-sep"></span>
       <!-- The project is chosen in the MAIN nav; this window follows it. Showing a
@@ -17887,10 +17867,9 @@ body.member-simple .hide-in-simple{display:none!important}
       <span class="pf-tb-label">Project</span>
       <span class="pf-tb-scope" id="pf-proj-scope" title="Set the working project in the top navigation bar">All projects</span>
     </div>
-    <div class="profiles-hint" id="profiles-hint">Everything Claude Code reads on this host, in one place — nothing that changes its behaviour lives anywhere else in this dashboard. Each profile is a fully isolated config (settings.json, CLAUDE.md, MEMORY.md, auto-memories, skills, agents, commands, MCP, login) under <code>~/.claude-&lt;id&gt;/</code>, selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>; the <strong>Default</strong> profile uses the standard <code>~/.claude</code>. Anything marked <b>shared</b> is host-wide and reads the same under every profile: the host context files (<code>~/CLAUDE.md</code> and what it points at), the hook scripts, and the <b>Projects</b> tab's working-directory files, which load on top of whichever profile a session runs on.</div>
+    <div class="profiles-hint" id="profiles-hint">Everything Claude Code reads on this host, in one place — nothing that changes its behaviour lives anywhere else in this dashboard: <code>settings.json</code>, <code>CLAUDE.md</code>, <code>MEMORY.md</code>, auto-memories, skills, agents, commands, MCP and login, all under the standard <code>~/.claude</code>. The <b>Projects</b> tab's working-directory files are per-cwd and load on top.</div>
     <div class="profiles-body">
-      <div class="profiles-list" id="profiles-list">Loading...</div>
-      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
+      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Loading…</div></div>
     </div>
   </div>
 </div>
@@ -19112,7 +19091,6 @@ function renderDetail(){
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
           <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
-          ${renderProfileDropdown(s)}
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <!-- Clean view sits right under Auto-push because it is the other
@@ -21418,8 +21396,8 @@ function _profileForSession(name){
 }
 
 // The skills UI is keyed by an element-id suffix. A session tab passes the
-// session name and the profile is looked up from it; the Profiles window passes
-// PF_SKILL_KEY and registers the profile it is editing here, so one set of
+// session name and the config dir is looked up from it; the Claude Config window
+// passes PF_SKILL_KEY and registers what it is editing here, so one set of
 // render/mutate functions drives both places.
 const _skillScopePid={};
 function _skillPid(key){
@@ -21433,7 +21411,7 @@ async function loadProfileSkills(name){
   const builtinEl=document.getElementById('skills-builtin-'+name);
   if(!activeEl||!libEl||!builtinEl)return;
   const pid=_skillPid(name);
-  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>';
+  if(meta)meta.innerHTML='Skills read from <code>'+esc(pid==='default'?'~/.claude/skills':('~/.claude-'+pid+'/skills'))+'</code>';
   activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
   libEl.innerHTML='<div class="skills-empty">Loading...</div>';
   builtinEl.innerHTML='<div class="skills-empty">Loading...</div>';
@@ -21686,13 +21664,18 @@ function closeSkillEditor(name){
   _editingSkillName=null;
 }
 
-// ── Claude profiles ──
+// ── Claude config ──
+// The multi-profile picker is gone. It offered a set of preset personas (UI
+// Expert, UX Expert, Researcher, …), each a separate CLAUDE_CONFIG_DIR, chosen
+// per session — a whole axis of state nobody was using, and one more control
+// between the user and the session. Every session runs on the default config
+// (`~/.claude`), and the window below edits that one config. The /api/profiles
+// routes stay: they are what the editor reads and writes.
 let _profilesCache = null;        // [{id,name,model,effort,builtin}, ...]
 let _profilesEditing = null;       // currently-edited full profile object
-let _profilePending = {};          // sessionName -> "pending restart" flag
 
 async function loadProfiles(force){
-  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
+  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no config editor
   if(_profilesCache && !force) return _profilesCache;
   try{
     const resp = await fetch(BASE+'/api/profiles');
@@ -21700,89 +21683,6 @@ async function loadProfiles(force){
     _profilesCache = data.profiles || [];
   }catch(e){ _profilesCache = []; }
   return _profilesCache;
-}
-
-function renderProfileDropdown(s){
-  if(MEMBER_SIMPLE) return '';  // members have no profile selector
-  const cur = s.profile_id || 'default';
-  const list = _profilesCache || [];
-  const opts = list.length
-    ? list.map(p=>`<option value="${esc(p.id)}" ${p.id===cur?'selected':''}>${esc(p.name)}</option>`).join('')
-    : `<option value="default" selected>Default</option>`;
-  const pending = _profilePending[s.name] ? ' pending' : '';
-  const restartTitle = _profilePending[s.name]
-    ? 'Restart Claude to apply the new profile'
-    : 'Restart Claude with this profile';
-  // Lives inside the "More" menu, not on the tab bar: it is a set-once-per-session
-  // control, and on the tab bar it cost a permanent slot next to Terminal.
-  // onclick stops the bubble because the menu closes on any outside click and
-  // was swallowing the <select>.
-  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)" onclick="event.stopPropagation()">
-    <span class="profile-label">Profile</span>
-    <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
-    <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
-  </div>
-  <div class="tab-more-model-sep"></div>`;
-}
-
-async function onProfileChange(sessionName, profileId){
-  // First call: probe whether Claude is currently running in this session
-  // (we pass restart:false so we get back the running state). If it IS running,
-  // ask the user whether to restart now; otherwise the new profile won't take
-  // effect until Claude is next launched and the user's memory will appear to
-  // "spill" from the previous profile.
-  try{
-    let resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: profileId, restart: false})
-    });
-    let data = await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to set profile'); return;}
-    const sess = sessions.find(x=>x.name===sessionName);
-    if(sess) sess.profile_id = profileId;
-
-    if(data.claude_was_running && !data.restarted){
-      const wantRestart = confirm(
-        'Profile switched to "' + profileId + '".\n\n' +
-        'Claude is still running with the previous profile and will keep using it ' +
-        '(including its memory) until you restart it.\n\n' +
-        'Restart Claude now?'
-      );
-      if(wantRestart){
-        resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({profile_id: profileId, restart: true})
-        });
-        data = await resp.json();
-        if(resp.ok && data.restarted){
-          delete _profilePending[sessionName];
-        }else{
-          _profilePending[sessionName] = true;
-        }
-      }else{
-        _profilePending[sessionName] = true;
-      }
-    }else{
-      delete _profilePending[sessionName];
-    }
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to set profile.'); }
-}
-
-async function restartWithProfile(sessionName){
-  const sess = sessions.find(x=>x.name===sessionName);
-  const pid = (sess && sess.profile_id) || 'default';
-  if(!confirm('Exit Claude in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Claude state will be lost.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: pid, restart: true})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to restart'); return; }
-    delete _profilePending[sessionName];
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to restart Claude.'); }
 }
 
 // ── Current-user awareness ──────────────────────────────────────────────────
@@ -21858,7 +21758,7 @@ function renderSettingsTabs(){
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
   const tabs = [];
   // "My Context" is an admin's ~/.claude — the same CLAUDE.md, MEMORY.md and
-  // settings.json the Claude Profiles window shows under Default, so it would be
+  // settings.json the Claude Config window shows, so it would be
   // the one file editor living in two places. Members have no profiles window,
   // and their config dir is their own, so they keep the tab.
   if(!isAdmin) tabs.push({id:'mycontext', label:'My Context'});
@@ -23648,34 +23548,16 @@ function _pfPrefGet(k, d){ try{ const v=localStorage.getItem(k); return v===null
 function _pfPrefSet(k, v){ try{ localStorage.setItem(k, v?'1':'0'); }catch(e){} }
 
 function applyProfilesChrome(){
-  const rail = _pfPrefGet('pfRail', false);
   const hint = _pfPrefGet('pfHint', false);   // the long explainer stays hidden by default
-  const body = document.querySelector('#profiles-overlay .profiles-body');
-  if(body) body.classList.toggle('rail', rail);
-  const rb = document.getElementById('pf-rail-btn');
-  if(rb){
-    rb.classList.toggle('on', rail);
-    rb.innerHTML = (rail ? '&#9654;' : '&#9664;') + ' Profiles';
-    rb.title = rail ? 'Show the profile list' : 'Collapse the profile list to widen the editor';
-  }
   const hEl = document.getElementById('profiles-hint');
-  // The explainer is hidden whenever the sidebar is collapsed: collapsing is a
-  // request for room, and a six-line paragraph is the biggest thing in the way.
-  if(hEl) hEl.classList.toggle('hidden', !hint || rail);
+  if(hEl) hEl.classList.toggle('hidden', !hint);
   const hb = document.getElementById('pf-hint-btn');
   if(hb){
-    hb.classList.toggle('on', hint && !rail);
-    hb.title = rail ? 'Expand the profile list to show the explainer'
-                    : (hint ? 'Hide the explainer' : 'What is this window?');
+    hb.classList.toggle('on', hint);
+    hb.title = hint ? 'Hide the explainer' : 'What is this window?';
   }
 }
-function toggleProfilesRail(){
-  _pfPrefSet('pfRail', !_pfPrefGet('pfRail', false));
-  applyProfilesChrome();
-}
 function toggleProfilesHint(){
-  // Asking for the explainer while collapsed should give it to you, not no-op.
-  if(_pfPrefGet('pfRail', false)) _pfPrefSet('pfRail', false);
   _pfPrefSet('pfHint', !_pfPrefGet('pfHint', false));
   applyProfilesChrome();
 }
@@ -23685,17 +23567,9 @@ async function openProfiles(){
   overlay.classList.add('active');
   applyProfilesChrome();
   await loadProfiles(true);
-  renderProfilesList();
-  // Open on a profile rather than an empty pane: the shared host context and the
-  // global block live inside the profile view, so an empty pane hides them.
-  const list = _profilesCache || [];
-  const want = (_profilesEditing && list.some(p=>p.id===_profilesEditing.id))
-    ? _profilesEditing.id
-    : (selectedSession ? _profileForSession(selectedSession) : '');
-  const pick = list.find(p=>p.id===want) || list.find(p=>p.id==='default') || list[0];
-  if(pick){ await editProfile(pick.id); return; }
-  document.getElementById('profile-edit').innerHTML =
-    '<div class="profile-empty">Select a profile on the left, or create a new one.</div>';
+  // One config, always. There is no profile to choose any more, so this opens
+  // straight onto `~/.claude` instead of a list.
+  await editProfile('default');
 }
 
 // Deep link into a specific tab. The session "More" menu uses this instead of
@@ -23712,33 +23586,14 @@ function closeProfiles(){
   _profilesEditing = null;
 }
 
-function renderProfilesList(){
-  const list = _profilesCache || [];
-  const el = document.getElementById('profiles-list');
-  let html = '<button class="profile-new-btn" onclick="newProfilePrompt()">+ New profile</button>';
-  list.forEach(p => {
-    const sel = (_profilesEditing && _profilesEditing.id===p.id) ? ' selected' : '';
-    const tag = p.builtin
-      ? (p.id==='default' ? '<span class="profile-row-builtin">default</span>' : '<span class="profile-row-builtin">preset</span>')
-      : '';
-    const meta = (p.model||'') + (p.effort?(' &middot; '+esc(p.effort)):'');
-    html += `<div class="profile-row${sel}" onclick="editProfile('${esc(p.id)}')">
-      <div class="profile-row-name">${esc(p.name)} ${tag}</div>
-      <div class="profile-row-meta">${meta || '&mdash;'}</div>
-    </div>`;
-  });
-  el.innerHTML = html;
-}
-
 async function editProfile(profileId){
   try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId));
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId||'default'));
     const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to load profile'); return; }
+    if(!resp.ok){ alert(data.error||'Failed to load config'); return; }
     _profilesEditing = data;
-    renderProfilesList();
     renderProfileEdit();
-  }catch(e){ alert('Failed to load profile.'); }
+  }catch(e){ alert('Failed to load config.'); }
 }
 
 let _profileActiveTab = 'identity';
@@ -23746,7 +23601,7 @@ let _profileActiveTab = 'identity';
 // context it always loads, the memories it wrote itself, then the capabilities
 // (skills/agents/commands/MCP) and the raw config behind them.
 const _PROFILE_TABS = [
-  {id:'identity', label:'Identity'},
+  {id:'identity', label:'Defaults'},
   {id:'context',  label:'Context'},
   {id:'projects', label:'Projects'},
   {id:'memories', label:'Memories'},
@@ -23833,14 +23688,11 @@ function pfShowMemoryEditor(){
 function renderProfileEdit(){
   const p = _profilesEditing;
   const el = document.getElementById('profile-edit');
-  if(!p){ el.innerHTML = '<div class="profile-empty">Select a profile.</div>'; return; }
+  if(!p){ el.innerHTML = '<div class="profile-empty">Could not load the Claude config.</div>'; return; }
   const isDefault = (p.id === 'default');
   const permJson = JSON.stringify(p.permissions||{}, null, 2);
   const envJson = JSON.stringify(p.env||{}, null, 2);
   const dir = p.dir || (isDefault ? '~/.claude (merged)' : ('~/.claude-'+p.id));
-  const builtinTag = isDefault
-    ? ' <span class="profile-row-builtin">default</span>'
-    : (p.builtin ? ' <span class="profile-row-builtin">preset</span>' : '');
   // Effort glyphs requested by user
   const EFFORTS = [
     {v:'',      label:'(default)'},
@@ -23852,9 +23704,6 @@ function renderProfileEdit(){
   const effortOpts = EFFORTS.map(o =>
     `<option value="${o.v}"${(p.effort||'')===o.v?' selected':''}>${o.label}</option>`
   ).join('');
-  const deleteBtn = isDefault
-    ? ''
-    : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
   const headerNote = isDefault
     ? '<div class="profiles-hint" style="margin:0 0 6px">Settings → identity edits are merged into <code>~/.claude/settings.json</code> (only <code>model</code>, <code>env</code>, <code>permissions</code> touched). Backup at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
     : '';
@@ -23864,13 +23713,14 @@ function renderProfileEdit(){
   ).join('');
 
   el.innerHTML = `
-    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}${builtinTag}</div>
+    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}</div>
     ${headerNote}
     <div class="pf-tabs">${tabBar}</div>
 
     <div class="pf-section${_profileActiveTab==='identity'?' active':''}" id="pf-section-identity">
-      <label>Name</label>
-      <input id="ed-name" value="${esc(p.name||'')}">
+      <!-- The config's display name only ever appeared in the profile list, which
+           is gone. Kept as a hidden field so saveProfile still round-trips it. -->
+      <input type="hidden" id="ed-name" value="${esc(p.name||'')}">
       <div class="row2">
         <div>
           <label>Model</label>
@@ -23999,10 +23849,10 @@ function renderProfileEdit(){
     </div>
 
     <div class="profile-edit-actions">
-      ${deleteBtn || '<span></span>'}
+      <span></span>
       <div style="display:flex;gap:8px">
         <button class="modal-cancel" onclick="closeProfiles()">Close</button>
-        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + context</button>
+        <button class="modal-confirm-create" onclick="saveProfile()">Save defaults + context</button>
       </div>
     </div>
   `;
@@ -24719,54 +24569,6 @@ async function saveProfile(){
     await loadProfiles(true);
     await editProfile(p.id);
   }catch(e){ alert('Failed to save profile.'); }
-}
-
-async function deleteProfile(profileId){
-  if(profileId==='default'){ alert("The default profile can't be deleted."); return; }
-  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.claude-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    _profilesEditing = null;
-    await loadProfiles(true);
-    renderProfilesList();
-    document.getElementById('profile-edit').innerHTML =
-      '<div class="profile-empty">Profile deleted.</div>';
-    // Refresh visible session dropdowns
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to delete profile.'); }
-}
-
-async function newProfilePrompt(){
-  const list = _profilesCache || [];
-  const presets = list.filter(p => p.builtin && p.id!=='default');
-  let promptMsg = 'New profile name (e.g. "My UI Reviewer"):';
-  if(presets.length){
-    promptMsg += '\\n\\nLeave empty to start blank. To clone a preset, append " | preset-id" -- available preset ids:\\n  '
-      + presets.map(p=>p.id).join(', ');
-  }
-  const raw = window.prompt(promptMsg, '');
-  if(raw === null) return;
-  let name = raw.trim();
-  let fromPreset = '';
-  if(name.includes('|')){
-    const parts = name.split('|');
-    name = parts[0].trim();
-    fromPreset = parts[1].trim();
-  }
-  if(!name){ alert('Name is required.'); return; }
-  try{
-    const resp = await fetch(BASE+'/api/profiles', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, from_preset: fromPreset})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create profile'); return; }
-    await loadProfiles(true);
-    await editProfile(data.id);
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to create profile.'); }
 }
 
 // ── Project-scope file editor (per-session, cwd-bound) ──
