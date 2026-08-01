@@ -75,6 +75,14 @@ _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
     _CODEX_DEFAULT_REASONING_EFFORT = "max"
 
+# Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
+# OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
+# access for documentation lookups, so keep that optional MCP out of the
+# interactive startup path unless an operator explicitly opts back in.
+_DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
+    "TMUX_DASH_DISABLE_OPENAI_DOCS_MCP", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
 MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
@@ -217,6 +225,9 @@ def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) ->
             out += " --sandbox workspace-write --ask-for-approval never"
     if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
         out += " --model " + shlex.quote(DEFAULT_MODEL)
+    docs_override = "mcp_servers.openaiDeveloperDocs.enabled=false"
+    if _DISABLE_STALLED_OPENAI_DOCS_MCP and docs_override not in out:
+        out += " -c " + shlex.quote(docs_override)
     return out
 
 
@@ -4656,7 +4667,7 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
 _CODEX_MODEL_LOADING_RE = re.compile(
     r"(?im)^[ \t]*[│|]\s*model:\s*loading\b"
 )
-_CODEX_INPUT_READY_TIMEOUT = 30.0
+_CODEX_INPUT_READY_TIMEOUT = 15.0
 
 
 async def _wait_for_codex_input_ready(
@@ -4666,10 +4677,10 @@ async def _wait_for_codex_input_ready(
     """Wait out Codex's initial ``model: loading`` state before typing.
 
     Codex 0.146 accepts input while its model and MCP servers are still
-    starting, but doing so interrupts MCP startup and can leave even a trivial
-    first turn apparently stuck for minutes. Established sessions must still
-    accept follow-up input while they are busy, so only the explicit startup
-    marker activates this wait.
+    starting, but doing so interrupts MCP startup. Its welcome card can also
+    keep the literal ``model: loading`` text after startup is usable, so the
+    marker activates a bounded grace period rather than a permanent block.
+    Established busy sessions continue to accept queued follow-ups immediately.
     """
     pane = await asyncio.to_thread(capture_pane_recent, session_name, 40)
     if not _CODEX_MODEL_LOADING_RE.search(pane):
@@ -4682,12 +4693,13 @@ async def _wait_for_codex_input_ready(
         if pane and not _CODEX_MODEL_LOADING_RE.search(pane):
             return True
 
-    logger.warning(
-        "Codex input did not become ready for session '%s' within %.1fs",
+    logger.info(
+        "Codex still shows its loading welcome card for session '%s' after "
+        "%.1fs; submitting after the startup grace period",
         session_name,
         timeout,
     )
-    return False
+    return True
 
 
 def get_pane_width(session_name: str) -> int:

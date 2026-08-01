@@ -1874,6 +1874,10 @@ class TestCreateSession:
         assert resp.status_code == 200
         calls_str = [str(c) for c in mock_run.call_args_list]
         assert any("codex --dangerously-bypass-approvals-and-sandbox" in c for c in calls_str)
+        assert any(
+            "mcp_servers.openaiDeveloperDocs.enabled=false" in c
+            for c in calls_str
+        )
 
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run", side_effect=Exception("tmux daemon crashed"))
@@ -2919,17 +2923,14 @@ class TestWaitForCodexInputReady:
         mock_sleep.assert_awaited_once_with(0.25)
 
     @pytest.mark.asyncio
-    async def test_loading_timeout_fails_closed(self):
+    async def test_stale_loading_card_submits_after_grace(self):
         import app as _app
 
         with patch(
             "app.capture_pane_recent",
             return_value="│ model: loading /model to change │",
         ):
-            assert (
-                await _app._wait_for_codex_input_ready("sess", timeout=0)
-                is False
-            )
+            assert await _app._wait_for_codex_input_ready("sess", timeout=0) is True
 
 
 # ---------------------------------------------------------------------------
