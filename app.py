@@ -25191,21 +25191,27 @@ function closeStats(){
 const _BOTTOM_BAR_IDS=['nav-browser-badge','nav-usage','nav-server-stats'];
 function syncMobileBottomBar(){
   const bar=document.getElementById('mobile-bottom-bar');
-  if(!bar)return;
+  const right=document.querySelector('.nav-right');
+  if(!bar||!right)return;
+  // The header's original child order, captured once before anything moves.
+  // Restoring by replaying this list is deterministic; restoring with
+  // insertBefore(el, el.nextSibling) is not — an anchor can still be sitting in
+  // the bar when the element that needs it comes back, and the two widgets end
+  // up swapped after a rotate-and-rotate-back.
+  if(!right._navOrder)right._navOrder=[].slice.call(right.children);
   const narrow=window.matchMedia?window.matchMedia('(max-width:768px)').matches:(innerWidth<=768);
   _BOTTOM_BAR_IDS.forEach(id=>{
     const el=document.getElementById(id);
     if(!el)return;
-    // Remember where it came from the first time we see it, while it is still
-    // sitting in its original slot.
-    if(!el._navHome){el._navHome=el.parentNode;el._navNext=el.nextElementSibling;}
     if(narrow){
       if(el.parentNode!==bar)bar.appendChild(el);
     }else if(el.parentNode===bar){
-      if(el._navNext&&el._navNext.parentNode===el._navHome)el._navHome.insertBefore(el,el._navNext);
-      else el._navHome.appendChild(el);
+      right.appendChild(el);
     }
   });
+  // appendChild on a node already in the parent MOVES it, so replaying the
+  // recorded order puts everything back exactly where it started.
+  if(!narrow)right._navOrder.forEach(c=>{if(c.parentNode===right)right.appendChild(c)});
   // A simplified team member sees none of these three, and an empty strip is
   // still a bordered 40px band at the foot of the page. Show the bar with the
   // class on, measure, then keep the class only if something actually rendered.
