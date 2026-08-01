@@ -17690,7 +17690,7 @@ body.member-simple .hide-in-simple{display:none!important}
      bottom of the page, under the terminal and the upload area. The copies that
      used to stand in for them inside the Tools menu are gone with them. */
   .nav-server-stats,.nav-usage,.nav-tools-usage{display:none}
-  .mobile-bottom-bar{display:flex;align-items:center;flex-wrap:wrap;gap:14px;
+  .mobile-bottom-bar.has-items{display:flex;align-items:center;flex-wrap:wrap;gap:14px;
     padding:12px 14px calc(14px + env(safe-area-inset-bottom,0px));margin-top:10px;
     border-top:1px solid #21262d;background:#0d1117}
   body:not(.member-simple) .mobile-bottom-bar .nav-usage:not(.disabled){
@@ -21816,6 +21816,8 @@ async function applyRoleVisibility(){
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
+  // Which widgets the phone strip can show depends on the role we just learned.
+  syncMobileBottomBar();
   if(isAdmin) startBrowserAuthPolling();
 }
 
@@ -25204,6 +25206,12 @@ function syncMobileBottomBar(){
       else el._navHome.appendChild(el);
     }
   });
+  // A simplified team member sees none of these three, and an empty strip is
+  // still a bordered 40px band at the foot of the page. Show the bar with the
+  // class on, measure, then keep the class only if something actually rendered.
+  bar.classList.add('has-items');
+  if(!narrow||![].some.call(bar.children,c=>c.getBoundingClientRect().width>0))
+    bar.classList.remove('has-items');
 }
 if(window.matchMedia){
   const _mq=window.matchMedia('(max-width:768px)');
