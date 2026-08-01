@@ -15680,6 +15680,27 @@ const draftText={};
 // Cache terminal content + scroll position across session switches
 const rawCache={}; // name -> {text, scrollTop, scrollHeight}
 
+function captureComposerFocus(){
+  const el=document.activeElement;
+  if(!el||!el.id||!el.classList||!el.classList.contains('cmd-input'))return null;
+  if(!/^cmd-(chat|raw)-/.test(el.id))return null;
+  return {
+    id:el.id,
+    start:Number.isInteger(el.selectionStart)?el.selectionStart:null,
+    end:Number.isInteger(el.selectionEnd)?el.selectionEnd:null,
+    direction:el.selectionDirection||'none'
+  };
+}
+function restoreComposerFocus(saved){
+  if(!saved)return;
+  const el=document.getElementById(saved.id);
+  if(!el)return;
+  try{el.focus({preventScroll:true})}catch(e){el.focus()}
+  if(saved.start===null||typeof el.setSelectionRange!=='function')return;
+  const max=el.value.length;
+  el.setSelectionRange(Math.min(saved.start,max),Math.min(saved.end,max),saved.direction);
+}
+
 function saveDrafts(){
   ['chat','raw'].forEach(tab=>{
     sessions.forEach(s=>{
@@ -15921,6 +15942,7 @@ function saveRawCache(){
   });
 }
 function renderDetail(){
+  const composerFocus=captureComposerFocus();
   saveDrafts();
   saveRawCache();
   const s=sessions.find(x=>x.name===selectedSession);
@@ -16157,6 +16179,9 @@ function renderDetail(){
 
   // Restore draft text in textareas
   restoreDrafts();
+  // Status/role refreshes rebuild the detail DOM. Keep the active composer and
+  // caret attached so Enter still reaches its key handler after that rebuild.
+  restoreComposerFocus(composerFocus);
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer

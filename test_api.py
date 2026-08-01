@@ -180,6 +180,18 @@ class TestDashboardFrontendRegressions:
             assert block.index("if(!resp.ok)") < block.index("appendChatBubble")
             assert "if(sent)scheduleBusyVerification(name)" in block
 
+    def test_detail_rerenders_preserve_composer_focus_and_caret(self, authed_client):
+        html = authed_client.get("/").text
+        render_start = html.index("function renderDetail()")
+        render_end = html.index("function selectSession", render_start)
+        render_block = html[render_start:render_end]
+
+        assert "function captureComposerFocus()" in html
+        assert "function restoreComposerFocus(saved)" in html
+        assert "const composerFocus=captureComposerFocus();" in render_block
+        assert "restoreComposerFocus(composerFocus);" in render_block
+        assert "el.setSelectionRange" in html
+
     def test_restored_drafts_restore_the_send_button_state(self, authed_client):
         html = authed_client.get("/").text
         restore_start = html.index("function restoreDrafts()")
