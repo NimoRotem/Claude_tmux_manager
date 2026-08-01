@@ -164,6 +164,22 @@ class TestDashboardFrontendRegressions:
             "updateComposerBtn(source+'-'+name)" in html[raw_start:raw_end],
         ) == (True, True)
 
+    def test_failed_sends_keep_the_composer_text_and_surface_server_error(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        chat_start = html.index("async function sendChat(name)")
+        chat_end = html.index("function setOptimisticBusy", chat_start)
+        raw_start = html.index("async function sendCmd(name,source)")
+        raw_end = html.index("function startRawPolling", raw_start)
+
+        for block in (html[chat_start:chat_end], html[raw_start:raw_end]):
+            assert "if(!resp.ok)throw new Error(data.error" in block
+            assert block.index("if(!resp.ok)") < block.index("input.value=''")
+            assert block.index("if(!resp.ok)") < block.index("appendChatBubble")
+            assert "if(sent)scheduleBusyVerification(name)" in block
+
     def test_restored_drafts_restore_the_send_button_state(self, authed_client):
         html = authed_client.get("/").text
         restore_start = html.index("function restoreDrafts()")
@@ -2018,7 +2034,38 @@ class TestSendCommandEndpoint:
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
         mock_sleep.assert_awaited_once_with(0.25)
-        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
+        sent_keys = [
+            call.args[0][-1]
+            for call in mock_run.call_args_list
+            if call.args[0][1] == "send-keys"
+        ]
+        assert sent_keys == ["echo hello", "C-m"]
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    @patch(
+        "app._wait_for_codex_input_ready",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    def test_send_during_stuck_startup_keeps_message_unsent(
+        self,
+        mock_ready,
+        mock_sessions,
+        authed_client,
+    ):
+        resp = authed_client.post(
+            "/api/sessions/test-session/send",
+            json={"command": "hi"},
+        )
+
+        assert resp.status_code == 503
+        assert resp.json() == {
+            "error": (
+                "Codex is still starting. Your message was not sent; "
+                "wait a moment and retry."
+            )
+        }
+        mock_ready.assert_awaited_once_with("test-session")
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -2035,6 +2082,11 @@ class TestSendCommandEndpoint:
         # Verify tmux load-buffer was called (buffer path taken)
         calls = [str(c) for c in mock_run.call_args_list]
         assert any("load-buffer" in c for c in calls)
+        assert any(
+            call.args[0][-1] == "C-m"
+            for call in mock_run.call_args_list
+            if call.args[0][1] == "send-keys"
+        )
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run", side_effect=Exception("tmux gone"))
@@ -2835,6 +2887,49 @@ class TestCapturePaneFunctions:
     def test_capture_recent_returns_empty_on_exception(self, mock_run):
         import app as _app
         assert _app.capture_pane_recent("sess") == ""
+
+
+class TestWaitForCodexInputReady:
+    @pytest.mark.asyncio
+    async def test_established_session_does_not_wait(self):
+        import app as _app
+
+        with (
+            patch("app.capture_pane_recent", return_value="• Working\n› queued"),
+            patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            assert await _app._wait_for_codex_input_ready("sess") is True
+
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_waits_until_loading_model_is_ready(self):
+        import app as _app
+
+        panes = [
+            "│ model:       loading   /model to change │",
+            "│ model:       gpt-5.6-sol max   /model to change │",
+        ]
+        with (
+            patch("app.capture_pane_recent", side_effect=panes),
+            patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            assert await _app._wait_for_codex_input_ready("sess") is True
+
+        mock_sleep.assert_awaited_once_with(0.25)
+
+    @pytest.mark.asyncio
+    async def test_loading_timeout_fails_closed(self):
+        import app as _app
+
+        with patch(
+            "app.capture_pane_recent",
+            return_value="│ model: loading /model to change │",
+        ):
+            assert (
+                await _app._wait_for_codex_input_ready("sess", timeout=0)
+                is False
+            )
 
 
 # ---------------------------------------------------------------------------
