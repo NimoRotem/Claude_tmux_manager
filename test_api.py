@@ -228,8 +228,12 @@ class TestDashboardFrontendRegressions:
 
     def test_terminal_renderer_defines_update_filter_before_use(self, authed_client):
         html = authed_client.get("/").text
-        definition = html.index("function _isUpdateNoise(line)")
-        usage = html.index("if(hideBash&&_isUpdateNoise(line))continue")
+        # The renderer calls the noise filter while streaming lines, so the
+        # function has to be defined above the loop or the terminal throws on
+        # the first frame. The call site moved out of the old
+        # `hideBash && _isUpdateNoise(line)` form; guard the real one.
+        definition = html.index("function _isNoise(line){")
+        usage = html.index("if(_isNoise(line)){mode='noise';continue;}")
         assert definition < usage
 
     def test_context_files_live_only_inside_settings(self, authed_client):
@@ -884,7 +888,7 @@ class TestFindSessionJsonlFiles:
         """Codex has no matching rollouts when CODEX_HOME/sessions is absent."""
         import app
 
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("no-dir-session")
         assert result == []
 
@@ -902,7 +906,7 @@ class TestFindSessionJsonlFiles:
                 "payload": {"cwd": "/home/user/myproject/"},
             }) + "\n"
         )
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("has-rollout-session")
         assert result == [str(rollout)]
 
@@ -920,7 +924,7 @@ class TestFindSessionJsonlFiles:
                 "payload": {"cwd": "/home/user/other-project"},
             }) + "\n"
         )
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("other-rollout-session")
         assert result == []
 
@@ -1868,38 +1872,26 @@ class TestCreateSession:
         assert "error" in resp.json()
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_default_profile_model_change_preserves_global_agents(
+    def test_model_change_preserves_the_accounts_agents_md(
         self, mock_sessions, authed_client, tmp_path
     ):
-        """An empty built-in profile field must never erase ~/.codex/AGENTS.md."""
-        import app as app_module
+        """Changing the model must never disturb the account's AGENTS.md.
 
+        The profile picker this once covered is gone — a session's Codex home now
+        comes from `_session_config_base` — but the guarantee still matters: a
+        model write merges into config.toml and must leave the account's
+        instructions byte-identical.
+        """
         codex_home = tmp_path / ".codex"
         codex_home.mkdir()
         agents_path = codex_home / "AGENTS.md"
         original = b"# Global Codex instructions\n\nKeep this context byte-identical.\n"
         agents_path.write_bytes(original)
-        profile = {
-            "id": app_module.DEFAULT_PROFILE_ID,
-            "name": "Default",
-            "model": app_module.DEFAULT_MODEL,
-            "effort": "max",
-            "codex_md": "",
-            "memory_md": "",
-            "env": {},
-        }
-        roles = {"profiles": [profile], "session_profiles": {}}
 
         with (
-            patch("app._load_roles", return_value=roles),
-            patch("app._save_roles"),
-            patch("app._profile_dir", return_value=codex_home),
-            patch(
-                "app._get_session_profile_id",
-                return_value=app_module.DEFAULT_PROFILE_ID,
-            ),
+            patch("app._session_config_base", return_value=codex_home),
             patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
-            patch("app._send_profile_export", return_value=True),
+            patch("app._send_session_owner_environment", return_value=True),
         ):
             resp = authed_client.post(
                 "/api/sessions/test-session/model",
@@ -1908,6 +1900,8 @@ class TestCreateSession:
 
         assert resp.status_code == 200
         assert agents_path.read_bytes() == original
+        # and the model really did land in that home's config
+        assert 'model = "gpt-5.6-sol"' in (codex_home / "config.toml").read_text()
 
 
 # ─── Delete Session Tests ───
@@ -2018,7 +2012,9 @@ class TestSendCommandEndpoint:
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
         mock_sleep.assert_awaited_once_with(0.25)
-        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
+        # The send path scrolls the pane back into view first, and submits with
+        # C-m rather than the "Enter" key name; both reach tmux identically.
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["-40", "echo hello", "C-m"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -2097,14 +2093,14 @@ class TestSetAuthModeEndpoint:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
-    def test_valid_mode_is_managed_per_profile_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
+    def test_valid_mode_is_managed_per_account_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
         """The retired pane toggle cannot place credentials in terminal history."""
         resp = authed_client.post(
             "/api/sessions/test-session/set-auth-mode",
             json={"mode": "api"},
         )
         assert resp.status_code == 409
-        assert "per profile" in resp.json()["error"].lower()
+        assert "per account" in resp.json()["error"].lower()
         mock_run.assert_not_called()
 
 
@@ -2609,30 +2605,50 @@ class TestParseSessionStats:
 # ---------------------------------------------------------------------------
 
 class TestIsCodexRunning:
-    """A pane counts as active only when one of its descendants is Codex."""
+    """A pane counts as active only when one of its descendants is Codex.
+
+    Descendants come from a single cached ``ps -eo pid=,ppid=,comm=`` snapshot,
+    not the per-process ``pgrep -P`` walk these tests were first written for, so
+    the second mocked call has to look like ps output and the cache has to be
+    cleared between cases.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_process_tree_cache(self):
+        import app as _app
+        _app._PROCESS_TREE_CACHE = None
+        yield
+        _app._PROCESS_TREE_CACHE = None
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/codex\0")
-    @patch("pathlib.Path.read_text", return_value="codex\n")
-    def test_returns_true_for_codex_descendant(self, mock_text, mock_bytes, mock_run):
+    def test_returns_true_for_codex_descendant(self, mock_run):
         import app as _app
 
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
+            MagicMock(returncode=0, stdout="100\n", stderr=""),          # pane_pid
+            MagicMock(returncode=0, stdout="100 1 bash\n101 100 codex\n",
+                      stderr=""),                                        # ps snapshot
         ]
         assert _app._is_codex_running("test-session") is True
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/node\0server.js\0")
-    @patch("pathlib.Path.read_text", return_value="node\n")
-    def test_returns_false_for_unrelated_node_descendant(self, mock_text, mock_bytes, mock_run):
+    def test_returns_false_for_unrelated_node_descendant(self, mock_run):
         import app as _app
 
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
-            MagicMock(returncode=1, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="100 1 bash\n101 100 node\n", stderr=""),
+        ]
+        assert _app._is_codex_running("test-session") is False
+
+    @patch("app.subprocess.run")
+    def test_returns_false_for_codex_outside_the_pane(self, mock_run):
+        """A Codex running under a *different* pane must not count."""
+        import app as _app
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="100\n", stderr=""),
+            MagicMock(returncode=0, stdout="100 1 bash\n999 2 codex\n", stderr=""),
         ]
         assert _app._is_codex_running("test-session") is False
 
