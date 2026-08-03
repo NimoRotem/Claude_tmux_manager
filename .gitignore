@@ -37,9 +37,6 @@ desktop.ini
 # Backup files
 *.bak-*
 *.orig
-*.away-mode-backup
-*.go-nuts-backup
-*.go-nuts-backup-*
 *.pre-skills-backup
 
 # Pidfiles, archives
