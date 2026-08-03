@@ -474,7 +474,14 @@ class TestGetTmuxSessions:
 
     @pytest.fixture(autouse=True)
     def _show_test_sessions_in_codex_dashboard(self):
-        with patch("app._session_is_codex", return_value=True):
+        # `get_tmux_sessions` also re-adds *parked* sessions from the lifecycle
+        # store so a retained session does not vanish from the UI. That store is
+        # real state on the host, so without isolating it these tests fail on any
+        # box that happens to have a parked session.
+        import app as _app
+        empty = {"sessions": {}}
+        with patch("app._session_is_codex", return_value=True), \
+             patch.object(_app._session_lifecycle, "snapshot", return_value=empty):
             yield
 
     @patch("app.subprocess.run")
