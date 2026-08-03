@@ -19225,7 +19225,6 @@ function _isNoise(line){
   return false;
 }
 // Kept for compatibility with the old two-toggle helper name.
-function _isUpdateNoise(line){return _isNoise(line)}
 // Structural furniture the pane draws at column 0: the `›`/`❯` composer prompt,
 // the start-up banner box, and the horizontal rules between turns. These always
 // end a hidden block.

@@ -1,6 +1,7 @@
 """Integration tests for tmux Dashboard API endpoints using FastAPI TestClient."""
 import json
 import os
+import re
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -107,10 +108,132 @@ class TestSecurityHeaders:
 
 
 class TestDashboardFrontendRegressions:
+    def test_voice_button_names_recording_and_transcribing_states(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        recording_start = html.index("async function toggleRecording(key)")
+        recording_end = html.index("async function sendChat(name)", recording_start)
+
+        assert (
+            "btn.setAttribute('aria-label','Stop recording and transcribe')"
+            in html[recording_start:recording_end],
+            "btn.setAttribute('aria-label','Transcribing voice message')"
+            in html[recording_start:recording_end],
+        ) == (True, True)
+
+    def test_voice_recording_has_visible_recording_and_transcribing_feedback(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        recording_rule = re.search(
+            r"\.composer-action\.is-recording\{([^}]*)\}",
+            html,
+        )
+        spinner_rule = re.search(r"\.composer-spin\{([^}]*)\}", html)
+
+        assert (
+            bool(recording_rule and "background:#da3633" in recording_rule.group(1)),
+            bool(spinner_rule and "animation:" in spinner_rule.group(1)),
+        ) == (True, True)
+
+    def test_composer_button_accessible_name_tracks_its_current_action(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        update_start = html.index("function updateComposerBtn(key)")
+        update_end = html.index("function composerAction(key)", update_start)
+
+        assert "btn.setAttribute('aria-label',label)" in html[update_start:update_end]
+
+    def test_successful_sends_return_both_buttons_to_microphone_state(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        chat_start = html.index("async function sendChat(name)")
+        chat_end = html.index("function setOptimisticBusy", chat_start)
+        raw_start = html.index("async function sendCmd(name,source)")
+        raw_end = html.index("function startRawPolling", raw_start)
+
+        assert (
+            "updateComposerBtn('chat-'+name)" in html[chat_start:chat_end],
+            "updateComposerBtn(source+'-'+name)" in html[raw_start:raw_end],
+        ) == (True, True)
+
+    def test_restored_drafts_restore_the_send_button_state(self, authed_client):
+        html = authed_client.get("/").text
+        restore_start = html.index("function restoreDrafts()")
+        restore_end = html.index("function updateFavicon", restore_start)
+
+        assert "updateComposerBtn(key)" in html[restore_start:restore_end]
+
+    def test_composer_action_is_a_round_record_button(self, authed_client):
+        html = authed_client.get("/").text
+        action_rule = re.search(r"\.btn\.composer-action\{([^}]*)\}", html)
+
+        assert (
+            action_rule
+            and "width:48px" in action_rule.group(1)
+            and "height:48px" in action_rule.group(1)
+            and "border-radius:50%" in action_rule.group(1)
+        )
+
+    def test_composer_action_stays_green_when_hovered(self, authed_client):
+        html = authed_client.get("/").text
+        hover_rule = re.search(r"\.btn\.composer-action:hover\{([^}]*)\}", html)
+
+        assert hover_rule and "background:#2ea043" in hover_rule.group(1)
+
+    def test_typed_message_state_styles_the_action_button_green(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        send_rule = re.search(r"\.composer-action\.is-send\{([^}]*)\}", html)
+
+        assert send_rule and "background:#238636" in send_rule.group(1)
+
+    def test_typing_updates_both_composer_buttons(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert html.count('oninput="autoGrow(this);updateComposerBtn(\'') == 2
+
+    def test_empty_chat_and_terminal_composers_render_microphone_buttons(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+
+        assert html.count('class="btn cmd-send composer-action is-mic"') == 2
+
+    def test_message_composer_is_tall_enough_for_multiple_lines(self, authed_client):
+        html = authed_client.get("/").text
+        composer_rule = re.search(r"\.cmd-input\{[^}]*min-height:(\d+)px", html)
+
+        assert composer_rule and int(composer_rule.group(1)) >= 80
+
+    def test_terminal_reload_is_in_the_session_header(self, authed_client):
+        html = authed_client.get("/").text
+        header_start = html.index('<div class="detail-badges">')
+        header_end = html.index(
+            '\n      </div>\n    </div>\n\n    <div class="tab-content',
+            header_start,
+        )
+
+        assert "onclick=\"loadRaw('${s.name}')\"" in html[header_start:header_end]
+
     def test_terminal_renderer_defines_update_filter_before_use(self, authed_client):
         html = authed_client.get("/").text
-        definition = html.index("function _isUpdateNoise(line)")
-        usage = html.index("if(hideBash&&_isUpdateNoise(line))continue")
+        # The renderer calls the noise filter while streaming lines, so the
+        # function has to be defined above the loop or the terminal throws on
+        # the first frame. The call site moved out of the old
+        # `hideBash && _isUpdateNoise(line)` form; guard the real one.
+        definition = html.index("function _isNoise(line){")
+        usage = html.index("if(_isNoise(line)){mode='noise';continue;}")
         assert definition < usage
 
     def test_context_files_live_only_inside_settings(self, authed_client):
@@ -765,7 +888,7 @@ class TestFindSessionJsonlFiles:
         """Codex has no matching rollouts when CODEX_HOME/sessions is absent."""
         import app
 
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("no-dir-session")
         assert result == []
 
@@ -783,7 +906,7 @@ class TestFindSessionJsonlFiles:
                 "payload": {"cwd": "/home/user/myproject/"},
             }) + "\n"
         )
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("has-rollout-session")
         assert result == [str(rollout)]
 
@@ -801,7 +924,7 @@ class TestFindSessionJsonlFiles:
                 "payload": {"cwd": "/home/user/other-project"},
             }) + "\n"
         )
-        with patch("app._profile_dir", return_value=tmp_path / ".codex"):
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("other-rollout-session")
         assert result == []
 
@@ -1088,6 +1211,11 @@ class TestExtendedSecurityHeaders:
         pp = resp.headers.get("Permissions-Policy", "")
         assert pp, "Permissions-Policy header should be set"
         assert "camera=()" in pp
+
+    def test_permissions_policy_allows_same_origin_microphone(self, authed_client):
+        resp = authed_client.get("/")
+
+        assert "microphone=(self)" in resp.headers.get("Permissions-Policy", "")
 
     def test_csp_on_api_endpoints(self, authed_client):
         with patch("app.get_tmux_sessions", return_value=[]):
@@ -1744,38 +1872,26 @@ class TestCreateSession:
         assert "error" in resp.json()
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    def test_default_profile_model_change_preserves_global_agents(
+    def test_model_change_preserves_the_accounts_agents_md(
         self, mock_sessions, authed_client, tmp_path
     ):
-        """An empty built-in profile field must never erase ~/.codex/AGENTS.md."""
-        import app as app_module
+        """Changing the model must never disturb the account's AGENTS.md.
 
+        The profile picker this once covered is gone — a session's Codex home now
+        comes from `_session_config_base` — but the guarantee still matters: a
+        model write merges into config.toml and must leave the account's
+        instructions byte-identical.
+        """
         codex_home = tmp_path / ".codex"
         codex_home.mkdir()
         agents_path = codex_home / "AGENTS.md"
         original = b"# Global Codex instructions\n\nKeep this context byte-identical.\n"
         agents_path.write_bytes(original)
-        profile = {
-            "id": app_module.DEFAULT_PROFILE_ID,
-            "name": "Default",
-            "model": app_module.DEFAULT_MODEL,
-            "effort": "max",
-            "codex_md": "",
-            "memory_md": "",
-            "env": {},
-        }
-        roles = {"profiles": [profile], "session_profiles": {}}
 
         with (
-            patch("app._load_roles", return_value=roles),
-            patch("app._save_roles"),
-            patch("app._profile_dir", return_value=codex_home),
-            patch(
-                "app._get_session_profile_id",
-                return_value=app_module.DEFAULT_PROFILE_ID,
-            ),
+            patch("app._session_config_base", return_value=codex_home),
             patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
-            patch("app._send_profile_export", return_value=True),
+            patch("app._send_session_owner_environment", return_value=True),
         ):
             resp = authed_client.post(
                 "/api/sessions/test-session/model",
@@ -1784,6 +1900,8 @@ class TestCreateSession:
 
         assert resp.status_code == 200
         assert agents_path.read_bytes() == original
+        # and the model really did land in that home's config
+        assert 'model = "gpt-5.6-sol"' in (codex_home / "config.toml").read_text()
 
 
 # ─── Delete Session Tests ───
@@ -1894,7 +2012,9 @@ class TestSendCommandEndpoint:
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
         mock_sleep.assert_awaited_once_with(0.25)
-        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["echo hello", "Enter"]
+        # The send path scrolls the pane back into view first, and submits with
+        # C-m rather than the "Enter" key name; both reach tmux identically.
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["-40", "echo hello", "C-m"]
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -1973,14 +2093,14 @@ class TestSetAuthModeEndpoint:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
-    def test_valid_mode_is_managed_per_profile_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
+    def test_valid_mode_is_managed_per_account_without_tmux_secret(self, mock_run, mock_sessions, authed_client):
         """The retired pane toggle cannot place credentials in terminal history."""
         resp = authed_client.post(
             "/api/sessions/test-session/set-auth-mode",
             json={"mode": "api"},
         )
         assert resp.status_code == 409
-        assert "per profile" in resp.json()["error"].lower()
+        assert "per account" in resp.json()["error"].lower()
         mock_run.assert_not_called()
 
 
@@ -2485,30 +2605,50 @@ class TestParseSessionStats:
 # ---------------------------------------------------------------------------
 
 class TestIsCodexRunning:
-    """A pane counts as active only when one of its descendants is Codex."""
+    """A pane counts as active only when one of its descendants is Codex.
+
+    Descendants come from a single cached ``ps -eo pid=,ppid=,comm=`` snapshot,
+    not the per-process ``pgrep -P`` walk these tests were first written for, so
+    the second mocked call has to look like ps output and the cache has to be
+    cleared between cases.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_process_tree_cache(self):
+        import app as _app
+        _app._PROCESS_TREE_CACHE = None
+        yield
+        _app._PROCESS_TREE_CACHE = None
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/codex\0")
-    @patch("pathlib.Path.read_text", return_value="codex\n")
-    def test_returns_true_for_codex_descendant(self, mock_text, mock_bytes, mock_run):
+    def test_returns_true_for_codex_descendant(self, mock_run):
         import app as _app
 
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
+            MagicMock(returncode=0, stdout="100\n", stderr=""),          # pane_pid
+            MagicMock(returncode=0, stdout="100 1 bash\n101 100 codex\n",
+                      stderr=""),                                        # ps snapshot
         ]
         assert _app._is_codex_running("test-session") is True
 
     @patch("app.subprocess.run")
-    @patch("pathlib.Path.read_bytes", return_value=b"/usr/bin/node\0server.js\0")
-    @patch("pathlib.Path.read_text", return_value="node\n")
-    def test_returns_false_for_unrelated_node_descendant(self, mock_text, mock_bytes, mock_run):
+    def test_returns_false_for_unrelated_node_descendant(self, mock_run):
         import app as _app
 
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="100\n", stderr=""),
-            MagicMock(returncode=0, stdout="101\n", stderr=""),
-            MagicMock(returncode=1, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="100 1 bash\n101 100 node\n", stderr=""),
+        ]
+        assert _app._is_codex_running("test-session") is False
+
+    @patch("app.subprocess.run")
+    def test_returns_false_for_codex_outside_the_pane(self, mock_run):
+        """A Codex running under a *different* pane must not count."""
+        import app as _app
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="100\n", stderr=""),
+            MagicMock(returncode=0, stdout="100 1 bash\n999 2 codex\n", stderr=""),
         ]
         assert _app._is_codex_running("test-session") is False
 
