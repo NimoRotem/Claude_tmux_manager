@@ -24675,19 +24675,23 @@ async def user_projects_page(request: Request, username: str):
 async def serve_project(request: Request, username: str, project: str, subpath: str = ""):
     if username in _RESERVED_TOP:
         return HTMLResponse("Not found", status_code=404)
-    owner = _find_user_by_username(username)
-    if not owner:
-        # Project namespaces predate account renames on some long-lived
-        # sessions.  Keep those stable URLs working, but only when the project
-        # name has an explicit owner in the session registry.
-        owner_id = _load_session_owners().get(project)
-        owner = _find_user_by_id(owner_id) if owner_id else None
-    if not owner:
-        return HTMLResponse("Not found", status_code=404)
     viewer = _current_user(request)
     if not viewer:
         return HTMLResponse(_login_page(), status_code=401)
-    if viewer.get("id") != owner.get("id") and not _is_admin(viewer):
+    owner = _find_user_by_username(username)
+    if not owner:
+        # Project namespaces predate account renames on some long-lived
+        # sessions.  Resolve those stable URLs through the explicit session
+        # owner whenever the registry has one.
+        owner_id = _load_session_owners().get(project)
+        owner = _find_user_by_id(owner_id) if owner_id else None
+    if not owner:
+        # The administrator can recover still-valid static handoffs from
+        # namespaces created before either account or session ownership was
+        # recorded.  Members cannot probe or open those orphaned directories.
+        if not _is_admin(viewer):
+            return HTMLResponse("Not found", status_code=404)
+    elif viewer.get("id") != owner.get("id") and not _is_admin(viewer):
         return HTMLResponse("Forbidden — you can only view your own projects.", status_code=403)
     pdir = _project_dir(username, project)
     if pdir is None or not pdir.exists():

@@ -79,6 +79,26 @@ def test_legacy_project_namespace_uses_its_session_owner(tmp_path, monkeypatch):
     assert blocked.status_code == 403 and marker not in blocked.text
 
 
+def test_admin_can_open_unregistered_legacy_project_namespace(tmp_path, monkeypatch):
+    marker = "PRIVATE-UNREGISTERED-LEGACY-WORK-PRODUCT"
+    users = [_user("admin", "admin", "admin"), _user("u_other", "other")]
+    _private_project(tmp_path, "Nimo", marker)
+    monkeypatch.setattr(dashboard, "AUTH_PASS", "testpass")
+    monkeypatch.setattr(dashboard, "PROJECTS_ROOT", tmp_path)
+    monkeypatch.setattr(dashboard, "_load_users", lambda: users)
+    monkeypatch.setattr(dashboard, "_load_session_owners", lambda: {})
+    admin_client = TestClient(dashboard.app)
+    admin_client.cookies.set(dashboard.AUTH_COOKIE, dashboard._make_token("admin"))
+    other_client = TestClient(dashboard.app)
+    other_client.cookies.set(dashboard.AUTH_COOKIE, dashboard._make_token("u_other"))
+
+    opened = admin_client.get("/Nimo/demo/")
+    blocked = other_client.get("/Nimo/demo/")
+
+    assert opened.status_code == 200 and marker in opened.text
+    assert blocked.status_code == 404 and marker not in blocked.text
+
+
 def test_project_work_product_is_private_between_member_accounts(tmp_path, monkeypatch):
     marker = "PRIVATE-WORK-PRODUCT"
     users = [_user("u_owner", "owner"), _user("u_other", "other")]
