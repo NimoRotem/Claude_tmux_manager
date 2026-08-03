@@ -13729,7 +13729,10 @@ async def api_codex_usage():
         "cacheReadTokens": cache_read,
         "cacheCreateTokens": reasoning_tok,
         "reasoningTokens": reasoning_tok,
-        "totalTokens": input_tok + output_tok + cache_read + reasoning_tok,
+        # input + output, matching Codex's own total_tokens. Cached input is a
+        # subset of input and reasoning a subset of output — adding them again
+        # double-counts (it inflated a 7-day estimate from $463 to $3527).
+        "totalTokens": input_tok + output_tok,
     }
     _usage_cache["ts"] = now
     _usage_cache["data"] = data
@@ -13771,24 +13774,14 @@ def _parse_usage_file(path: str | Path, date_prefix: str) -> tuple[int, int, int
 _stats_usage_cache: dict = {"ts": 0, "data": {}}
 
 def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
-    """Estimate cost in USD from token counts for codex/OpenAI models.
+    """Estimate cost in USD from one turn's Codex token counts.
 
-    cr = cached_input_tokens (treated like cache-read), cc = reasoning_output
-    tokens (billed at output rate). Rates are public list prices per 1M tokens.
+    Delegates to :func:`_codex_turn_cost` so every usage view on the dashboard
+    prices a turn the same way. ``cc`` (reasoning output) is accepted for the
+    callers that still pass it but deliberately ignored: it is a subset of
+    ``out``, so adding it again charged reasoning twice.
     """
-    m = (model or "").lower()
-    ci, co, ccr = 1.25, 10.0, 0.125
-    if "o3" in m and "mini" not in m:
-        ci, co, ccr = 2.0, 8.0, 0.5
-    elif "o3-mini" in m or "o4-mini" in m or "gpt-5-mini" in m or "gpt-5.4-mini" in m:
-        ci, co, ccr = 0.25, 2.0, 0.025
-    elif "gpt-4o-mini" in m:
-        ci, co, ccr = 0.15, 0.6, 0.075
-    elif "gpt-4o" in m:
-        ci, co, ccr = 2.5, 10.0, 1.25
-    elif "gpt-5" in m or "5.4" in m or "5.3" in m:
-        ci, co, ccr = 1.25, 10.0, 0.125
-    return inp * ci / 1e6 + (out + cc) * co / 1e6 + cr * ccr / 1e6
+    return _codex_turn_cost(inp, out, cr, model)
 
 
 _user_usage_cache: dict = {"ts": 0, "data": {}}
@@ -14092,7 +14085,7 @@ async def api_stats_usage():
         latest_model = "gpt-5.4"
 
         for ts, inp, out, cr, reason, model in entries:
-            total = inp + out + cr + reason
+            total = inp + out          # cached/reasoning are subsets, not extras
             sweek["totalTokens"] += total
             sweek["messages"] += 1
             sweek["estimatedCost"] += _estimate_cost(inp, out, cr, reason, model)
@@ -14374,7 +14367,7 @@ def _parse_session_stats(session_name: str) -> dict:
         b = buckets.setdefault(minute, {"input": 0, "output": 0, "total": 0})
         b["input"] += inp
         b["output"] += out
-        b["total"] += inp + out + cr + cc
+        b["total"] += inp + out
 
     # Active minutes: only windows with meaningful output (streaming, not just tool calls)
     active_minutes = [m for m, b in buckets.items() if b["output"] > 10]
@@ -14428,7 +14421,7 @@ def _parse_session_stats(session_name: str) -> dict:
         "totalOutput": total_output,
         "cacheRead": total_cache_read,
         "cacheCreate": total_cache_create,
-        "totalTokens": total_input + total_output + total_cache_read + total_cache_create,
+        "totalTokens": total_input + total_output,
         "estimatedCost": round(estimated_cost, 4),
         "peakOutputRate": peak_output_rate,  # tokens/min
         "peakTotalRate": peak_output_rate,
@@ -15883,6 +15876,29 @@ def _looks_like_bare_shell(visible: str) -> bool:
     return False
 
 
+def _pane_is_recoverable_shell(text: str) -> bool:
+    """Whether a pane with no live Codex is one we may relaunch into.
+
+    Both watchdogs share this so they cannot drift apart. Three conditions, and
+    all of them matter:
+
+    1. The pane really is a shell — a prompt, or a bash `>` continuation. Codex
+       takes a moment to appear in the process tree after launch, so "no codex
+       process" alone would let a poll fire *into a starting session* and type a
+       second launch line into the TUI.
+    2. Codex died rather than never having been started here: a crash
+       signature, a startup failure, or our own launch line in the scrollback.
+    3. Nothing half-typed on the prompt line that a relaunch would clobber.
+    """
+    if not (text or "").strip():
+        return False
+    if not (_looks_like_bare_shell(text) or _looks_like_stuck_shell(text)):
+        return False
+    if not _codex_is_down_recoverably(text):
+        return False
+    return not _shell_has_pending_input(text)
+
+
 # bash's secondary prompts. A pane sitting on one of these is a shell waiting
 # for the rest of an unterminated command — it happens when a user pastes a
 # prompt containing a quote into a pane that has already dropped out of Codex.
@@ -15967,16 +15983,12 @@ async def _crash_recovery_loop():
                     recent = await asyncio.to_thread(capture_pane_recent, name, 80)
                 except Exception:
                     continue
-                if not recent.strip():
-                    continue
                 # Only recover a Codex that really died — never hijack a shell
-                # someone opened on purpose. A crash signature, a startup
-                # failure, or our own launch line in the scrollback all qualify.
-                if not _codex_is_down_recoverably(recent):
+                # someone opened on purpose, and never fire into a session that
+                # is still starting up.
+                if not _pane_is_recoverable_shell(recent):
                     continue
-                # Don't clobber a command the user is typing at the shell.
-                if _shell_has_pending_input(recent):
-                    continue
+                start_failure = _looks_like_codex_start_failure(recent)
                 if state.get("attempts", 0) >= _CRASH_RECOVERY_MAX_ATTEMPTS:
                     if not state.get("gave_up"):
                         rlog.error("Crash recovery giving up on '%s' after %d attempts — "
@@ -15996,13 +16008,13 @@ async def _crash_recovery_loop():
                 reason = (
                     "crashed"
                     if _looks_like_crash(recent)
-                    else "failed to start" if _looks_like_codex_start_failure(recent)
+                    else "failed to start" if start_failure
                     else "exited"
                 )
                 rlog.warning("Session '%s' %s to shell — resuming Codex, attempt %d/%d",
                              name, reason,
                              state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
-                if _looks_like_codex_start_failure(recent):
+                if start_failure:
                     _record_codex_alert(
                         name,
                         "codex-start-failure",
@@ -16098,12 +16110,7 @@ async def _codex_health_watchdog_loop():
                     recent = await asyncio.to_thread(capture_pane_recent, name, 80)
                 except Exception:
                     continue
-                # A pane that is not a shell is mid-launch or running something
-                # full-screen; either way it is not ours to restart. A `>`
-                # continuation prompt counts — that is a shell too.
-                if not (_looks_like_bare_shell(recent) or _looks_like_stuck_shell(recent)):
-                    continue
-                if not _codex_is_down_recoverably(recent):
+                if not _pane_is_recoverable_shell(recent):
                     continue
                 down.append((name, recent))
 
@@ -16130,6 +16137,9 @@ async def _codex_health_watchdog_loop():
                 state = _codex_health_state.setdefault(
                     name, {"attempts": 0, "last_action": 0}
                 )
+                # Recheck the clock: validating the credential above can take
+                # seconds, and a stale `now` would shorten every cooldown.
+                now = time.time()
                 if now - float(state.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
                     continue
                 # Crash recovery polls three times as often and may already be
@@ -16137,9 +16147,6 @@ async def _codex_health_watchdog_loop():
                 # is worse than waiting one sweep.
                 peer = _crash_recovery_state.get(name) or {}
                 if now - float(peer.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
-                    continue
-                # Never clobber a command someone is typing at that shell.
-                if _shell_has_pending_input(recent):
                     continue
                 state["last_action"] = now
                 state["attempts"] = int(state.get("attempts") or 0) + 1
@@ -17926,6 +17933,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-spacer{flex:1}
 .nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;padding-right:10px;display:flex;align-items:center;gap:8px;border-right:1px solid #30363d;margin-right:10px;padding:4px 10px 4px 0;transition:color .15s}
 .nav-server-stats:hover{color:#c9d1d9}
+.nav-codex-alert{font-size:.7rem;font-weight:600;color:#f85149;background:rgba(248,81,73,.12);
+  border:1px solid rgba(248,81,73,.4);border-radius:10px;padding:2px 8px;margin-right:8px;
+  cursor:pointer;white-space:nowrap}
+.nav-codex-alert:hover{background:rgba(248,81,73,.22)}
+body.member-simple .nav-codex-alert{display:none !important}
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
@@ -18757,6 +18769,10 @@ body.member-simple .hide-in-simple{display:none!important}
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <!-- Open Codex health alerts. An alert nobody sees is not an alert, so the
+       watchdog's findings surface here rather than only inside Stats. -->
+  <span class="nav-codex-alert" id="nav-codex-alert" style="display:none"
+        title="Codex health alerts — click for details" onclick="openStats()"></span>
   <!-- Generic browser-session status. Codex auto-auth is retired. -->
   <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
         title="Browser sign-in status" onclick="onBrowserBadgeClick()">
@@ -20991,8 +21007,29 @@ async function refreshNavStats(){
     const leases=s.capacity?s.capacity.active_browser_leases:0;
     navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span> &middot; browsers <span class="stat-val">'+leases+'</span></span>';
   }catch(e){navStatsEl.innerHTML=''}
+  refreshCodexAlertBadge();
 }
 refreshNavStats();
+
+// --- Open Codex health alerts, surfaced in the header ---
+// Admin-only: the endpoint 403s for members, and a member cannot act on a
+// fleet-wide Codex fault anyway.
+async function refreshCodexAlertBadge(){
+  const el=document.getElementById('nav-codex-alert');
+  if(!el)return;
+  if(MEMBER_SIMPLE||!(_currentUser&&_currentUser.role==='admin')){el.style.display='none';return}
+  try{
+    const resp=await fetch(BASE+'/api/admin/codex-alerts?include_resolved=0');
+    if(!resp.ok){el.style.display='none';return}
+    const d=await resp.json();
+    const open=d.open||0;
+    if(!open){el.style.display='none';return}
+    const sessions=[...new Set((d.alerts||[]).map(a=>a.session_name==='*'?'all accounts':a.session_name))];
+    el.textContent='⚠ '+open+' Codex alert'+(open===1?'':'s');
+    el.title='Codex health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
+    el.style.display='';
+  }catch(e){el.style.display='none'}
+}
 
 // --- Authoritative ChatGPT-plan usage windows in the nav header ---
 let _usageLimitsTimer=null;
@@ -24215,7 +24252,10 @@ async function openStats(){
 async function clearCodexAlerts(){
   try{
     await fetch(BASE+'/api/admin/codex-alerts/clear',{method:'POST'});
-    openStats();
+    // Awaited: openStats() fires four parallel fetches, and letting the badge
+    // refresh race them left the pill on screen after the click.
+    await refreshCodexAlertBadge();
+    await openStats();
   }catch(e){}
 }
 

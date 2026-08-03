@@ -367,3 +367,81 @@ def test_health_and_crash_loops_use_the_same_cooldown_window():
     cooldown, so the two constants must stay aligned."""
     assert app._CODEX_HEALTH_COOLDOWN >= app._CRASH_RECOVERY_INTERVAL
     assert app._CODEX_HEALTH_COOLDOWN == app._CRASH_RECOVERY_COOLDOWN
+
+
+# --- the shared relaunch guard ------------------------------------------------
+
+STARTING_PANE = """\
+nimrod_rotem@grabo-tech:~/p$ exec env CODEX_HOME=/home/nimrod_rotem/.codex-user-u_x codex --yolo
+"""
+
+
+def test_starting_session_is_never_relaunched_into():
+    """Codex takes seconds to appear in the process tree, so a poll can catch a
+    session that is still booting. The pane then shows the launch command still
+    sitting on the prompt line and nothing after it — which reads as pending
+    input, and blocks the relaunch. Without that, a watchdog would type a second
+    launch line into a booting TUI."""
+    assert app._codex_launch_was_attempted(STARTING_PANE)
+    # The echoed command makes this look like a prompt AND like typed input;
+    # it is the pending-input check that saves us, not the shell check.
+    assert app._looks_like_bare_shell(STARTING_PANE)
+    assert app._shell_has_pending_input(STARTING_PANE)
+    assert not app._pane_is_recoverable_shell(STARTING_PANE)
+
+
+def test_booting_session_that_cleared_the_screen_is_left_alone():
+    """Once Codex takes the alternate screen the pane is no longer a prompt."""
+    pane = ("nimrod_rotem@grabo-tech:~/p$ exec env CODEX_HOME=/home/x codex --yolo\n"
+            "  Loading...\n")
+    assert not app._looks_like_bare_shell(pane)
+    assert not app._pane_is_recoverable_shell(pane)
+
+
+def test_recoverable_shell_accepts_the_real_broken_pane():
+    assert app._pane_is_recoverable_shell(BROKEN_PANE)
+
+
+def test_recoverable_shell_rejects_a_running_tui():
+    assert not app._pane_is_recoverable_shell(HEALTHY_PANE)
+
+
+def test_recoverable_shell_rejects_a_deliberate_shell():
+    pane = "nimrod_rotem@grabo-tech:~$ ls\nREADME.md\nnimrod_rotem@grabo-tech:~$ \n"
+    assert not app._pane_is_recoverable_shell(pane)
+
+
+def test_recoverable_shell_rejects_half_typed_input():
+    pane = ("exec env CODEX_HOME=/home/x/.codex-user-u_x codex --yolo\n"
+            "Error loading config.toml: invalid transport\n"
+            "nimrod_rotem@grabo-tech:~/p$ git status --short")
+    assert not app._pane_is_recoverable_shell(pane)
+
+
+def test_recoverable_shell_accepts_a_stuck_continuation(): 
+    pane = ("exec env CODEX_HOME=/home/x/.codex-user-u_x codex --yolo\n"
+            "Error loading config.toml: invalid transport\n"
+            "nimrod_rotem@grabo-tech:~/p$ echo \"unterminated\n>\n")
+    assert app._pane_is_recoverable_shell(pane)
+
+
+def test_recoverable_shell_rejects_empty_output():
+    assert not app._pane_is_recoverable_shell("")
+    assert not app._pane_is_recoverable_shell("   \n\n")
+
+
+# --- one accounting rule everywhere ------------------------------------------
+
+def test_estimate_cost_matches_the_codex_turn_cost():
+    """Both usage views must price a turn identically, or Stats shows two
+    different numbers for the same work."""
+    args = (181800, 380, 180992)
+    assert app._estimate_cost(*args, 265, "gpt-5.6-sol") == app._codex_turn_cost(*args, "gpt-5.6-sol")
+
+
+def test_reasoning_is_not_billed_twice():
+    """reasoning_output_tokens is a subset of output_tokens, so passing it must
+    not change the price."""
+    with_reasoning = app._estimate_cost(1000, 500, 0, 400, "gpt-5.6-sol")
+    without = app._estimate_cost(1000, 500, 0, 0, "gpt-5.6-sol")
+    assert with_reasoning == without
