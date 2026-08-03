@@ -24678,6 +24678,12 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     owner = _find_user_by_username(username)
     if not owner:
+        # Project namespaces predate account renames on some long-lived
+        # sessions.  Keep those stable URLs working, but only when the project
+        # name has an explicit owner in the session registry.
+        owner_id = _load_session_owners().get(project)
+        owner = _find_user_by_id(owner_id) if owner_id else None
+    if not owner:
         return HTMLResponse("Not found", status_code=404)
     viewer = _current_user(request)
     if not viewer:
