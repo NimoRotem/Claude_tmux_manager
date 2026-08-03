@@ -233,7 +233,64 @@ async def _model_refresh_loop():
         await asyncio.sleep(3600)
 
 
-def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) -> str:
+_CODEX_MCP_HEADER_RE = re.compile(r"^\s*\[\s*mcp_servers\s*\.\s*([^\].]+?)\s*[\].]")
+_codex_mcp_decl_cache: dict[str, tuple[float, int, frozenset[str]]] = {}
+
+
+def _codex_home_mcp_servers(codex_home: Path | None) -> frozenset[str]:
+    """Names of the MCP servers a CODEX_HOME's ``config.toml`` really declares.
+
+    Cached on (mtime, size) so starting a session does not re-read the file.
+    """
+    path = Path(codex_home or CODEX_HOME) / "config.toml"
+    key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        _codex_mcp_decl_cache.pop(key, None)
+        return frozenset()
+    cached = _codex_mcp_decl_cache.get(key)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    names: set[str] = set()
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            match = _CODEX_MCP_HEADER_RE.match(line)
+            if match:
+                names.add(match.group(1).strip().strip("\"'"))
+    except OSError:
+        return frozenset()
+    resolved = frozenset(names)
+    _codex_mcp_decl_cache[key] = (stat.st_mtime, stat.st_size, resolved)
+    return resolved
+
+
+# Codex validates every `mcp_servers.*` table while loading config.toml —
+# including a table that only an `-c` override brought into existence. Sending
+# `-c mcp_servers.openaiDeveloperDocs.enabled=false` to a CODEX_HOME whose
+# config.toml does not declare that server therefore CREATES a server with no
+# `command` and no `url`, and Codex refuses to start:
+#
+#     Error: failed to load configuration
+#     Caused by: invalid transport in `mcp_servers.openaiDeveloperDocs`
+#
+# It exits before the TUI draws, the pane falls back to its parent login shell,
+# and the account looks logged out. Member homes never declare that server, so
+# every member session died this way while admin sessions (whose config.toml
+# does declare it) were fine. Only send the override where the server exists.
+_CODEX_DOCS_MCP_SERVER = "openaiDeveloperDocs"
+_CODEX_DOCS_MCP_OVERRIDE = f"mcp_servers.{_CODEX_DOCS_MCP_SERVER}.enabled=false"
+_CODEX_DOCS_OVERRIDE_RE = re.compile(
+    r"\s+-c\s+(['\"]?)" + re.escape(_CODEX_DOCS_MCP_OVERRIDE) + r"\1"
+)
+
+
+def _launch_codex_cmd(
+    cmd: str,
+    pin_model: bool = True,
+    resume: bool = False,
+    codex_home: Path | None = None,
+) -> str:
     """Build a Codex launch command using the account's standard configuration."""
     out = cmd.strip() or NEW_SESSION_CMD
     if resume:
@@ -244,9 +301,14 @@ def _launch_codex_cmd(cmd: str, pin_model: bool = True, resume: bool = False) ->
             out += " --sandbox workspace-write --ask-for-approval never"
     if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
         out += " --model " + shlex.quote(DEFAULT_MODEL)
-    docs_override = "mcp_servers.openaiDeveloperDocs.enabled=false"
-    if _DISABLE_STALLED_OPENAI_DOCS_MCP and docs_override not in out:
-        out += " -c " + shlex.quote(docs_override)
+    # Strip any inherited copy first: a stored session command must not be able
+    # to smuggle the override into a home that does not declare the server.
+    out = _CODEX_DOCS_OVERRIDE_RE.sub("", out).strip()
+    if (
+        _DISABLE_STALLED_OPENAI_DOCS_MCP
+        and _CODEX_DOCS_MCP_SERVER in _codex_home_mcp_servers(codex_home)
+    ):
+        out += " -c " + shlex.quote(_CODEX_DOCS_MCP_OVERRIDE)
     if not CODEX_API_FALLBACK_ENABLED:
         out = "env -u OPENAI_API_KEY " + out
     return out
@@ -297,7 +359,12 @@ def _session_launch_command(
     resume: bool = False,
 ) -> str:
     """Build the Codex command and keep its process tree in a session scope."""
-    launch = _launch_codex_cmd(base, pin_model=pin_model, resume=resume)
+    launch = _launch_codex_cmd(
+        base,
+        pin_model=pin_model,
+        resume=resume,
+        codex_home=_session_config_base(session_name),
+    )
     launch = _session_launch_identity_prefix(session_name) + " " + launch
     return scoped_codex_command(
         session_name,
@@ -310,8 +377,10 @@ def _session_launch_command(
 
 
 # Compatibility aliases used by newer Grabo paths while the implementation is Codex.
-def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
-    return _launch_codex_cmd(cmd, pin_model=pin_model)
+def _launch_claude_cmd(
+    cmd: str, pin_model: bool = True, codex_home: Path | None = None
+) -> str:
+    return _launch_codex_cmd(cmd, pin_model=pin_model, codex_home=codex_home)
 
 
 def _restore_default_model_setting():
@@ -753,8 +822,15 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         launch = _session_launch_command(
             session_name, launch_base, pin_model=True, resume=True
         )
-        # C-u first to discard any stray text left on the crashed shell's prompt
-        # line (e.g. a "continue" a watchdog typed before this loop took over).
+        # C-c first: an unterminated paste leaves bash on a `>` continuation
+        # prompt, where C-u only clears the current line and the relaunch would
+        # be swallowed as more of the same command. C-u then discards any stray
+        # text left on the prompt line (e.g. a "continue" a watchdog typed
+        # before this loop took over).
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "C-c"],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.sleep(0.2)
         await asyncio.to_thread(subprocess.run,
             ["tmux", "send-keys", "-t", session_name, "C-u"],
             capture_output=True, text=True, timeout=5)
@@ -877,6 +953,7 @@ async def lifespan(_app: FastAPI):
         ("simple watchdog", _simple_watchdog_loop()),
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
+        ("codex health watchdog", _codex_health_watchdog_loop()),
         ("model refresh", _model_refresh_loop()),
         ("browser lifecycle", _browser_lifecycle_loop()),
         ("session lifecycle", _session_lifecycle_loop()),
@@ -13714,6 +13791,230 @@ def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
     return inp * ci / 1e6 + (out + cc) * co / 1e6 + cr * ccr / 1e6
 
 
+_user_usage_cache: dict = {"ts": 0, "data": {}}
+
+
+def _prompt_counts_by_user(cutoffs: dict[str, float]) -> dict[str, dict[str, int]]:
+    """Count audited human prompts per account for each named time window."""
+    counts: dict[str, dict[str, int]] = {}
+    oldest = min(cutoffs.values()) if cutoffs else 0
+    # Scanned in full rather than stopping at the first old record: the audit is
+    # append-only in real time, but `_backfill_prompt_audit` appends historical
+    # rows, so the file is not reliably sorted. It is one line per human prompt,
+    # so a full pass is cheap and the result is cached for two minutes anyway.
+    for entry in _iter_prompt_audit_reverse() or ():
+        timestamp = float(entry.get("ts") or 0)
+        if timestamp < oldest:
+            continue
+        user_id = str(entry.get("user_id") or "")
+        if not user_id:
+            continue
+        row = counts.setdefault(user_id, {key: 0 for key in cutoffs})
+        for window, cutoff in cutoffs.items():
+            if timestamp >= cutoff:
+                row[window] += 1
+    return counts
+
+
+def _codex_turn_cost(inp: int, out: int, cached: int, model: str) -> float:
+    """List-price estimate for one Codex turn.
+
+    ``cached_input_tokens`` is a SUBSET of ``input_tokens`` and
+    ``reasoning_output_tokens`` a subset of ``output_tokens`` — Codex's own
+    ``total_tokens`` is exactly ``input + output``. So the cached part is billed
+    at the cache rate and only the remainder at the full input rate; reasoning
+    is already inside ``output`` and must not be added again.
+    """
+    rate_in, rate_out, rate_cached = 1.25, 10.0, 0.125
+    name = (model or "").lower()
+    if "o3" in name and "mini" not in name:
+        rate_in, rate_out, rate_cached = 2.0, 8.0, 0.5
+    elif any(tag in name for tag in ("o3-mini", "o4-mini", "gpt-5-mini", "gpt-5.4-mini")):
+        rate_in, rate_out, rate_cached = 0.25, 2.0, 0.025
+    elif "gpt-4o-mini" in name:
+        rate_in, rate_out, rate_cached = 0.15, 0.6, 0.075
+    elif "gpt-4o" in name:
+        rate_in, rate_out, rate_cached = 2.5, 10.0, 1.25
+    fresh = max(0, inp - cached)
+    return (fresh * rate_in + cached * rate_cached + out * rate_out) / 1e6
+
+
+def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str, dict]:
+    """Sum a CODEX_HOME's rollout token deltas into each named time window.
+
+    ``token_count`` events carry both a running total and that turn's delta;
+    only ``last_token_usage`` is summed so repeated snapshots cannot inflate the
+    figures. Cutoffs are ISO-8601 strings compared against each record's own
+    timestamp, so a thread spanning midnight lands in the right day.
+
+    ``totalTokens`` is ``input + output``, matching Codex's own ``total_tokens``.
+    Cached input and reasoning output are reported alongside as the subsets they
+    are, never added on top.
+    """
+    blank = {
+        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+        "reasoningTokens": 0, "totalTokens": 0, "turns": 0, "estimatedCost": 0.0,
+    }
+    totals = {window: dict(blank) for window in cutoffs}
+    sessions_dir = codex_home / "sessions"
+    if not sessions_dir.exists():
+        return totals
+    oldest = min(cutoffs.values()) if cutoffs else ""
+    for path in sessions_dir.rglob("rollout-*.jsonl"):
+        try:
+            # Cheap skip: a file untouched since before the widest window can
+            # hold nothing inside it.
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            if mtime.isoformat() < oldest:
+                continue
+            model = DEFAULT_MODEL
+            with open(path, errors="replace") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if event.get("type") == "turn_context":
+                        model = (event.get("payload") or {}).get("model") or model
+                        continue
+                    if event.get("type") != "event_msg":
+                        continue
+                    payload = event.get("payload") or {}
+                    if payload.get("type") != "token_count":
+                        continue
+                    timestamp = str(event.get("timestamp") or "")
+                    last = (payload.get("info") or {}).get("last_token_usage") or {}
+                    inp = int(last.get("input_tokens") or 0)
+                    out = int(last.get("output_tokens") or 0)
+                    cached = int(last.get("cached_input_tokens") or 0)
+                    reasoning = int(last.get("reasoning_output_tokens") or 0)
+                    if not (inp or out):
+                        continue
+                    cost = _codex_turn_cost(inp, out, cached, model)
+                    for window, cutoff in cutoffs.items():
+                        if timestamp < cutoff:
+                            continue
+                        bucket = totals[window]
+                        bucket["inputTokens"] += inp
+                        bucket["outputTokens"] += out
+                        bucket["cacheReadTokens"] += cached
+                        bucket["reasoningTokens"] += reasoning
+                        bucket["totalTokens"] += inp + out
+                        bucket["turns"] += 1
+                        bucket["estimatedCost"] += cost
+        except Exception:
+            logger.debug("Failed to parse rollout '%s' for usage", path, exc_info=True)
+    for bucket in totals.values():
+        bucket["estimatedCost"] = round(bucket["estimatedCost"], 2)
+    return totals
+
+
+def _usage_by_account() -> dict:
+    """Prompts and tokens per dashboard account, for today and the last 7 days."""
+    now_dt = datetime.now(timezone.utc)
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now_dt - timedelta(days=7)
+    ts_cutoffs = {"today": today_start.timestamp(), "week": week_start.timestamp()}
+    iso_cutoffs = {"today": today_start.isoformat(), "week": week_start.isoformat()}
+
+    prompt_counts = _prompt_counts_by_user(ts_cutoffs)
+    rows = []
+    totals = {
+        "promptsToday": 0, "promptsWeek": 0,
+        "tokensToday": 0, "tokensWeek": 0,
+        "costToday": 0.0, "costWeek": 0.0,
+    }
+    for user in _load_users():
+        if not user:
+            continue
+        user_id = str(user.get("id") or "")
+        tokens = _token_usage_for_home(_user_codex_config_dir(user), iso_cutoffs)
+        prompts = prompt_counts.get(user_id, {"today": 0, "week": 0})
+        row = {
+            "user_id": user_id,
+            "username": str(user.get("username") or ""),
+            "role": str(user.get("role") or "user"),
+            "promptsToday": prompts.get("today", 0),
+            "promptsWeek": prompts.get("week", 0),
+            "today": tokens["today"],
+            "week": tokens["week"],
+        }
+        rows.append(row)
+        totals["promptsToday"] += row["promptsToday"]
+        totals["promptsWeek"] += row["promptsWeek"]
+        totals["tokensToday"] += tokens["today"]["totalTokens"]
+        totals["tokensWeek"] += tokens["week"]["totalTokens"]
+        totals["costToday"] += tokens["today"]["estimatedCost"]
+        totals["costWeek"] += tokens["week"]["estimatedCost"]
+    totals["costToday"] = round(totals["costToday"], 2)
+    totals["costWeek"] = round(totals["costWeek"], 2)
+    rows.sort(
+        key=lambda row: (row["week"]["totalTokens"], row["promptsWeek"]),
+        reverse=True,
+    )
+    return {
+        "generatedAt": now_dt.timestamp(),
+        "todayStart": today_start.isoformat(),
+        "weekStart": week_start.isoformat(),
+        "users": rows,
+        "totals": totals,
+    }
+
+
+@app.get("/api/stats/usage-by-user")
+async def api_stats_usage_by_user(request: Request):
+    """Per-account prompt and token usage for today and the last 7 days.
+
+    Administrators see every account; a member sees only their own row.
+    """
+    viewer = _current_user(request)
+    if not viewer:
+        return JSONResponse({"error": "Not signed in"}, status_code=401)
+    now = time.time()
+    if now - _user_usage_cache["ts"] > 120 or not _user_usage_cache["data"]:
+        _user_usage_cache["data"] = await asyncio.to_thread(_usage_by_account)
+        _user_usage_cache["ts"] = now
+    data = dict(_user_usage_cache["data"])
+    if not _is_admin(viewer):
+        mine = [
+            row for row in data.get("users", [])
+            if row.get("user_id") == str(viewer.get("id") or "")
+        ]
+        data["users"] = mine
+        data["totals"] = {
+            "promptsToday": sum(row["promptsToday"] for row in mine),
+            "promptsWeek": sum(row["promptsWeek"] for row in mine),
+            "tokensToday": sum(row["today"]["totalTokens"] for row in mine),
+            "tokensWeek": sum(row["week"]["totalTokens"] for row in mine),
+            "costToday": round(sum(row["today"]["estimatedCost"] for row in mine), 2),
+            "costWeek": round(sum(row["week"]["estimatedCost"] for row in mine), 2),
+        }
+    return JSONResponse(data)
+
+
+@app.get("/api/admin/codex-alerts")
+async def api_admin_codex_alerts(request: Request, include_resolved: int = 1):
+    """Codex health alerts raised by the watchdog."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    rows, auth = _codex_alerts_snapshot(include_resolved=bool(include_resolved))
+    return JSONResponse({
+        "alerts": rows[:100],
+        "open": sum(1 for row in rows if not row.get("resolved")),
+        "auth": auth,
+    })
+
+
+@app.post("/api/admin/codex-alerts/clear")
+async def api_admin_codex_alerts_clear(request: Request):
+    """Acknowledge every Codex health alert."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    with _codex_alerts_lock:
+        _write_codex_alerts_locked([], _read_codex_alerts_locked()[1])
+    return JSONResponse({"ok": True})
+
+
 @app.get("/api/stats/usage")
 async def api_stats_usage():
     """Aggregated token usage across all codex sessions: 5h window + this week."""
@@ -15332,9 +15633,242 @@ _CRASH_OOM_RE = re.compile(
 )
 
 
+# Codex also dies *before* the TUI ever draws: a config.toml Codex refuses to
+# load, a rejected credential, an unknown CLI flag. None of those print an
+# OOM/SIGABRT signature, so the two matchers above never fired and the pane sat
+# at a bare shell until a human noticed — the "logged out into the terminal"
+# report. These are the startup failures worth recovering from.
+_CODEX_START_FAILURE_RE = re.compile(
+    r"failed to load configuration"
+    r"|error loading config\.toml"
+    r"|invalid transport"
+    r"|unexpected argument|unknown option|unrecognized option"
+    r"|codex: command not found|command not found: codex"
+    r"|not logged in|please run\s+`?codex login`?|run `?codex login`?"
+    r"|401 unauthorized|invalid_grant|missing required tokens",
+    re.I,
+)
+
+# The dashboard's own launch line, as it stays in the pane's scrollback. Seeing
+# it while no Codex process is alive and the pane is a bare shell means the
+# launch we issued did not survive, whatever the reason.
+_CODEX_LAUNCH_LINE_RE = re.compile(
+    r"CODEX_HOME=\S+[^\n]*\bcodex\b|systemd-run[^\n]*--unit=codex-"
+)
+
+
 def _looks_like_crash(text: str) -> bool:
     """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
     return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
+
+
+def _looks_like_codex_start_failure(text: str) -> bool:
+    """True if Codex refused to start (bad config, bad credential, bad flag)."""
+    return bool(_CODEX_START_FAILURE_RE.search(text or ""))
+
+
+def _codex_launch_was_attempted(text: str) -> bool:
+    """True if the pane's scrollback still shows a dashboard Codex launch."""
+    return bool(_CODEX_LAUNCH_LINE_RE.search(text or ""))
+
+
+def _codex_is_down_recoverably(text: str) -> bool:
+    """Decide whether a bare-shell pane is a dead Codex we should relaunch.
+
+    Only ever consulted once the pane is already a shell with no live Codex
+    descendant. Any one of three signals is enough: a process-death signature, a
+    startup failure, or our own launch line sitting in the scrollback.
+    """
+    return (
+        _looks_like_crash(text)
+        or _looks_like_codex_start_failure(text)
+        or _codex_launch_was_attempted(text)
+    )
+
+
+# --- Codex health alerts -----------------------------------------------------
+# The watchdog below repairs sessions on its own, but a repair that keeps
+# happening is a fault someone has to see.
+#
+# The file on disk is the single source of truth, not a module global: the
+# watchdog runs in the controller process while the API is served by separate
+# uvicorn workers (see PROCESS_ROLE), so an in-memory list would leave the
+# endpoint reporting zero alerts while the controller was raising them. Alerts
+# are rare enough that read-modify-write per alert costs nothing.
+CODEX_ALERTS_FILE = MESSAGES_DIR / "codex-alerts.json"
+_CODEX_ALERT_MAX = 200
+_CODEX_ALERT_REPEAT_WINDOW = 900   # fold repeats of the same fault into one row
+_codex_alerts_lock = threading.Lock()
+
+
+def _read_codex_alerts_locked() -> tuple[list[dict], dict]:
+    """Return (alerts, auth-state) from disk. Tolerates the legacy bare list."""
+    try:
+        data = json.loads(CODEX_ALERTS_FILE.read_text())
+    except Exception:
+        return [], {}
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)], {}
+    if isinstance(data, dict):
+        rows = data.get("alerts")
+        auth = data.get("auth")
+        return (
+            [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            auth if isinstance(auth, dict) else {},
+        )
+    return [], {}
+
+
+def _write_codex_alerts_locked(rows: list[dict], auth: dict | None = None):
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"alerts": rows[-_CODEX_ALERT_MAX:]}
+        payload["auth"] = auth if auth is not None else _read_codex_alerts_locked()[1]
+        _atomic_write_json(CODEX_ALERTS_FILE, payload)
+    except Exception:
+        logger.debug("Failed to persist Codex alerts", exc_info=True)
+
+
+def _record_codex_alert(
+    session_name: str,
+    kind: str,
+    detail: str,
+    *,
+    username: str = "",
+    resolved: bool = False,
+) -> dict:
+    """Record (or fold into) one Codex health alert and log it loudly."""
+    now = time.time()
+    detail = (detail or "").strip()[:400]
+    with _codex_alerts_lock:
+        rows, auth = _read_codex_alerts_locked()
+        for row in reversed(rows):
+            if (
+                row.get("session_name") == session_name
+                and row.get("kind") == kind
+                and not row.get("resolved")
+                and now - float(row.get("last_ts") or 0) < _CODEX_ALERT_REPEAT_WINDOW
+            ):
+                row["count"] = int(row.get("count") or 1) + 1
+                row["last_ts"] = now
+                if detail:
+                    row["detail"] = detail
+                _write_codex_alerts_locked(rows, auth)
+                return dict(row)
+        entry = {
+            "id": secrets.token_hex(8),
+            "session_name": session_name,
+            "username": username,
+            "kind": kind,
+            "detail": detail,
+            "count": 1,
+            "first_ts": now,
+            "last_ts": now,
+            "resolved": bool(resolved),
+            "resolved_ts": now if resolved else 0,
+        }
+        rows.append(entry)
+        _write_codex_alerts_locked(rows, auth)
+    logging.getLogger("codex-health").error(
+        "ALERT %s in '%s'%s: %s",
+        kind, session_name, f" ({username})" if username else "", detail,
+    )
+    return dict(entry)
+
+
+def _resolve_codex_alerts(session_name: str, note: str = ""):
+    """Mark a session's open alerts resolved once Codex is healthy again."""
+    with _codex_alerts_lock:
+        rows, auth = _read_codex_alerts_locked()
+        changed = False
+        for row in rows:
+            if row.get("session_name") == session_name and not row.get("resolved"):
+                row["resolved"] = True
+                row["resolved_ts"] = time.time()
+                if note:
+                    row["resolution"] = note[:200]
+                changed = True
+        if changed:
+            _write_codex_alerts_locked(rows, auth)
+
+
+def _publish_codex_auth_state(auth: dict):
+    """Share the watchdog's credential verdict with the API workers."""
+    with _codex_alerts_lock:
+        rows, _ = _read_codex_alerts_locked()
+        _write_codex_alerts_locked(rows, dict(auth))
+
+
+def _codex_alerts_snapshot(include_resolved: bool = True) -> tuple[list[dict], dict]:
+    with _codex_alerts_lock:
+        rows, auth = _read_codex_alerts_locked()
+    if not include_resolved:
+        rows = [row for row in rows if not row.get("resolved")]
+    rows.sort(key=lambda row: float(row.get("last_ts") or 0), reverse=True)
+    return rows, auth
+
+
+def _username_for_session(session_name: str) -> str:
+    try:
+        owner = _user_for_session(session_name)
+        return str(owner.get("username") or "") if owner else ""
+    except Exception:
+        return ""
+
+
+def _codex_failure_excerpt(text: str, max_chars: int = 300) -> str:
+    """The lines from a dead pane that say *why* Codex is not running.
+
+    Prefers the error lines themselves; falls back to the last real output
+    above the shell prompt so an alert is never empty.
+    """
+    lines = [line.rstrip() for line in (text or "").split("\n")]
+    picked: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.strip() or _SHELL_PROMPT_RE.search(line):
+            continue
+        if _CODEX_START_FAILURE_RE.search(line) or _CRASH_SIGNATURE_RE.search(line):
+            for follow in lines[index:index + 3]:
+                follow = follow.strip()
+                if follow and follow not in picked and not _SHELL_PROMPT_RE.search(follow):
+                    picked.append(follow)
+    if not picked:
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped or _SHELL_PROMPT_RE.search(line):
+                continue
+            picked.append(stripped)
+            if len(picked) >= 2:
+                break
+        picked.reverse()
+    return " / ".join(picked)[:max_chars]
+
+
+def _repair_member_codex_auth() -> int:
+    """Re-point every member CODEX_HOME at the shared, working credential.
+
+    Member ``auth.json`` files are symlinks into the admin home. An accidental
+    ``/login`` (or an atomic rewrite) replaces the symlink with a stale copy,
+    and that account alone starts failing. Re-applying the link is cheap and
+    idempotent, so this runs whenever the credential looks unhealthy.
+    """
+    repaired = 0
+    try:
+        if not _multi_tenant_enabled():
+            return 0
+        for user in _load_users():
+            if not user or _is_admin(user):
+                continue
+            try:
+                _apply_member_auth(_user_codex_config_dir(user))
+                repaired += 1
+            except Exception:
+                logger.debug(
+                    "Could not repair Codex auth for %s", user.get("id"), exc_info=True
+                )
+    except Exception:
+        logger.debug("Member Codex auth repair failed", exc_info=True)
+    return repaired
 
 # A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
 _SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
@@ -15346,6 +15880,23 @@ def _looks_like_bare_shell(visible: str) -> bool:
         if not line.strip():
             continue
         return bool(_SHELL_PROMPT_RE.search(line.rstrip()))
+    return False
+
+
+# bash's secondary prompts. A pane sitting on one of these is a shell waiting
+# for the rest of an unterminated command — it happens when a user pastes a
+# prompt containing a quote into a pane that has already dropped out of Codex.
+# It is still a dead session, but `_looks_like_bare_shell` cannot see it because
+# there is no user@host on the line.
+_SHELL_CONTINUATION_RE = re.compile(r"^\s*(?:>|dquote>|quote>|bquote>|cmdsubst>)\s*$")
+
+
+def _looks_like_stuck_shell(visible: str) -> bool:
+    """True if the pane's last line is a bash continuation prompt."""
+    for line in reversed((visible or "").split("\n")):
+        if not line.strip():
+            continue
+        return bool(_SHELL_CONTINUATION_RE.match(line.rstrip()))
     return False
 
 
@@ -15418,8 +15969,10 @@ async def _crash_recovery_loop():
                     continue
                 if not recent.strip():
                     continue
-                # Only recover genuine crashes — never hijack an intentional shell.
-                if not _looks_like_crash(recent):
+                # Only recover a Codex that really died — never hijack a shell
+                # someone opened on purpose. A crash signature, a startup
+                # failure, or our own launch line in the scrollback all qualify.
+                if not _codex_is_down_recoverably(recent):
                     continue
                 # Don't clobber a command the user is typing at the shell.
                 if _shell_has_pending_input(recent):
@@ -15429,22 +15982,196 @@ async def _crash_recovery_loop():
                         rlog.error("Crash recovery giving up on '%s' after %d attempts — "
                                    "manual restart needed", name, state["attempts"])
                         state["gave_up"] = True
+                        _record_codex_alert(
+                            name,
+                            "relaunch-failed",
+                            "Codex would not stay up after "
+                            f"{state['attempts']} relaunch attempts. Last pane output: "
+                            + _codex_failure_excerpt(recent),
+                            username=_username_for_session(name),
+                        )
                     continue
                 state["attempts"] = state.get("attempts", 0) + 1
                 state["last_action"] = now
-                rlog.warning("Session '%s' crashed to shell — resuming Codex, attempt %d/%d",
-                             name,
+                reason = (
+                    "crashed"
+                    if _looks_like_crash(recent)
+                    else "failed to start" if _looks_like_codex_start_failure(recent)
+                    else "exited"
+                )
+                rlog.warning("Session '%s' %s to shell — resuming Codex, attempt %d/%d",
+                             name, reason,
                              state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
+                if _looks_like_codex_start_failure(recent):
+                    _record_codex_alert(
+                        name,
+                        "codex-start-failure",
+                        _codex_failure_excerpt(recent),
+                        username=_username_for_session(name),
+                    )
                 ok = await _ensure_codex_running(name)
                 if ok:
                     _seen_claude_running.add(name)
                     _crash_recovery_state[name] = {"attempts": 0, "last_action": now, "gave_up": False}
+                    _resolve_codex_alerts(name, "relaunched by crash recovery")
                     rlog.info("Recovered '%s' — Codex is running again", name)
         except asyncio.CancelledError:
             rlog.info("Crash recovery cancelled")
             raise
         except Exception:
             logger.debug("Crash recovery iteration failed", exc_info=True)
+
+
+# --- Codex health watchdog: alert, repair the login, relaunch ----------------
+# Crash recovery watches one pane at a time and needs a death signature. This
+# loop watches the fleet and the *credential*. When the shared ChatGPT login
+# stops working every account goes down together and each pane quietly falls
+# back to its login shell, which is what users report as "logged out of Codex,
+# left in a terminal". It raises an alert for anything it finds, repairs the
+# credential when that is the fault, and types the correct relaunch command
+# into every session still sitting at a shell.
+
+_CODEX_HEALTH_INTERVAL = 60        # seconds between fleet sweeps
+_CODEX_HEALTH_COOLDOWN = 120       # min seconds between relaunches per session
+_CODEX_AUTH_PROBE_MAX_AGE = 300    # reuse a credential verdict for this long
+_CODEX_AUTH_PROBE_FLOOR = 120      # ...and never re-probe faster than this
+_codex_health_state: dict[str, dict] = {}
+_codex_health_auth: dict = {"ts": 0.0, "loggedIn": True, "reason": ""}
+
+
+async def _codex_auth_health(force: bool = False) -> dict:
+    """Validate the shared Codex credential, at most once every few minutes.
+
+    Validation starts a Codex app-server, so it is far too expensive to run on
+    every sweep; the cached verdict is plenty for deciding whether a fleet-wide
+    outage is a login problem. Even ``force`` keeps a floor, so a persistent
+    outage cannot spawn an app-server every single sweep.
+    """
+    now = time.time()
+    age = now - float(_codex_health_auth.get("ts") or 0)
+    if age < (_CODEX_AUTH_PROBE_FLOOR if force else _CODEX_AUTH_PROBE_MAX_AGE):
+        return dict(_codex_health_auth)
+    try:
+        state = await asyncio.to_thread(
+            _ensure_codex_auth_with_fallback, CODEX_HOME, True
+        )
+    except Exception:
+        logger.debug("Codex auth health probe failed", exc_info=True)
+        return dict(_codex_health_auth)
+    _codex_health_auth.update({
+        "ts": now,
+        "loggedIn": bool(state.get("loggedIn")),
+        "activeMode": str(state.get("activeMode") or "unknown"),
+        "reason": str(state.get("fallbackReason") or ""),
+        "fallbackActive": bool(state.get("fallbackActive")),
+    })
+    # The API workers cannot see this process's memory — publish it.
+    await asyncio.to_thread(_publish_codex_auth_state, _codex_health_auth)
+    return dict(_codex_health_auth)
+
+
+async def _codex_health_watchdog_loop():
+    """Alert on, and recover from, sessions that dropped out of Codex."""
+    hlog = logging.getLogger("codex-health")
+    await asyncio.sleep(25)  # let startup and crash recovery settle
+    while True:
+        try:
+            await asyncio.sleep(_CODEX_HEALTH_INTERVAL)
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            owners = _load_session_owners()
+            now = time.time()
+
+            down: list[tuple[str, str]] = []
+            for sess in sessions_list:
+                name = sess["name"]
+                if _session_lifecycle.get(name).get("parked"):
+                    continue
+                # Only sessions this dashboard owns or has seen running Codex.
+                if name not in owners and name not in _seen_claude_running:
+                    continue
+                if await _async_is_codex_running(name):
+                    _seen_claude_running.add(name)
+                    if _codex_health_state.pop(name, None):
+                        _resolve_codex_alerts(name, "Codex is running again")
+                    continue
+                try:
+                    recent = await asyncio.to_thread(capture_pane_recent, name, 80)
+                except Exception:
+                    continue
+                # A pane that is not a shell is mid-launch or running something
+                # full-screen; either way it is not ours to restart. A `>`
+                # continuation prompt counts — that is a shell too.
+                if not (_looks_like_bare_shell(recent) or _looks_like_stuck_shell(recent)):
+                    continue
+                if not _codex_is_down_recoverably(recent):
+                    continue
+                down.append((name, recent))
+
+            if not down:
+                continue
+
+            # More than one account down at once points at the shared
+            # credential rather than one bad session. Check the login before
+            # relaunching anything, and repair it when it is the fault.
+            auth = await _codex_auth_health(force=len(down) > 1)
+            if not auth.get("loggedIn"):
+                _record_codex_alert(
+                    "*",
+                    "codex-logged-out",
+                    auth.get("reason") or "Codex has no usable credential",
+                )
+                repaired = await asyncio.to_thread(_repair_member_codex_auth)
+                hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
+                auth = await _codex_auth_health(force=True)
+                if auth.get("loggedIn"):
+                    _resolve_codex_alerts("*", "credential repaired")
+
+            for name, recent in down:
+                state = _codex_health_state.setdefault(
+                    name, {"attempts": 0, "last_action": 0}
+                )
+                if now - float(state.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
+                    continue
+                # Crash recovery polls three times as often and may already be
+                # relaunching this pane. Two loops typing into the same terminal
+                # is worse than waiting one sweep.
+                peer = _crash_recovery_state.get(name) or {}
+                if now - float(peer.get("last_action") or 0) < _CODEX_HEALTH_COOLDOWN:
+                    continue
+                # Never clobber a command someone is typing at that shell.
+                if _shell_has_pending_input(recent):
+                    continue
+                state["last_action"] = now
+                state["attempts"] = int(state.get("attempts") or 0) + 1
+                username = _username_for_session(name)
+                _record_codex_alert(
+                    name,
+                    "codex-not-running",
+                    _codex_failure_excerpt(recent) or "Codex exited to a shell",
+                    username=username,
+                )
+                hlog.warning(
+                    "Relaunching Codex in '%s'%s (attempt %d)",
+                    name, f" for {username}" if username else "", state["attempts"],
+                )
+                if await _ensure_codex_running(name):
+                    _seen_claude_running.add(name)
+                    _codex_health_state.pop(name, None)
+                    _resolve_codex_alerts(name, "relaunched by the health watchdog")
+                    hlog.warning("Session '%s' is back on Codex", name)
+                else:
+                    _record_codex_alert(
+                        name,
+                        "relaunch-failed",
+                        "Relaunch did not bring Codex up. Pane: "
+                        + _codex_failure_excerpt(recent),
+                        username=username,
+                    )
+        except asyncio.CancelledError:
+            hlog.info("Codex health watchdog cancelled")
+            raise
+        except Exception:
+            logger.debug("Codex health watchdog iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
@@ -23468,18 +24195,55 @@ async function openStats(){
   overlay.classList.add('active');
   document.getElementById('stats-content').innerHTML='<div style="text-align:center;color:#8b949e;padding:20px"><span class="spinner"></span> Loading stats...</div>';
   try{
-    const [statsResp,usageResp]=await Promise.all([fetch(BASE+'/api/stats'),fetch(BASE+'/api/stats/usage')]);
+    const [statsResp,usageResp,byUserResp,alertsResp]=await Promise.all([
+      fetch(BASE+'/api/stats'),
+      fetch(BASE+'/api/stats/usage'),
+      fetch(BASE+'/api/stats/usage-by-user'),
+      fetch(BASE+'/api/admin/codex-alerts').catch(()=>null),
+    ]);
     const s=await statsResp.json();
-    let usage=null;
+    let usage=null,byUser=null,alerts=null;
     if(usageResp.ok) usage=await usageResp.json();
-    renderStats(s,usage);
+    if(byUserResp.ok) byUser=await byUserResp.json();
+    if(alertsResp&&alertsResp.ok) alerts=await alertsResp.json();
+    renderStats(s,usage,byUser,alerts);
   }catch(e){
     document.getElementById('stats-content').innerHTML='<div style="color:#f85149">Failed to load stats.</div>';
   }
 }
 
-function renderStats(s,usage){
+async function clearCodexAlerts(){
+  try{
+    await fetch(BASE+'/api/admin/codex-alerts/clear',{method:'POST'});
+    openStats();
+  }catch(e){}
+}
+
+function renderStats(s,usage,byUser,alerts){
   let html='';
+  // Codex health first — an open alert is the thing you opened Stats to see.
+  if(alerts&&alerts.alerts&&alerts.alerts.length){
+    const open=alerts.alerts.filter(a=>!a.resolved);
+    const shown=(open.length?open:alerts.alerts).slice(0,12);
+    const title=open.length
+      ?open.length+' open Codex alert'+(open.length===1?'':'s')
+      :'Codex health (all clear)';
+    html+='<div class="stats-section"><div class="stats-section-title">'+esc(title)
+      +' <button class="users-plain-btn" style="float:right;font-size:.65rem" onclick="clearCodexAlerts()">Clear</button></div>';
+    if(alerts.auth&&alerts.auth.loggedIn===false){
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#f85149">Codex login</span>'
+        +'<span class="stats-row-value" style="color:#f85149">'+esc(alerts.auth.reason||'no usable credential')+'</span></div>';
+    }
+    shown.forEach(a=>{
+      const color=a.resolved?'#3fb950':'#f85149';
+      const who=a.session_name==='*'?'all accounts':a.session_name+(a.username?' ('+a.username+')':'');
+      const times=a.count>1?' &times;'+a.count:'';
+      html+='<div class="stats-row" style="align-items:flex-start"><span class="stats-row-label" style="color:'+color+'">'
+        +esc(who)+times+'</span><span class="stats-row-value" style="font-size:.68rem;text-align:right;max-width:62%;word-break:break-word">'
+        +esc(a.kind)+' &middot; '+esc(a.detail||'')+'</span></div>';
+    });
+    html+='</div>';
+  }
   // Server
   html+='<div class="stats-section"><div class="stats-section-title">Server</div>';
   html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
@@ -23558,6 +24322,30 @@ function renderStats(s,usage){
     html+='<td>'+fmtTok(usage.window5h.totalTokens)+'</td><td>'+fmtCost(usage.window5h.estimatedCost)+'</td>';
     html+='<td>'+fmtTok(usage.thisWeek.totalTokens)+'</td><td>'+fmtCost(usage.thisWeek.estimatedCost)+'</td></tr>';
     html+='</tbody></table></div>';
+  }
+
+  // Per-account usage: prompts sent and tokens spent, today and over 7 days.
+  if(byUser&&byUser.users&&byUser.users.length){
+    function fmtN(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
+    function fmtC(n){if(!n)return'—';return'$'+n.toFixed(2)}
+    const t=byUser.totals||{};
+    html+='<div class="stats-section"><div class="stats-section-title">Usage by account</div>';
+    html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Account</th>'
+      +'<th>Prompts today</th><th>Tokens today</th><th>Cost today</th>'
+      +'<th>Prompts 7d</th><th>Tokens 7d</th><th>Cost 7d</th></tr></thead><tbody>';
+    byUser.users.forEach(u=>{
+      const idle=!u.promptsWeek&&!u.week.totalTokens;
+      html+='<tr'+(idle?' style="opacity:.55"':'')+'><td>'+esc(u.username||u.user_id)
+        +(u.role==='admin'?' <span class="users-role-admin">admin</span>':'')+'</td>';
+      html+='<td>'+fmtN(u.promptsToday)+'</td><td>'+fmtN(u.today.totalTokens)+'</td><td>'+fmtC(u.today.estimatedCost)+'</td>';
+      html+='<td>'+fmtN(u.promptsWeek)+'</td><td>'+fmtN(u.week.totalTokens)+'</td><td>'+fmtC(u.week.estimatedCost)+'</td></tr>';
+    });
+    html+='<tr class="stats-totals-row"><td>Total</td>';
+    html+='<td>'+fmtN(t.promptsToday)+'</td><td>'+fmtN(t.tokensToday)+'</td><td>'+fmtC(t.costToday)+'</td>';
+    html+='<td>'+fmtN(t.promptsWeek)+'</td><td>'+fmtN(t.tokensWeek)+'</td><td>'+fmtC(t.costWeek)+'</td></tr>';
+    html+='</tbody></table>';
+    html+='<div class="stats-row"><span class="stats-row-label" style="font-size:.65rem">Prompts are audited human messages; tokens are Codex turn deltas. Cost is a list-price estimate, not billing.</span></div>';
+    html+='</div>';
   }
 
   document.getElementById('stats-content').innerHTML=html;
