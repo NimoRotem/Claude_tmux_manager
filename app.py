@@ -917,6 +917,11 @@ async def lifespan(_app: FastAPI):
             # so a host that accidentally omitted TEAM_MODE never received the
             # admin's shared policy until that user was edited or recreated.
             _ensure_user_codex_config_dir(member)
+        elif _multi_tenant_enabled() and _is_admin(member):
+            # Admins do not receive the member developer-instruction block. Keep
+            # their managed project handoff rule current on every controller
+            # start, not only when they create a brand-new tmux session.
+            _sync_projects_note_into(config_dir / "AGENTS.md")
         _ensure_user_browser_session(member, start=False)
         if (config_dir / "config.toml").exists():
             synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
@@ -1385,7 +1390,13 @@ def _set_toml_table_bool(existing: str, section: str, key: str, value: bool) -> 
 
 def _member_developer_instructions(user: dict) -> str:
     """Combine host policy with the signed-in account's fixed permission group."""
-    sections = [_read_global_context().strip()]
+    global_context = _read_global_context().strip()
+    sections = [global_context]
+    # Existing deployments keep their admin-edited global context file. Append
+    # the managed publishing rule when that file predates it, rather than
+    # overwriting the administrator's policy to pick up a new default.
+    if "local filesystem path as the only link to a work product" not in global_context:
+        sections.append(_PROJ_NOTE.replace("__PUBURL__", PUB_URL).strip())
     group = PERMISSION_GROUPS.get(str(user.get("group") or ""))
     if group:
         sections.append(str(group.get("instructions") or "").strip())
@@ -2034,11 +2045,6 @@ async def auth_middleware(request: Request, call_next):
     # Google sign-in: both legs run before there is a session cookie.
     if "/auth/google/" in path:
         return await call_next(request)
-    # Public project serving: /<username>/<project>[/...] is served publicly (the
-    # /<username> project-list page itself stays gated below).
-    rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
-    if _is_public_project_request(rel_path):
-        return await call_next(request)
     token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
         resp = HTMLResponse(_login_page())
@@ -2558,17 +2564,39 @@ def _last_human_activity(user: dict) -> float:
     return latest
 
 
+def _user_lifetime_stats(users: list[dict]) -> dict[str, dict[str, int]]:
+    """Return lightweight retained prompt/token totals for the Users table."""
+    prompt_totals = _prompt_audit_summary()
+    stats = {}
+    for user in users:
+        user_id = str(user.get("id") or "")
+        if not user_id:
+            continue
+        tokens = _token_usage_for_home(
+            _user_codex_config_dir(user), {"all": ""}
+        )["all"]
+        stats[user_id] = {
+            "total_prompts": int(
+                (prompt_totals.get(user_id) or {}).get("count") or 0
+            ),
+            "total_tokens": int(tokens.get("totalTokens") or 0),
+        }
+    return stats
+
+
 @app.get("/api/admin/users")
 async def api_admin_list_users(request: Request):
     user = _current_user(request)
     if not _is_admin(user):
         return JSONResponse({"error": "Admin only"}, status_code=403)
     users = _load_users()
+    lifetime_stats = await asyncio.to_thread(_user_lifetime_stats, users)
     out = []
     for u in users:
         rec = _public_user(u)
         rec["session_count"] = _user_session_count(u["id"])
         rec["last_activity"] = _last_human_activity(u)
+        rec.update(lifetime_stats.get(str(u.get("id") or ""), {}))
         out.append(rec)
     return JSONResponse({"users": out})
 
@@ -3977,6 +4005,10 @@ A missing field is a bug: fix it, or name the exact field when you hand back.
   immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a
   free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to
   have it reverse-proxied there.
+- Never return a local filesystem path as the only link to a work product.
+  Put the deliverable under `$DASH_PROJECT_DIR` and hand back its live
+  `$DASH_PROJECT_URL` URL. Project URLs require dashboard sign-in, so the remote
+  user can open them without exposing the work product publicly.
 - This session: user `$DASH_USER`, session `$DASH_SESSION`, link
   `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard).
 """
@@ -4066,6 +4098,7 @@ _PROJ_NOTE_END = "<!-- END TEAM PROJECTS CONVENTION -->"
 _PROJ_NOTE = """## Projects & working folder
 - Publish projects at __PUBURL__/<username>/<project> (default <project> = the current tmux session name).
 - Put the project's web files in `$DASH_PROJECT_DIR` (= `~/web-projects/<username>/<project>/`); static files are served immediately at `$DASH_PROJECT_URL`. For a dynamic app, run your server on a free port and write `$DASH_PROJECT_DIR/.serve.json` = `{"port": <PORT>}` to have it reverse-proxied there.
+- Never return a local filesystem path as the only link to a work product. Put the deliverable under `$DASH_PROJECT_DIR` and hand back its live `$DASH_PROJECT_URL` URL. Project URLs require dashboard sign-in, so the remote user can open them without exposing the work product publicly.
 - This session: user `$DASH_USER`, link `$DASH_PROJECT_URL` (also shown as a clickable link in the dashboard)."""
 
 
@@ -5677,7 +5710,7 @@ async def api_admin_user_data_file(
 
 # --- public projects: serving + helpers -----------------------------------
 def _safe_seg(s: str) -> bool:
-    return bool(s) and re.match(r"^[A-Za-z0-9._-]{1,64}$", s or "") is not None and s not in (".", "..")
+    return bool(s) and re.match(r"^[A-Za-z0-9.@_-]{1,128}$", s or "") is not None and s not in (".", "..")
 
 
 def _user_projects_dir(username: str) -> Path:
@@ -5695,14 +5728,6 @@ def _project_dir(username: str, project: str):
     if not _safe_seg(username) or not _safe_seg(project):
         return None
     return _user_projects_dir(username) / project
-
-
-def _is_public_project_request(rel: str) -> bool:
-    """A GET to /<username>/<project>[/...] for a real, non-reserved user is public."""
-    segs = [s for s in rel.split("/") if s != ""]
-    if len(segs) < 2 or segs[0] in _RESERVED_TOP:
-        return False
-    return _find_user_by_username(segs[0]) is not None
 
 
 async def _proxy_to_port(request: Request, port: int, subpath: str):
@@ -13832,6 +13857,106 @@ def _codex_turn_cost(inp: int, out: int, cached: int, model: str) -> float:
     return (fresh * rate_in + cached * rate_cached + out * rate_out) / 1e6
 
 
+_rollout_lifetime_cache: dict[str, dict] = {}
+
+
+def _iter_jsonl_reverse(path: Path, chunk_size: int = 64 * 1024):
+    """Yield a JSONL file's raw lines newest-first without loading it in memory."""
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        position = stream.tell()
+        carry = b""
+        while position > 0:
+            size = min(chunk_size, position)
+            position -= size
+            stream.seek(position)
+            parts = (stream.read(size) + carry).split(b"\n")
+            carry = parts[0]
+            for raw in reversed(parts[1:]):
+                if raw:
+                    yield raw
+        if carry:
+            yield carry
+
+
+def _rollout_lifetime_usage(path: str | Path) -> dict[str, int]:
+    """Read one rollout's final cumulative token counter efficiently.
+
+    Codex writes ``total_token_usage`` as a running total alongside every turn
+    delta. The newest counter is therefore the rollout's lifetime total. Reading
+    backward avoids rescanning very large transcripts merely to show an all-time
+    figure. Old-format rollouts without a cumulative counter fall back to summing
+    their deltas once.
+    """
+    rollout = Path(path)
+    blank = {
+        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+        "reasoningTokens": 0, "totalTokens": 0,
+    }
+    try:
+        stat = rollout.stat()
+    except OSError:
+        return blank
+    signature = (stat.st_mtime_ns, stat.st_size)
+    key = str(rollout)
+    cached = _rollout_lifetime_cache.get(key)
+    if cached and cached.get("signature") == signature:
+        return dict(cached["usage"])
+
+    usage = None
+    try:
+        for raw in _iter_jsonl_reverse(rollout):
+            if b'"token_count"' not in raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload") or {}
+            if payload.get("type") != "token_count":
+                continue
+            total = (payload.get("info") or {}).get("total_token_usage") or {}
+            if not total:
+                continue
+            try:
+                inp = int(total.get("input_tokens") or 0)
+                out = int(total.get("output_tokens") or 0)
+                cached_input = int(total.get("cached_input_tokens") or 0)
+                reasoning = int(total.get("reasoning_output_tokens") or 0)
+            except (TypeError, ValueError):
+                continue
+            usage = {
+                "inputTokens": inp,
+                "outputTokens": out,
+                "cacheReadTokens": cached_input,
+                "reasoningTokens": reasoning,
+                "totalTokens": inp + out,
+            }
+            break
+    except OSError:
+        return blank
+
+    if usage is None:
+        try:
+            inp, out, cached_input, reasoning, _ = _parse_usage_file(rollout, "")
+            usage = {
+                "inputTokens": inp,
+                "outputTokens": out,
+                "cacheReadTokens": cached_input,
+                "reasoningTokens": reasoning,
+                "totalTokens": inp + out,
+            }
+        except OSError:
+            usage = blank
+
+    _rollout_lifetime_cache[key] = {"signature": signature, "usage": dict(usage)}
+    if len(_rollout_lifetime_cache) > 2048:
+        _rollout_lifetime_cache.pop(next(iter(_rollout_lifetime_cache)), None)
+    return dict(usage)
+
+
 def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str, dict]:
     """Sum a CODEX_HOME's rollout token deltas into each named time window.
 
@@ -13840,9 +13965,11 @@ def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str
     figures. Cutoffs are ISO-8601 strings compared against each record's own
     timestamp, so a thread spanning midnight lands in the right day.
 
-    ``totalTokens`` is ``input + output``, matching Codex's own ``total_tokens``.
-    Cached input and reasoning output are reported alongside as the subsets they
-    are, never added on top.
+    The reserved ``all`` window uses each rollout's final cumulative counter,
+    which avoids rescanning multi-hundred-megabyte transcripts. Other windows
+    sum timestamped deltas. ``totalTokens`` is ``input + output``, matching
+    Codex's own ``total_tokens``; cached input and reasoning output are reported
+    alongside as subsets, never added on top.
     """
     blank = {
         "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
@@ -13852,9 +13979,21 @@ def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str
     sessions_dir = codex_home / "sessions"
     if not sessions_dir.exists():
         return totals
-    oldest = min(cutoffs.values()) if cutoffs else ""
+    active_cutoffs = {
+        window: cutoff for window, cutoff in cutoffs.items() if window != "all"
+    }
+    oldest = min(active_cutoffs.values()) if active_cutoffs else ""
     for path in sessions_dir.rglob("rollout-*.jsonl"):
         try:
+            if "all" in totals:
+                lifetime = _rollout_lifetime_usage(path)
+                for field in (
+                    "inputTokens", "outputTokens", "cacheReadTokens",
+                    "reasoningTokens", "totalTokens",
+                ):
+                    totals["all"][field] += lifetime[field]
+            if not active_cutoffs:
+                continue
             # Cheap skip: a file untouched since before the widest window can
             # hold nothing inside it.
             mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
@@ -13884,7 +14023,7 @@ def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str
                     if not (inp or out):
                         continue
                     cost = _codex_turn_cost(inp, out, cached, model)
-                    for window, cutoff in cutoffs.items():
+                    for window, cutoff in active_cutoffs.items():
                         if timestamp < cutoff:
                             continue
                         bucket = totals[window]
@@ -13903,18 +14042,21 @@ def _token_usage_for_home(codex_home: Path, cutoffs: dict[str, str]) -> dict[str
 
 
 def _usage_by_account() -> dict:
-    """Prompts and tokens per dashboard account, for today and the last 7 days."""
+    """Prompts and tokens per dashboard account, including retained history."""
     now_dt = datetime.now(timezone.utc)
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now_dt - timedelta(days=7)
     ts_cutoffs = {"today": today_start.timestamp(), "week": week_start.timestamp()}
-    iso_cutoffs = {"today": today_start.isoformat(), "week": week_start.isoformat()}
+    iso_cutoffs = {
+        "today": today_start.isoformat(), "week": week_start.isoformat(), "all": "",
+    }
 
     prompt_counts = _prompt_counts_by_user(ts_cutoffs)
+    prompt_totals = _prompt_audit_summary()
     rows = []
     totals = {
-        "promptsToday": 0, "promptsWeek": 0,
-        "tokensToday": 0, "tokensWeek": 0,
+        "promptsToday": 0, "promptsWeek": 0, "promptsTotal": 0,
+        "tokensToday": 0, "tokensWeek": 0, "tokensTotal": 0,
         "costToday": 0.0, "costWeek": 0.0,
     }
     for user in _load_users():
@@ -13929,14 +14071,18 @@ def _usage_by_account() -> dict:
             "role": str(user.get("role") or "user"),
             "promptsToday": prompts.get("today", 0),
             "promptsWeek": prompts.get("week", 0),
+            "promptsTotal": int((prompt_totals.get(user_id) or {}).get("count") or 0),
             "today": tokens["today"],
             "week": tokens["week"],
+            "all": tokens["all"],
         }
         rows.append(row)
         totals["promptsToday"] += row["promptsToday"]
         totals["promptsWeek"] += row["promptsWeek"]
+        totals["promptsTotal"] += row["promptsTotal"]
         totals["tokensToday"] += tokens["today"]["totalTokens"]
         totals["tokensWeek"] += tokens["week"]["totalTokens"]
+        totals["tokensTotal"] += tokens["all"]["totalTokens"]
         totals["costToday"] += tokens["today"]["estimatedCost"]
         totals["costWeek"] += tokens["week"]["estimatedCost"]
     totals["costToday"] = round(totals["costToday"], 2)
@@ -13977,8 +14123,10 @@ async def api_stats_usage_by_user(request: Request):
         data["totals"] = {
             "promptsToday": sum(row["promptsToday"] for row in mine),
             "promptsWeek": sum(row["promptsWeek"] for row in mine),
+            "promptsTotal": sum(row["promptsTotal"] for row in mine),
             "tokensToday": sum(row["today"]["totalTokens"] for row in mine),
             "tokensWeek": sum(row["week"]["totalTokens"] for row in mine),
+            "tokensTotal": sum(row["all"]["totalTokens"] for row in mine),
             "costToday": round(sum(row["today"]["estimatedCost"] for row in mine), 2),
             "costWeek": round(sum(row["week"]["estimatedCost"] for row in mine), 2),
         }
@@ -18555,11 +18703,12 @@ body.member-simple .hide-in-simple{display:none!important}
 .users-top-scroll{height:14px;overflow-x:auto;overflow-y:hidden;border-bottom:1px solid #21262d;background:#161b22}
 .users-top-scroll-inner{height:1px}
 .users-table-scroll{flex:1;min-height:0;overflow:auto}
-.users-table{width:100%;min-width:1180px;border-collapse:separate;border-spacing:0;font-size:.82rem;table-layout:fixed}
+.users-table{width:100%;min-width:1400px;border-collapse:separate;border-spacing:0;font-size:.82rem;table-layout:fixed}
 .users-table th{position:sticky;top:0;z-index:3;text-align:left;color:#8b949e;text-transform:uppercase;font-size:.66rem;letter-spacing:.06em;padding:9px 10px;background:#161b22;border-bottom:1px solid #30363d;border-right:1px solid #21262d;white-space:nowrap}
 .users-table td{padding:9px 10px;border-bottom:1px solid #161b22;border-right:1px solid #161b22;color:#c9d1d9;vertical-align:middle;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#0d1117}
 .users-table th:first-child{left:0;z-index:5}
 .users-table td:first-child{position:sticky;left:0;z-index:2;background:#0d1117;text-align:right;color:#6e7681}
+.users-table td.users-num{text-align:right;font-variant-numeric:tabular-nums}
 .users-table tbody tr{cursor:pointer}
 .users-table tbody tr:hover td{background:#161b22}
 .users-table tbody tr:hover td:first-child{background:#161b22}
@@ -19774,17 +19923,17 @@ function _chatInline(s,plain){
   h=h.replace(/^\s*(#{1,6})\s+(.+)$/gm,'<strong class="chat-h">$2</strong>');
   return h;
 }
-function _chatHref(target){
-  return /^https?:\/\//i.test(target)
-    ? target
-    : BASE+'/file?path='+encodeURIComponent(target);
+function _chatHref(target,sessionName){
+  if(/^https?:\/\//i.test(target))return target;
+  return BASE+'/file?path='+encodeURIComponent(target)
+    +(sessionName?'&session='+encodeURIComponent(sessionName):'');
 }
-function _chatAnchor(target,label,plain){
+function _chatAnchor(target,label,plain,sessionName){
   if(!/^(https?:\/\/|~\/|\/)/i.test(target))return _chatInline(label||target,plain);
-  return '<a class="chat-link" href="'+_escTermHtml(_chatHref(target))+'" target="_blank" rel="noopener"'
+  return '<a class="chat-link" href="'+_escTermHtml(_chatHref(target,sessionName))+'" target="_blank" rel="noopener"'
     +' title="'+_escTermHtml(target)+'">'+_chatInline(label||target,plain)+'</a>';
 }
-function _chatRichSpan(text,plain){
+function _chatRichSpan(text,plain,sessionName){
   if(!text)return'';
   let out='',last=0,m;
   _CHAT_LINK_RE.lastIndex=0;
@@ -19792,13 +19941,13 @@ function _chatRichSpan(text,plain){
     if(m[0]===''){_CHAT_LINK_RE.lastIndex++;continue;}
     out+=_chatInline(text.slice(last,m.index),plain);
     if(m[1]!==undefined&&m[2]!==undefined){          // [label](target)
-      out+=_chatAnchor(_splitLinkTail(m[2]).link,m[1],plain);
+      out+=_chatAnchor(_splitLinkTail(m[2]).link,m[1],plain,sessionName);
     }else if(m[4]!==undefined){                      // leading char + path
       const p=_splitLinkTail(m[4]);
-      out+=_chatInline(m[3]||'',plain)+_chatAnchor(p.link,null,plain)+_chatInline(p.tail,plain);
+      out+=_chatInline(m[3]||'',plain)+_chatAnchor(p.link,null,plain,sessionName)+_chatInline(p.tail,plain);
     }else{                                           // bare URL
       const u=_splitLinkTail(m[0]);
-      out+=_chatAnchor(u.link,null,plain)+_chatInline(u.tail,plain);
+      out+=_chatAnchor(u.link,null,plain,sessionName)+_chatInline(u.tail,plain);
     }
     last=_CHAT_LINK_RE.lastIndex;
   }
@@ -19806,7 +19955,7 @@ function _chatRichSpan(text,plain){
   return out;
 }
 const _CHAT_CODE_RE=/`([^`\n]{1,300})`/g;
-function _chatRich(text){
+function _chatRich(text,sessionName){
   if(!text)return'';
   // Inline code spans are peeled off first, then linkified on their own. Agents
   // write a deliverable as `~/REPORT.md` far more often than bare, and a path
@@ -19814,21 +19963,21 @@ function _chatRich(text){
   let out='',idx=0,cm;
   _CHAT_CODE_RE.lastIndex=0;
   while((cm=_CHAT_CODE_RE.exec(text))!==null){
-    out+=_chatRichSpan(text.slice(idx,cm.index),false);
-    out+='<code>'+_chatRichSpan(cm[1],true)+'</code>';
+    out+=_chatRichSpan(text.slice(idx,cm.index),false,sessionName);
+    out+='<code>'+_chatRichSpan(cm[1],true,sessionName)+'</code>';
     idx=_CHAT_CODE_RE.lastIndex;
   }
-  out+=_chatRichSpan(text.slice(idx),false);
+  out+=_chatRichSpan(text.slice(idx),false,sessionName);
   return out;
 }
-function _chatLinksHtml(links){
+function _chatLinksHtml(links,sessionName){
   if(!links||!links.length)return'';
   const chips=links.map(l=>{
     const isFile=l.kind==='file';
     const target=isFile?l.path:l.href;
     if(!target)return'';
     const ico=isFile?(l.dir?'&#128193;':'&#128196;'):'&#128279;';
-    return '<a class="chat-chip" href="'+_escTermHtml(_chatHref(target))+'" target="_blank" rel="noopener"'
+    return '<a class="chat-chip" href="'+_escTermHtml(_chatHref(target,sessionName))+'" target="_blank" rel="noopener"'
       +' title="'+_escTermHtml(target)+'"><span class="chat-chip-ico">'+ico+'</span>'
       +esc(l.label||target)+'</a>';
   }).join('');
@@ -19846,16 +19995,16 @@ function _isRecapWorthShowing(summary,full){
   const f=_normLoose(full);
   return !!s && s!==f && !f.startsWith(s);
 }
-function chatBubbleInner(m){
+function chatBubbleInner(m,sessionName){
   const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
-  if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
+  if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'',sessionName)+'</div>'+ts;
   const full=(m.full||'').trim();
   const summary=(m.text||'').trim();
   let html='';
   if(full.length>700&&_isRecapWorthShowing(summary,full))
-    html+='<div class="chat-lead">'+_chatRich(summary)+'</div>';
-  html+='<div class="chat-body">'+_chatRich(full||summary)+'</div>';
-  html+=_chatLinksHtml(m.links);
+    html+='<div class="chat-lead">'+_chatRich(summary,sessionName)+'</div>';
+  html+='<div class="chat-body">'+_chatRich(full||summary,sessionName)+'</div>';
+  html+=_chatLinksHtml(m.links,sessionName);
   return html+ts;
 }
 function renderChatBubbles(name){
@@ -19863,7 +20012,7 @@ function renderChatBubbles(name){
   if(!msgs.length){
     return '<div class="chat-empty">No messages yet. Type below to talk to Codex — every reply shows up here in full, with links to anything it produced.</div>';
   }
-  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m)}</div>`).join('');
+  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m,name)}</div>`).join('');
 }
 
 function saveRawCache(){
@@ -20339,7 +20488,7 @@ function appendChatBubble(name,role,text,ts,extra){
       if(typing)typing.remove();
       const bubble=document.createElement('div');
       bubble.className='chat-msg '+role;
-      bubble.innerHTML=chatBubbleInner(msg);
+      bubble.innerHTML=chatBubbleInner(msg,name);
       chatEl.appendChild(bubble);
       // Only auto-scroll if user was at bottom or this is their own message
       if(wasAtBottom||role==='user')chatEl.scrollTop=chatEl.scrollHeight;
@@ -20383,7 +20532,7 @@ function updateLastAssistantBubble(name,msg){
   if(!chatEl)return;
   const bubbles=chatEl.querySelectorAll('.chat-msg.assistant');
   const el=bubbles[bubbles.length-1];
-  if(el)el.innerHTML=chatBubbleInner(msg);
+  if(el)el.innerHTML=chatBubbleInner(msg,name);
 }
 
 function autoGrow(el){
@@ -21794,12 +21943,11 @@ function buildKeyBar(name,tab){
   // page doesn't overflow (page overflow would steal the terminal's scroll).
   if(MEMBER_SIMPLE){
     return `<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
-    <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
     <div class="upload-drop" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
       ondrop="handleDrop(event,'${name}','${tab}')"
-      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">or drop files here</div>
+      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">Drop files here or click to upload</div>
     <div class="upload-progress" id="upload-progress-${tab}-${name}">
       <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
       <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
@@ -21820,13 +21968,9 @@ function buildKeyBar(name,tab){
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Space'])" title="Space — scroll pager">Space</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['q'])" title="q — quit pager">q</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['n'])" title="n — no">n</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['Tab'])" title="Tab">Tab</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
     ${tab==='raw'?`<span class="key-bar-sep"></span>
@@ -21836,15 +21980,7 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/new')" title="New conversation">/new</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/status')" title="Session status & usage">/status</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/diff')" title="Show working-tree diff">/diff</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4')" title="Switch to GPT-5.4">/model 5.4</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4-mini')" title="Switch to GPT-5.4-mini">/model mini</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/approvals')" title="Approvals mode">/approvals</button>
-    <span class="key-bar-sep"></span>
-    <span class="key-bar-label">Opts:</span>
-    <button class="key-btn key-toggle" id="bp-toggle-${name}" onclick="toggleBracketedPaste('${name}',this)" title="Bracketed Paste — when ON, multi-line pastes show as preview. Turn OFF to paste raw text.">Paste Mode: ON</button>
-    <span class="key-bar-sep"></span>
-    <button class="key-btn" onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()" title="Upload file">&#x1F4CE; Upload</button>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
@@ -23409,7 +23545,7 @@ let _usersSearch='';
 let _usersDetailData=null;
 let _usersDetailTab='overview';
 let _usersHistoryTranscript=null;
-const _userColumns={role:true,group:true,google:true,sessions:true,activity:true,actions:true};
+const _userColumns={role:true,group:true,google:true,sessions:true,prompts:true,tokens:true,activity:true,actions:true};
 
 function _groupOpts(selected){
   return '<option value="">Unassigned</option>'+_groupsCache.map(g=>
@@ -23563,13 +23699,16 @@ function renderUsersAdmin(){
       <td style="${userColumnStyle('group')}">${groupCell}</td>
       <td style="${userColumnStyle('google')}">${google}</td>
       <td style="${userColumnStyle('sessions')}">${u.session_count||0}</td>
+      <td class="users-num" style="${userColumnStyle('prompts')}">${Number(u.total_prompts||0).toLocaleString()}</td>
+      <td class="users-num" style="${userColumnStyle('tokens')}" title="${Number(u.total_tokens||0).toLocaleString()} tokens">${fmtTokens(u.total_tokens||0)}</td>
       <td style="${userColumnStyle('activity')}">${u.last_activity?timeAgo(u.last_activity):'<span class="muted">No human activity</span>'}</td>
       <td style="${userColumnStyle('actions')}"><div class="users-actions">${actions}</div></td>
     </tr>`;
   }).join('');
   const columnChecks=[
     ['role','Role'],['group','Permission group'],['google','Google sign-in'],
-    ['sessions','Sessions'],['activity','Last activity'],['actions','Actions'],
+    ['sessions','Sessions'],['prompts','Total prompts'],['tokens','Total tokens'],
+    ['activity','Last activity'],['actions','Actions'],
   ].map(([key,label])=>`<label><input type="checkbox" ${_userColumns[key]?'checked':''} onchange="setUserColumn('${key}',this.checked)"> ${label}</label>`).join('');
   content.innerHTML=`<div class="users-workspace">
     <div class="panel-hint">Each account has its own sessions, CODEX_HOME, browser, history, memories, and advisor identity. Click any row to inspect that account without leaving this window.</div>
@@ -23596,7 +23735,8 @@ function renderUsersAdmin(){
           <colgroup>
             <col style="width:54px"><col style="width:170px"><col style="width:90px">
             <col style="width:185px"><col style="width:245px"><col style="width:82px">
-            <col style="width:150px"><col style="width:340px">
+            <col style="width:110px"><col style="width:120px"><col style="width:150px">
+            <col style="width:340px">
           </colgroup>
           <thead><tr>
             <th>#<span class="user-col-resizer" onmousedown="startUserColumnResize(event,0)"></span></th>
@@ -23605,10 +23745,12 @@ function renderUsersAdmin(){
             <th style="${userColumnStyle('group')}">Permission group<span class="user-col-resizer" onmousedown="startUserColumnResize(event,3)"></span></th>
             <th style="${userColumnStyle('google')}">Google sign-in<span class="user-col-resizer" onmousedown="startUserColumnResize(event,4)"></span></th>
             <th style="${userColumnStyle('sessions')}">Sessions<span class="user-col-resizer" onmousedown="startUserColumnResize(event,5)"></span></th>
-            <th style="${userColumnStyle('activity')}">Last activity<span class="user-col-resizer" onmousedown="startUserColumnResize(event,6)"></span></th>
-            <th style="${userColumnStyle('actions')}">Actions<span class="user-col-resizer" onmousedown="startUserColumnResize(event,7)"></span></th>
+            <th style="${userColumnStyle('prompts')}">Total prompts<span class="user-col-resizer" onmousedown="startUserColumnResize(event,6)"></span></th>
+            <th style="${userColumnStyle('tokens')}">Total tokens<span class="user-col-resizer" onmousedown="startUserColumnResize(event,7)"></span></th>
+            <th style="${userColumnStyle('activity')}">Last activity<span class="user-col-resizer" onmousedown="startUserColumnResize(event,8)"></span></th>
+            <th style="${userColumnStyle('actions')}">Actions<span class="user-col-resizer" onmousedown="startUserColumnResize(event,9)"></span></th>
           </tr></thead>
-          <tbody>${rows||'<tr><td colspan="8" class="history-empty">No matching users.</td></tr>'}</tbody>
+          <tbody>${rows||'<tr><td colspan="10" class="history-empty">No matching users.</td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -24363,27 +24505,30 @@ function renderStats(s,usage,byUser,alerts){
     html+='</tbody></table></div>';
   }
 
-  // Per-account usage: prompts sent and tokens spent, today and over 7 days.
+  // Per-user usage: lifetime totals plus today and the trailing 7 days.
   if(byUser&&byUser.users&&byUser.users.length){
-    function fmtN(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
+    function fmtN(n){if(!n)return'—';if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
     function fmtC(n){if(!n)return'—';return'$'+n.toFixed(2)}
     const t=byUser.totals||{};
-    html+='<div class="stats-section"><div class="stats-section-title">Usage by account</div>';
+    html+='<div class="stats-section"><div class="stats-section-title">Usage by user</div>';
     html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Account</th>'
+      +'<th>Total prompts</th><th>Total tokens</th>'
       +'<th>Prompts today</th><th>Tokens today</th><th>Cost today</th>'
       +'<th>Prompts 7d</th><th>Tokens 7d</th><th>Cost 7d</th></tr></thead><tbody>';
     byUser.users.forEach(u=>{
-      const idle=!u.promptsWeek&&!u.week.totalTokens;
+      const idle=!u.promptsTotal&&!u.all.totalTokens;
       html+='<tr'+(idle?' style="opacity:.55"':'')+'><td>'+esc(u.username||u.user_id)
         +(u.role==='admin'?' <span class="users-role-admin">admin</span>':'')+'</td>';
+      html+='<td>'+fmtN(u.promptsTotal)+'</td><td>'+fmtN(u.all.totalTokens)+'</td>';
       html+='<td>'+fmtN(u.promptsToday)+'</td><td>'+fmtN(u.today.totalTokens)+'</td><td>'+fmtC(u.today.estimatedCost)+'</td>';
       html+='<td>'+fmtN(u.promptsWeek)+'</td><td>'+fmtN(u.week.totalTokens)+'</td><td>'+fmtC(u.week.estimatedCost)+'</td></tr>';
     });
     html+='<tr class="stats-totals-row"><td>Total</td>';
+    html+='<td>'+fmtN(t.promptsTotal)+'</td><td>'+fmtN(t.tokensTotal)+'</td>';
     html+='<td>'+fmtN(t.promptsToday)+'</td><td>'+fmtN(t.tokensToday)+'</td><td>'+fmtC(t.costToday)+'</td>';
     html+='<td>'+fmtN(t.promptsWeek)+'</td><td>'+fmtN(t.tokensWeek)+'</td><td>'+fmtC(t.costWeek)+'</td></tr>';
     html+='</tbody></table>';
-    html+='<div class="stats-row"><span class="stats-row-label" style="font-size:.65rem">Prompts are audited human messages; tokens are Codex turn deltas. Cost is a list-price estimate, not billing.</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label" style="font-size:.65rem">Totals cover retained audited prompts and Codex rollouts. Windowed tokens are turn deltas. Cost is a list-price estimate, not billing.</span></div>';
     html+='</div>';
   }
 
@@ -24466,7 +24611,7 @@ _GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
 # ===========================================================================
-# Catch-all routes for public projects + per-user project lists. Registered
+# Catch-all routes for authenticated projects + per-user project lists. Registered
 # LAST so every literal/api route takes precedence over these path params.
 # ===========================================================================
 _PROJECTS_PAGE_CSS = (
@@ -24480,14 +24625,24 @@ _PROJECTS_PAGE_CSS = (
 
 
 def _projects_page_html(title: str, rows):
+    base = PUB_URL.rstrip("/")
     items = "".join(
-        f'<li><a href="/{u}/{p}">dianaotech.com/{u}/{p}</a> <span class="open">open ↗</span></li>'
+        (
+            '<li><a href="{href}">{label}</a> <span class="open">open ↗</span></li>'
+            .format(
+                href=_html_escape(
+                    base + "/" + urllib.parse.quote(str(u), safe="@._-")
+                    + "/" + urllib.parse.quote(str(p), safe="@._-")
+                ),
+                label=_html_escape(f"{base}/{u}/{p}"),
+            )
+        )
         for (u, p) in rows) or '<li class="muted">No projects yet. Ask Codex in a session to build something — it gets published here.</li>'
-    return (f"<!doctype html><html><head><meta charset=utf-8><title>{title} · {BRAND_NAME}</title>"
+    return (f"<!doctype html><html><head><meta charset=utf-8><title>{_html_escape(title)} · {BRAND_NAME}</title>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<style>{_PROJECTS_PAGE_CSS}</style></head><body><h1>{title}</h1>"
+            f"<style>{_PROJECTS_PAGE_CSS}</style></head><body><h1>{_html_escape(title)}</h1>"
             f"<div class=card><ul>{items}</ul></div>"
-            f"<p class=muted>{BRAND_NAME} — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
+            f"<p class=muted>{BRAND_NAME} — projects are private and require dashboard sign-in.</p>"
             "</body></html>")
 
 
@@ -24520,6 +24675,24 @@ async def user_projects_page(request: Request, username: str):
 async def serve_project(request: Request, username: str, project: str, subpath: str = ""):
     if username in _RESERVED_TOP:
         return HTMLResponse("Not found", status_code=404)
+    viewer = _current_user(request)
+    if not viewer:
+        return HTMLResponse(_login_page(), status_code=401)
+    owner = _find_user_by_username(username)
+    if not owner:
+        # Project namespaces predate account renames on some long-lived
+        # sessions.  Resolve those stable URLs through the explicit session
+        # owner whenever the registry has one.
+        owner_id = _load_session_owners().get(project)
+        owner = _find_user_by_id(owner_id) if owner_id else None
+    if not owner:
+        # The administrator can recover still-valid static handoffs from
+        # namespaces created before either account or session ownership was
+        # recorded.  Members cannot probe or open those orphaned directories.
+        if not _is_admin(viewer):
+            return HTMLResponse("Not found", status_code=404)
+    elif viewer.get("id") != owner.get("id") and not _is_admin(viewer):
+        return HTMLResponse("Forbidden — you can only view your own projects.", status_code=403)
     pdir = _project_dir(username, project)
     if pdir is None or not pdir.exists():
         return HTMLResponse(f"Project not found. (Served from ~/web-projects/{username}/{project}/)",
