@@ -42,6 +42,15 @@ def test_fixed_permission_groups_match_the_requested_catalog():
     ]
     policies = {key: value["instructions"].lower() for key, value in groups.items()}
     assert "modify permissions" in policies["managers"]
+    # Personal identity documents and the Ramp card estate are not company
+    # data: a manager who needs a figure asks for that figure.
+    assert "ramp" in groups["managers"]["advisor_cannot_see"]
+    assert "identity" not in groups["managers"]["advisor_can_see"].split(",")
+    # The advisor matches the bare token "identity" for get_identity;
+    # "identity_docs" reads like it should work and does not, which is how a
+    # manager kept pulling passports while ramp in the same list was refused.
+    for group_id, group in groups.items():
+        assert "identity" in group["advisor_cannot_see"].split(","), group_id
     assert "sales" in policies["engineers"] and "salaries" in policies["engineers"]
     assert "mainland china" in policies["accounting-cn"]
     assert "all companies" in policies["accounting-all"]
