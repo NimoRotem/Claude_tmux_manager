@@ -1608,21 +1608,16 @@ def _configure_member_codex_isolation(
             'bearer_token_env_var = "ADVISOR_TOKEN"',
             "# END GRABO ADVISOR MCP",
         ))
-    if google_parts and DOCVAULT_MCP_KEY and DOCVAULT_MCP_SCRIPT.is_file():
-        lines.extend((
-            "",
-            "# BEGIN GRABO DOCVAULT MCP (managed)",
-            "[mcp_servers.docvault]",
-            f'command = "{_toml_escape(google_parts[0])}"',
-            f'args = ["{_toml_escape(str(DOCVAULT_MCP_SCRIPT))}"]',
-            'default_tools_approval_mode = "approve"',
-            "",
-            "[mcp_servers.docvault.env]",
-            f'DOCVAULT_MCP_URL = "{_toml_escape(DOCVAULT_MCP_URL)}"',
-            f'DOCVAULT_MCP_KEY = "{_toml_escape(DOCVAULT_MCP_KEY)}"',
-            "# END GRABO DOCVAULT MCP",
-        ))
+    # The document vault is NOT wired directly any more. It used to be: every
+    # member's config.toml carried the vault's bearer key and talked to
+    # https://grabo.cc/docvault-mcp/mcp itself, so ~150,000 company documents
+    # (payroll runs, bank paperwork, passport scans) were reachable with no
+    # per-person check and the key sat in fifteen files on disk. The advisor
+    # holds the key now and exposes `docvault_search` / `docvault_get`, which
+    # apply the caller's permission group to the query and to what comes back.
+    # Any leftover block from the old wiring is stripped below.
     updated = "\n".join(lines) + "\n"
+    updated = _strip_managed_block(updated, "GRABO DOCVAULT MCP")
     # Fixed point: collapse blank runs and settle the trailing newline, so the
     # next sync produces exactly this text and writes nothing.
     updated = re.sub(r"\n{3,}", "\n\n", updated).strip("\n") + "\n"
@@ -1632,6 +1627,19 @@ def _configure_member_codex_isolation(
     _backup_before_dashboard_write(config)
     config.write_text(updated)
     return True
+
+
+def _strip_managed_block(text: str, marker: str) -> str:
+    """Remove a `# BEGIN <marker> ... # END <marker>` section we no longer write.
+
+    Members keep a long-lived config.toml, so retiring a managed block has to
+    delete what an earlier build already wrote, not merely stop appending it.
+    """
+    pattern = re.compile(
+        r"\n*# BEGIN " + re.escape(marker) + r".*?# END " + re.escape(marker) + r"[^\n]*\n?",
+        re.S,
+    )
+    return pattern.sub("\n", text)
 
 
 def _materialize_member_skills(cfg_dir: Path) -> None:
