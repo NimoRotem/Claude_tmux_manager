@@ -41,6 +41,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
+import google_policy
 from runtime_control import (
     BrowserLeaseStore,
     LockedJsonStore,
@@ -3850,6 +3851,9 @@ SHARED_CODEX_AUTH = CODEX_HOME / "auth.json"
 GLOBAL_CONTEXT_FILE = MESSAGES_DIR / "global-context.md"
 SANDBOX_HOOK_PATH = MESSAGES_DIR / "hooks" / "sandbox_guard.py"
 CONNECTIONS_DIR = MESSAGES_DIR / "connections"
+# Written by google_workspace_mcp.py, one line per Google tool call. Read here
+# so an admin can review access without shelling into the box.
+GOOGLE_MCP_AUDIT_FILE = MESSAGES_DIR / google_policy.AUDIT_FILE_NAME
 GOOGLE_OAUTH_CLIENT_FILE = MESSAGES_DIR / "google_oauth_client.json"
 BROWSER_POLICY_FILE = Path.home() / ".tmux-dashboard" / "context" / "browser-policy.md"
 
@@ -3942,6 +3946,22 @@ exact field or action needed.
 - Local Codex memory is private because every account has a separate
   `CODEX_HOME`. Use it as recall, never as the sole source of required policy or
   current external facts.
+
+## Google Workspace is per person, and it is enforced
+
+- Drive, Gmail and Calendar run as **your own** company Google account. There is
+  no shared company mailbox behind these tools any more: what you can open is
+  what Workspace shares with you.
+- Documents that read as payroll, HR or personal identity material are refused
+  for the engineering groups, in search results as well as on open. A refusal is
+  the correct answer for your account, not an obstacle to work around: name the
+  single figure you need and ask an admin.
+- Mail to a personal mailbox (gmail.com, qq.com, outlook.com and the like) is
+  refused for every account, and groups outside managers and accounting write to
+  company addresses only. Hand a work product back as its dashboard project
+  link rather than mailing it out.
+- Every Google tool call is recorded with your account, the tool, the target and
+  whether it was allowed.
 
 ## Load details only when relevant
 
@@ -14143,6 +14163,34 @@ async def api_admin_codex_alerts(request: Request, include_resolved: int = 1):
         "alerts": rows[:100],
         "open": sum(1 for row in rows if not row.get("resolved")),
         "auth": auth,
+    })
+
+
+@app.get("/api/admin/google-audit")
+async def api_admin_google_audit(
+    request: Request,
+    limit: int = 200,
+    user_id: str = "",
+    decision: str = "",
+):
+    """Who reached which Google document or mailbox, and what was refused.
+
+    The MCP writes one line per tool call; this is the only place an access
+    review can see it, so it is admin-only and read-only.
+    """
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    rows = google_policy.read_audit(
+        GOOGLE_MCP_AUDIT_FILE, limit=max(1, min(int(limit), 2000))
+    )
+    if user_id:
+        rows = [row for row in rows if row.get("user_id") == user_id]
+    if decision:
+        rows = [row for row in rows if row.get("decision") == decision]
+    return JSONResponse({
+        "entries": rows,
+        "denied": sum(1 for row in rows if row.get("decision") == "denied"),
+        "file": str(GOOGLE_MCP_AUDIT_FILE),
     })
 
 

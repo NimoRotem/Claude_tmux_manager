@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import functools
+import inspect
 import json
 import os
 import tempfile
@@ -23,6 +25,8 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+
+import google_policy as policy
 
 _GOOGLE_API_BASES = {
     "drive": "https://www.googleapis.com",
@@ -42,6 +46,10 @@ _GOOGLE_EXPORT_TYPES = {
 _DWD_SCOPES = {
     "drive": "https://www.googleapis.com/auth/drive",
     "gmail": "https://www.googleapis.com/auth/gmail.modify",
+    # Members read their own calendar rather than the admin's. The delegation
+    # client is authorized for the full calendar scope and not for
+    # calendar.readonly, so this is the narrowest one that can actually mint.
+    "calendar": "https://www.googleapis.com/auth/calendar",
 }
 _DWD_ACCOUNT_MARKER = Path("/__grabo_google_workspace_dwd__")
 _DWD_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
@@ -161,6 +169,18 @@ def _dwd_access_token(service: str) -> str:
     return token
 
 
+def _credentials_dir_or_none() -> Path | None:
+    try:
+        return _credentials_dir()
+    except RuntimeError:
+        return None
+
+
+def _actor() -> policy.Actor:
+    """The dashboard account this MCP process belongs to."""
+    return policy.load_actor(_credentials_dir_or_none())
+
+
 SHARED_CREDENTIALS_DIR_NAME = "_shared"
 
 
@@ -187,27 +207,36 @@ def _checked_token_file(directory: Path, service: str) -> Path:
 
 
 def _account_paths(service: str) -> list[tuple[str, Path]]:
-    """Every grant this member may use, as (label, token file).
+    """Every grant this account may use, as (label, token file).
 
-    The company account comes first, then the member's own if they connected
-    one. Both are searched: someone who signed in with their personal Google
-    account still needs to find company documents.
+    A member gets exactly one: their own company Workspace identity, through
+    domain-wide delegation. Workspace sharing then decides what they can see,
+    which is the boundary the company already manages.
+
+    Two grants are deliberately withheld from members:
+
+    * the shared "company" token. It belongs to one person's account
+      (historically nimo@nemopowertools.com) and handing it to everyone gave all
+      fourteen members read of that mailbox and Drive, over the top of every
+      Workspace permission. Admin keeps it because the admin account signs in
+      with a personal Google address and has no delegation subject.
+    * a personal OAuth grant this member connected themselves. Falling back to
+      it would let someone connect their own Google account and use these tools
+      to move company material into it.
     """
     if service not in _GOOGLE_API_BASES:
         raise ValueError("Unsupported Google service.")
+    actor = _actor()
     found: list[tuple[str, Path]] = []
     own = _checked_token_file(_credentials_dir(), service)
     shared_dir = _shared_credentials_dir()
-    # Company first. This is a shared work environment and the company archive
-    # is what people are looking for; when a member also has a personal account
-    # its files would otherwise fill the top of every result list.
-    if shared_dir is not None:
+    if actor.is_admin and shared_dir is not None:
         shared = _checked_token_file(shared_dir, service)
         if shared.exists() and shared != own:
             found.append(("company", shared))
     if _dwd_available(service):
         found.append(("mine", _DWD_ACCOUNT_MARKER))
-    elif own.exists():
+    elif own.exists() and actor.is_admin:
         found.append(("mine", own))
     return found
 
@@ -248,10 +277,7 @@ def _merged(service: str, call, key: str, *args, **kwargs) -> dict[str, Any]:
     """
     accounts = _account_paths(service)
     if not accounts:
-        raise RuntimeError(
-            f"{service.title()} is not connected. Ask an admin to connect the "
-            "company account in dashboard Settings, or connect your own."
-        )
+        raise RuntimeError(_no_account_message(service))
     items: list[Any] = []
     extra: dict[str, Any] = {}
     problems: list[str] = []
@@ -260,6 +286,8 @@ def _merged(service: str, call, key: str, *args, **kwargs) -> dict[str, Any]:
         try:
             with _use_account(service, path):
                 result = call(*args, **kwargs)
+        except policy.PolicyDenied:                    # a rule, not a bad grant
+            raise
         except Exception as exc:                       # one account, not the tool
             problems.append(f"{label}: {exc}")
             continue
@@ -284,11 +312,27 @@ def _merged(service: str, call, key: str, *args, **kwargs) -> dict[str, Any]:
     return out
 
 
+def _no_account_message(service: str) -> str:
+    """Why this account has no Google identity, and what actually fixes it."""
+    actor = _actor()
+    if actor.is_admin:
+        return (
+            f"{service.title()} is not connected. Connect the company account "
+            "in dashboard Settings."
+        )
+    return (
+        f"{service.title()} is not available for {actor.label}: this account has "
+        "no company Workspace address, and the shared company grant is admin "
+        "only. Ask an admin to set your company Google address on your "
+        "dashboard user; do not connect a personal Google account for this."
+    )
+
+
 def _first_account_that_works(service: str, call, *args, **kwargs) -> dict[str, Any]:
     """Read one item: try each account until one returns it."""
     accounts = _account_paths(service)
     if not accounts:
-        raise RuntimeError(f"{service.title()} is not connected.")
+        raise RuntimeError(_no_account_message(service))
     problems = []
     for label, path in accounts:
         try:
@@ -296,6 +340,8 @@ def _first_account_that_works(service: str, call, *args, **kwargs) -> dict[str, 
                 result = call(*args, **kwargs)
             result["account"] = label
             return result
+        except policy.PolicyDenied:                    # a rule, not a bad grant
+            raise
         except Exception as exc:
             problems.append(f"{label}: {exc}")
     raise RuntimeError("; ".join(problems))
@@ -481,17 +527,19 @@ def _api_get(
 
 
 def _own_account_call(service: str, call, *args, **kwargs) -> dict[str, Any]:
-    """Run a mutation only as this dashboard user's own Google identity."""
+    """Run a mutation only as this dashboard user's own Google identity.
+
+    A member writes as their company Workspace account or not at all: a
+    personal grant is never used, so these tools cannot write company material
+    into someone's own Google account.
+    """
     own = _checked_token_file(_credentials_dir(), service)
     if _dwd_available(service):
         credential = _DWD_ACCOUNT_MARKER
-    elif own.exists():
+    elif own.exists() and _actor().is_admin:
         credential = own
     else:
-        raise RuntimeError(
-            f"Your own {service.title()} account is not connected. "
-            "Sign out and continue with Google again."
-        )
+        raise RuntimeError(_no_account_message(service))
     with _use_account(service, credential):
         result = call(*args, **kwargs)
     if isinstance(result, dict):
@@ -555,6 +603,11 @@ def _drive_read_one(file_id: str) -> dict[str, Any]:
             "supportsAllDrives": "true",
         },
     )
+    # Checked on the metadata, before a byte of content is fetched, so a denied
+    # document is never read into the session's context.
+    denial = policy.drive_denial(_actor(), str(metadata.get("name") or ""))
+    if denial:
+        raise policy.PolicyDenied(denial)
     mime_type = str(metadata.get("mimeType") or "")
     if mime_type.startswith("application/vnd.google-apps."):
         export_type = _GOOGLE_EXPORT_TYPES.get(mime_type)
@@ -776,6 +829,12 @@ def _gmail_read_one(message_id: str) -> dict[str, Any]:
     }
 
 
+def _check_recipients(to: str, cc: str = "", bcc: str = "") -> None:
+    denial = policy.recipient_denial(_actor(), to, cc, bcc)
+    if denial:
+        raise policy.PolicyDenied(denial)
+
+
 def _gmail_raw_message(
     to: str,
     subject: str,
@@ -786,6 +845,9 @@ def _gmail_raw_message(
     clean_to = str(to or "").strip()
     if not clean_to:
         raise ValueError("to is required.")
+    # Checked again here, where both send and draft actually build the message,
+    # so a future caller that skips the public tool is still covered.
+    _check_recipients(clean_to, cc, bcc)
     message = EmailMessage()
     message["To"] = clean_to
     message["Subject"] = str(subject or "")
@@ -883,27 +945,114 @@ def _calendar_list_events_one(
     return {"events": value.get("items", [])}
 
 
+# --- audit -------------------------------------------------------------------
+#
+# Every tool call is recorded: who, which tool, allowed or denied, and enough of
+# the arguments to recognise the request later. Message bodies and file contents
+# are never written to the log — only the addressing and the identifiers, which
+# is what an access review needs.
+
+_LOGGED_ARGUMENTS = (
+    "to", "cc", "bcc", "subject", "query", "file_id", "message_id", "name",
+    "folder_id", "page_size", "add_label_ids", "remove_label_ids",
+)
+
+
+def _call_detail(func, args: tuple, kwargs: dict) -> str:
+    try:
+        bound = inspect.signature(func).bind_partial(*args, **kwargs)
+    except TypeError:
+        return ""
+    parts = []
+    for key, value in bound.arguments.items():
+        if key not in _LOGGED_ARGUMENTS:
+            continue
+        parts.append(f"{key}={str(value)[:120]}")
+    return " ".join(parts)
+
+
+def _audited(func):
+    """Record the call and its outcome, then let the result or error through."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        actor = _actor()
+        directory = _credentials_dir_or_none()
+        detail = _call_detail(func, args, kwargs)
+        try:
+            result = func(*args, **kwargs)
+        except policy.PolicyDenied as exc:
+            policy.audit(
+                actor, func.__name__, "denied", detail, str(exc),
+                credentials_dir=directory,
+            )
+            raise
+        except Exception as exc:
+            policy.audit(
+                actor, func.__name__, "error", detail, str(exc)[:200],
+                credentials_dir=directory,
+            )
+            raise
+        accounts = []
+        if isinstance(result, dict):
+            accounts = result.get("accounts_searched") or (
+                [result["account"]] if result.get("account") else []
+            )
+        policy.audit(
+            actor, func.__name__, "allowed", detail,
+            credentials_dir=directory, accounts=accounts,
+        )
+        return result
+
+    return wrapper
+
 
 # --- public tools: every account the member is entitled to -------------------
 
+@_audited
 def drive_search(
     query: str = "",
     page_size: int = 20,
     page_token: str = "",
 ) -> dict[str, Any]:
-    """Search company Google Drive (and your own, if you connected it).
+    """Search the Google Drive of your own company account.
 
-    Covers shared drives and everything shared with the account. Each result
-    carries `account`: "company" for the shared GRABO Drive, "mine" for your own.
+    Covers shared drives and everything shared with you. Files your permission
+    group may not open are left out and counted in `withheld`.
     """
-    return _merged("drive", _drive_search_one, "files", query, page_size, page_token)
+    actor = _actor()
+    denial = policy.query_denial(actor, query)
+    if denial:
+        raise policy.PolicyDenied(denial)
+    result = _merged(
+        "drive", _drive_search_one, "files", query, page_size, page_token
+    )
+    kept = []
+    withheld = 0
+    for item in result.get("files", []) or []:
+        name = str(item.get("name") or "") if isinstance(item, dict) else ""
+        if policy.drive_denial(actor, name):
+            withheld += 1
+            continue
+        kept.append(item)
+    result["files"] = kept
+    if withheld:
+        result["withheld"] = withheld
+        result["withheld_note"] = (
+            f"{withheld} result(s) hidden: they look like material the "
+            f"{actor.group or 'no group'} permission group may not open. "
+            "Ask an admin if you need one for a specific task."
+        )
+    return result
 
 
+@_audited
 def drive_read(file_id: str) -> dict[str, Any]:
-    """Read or export one Drive file (100 KB of text max), from either account."""
+    """Read or export one Drive file (100 KB of text max) from your account."""
     return _first_account_that_works("drive", _drive_read_one, file_id)
 
 
+@_audited
 def drive_create_text(
     name: str,
     content: str,
@@ -921,6 +1070,7 @@ def drive_create_text(
     )
 
 
+@_audited
 def drive_update_text(
     file_id: str,
     content: str,
@@ -936,25 +1086,28 @@ def drive_update_text(
     )
 
 
+@_audited
 def drive_move_to_trash(file_id: str) -> dict[str, Any]:
     """Move one file in your own Drive to trash; this is recoverable."""
     return _own_account_call("drive", _drive_move_to_trash_one, file_id)
 
 
+@_audited
 def gmail_search(query: str = "", page_size: int = 10) -> dict[str, Any]:
-    """Search the company mailbox (and your own, if you connected it).
+    """Search your own company mailbox.
 
     Accepts normal Gmail query syntax, e.g. `from:someone@x.com has:attachment`.
-    Each message carries `account`: "company" or "mine".
     """
     return _merged("gmail", _gmail_search_one, "messages", query, page_size)
 
 
+@_audited
 def gmail_read(message_id: str) -> dict[str, Any]:
-    """Read one message by id, from whichever account holds it."""
+    """Read one message by id from your own company mailbox."""
     return _first_account_that_works("gmail", _gmail_read_one, message_id)
 
 
+@_audited
 def gmail_send(
     to: str,
     subject: str,
@@ -962,7 +1115,12 @@ def gmail_send(
     cc: str = "",
     bcc: str = "",
 ) -> dict[str, Any]:
-    """Send an email from your own connected Gmail account."""
+    """Send an email from your own company Gmail account.
+
+    Personal mailboxes are refused for everyone but the admin, and groups
+    outside managers and accounting may write to company addresses only.
+    """
+    _check_recipients(to, cc, bcc)
     return _own_account_call(
         "gmail",
         _gmail_send_one,
@@ -974,6 +1132,7 @@ def gmail_send(
     )
 
 
+@_audited
 def gmail_create_draft(
     to: str,
     subject: str,
@@ -981,7 +1140,12 @@ def gmail_create_draft(
     cc: str = "",
     bcc: str = "",
 ) -> dict[str, Any]:
-    """Create a draft in your own connected Gmail account."""
+    """Create a draft in your own company Gmail account.
+
+    The same recipient rules as `gmail_send` apply: a draft is not a way to
+    address a personal mailbox.
+    """
+    _check_recipients(to, cc, bcc)
     return _own_account_call(
         "gmail",
         _gmail_create_draft_one,
@@ -993,6 +1157,7 @@ def gmail_create_draft(
     )
 
 
+@_audited
 def gmail_modify_labels(
     message_id: str,
     add_label_ids: list[str] | None = None,
@@ -1008,13 +1173,15 @@ def gmail_modify_labels(
     )
 
 
+@_audited
 def gmail_move_to_trash(message_id: str) -> dict[str, Any]:
     """Move one message in your own Gmail account to trash; this is recoverable."""
     return _own_account_call("gmail", _gmail_move_to_trash_one, message_id)
 
 
+@_audited
 def calendar_list_events(page_size: int = 20, query: str = "") -> dict[str, Any]:
-    """Upcoming events from the company calendar (and your own, if connected)."""
+    """Upcoming events from your own company calendar."""
     return _merged("calendar", _calendar_list_events_one, "events", page_size, query)
 
 
