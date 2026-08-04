@@ -5095,13 +5095,18 @@ ADVISOR_HOST_NAME = os.environ.get(
 PERMISSION_GROUPS = {
     "managers": {
         "name": "Managers",
-        "summary": "May see all company and system data, but may not take destructive actions or change permissions.",
-        "advisor_can_see": "admin,payments,identity,ramp,financial,hr,tax,sales,expenses,salaries,income,bank",
-        "advisor_cannot_see": "destructive,permissions.write",
+        "summary": "May see all company and system data, but not personal identity documents or the Ramp card estate, and may not take destructive actions or change permissions.",
+        "advisor_can_see": "admin,payments,financial,hr,tax,sales,expenses,salaries,income,bank",
+        "advisor_cannot_see": "destructive,permissions.write,identity,identity_docs,ramp",
         "advisor_scopes": "secrets,infra,memories.write,payments",
         "instructions": """# Permission group: Managers
 
 You may read and analyze all company, financial, people, credential, and system data needed for the task.
+
+Personal identity documents (passports, ID cards, dates of birth, tax and
+insurance numbers for the owner and his family) are not company data and are
+not available to this group, nor is the Ramp card estate. Ask an administrator
+for a specific figure if a task genuinely needs one.
 
 You must not take destructive actions. This includes deleting or retiring systems, databases, domains, user data, production resources, or credentials; rewriting shared history; revoking access; or making an irreversible change. You must not create, remove, or modify permissions, roles, groups, authentication policy, or another person's access. Stop and ask an administrator to perform those actions. Non-destructive work and reversible updates remain allowed.
 """,
@@ -5110,7 +5115,7 @@ You must not take destructive actions. This includes deleting or retiring system
         "name": "Engineers",
         "summary": "Engineering access with all company financial, sales, expense, payment, and salary data denied.",
         "advisor_can_see": "systems",
-        "advisor_cannot_see": "payments,ramp,people,identity_docs,financial,sales,expenses,salaries,income,bank",
+        "advisor_cannot_see": "payments,ramp,people,identity,identity_docs,financial,sales,expenses,salaries,income,bank",
         "advisor_scopes": "secrets,infra,memories.write",
         "instructions": """# Permission group: Engineers
 
@@ -5121,7 +5126,7 @@ You may perform ordinary engineering work, but you must refuse any request for c
         "name": "Accounting-CN",
         "summary": "Read-only finance, HR, and tax access for mainland China entities only.",
         "advisor_can_see": "payments,entities,contacts,financial,hr,tax,entity:cn",
-        "advisor_cannot_see": "ramp,people,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,entity:non-cn,destructive",
+        "advisor_cannot_see": "ramp,people,identity,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,entity:non-cn,destructive",
         "advisor_scopes": "memories.write,payments",
         "instructions": """# Permission group: Accounting-CN
 
@@ -5134,7 +5139,7 @@ You must not initiate, approve, schedule, or make transactions or payments. You 
         "name": "Accounting-all",
         "summary": "Read-only finance, HR, and tax access for all companies and entities.",
         "advisor_can_see": "payments,identity,entities,contacts,people,financial,hr,tax",
-        "advisor_cannot_see": "ramp,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,destructive",
+        "advisor_cannot_see": "ramp,identity,identity_docs,secrets,memories,transactions.write,systems.write,permissions.write,destructive",
         "advisor_scopes": "memories.write,payments",
         "instructions": """# Permission group: Accounting-all
 
@@ -5147,7 +5152,7 @@ You must not initiate, approve, schedule, or make transactions or payments. You 
         "name": "Dev",
         "summary": "May modify systems, but cannot transact or view protected company financial data.",
         "advisor_can_see": "systems,systems.write",
-        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write",
+        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write,identity",
         "advisor_scopes": "secrets,infra,memories.write",
         "instructions": """# Permission group: Dev
 
@@ -5160,7 +5165,7 @@ You must not initiate, approve, schedule, or make transactions or payments. You 
         "name": "Limited-Dev",
         "summary": "Junior developer access with the Dev data restrictions and extra care for live changes.",
         "advisor_can_see": "systems,systems.write",
-        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write",
+        "advisor_cannot_see": "payments,ramp,financial,expenses,salaries,income,bank,transactions.write,identity",
         "advisor_scopes": "secrets,infra,memories.write",
         "instructions": """# Permission group: Limited-Dev
 
