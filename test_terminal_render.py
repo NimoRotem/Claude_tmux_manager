@@ -75,7 +75,7 @@ x-user-u_36f0/advisor-token 2>/dev/null)" env -u OPENAI_API_KEY codex --yolo; fi
 # file can hold the pattern that matches it.
 DRIVER = r"""
 const fs=require('fs'), vm=require('vm');
-const src=fs.readFileSync(process.argv[1],'utf8');
+const src=fs.readFileSync(process.argv[2],'utf8');
 const Q='"'.repeat(3);
 const html=src.match(new RegExp('^HTML_PAGE = r'+Q+'([\\s\\S]*?)^'+Q,'m'))[1];
 const js=html.match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
@@ -83,14 +83,14 @@ const region=js.slice(js.indexOf('function getCleanViewPref(){'), js.indexOf('//
 const noop=()=>{};
 const ctx=vm.createContext({
   console, sessions:[], selectedSession:null,
-  localStorage:{getItem:k=>(k==='terminalCleanView'?process.argv[3]:null), setItem:noop},
+  localStorage:{getItem:k=>(k==='terminalCleanView'?process.argv[4]:null), setItem:noop},
   document:{addEventListener:noop,getElementById:()=>null},
   window:{addEventListener:noop,getSelection:()=>null,performance:{now:()=>0}},
   setInterval:noop, setTimeout:noop, clearTimeout:noop,
   getComputedStyle:()=>({fontSize:'13px',paddingLeft:'12px',paddingRight:'12px'}),
 });
 vm.runInContext(region, ctx);
-const pane=fs.readFileSync(process.argv[2],'utf8');
+const pane=fs.readFileSync(process.argv[3],'utf8');
 const split=ctx.splitLiveTail(pane.split('\n'));
 const filtered=ctx.applyRawFilter(split.body.join('\n'));
 process.stdout.write(JSON.stringify({
