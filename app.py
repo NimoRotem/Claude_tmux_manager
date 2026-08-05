@@ -18639,6 +18639,19 @@ document.addEventListener('mouseup',function(){
 // into porridge. The word test never merges those, because the next line's first
 // word plainly would have fitted.
 const _BLOCK_START_RE=/^\s*(?:[●⏺•✱✲✳✴✵✶✷✸✹✺✧✦⎿└├┌┐┘╭╮╯╰│┤┬┴┼─━═║╔╗╚╝▌▐❯›»>]|[-*+]\s|\d+[.)]\s|#{1,6}\s|[✓✔✗✘◻☐☑▢]\s)/;
+// A token too long to finish the row is cut at the very last column and picked
+// up at column 0 on the next one, whatever the paragraph's indent was — which is
+// exactly how a URL comes through:
+//
+//     (https://docs.google.com/spreadsheets/d/1I5Lii…UNfAUe8oObwbE/edit    <- col 80
+//   ?gid=1321488188).                                                     <- col 0
+//
+// So a column-0 row is still a continuation when the row above filled the pane
+// and the two halves join into one token. Without this the link stays in two
+// pieces and neither half is clickable.
+function _isTokenCut(prev,row,limit){
+  return prev.length>=limit&&_wrapGlue(prev,row,limit)==='';
+}
 function _isWrapContinuation(prev,row,limit){
   if(!prev||!row)return false;
   if(!prev.trim()||!row.trim())return false;
@@ -18646,7 +18659,8 @@ function _isWrapContinuation(prev,row,limit){
   if(_BLOCK_START_RE.test(row))return false;
   const pIndent=prev.length-prev.replace(/^\s+/,'').length;
   const rIndent=row.length-row.replace(/^\s+/,'').length;
-  if(rIndent===0&&pIndent>0)return false;   // back at column 0 — structure, not a wrap
+  // back at column 0 — structure, not a wrap, unless a token was cut there
+  if(rIndent===0&&pIndent>0&&!_isTokenCut(prev,row,limit))return false;
   if(rIndent>pIndent+6)return false;        // a deeper block of its own
   const word=row.replace(/^\s+/,'').split(/\s/)[0]||'';
   if(!word)return false;
