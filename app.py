@@ -18314,7 +18314,27 @@ body.member-simple .nav-codex-alert{display:none !important}
 .raw-controls{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .raw-info{color:#6e7681;font-size:.75rem;flex-shrink:0}
 .raw-title{flex:1;min-width:0;color:#8b949e;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
-.raw-output{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:.8rem;line-height:1.45;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 280px);overflow-y:auto;white-space:pre;word-wrap:normal;overflow-x:auto}
+/* The terminal paints ONE `<div class="tl">` per logical line and rewrites only
+   the lines whose text actually changed (renderRawText/_applyLineDiff).
+   Untouched lines keep their DOM node, so a selection inside them survives an
+   update and nothing above a change can shift — that, not any scroll
+   arithmetic, is what stops the view jumping while the agent streams.
+   `overflow-anchor:none` because we do the anchoring ourselves and the
+   browser's own guess fights it. */
+.raw-output{position:relative;background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:13px;line-height:1.5;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 306px);overflow-y:auto;overflow-x:hidden;overflow-anchor:none}
+.raw-output .tl{white-space:pre-wrap;overflow-wrap:anywhere;min-height:1.5em}
+/* Exact mode (clean view off) — the terminal grid, character for character. The
+   font size is fitted to the pane width (fitTerminalFont) so all of it fits the
+   column that is there: a phone stops scrolling sideways, a wide desktop stops
+   drawing an 80-column ribbon down the middle. Nothing is allowed to scroll
+   horizontally even so — the grid rows now fit by construction, and the only
+   lines that could overflow are scrollback rows tmux already rejoined, which
+   were never part of the grid. Those wrap. */
+.raw-output.exact .tl{word-break:break-word}
+/* Flow mode (clean view on) — the TUI's own hard wraps are undone and the text
+   reflows to whatever width there is, with a hanging indent so nesting reads. */
+.raw-output.flow{font-size:13.5px}
+.raw-output.flow .tl{padding-left:2.2em;text-indent:-2.2em}
 .raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#484f58;border-radius:6px;border:2px solid #0d1117}
@@ -18332,6 +18352,27 @@ body.member-simple .nav-codex-alert{display:none !important}
 .raw-resize-handle:hover{background:#21262d}
 .raw-resize-handle::after{content:'';width:40px;height:3px;border-radius:2px;background:#30363d}
 .raw-resize-handle:hover::after{background:#484f58}
+
+/* Our own live indicator. Both CLIs park a status area at the foot of the pane —
+   a spinner glyph, a verb, a seconds counter, a token tally — and redraw it many
+   times a second. Streaming that into the transcript was most of the churn the
+   reader was fighting, so those rows are cut off (splitLiveTail) and redrawn
+   here instead: outside the scroll area, off a locally ticking clock. Time
+   passing now moves nothing. */
+.term-live{display:none;align-items:center;gap:8px;padding:6px 11px;margin-top:-1px;border:1px solid #21262d;border-top:none;border-radius:0 0 8px 8px;background:#0d1117;font-size:.72rem;color:#8b949e;flex-shrink:0;min-height:16px}
+.term-live.on{display:flex}
+.tl-dots{display:inline-flex;gap:3px;flex-shrink:0}
+.tl-dots i{width:5px;height:5px;border-radius:50%;background:#58a6ff;display:block;animation:tl-pulse 1.25s ease-in-out infinite}
+.tl-dots i:nth-child(2){animation-delay:.18s}
+.tl-dots i:nth-child(3){animation-delay:.36s}
+@keyframes tl-pulse{0%,75%,100%{opacity:.22;transform:scale(.75)}35%{opacity:1;transform:scale(1)}}
+.term-live.idle .tl-dots i{animation:none;opacity:.3;background:#484f58}
+.tl-verb{color:#c9d1d9;font-weight:600;white-space:nowrap}
+.tl-time{font-variant-numeric:tabular-nums;white-space:nowrap}
+.tl-tok{color:#6e7681;white-space:nowrap}
+.tl-sep{color:#30363d}
+.tl-spacer{flex:1}
+.tl-note{color:#6e7681;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -18945,6 +18986,13 @@ body.member-simple .hide-in-simple{display:none!important}
   .chat-msg{max-width:92%}
   .chat-messages{max-height:calc(100vh - 320px);min-height:80px}
   .raw-output{max-height:50vh}
+  /* Flow mode is what a phone gets by default (clean view is on), and the whole
+     point of it here is that the text fits the screen — so the hanging indent
+     shrinks and nothing is allowed to push the line box wider than the column. */
+  .raw-output.flow{font-size:12.5px;line-height:1.55}
+  .raw-output.flow .tl{padding-left:1.3em;text-indent:-1.3em}
+  .term-live{font-size:.66rem;gap:6px;padding:5px 9px}
+  .term-live .tl-note{display:none}
   .modal{min-width:280px;margin:0 16px}
   .tab{padding:8px 12px;font-size:.8rem}
   .tab-more-menu{min-width:160px}
@@ -19150,9 +19198,12 @@ let pollTimer=null;
 const activeTabs={};
 const rawState={};
 // `frozen`/`frozenAtLines` back the Freeze toggle: streaming and st.fullText carry
-// on exactly as before, only the paint is held. `lastHtml` is what is currently
-// on screen — see renderRawText for why re-writing identical HTML is not free.
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,socket:null,reconnectTimer:null,backoff:500,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,lastHtml:null};return rawState[n]}
+// on exactly as before, only the paint is held.
+// `painted` is the HTML of every line currently on screen — the renderer diffs
+// against it and rewrites only what moved. `_bodyText` is the transcript with
+// the live counter already stripped, so a repaint of the counter alone is a
+// no-op. `live` is what that counter said, redrawn by us in the status strip.
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,socket:null,reconnectTimer:null,backoff:500,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
 // --- "Clean view" terminal filter ---
 // One switch. On, the terminal shows only what the agent SAID to you and drops
 // everything that is plumbing: tool-call headers (Claude's `Bash(…)`, Codex's
@@ -19299,11 +19350,214 @@ function _looksLikeAgentPane(text){
   return /^[\s]*[●⏺•]/m.test(text)||text.indexOf('⎿')>=0||
          text.indexOf('OpenAI Codex')>=0||text.indexOf('Claude Code')>=0;
 }
+
+// ── The live status block, and the chrome around it ─────────────────────────
+// Both CLIs keep a status area pinned to the foot of the pane and repaint it
+// several times a second. Codex draws:
+//
+//   • Working (23s · esc to interrupt) · 1 background terminal running
+//   › Use /skills to list available skills          <- composer placeholder
+//     gpt-5.6-sol max · ~/web-projects/guy/0zuqr    <- model + cwd footer
+//
+// None of it is transcript. The counter alone changed the buffer every second,
+// which forced a repaint every second, which is why the page moved under anyone
+// trying to read or copy. The spinner row is cut out of the text in BOTH views
+// and re-drawn by us outside the scroll area (see updateLiveBar); the rules, the
+// composer and the footer are cut in clean view.
+//
+// The glyph set below excludes ●, ⏺ and • — those are the agent's real prose and
+// tool bullets. `·` doubles as a spinner frame, so a match also has to carry
+// evidence: a clock, a token tally, or the interrupt hint.
+const _LIVE_HEAD_RE=/^ {0,6}([✻✽✢✳✴✱✲✵✶✷✸✹✺✧✦·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒▌▐])[ \t]+(\S.*)$/;
+// Codex is the awkward one: it draws its working line with the SAME bullet it
+// uses for prose ("• Working (3s · esc to interrupt)" against "• I'm running the
+// command…"), and alternates it with ◦ as the spinner frame. A bullet therefore
+// only counts as status on the tighter shape — one verb word and then a timer in
+// parentheses, or an explicit interrupt hint. Ordinary prose never does that.
+const _LIVE_BULLET_RE=/^ {0,6}[•◦][ \t]+(\S+[ \t]*\(\s*\d+\s*[hms]\b.*|\S.*\besc to interrupt\b.*)$/i;
+const _LIVE_EVID_RE=/\(\s*\d+\s*[hms]\b|\bfor\s+\d+\s*[hms]\b|\besc to interrupt\b|\btokens?\b|\bthought for\b|…\s*\(/i;
+const _LIVE_VERB_RE=/^([A-Za-z][A-Za-zÀ-ÿ'’-]{1,24})/;   // accents count: "Sautéing…" is one word
+const _LIVE_TIME_RE=/(?:^|[\s(·•])(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(\d+)\s*s\b/;
+const _LIVE_TOK_RE=/([↑↓⇡⇣])?\s*([\d.]+\s*[kKmM]?)\s*tokens?/;
+// What Codex leaves behind once the turn is over, in place of the spinner:
+//   ─ Worked for 50m 51s ──────────────────────────────────────────
+// It is the only record of how long the last turn took, so it feeds the strip's
+// idle reading instead of being thrown away with the rest of the chrome.
+const _LIVE_DONE_RE=/^\s*[─━]\s*([A-Z][a-zé]+)\s+for\s+((?:\d+\s*[hms]\s*)+)[─━\s]*$/;
+// The status line's tail: "· 1 background terminal running · /ps to view". Worth
+// keeping — it is the only place the dashboard ever says a background shell is
+// still alive — so it goes in the strip's note rather than the transcript.
+const _LIVE_NOTE_RE=/\)\s*[·•]\s*([^·•]+?)\s*(?:[·•]|$)/;
+// Returns the part of the line after the spinner glyph, or nothing if this line
+// is not a status line at all.
+function _liveHead(line){
+  const m=_LIVE_HEAD_RE.exec(line||'');
+  if(m)return _LIVE_EVID_RE.test(m[2])?m[2]:null;
+  const b=_LIVE_BULLET_RE.exec(line||'');
+  return b?b[1]:null;
+}
+function _isLiveStatusLine(line){return _liveHead(line)!==null}
+function _readLiveStatus(line,live){
+  const rest=_liveHead(line);
+  if(rest===null)return;
+  const v=_LIVE_VERB_RE.exec(rest);
+  if(v)live.verb=v[1];
+  const t=_LIVE_TIME_RE.exec(rest);
+  if(t)live.sec=(parseInt(t[1]||'0',10)*3600)+(parseInt(t[2]||'0',10)*60)+parseInt(t[3]||'0',10);
+  const k=_LIVE_TOK_RE.exec(rest);
+  if(k){live.dir=k[1]||'';live.tok=k[2].replace(/\s+/g,'')}
+  const n=_LIVE_NOTE_RE.exec(rest);
+  live.note=(n&&!/^\/|to view|to close/i.test(n[1]))?n[1]:'';
+  live.esc=/esc to interrupt/i.test(rest);
+  live.done=false;
+  live.seen=true;
+}
+function _readLiveDone(line,live){
+  const m=_LIVE_DONE_RE.exec(line||'');
+  if(!m)return false;
+  const t=_LIVE_TIME_RE.exec(' '+m[2]);
+  live.verb=m[1];
+  live.sec=t?((parseInt(t[1]||'0',10)*3600)+(parseInt(t[2]||'0',10)*60)+parseInt(t[3]||'0',10)):live.sec;
+  live.tok='';live.dir='';live.note='';live.esc=false;
+  live.done=true;live.seen=true;
+  return true;
+}
+// Full-width horizontal rule. Box-drawing only, and long: an agent printing a
+// markdown `---` or a table border must survive (a table border opens with
+// ┌ ├ └, never with a bare ─).
+const _CHROME_RULE_RE=/^\s*[─━═]{18,}\s*$/;
+// The composer, and it has to be an EMPTY one: both CLIs echo every message you
+// sent back with the same `›`/`❯` prefix, and those are the transcript, not
+// chrome. Codex's non-empty placeholder is handled structurally instead, in
+// _stripPaneFooter. `>` is left out entirely — it starts a quoted line in prose.
+const _CHROME_COMPOSER_RE=/^\s*[❯›»][\s █▌│]*$/;
+// The hint bar under it, and the badges the CLIs park beside it.
+const _CHROME_HINT_RE=/^\s*(?:⏵|\?\s*for shortcuts|shift\+tab\b|ctrl\+[a-z0-9]+ to\b|esc to (?:interrupt|undo|clear)\b|⧉\s*In\b|↑\s*to (?:edit|recall)\b|⌥|bypassing permissions\b|\d+%\s+context left\b|←\s*for agents\b)/i;
+function _isPaneChrome(line){
+  return _CHROME_RULE_RE.test(line)||_CHROME_COMPOSER_RE.test(line)||_CHROME_HINT_RE.test(line)||_LIVE_DONE_RE.test(line);
+}
+// Codex's footer: the model it is on and the directory it is in, drawn under the
+// composer — "  gpt-5.6-sol max · ~/web-projects/guy/0zuqr". Anchored on the
+// ` · ` between a model name and a path, with a digit required somewhere in that
+// name (every model has one) and list markers excluded, so a markdown bullet
+// like "- Ops · /var/log" is never taken for it.
+const _CODEX_FOOTER_RE=/^\s{0,6}(?![-*+•]\s)[A-Za-z][\w.\-]*\d[\w.\-]*(?:\s+[\w.\-]+)*\s+[·•]\s+[~\/][^\s]*\s*$/;
+// The composer's placeholder ("› Use /skills to list available skills"), which
+// Codex rotates through a set of suggestions. It cannot be told from a real user
+// message by content — Codex echoes those with the same `›` — so it is found by
+// POSITION instead: the row directly above the model/cwd footer, blank rows
+// aside. Nothing but the composer is ever there, because a message you sent is
+// redrawn above the spinner, not below it.
+//
+// Both are matched everywhere in the buffer, not just at its foot. The pane
+// redraws its chrome in place, so every frame that scrolled away left its own
+// composer and footer behind in tmux's history.
+function _stripPaneFooter(lines){
+  const cut={};
+  for(let i=0;i<lines.length;i++){
+    if(!_CODEX_FOOTER_RE.test(lines[i]))continue;
+    cut[i]=1;
+    let j=i-1;
+    while(j>=0&&lines[j].trim()==='')j--;
+    if(j>=0&&/^\s*[❯›»]/.test(lines[j]))cut[j]=1;
+  }
+  return lines.filter((l,idx)=>!cut[idx]);
+}
+// Pull the live status out of the buffer and read it. Runs in both views, and
+// runs before anything else, so a repaint of the counter alone never reaches the
+// renderer. Returns the body with those rows (and the trailing blank rows the
+// pane pads itself with) removed.
+function splitLiveTail(lines){
+  const live={verb:'',sec:null,tok:'',dir:'',note:'',esc:false,done:false,seen:false};
+  const body=[];
+  for(let i=0;i<lines.length;i++){
+    if(_isLiveStatusLine(lines[i])){_readLiveStatus(lines[i],live);continue}
+    // The "Worked for 50m 51s" rule stays in the buffer for clean view to drop
+    // with the rest of the chrome; only its number is taken here.
+    _readLiveDone(lines[i],live);
+    body.push(lines[i]);
+  }
+  while(body.length&&body[body.length-1].trim()==='')body.pop();
+  return {body:body,live:live};
+}
+// The dashboard starts a session by typing a shell line into it:
+//
+//   nimrod_rotem@grabo-tech:~$ if [ -f … ]; then exec env CODEX_HOME=/home/…
+//   ADVISOR_TOKEN="$(cat /home/…/advisor-token 2>/dev/null)" env -u
+//   OPENAI_API_KEY codex --yolo; fi
+//
+// which the terminal then wraps over half a dozen rows. It is the first thing
+// anyone opening the session reads and it means nothing to them. Cut everything
+// from the top down to the first row that is actually the agent talking. Scoped
+// to the head of the buffer and to panes that did start an agent, so a plain
+// shell session is never blanked.
+const _ENV_ASSIGN_RE=/^[A-Za-z_][A-Za-z0-9_]*=/;
+// The launch line itself, for the case where the prompt that carried it has
+// already scrolled out of tmux's history and only the command is left.
+const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=/;
+// Its wrapped rows, which start mid-token and so match none of the above: the
+// launcher is one long `if … then exec env … fi`, and tmux breaks it anywhere.
+const _LAUNCH_FRAG_RE=/CODEX_HOME=|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
+function _stripStartupPreamble(lines){
+  let i=0,sawShell=false;
+  const limit=Math.min(lines.length,120);
+  while(i<limit){
+    const l=lines[i],t=l.trim();
+    if(t===''){i++;continue}
+    if(_SHELL_PROMPT_RE.test(l)||_LAUNCH_CMD_RE.test(t)){sawShell=true;i++;continue}
+    if(!sawShell)break;
+    // Wrapped tail of that command: bare VAR=value pairs, `export`/`cd`/`&&`
+    // fragments, the launcher's own shell plumbing, and the CLI's "starting…"
+    // chatter.
+    if(_ENV_ASSIGN_RE.test(t)||/^(export|cd|source|env|exec|nohup|&&|\|\|)\b/.test(t)||
+       /^--?[a-z]/.test(t)||/^(claude|codex)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
+    // The compact start-up banner, which is the CLI's block-glyph logo with the
+    // version, the model and the cwd set beside it. Not drawn as a box, so
+    // _stripStartupBanner cannot see it; three or more logo glyphs on a row is
+    // the tell.
+    if((l.match(/[▐▛▜▌▝▘█▄▀]/g)||[]).length>=3){i++;continue}
+    break;
+  }
+  return sawShell?lines.slice(i):lines;
+}
+// The welcome box each CLI draws on start-up — Codex's is the ">_ OpenAI Codex
+// (v0.146.0)" frame with model, directory and permissions in it. It is a box so
+// _isTableRow keeps it; drop it by content.
+const _BANNER_HINT_RE=/welcome (to|back)\b|(claude code|openai codex)\s+\(?v?\d|\/help for help|\/init to create|\/model to change|release-notes|tips for getting|what's new|cwd:|workdir:|directory:\s|permissions:\s|model:\s|approval:|sandbox:|press enter to continue/i;
+function _stripStartupBanner(lines){
+  const out=[];
+  let box=null;
+  for(let i=0;i<lines.length;i++){
+    const t=lines[i].trim();
+    const opens=/^[╭┌]/.test(t),closes=/^[╰└]/.test(t);
+    if(box===null&&opens){box={rows:[lines[i]],hit:false};continue}
+    if(box!==null){
+      box.rows.push(lines[i]);
+      if(_BANNER_HINT_RE.test(t))box.hit=true;
+      if(closes||box.rows.length>14){
+        if(!box.hit)for(const r of box.rows)out.push(r);
+        box=null;
+      }
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  if(box!==null&&!box.hit)for(const r of box.rows)out.push(r);
+  return out;
+}
 function applyRawFilter(text){
   if(!getCleanViewPref())return text;
   if(!text)return text;
-  const lines=text.split('\n');
+  let lines=text.split('\n');
+  // Decided on the ORIGINAL text: the start-up banner is one of the tells, and
+  // we are about to delete it.
   const agentPane=_looksLikeAgentPane(text);
+  if(agentPane){
+    lines=_stripStartupPreamble(lines);
+    lines=_stripStartupBanner(lines);
+    lines=_stripPaneFooter(lines);
+  }
+  lines=lines.filter(l=>!_isPaneChrome(l));
   // Index of the next non-empty line, for the structural tool-block test and
   // for deciding whether a blank row ends a hidden block or sits inside one.
   const nextNonEmpty=new Array(lines.length).fill(-1);
@@ -19331,6 +19585,11 @@ function applyRawFilter(text){
     if(_isNoise(line)){mode='noise';continue;}
     if(_CALL_CONT_RE.test(line)){mode='call';continue;}
     if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
+    // A tool call that is still RUNNING is drawn without its bullet — Claude
+    // only stamps the ● once the call returns. So `  Bash(cd …` sits there at an
+    // indent with nothing to mark it, and the bullet branch below never sees it.
+    // `Name(` at the start of a line is never prose, so match it on its own.
+    if(_TOOL_PAREN_RE.test(line.replace(_ANY_DECORATION_RE,''))){mode='call';continue;}
     if(_LEADING_BULLET_RE.test(line)){
       const nx=nextNonEmpty[i];
       const followerIsMarker=nx>=0&&(_OUTPUT_MARKER_RE.test(lines[nx])||_CALL_CONT_RE.test(lines[nx]));
@@ -19583,25 +19842,36 @@ function _linkifyTerminalText(text,paneWidth){
   }
   return out;
 }
-function _hasSelectionWithin(el){
+// Which rendered line is this node in? Used to decide whether a paint would
+// actually disturb the reader's selection, rather than assuming it would.
+function _lineIndexOf(el,node){
+  let x=node;
+  while(x&&x.parentNode!==el)x=x.parentNode;
+  if(!x)return -1;
+  return Array.prototype.indexOf.call(el.children,x);
+}
+// A paint only destroys a selection if it rewrites a line the selection is in.
+// The agent appends at the tail, so a reader highlighting something further up
+// is not affected and there is no reason to hold the update back.
+function _selectionBelow(el,fromIdx){
   const sel=window.getSelection?window.getSelection():null;
   if(!sel||sel.isCollapsed||sel.rangeCount===0)return false;
   for(let i=0;i<sel.rangeCount;i++){
     const r=sel.getRangeAt(i);
-    if(el.contains(r.startContainer)||el.contains(r.endContainer)||el.contains(r.commonAncestorContainer))return true;
+    if(!(el.contains(r.startContainer)||el.contains(r.endContainer)))continue;
+    const a=_lineIndexOf(el,r.startContainer),b=_lineIndexOf(el,r.endContainer);
+    if(a<0||b<0)return true;                 // can't place it — play safe
+    if(Math.max(a,b)>=fromIdx)return true;
   }
   return false;
 }
-// Part 4: once the user clears a terminal selection, flush any render we deferred
-// while they were highlighting text to copy.
+// Once the user's selection moves off the lines a paint wanted to rewrite, flush
+// it. renderRawText re-tests the overlap itself, so this can just ask again.
 function _flushDeferredRawRenders(){
   if(typeof rawState!=='object'||!rawState)return;
   for(const n in rawState){
     const st=rawState[n];
-    if(st&&st._pendingRender&&!st.frozen){
-      const el=document.getElementById('raw-'+n);
-      if(el&&!_hasSelectionWithin(el))renderRawText(n);
-    }
+    if(st&&st._pendingRender&&!st.frozen&&document.getElementById('raw-'+n))renderRawText(n);
   }
 }
 document.addEventListener('selectionchange',_flushDeferredRawRenders);
@@ -19620,41 +19890,373 @@ document.addEventListener('mouseup',function(){
   _rawDragEl=null;
   _flushDeferredRawRenders();
 },true);
+// ── Undoing the terminal's own line breaks ──────────────────────────────────
+// Codex and Claude Code hard-wrap their output to the pane width before tmux
+// ever sees it, so a paragraph arrives as N rows of ~78 columns and a long URL
+// arrives cut in half. That is the whole of two complaints at once: the text is
+// stuck at 80 columns (too wide for a phone, half the screen wasted on a
+// desktop) and a link split across two rows is not a link any more.
+//
+// A row continues the one above it only if the first word of the row would NOT
+// have fitted on it — the exact inverse of the greedy wrap that produced them.
+// "Did the row reach the right margin" is not enough on its own: two short lines
+// that happen to be long-ish get glued together, and a two-column list turns
+// into porridge. The word test never merges those, because the next line's first
+// word plainly would have fitted.
+const _BLOCK_START_RE=/^\s*(?:[●⏺•✱✲✳✴✵✶✷✸✹✺✧✦⎿└├┌┐┘╭╮╯╰│┤┬┴┼─━═║╔╗╚╝▌▐❯›»>]|[-*+]\s|\d+[.)]\s|#{1,6}\s|[✓✔✗✘◻☐☑▢]\s)/;
+// A token too long to finish the row is cut at the very last column and picked
+// up at column 0 on the next one, whatever the paragraph's indent was — which is
+// exactly how a URL comes through:
+//
+//     (https://docs.google.com/spreadsheets/d/1I5Lii…UNfAUe8oObwbE/edit    <- col 80
+//   ?gid=1321488188).                                                     <- col 0
+//
+// So a column-0 row is still a continuation when the row above filled the pane
+// and the two halves join into one token. Without this the link stays in two
+// pieces and neither half is clickable.
+function _isTokenCut(prev,row,limit){
+  return prev.length>=limit&&_wrapGlue(prev,row,limit)==='';
+}
+function _isWrapContinuation(prev,row,limit){
+  if(!prev||!row)return false;
+  if(!prev.trim()||!row.trim())return false;
+  if(_isTableRow(prev)||_isTableRow(row))return false;
+  if(_BLOCK_START_RE.test(row))return false;
+  const pIndent=prev.length-prev.replace(/^\s+/,'').length;
+  const rIndent=row.length-row.replace(/^\s+/,'').length;
+  // back at column 0 — structure, not a wrap, unless a token was cut there
+  if(rIndent===0&&pIndent>0&&!_isTokenCut(prev,row,limit))return false;
+  if(rIndent>pIndent+6)return false;        // a deeper block of its own
+  const word=row.replace(/^\s+/,'').split(/\s/)[0]||'';
+  if(!word)return false;
+  // The row above has to have been nearly full for a wrap to be plausible at
+  // all, and the word below has to be one that would not have finished it. The
+  // 2-column slack absorbs the fact that `limit` is an estimate: the widest row
+  // we can see is a lower bound on where the CLI actually broke.
+  if(prev.length<limit-10)return false;
+  return (prev.length+1+word.length)>limit-2;
+}
+function _wrapGlue(prev,row,limit){
+  // A word wrap ate the space that was between the two halves; a token too long
+  // for one row was cut with no space at all. Only the second may be rejoined
+  // tight, and it is exactly the case that used to leave a URL split down the
+  // middle and therefore dead.
+  // A token is only ever cut when it fills the row to the very last column. One
+  // column short of that and the break was at a space, so the space goes back.
+  if(prev.length<limit)return ' ';
+  const tail=prev.slice(prev.lastIndexOf(' ')+1);
+  const head=row.replace(/^\s+/,'');
+  const CH=/[A-Za-z0-9\/._~:?#\[\]@!$&'()*+,;=%-]/;
+  if(!CH.test(tail.slice(-1))||!CH.test(head.charAt(0)))return ' ';
+  // Anything that ends in punctuation is a finished word, whatever else it looks
+  // like. "…cost me a cycle:" ends a clause; it is not half of a URL, and gluing
+  // it gave "cycle:the".
+  if(/[.,;:!?)\]}'"]$/.test(tail))return ' ';
+  // A path that already carries its extension, or ends at a directory slash, is
+  // finished too — what follows is the next word, not the rest of the token.
+  if((/\.[A-Za-z]{2,5}$/.test(tail)||tail.slice(-1)==='/')&&/^[A-Za-z]/.test(head))return ' ';
+  const looksCut=/:\/\//.test(tail)         // carries a scheme
+              || /^[~.]?\//.test(tail)      // is a path
+              || tail.indexOf('/')>=0       // has a path segment in it
+              || /@[A-Za-z0-9-]+$/.test(tail)
+              || tail.length>=22;           // one long unbroken token
+  return looksCut?'':' ';
+}
+// The wrap column is what the agent actually drew to, not what tmux says the
+// pane is — and it is not one number for the whole buffer. Inside a bordered box
+// (a quoted user message, a plan) the CLI wraps several columns narrower than it
+// does in open prose, so a single buffer-wide maximum makes every paragraph in
+// the box look "not full" and none of it gets rejoined. Estimate it locally.
+//
+// The window looks BACKWARDS only, and that is the whole point. A window that
+// also peeked ahead meant one new row at the bottom could change the estimate
+// for rows above it, re-join them differently, and shift the text under a reader
+// who was nowhere near the bottom. Looking only at what is already settled makes
+// the result append-only: everything above the new row is decided for good.
+const _WRAP_WINDOW=16;
+function _localWrapLimits(rs,paneWidth){
+  const n=rs.length,pw=Math.max(40,paneWidth||80),out=new Array(n);
+  for(let i=0;i<n;i++){
+    let w=0;
+    const lo=Math.max(0,i-_WRAP_WINDOW);
+    for(let j=lo;j<=i;j++)if(rs[j].length>w)w=rs[j].length;
+    out[i]=Math.min(Math.max(w,40),pw);
+  }
+  return out;
+}
+function _unwrapRows(lines,paneWidth){
+  const n=lines.length,rs=new Array(n);
+  for(let i=0;i<n;i++)rs[i]=lines[i].replace(/\s+$/,'');
+  const limits=_localWrapLimits(rs,paneWidth);
+  const out=[];
+  let cur=null,lastRow='',lastIdx=0;
+  for(let i=0;i<n;i++){
+    const row=rs[i],limit=limits[lastIdx];
+    if(cur!==null&&_isWrapContinuation(lastRow,row,limit)){
+      cur+=_wrapGlue(lastRow,row,limit)+row.replace(/^\s+/,'');
+      lastRow=row;lastIdx=i;
+      continue;
+    }
+    if(cur!==null)out.push(cur);
+    cur=row;lastRow=row;lastIdx=i;
+  }
+  if(cur!==null)out.push(cur);
+  return out;
+}
+// There is deliberately no global de-indent here. Stripping the pane's common
+// left margin looks tidier, but the common margin is a property of the WHOLE
+// buffer: one new line at column 0 arriving at the bottom re-indents every line
+// above it and the page jumps under the reader. The margin is two columns and
+// the CSS hanging indent handles the rest, so it stays.
+
+// ── Fitting the grid to the screen ──────────────────────────────────────────
+// Exact mode has to keep the terminal's character grid, so the only free
+// variable is the type size. Fit pane_width columns to the column that is
+// actually there: a phone stops needing to scroll sideways, and a wide desktop
+// stops rendering an 80-column ribbon down the middle of a 1400px window.
+let _termCharRatio=0;
+function _measureCharRatio(el){
+  if(_termCharRatio)return _termCharRatio;
+  const probe=document.createElement('span');
+  probe.style.cssText='position:absolute;visibility:hidden;white-space:pre;left:-9999px;top:0';
+  probe.textContent='0123456789'.repeat(10);
+  el.appendChild(probe);
+  const w=probe.getBoundingClientRect().width;
+  const fs=parseFloat(getComputedStyle(probe).fontSize)||13;
+  el.removeChild(probe);
+  if(w>0&&fs>0)_termCharRatio=(w/100)/fs;
+  return _termCharRatio||0.6;
+}
+function fitTerminalFont(el,paneWidth,flow){
+  if(flow){el.style.fontSize='';return}
+  const ratio=_measureCharRatio(el);
+  const cs=getComputedStyle(el);
+  const avail=el.clientWidth-(parseFloat(cs.paddingLeft)||0)-(parseFloat(cs.paddingRight)||0)-2;
+  if(avail<=0)return;
+  const cols=Math.max(20,paneWidth||80);
+  const size=Math.max(9,Math.min(15,avail/(cols*ratio)));
+  el.style.fontSize=size.toFixed(2)+'px';
+}
+
+// ── Painting: replace only the lines that changed ───────────────────────────
+// One <div class="tl"> per line, diffed by common prefix and common suffix. In
+// the normal case the agent appends at the tail, the prefix covers everything
+// above it, and not one node the reader is looking at is touched — so nothing
+// shifts, and a highlight in that region survives the update intact.
+function _lineDiff(prev,next){
+  const n=next.length,m=prev.length;
+  let p=0;
+  while(p<n&&p<m&&next[p]===prev[p])p++;
+  let s=0;
+  while(s<(n-p)&&s<(m-p)&&next[n-1-s]===prev[m-1-s])s++;
+  return {from:p,remove:(m-s)-p,insert:(n-s)-p};
+}
+function _applyLineDiff(el,d,next){
+  const kids=el.children;
+  const reuse=Math.min(d.remove,d.insert);
+  for(let k=0;k<reuse;k++){
+    const c=kids[d.from+k];
+    if(c)c.innerHTML=next[d.from+k]||'';
+  }
+  if(d.remove>d.insert){
+    for(let k=d.remove-1;k>=reuse;k--){
+      const c=kids[d.from+k];
+      if(c)el.removeChild(c);
+    }
+  }else if(d.insert>d.remove){
+    const before=kids[d.from+reuse]||null;
+    const frag=document.createDocumentFragment();
+    for(let k=reuse;k<d.insert;k++){
+      const div=document.createElement('div');
+      div.className='tl';
+      div.innerHTML=next[d.from+k]||'';
+      frag.appendChild(div);
+    }
+    el.insertBefore(frag,before);
+  }
+}
+function _setRawScroll(el,target){
+  const max=Math.max(0,el.scrollHeight-el.clientHeight);
+  target=Math.max(0,Math.min(target,max));
+  if(Math.abs(el.scrollTop-target)<1)return;
+  el.scrollTop=target;
+}
+// A very long scrollback is bounded, with hysteresis so the window does not
+// crawl forward a line at a time (which would repaint everything, every poll).
+const RAW_MAX_LINES=5000;
+
 function renderRawText(name,force){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
-  if(!force){
-    // Frozen: keep buffering into st.fullText and leave the screen alone. The
-    // agent is untouched — only the paint waits, and unfreezing shows the lot.
-    if(st.frozen){st._pendingRender=true;updateFreezeUi(name);return;}
-    // Part 4: don't clobber an active (or in-progress) text selection inside the
-    // terminal — defer so the user can highlight & copy while output streams.
-    if(_rawDragEl===rawEl||_hasSelectionWithin(rawEl)){st._pendingRender=true;return;}
+  // The live counter comes off FIRST, in both views. It changes every second,
+  // and everything below this line would otherwise re-run every second.
+  const split=splitLiveTail((st.fullText||'').split('\n'));
+  if(split.live.seen){
+    split.live.at=_nowMs();
+    st.live=split.live;
   }
-  const filtered=applyRawFilter(st.fullText);
-  const html=_linkifyTerminalText(filtered,st.paneWidth);
-  // tmux redraws its pane far more often than the pane's content actually
-  // changes, and every `innerHTML=` throws away the layout, the scroll anchor
-  // and any nascent selection. Writing identical HTML is the single biggest
-  // cause of the terminal "jumping" while you try to read it — so don't.
-  if(html===st.lastHtml&&!force){st._pendingRender=false;return;}
-  st.lastHtml=html;
-  st._pendingRender=false;
-  const wasAtBottom=!st.userScrolledUp;
-  const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
-  rawEl._programmaticScroll=true;
-  rawEl.innerHTML=html;
-  const target=wasAtBottom?rawEl.scrollHeight:Math.max(0,rawEl.scrollHeight-prevDistFromBottom);
-  rawEl._progExpect=target;
-  if(Math.abs(rawEl.scrollTop-target)>1)rawEl.scrollTop=target;
-  else rawEl._programmaticScroll=false;   // nothing moved, so no scroll event is coming
+  updateLiveBar(name);
+  // Frozen: keep buffering into st.fullText and leave the screen alone. The
+  // agent is untouched — only the paint waits, and unfreezing shows the lot.
+  if(!force&&st.frozen){st._pendingRender=true;updateFreezeUi(name);return;}
+
+  const flow=getCleanViewPref();
+  // A fresh element — switching session or tab rebuilds the whole detail panel —
+  // has none of our line divs in it, so whatever we last painted is gone with
+  // the old node. Drop the memo BEFORE the no-change short-circuit below, or the
+  // new element stays stuck on "Loading Codex…" until the text changes.
+  if(rawEl._lineMode!==true){rawEl.textContent='';rawEl._lineMode=true;st.painted=null;st._bodyText=null}
+  const bodyText=split.body.join('\n');
+  if(!force&&bodyText===st._bodyText&&flow===st._flowMode&&st.painted){st._pendingRender=false;return;}
+
+  let body=applyRawFilter(bodyText);
+  let rows=body?body.split('\n'):[];
+  if(flow){
+    rows=_unwrapRows(rows,st.paneWidth);
+    while(rows.length&&rows[rows.length-1].trim()==='')rows.pop();
+  }else{
+    // tmux pads every row out to the pane width. Those trailing spaces are
+    // invisible, but they count towards the line box and would wrap a row that
+    // otherwise fits exactly.
+    rows=rows.map(l=>l.replace(/\s+$/,''));
+  }
+  if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
+  let htmlLines;
+  if(!rows.length||!rows.join('').trim()){
+    htmlLines=(st.fullText||'').trim()
+      ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
+      : [];
+  }else{
+    // Linkified as one string so the exact-mode rejoining of URLs and paths
+    // split across rows still works; neither renderer ever emits a tag that
+    // straddles a newline, so splitting the result back per line is safe.
+    htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+  }
+
+  const prev=st.painted||[];
+  const d=_lineDiff(prev,htmlLines);
+  if(!d.remove&&!d.insert){
+    st.painted=htmlLines;st._bodyText=bodyText;st._flowMode=flow;st._pendingRender=false;
+    return;
+  }
+  // Hold the paint only if it would actually rip out what the reader is holding:
+  // a drag in progress here, or a selection that reaches into the lines about to
+  // be rewritten. A highlight further up is left alone and the update goes ahead.
+  if(!force&&(_rawDragEl===rawEl||_selectionBelow(rawEl,d.from))){st._pendingRender=true;return;}
+
+  rawEl.classList.toggle('flow',flow);
+  rawEl.classList.toggle('exact',!flow);
+  if(st._flowMode!==flow||rawEl._fitW!==rawEl.clientWidth||rawEl._fitPw!==st.paneWidth){
+    fitTerminalFont(rawEl,st.paneWidth,flow);
+    rawEl._fitW=rawEl.clientWidth;rawEl._fitPw=st.paneWidth;
+  }
+
+  const atBottom=!st.userScrolledUp;
+  const beforeH=rawEl.scrollHeight,beforeTop=rawEl.scrollTop;
+  const anchor=rawEl.children[d.from];
+  const anchorTop=anchor?anchor.offsetTop:beforeH;
+  _applyLineDiff(rawEl,d,htmlLines);
+  st.painted=htmlLines;st._bodyText=bodyText;st._flowMode=flow;st._pendingRender=false;
+  if(atBottom){
+    _setRawScroll(rawEl,rawEl.scrollHeight);
+  }else if(anchorTop<beforeTop){
+    // Something above the fold moved (a resync, or the scrollback cap trimming
+    // the head). Give the reader back the line they were on.
+    const delta=rawEl.scrollHeight-beforeH;
+    if(delta)_setRawScroll(rawEl,beforeTop+delta);
+  }
+  // Scrolled up and the change was at or below the top of the viewport: nothing
+  // the reader can see has moved, so scrollTop is not touched at all.
   updateFreezeUi(name);
 }
 function rerenderAllRaw(){
   // Called after the filter preference changes — re-render every cached buffer
   for(const n in rawState){
     if(rawState[n]&&rawState[n].fullText)renderRawText(n,true);
+  }
+}
+// The exact-mode type size is a function of the container width, so it has to be
+// recomputed when the window changes shape (rotating a phone, most of all).
+let _refitTimer=null;
+window.addEventListener('resize',function(){
+  clearTimeout(_refitTimer);
+  _refitTimer=setTimeout(function(){
+    if(!selectedSession)return;
+    const el=document.getElementById('raw-'+selectedSession);
+    if(!el)return;
+    const st=getRawState(selectedSession);
+    fitTerminalFont(el,st.paneWidth,getCleanViewPref());
+    el._fitW=el.clientWidth;el._fitPw=st.paneWidth;
+    if(!st.userScrolledUp)_setRawScroll(el,el.scrollHeight);
+  },180);
+});
+
+// ── Our own live indicator ──────────────────────────────────────────────────
+// Everything the CLIs animate into the pane is stripped upstream; this is what
+// replaces it. It sits outside the scroll area and updates by writing text into
+// three spans, so a second passing moves nothing in the transcript. The clock
+// runs locally off the last value we parsed, which is why it stays smooth even
+// though we no longer care how often the terminal redraws it.
+function _nowMs(){return (window.performance&&performance.now)?performance.now():new Date().getTime()}
+function _fmtElapsed(sec){
+  sec=Math.max(0,Math.floor(sec||0));
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
+  if(h)return h+'h '+String(m).padStart(2,'0')+'m';
+  if(m)return m+'m '+String(s).padStart(2,'0')+'s';
+  return s+'s';
+}
+function _sessionBusy(name){
+  const s=sessions.find(x=>x.name===name);
+  return !!(s&&s.activity_status==='busy');
+}
+function _liveSeconds(st,busy){
+  const live=st.live||{};
+  if(live.sec===null||live.sec===undefined)return null;
+  if(!busy||live.done)return live.sec;
+  return live.sec+Math.max(0,(_nowMs()-(live.at||_nowMs()))/1000);
+}
+let _liveTicker=null;
+function startLiveTicker(){
+  if(_liveTicker)return;
+  _liveTicker=setInterval(function(){
+    if(!selectedSession)return;
+    const st=rawState[selectedSession];
+    if(!st||!st.live||!st.live.seen||st.live.done||!_sessionBusy(selectedSession))return;
+    const e=document.getElementById('tl-time-'+selectedSession);
+    const secs=_liveSeconds(st,true);
+    if(e&&secs!==null)e.textContent=_fmtElapsed(secs);
+  },1000);
+}
+function updateLiveBar(name){
+  const bar=document.getElementById('term-live-'+name);
+  if(!bar)return;
+  startLiveTicker();
+  const st=getRawState(name);
+  const live=st.live||{};
+  const busy=_sessionBusy(name);
+  const show=busy||!!live.seen;
+  bar.classList.toggle('on',show);
+  if(!show)return;
+  bar.classList.toggle('idle',!busy);
+  const set=function(id,txt){
+    const e=document.getElementById(id+name);
+    if(e&&e.textContent!==txt)e.textContent=txt;
+  };
+  // The verb is the CLI's whimsical spinner word ("Working", "Cogitated") and it
+  // only means anything while the turn is running. Once it is over the useful
+  // fact is how long the turn took, not what it was called.
+  const verb=(live.verb||'').replace(/[.…]+$/,'');
+  set('tl-verb-',busy?(verb||'Working'):'Idle');
+  const secs=_liveSeconds(st,busy);
+  set('tl-time-',secs===null?'':((busy&&!live.done)?'':'last turn ')+_fmtElapsed(secs));
+  set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
+  const note=document.getElementById('tl-note-'+name);
+  if(note){
+    // Codex's own note first ("1 background terminal running") — it is the only
+    // place a still-running shell is ever mentioned.
+    const txt=busy?(live.note||(live.esc?'Stop to interrupt':'')):'';
+    if(note.textContent!==txt)note.textContent=txt;
   }
 }
 
@@ -20198,6 +20800,17 @@ function renderDetail(){
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
+      <!-- The spinner, the seconds counter and the token tally the CLI paints
+           into the pane are cut out of the transcript and redrawn here, outside
+           the scroll area, off a clock that ticks locally. See updateLiveBar. -->
+      <div class="term-live" id="term-live-${s.name}">
+        <span class="tl-dots"><i></i><i></i><i></i></span>
+        <span class="tl-verb" id="tl-verb-${s.name}"></span>
+        <span class="tl-time" id="tl-time-${s.name}"></span>
+        <span class="tl-tok" id="tl-tok-${s.name}"></span>
+        <span class="tl-spacer"></span>
+        <span class="tl-note" id="tl-note-${s.name}"></span>
+      </div>
       <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
            which is collapsed by default, so the frozen state needs to announce
            itself (and undo itself) from on top of the terminal. -->
@@ -20366,7 +20979,7 @@ function renderDetail(){
         const st=getRawState(s.name);
         st.fullText=cached.text;
         st.userScrolledUp=false;
-        st.lastHtml=null;
+        st.painted=null;st._bodyText=null;
         if(st.frozen)st.frozenAtLines=(st.fullText||'').split('\n').length;
         renderRawText(s.name,true);
         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
@@ -20945,26 +21558,16 @@ document.addEventListener('visibilitychange',()=>{
 function _ensureRawScrollTracking(rawEl,st){
   if(rawEl._scrollTracked)return;
   rawEl._scrollTracked=true;
-  // Single `scroll` listener catches wheel, touch, scrollbar drag, and keyboard
-  // navigation. Programmatic scrolls flip `_programmaticScroll` so they don't
-  // get misclassified as user scrolls.
+  // Follow-the-tail is decided by WHERE the pane is, never by who scrolled it.
+  // The old code tried to tell our own scrolls from the reader's with a flag and
+  // an expected position, and any scroll that arrived in the window between a
+  // paint and its scroll event was thrown away as ours — so a flick of the wheel
+  // during an update did nothing and the view snapped back to the bottom.
+  // Position cannot lie: at the bottom means follow, anywhere else means hold
+  // still. Our own scroll-to-bottom lands at the bottom and re-arms follow by
+  // itself; our own compensation lands away from it and does not.
   rawEl.addEventListener('scroll',()=>{
-    if(rawEl._programmaticScroll){
-      // One render can emit TWO scroll events: the browser clamping scrollTop to
-      // the new scrollHeight, then our own assignment. Clearing the flag on the
-      // first one made the second read as a user scroll and pinned the view
-      // away from the tail. Clear it only on the event that lands where we
-      // aimed; anything else is still ours to ignore.
-      if(rawEl._progExpect===undefined||Math.abs(rawEl.scrollTop-rawEl._progExpect)<2){
-        rawEl._programmaticScroll=false;
-        // Programmatic scroll-to-bottom keeps the "follow-tail" mode on
-        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<10;
-        if(atBottom)st.userScrolledUp=false;
-      }
-      return;
-    }
-    const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<24;
-    st.userScrolledUp=!atBottom;
+    st.userScrolledUp=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)>24;
   },{passive:true});
 }
 
@@ -21025,13 +21628,15 @@ async function loadRaw(name){
   st.visibleHash='';
   st.firstLoad=true;
   st.fullText='';
-  st.lastHtml=null;
+  st.painted=null;st._bodyText=null;st.live=null;
   // Reload is an explicit "show me the terminal as it is now", which is the
   // opposite of a freeze — so it lifts one.
   st.frozen=false;st.frozenAtLines=0;
   updateFreezeUi(name);
   const rawEl=document.getElementById('raw-'+name);
-  if(rawEl)rawEl.textContent='Loading Codex...';
+  // Wiping to a text node takes the line elements with it — tell the renderer to
+  // rebuild rather than diff against lines that no longer exist.
+  if(rawEl){rawEl.textContent='Loading Codex...';rawEl._lineMode=false}
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
   stopRawPolling(name);
@@ -21078,6 +21683,8 @@ function updateCard(s){
   if(tsNotes)tsNotes.textContent=timeAgo(s.notes_at);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
   updateStatusPill(s.name,s.activity_status,s.activity_detail);
+  // Busy/idle drives the live strip's dots and whether its clock is running.
+  updateLiveBar(s.name);
 
   // Update typing indicator
   const chatEl=document.getElementById('chat-'+s.name);
