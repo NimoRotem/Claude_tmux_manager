@@ -148,6 +148,18 @@ def test_prose_that_merely_mentions_seconds_is_not_a_status_row():
     assert out["live"]["sec"] == 3
 
 
+def test_a_status_row_caught_mid_repaint_is_still_chrome():
+    # tmux captures the frame while Codex is painting it, so the verb and the
+    # clock come out shredded. The tail it hangs off the ` · ` survives, and
+    # prose never writes that.
+    torn = "◦ Workingli4es00ctrl + t to view tran · 1 background terminal running · /ps to view"
+    out = _run("• a real reply\n" + torn)
+    assert not any("background terminal running" in l for l in out["body"]), out["body"]
+    # ...while prose that merely mentions the same words stays.
+    keep = _run("• The background terminal running the build is still alive.")
+    assert len(keep["body"]) == 1
+
+
 def test_completion_rule_becomes_the_idle_reading():
     out = _run("• done\n─ Worked for 50m 51s ────────────────────")
     assert out["live"]["done"] is True
