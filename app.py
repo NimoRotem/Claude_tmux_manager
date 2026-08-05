@@ -19374,7 +19374,12 @@ const _LIVE_HEAD_RE=/^ {0,6}([✻✽✢✳✴✱✲✵✶✷✸✹✺✧✦·⠋
 // command…"), and alternates it with ◦ as the spinner frame. A bullet therefore
 // only counts as status on the tighter shape — one verb word and then a timer in
 // parentheses, or an explicit interrupt hint. Ordinary prose never does that.
-const _LIVE_BULLET_RE=/^ {0,6}[•◦][ \t]+(\S+[ \t]*\(\s*\d+\s*[hms]\b.*|\S.*\besc to interrupt\b.*)$/i;
+// The third alternative catches a status row whose timer was overwritten by a
+// partial redraw — tmux captures the frame mid-paint and what lands in the
+// scrollback is "◦ Workingli4es00ctrl + t to view tran · 1 background terminal
+// running · /ps to view". The verb and the clock are gone, but the tail Codex
+// hangs off the ` · ` is unmistakable, and prose never writes it.
+const _LIVE_BULLET_RE=/^ {0,6}[•◦][ \t]+(\S+[ \t]*\(\s*\d+\s*[hms]\b.*|\S.*\besc to interrupt\b.*|\S.*[·•]\s*(?:\d+\s+background terminals?\s+running|\/ps to view|\/stop to close).*)$/i;
 const _LIVE_EVID_RE=/\(\s*\d+\s*[hms]\b|\bfor\s+\d+\s*[hms]\b|\besc to interrupt\b|\btokens?\b|\bthought for\b|…\s*\(/i;
 const _LIVE_VERB_RE=/^([A-Za-z][A-Za-zÀ-ÿ'’-]{1,24})/;   // accents count: "Sautéing…" is one word
 const _LIVE_TIME_RE=/(?:^|[\s(·•])(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(\d+)\s*s\b/;
