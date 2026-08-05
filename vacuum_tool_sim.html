@@ -1,0 +1,1858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vacuum lifter: component map and firmware simulation</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --line:#e5e7eb; --line2:#d1d5db;
+    --ink:#111827; --muted:#6b7280; --faint:#9ca3af;
+    --accent:#2563eb; --accent-soft:#eff6ff;
+    --warn:#d97706; --bad:#dc2626; --ok:#059669;
+    --lcd:#0f172a; --lcd-off:#232b3a; --lcd-on:#ff4436;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  h1{font-size:18px;margin:0;font-weight:650;letter-spacing:-.2px}
+  h2{font-size:12px;margin:0 0 12px;font-weight:650;text-transform:uppercase;
+     letter-spacing:.07em;color:var(--muted)}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px;
+         display:flex;align-items:center;gap:18px;flex-wrap:wrap;position:sticky;top:0;z-index:20}
+  header .sub{color:var(--muted);font-size:12.5px}
+  .grow{flex:1}
+  .wrap{padding:20px;display:grid;gap:16px;align-items:start;
+        grid-template-columns:1fr 1fr 1fr}
+  .card.tool{grid-column:1/3;grid-row:1}
+  .card.map {grid-column:3;  grid-row:1}
+  .card.tl  {grid-column:1/3;grid-row:2}
+  .card.state{grid-column:3; grid-row:2}
+  @media(max-width:1180px){
+    .wrap{grid-template-columns:1fr}
+    .card.tool,.card.map,.card.tl,.card.state{grid-column:1;grid-row:auto}
+  }
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card.span{grid-column:1/-1}
+
+  /* ---- controls ---- */
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line2);
+         background:#fff;color:var(--ink);padding:7px 12px;transition:.12s}
+  button:hover{border-color:var(--faint);background:#fafafa}
+  button:active{transform:translateY(1px)}
+  button.pri{background:var(--ink);border-color:var(--ink);color:#fff}
+  button.pri:hover{background:#000}
+  button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.4;cursor:default}
+  button:disabled:hover{border-color:var(--line2);background:#fff}
+  .seg{display:inline-flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+  .seg button{border:0;border-radius:0;padding:6px 11px;font-size:13px}
+  .seg button+button{border-left:1px solid var(--line2)}
+  .seg button.on{background:var(--accent);color:#fff}
+  label.row{display:flex;align-items:center;gap:8px;margin:9px 0;font-size:13px}
+  label.row span.k{color:var(--muted);min-width:104px}
+  input[type=range]{flex:1;accent-color:var(--accent)}
+  select{font:inherit;padding:6px 8px;border-radius:8px;border:1px solid var(--line2);background:#fff}
+
+  /* ---- tool sketch ---- */
+  #tool{background:linear-gradient(180deg,#fbfcfd 0%,#f1f3f6 100%);
+        border:1px solid var(--line);border-radius:12px;width:100%}
+  #tool .btn{cursor:pointer}
+  #tool text{user-select:none}
+  .toolcap{margin-top:10px;font-size:12.5px;color:var(--muted);text-align:center;min-height:20px}
+  .toolcap b{color:var(--ink)}
+  .fwrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .fwrow select{flex:1;min-width:160px}
+  .fwsum{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:10px;
+         font-size:12px;color:var(--muted)}
+  .fwsum b{color:var(--ink);font-weight:600}
+  button.lnk{border:0;background:none;color:var(--accent);padding:2px 6px;font-size:14px;
+             line-height:1;font-weight:700}
+  button.lnk:hover{background:var(--accent-soft)}
+  table.fwtbl{margin-top:8px}
+  table.fwtbl td.k{font-family:var(--mono);font-size:11px}
+  .toolctl{display:flex;gap:8px;margin-top:10px}
+  .toolctl button{flex:1;font-size:12.5px;padding:7px 4px}
+  .hint{color:var(--muted);font-size:12px;text-align:center;margin-top:10px}
+
+  /* ---- state readouts ---- */
+  table.st{width:100%;border-collapse:collapse;font-size:12.5px}
+  table.st td{padding:3px 0;vertical-align:top}
+  table.st td.k{color:var(--muted);white-space:nowrap;padding-right:10px}
+  table.st td.v{font-family:var(--mono);text-align:right;white-space:nowrap}
+  .pill{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+        font-family:var(--mono);background:#f3f4f6;color:var(--muted)}
+  .pill.a{background:var(--accent-soft);color:var(--accent)}
+  .pill.w{background:#fffbeb;color:var(--warn)}
+  .pill.b{background:#fef2f2;color:var(--bad)}
+  .pill.g{background:#ecfdf5;color:var(--ok)}
+  .bar{height:6px;border-radius:4px;background:#f3f4f6;overflow:hidden;margin-top:3px}
+  .bar i{display:block;height:100%;background:var(--accent);width:0}
+  .bar.w i{background:var(--warn)}
+
+  /* ---- log ---- */
+  #log{font-family:var(--mono);font-size:11.5px;height:190px;overflow-y:auto;
+       border:1px solid var(--line);border-radius:8px;padding:8px;background:#fcfcfd}
+  #log div{padding:1px 0;border-bottom:1px solid #f4f4f5;display:flex;gap:8px}
+  #log div:last-child{border:0}
+  #log .t{color:var(--faint);flex:none;width:52px}
+  #log .m{flex:1}
+  #log .fw{color:var(--accent)}
+  #log .cut{color:var(--bad)}
+  #log .warn{color:var(--warn)}
+
+  .note{font-size:12px;color:var(--muted);margin-top:10px;padding-top:10px;
+        border-top:1px solid var(--line)}
+  .note code{background:#f3f4f6;padding:1px 4px;border-radius:4px;font-size:11px}
+  .scen{display:flex;flex-wrap:wrap;gap:7px}
+  .scen button{font-size:12.5px;padding:6px 10px}
+  svg{display:block;max-width:100%}
+  .wire{stroke:var(--line2);stroke-width:1.5;fill:none}
+  .wire.hot{stroke:var(--accent);stroke-width:2.2}
+  .node rect{fill:#fff;stroke:var(--line2);stroke-width:1.2}
+  .node.hot rect{fill:var(--accent-soft);stroke:var(--accent)}
+  .node text.nm{font-size:10.5px;font-weight:600;fill:var(--ink)}
+  .node.hot text.nm{fill:var(--accent)}
+  .node text.pin{font-size:9px;fill:var(--faint);font-family:var(--mono)}
+  .node text.val{font-size:9.5px;fill:var(--muted);font-family:var(--mono)}
+  .node.hot text.val{fill:var(--accent)}
+  .mcu rect{fill:#111827;stroke:#111827}
+  .mcu text{fill:#fff}
+  .lbl{font-size:9.5px;fill:var(--faint);text-transform:uppercase;letter-spacing:.06em}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1 data-i18n="app.title"></h1>
+    <div class="sub" data-i18n="app.sub"></div>
+  </div>
+  <div class="grow"></div>
+  <div class="seg" id="langSeg">
+    <button data-lang="cn" class="on">中文</button>
+    <button data-lang="en">EN</button>
+  </div>
+  <div class="seg" id="spdSeg">
+    <button data-spd="0" data-i18n="ui.pause"></button>
+    <button data-spd="0.25">0.25&times;</button>
+    <button data-spd="1" class="on">1&times;</button>
+    <button data-spd="4">4&times;</button>
+  </div>
+  <button id="stepBtn" data-i18n="ui.step"></button>
+  <button id="resetBtn" class="pri" data-i18n="ui.reset"></button>
+</header>
+
+<div class="wrap">
+
+  <!-- ============ TOOL ============ -->
+  <div class="card tool">
+    <h2><span data-i18n="fw.title"></span> <span class="pill" data-i18n="fw.pill"></span></h2>
+    <div class="fwrow">
+      <select id="fwSel"></select>
+      <button id="fwFileBtn" data-i18n="fw.upload"></button>
+      <button id="fwDirBtn" data-i18n="fw.uploadDir"></button>
+      <input type="file" id="fwFiles" multiple accept=".c,.h,.txt,.zip" hidden>
+      <input type="file" id="fwDir" webkitdirectory directory hidden>
+    </div>
+    <div id="fwInfo"></div>
+    <div class="note" data-i18n="fw.help"></div>
+
+    <h2 style="margin-top:18px"><span data-i18n="tool.title"></span> <span class="pill" data-i18n="tool.pill"></span></h2>
+    <svg id="tool" viewBox="0 74 560 322"></svg>
+    <div class="toolcap" id="toolCap"></div>
+    <div class="toolctl">
+      <button id="padBtn"></button>
+      <button id="padNudgeBtn" disabled data-i18n="ui.nudge"></button>
+      <button id="liftBtn" disabled></button>
+    </div>
+    <div class="hint" data-i18n="tool.hint"></div>
+
+    <h2 style="margin-top:18px"><span data-i18n="surface.title"></span> <span class="pill" data-i18n="surface.pill"></span></h2>
+    <label class="row"><span class="k" data-i18n="surf.label"></span>
+      <select id="surface"></select>
+    </label>
+    <label class="row"><span class="k" data-i18n="ui.noise"></span>
+      <input type="range" id="noise" min="0" max="3" step="1" value="0">
+      <span class="v" id="noiseV" style="font-family:var(--mono);width:44px;text-align:right">0</span>
+    </label>
+    <label class="row" data-i18n-title="ui.stallBandTip"><span class="k" data-i18n="ui.stallBand"></span>
+      <input type="range" id="stallDelta" min="1" max="10" step="1" value="3">
+      <span class="v" id="stallDeltaV" style="font-family:var(--mono);width:44px;text-align:right">3</span>
+    </label>
+    <label class="row"><span class="k" data-i18n="ui.battery"></span>
+      <input type="range" id="bat" min="50" max="84" step="1" value="80">
+      <span class="v" id="batV" style="font-family:var(--mono);width:44px;text-align:right">80</span>
+    </label>
+    <label class="row"><span class="k" data-i18n="ui.usb"></span>
+      <input type="checkbox" id="usb"> <span style="color:var(--muted);font-size:12px">USB_IN PB5</span>
+    </label>
+
+    <div class="note" data-i18n="tool.note"></div>
+  </div>
+
+  <!-- ============ STATE ============ -->
+  <div class="card state">
+    <h2 data-i18n="state.title"></h2>
+    <table class="st" id="stTbl"></table>
+    <h2 style="margin-top:16px" data-i18n="scen.title"></h2>
+    <div class="scen" id="scen"></div>
+    <div class="note" id="scenNote"></div>
+  </div>
+
+  <!-- ============ MAP ============ -->
+  <div class="card map">
+    <h2><span data-i18n="map.title"></span> <span class="pill" data-i18n="map.pill"></span></h2>
+    <svg id="map" viewBox="0 0 566 470"></svg>
+    <div class="note" data-i18n="map.note"></div>
+  </div>
+
+  <!-- ============ TIMELINE + LOG ============ -->
+  <div class="card tl">
+    <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+      <div style="flex:2;min-width:340px">
+        <h2 data-i18n="chart.title"></h2>
+        <svg id="chart" viewBox="0 0 900 220"></svg>
+      </div>
+      <div style="flex:1;min-width:290px">
+        <h2 data-i18n="log.title"></h2>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* =====================================================================
+   0. LANGUAGE.  Chinese is the default; ?lang=en or the toggle switches.
+   Log lines are stored as key + args, not as finished text, so switching
+   language re-renders the whole history rather than leaving it mixed.
+   ===================================================================== */
+let lang = "cn";
+const I18N = {
+en: {
+  "app.title":"Vacuum lifter: component map + firmware simulation",
+  "app.sub":"CH32L103 / <span class=\"pill\">PRO_LITE</span>. The logic below is ported tick-for-tick from <code>Key.c</code>, <code>Working_run.c</code>, <code>Show.c</code>, <code>Init.c</code>.",
+  "ui.pause":"pause", "ui.step":"step 1 tick", "ui.reset":"power-off reset",
+  "tool.title":"The tool", "tool.pill":"interactive sketch",
+  "tool.hint":"Press the buttons <b>on the tool</b>. Hold POWER 2&nbsp;s to boot, tap PUMP to run it, <b>hold PUMP 3&nbsp;s with no pressure to power off</b>, two taps on RELEASE vent for 10&nbsp;s.",
+  "tool.note":"The tool stays where you put it. Setting it down squeezes air out of the pad and gives the brief pressure rise the auto-start looks for; \"press down again\" does the same on a pad that is already holding vacuum. Lifting needs at least <b>20&nbsp;kg</b> of grip or the pad just comes away, and if the reading falls below that while carrying, the load drops.",
+  "fw.title":"Firmware", "fw.pill":"switch or upload",
+  "fw.version":"Version", "fw.upload":"upload files", "fw.uploadDir":"upload a folder",
+  "fw.detail":"Constants read from the selected version. Values that differ from the built-in v3 are highlighted.",
+  "fw.help":"Upload a firmware folder or its <code>.c</code> / <code>.h</code> files (a <code>.zip</code> works too). The page reads every <code>NIMO_*</code> constant and detects which auto-start and cut-off the code implements, then runs the simulation with them. It simulates the <b>parameters and structure</b> it can read from the source, not a compiled binary.",
+  "fw.autostart":"auto-start", "fw.stall":"no-seal cut-off",
+  "fw.riseAlone":"rise alone (v3)", "fw.armThenRise":"arm low, then rise (v2)",
+  "fw.present":"present", "fw.absent":"absent", "fw.files":"%s file(s)",
+  "surface.title":"Surface and sensor", "surface.pill":"model, not firmware",
+  "surf.label":"Surface", "surf.none":"open air / cannot seal",
+  "surf.good":"good seal", "surf.leaky":"leaky seal (holds ~45)",
+  "ui.noise":"Sensor noise", "ui.stallBand":"Stall band",
+  "ui.stallBandTip":"NIMO_STALL_DELTA: how wide 'not changing' is. Raise it until the cut-off still fires at your real sensor noise.",
+  "ui.battery":"Battery (ADC)", "ui.usb":"USB plugged",
+  "ui.place":"place on surface", "ui.takeOff":"take off the surface",
+  "ui.nudge":"press down again", "ui.lift":"lift the tool", "ui.setDown":"set it down",
+  "state.title":"Firmware state", "scen.title":"Scenarios",
+  "scen.note":"Each scenario resets the tool and drives the buttons for you.",
+  "map.title":"Component map", "map.pill":"live",
+  "map.note":"Pin assignments read from <code>Init.h</code> / <code>Init.c</code>. Inputs on the left, outputs on the right. A node turns blue when its signal is asserted. <code>KEY_MOT</code> is active high; <code>KEY_YV</code> and <code>SW_IN</code> are pull-ups, so pressed reads 0.",
+  "chart.title":"Pressure and outputs", "log.title":"Event log",
+  "map.inputs":"inputs", "map.mcu":"MCU", "map.outputs":"outputs",
+  "map.pneu":"pneumatics (modelled)",
+  "map.powerBtn":"power button", "map.pumpBtn":"pump button", "map.relBtn":"release button",
+  "map.sensor":"pressure sensor", "map.batSense":"battery sense", "map.usbDet":"USB detect",
+  "map.chgFlag":"charge flag", "map.motor":"pump motor", "map.valve":"solenoid valve",
+  "map.display":"display", "map.rail":"logic rail", "map.mosfet":"battery MOSFET",
+  "map.pump":"pump", "map.solenoid":"solenoid", "map.pad":"pad", "map.vacuum":"vacuum",
+  "tool.material":"material", "tool.lifted":"lifted", "tool.valve":"VALVE",
+  "map.running":"running", "map.off":"off", "map.open":"open", "map.shut":"shut",
+  "map.onSurface":"on surface", "map.free":"free",
+  "map.active":"active", "map.idle":"idle",
+  "st.phase":"phase", "st.clock":"clock", "st.ticks":"ticks",
+  "st.boot":"<b>boot</b> (Init.c)", "st.ringFrame":"ring frame",
+  "st.pump":"<b>pump</b> (Key.c)", "st.latch":"latch KEY_MOT_Value_1",
+  "st.startedBy":"started by", "st.motOut":"MOT output PA5",
+  "st.riseWindow":"rise window", "st.noSealTimer":"no-seal timer",
+  "st.band":"band low/high", "st.pumpHeld":"PUMP held",
+  "st.low20":"20 s low counter", "st.postMax":"post-max run-on",
+  "st.release":"<b>release</b> (Key.c)", "st.firstPress":"1st press armed",
+  "st.relActive":"release active", "st.yvOut":"YV output PA7",
+  "st.display":"<b>display</b> (Show.c)", "st.reading":"reading VSEN",
+  "st.logoMode":"logo mode", "st.presAlarm":"pressure alarm", "st.errBlink":"Err blink",
+  "st.shown":"shown %s", "st.left":"<b>%s s</b> left", "st.of":"%s / %s",
+  "v.running":"running", "v.booting":"booting", "v.shuttingDown":"shutting down",
+  "v.off":"off", "v.on":"on", "v.energized":"energized", "v.open":"open", "v.shut":"shut",
+  "v.no":"no", "v.yes":"yes", "v.reset":"reset", "v.na":"n/a", "v.dash":"--",
+  "v.autostart":"auto-start", "v.hand":"hand", "v.disarmedSealed":"disarmed, sealed",
+  "v.idle":"idle", "v.blinking":"blinking", "v.err":"Err",
+  "v.followAlarm":"follow alarm", "v.steady":"steady",
+  "v.fastBlink":"fast blink", "v.slowBlink":"slow blink",
+  "v.armedFor":"yes, %s s left", "v.sOf10":"%s s of 10",
+  "cap.off":"<b>Off.</b> Hold POWER on the tool for 2 s.",
+  "cap.boot":"<b>Booting.</b> Ring at frame %s of 10.",
+  "cap.shutdown":"<b>Powering off.</b>",
+  "cap.carrying":"<b>Carrying the load</b> at %s kg.",
+  "cap.inAir":"<b>In the air</b>, nothing gripped.",
+  "cap.onSurface":"<b>On the surface</b> (%s), %s kg%s",
+  "cap.pumpRunning":", pump running",
+  "cap.offSurface":"<b>Off the surface.</b> Place it down to start.",
+  "chart.window":"%s s window &middot; reading vs 135 max",
+  "reason.shutdown":"shutdown complete", "reason.bootCancel":"boot cancelled",
+  "log.railOff":"power rail off, waiting for SW_IN",
+  "log.railOffCleared":"power rail off (%s), MCU state cleared",
+  "log.padPlaced":"pad placed on surface (%s)",
+  "log.padLifted":"pad lifted off the surface",
+  "log.padNudge":"pad pressed down again",
+  "log.lifted":"lifted, carrying the load at %s kg",
+  "log.liftNoGrip":"lifted with only %s kg of grip: the pad came away",
+  "log.setDown":"set back down on the surface",
+  "log.gripLost":"GRIP LOST at %s kg: the load dropped",
+  "log.relWindowExpired":"release: 2 s window expired, first press forgotten",
+  "log.relSolenoidEnd":"release: 10 s solenoid window ended",
+  "log.relConfirmed":"release CONFIRMED: pump off, solenoid open 10 s",
+  "log.relArmed":"release: 1st press armed (needs 2nd within 2 s)",
+  "log.errBlink":"PUMP held 3 s with pressure: Err blink",
+  "log.pwrOffHold":"PUMP held 3 s idle: power off",
+  "log.pumpToggle":"PUMP button: pump latch %s (by hand)",
+  "log.low20s":"20 s below 10: pump latch cleared (pre-existing rule)",
+  "log.autostart":"AUTO-START: rise of %s over 100 ms at reading %s",
+  "log.v2armed":"v2: armed (reading held below 1 for 100 ms)",
+  "log.autostartV2":"AUTO-START (v2): rise after the low arming step",
+  "log.noSealCut":"NO-SEAL CUT-OFF: 3.00 s without a change, pump off",
+  "log.postMax":"max pressure: 0.5 s run-on done, pump off",
+  "log.idle5min":"5 minutes idle: power off",
+  "log.swinPressed":"SW_IN pressed: LDO latched on, loading ring starts",
+  "log.bootDone":"2 s hold complete: boot finished, main loop running",
+  "log.bootCancel":"released early: ring reversed to off, boot cancelled",
+  "log.fwSwitched":"firmware switched to %s",
+  "log.scenario":"scenario: %s",
+  "log.fwLoaded":"loaded firmware \"%s\" from %s file(s)",
+  "log.fwParseFail":"no NIMO_ constants found in those files, nothing loaded",
+  "sc.0.n":"Boot: hold POWER 2 s",
+  "sc.0.d":"Fills the ten perimeter segments clockwise, then the main loop starts.",
+  "sc.1.n":"Boot cancelled at 1 s",
+  "sc.1.d":"Ring fills half way, then reverses back to off when you let go early.",
+  "sc.2.n":"Auto-start, good seal to 135",
+  "sc.2.d":"A rise starts the pump, vacuum builds, 0.5 s run-on at max.",
+  "sc.3.n":"No-seal cut-off after 3 s",
+  "sc.3.d":"Auto-starts on the rise, then gives up because nothing changes.",
+  "sc.4.n":"v2 vs v3 from residual vacuum",
+  "sc.4.d":"Pump stopped while sealed, then the pad is pressed again. v3 restarts, v2 cannot.",
+  "sc.5.n":"Release: single press does nothing",
+  "sc.5.d":"One press only arms. The solenoid stays shut.",
+  "sc.6.n":"Release: double press vents 10 s",
+  "sc.6.d":"Two presses under 2 s apart cancel the pump and latch the valve open.",
+  "sc.7.n":"Power off: hold PUMP 3 s",
+  "sc.7.d":"With no pressure, a 3 s hold on PUMP writes OFF on the display, then drops the rail.",
+  "sc.8.n":"Quick tap on POWER does nothing",
+  "sc.8.d":"A short tap must reverse and cancel, never boot.",
+  "sc.9.n":"Off then on again",
+  "sc.9.d":"Boot, power off with a 3 s PUMP hold, then boot again. It has to come back on and stay on.",
+  "sc.10.n":"Place, grip, lift and carry",
+  "sc.10.d":"The whole working cycle: set down, auto-start, vacuum builds, lift the load.",
+  "sc.11.n":"Lift too early, no grip",
+  "sc.11.d":"Lifting before the vacuum reaches 20 kg: the pad just comes away.",
+  "sc.12.n":"Carry, then vent to release",
+  "sc.12.d":"Lift the load, then two taps on RELEASE open the valve and it drops.",
+  "sc.13.n":"Leaky seal loses the load",
+  "sc.13.d":"A leaky pad holds ~45 kg, so once the pump stops the grip decays until it drops."
+},
+cn: {
+  "app.title":"真空吸盘吊具：元件图 + 固件仿真",
+  "app.sub":"CH32L103 / <span class=\"pill\">PRO_LITE</span>。下面的逻辑逐个时钟节拍移植自 <code>Key.c</code>、<code>Working_run.c</code>、<code>Show.c</code>、<code>Init.c</code>。",
+  "ui.pause":"暂停", "ui.step":"单步 1 拍", "ui.reset":"断电复位",
+  "tool.title":"工具", "tool.pill":"可交互示意图",
+  "tool.hint":"直接点按<b>工具上的按键</b>。长按 POWER 2&nbsp;秒开机；轻按 PUMP 启动或停止泵；<b>无气压时长按 PUMP 3&nbsp;秒关机</b>；连按两次 RELEASE 放气 10&nbsp;秒。",
+  "tool.note":"工具会停在你放置的位置。放下时会挤出吸盘内的空气，产生自动启动所需的短暂气压上升；“再次按压”对已经吸住的吸盘也是同样效果。抬起至少需要 <b>20&nbsp;kg</b> 吸力，否则吸盘会直接脱落；搬运过程中读数低于该值，负载就会掉落。",
+  "fw.title":"固件", "fw.pill":"切换或上传",
+  "fw.version":"版本", "fw.upload":"上传文件", "fw.uploadDir":"上传文件夹",
+  "fw.detail":"以下常量取自所选版本。与内置 v3 不同的数值会高亮显示。",
+  "fw.help":"上传固件文件夹或其中的 <code>.c</code> / <code>.h</code> 文件（<code>.zip</code> 也可以）。本页会读取全部 <code>NIMO_*</code> 常量，并识别代码实现的自动启动方式与停机保护，然后按这些参数运行仿真。它仿真的是能从源码中读出的<b>参数与结构</b>，不是编译后的二进制。",
+  "fw.autostart":"自动启动", "fw.stall":"未密封停机",
+  "fw.riseAlone":"仅凭上升（v3）", "fw.armThenRise":"先低值预备再上升（v2）",
+  "fw.present":"有", "fw.absent":"无", "fw.files":"%s 个文件",
+  "surface.title":"表面与传感器", "surface.pill":"模型，非固件",
+  "surf.label":"表面", "surf.none":"敞开空气／无法密封",
+  "surf.good":"良好密封", "surf.leaky":"漏气密封（约 45）",
+  "ui.noise":"传感器噪声", "ui.stallBand":"停机判定带宽",
+  "ui.stallBandTip":"NIMO_STALL_DELTA：“无变化”的判定宽度。按实际传感器噪声调大，直到停机保护仍能触发。",
+  "ui.battery":"电池（ADC）", "ui.usb":"已插 USB",
+  "ui.place":"放到表面上", "ui.takeOff":"从表面拿起",
+  "ui.nudge":"再次按压", "ui.lift":"抬起工具", "ui.setDown":"放下工具",
+  "state.title":"固件状态", "scen.title":"演示场景",
+  "scen.note":"每个场景都会复位工具，并自动替你操作按键。",
+  "map.title":"元件图", "map.pill":"实时",
+  "map.note":"引脚分配取自 <code>Init.h</code> / <code>Init.c</code>。左侧为输入，右侧为输出。信号有效时节点变蓝。<code>KEY_MOT</code> 为高电平有效；<code>KEY_YV</code> 与 <code>SW_IN</code> 带上拉，按下读 0。",
+  "chart.title":"气压与输出", "log.title":"事件日志",
+  "map.inputs":"输入", "map.mcu":"单片机", "map.outputs":"输出",
+  "map.pneu":"气路（模型）",
+  "map.powerBtn":"电源键", "map.pumpBtn":"泵键", "map.relBtn":"释放键",
+  "map.sensor":"气压传感器", "map.batSense":"电池检测", "map.usbDet":"USB 检测",
+  "map.chgFlag":"充电标志", "map.motor":"泵电机", "map.valve":"电磁阀",
+  "map.display":"显示屏", "map.rail":"逻辑电源", "map.mosfet":"电池 MOS 管",
+  "map.pump":"泵", "map.solenoid":"电磁阀", "map.pad":"吸盘", "map.vacuum":"真空度",
+  "tool.material":"材料", "tool.lifted":"已抬起", "tool.valve":"阀",
+  "map.running":"运行", "map.off":"关", "map.open":"打开", "map.shut":"关闭",
+  "map.onSurface":"在表面上", "map.free":"悬空",
+  "map.active":"工作中", "map.idle":"空闲",
+  "st.phase":"阶段", "st.clock":"时钟", "st.ticks":"拍",
+  "st.boot":"<b>启动</b>（Init.c）", "st.ringFrame":"加载环帧",
+  "st.pump":"<b>泵</b>（Key.c）", "st.latch":"锁存 KEY_MOT_Value_1",
+  "st.startedBy":"启动方式", "st.motOut":"MOT 输出 PA5",
+  "st.riseWindow":"上升窗口", "st.noSealTimer":"未密封计时",
+  "st.band":"判定带 低/高", "st.pumpHeld":"PUMP 已按住",
+  "st.low20":"20 秒低压计数", "st.postMax":"到顶后延时运行",
+  "st.release":"<b>释放</b>（Key.c）", "st.firstPress":"第一次按键已预备",
+  "st.relActive":"释放进行中", "st.yvOut":"YV 输出 PA7",
+  "st.display":"<b>显示</b>（Show.c）", "st.reading":"读数 VSEN",
+  "st.logoMode":"标志闪烁模式", "st.presAlarm":"气压报警", "st.errBlink":"Err 闪烁",
+  "st.shown":"显示 %s", "st.left":"剩余 <b>%s 秒</b>", "st.of":"%s / %s",
+  "v.running":"运行中", "v.booting":"启动中", "v.shuttingDown":"正在关机",
+  "v.off":"关", "v.on":"开", "v.energized":"通电", "v.open":"打开", "v.shut":"关闭",
+  "v.no":"否", "v.yes":"是", "v.reset":"已复位", "v.na":"不适用", "v.dash":"--",
+  "v.autostart":"自动启动", "v.hand":"手动", "v.disarmedSealed":"已解除，已密封",
+  "v.idle":"空闲", "v.blinking":"闪烁中", "v.err":"Err",
+  "v.followAlarm":"随全屏闪", "v.steady":"常亮",
+  "v.fastBlink":"快闪", "v.slowBlink":"慢闪",
+  "v.armedFor":"是，剩余 %s 秒", "v.sOf10":"10 秒中的 %s 秒",
+  "cap.off":"<b>已关机。</b>长按工具上的 POWER 键 2 秒。",
+  "cap.boot":"<b>启动中。</b>加载环第 %s / 10 帧。",
+  "cap.shutdown":"<b>正在关机。</b>",
+  "cap.carrying":"<b>正在搬运负载</b>，%s kg。",
+  "cap.inAir":"<b>悬在空中</b>，未吸住任何东西。",
+  "cap.onSurface":"<b>在表面上</b>（%s），%s kg%s",
+  "cap.pumpRunning":"，泵运行中",
+  "cap.offSurface":"<b>已离开表面。</b>放下即可开始。",
+  "chart.window":"%s 秒窗口 &middot; 读数（上限 135）",
+  "reason.shutdown":"关机完成", "reason.bootCancel":"启动取消",
+  "log.railOff":"电源已断开，等待 SW_IN",
+  "log.railOffCleared":"电源断开（%s），单片机状态已清零",
+  "log.padPlaced":"吸盘已放到表面上（%s）",
+  "log.padLifted":"吸盘已离开表面",
+  "log.padNudge":"再次按压吸盘",
+  "log.lifted":"已抬起，负载 %s kg",
+  "log.liftNoGrip":"仅 %s kg 吸力就抬起：吸盘脱落",
+  "log.setDown":"重新放回表面",
+  "log.gripLost":"吸力丧失（%s kg）：负载掉落",
+  "log.relWindowExpired":"释放：2 秒窗口超时，第一次按键作废",
+  "log.relSolenoidEnd":"释放：10 秒电磁阀窗口结束",
+  "log.relConfirmed":"释放已确认：泵停止，电磁阀打开 10 秒",
+  "log.relArmed":"释放：第一次按键已预备（需 2 秒内再按一次）",
+  "log.errBlink":"长按 PUMP 3 秒且有气压：Err 闪烁",
+  "log.pwrOffHold":"长按 PUMP 3 秒且无气压：关机",
+  "log.pumpToggle":"PUMP 键：泵锁存 %s（手动）",
+  "log.low20s":"低于 10 持续 20 秒：清除泵锁存（原有规则）",
+  "log.autostart":"自动启动：100 毫秒内上升 %s（读数 %s）",
+  "log.v2armed":"v2：已预备（读数低于 1 持续 100 毫秒）",
+  "log.autostartV2":"自动启动（v2）：低值预备后的上升",
+  "log.noSealCut":"未密封停机：3.00 秒无变化，泵停止",
+  "log.postMax":"到达最大气压：0.5 秒延时运行结束，泵停止",
+  "log.idle5min":"无操作 5 分钟：关机",
+  "log.swinPressed":"SW_IN 按下：LDO 锁存导通，加载环开始",
+  "log.bootDone":"长按 2 秒完成：启动结束，主循环开始运行",
+  "log.bootCancel":"提前松手：加载环反向熄灭，启动取消",
+  "log.fwSwitched":"固件已切换为 %s",
+  "log.scenario":"场景：%s",
+  "log.fwLoaded":"已从 %s 个文件载入固件“%s”",
+  "log.fwParseFail":"这些文件中没有找到 NIMO_ 常量，未载入任何内容",
+  "sc.0.n":"开机：长按 POWER 2 秒",
+  "sc.0.d":"十段外圈按顺时针依次点亮，随后主循环开始运行。",
+  "sc.1.n":"1 秒时取消开机",
+  "sc.1.d":"外圈亮到一半，提前松手后反向熄灭。",
+  "sc.2.n":"自动启动，良好密封到 135",
+  "sc.2.d":"气压上升启动泵，真空建立，到顶后延时运行 0.5 秒。",
+  "sc.3.n":"3 秒后未密封停机",
+  "sc.3.d":"上升触发自动启动，随后因为读数毫无变化而放弃。",
+  "sc.4.n":"残余真空下的 v2 与 v3 对比",
+  "sc.4.d":"吸住状态下停泵，再次按压吸盘。v3 会重新启动，v2 不会。",
+  "sc.5.n":"释放：只按一次没有反应",
+  "sc.5.d":"按一次只是预备，电磁阀保持关闭。",
+  "sc.6.n":"释放：连按两次放气 10 秒",
+  "sc.6.d":"间隔小于 2 秒的两次按键会停泵并锁定电磁阀打开。",
+  "sc.7.n":"关机：长按 PUMP 3 秒",
+  "sc.7.d":"无气压时长按 PUMP 3 秒，屏幕显示 OFF，随后断开电源。",
+  "sc.8.n":"轻点 POWER 不会开机",
+  "sc.8.d":"短按必须反向取消，绝不能开机。",
+  "sc.9.n":"关机后再开机",
+  "sc.9.d":"开机，长按 PUMP 3 秒关机，再次开机。必须能重新开机并保持开启。",
+  "sc.10.n":"放下、吸住、抬起并搬运",
+  "sc.10.d":"完整工作流程：放下、自动启动、真空建立、抬起负载。",
+  "sc.11.n":"过早抬起，没有吸力",
+  "sc.11.d":"真空还没到 20 kg 就抬起：吸盘直接脱落。",
+  "sc.12.n":"搬运后放气释放",
+  "sc.12.d":"抬起负载后，连按两次 RELEASE 打开阀门，负载落下。",
+  "sc.13.n":"漏气密封失去负载",
+  "sc.13.d":"漏气吸盘只能保持约 45 kg，停泵后吸力衰减直到负载掉落。"
+}
+};
+function t(k, ...a){
+  const d = I18N[lang] || I18N.en;
+  let s = (k in d) ? d[k] : (I18N.en[k] !== undefined ? I18N.en[k] : k);
+  for(const v of a) s = s.replace("%s", v);
+  return s;
+}
+function setLang(l){
+  lang = (l === "en") ? "en" : "cn";
+  try{ localStorage.setItem("vacsim.lang", lang); }catch(e){}
+  document.documentElement.lang = (lang === "cn") ? "zh-CN" : "en";
+  document.querySelectorAll("[data-i18n]").forEach(el=>{ el.innerHTML = t(el.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-title]").forEach(el=>{
+    el.title = t(el.dataset.i18nTitle); });
+  [...document.getElementById("langSeg").children]
+    .forEach(c=>c.classList.toggle("on", c.dataset.lang === lang));
+  buildSurfaceOptions();
+  buildScenarioButtons();
+  renderFwInfo();          /* the firmware summary is built text, not [data-i18n] */
+  syncPadBtn();
+  render();
+}
+function buildSurfaceOptions(){
+  const sel=document.getElementById("surface"), cur=sel.value;
+  sel.innerHTML = ["none","good","leaky"]
+    .map(v=>`<option value="${v}">${t("surf."+v)}</option>`).join("");
+  sel.value = cur || "good";
+}
+
+/* =====================================================================
+   1. CONSTANTS  (NimoVersion.h)
+   ===================================================================== */
+let K = {
+  TICK_MS: 10,
+  RISE_DELTA: 1, RISE_WINDOW: 10,
+  STALL_TICKS: 300, STALL_DELTA: 3, STALL_NO_SEAL: 10,
+  MAX_PRESSURE: 135, POST_MAX_TICKS: 50,
+  REL_WINDOW: 200, REL_DEBOUNCE: 3, REL_SOLENOID: 1000,
+  REL_PRESSED: 0, REL_IDLE: 1,
+  SU_FRAMES: 10, SU_FRAME_TICKS: 20, SU_PRESSED: 0,
+  // v2 only, for the comparison mode
+  V2_LOW_THRESHOLD: 1, V2_LOW_ARM: 10
+};
+const SEG = {A:0x01,B:0x02,C:0x04,D:0x08,E:0x10,F:0x20,G:0x40};
+const NUM = [0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F];
+const CH_O=0x3F, CH_F=0x71, CH_E=0x79, CH_r=0x50;
+const ICON_BOX=SEG.A|SEG.B|SEG.C|SEG.D|SEG.E, ICON_LOGO=SEG.F|SEG.G;
+const UNIT_ICON=SEG.E|SEG.F;
+const BAT_TBL=[SEG.D, SEG.C, SEG.C|SEG.B, SEG.C|SEG.B|SEG.A];
+
+/* Ten perimeter frames, copied from NimoVersion_startup_led_frames in Init.c */
+const A=SEG.A,B=SEG.B,C=SEG.C,D=SEG.D,E=SEG.E,F=SEG.F;
+const SU_LED=[
+  [0,0,0],[A,0,0],[A,A,0],[A,A,A],[A,A,A|B],[A,A,A|B|C],[A,A,A|B|C|D],
+  [A,A|D,A|B|C|D],[A|D,A|D,A|B|C|D],[A|D|E,A|D,A|B|C|D],[A|D|E|F,A|D,A|B|C|D]
+];
+
+/* =====================================================================
+   1b. FIRMWARE VERSIONS
+   A version is the set of NIMO_* constants plus which auto-start and
+   cut-off the source implements. Upload a folder, some .c/.h files or a
+   .zip and the page reads both out of the source and runs the simulation
+   with them. It cannot execute a compiled binary, so what it reproduces is
+   the parameters and the structure it can see in the code.
+   ===================================================================== */
+const FW_MAP = {   // NIMO_ constant -> the K field it drives
+  NIMO_INPUT_TICK_MS:"TICK_MS",
+  NIMO_MAX_PRESSURE_THRESHOLD:"MAX_PRESSURE",
+  NIMO_PUMP_POST_MAX_TICKS:"POST_MAX_TICKS",
+  NIMO_PRESSURE_RISE_DELTA:"RISE_DELTA",
+  NIMO_PRESSURE_RISE_WINDOW_TICKS:"RISE_WINDOW",
+  NIMO_STALL_TICKS:"STALL_TICKS",
+  NIMO_STALL_DELTA:"STALL_DELTA",
+  NIMO_STALL_NO_SEAL_PRESSURE:"STALL_NO_SEAL",
+  NIMO_RELEASE_DOUBLE_PRESS_WINDOW_TICKS:"REL_WINDOW",
+  NIMO_RELEASE_DEBOUNCE_TICKS:"REL_DEBOUNCE",
+  NIMO_RELEASE_SOLENOID_TICKS:"REL_SOLENOID",
+  NIMO_STARTUP_FRAME_COUNT:"SU_FRAMES",
+  NIMO_STARTUP_FRAME_TICKS:"SU_FRAME_TICKS",
+  NIMO_PRESSURE_LOW_THRESHOLD:"V2_LOW_THRESHOLD",
+  NIMO_PRESSURE_LOW_ARM_TICKS:"V2_LOW_ARM"
+};
+const FW_V3 = {
+  id:"v3", name:"Nimo v3", builtin:true, autostart:"v3", hasStall:true, files:0,
+  defs:{ NIMO_INPUT_TICK_MS:10, NIMO_MAX_PRESSURE_THRESHOLD:135,
+    NIMO_PUMP_POST_MAX_TICKS:50, NIMO_PRESSURE_RISE_DELTA:1,
+    NIMO_PRESSURE_RISE_WINDOW_TICKS:10, NIMO_STALL_TICKS:300, NIMO_STALL_DELTA:3,
+    NIMO_STALL_NO_SEAL_PRESSURE:10, NIMO_RELEASE_DOUBLE_PRESS_WINDOW_TICKS:200,
+    NIMO_RELEASE_DEBOUNCE_TICKS:3, NIMO_RELEASE_SOLENOID_TICKS:1000,
+    NIMO_STARTUP_FRAME_COUNT:10, NIMO_STARTUP_FRAME_TICKS:20 }
+};
+/* v2 had no no-seal cut-off at all, and armed on a low reading first. */
+const FW_V2 = {
+  id:"v2", name:"Nimo v2", builtin:true, autostart:"v2", hasStall:false, files:0,
+  defs:{ NIMO_INPUT_TICK_MS:10, NIMO_MAX_PRESSURE_THRESHOLD:135,
+    NIMO_PUMP_POST_MAX_TICKS:50, NIMO_PRESSURE_LOW_THRESHOLD:1,
+    NIMO_PRESSURE_LOW_ARM_TICKS:10, NIMO_RELEASE_DOUBLE_PRESS_WINDOW_TICKS:200,
+    NIMO_RELEASE_DEBOUNCE_TICKS:3, NIMO_RELEASE_SOLENOID_TICKS:1000,
+    NIMO_STARTUP_FRAME_COUNT:10, NIMO_STARTUP_FRAME_TICKS:20 }
+};
+let FW_LIST=[FW_V3, FW_V2];
+let FW=FW_V3;
+
+function applyFirmware(fw, quiet){
+  FW=fw;
+  for(const [nimo,kk] of Object.entries(FW_MAP))
+    if(fw.defs[nimo]!==undefined) K[kk]=fw.defs[nimo];
+  /* v3 defaults for anything a version does not define, so a partial upload
+     still runs instead of producing NaN timings. */
+  for(const [nimo,kk] of Object.entries(FW_MAP))
+    if(fw.defs[nimo]===undefined && FW_V3.defs[nimo]!==undefined) K[kk]=FW_V3.defs[nimo];
+  const sd=document.getElementById("stallDelta");
+  if(sd){ sd.value=K.STALL_DELTA; document.getElementById("stallDeltaV").textContent=K.STALL_DELTA; }
+  buildFwSelect();
+  renderFwInfo();
+  reset();
+  if(!quiet) logEvent("log.fwSwitched","fw",fw.name);
+}
+function buildFwSelect(){
+  const sel=document.getElementById("fwSel");
+  if(!sel) return;
+  sel.innerHTML=FW_LIST.map(f=>
+    `<option value="${f.id}"${f===FW?" selected":""}>${f.name}</option>`).join("");
+}
+function renderFwInfo(){
+  const el=document.getElementById("fwInfo");
+  if(!el) return;
+  const keys=Object.keys(FW_MAP).filter(k=>FW.defs[k]!==undefined);
+  const rows=keys.map(k=>{
+    const v=FW.defs[k], base=FW_V3.defs[k];
+    const diff=(base===undefined)||(v!==base);
+    return `<tr><td class="k">${k.replace(/^NIMO_/,"")}</td>`
+      +`<td class="v"${diff?' style="color:var(--accent);font-weight:600"':''}>${v}</td></tr>`;
+  }).join("");
+  el.innerHTML =
+    `<div class="fwsum">`
+    + `<span>${t("fw.autostart")}: <b>${t(FW.autostart==="v3"?"fw.riseAlone":"fw.armThenRise")}</b></span>`
+    + `<span>${t("fw.stall")}: <b>${t(FW.hasStall?"fw.present":"fw.absent")}</b></span>`
+    + (FW.files?`<span>${t("fw.files",FW.files)}</span>`:"")
+    + `<button id="fwToggle" class="lnk">${fwOpen?"&minus;":"+"}</button></div>`
+    + (fwOpen?`<table class="st fwtbl">${rows}</table>
+        <div class="note" style="margin-top:6px">${t("fw.detail")}</div>`:"");
+  const b=document.getElementById("fwToggle");
+  if(b) b.onclick=()=>{ fwOpen=!fwOpen; renderFwInfo(); };
+}
+let fwOpen=false;
+
+/* ---- read a firmware version out of source text ---- */
+function parseFirmware(files, name){
+  const strip=txt=>txt.replace(/\/\*[\s\S]*?\*\//g,"").replace(/\/\/[^\n]*/g,"");
+  const src=files.map(f=>strip(f.text)).join("\n");
+  const defs={};
+  const re=/#define\s+(NIMO_[A-Z0-9_]+)\s+\(?\s*(\d+)\s*\)?\s*U?\b/g;
+  let m; while((m=re.exec(src))!==null) defs[m[1]]=parseInt(m[2],10);
+  if(!Object.keys(defs).length) return null;
+  const hasRise =/NimoVersion_Rise_Update/.test(src);
+  const hasArm  =/NIMO_PRESSURE_LOW_ARM_TICKS|Rising_air_pressure_cnt/.test(src);
+  const hasStall=/NimoVersion_Stall_Update/.test(src);
+  return { id:"up"+(FW_LIST.length), name:name||"uploaded", builtin:false,
+           autostart:hasRise?"v3":(hasArm?"v2":"v3"), hasStall:hasStall,
+           files:files.length, defs:defs };
+}
+
+/* ---- minimal ZIP reader (stored + deflate) using DecompressionStream ---- */
+async function readZip(file){
+  const buf=new Uint8Array(await file.arrayBuffer());
+  const dv=new DataView(buf.buffer);
+  let eocd=-1;
+  for(let i=buf.length-22;i>=0 && i>buf.length-66000;i--)
+    if(dv.getUint32(i,true)===0x06054b50){ eocd=i; break; }
+  if(eocd<0) throw new Error("not a zip");
+  const n=dv.getUint16(eocd+10,true);
+  let off=dv.getUint32(eocd+16,true);
+  const out=[];
+  for(let i=0;i<n;i++){
+    if(dv.getUint32(off,true)!==0x02014b50) break;
+    const method=dv.getUint16(off+10,true);
+    const csize=dv.getUint32(off+20,true);
+    const nameLen=dv.getUint16(off+28,true);
+    const extraLen=dv.getUint16(off+30,true);
+    const cmtLen=dv.getUint16(off+32,true);
+    const lho=dv.getUint32(off+42,true);
+    const name=new TextDecoder().decode(buf.subarray(off+46,off+46+nameLen));
+    off += 46+nameLen+extraLen+cmtLen;
+    if(!/\.(c|h|txt)$/i.test(name)) continue;
+    const lnLen=dv.getUint16(lho+26,true), lxLen=dv.getUint16(lho+28,true);
+    const start=lho+30+lnLen+lxLen;
+    const data=buf.subarray(start,start+csize);
+    let text;
+    if(method===0) text=new TextDecoder().decode(data);
+    else {
+      const ds=new DecompressionStream("deflate-raw");
+      const ab=await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer();
+      text=new TextDecoder().decode(ab);
+    }
+    out.push({name:name, text:text});
+  }
+  return out;
+}
+
+async function loadFirmwareFiles(fileList){
+  const picked=[...fileList];
+  if(!picked.length) return;
+  let files=[], name="";
+  for(const f of picked){
+    const rel=f.webkitRelativePath || f.name;
+    if(!name) name=(rel.includes("/")?rel.split("/")[0]:f.name).replace(/\.(zip|c|h|txt)$/i,"");
+    if(/\.zip$/i.test(f.name)){
+      try{ files=files.concat(await readZip(f)); }
+      catch(e){ /* fall through to the no-constants message */ }
+    } else if(/\.(c|h|txt)$/i.test(f.name)){
+      files.push({name:rel, text:await f.text()});
+    }
+  }
+  const fw=parseFirmware(files, name);
+  if(!fw){ logEvent("log.fwParseFail","cut"); render(); return; }
+  FW_LIST.push(fw);
+  applyFirmware(fw, true);
+  logEvent("log.fwLoaded","fw",fw.files,fw.name);
+}
+
+/* =====================================================================
+   2. STATE
+   ===================================================================== */
+let S, plant, io, hist, logLines;
+
+/*
+ * Every firmware static, as it is at power-up. The MCU runs off the rail it
+ * gates with LDO_EN, so dropping that rail unpowers the MCU and all of this is
+ * gone: a power cycle MUST go through here. Carrying it over is what made the
+ * tool refuse to start again after being switched off, because
+ * shut_down_Long_press_fg stayed latched and re-triggered the shutdown on the
+ * first tick after the next boot.
+ */
+function freshState(tick){
+  return {
+    tick:tick, phase:"off",         // off | boot | run | shutdown
+    /* --- Init.c startup loading --- */
+    su:{frame:0,frame_ticks:0,complete:0,reversing:0,cancelled:0}, ldo:0,
+    /* --- Key.c statics --- */
+    rise:{hist:new Array(K.RISE_WINDOW).fill(0),idx:0,primed:0},
+    stall:{low:0,high:0,ticks:0,primed:0},
+    autostart_run:0,
+    v2_rising_cnt:0, v2_record_old:0,
+    KEY_cnt:0, tool_10s_off_cnt:0, MOT_latch:0,
+    flick_sd:0, flick_sd_cnt:0, sd_long:0,
+    rel_first:0, rel_prev:K.REL_IDLE, rel_stable:K.REL_IDLE,
+    rel_deb:0, rel_win:0, rel_active:0, rel_active_cnt:0,
+    /* --- Working_run.c statics --- */
+    MOT_run_cnt:0, YV_run_cnt:0, flick_p_cnt:0,
+    no_action:0, logo_mode:0, flick_p:0,
+    OFF_Power_cnt:0, sd_five:0,
+    /* --- Show.c statics --- */
+    val_temp:0, val_chg_cnt:0, logo_cnt:0, pwr_cnt:0,
+    logo_blink:0, pwr_blink:0, chg_test:0, chg_val:0,
+    flick_all_cnt:0, flick_3_cnt:0, shutdown_cnt:0,
+    sen_buf:new Array(16).fill(0), sen_i:0, sen_sum:0,
+    bat_buf:new Array(16).fill(0), bat_i:0, bat_sum:0,
+    bat_led_cnt:[0,0,0,0], bat_show:3, bat_val:100, bat_chg_cnt:0,
+    lpwr_cnt:0,
+    /* --- outputs --- */
+    MOT:0, YV:0, tm:[0,0,0,0,0]
+  };
+}
+
+function reset(){
+  S = freshState(0);
+  plant = { p:0, blip:0, pad:0, lifted:0 };
+  io = { pwr:0, mot:0, yv:0 };
+  hist = [];
+  logLines = [];
+  logEvent("log.railOff","");
+  syncPadBtn();
+  render();
+}
+
+/* The rail dropped. Wipe the MCU, keep what physically survives: the clock, any
+   vacuum still in the pad, the button positions, and the observer's log. */
+function mcuPowerDown(reason){
+  S = freshState(S.tick);
+  logEvent("log.railOffCleared","warn",t(reason));
+}
+
+/* The ADC converts continuously in main()'s while(1), far faster than the 10 ms
+   task, so both boxcars are already settled by the time the first task runs.
+   Starting them from zero made the battery read flat for ~12 ticks and threw a
+   spurious low-voltage blink at every boot. */
+function primeFilters(){
+  S.sen_buf.fill(VSEN());  S.sen_sum = VSEN()*16;
+  S.bat_buf.fill(VBAT());  S.bat_sum = VBAT()*16;
+  S.bat_val = VBAT();
+}
+
+function logEvent(key, cls, ...args){
+  logLines.push({t:(S?S.tick*K.TICK_MS/1000:0), k:key, a:args, c:cls||""});
+  if(logLines.length>400) logLines.shift();
+}
+
+/* =====================================================================
+   3. PLANT MODEL  (not firmware: the pad, pump, valve and surface)
+   ===================================================================== */
+function plantStep(){
+  const surf = document.getElementById("surface").value;
+  const sealed = plant.pad && surf!=="none";
+  if(S.YV){                                  // solenoid open: vent hard
+    plant.p -= 6;
+  } else if(S.MOT){                          // pump running
+    let target = 2;                          // open air: no vacuum builds
+    if(sealed) target = (surf==="good") ? 150 : 45;
+    plant.p += (target - plant.p) * 0.012;
+  } else {                                   // pump off
+    if(sealed) plant.p -= (surf==="good") ? 0.02 : 0.35;
+    else plant.p -= 3;
+  }
+  checkGrip();
+  plant.blip *= 0.85;
+  if(plant.blip < 0.05) plant.blip = 0;
+  plant.p = Math.max(0, Math.min(160, plant.p));
+}
+/* The pad LATCHES. You set the tool down on the material and it stays there,
+   so this must not be a hold-the-mouse control: with a momentary pad the seal
+   vanished the instant the button was released, no vacuum could ever build and
+   every run ended in the 3 s no-seal cut-off. */
+function padPlace(on){
+  const surf = document.getElementById("surface").value;
+  if(on && !plant.pad){
+    plant.pad = 1;
+    // Pressing the pad down displaces air: a brief positive rise either way.
+    plant.blip += (surf==="none") ? 2.5 : 4.5;
+    logEvent("log.padPlaced","",t("surf."+surf));
+  } else if(!on && plant.pad){
+    plant.pad = 0;
+    logEvent("log.padLifted","");
+  }
+  syncPadBtn();
+}
+/* Pressing down on an already-placed pad, without lifting it. This is the real
+   gesture that restarts the tool on material it is still holding, and it is what
+   the v2 auto-start could not act on. Lifting the pad instead would dump the
+   residual vacuum far faster than the rise could be seen. */
+function padNudge(){
+  if(!plant.pad){ padPlace(true); return; }
+  const surf = document.getElementById("surface").value;
+  plant.blip += (surf==="none") ? 2.5 : 4.5;
+  logEvent("log.padNudge","");
+}
+/* Lifting needs real grip. Below HOLD_MIN the pad simply comes away, and losing
+   grip while carrying drops the load, which is the failure the no-seal cut-off
+   must never be able to cause. */
+function liftTool(on){
+  if(on && !plant.lifted){
+    if(plant.pad && VSEN()>=HOLD_MIN){
+      plant.lifted=1;
+      logEvent("log.lifted","fw",VSEN());
+    } else {
+      plant.lifted=1; plant.pad=0;
+      logEvent("log.liftNoGrip","warn",VSEN());
+    }
+  } else if(!on && plant.lifted){
+    plant.lifted=0; plant.pad=1;
+    logEvent("log.setDown","");
+  }
+  syncPadBtn();
+}
+function checkGrip(){
+  if(plant.lifted && plant.pad && VSEN()<HOLD_MIN){
+    plant.pad=0; anim.drop=1.4;
+    logEvent("log.gripLost","cut",VSEN());
+    syncPadBtn();
+  }
+}
+function syncPadBtn(){
+  const b=document.getElementById("padBtn"),
+        n=document.getElementById("padNudgeBtn"),
+        l=document.getElementById("liftBtn");
+  if(!b) return;
+  b.disabled = !!plant.lifted;
+  b.classList.toggle("on", !!plant.pad && !plant.lifted);
+  b.textContent = t(plant.pad ? "ui.takeOff" : "ui.place");
+  if(n) n.disabled = !plant.pad || !!plant.lifted;
+  if(l){
+    l.disabled = !plant.pad && !plant.lifted;
+    l.classList.toggle("on", !!plant.lifted);
+    l.textContent = t(plant.lifted ? "ui.setDown" : "ui.lift");
+  }
+}
+
+/* Sensor: ADC_VSEN_value() is a 32-sample boxcar that settles well inside one
+   10 ms tick, so the tick value is the plant reading, truncated to an integer. */
+function VSEN(){
+  const n = +document.getElementById("noise").value;
+  let v = plant.p + plant.blip;
+  if(n) v += (S.tick%7<3?1:-1) * (((S.tick*7)%(n+1)));
+  return Math.max(0, Math.floor(v));
+}
+function VBAT(){ return +document.getElementById("bat").value; }
+function USB_IN(){ return document.getElementById("usb").checked ? 1 : 0; }
+function CH_FG(){ return 0; }                       // no charge-detect short
+function Key_MOT(){ return io.mot ? 1 : 0; }        // PB3 active high
+function Key_YV(){ return io.yv ? 0 : 1; }          // PA6 pull-up, pressed = 0
+function SW_IN(){ return io.pwr ? 0 : 1; }          // PA15 pull-up, pressed = 0
+
+/* ADC.c helpers */
+function Get_SEN_average(v){
+  S.sen_sum -= S.sen_buf[S.sen_i]; S.sen_buf[S.sen_i]=v; S.sen_sum += v;
+  S.sen_i=(S.sen_i+1)&15; return S.sen_sum>>4;
+}
+function Get_BAT_average(v){
+  S.bat_sum -= S.bat_buf[S.bat_i]; S.bat_buf[S.bat_i]=v; S.bat_sum += v;
+  S.bat_i=(S.bat_i+1)&15; return S.bat_sum>>4;
+}
+
+/* =====================================================================
+   4. NimoVersion.h  helpers
+   ===================================================================== */
+function Rise_Reset(r){ r.idx=0; r.primed=0; }
+function Rise_Prime(r,p){ r.hist.fill(p); r.idx=0; r.primed=1; }
+function Rise_Update(r,p){
+  if(!r.primed){ Rise_Prime(r,p); return 0; }
+  const oldest = r.hist[r.idx];
+  const rising = (p >= oldest + K.RISE_DELTA) ? 1 : 0;
+  r.hist[r.idx]=p; r.idx=(r.idx+1)%K.RISE_WINDOW;
+  return rising;
+}
+/* NIMO_STALL_DELTA is live-tunable here: it is the one threshold the README
+   asks Bill to set on the bench, and its right value depends on real sensor
+   noise. Everything else is fixed at the shipped value. */
+function stallDelta(){ return +document.getElementById("stallDelta").value; }
+function Stall_Reset(s){ s.low=0;s.high=0;s.ticks=0;s.primed=0; }
+function Stall_Prime(s,p){ s.low=p;s.high=p;s.ticks=0;s.primed=1; }
+function Stall_Update(s,p){
+  if(!s.primed){ Stall_Prime(s,p); return 0; }
+  if(p<s.low) s.low=p;
+  if(p>s.high) s.high=p;
+  if((s.high-s.low)>=stallDelta()){ Stall_Prime(s,p); return 0; }
+  if(s.ticks<K.STALL_TICKS) s.ticks++;
+  return s.ticks>=K.STALL_TICKS ? 1 : 0;
+}
+function Startup_Update(st, pressed){
+  if(st.complete||st.cancelled) return;
+  if(st.reversing){
+    st.frame_ticks++;
+    if(st.frame_ticks>=K.SU_FRAME_TICKS){
+      st.frame_ticks=0;
+      if(st.frame>0) st.frame--;
+      if(st.frame===0) st.cancelled=1;
+    }
+    return;
+  }
+  if(!pressed && st.frame>0){
+    st.reversing=1; st.frame_ticks=0; st.frame--;
+    if(st.frame===0) st.cancelled=1;
+    return;
+  }
+  if(pressed){
+    if(st.frame===0){ st.frame=1; st.frame_ticks=0; return; }
+    st.frame_ticks++;
+    if(st.frame_ticks>=K.SU_FRAME_TICKS){
+      st.frame_ticks=0;
+      if(st.frame<K.SU_FRAMES) st.frame++;
+      else st.complete=1;
+    }
+  }
+}
+
+/* =====================================================================
+   5. Key.c :: KEY_MOT_state()
+   ===================================================================== */
+function KEY_MOT_state(){
+  const raw = Key_YV();
+  let edge = 0;
+
+  if(S.rel_first===1){
+    S.rel_win++;
+    if(S.rel_win>=K.REL_WINDOW){ S.rel_first=0; S.rel_win=0;
+      logEvent("log.relWindowExpired","warn"); }
+  }
+  if(S.rel_active===1){
+    S.rel_active_cnt++;
+    if(S.rel_active_cnt>=K.REL_SOLENOID){
+      S.rel_active=0; S.rel_active_cnt=0;
+      logEvent("log.relSolenoidEnd","fw");
+    }
+  }
+  if(raw===S.rel_prev){ if(S.rel_deb<K.REL_DEBOUNCE) S.rel_deb++; }
+  else { S.rel_prev=raw; S.rel_deb=1; }
+
+  if(S.rel_deb>=K.REL_DEBOUNCE && S.rel_stable!==raw){
+    S.rel_stable=raw;
+    if(S.rel_stable===K.REL_PRESSED) edge=1;
+  }
+  if(edge===1){
+    if(S.rel_first===1){
+      S.rel_first=0; S.rel_win=0; S.rel_active=1; S.rel_active_cnt=0;
+      S.MOT_latch=0; S.autostart_run=0;
+      Rise_Reset(S.rise); Stall_Reset(S.stall);
+      logEvent("log.relConfirmed","fw");
+    } else {
+      S.rel_first=1; S.rel_win=0;
+      logEvent("log.relArmed","");
+    }
+  }
+
+  if(Key_MOT()===1){
+    if(S.KEY_cnt<300) S.KEY_cnt++;
+    else {
+      if(S.MOT_latch===1 || VSEN()>20){
+        if(!S.flick_sd) logEvent("log.errBlink","warn");
+        S.flick_sd=1; S.KEY_cnt=0;
+      } else {
+        if(!S.sd_long) logEvent("log.pwrOffHold","warn");
+        S.sd_long=1;
+      }
+    }
+  } else {
+    if(S.flick_sd===1){ S.KEY_cnt=0; }
+    else if(S.KEY_cnt>1){
+      S.KEY_cnt=0;
+      S.MOT_latch = (S.MOT_latch===1)?0:1;
+      S.autostart_run=0;
+      Rise_Reset(S.rise); Stall_Reset(S.stall);
+      logEvent("log.pumpToggle","fw",t(S.MOT_latch?"v.on":"v.off"));
+    }
+    if(S.MOT_latch===1 && VSEN()<10){
+      if(S.tool_10s_off_cnt<2000) S.tool_10s_off_cnt++;
+      else { S.MOT_latch=0;
+        logEvent("log.low20s","warn"); }
+    } else S.tool_10s_off_cnt=0;
+  }
+  if(S.flick_sd===1){
+    if(S.flick_sd_cnt<100) S.flick_sd_cnt++;
+    else { S.flick_sd=0; S.flick_sd_cnt=0; }
+  }
+
+  /* ---- auto-start ---- */
+  if(S.MOT_latch===0 && S.rel_active===0 && Key_YV()===K.REL_IDLE){
+    if(FW.autostart==="v3"){
+      if(Rise_Update(S.rise, VSEN())===1){
+        S.MOT_latch=1; S.autostart_run=1; Stall_Prime(S.stall, VSEN());
+        logEvent("log.autostart","fw",K.RISE_DELTA,VSEN());
+      }
+    } else {
+      /* v2: arm on a low reading, then fire on the following rise */
+      if(VSEN() < K.V2_LOW_THRESHOLD){
+        if(S.v2_rising_cnt<K.V2_LOW_ARM) S.v2_rising_cnt++;
+        else {
+          if(!S.v2_record_old) logEvent("log.v2armed","");
+          S.v2_record_old=1;
+        }
+      } else S.v2_rising_cnt=0;
+      if(S.v2_record_old===1 && VSEN()>=K.V2_LOW_THRESHOLD){
+        S.MOT_latch=1; S.v2_record_old=0; S.autostart_run=1;
+        Stall_Prime(S.stall, VSEN());
+        logEvent("log.autostartV2","fw");
+      }
+    }
+  } else { Rise_Reset(S.rise); S.v2_record_old=0; S.v2_rising_cnt=0; }
+
+  /* ---- no-seal stall cut-off ---- */
+  if(FW.hasStall && S.MOT_latch===1 && S.autostart_run===1){
+    if(VSEN()<K.STALL_NO_SEAL){
+      if(Stall_Update(S.stall, VSEN())===1){
+        S.MOT_latch=0; S.autostart_run=0;
+        Stall_Reset(S.stall); Rise_Reset(S.rise);
+        logEvent("log.noSealCut","cut");
+      }
+    } else Stall_Reset(S.stall);
+  } else if(S.MOT_latch===0){
+    S.autostart_run=0; Stall_Reset(S.stall);
+  }
+  return S.MOT_latch;
+}
+
+/* =====================================================================
+   6. Working_run.c :: MOT_run() / Shut_down()
+   ===================================================================== */
+function MOT_run(){
+  if(KEY_MOT_state()===1){
+    S.YV=0;
+    if(VSEN() < K.MAX_PRESSURE){
+      S.MOT=1; S.MOT_run_cnt=0; S.logo_mode=2;
+    } else {
+      if(S.MOT_run_cnt<K.POST_MAX_TICKS) S.MOT_run_cnt++;
+      if(S.MOT_run_cnt>=K.POST_MAX_TICKS){
+        if(S.MOT===1) logEvent("log.postMax","fw");
+        S.MOT=0;
+      } else S.MOT=1;
+      S.logo_mode=1;
+    }
+    S.no_action=0; S.flick_p=0; S.flick_p_cnt=0;
+  } else {
+    S.MOT=0;
+    if(VSEN()<135 && VSEN()>5){ S.flick_p=1; S.flick_p_cnt=0; }
+    else if(VSEN()>135){
+      if(S.flick_p_cnt<1000) S.flick_p_cnt++; else S.flick_p=1;
+    } else { S.flick_p_cnt=0; S.flick_p=0; }
+    S.logo_mode = (S.flick_p===1) ? 0 : 3;
+  }
+  if(S.rel_active===1){
+    if(S.YV_run_cnt<K.REL_SOLENOID){ S.YV=1; S.YV_run_cnt++; }
+    else S.YV=0;
+    S.no_action=0;
+  } else { S.YV=0; S.YV_run_cnt=0; S.no_action=1; }
+}
+function Shut_down(){
+  if(S.no_action && Get_SEN_average(VSEN())<5){
+    if(S.OFF_Power_cnt<90000) S.OFF_Power_cnt++;
+    if(S.OFF_Power_cnt>30000){
+      if(!S.sd_five) logEvent("log.idle5min","warn");
+      S.sd_five=1;
+    }
+  } else S.OFF_Power_cnt=0;
+}
+
+/* =====================================================================
+   7. Voltage.c + Show.c
+   ===================================================================== */
+const BAT_CFG=[[79,0,3],[73,1,2],[67,2,1],[0,3,0]];
+function Show_Power_value(){
+  const t = Get_BAT_average(VBAT());
+  if(t!==S.bat_val){ if(S.bat_chg_cnt<50) S.bat_chg_cnt++; else S.bat_val=t; }
+  else S.bat_chg_cnt=0;
+  for(const [th,idx,lvl] of BAT_CFG){
+    if(S.bat_val>=th){
+      if(S.bat_led_cnt[idx]<100) S.bat_led_cnt[idx]++;
+      if(S.bat_led_cnt[idx]>30) S.bat_show=lvl;
+      if(S.bat_led_cnt[idx]>20)
+        for(let k=0;k<4;k++) if(k!==idx) S.bat_led_cnt[k]=0;
+      break;
+    }
+  }
+  return S.bat_show;
+}
+function L_Power_6V(){
+  const a = Get_BAT_average(VBAT());
+  if(a<61){
+    if(a<55) S.lpwr_cnt+=50; else if(S.lpwr_cnt<8000) S.lpwr_cnt++;
+    if(S.lpwr_cnt>3000) return 2;
+    if(S.lpwr_cnt>300) return 1;
+  } else S.lpwr_cnt=0;
+  return 0;
+}
+function wr(b0,b1,b2,b3,b4){ S.tm=[b0,b1,b2,b3,b4]; }
+
+function Show_Num_value(){
+  let v = Get_SEN_average(VSEN());
+  if(v<5) v=0;
+  if(v>150) v=150;
+  if(S.val_temp!==v){ if(S.val_chg_cnt<10) S.val_chg_cnt++; else S.val_temp=v; }
+  else S.val_chg_cnt=0;
+
+  if(S.logo_cnt<2000) S.logo_cnt++; else S.logo_cnt=0;
+
+  const lp = L_Power_6V();
+  if(lp===1){
+    if(S.pwr_cnt<300) S.pwr_cnt++; else S.pwr_cnt=0;
+    S.pwr_blink = (S.pwr_cnt%30>14)?1:0;
+  } else if(lp===0) S.pwr_blink=0;
+
+  if(S.logo_mode===2)      S.logo_blink = (S.logo_cnt%30>14)?1:0;
+  else if(S.logo_mode===3) S.logo_blink = (S.logo_cnt%100>49)?1:0;
+  else                     S.logo_blink = 0;
+
+  const t=S.val_temp;
+  wr(NUM[Math.floor(t/100)], NUM[Math.floor(t/10)%10], NUM[t%10],
+     S.logo_blink===0 ? (ICON_BOX|ICON_LOGO) : ICON_BOX,
+     S.pwr_blink===0 ? (UNIT_ICON|BAT_TBL[Show_Power_value()]) : UNIT_ICON);
+}
+function Execute_shutdown(){
+  if(S.shutdown_cnt<150) S.shutdown_cnt++; else S.ldo=0;
+  if(S.shutdown_cnt%50>24) wr(CH_O,CH_F,CH_F,0,0); else wr(0,0,0,0,0);
+}
+function Show_Temp(){
+  if(USB_IN()===1){
+    S.MOT=0; S.YV=0;
+    if(CH_FG()===1) wr(0,0,0,ICON_BOX,BAT_TBL[3]);
+    else {
+      if(S.chg_test<3000) S.chg_test++; else S.chg_test=0;
+      if(S.chg_test%50===1){ S.chg_val = (S.chg_val<3)?S.chg_val+1:1; }
+      wr(0,0,0,ICON_BOX,BAT_TBL[S.chg_val]);
+    }
+    return;
+  }
+  if(S.sd_long || S.sd_five || L_Power_6V()===2){ Execute_shutdown(); Shut_down(); return; }
+
+  if(S.flick_sd===1){
+    if(S.flick_3_cnt<200) S.flick_3_cnt++; else S.flick_3_cnt=0;
+    if(S.flick_3_cnt%33>12) wr(CH_E,CH_r,CH_r,0,0); else wr(0,0,0,0,0);
+  } else if(S.flick_p===1){
+    if(S.flick_all_cnt<1000) S.flick_all_cnt++; else S.flick_all_cnt=0;
+    if(S.flick_all_cnt%50>24) Show_Num_value();
+    else wr(0,0,0, S.logo_mode===1?(ICON_BOX|ICON_LOGO):0, 0);
+  } else Show_Num_value();
+
+  if(CH_FG()===0) MOT_run();
+  Shut_down();
+}
+
+/* =====================================================================
+   8. TICK
+   ===================================================================== */
+function tick(){
+  if(S.phase==="off"){
+    if(SW_IN()===K.SU_PRESSED){
+      S.ldo=1; S.phase="boot";
+      S.su={frame:0,frame_ticks:0,complete:0,reversing:0,cancelled:0};
+      logEvent("log.swinPressed","fw");
+      /* Fall straight into the boot handling this same tick. In the C, the
+         wait-for-press loop exits and NimoVersion_Startup_Update() runs with no
+         Delay_Ms() in between, so the first frame costs no extra tick. Consuming
+         one here made the hold 201 ticks instead of 200. */
+    } else { S.tick++; sample(); return; }
+  }
+  if(S.phase==="boot"){
+    Startup_Update(S.su, SW_IN()===K.SU_PRESSED?1:0);
+    const lf=SU_LED[Math.min(S.su.frame,SU_LED.length-1)];
+    S.tm=[lf[0],lf[1],lf[2],0,0];
+    if(S.su.complete){ S.phase="run"; primeFilters();
+      logEvent("log.bootDone","fw"); }
+    else if(S.su.cancelled){
+      logEvent("log.bootCancel","warn");
+      S.tick++; plantStep(); sample();
+      mcuPowerDown("reason.bootCancel");
+      return;
+    }
+    S.tick++; plantStep(); sample(); return;
+  }
+  if(S.sd_long || S.sd_five || L_Power_6V()===2) S.phase="shutdown";
+  Show_Temp();
+  plantStep();
+  S.tick++; sample();
+  if(S.phase==="shutdown" && S.ldo===0) mcuPowerDown("reason.shutdown");
+}
+function sample(){
+  hist.push({t:S.tick, p:VSEN(), m:S.MOT, y:S.YV, l:S.MOT_latch});
+  if(hist.length>1400) hist.shift();
+}
+
+/* =====================================================================
+   9. RENDER: seven-segment display
+   ===================================================================== */
+function hbar(cx,cy,L,t){const h=t/2,l=L/2;return[[cx-l,cy],[cx-l+h,cy-h],[cx+l-h,cy-h],
+  [cx+l,cy],[cx+l-h,cy+h],[cx-l+h,cy+h]].map(p=>p.join(",")).join(" ");}
+function vbar(cx,cy,L,t){const h=t/2,l=L/2;return[[cx,cy-l],[cx+h,cy-l+h],[cx+h,cy+l-h],
+  [cx,cy+l],[cx-h,cy+l-h],[cx-h,cy-l+h]].map(p=>p.join(",")).join(" ");}
+
+function digitSVG(x, mask){
+  const W=42,H=70,t=8, T=4, Mid=H/2, Bo=H-4;
+  const segs=[
+    ["A",hbar(W/2,T,W-8,t)], ["G",hbar(W/2,Mid,W-8,t)], ["D",hbar(W/2,Bo,W-8,t)],
+    ["F",vbar(T,(T+Mid)/2,Mid-T-2,t)], ["B",vbar(W-T,(T+Mid)/2,Mid-T-2,t)],
+    ["E",vbar(T,(Mid+Bo)/2,Bo-Mid-2,t)], ["C",vbar(W-T,(Mid+Bo)/2,Bo-Mid-2,t)]
+  ];
+  return `<g transform="translate(${x},14)">` + segs.map(([n,pts])=>
+    `<polygon points="${pts}" fill="${(mask&SEG[n])?'var(--lcd-on)':'var(--lcd-off)'}"/>`
+  ).join("") + `</g>`;
+}
+/* The display as SVG markup, so it can be dropped onto the tool sketch. Digit
+   offsets stay 14/66/118 inside this group whatever the outer transform. */
+function lcdSVG(){
+  const [b0,b1,b2,b3,b4]=S.tm;
+  let s = digitSVG(14,b0)+digitSVG(66,b1)+digitSVG(118,b2);
+  // DIG4: ICON_BOX (A..E) + ICON_LOGO (F,G)
+  const boxOn=(b3&ICON_BOX)?1:0, logoOn=(b3&ICON_LOGO)?1:0;
+  s += `<g transform="translate(174,22)">
+    <rect x="0" y="0" width="34" height="26" rx="4" fill="none" stroke-width="3"
+      stroke="${boxOn?'var(--lcd-on)':'var(--lcd-off)'}"/>
+    <rect x="6" y="32" width="22" height="9" rx="4.5"
+      fill="${logoOn?'var(--lcd-on)':'var(--lcd-off)'}"/></g>`;
+  // DIG5: battery bits A,B,C,D + UNIT_ICON (E,F)
+  const bits=[["A",SEG.A],["B",SEG.B],["C",SEG.C],["D",SEG.D]];
+  s += `<g transform="translate(224,18)">
+    <rect x="0" y="0" width="30" height="40" rx="4" fill="none" stroke="var(--lcd-off)" stroke-width="2"/>
+    <rect x="10" y="-5" width="10" height="4" rx="1.5" fill="var(--lcd-off)"/>`;
+  bits.forEach(([n,bit],i)=>{ s += `<rect x="5" y="${5+i*9}" width="20" height="6" rx="1.5"
+      fill="${(b4&bit)?'var(--lcd-on)':'var(--lcd-off)'}"/>`; });
+  s += `<text x="15" y="56" text-anchor="middle" font-size="11" font-family="var(--mono)"
+      fill="${(b4&UNIT_ICON)?'var(--lcd-on)':'var(--lcd-off)'}">kg</text></g>`;
+  return s;
+}
+
+/* =====================================================================
+   9b. RENDER: the tool sketch
+   Schematic side elevation. Purely presentational: it reads sim state and
+   never writes it, apart from the three buttons which drive io like any
+   other input. Motion is eased toward targets so placing, lifting and
+   venting read as movement rather than as a jump.
+   ===================================================================== */
+const HOLD_MIN = 20;                 // kg of grip needed to carry the load
+let anim = {toolY:0, slabY:0, padC:0, phase:0, drop:0, press:{pwr:0,mot:0,yv:0}};
+
+function animStep(){
+  anim.phase++;
+  const carrying = plant.lifted && plant.pad;
+  const tTool = plant.lifted ? -70 : 0;
+  const tSlab = carrying ? -70 : 0;
+  const tPad  = plant.pad ? (0.30 + 0.70*Math.min(VSEN(),135)/135) : 0;
+  anim.toolY += (tTool-anim.toolY)*0.16;
+  anim.slabY += (tSlab-anim.slabY)*0.20;
+  anim.padC  += (tPad -anim.padC )*0.18;
+  if(anim.drop>0) anim.drop -= 0.02;
+  for(const k of ["pwr","mot","yv"]){
+    const on=io[k]?1:0;
+    /* Rise fast, fall slow, so even a 60 ms tap leaves a visible ripple. */
+    anim.press[k] += (on-anim.press[k])*(on>anim.press[k] ? 0.5 : 0.10);
+  }
+}
+
+function renderTool(){
+  const FLOOR=376, SLAB_TOP=342, SLAB_H=32;
+  const ty=anim.toolY, sy=anim.slabY, pc=anim.padC;
+  const padH  = 30-8*pc;
+  const padTop= SLAB_TOP-padH;             // pad sits on the slab surface
+  const bodyH = 108, bodyTop = padTop-bodyH;
+  const vac   = Math.min(VSEN(),150)/150;
+  const carrying = plant.lifted && plant.pad;
+  let s="";
+
+  /* floor */
+  s += `<line x1="16" y1="${FLOOR}" x2="544" y2="${FLOOR}" stroke="var(--line2)" stroke-width="2"/>`;
+  for(let x=16;x<544;x+=14)
+    s += `<line x1="${x}" y1="${FLOOR}" x2="${x-8}" y2="${FLOOR+9}" stroke="var(--line)" stroke-width="1.5"/>`;
+
+  /* shadow, tightens as the load rises */
+  const lift=-sy, sh=Math.max(0,1-lift/80);
+  s += `<ellipse cx="280" cy="${FLOOR-2}" rx="${170+lift*0.5}" ry="${5*sh+2}"
+      fill="#000" opacity="${0.10*sh+0.03}"/>`;
+
+  /* the material */
+  const dropFlash = anim.drop>0 ? anim.drop : 0;
+  s += `<g transform="translate(0,${sy.toFixed(1)})">
+    <rect x="64" y="${SLAB_TOP}" width="432" height="${SLAB_H}" rx="3"
+      fill="${dropFlash>0?'#fee2e2':'#dfe3ea'}"
+      stroke="${dropFlash>0?'var(--bad)':'#b3bbc7'}" stroke-width="1.5"/>
+    <text x="76" y="${SLAB_TOP+20}" font-size="10" fill="var(--faint)">${t("tool.material")}</text></g>`;
+
+  /* ---------------- the tool ---------------- */
+  s += `<g transform="translate(0,${ty.toFixed(1)})">`;
+
+  /* rubber pad, squashes as vacuum builds */
+  const padX=158-7*pc, padW=244+14*pc;
+  s += `<rect x="${padX}" y="${padTop}" width="${padW}" height="${padH}" rx="7"
+      fill="#39404e"/>
+    <rect x="${padX+7}" y="${padTop+3}" width="${padW-14}" height="${Math.max(2,padH-12)}" rx="4"
+      fill="#2b313c"/>`;
+  /* vacuum shown inside the pad cavity */
+  if(plant.pad && vac>0.02)
+    s += `<rect x="${padX+14}" y="${padTop+5}" width="${padW-28}" height="${Math.max(2,padH-16)}" rx="3"
+        fill="var(--accent)" opacity="${(0.12+0.36*vac).toFixed(2)}"/>`;
+
+  /* housing */
+  s += `<rect x="136" y="${bodyTop}" width="288" height="${bodyH}" rx="16"
+      fill="#eef1f5" stroke="#c3cad4" stroke-width="1.5"/>
+    <rect x="136" y="${bodyTop+bodyH-16}" width="288" height="16" rx="6" fill="#dfe4ea"/>`;
+
+  /* carry handle */
+  s += `<path d="M186,${bodyTop+4} C186,${bodyTop-54} 374,${bodyTop-54} 374,${bodyTop+4}"
+      fill="none" stroke="#39404e" stroke-width="17" stroke-linecap="round"/>
+    <path d="M186,${bodyTop+4} C186,${bodyTop-54} 374,${bodyTop-54} 374,${bodyTop+4}"
+      fill="none" stroke="#4a5364" stroke-width="7" stroke-linecap="round"/>`;
+
+  /* display, driven by the same 5 TM1640 bytes as the firmware writes */
+  s += `<rect x="150" y="${bodyTop+18}" width="158" height="58" rx="7" fill="var(--lcd)"/>
+    <g transform="translate(${150+6},${bodyTop+18+4}) scale(0.52)">${lcdSVG()}</g>`;
+
+  /* the three buttons */
+  const BTNS=[["pwr","PWR","PA15",332],["mot","PUMP","PB3",366],["yv","REL","PA6",400]];
+  BTNS.forEach(([k,lab,pin,cx])=>{
+    const p=anim.press[k], down=p>0.5;
+    const cy=bodyTop+40+p*2.5;
+    /* One group per button so the label is part of the target. The transparent
+       rect is what makes the whole area hit-testable (fill="none" would not be). */
+    s += `<g class="btn" data-btn="${k}">
+      <rect x="${cx-17}" y="${bodyTop+22}" width="34" height="62" fill="transparent"/>`;
+    if(p>0.05)   /* press ripple */
+      s += `<circle cx="${cx}" cy="${cy}" r="${13+10*p}" fill="none"
+          stroke="var(--accent)" stroke-width="1.5" opacity="${(0.5*(1-p)).toFixed(2)}"/>`;
+    /* How far the 3 s power-off hold has got. The threshold is a hard 300 ticks,
+       so show it counting rather than leaving the operator guessing. */
+    if(k==="mot" && S.KEY_cnt>4){
+      const frac=Math.min(1,S.KEY_cnt/300), R=18, C=2*Math.PI*R;
+      s += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none" stroke="var(--warn)"
+          stroke-width="2.5" stroke-linecap="round"
+          stroke-dasharray="${(C*frac).toFixed(1)} ${C.toFixed(1)}"
+          transform="rotate(-90 ${cx} ${cy})" opacity="0.9"/>`;
+    }
+    s += `<circle cx="${cx}" cy="${cy}" r="13"
+        fill="${down?'var(--accent)':'#fff'}" stroke="${down?'var(--accent)':'#aab2be'}"
+        stroke-width="1.5"/>
+      <text x="${cx}" y="${bodyTop+72}" text-anchor="middle" font-size="7.5"
+        font-weight="600" fill="${down?'var(--accent)':'var(--muted)'}">${lab}</text>
+      <text x="${cx}" y="${bodyTop+81}" text-anchor="middle" font-size="6.5"
+        font-family="var(--mono)" fill="var(--faint)">${pin}</text></g>`;
+  });
+
+  /* pump and valve tell-tales on the housing */
+  s += `<circle cx="163" cy="${bodyTop+bodyH-8}" r="4"
+      fill="${S.MOT?'var(--accent)':'#cfd5de'}"/>
+    <text x="173" y="${bodyTop+bodyH-5}" font-size="7.5" fill="var(--faint)">${t("map.pump").toUpperCase()}</text>
+    <circle cx="215" cy="${bodyTop+bodyH-8}" r="4"
+      fill="${S.YV?'var(--warn)':'#cfd5de'}"/>
+    <text x="225" y="${bodyTop+bodyH-5}" font-size="7.5" fill="var(--faint)">${t("tool.valve")}</text>`;
+  s += `</g>`;   /* end tool */
+
+  /* airflow: in while pumping on a seal, out while venting */
+  const flowIn = S.MOT && plant.pad, flowOut = S.YV;
+  if(flowIn || flowOut){
+    const col = flowOut ? "var(--warn)" : "var(--accent)";
+    const ph  = (anim.phase*(flowOut?2.4:1.8))%26;
+    for(let i=0;i<3;i++){
+      const o = ((ph+i*9)%26);
+      const d = flowOut ? o : 26-o;
+      const yy = padTop+padH/2+ty;
+      s += `<path d="M${padX-6-d},${yy-5} l-6,5 l6,5" fill="none" stroke="${col}"
+          stroke-width="2" stroke-linecap="round" opacity="${(0.8-d/34).toFixed(2)}"
+          transform="${flowIn?`rotate(180 ${padX-6-d} ${yy})`:''}"/>`;
+      s += `<path d="M${padX+padW+6+d},${yy-5} l6,5 l-6,5" fill="none" stroke="${col}"
+          stroke-width="2" stroke-linecap="round" opacity="${(0.8-d/34).toFixed(2)}"
+          transform="${flowIn?`rotate(180 ${padX+padW+6+d} ${yy})`:''}"/>`;
+    }
+  }
+
+  /* lift gap */
+  if(lift>6){
+    s += `<line x1="530" y1="${SLAB_TOP+SLAB_H+sy}" x2="530" y2="${FLOOR}"
+        stroke="var(--accent)" stroke-width="1" stroke-dasharray="3 3"/>
+      <text x="524" y="${FLOOR-lift/2+8}" text-anchor="end" font-size="9"
+        font-family="var(--mono)" fill="var(--accent)">${t("tool.lifted")}</text>`;
+  }
+  if(dropFlash>0)
+    s += `<text x="280" y="${FLOOR+28}" text-anchor="middle" font-size="12" font-weight="700"
+        fill="var(--bad)" opacity="${Math.min(1,dropFlash).toFixed(2)}">LOAD DROPPED</text>`;
+
+  document.getElementById("tool").innerHTML = s;
+
+  /* caption */
+  const surf=document.getElementById("surface").value;
+  let cap;
+  if(S.phase==="off")            cap=t("cap.off");
+  else if(S.phase==="boot")      cap=t("cap.boot",S.su.frame);
+  else if(S.phase==="shutdown")  cap=t("cap.shutdown");
+  else if(carrying)              cap=t("cap.carrying",VSEN());
+  else if(plant.lifted)          cap=t("cap.inAir");
+  else if(plant.pad)             cap=t("cap.onSurface",t("surf."+surf),VSEN(),
+                                       S.MOT?t("cap.pumpRunning"):"");
+  else                           cap=t("cap.offSurface");
+  document.getElementById("toolCap").innerHTML=cap;
+}
+
+/* =====================================================================
+   10. RENDER: component map
+   ===================================================================== */
+const MAP_IN=[
+  ["SW_IN","PA15",()=>SW_IN(),()=>io.pwr,"map.powerBtn"],
+  ["KEY_MOT","PB3",()=>Key_MOT(),()=>io.mot,"map.pumpBtn"],
+  ["KEY_YV","PA6",()=>Key_YV(),()=>io.yv,"map.relBtn"],
+  ["VSEN","PB0",()=>VSEN(),()=>VSEN()>5,"map.sensor"],
+  ["VBAT","PA1",()=>VBAT(),()=>false,"map.batSense"],
+  ["USB_IN","PB5",()=>USB_IN(),()=>USB_IN()===1,"map.usbDet"],
+  ["CH_FG","PA4",()=>CH_FG(),()=>CH_FG()===1,"map.chgFlag"]
+];
+const MAP_OUT=[
+  ["MOT","PA5",()=>S.MOT,()=>S.MOT===1,"map.motor"],
+  ["YV","PA7",()=>S.YV,()=>S.YV===1,"map.valve"],
+  ["TM1640","PA2/PA3",()=>t(S.tm.some(b=>b)?"map.active":"map.idle"),
+    ()=>S.tm.some(b=>b),"map.display"],
+  ["LDO_EN","PB4",()=>S.ldo,()=>S.ldo===1,"map.rail"],
+  ["V_BAT_MOS","PA0",()=>1,()=>true,"map.mosfet"]
+];
+function renderMap(){
+  const NW=126, NH=34, MX=248, MW=144, MY=52, MH=340;
+  let s="";
+  s += `<text class="lbl" x="8" y="16">${t("map.inputs")}</text>`;
+  s += `<text class="lbl" x="${MX+4}" y="16">${t("map.mcu")}</text>`;
+  s += `<text class="lbl" x="${MX+MW+34}" y="16">${t("map.outputs")}</text>`;
+  s += `<g class="mcu"><rect x="${MX}" y="${MY}" width="${MW}" height="${MH}" rx="10"/>
+    <text x="${MX+MW/2}" y="${MY+30}" text-anchor="middle" font-size="13" font-weight="700">CH32L103</text>
+    <text x="${MX+MW/2}" y="${MY+48}" text-anchor="middle" font-size="9.5"
+      fill="#9ca3af" font-family="var(--mono)">RISC-V &middot; 10 ms task</text>
+    <text x="${MX+MW/2}" y="${MY+MH-52}" text-anchor="middle" font-size="9.5"
+      fill="#9ca3af" font-family="var(--mono)">KEY_MOT_state()</text>
+    <text x="${MX+MW/2}" y="${MY+MH-38}" text-anchor="middle" font-size="9.5"
+      fill="#9ca3af" font-family="var(--mono)">MOT_run()</text>
+    <text x="${MX+MW/2}" y="${MY+MH-24}" text-anchor="middle" font-size="9.5"
+      fill="#9ca3af" font-family="var(--mono)">Show_Temp()</text></g>`;
+
+  const draw=(list,side)=>list.map((n,i)=>{
+    const [nm,pin,val,hotf,descKey]=n;
+    const y = MY + 16 + i*((MH-40)/Math.max(list.length,1));
+    const x = side<0 ? 8 : MX+MW+34;
+    const hot = hotf();
+    const wx1 = side<0 ? x+NW : x, wx2 = side<0 ? MX : MX+MW;
+    return `<g class="node ${hot?'hot':''}">
+      <rect x="${x}" y="${y}" width="${NW}" height="${NH}" rx="7"/>
+      <text class="nm" x="${x+9}" y="${y+14}">${nm}</text>
+      <text class="pin" x="${x+NW-9}" y="${y+14}" text-anchor="end">${pin}</text>
+      <text class="val" x="${x+9}" y="${y+26}">${t(descKey)}</text>
+      <text class="val" x="${x+NW-9}" y="${y+26}" text-anchor="end">${val()}</text>
+    </g>
+    <path class="wire ${hot?'hot':''}" d="M${wx1},${y+NH/2} L${wx2},${y+NH/2}"/>
+    <circle cx="${wx2}" cy="${y+NH/2}" r="2.6" fill="${hot?'var(--accent)':'var(--line2)'}"/>`;
+  }).join("");
+
+  s += draw(MAP_IN,-1) + draw(MAP_OUT,1);
+  s += `<text class="lbl" x="8" y="${MY+MH+34}">${t("map.pneu")}</text>`;
+  const pOn=S.MOT===1, vOn=S.YV===1;
+  s += `<g class="node ${pOn?'hot':''}"><rect x="8" y="${MY+MH+42}" width="112" height="30" rx="7"/>
+    <text class="nm" x="17" y="${MY+MH+62}">${t("map.pump")}</text>
+    <text class="val" x="111" y="${MY+MH+62}" text-anchor="end">${t(pOn?"map.running":"map.off")}</text></g>`;
+  s += `<g class="node ${vOn?'hot':''}"><rect x="132" y="${MY+MH+42}" width="122" height="30" rx="7"/>
+    <text class="nm" x="141" y="${MY+MH+62}">${t("map.solenoid")}</text>
+    <text class="val" x="245" y="${MY+MH+62}" text-anchor="end">${t(vOn?"map.open":"map.shut")}</text></g>`;
+  s += `<g class="node ${plant.pad?'hot':''}"><rect x="266" y="${MY+MH+42}" width="112" height="30" rx="7"/>
+    <text class="nm" x="275" y="${MY+MH+62}">${t("map.pad")}</text>
+    <text class="val" x="369" y="${MY+MH+62}" text-anchor="end">${t(plant.pad?"map.onSurface":"map.free")}</text></g>`;
+  s += `<g class="node"><rect x="390" y="${MY+MH+42}" width="140" height="30" rx="7"/>
+    <text class="nm" x="399" y="${MY+MH+62}">${t("map.vacuum")}</text>
+    <text class="val" x="521" y="${MY+MH+62}" text-anchor="end">${VSEN()} / 135</text></g>`;
+  document.getElementById("map").innerHTML = s;
+}
+
+/* =====================================================================
+   11. RENDER: state table + chart + log
+   ===================================================================== */
+function pill(txt,cls){ return `<span class="pill ${cls||''}">${txt}</span>`; }
+function renderState(){
+  const tc=(S.tick*K.TICK_MS/1000).toFixed(2);
+  const stallLeft = S.stall.primed ? ((K.STALL_TICKS-S.stall.ticks)*K.TICK_MS/1000).toFixed(2) : "--";
+  const rows=[
+    [t("st.phase"), S.phase==="run"?pill(t("v.running"),"g"):S.phase==="boot"?pill(t("v.booting"),"a")
+      :S.phase==="shutdown"?pill(t("v.shuttingDown"),"w"):pill(t("v.off"))],
+    [t("st.clock"), tc+" s &nbsp;<span style='color:var(--faint)'>"+S.tick+" "+t("st.ticks")+"</span>"],
+    ["&nbsp;",""],
+    [t("st.boot"),""],
+    [t("st.ringFrame"), S.su.frame+" / "+K.SU_FRAMES],
+    ["LDO_EN", S.ldo?pill(t("v.on"),"a"):pill(t("v.off"))],
+    ["&nbsp;",""],
+    [t("st.pump"),""],
+    [t("st.latch"), S.MOT_latch?pill("1","a"):pill("0")],
+    [t("st.startedBy"), S.MOT_latch ? (S.autostart_run?pill(t("v.autostart"),"a"):pill(t("v.hand"),"g")) : pill(t("v.dash"))],
+    [t("st.motOut"), S.MOT?pill(t("v.energized"),"a"):pill(t("v.off"))],
+    [t("st.riseWindow"), S.rise.primed
+      ? (S.rise.hist[S.rise.idx]+" &rarr; "+VSEN())
+      : pill(t("v.reset"))],
+    [t("st.noSealTimer"), FW.hasStall && S.autostart_run && S.stall.primed && VSEN()<K.STALL_NO_SEAL
+      ? (t("st.left",stallLeft)+"<div class='bar w'><i style='width:"
+         +(100*S.stall.ticks/K.STALL_TICKS)+"%'></i></div>")
+      : pill(!FW.hasStall?t("fw.absent"):S.autostart_run?(VSEN()>=K.STALL_NO_SEAL?t("v.disarmedSealed"):t("v.idle")):t("v.na"))],
+    [t("st.band"), S.stall.primed
+      ? (S.stall.low+" / "+S.stall.high+" &nbsp;<span style='color:var(--faint)'>&lt;"
+         +stallDelta()+"</span>") : t("v.dash")],
+    [t("st.pumpHeld"), S.KEY_cnt>0
+      ? (t("st.of",(S.KEY_cnt/100).toFixed(2),"3.00 s")
+         +"<div class='bar w'><i style='width:"+(100*Math.min(1,S.KEY_cnt/300))+"%'></i></div>")
+      : pill(t("v.dash"))],
+    [t("st.low20"), (S.tool_10s_off_cnt/100).toFixed(2)+" s"],
+    [t("st.postMax"), S.MOT_run_cnt>0
+      ? t("st.of",(S.MOT_run_cnt*K.TICK_MS/1000).toFixed(2),"0.50 s") : pill(t("v.dash"))],
+    ["&nbsp;",""],
+    [t("st.release"),""],
+    [t("st.firstPress"), S.rel_first
+      ? pill(t("v.armedFor",((K.REL_WINDOW-S.rel_win)*K.TICK_MS/1000).toFixed(2)),"a")
+      : pill(t("v.no"))],
+    [t("st.relActive"), S.rel_active
+      ? pill(t("v.sOf10",((K.REL_SOLENOID-S.rel_active_cnt)*K.TICK_MS/1000).toFixed(2)),"a")
+      : pill(t("v.no"))],
+    [t("st.yvOut"), S.YV?pill(t("v.open"),"a"):pill(t("v.shut"))],
+    ["&nbsp;",""],
+    [t("st.display"),""],
+    [t("st.reading"), VSEN()+" &nbsp;<span style='color:var(--faint)'>"+t("st.shown",S.val_temp)+"</span>"],
+    [t("st.logoMode"), pill(t(["v.followAlarm","v.steady","v.fastBlink","v.slowBlink"][S.logo_mode]))],
+    [t("st.presAlarm"), S.flick_p?pill(t("v.blinking"),"w"):pill(t("v.off"))],
+    [t("st.errBlink"), S.flick_sd?pill(t("v.err"),"b"):pill(t("v.off"))]
+  ];
+  document.getElementById("stTbl").innerHTML = rows.map(([k,v])=>
+    v==="" ? `<tr><td colspan="2" style="padding-top:7px">${k}</td></tr>`
+           : `<tr><td class="k">${k}</td><td class="v">${v}</td></tr>`).join("");
+}
+function renderChart(){
+  const W=900,H=220,pad=28;
+  if(hist.length<2){ document.getElementById("chart").innerHTML=""; return; }
+  const n=hist.length, x=i=>pad+(W-pad-8)*i/(n-1), y=v=>H-30-(H-58)*Math.min(v,150)/150;
+  let d="", s="";
+  /* One point per horizontal unit is plenty; drawing all 1400 was the single
+     most expensive thing on the frame and it is what pushed the tick loop off
+     real time. */
+  const step=Math.max(1,Math.floor(n/460));
+  for(let i=0;i<n;i+=step) d += (d?"L":"M")+x(i).toFixed(1)+","+y(hist[i].p).toFixed(1);
+  d += "L"+x(n-1).toFixed(1)+","+y(hist[n-1].p).toFixed(1);
+  [135,10].forEach(v=>{
+    s += `<line x1="${pad}" y1="${y(v)}" x2="${W-8}" y2="${y(v)}" stroke="var(--line)"
+      stroke-dasharray="4 4"/><text x="${pad-4}" y="${y(v)+3}" text-anchor="end"
+      font-size="9" fill="var(--faint)" font-family="var(--mono)">${v}</text>`;
+  });
+  // output ribbons
+  /* Merge contiguous runs into one rect each instead of one rect per sample.
+     With 1400 samples the naive version emitted up to 1400 nodes per frame. */
+  const band=(key,yy,col,label)=>{
+    let r="", i=0;
+    while(i<n){
+      if(!hist[i][key]){ i++; continue; }
+      const a=i;
+      while(i<n && hist[i][key]) i++;
+      const x0=x(a), x1=x(Math.min(i,n-1));
+      r += `<rect x="${x0.toFixed(1)}" y="${yy}" width="${Math.max(0.8,x1-x0).toFixed(1)}"
+        height="7" fill="${col}"/>`;
+    }
+    return r+`<text x="${pad-4}" y="${yy+7}" text-anchor="end" font-size="9"
+      fill="var(--faint)" font-family="var(--mono)">${label}</text>`;
+  };
+  s += band("m",H-20,"var(--accent)","MOT") + band("y",H-10,"var(--warn)","YV");
+  s += `<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.8"/>`;
+  s += `<text x="${W-8}" y="14" text-anchor="end" font-size="10" fill="var(--muted)">
+    ${t("chart.window",(n*K.TICK_MS/1000).toFixed(1))}</text>`;
+  document.getElementById("chart").innerHTML=s;
+}
+function renderLog(){
+  const el=document.getElementById("log");
+  const near = el.scrollTop+el.clientHeight >= el.scrollHeight-30;
+  el.innerHTML = logLines.slice(-160).map(l=>
+    `<div><span class="t">${l.t.toFixed(2)}</span><span class="m ${l.c}">${t(l.k,...l.a)}</span></div>`).join("");
+  if(near) el.scrollTop=el.scrollHeight;
+}
+function render(){ animStep(); renderTool(); renderMap(); renderState(); renderChart(); renderLog(); }
+
+/* =====================================================================
+   12. LOOP + INPUT
+   ===================================================================== */
+let speed=1, acc=0, last=null;
+/*
+ * Two requirements pull against each other here.
+ *
+ * The sim must keep wall-clock time, or a hold measured in seconds never
+ * reaches its tick count: clamping dt made the clock run at ~88% of real time,
+ * so a 3 s hold on PUMP produced 276 ticks and the 300-tick power-off could
+ * never fire.
+ *
+ * But it must also never fast-forward through held input, or one delayed frame
+ * runs hundreds of ticks while sampling whatever the buttons read at that
+ * instant, and a quick tap on POWER completes the 2 s boot hold.
+ *
+ * So: keep every millisecond (no dt clamp), but drain at most MAX_TICKS_PER_FRAME
+ * per frame and leave the rest in the accumulator. Mouse events are delivered
+ * between frames, so a release is always seen within a few ticks. The backlog
+ * itself is capped, so a long stall or a hidden tab is dropped rather than
+ * replayed.
+ */
+/*
+ * The tick loop is DECOUPLED from rendering. While the two shared a
+ * requestAnimationFrame callback, the sim clock was hostage to how fast the
+ * page could draw: on a loaded machine it ran at 88% of real time, so a 3 s
+ * hold on PUMP produced only ~276 of the 300 ticks the power-off needs and the
+ * tool simply would not switch off. Ticks are microseconds of work, drawing is
+ * not, so they belong on separate clocks. If the machine cannot keep up now,
+ * the picture lags and the simulated clock stays true.
+ */
+/* MAX_TICKS_PER_STEP is the safety property, not the backlog size: at 4 ticks a
+   callback the loop can never burn a 200-tick hold before the browser delivers
+   the matching mouseup, so time can be recovered generously without letting a
+   tap boot the tool. */
+const MAX_TICKS_PER_STEP = 4;      // per timer callback, ~100 callbacks/s
+const MAX_BACKLOG_MS = 500;        // recover this much lost time, drop the rest
+function simStep(){
+  if(speed<=0){ last=null; acc=0; return; }
+  const now=performance.now();
+  if(last===null) last=now;
+  const dt=now-last; last=now;
+  acc += dt*speed;
+  if(acc>MAX_BACKLOG_MS) acc=MAX_BACKLOG_MS;
+  let guard=0;
+  while(acc>=K.TICK_MS && guard<MAX_TICKS_PER_STEP){
+    acc-=K.TICK_MS; runScenario(); tick(); guard++;
+  }
+}
+setInterval(simStep, K.TICK_MS);
+/* Hidden tabs throttle timers to about once a second. Drop that gap rather than
+   replaying it, so nothing runs against input that has long since changed. */
+document.addEventListener("visibilitychange",()=>{ last=null; acc=0; });
+
+function frame(){
+  render();
+  requestAnimationFrame(frame);
+}
+/* The sketch is re-rendered every frame, so bind by delegation rather than to
+   elements that are about to be replaced. */
+const toolSvg=document.getElementById("tool");
+function btnDown(e){
+  const t=e.target.closest("[data-btn]");
+  if(!t) return;
+  e.preventDefault();
+  io[t.dataset.btn]=1;
+}
+function btnUp(){ io.pwr=0; io.mot=0; io.yv=0; }
+toolSvg.addEventListener("mousedown",btnDown);
+toolSvg.addEventListener("touchstart",btnDown,{passive:false});
+window.addEventListener("mouseup",btnUp);
+window.addEventListener("touchend",btnUp);
+
+document.getElementById("padBtn").addEventListener("click",()=>padPlace(!plant.pad));
+document.getElementById("liftBtn").addEventListener("click",()=>liftTool(!plant.lifted));
+document.getElementById("padNudgeBtn").addEventListener("click",()=>padNudge());
+
+document.getElementById("langSeg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  setLang(b.dataset.lang);
+});
+document.getElementById("fwSel").addEventListener("change",e=>{
+  const fw=FW_LIST.find(f=>f.id===e.target.value);
+  if(fw) applyFirmware(fw);
+});
+document.getElementById("fwFileBtn").onclick=()=>document.getElementById("fwFiles").click();
+document.getElementById("fwDirBtn").onclick =()=>document.getElementById("fwDir").click();
+document.getElementById("fwFiles").addEventListener("change",e=>{
+  loadFirmwareFiles(e.target.files); e.target.value=""; });
+document.getElementById("fwDir").addEventListener("change",e=>{
+  loadFirmwareFiles(e.target.files); e.target.value=""; });
+document.getElementById("spdSeg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  speed=+b.dataset.spd;
+  [...e.currentTarget.children].forEach(c=>c.classList.toggle("on",c===b));
+});
+document.getElementById("stepBtn").onclick=()=>{ tick(); render(); };
+document.getElementById("resetBtn").onclick=()=>{ scenario=null; reset(); };
+document.getElementById("noise").oninput=e=>document.getElementById("noiseV").textContent=e.target.value;
+document.getElementById("stallDelta").oninput=e=>
+  document.getElementById("stallDeltaV").textContent=e.target.value;
+document.getElementById("bat").oninput=e=>document.getElementById("batV").textContent=e.target.value;
+
+/* =====================================================================
+   13. SCENARIOS
+   ===================================================================== */
+const SCENARIOS=[
+  /* 0 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}]],
+  /* 1 */ [[0,s=>{io.pwr=1}],[100,s=>{io.pwr=0}]],
+  /* 2 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}]],
+  /* 3 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("none")}],
+    [240,s=>{padPlace(true)}]],
+  /* 4 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [900,s=>{io.mot=1}],[906,s=>{io.mot=0}],[1000,s=>{padNudge()}]],
+  /* 5 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [700,s=>{io.yv=1}],[706,s=>{io.yv=0}]],
+  /* 6 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [700,s=>{io.yv=1}],[706,s=>{io.yv=0}],[730,s=>{io.yv=1}],[736,s=>{io.yv=0}]],
+  /* 7 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[260,s=>{io.mot=1}],[580,s=>{io.mot=0}]],
+  /* 8 */ [[0,s=>{io.pwr=1}],[8,s=>{io.pwr=0}]],
+  /* 9 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[260,s=>{io.mot=1}],[580,s=>{io.mot=0}],
+    [900,s=>{io.pwr=1}],[1120,s=>{io.pwr=0}]],
+  /* 10 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [900,s=>{liftTool(true)}]],
+  /* 11 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [244,s=>{liftTool(true)}]],
+  /* 12 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("good")}],[240,s=>{padPlace(true)}],
+    [900,s=>{liftTool(true)}],[1000,s=>{io.yv=1}],[1006,s=>{io.yv=0}],
+    [1030,s=>{io.yv=1}],[1036,s=>{io.yv=0}]],
+  /* 13 */ [[0,s=>{io.pwr=1}],[215,s=>{io.pwr=0}],[230,s=>{surf("leaky")}],[240,s=>{padPlace(true)}],
+    [900,s=>{liftTool(true)}],[950,s=>{io.mot=1}],[956,s=>{io.mot=0}]]
+];
+function surf(v){ document.getElementById("surface").value=v; }
+let scenario=null, scenStart=0, scenIdx=0;
+function runScenario(){
+  if(!scenario) return;
+  while(scenIdx<scenario.length && S.tick-scenStart>=scenario[scenIdx][0]){
+    scenario[scenIdx][1](); scenIdx++;
+  }
+  if(scenIdx>=scenario.length) scenario=null;
+}
+function buildScenarioButtons(){
+  document.getElementById("scen").innerHTML = SCENARIOS.map((_,i)=>
+    `<button data-i="${i}">${t("sc."+i+".n")}</button>`).join("");
+  const n=document.getElementById("scenNote");
+  if(n && !n.dataset.active) n.innerHTML=t("scen.note");
+  else if(n && n.dataset.active) n.innerHTML=scenNoteHtml(+n.dataset.active);
+}
+function scenNoteHtml(i){
+  return "<b>"+t("sc."+i+".n")+"</b> &middot; "+t("sc."+i+".d");
+}
+document.getElementById("scen").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  const i=+b.dataset.i, steps=SCENARIOS[i];
+  reset(); io={pwr:0,mot:0,yv:0}; plant={p:0,blip:0,pad:0,lifted:0}; syncPadBtn();
+  scenario=steps; scenStart=S.tick; scenIdx=0;
+  if(speed===0){ speed=1; [...document.getElementById("spdSeg").children]
+    .forEach(c=>c.classList.toggle("on",c.dataset.spd==="1")); }
+  const nEl=document.getElementById("scenNote");
+  nEl.dataset.active=i; nEl.innerHTML=scenNoteHtml(i);
+  logEvent("log.scenario","fw",t("sc."+i+".n"));
+});
+
+/* =====================================================================
+   14. DEEP LINKS  ?scenario=<n>&ticks=<n>&ver=v2|v3&noise=<n>
+   Lets a link open straight on a scenario, and lets the page be rendered
+   at a fixed point in time without waiting on real-time animation.
+   ===================================================================== */
+function applyQuery(){
+  const q=new URLSearchParams(location.search);
+  if(q.has("ver")){
+    const fw=FW_LIST.find(f=>f.id===(q.get("ver")==="v2"?"v2":"v3"));
+    if(fw) applyFirmware(fw, true);
+  }
+  if(q.has("noise")){
+    const n=String(Math.max(0,Math.min(3,+q.get("noise")||0)));
+    document.getElementById("noise").value=n;
+    document.getElementById("noiseV").textContent=n;
+  }
+  if(q.has("delta")){
+    const d=String(Math.max(1,Math.min(10,+q.get("delta")||3)));
+    document.getElementById("stallDelta").value=d;
+    document.getElementById("stallDeltaV").textContent=d;
+  }
+  if(q.has("scenario")){
+    const i=+q.get("scenario");
+    if(SCENARIOS[i]){
+      scenario=SCENARIOS[i]; scenStart=S.tick; scenIdx=0;
+      const nEl=document.getElementById("scenNote");
+      nEl.dataset.active=i; nEl.innerHTML=scenNoteHtml(i);
+      logEvent("log.scenario","fw",t("sc."+i+".n"));
+    }
+  }
+  /* ?press=pwr:0-10,mot:50-400,pad:120-  drives inputs on exact ticks, which is
+     how any reported behaviour gets reproduced without real-time clicking. */
+  if(q.has("press")){
+    const steps=[];
+    q.get("press").split(",").forEach(seg=>{
+      const [k,range]=seg.split(":");
+      if(!range) return;
+      const [a,b]=range.split("-");
+      const from=+a, to=(b===undefined||b==="")?null:+b;
+      if(k==="lift"){
+        steps.push([from,()=>liftTool(true)]);
+        if(to!==null) steps.push([to,()=>liftTool(false)]);
+      } else if(k==="nudge"){
+        steps.push([from,()=>padNudge()]);
+      } else if(k==="pad"){
+        steps.push([from,()=>padPlace(true)]);
+        if(to!==null) steps.push([to,()=>padPlace(false)]);
+      } else if(k==="surface"){
+        steps.push([from,()=>surf(b)]);
+      } else if(["pwr","mot","yv"].includes(k)){
+        steps.push([from,()=>{io[k]=1}]);
+        if(to!==null) steps.push([to,()=>{io[k]=0}]);
+      }
+    });
+    steps.sort((x,y)=>x[0]-y[0]);
+    scenario=steps; scenStart=S.tick; scenIdx=0;
+    document.getElementById("scenNote").textContent="scripted input: "+q.get("press");
+  }
+  const n=Math.max(0,Math.min(60000,+q.get("ticks")||0));
+  for(let i=0;i<n;i++){ runScenario(); tick(); }
+  if(q.get("speed")!==null){
+    speed=+q.get("speed")||0;
+    [...document.getElementById("spdSeg").children]
+      .forEach(c=>c.classList.toggle("on",c.dataset.spd===String(speed)));
+  }
+}
+
+(function init(){
+  let l="cn";
+  try{ l=localStorage.getItem("vacsim.lang")||"cn"; }catch(e){}
+  const q=new URLSearchParams(location.search);
+  if(q.has("lang")) l=q.get("lang")==="en"?"en":"cn";
+  reset();
+  applyFirmware(FW_V3, true);
+  setLang(l);
+  applyQuery();
+  render();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

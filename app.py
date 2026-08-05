@@ -32,7 +32,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               FileResponse, Response, StreamingResponse)
 from pydantic import BaseModel, Field
 import openai
 import uvicorn
@@ -1192,8 +1193,10 @@ var GERR={domain:'That Google account is not allowed. Use your company Google ac
           failed:'Google sign-in failed — please try again.'};
 if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
 /* Carry the deep link through the login so signing in from e.g. a noVNC viewer
-   URL lands back on the viewer instead of the dashboard home. */
-var nxt=location.pathname+location.search;
+   URL lands back on the viewer instead of the dashboard home. An explicit
+   ?next= wins: that is how a sibling app on rotem.ai (Analytics, ...) asks to
+   be returned to, since its own URL is not the one showing this page. */
+var nxt=q.get('next')||location.pathname+location.search;
 document.getElementById('next').value=nxt;
 var g=document.getElementById('gbtn');
 if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
@@ -1233,7 +1236,9 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # The mic is allowed for our own origin only: the WeChat desktop viewer needs
+    # getUserMedia to put you inside a call. Camera and geolocation stay off.
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
     # CSP: allow inline scripts/styles (needed for the embedded single-page HTML) and blob: for xterm.js
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
@@ -1336,6 +1341,11 @@ async def auth_middleware(request: Request, call_next):
     # Google sign-in: both legs run before there is a session cookie.
     if "/auth/google/" in path:
         return await call_next(request)
+    # The vacuum-lifter simulator is public at Nimo's request (2026-07-30). It is
+    # a read-only page with no data behind it, but note it does put the firmware's
+    # thresholds and the CH32L103 pin map on the open internet.
+    if path in ("/vacuum-sim", rp + "/vacuum-sim"):
+        return await call_next(request)
     # Public project serving: /<username>/<project>[/...] is served publicly (the
     # /<username> project-list page itself stays gated below).
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
@@ -1401,6 +1411,29 @@ def _check_login_rate_limit(ip: str) -> bool:
     for k in stale:
         del _login_attempts[k]
     return True
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    """Serve the sign-in page.
+
+    The auth middleware already returns this HTML for any gated path, but
+    ``/login`` itself is exempt from it (POST /login has to work while signed
+    out) — so without this route a plain ``GET /login`` 404s. That is exactly
+    where ``/logout`` sends you, and where the sibling apps on rotem.ai send a
+    lapsed session, so both landed on a 404 until now.
+
+    ``?next=`` is honoured, which is how a sibling app gets the user back to
+    the page they actually asked for.
+    """
+    nxt = (request.query_params.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = request.scope.get("root_path", "") + "/"
+    if _check_token(request.cookies.get("tmux_auth")):
+        return RedirectResponse(url=nxt, status_code=303)
+    resp = HTMLResponse(_login_page())
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.post("/login")
@@ -2173,196 +2206,158 @@ async def api_unimpersonate(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API registry — a managed catalog of all external API keys/services (Brave,
-# SerpApi, ScrapingBee, OpenAI, Anthropic, …) with plan/limit/cost notes and,
-# where the provider exposes one, a LIVE usage fetch so you can see how close to
-# the limit you are. Admin-only. Secrets never live in git: the seed below is
-# metadata only, and actual key values are hydrated at first run from
-# ~/CLAUDE_API_KEYS.md (or the environment). Once seeded, the full records live
-# in ~/.tmux-dashboard/api_registry.json (chmod 600, not in the repo).
-# ─────────────────────────────────────────────────────────────────────────────
+# API registry: the managed catalog of external API keys/services, with
+# plan/limit/cost notes and, where the provider exposes one, a LIVE usage fetch
+# so you can see how close to the limit you are. Admin-only.
+#
+# 2026-07-30: the catalogue MOVED OFF THIS HOST. Every value now lives in the
+# advisor (hk-proxy, https://advisor.rotem.ai), which all four builder
+# dashboards share; the old ~/CLAUDE_API_KEYS.md seed and
+# ~/.tmux-dashboard/api_registry.json are gone. Nothing below stores a key.
+# ──────────────────────────────────────────────────────────────────────────────
 import urllib.error
-
-API_REGISTRY_FILE = MESSAGES_DIR / "api_registry.json"
-_CLAUDE_API_KEYS_MD = Path.home() / "CLAUDE_API_KEYS.md"
-
-# Metadata-only seed (NO secret values). key_label is a substring hint used to
-# pick the right value when one env var appears multiple times in the md file.
-_API_SEED = [
-    # ── Search & Scrape ──────────────────────────────────────────────────────
-    {"seed_id": "brave", "name": "Brave Search", "provider": "brave", "category": "search",
-     "env_var": "BRAVE_API_KEY", "key_label": "", "plan": "Free/Data-for-Search",
-     "limits": "Free: ~2,000 q/mo · 1 q/s", "costs": "Free tier / from $3 CPM",
-     "usage_provider": "brave", "docs_url": "https://api-dashboard.search.brave.com/app/documentation",
-     "dashboard_url": "https://api-dashboard.search.brave.com/", "notes": "Web search API. Live rate-limit headers read on each fetch."},
-    {"seed_id": "serpapi", "name": "SerpApi", "provider": "serpapi", "category": "search",
-     "env_var": "SERPAPI_KEY", "key_label": "", "plan": "Production",
-     "limits": "15,000 searches/mo · 3,000/hr", "costs": "$150/mo",
-     "usage_provider": "serpapi", "docs_url": "https://serpapi.com/search-api",
-     "dashboard_url": "https://serpapi.com/dashboard", "notes": "Google/Bing/etc SERP scraping. Live usage supported."},
-    {"seed_id": "scrapingbee", "name": "ScrapingBee", "provider": "scrapingbee", "category": "search",
-     "env_var": "SCRAPINGBEE_API_KEY", "key_label": "", "plan": "",
-     "limits": "1,000,000 API credits/mo · 100 concurrency", "costs": "paid plan",
-     "usage_provider": "scrapingbee", "docs_url": "https://www.scrapingbee.com/documentation/",
-     "dashboard_url": "https://app.scrapingbee.com/dashboard", "notes": "Headless-browser scraping + JS render (SocialPanel gated-platform metrics). Live usage supported."},
-    {"seed_id": "firecrawl", "name": "Firecrawl", "provider": "firecrawl", "category": "search",
-     "env_var": "FIRECRAWL_API_KEY", "key_label": "", "plan": "",
-     "limits": "100,000 credits/period", "costs": "paid plan",
-     "usage_provider": "firecrawl", "docs_url": "https://docs.firecrawl.dev/",
-     "dashboard_url": "https://www.firecrawl.dev/app", "notes": "Crawl → markdown/JSON. Live usage supported."},
-    {"seed_id": "linkup", "name": "Linkup", "provider": "linkup", "category": "search",
-     "env_var": "LINKUP_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "linkup", "docs_url": "https://docs.linkup.so/",
-     "dashboard_url": "https://app.linkup.so/", "notes": "AI web search. Live credit balance supported."},
-    {"seed_id": "exa", "name": "Exa", "provider": "exa", "category": "search",
-     "env_var": "EXA_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "exa", "docs_url": "https://docs.exa.ai/",
-     "dashboard_url": "https://dashboard.exa.ai/", "notes": "Neural/semantic web search. No usage API — check dashboard."},
-    {"seed_id": "jina", "name": "Jina AI", "provider": "jina", "category": "search",
-     "env_var": "JINA_API_KEY", "key_label": "", "plan": "",
-     "limits": "token-based wallet", "costs": "pay-as-you-go",
-     "usage_provider": "jina", "docs_url": "https://jina.ai/reader/",
-     "dashboard_url": "https://jina.ai/api-dashboard/", "notes": "Reader (r.jina.ai) + embeddings + reranker. Live wallet balance supported."},
-    {"seed_id": "tavily", "name": "Tavily", "provider": "tavily", "category": "search",
-     "env_var": "TAVILY_API_KEY", "key_label": "", "plan": "Dev",
-     "limits": "credit-based", "costs": "free dev tier",
-     "usage_provider": "tavily", "docs_url": "https://docs.tavily.com/",
-     "dashboard_url": "https://app.tavily.com/", "notes": "AI search API. Live usage attempted."},
-    {"seed_id": "valyu", "name": "Valyu", "provider": "valyu", "category": "search",
-     "env_var": "VALYU_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "valyu", "docs_url": "https://docs.valyu.network/",
-     "dashboard_url": "https://exchange.valyu.network/", "notes": "⚠️ Stored value currently duplicates the Tavily key — looks mislabeled; verify the real Valyu key."},
-    {"seed_id": "mistral", "name": "Mistral", "provider": "mistral", "category": "search",
-     "env_var": "MISTRAL_API_KEY", "key_label": "", "plan": "",
-     "limits": "token/req rate limits", "costs": "pay-as-you-go",
-     "usage_provider": "mistral", "docs_url": "https://docs.mistral.ai/",
-     "dashboard_url": "https://console.mistral.ai/", "notes": "LLM + OCR/document APIs. Key validated live; usage on dashboard."},
-    # ── LLM / AI models ──────────────────────────────────────────────────────
-    {"seed_id": "openai-grabo", "name": "OpenAI (GRABO-data)", "provider": "openai", "category": "llm",
-     "env_var": "OPENAI_API_KEY", "key_label": "GRABO-data", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
-     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20. Hit 429 insufficient_quota 2026-07-17 → Vertex fallback."},
-    {"seed_id": "openai-rotemai", "name": "OpenAI (rotemai)", "provider": "openai", "category": "llm",
-     "env_var": "OPENAI_API_KEY", "key_label": "rotemai", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
-     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20."},
-    {"seed_id": "anthropic-grabo", "name": "Anthropic (grabo-data)", "provider": "anthropic", "category": "llm",
-     "env_var": "ANTHROPIC_API_KEY", "key_label": "grabo-data", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
-     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27. Cost/usage report needs an Admin API key."},
-    {"seed_id": "anthropic-docvault", "name": "Anthropic (docvault-GRABO)", "provider": "anthropic", "category": "llm",
-     "env_var": "ANTHROPIC_API_KEY", "key_label": "docvault", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
-     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27."},
-    {"seed_id": "gemini", "name": "Gemini (Direct API)", "provider": "gemini", "category": "llm",
-     "env_var": "GEMINI_API_KEY", "key_label": "", "plan": "",
-     "limits": "per-model RPM/RPD", "costs": "free tier + pay-as-you-go",
-     "usage_provider": "gemini", "docs_url": "https://ai.google.dev/gemini-api/docs",
-     "dashboard_url": "https://aistudio.google.com/app/apikey", "notes": "Non-Vertex. Project 808242700204, rotated 2026-05-20. Key validated live; usage in Google Cloud console."},
-    {"seed_id": "vertex", "name": "Vertex AI / Gemini (GCE SA)", "provider": "vertex", "category": "llm",
-     "env_var": "", "key_label": "", "plan": "GCP", "limits": "GCP quotas",
-     "costs": "GCP billing (nimo-gpt)", "usage_provider": "vertex",
-     "docs_url": "https://cloud.google.com/vertex-ai/docs", "dashboard_url": "https://console.cloud.google.com/vertex-ai",
-     "notes": "No API key — GCE service account nimo-843@nimo-gpt. google.genai(vertexai=True, project='nimo-gpt', location='us-central1'). OpenAI-quota fallback."},
-    # ── Email / Messaging ────────────────────────────────────────────────────
-    {"seed_id": "resend-alphabell", "name": "Resend (alphabell-relay)", "provider": "resend", "category": "mail",
-     "env_var": "RESEND_API_KEY", "key_label": "alphabell", "plan": "",
-     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
-     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
-     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain alphabell.com. Used by alphabell/lisa mail relays."},
-    {"seed_id": "resend-grabo", "name": "Resend (grabo-relay)", "provider": "resend", "category": "mail",
-     "env_var": "RESEND_API_KEY", "key_label": "grabo-relay", "plan": "",
-     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
-     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
-     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain grabo.cc. Used by grabo-mail relay (2026-06-08)."},
-    {"seed_id": "twilio", "name": "Twilio (SMS + phone agent)", "provider": "twilio", "category": "mail",
-     "env_var": "", "key_label": "", "plan": "pay-as-you-go",
-     "limits": "account balance", "costs": "~$208 MTD (2026-07-17)",
-     "usage_provider": "twilio", "docs_url": "https://www.twilio.com/docs",
-     "dashboard_url": "https://console.twilio.com/", "notes": "SID ACe4d65af6… Live creds env-based on builder ~/phoneagent-app/.env (token not stored here). Killed Voice Intelligence auto-transcribe ~$27/day."},
-]
-
-
-def _parse_api_keys_md():
-    """Extract (env_var, label, value) triples from ~/CLAUDE_API_KEYS.md.
-    Lines look like `- SERPAPI_KEY: abc` or `- OPENAI_API_KEY (rotemai): sk-…`."""
-    out = []
-    try:
-        if not _CLAUDE_API_KEYS_MD.exists():
-            return out
-        for line in _CLAUDE_API_KEYS_MD.read_text(errors="replace").splitlines():
-            m = re.match(r"^\s*[-*]?\s*([A-Z][A-Z0-9_]{2,})\s*(?:\(([^)]*)\))?\s*:\s*(\S+)", line)
-            if m:
-                out.append((m.group(1), (m.group(2) or "").strip(), m.group(3).strip()))
-    except Exception:
-        logger.debug("Failed to parse CLAUDE_API_KEYS.md", exc_info=True)
-    return out
-
-
-def _resolve_seed_key(env_var, key_label):
-    """Best-effort hydrate a seed entry's key from the md file, then env."""
-    if not env_var:
-        return ""
-    triples = _parse_api_keys_md()
-    cands = [(lbl, val) for (ev, lbl_, val) in triples for lbl in [lbl_] if ev == env_var]
-    if cands:
-        if key_label:
-            hint = key_label.lower()
-            for lbl, val in cands:
-                if hint in lbl.lower():
-                    return val
-        return cands[0][1]
-    return os.environ.get(env_var, "") or ""
 
 
 def _new_api_id() -> str:
     return "api_" + secrets.token_hex(6)
 
 
-def _seed_api_registry() -> list:
-    items = []
-    for s in _API_SEED:
-        e = dict(s)
-        e["id"] = "api_" + s["seed_id"]
-        e["key"] = _resolve_seed_key(s.get("env_var", ""), s.get("key_label", ""))
-        e["status"] = "active"
-        e["created_at"] = time.time()
-        e["updated_at"] = time.time()
-        items.append(e)
-    return items
+# ── The advisor is the source of truth for every credential ──────────────────
+# No key value is stored on this host any more. The APIs tab reads them from the
+# advisor (hk-proxy, https://advisor.rotem.ai) on demand and writes edits back to
+# it, so all four builder dashboards see the same catalogue. `advisor_cache.json`
+# holds metadata ONLY (never a key) so the tab still renders when the advisor is
+# unreachable.
+ADVISOR_URL = (os.environ.get("ADVISOR_URL") or "https://advisor.rotem.ai").rstrip("/")
+ADVISOR_TOKEN_FILE = Path(os.environ.get("ADVISOR_TOKEN_FILE")
+                          or (Path.home() / ".advisor-token"))
+ADVISOR_META_CACHE = MESSAGES_DIR / "advisor_cache.json"
+_advisor_state = {"ts": 0.0, "items": [], "error": ""}
+_ADVISOR_TTL = 45.0
 
 
-def _load_api_registry() -> list:
-    if API_REGISTRY_FILE.exists():
+def _advisor_token() -> str:
+    try:
+        return ADVISOR_TOKEN_FILE.read_text().strip()
+    except Exception:
+        return os.environ.get("ADVISOR_TOKEN", "").strip()
+
+
+def _advisor_request(path: str, payload: Optional[dict] = None, method: str = "",
+                     timeout: float = 12.0) -> dict:
+    tok = _advisor_token()
+    if not tok:
+        raise RuntimeError("no advisor token (~/.advisor-token)")
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"{ADVISOR_URL}{path}", data=body,
+        method=method or ("POST" if body else "GET"),
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def _advisor_secret_to_entry(s: dict) -> dict:
+    """One advisor credential rendered in the shape the APIs tab expects."""
+    return {
+        "id": "api_" + s.get("name", ""),
+        "advisor_name": s.get("name", ""),
+        "seed_id": s.get("name", ""),
+        "name": s.get("title") or s.get("name", ""),
+        "provider": s.get("provider", ""),
+        "category": s.get("category", "other"),
+        "env_var": s.get("env_var", ""),
+        "key_label": s.get("account", ""),
+        "key": s.get("value", ""),
+        "plan": s.get("plan", ""),
+        "limits": s.get("limits", ""),
+        "costs": s.get("costs", ""),
+        "usage_provider": s.get("provider", ""),
+        "docs_url": s.get("docs_url", ""),
+        "dashboard_url": s.get("dashboard_url", ""),
+        "notes": s.get("notes", ""),
+        "status": s.get("status", "active"),
+        "created_at": s.get("created_at", ""),
+        "updated_at": s.get("updated_at", ""),
+    }
+
+
+def _entry_to_advisor_secret(e: dict) -> dict:
+    # Entries created in this UI carry a random id, so name them off the label.
+    name = e.get("advisor_name") or e.get("seed_id") or \
+        re.sub(r"[^a-z0-9]+", "-", (e.get("name", "") or "").lower()).strip("-") or \
+        (e.get("id", "") or "").replace("api_", "")
+    return {
+        "name": name,
+        "title": e.get("name", ""),
+        "provider": e.get("provider", ""),
+        "category": e.get("category", "other"),
+        "env_var": e.get("env_var", ""),
+        "value": e.get("key", ""),
+        "account": e.get("key_label", ""),
+        "plan": e.get("plan", ""),
+        "limits": e.get("limits", ""),
+        "costs": e.get("costs", ""),
+        "docs_url": e.get("docs_url", ""),
+        "dashboard_url": e.get("dashboard_url", ""),
+        "notes": e.get("notes", ""),
+        "status": e.get("status", "active"),
+    }
+
+
+def _write_advisor_meta_cache(items: list):
+    """Metadata only. A key value must never land on this disk."""
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        safe = [{k: v for k, v in e.items() if k != "key"} for e in items]
+        ADVISOR_META_CACHE.write_text(json.dumps({"apis": safe}, indent=1))
+        ADVISOR_META_CACHE.chmod(0o600)
+    except Exception:
+        logger.debug("advisor metadata cache write failed", exc_info=True)
+
+
+def _load_api_registry(force: bool = False) -> list:
+    now_ts = time.time()
+    if not force and _advisor_state["items"] and now_ts - _advisor_state["ts"] < _ADVISOR_TTL:
+        return _advisor_state["items"]
+    try:
+        data = _advisor_request("/api/catalog")
+        items = [_advisor_secret_to_entry(s) for s in (data.get("secrets") or [])]
+        _advisor_state.update({"ts": now_ts, "items": items, "error": ""})
+        _write_advisor_meta_cache(items)
+        return items
+    except Exception as exc:
+        _advisor_state["error"] = str(exc)[:160]
+        logger.warning("advisor unreachable (%s); serving metadata cache", exc)
+        if _advisor_state["items"]:
+            return _advisor_state["items"]
         try:
-            data = json.loads(API_REGISTRY_FILE.read_text())
-            items = data.get("apis") if isinstance(data, dict) else None
-            if isinstance(items, list):
-                return items
+            cached = json.loads(ADVISOR_META_CACHE.read_text()).get("apis") or []
+            return [dict(e, key="") for e in cached]
         except Exception:
-            logger.exception("Failed to read %s — re-seeding", API_REGISTRY_FILE)
-    items = _seed_api_registry()
-    _save_api_registry(items)
-    return items
+            return []
 
 
 def _save_api_registry(items: list):
+    """Push edits back to the advisor. Nothing is persisted locally."""
+    before = {e.get("id"): e for e in (_advisor_state.get("items") or [])}
+    after = {e.get("id"): e for e in items}
     try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        API_REGISTRY_FILE.write_text(json.dumps({"apis": items}, indent=2))
-        try:
-            API_REGISTRY_FILE.chmod(0o600)
-        except Exception:
-            logger.debug("chmod 600 on api_registry.json failed", exc_info=True)
+        for eid, e in after.items():
+            if before.get(eid) != e:
+                _advisor_request("/api/secrets", _entry_to_advisor_secret(e))
+        for eid, e in before.items():
+            if eid not in after:
+                name = e.get("advisor_name") or (eid or "").replace("api_", "")
+                _advisor_request("/api/secrets",
+                                 dict(_entry_to_advisor_secret(e), status="revoked",
+                                      notes=(e.get("notes", "") + "\nrevoked from the "
+                                             "builder dashboard").strip()))
+                logger.info("advisor: marked %s revoked (delete is a UI-side action)", name)
     except Exception:
-        logger.exception("Failed to save API registry to %s", API_REGISTRY_FILE)
+        logger.exception("Failed to push API changes to the advisor at %s", ADVISOR_URL)
+    _advisor_state["ts"] = 0.0
+    _load_api_registry(force=True)
 
 
 def _mask_key(k: str) -> str:
@@ -10435,6 +10430,18 @@ def _browser_alive(s: dict) -> bool:
     return _browser_port_alive(int(s.get("cdp_port") or 0))
 
 
+def _port_alive(host: str, port: int) -> bool:
+    """Like _browser_port_alive but honours the host — the desktop viewer runs on
+    wechat-voice, not on builder."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            return s.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+
+
 def _next_browser_slot(sessions: list) -> int:
     used = {int(s.get("slot", 0)) for s in sessions}
     k = 1
@@ -10466,6 +10473,139 @@ def _browser_viewer_url(s: dict) -> str:
             "&reconnect=true&reconnect_delay=2000")
 
 
+# ── Android device viewers ───────────────────────────────────────────────────
+# These are NOT noVNC. redroid has no X display, so the Xvfb + x11vnc +
+# websockify + noVNC stack the Chrome sessions above rely on has nothing to
+# attach to. `androidview.py` instead talks to adb directly (screencap for
+# frames, `input` for touch/keys) and serves a plain page. We proxy it here so
+# it inherits this dashboard's admin auth rather than being exposed on its own,
+# and so the Browser tab's iframe preview stays same-origin.
+ANDROID_VIEWERS = {
+    # "host" defaults to builder itself; the desktop client lives on wechat-voice.
+    "wechat-desktop": {
+        "name": "WeChat desktop (voice)",
+        "host": "10.128.0.89",
+        "port": 8716,
+        "notes": "Official WeChat Linux client on wechat-voice, headless on Xvfb with "
+                 "PulseAudio virtual devices so call audio can be bridged to a voice agent. "
+                 "Sign in by scanning the on-screen QR from a phone already on that account.",
+    },
+    "wechat": {
+        "name": "WeChat (Android)",
+        "port": 8713,
+        "notes": "redroid Android 13 on wechat-vm-arm, signed in as 夏天 "
+                 "(Weixin ID Zytoolsbag). Click to tap, drag to swipe.",
+    },
+    "wechat-cn": {
+        "name": "WeChat CN (Android)",
+        "port": 8715,
+        "notes": "redroid Android 13 on wechat-vm-cn, for +86 189 2605 5158. "
+                 "All of its traffic leaves through a Shenzhen residential IP, "
+                 "so WeChat sees a Guangdong consumer connection, not a datacenter. "
+                 "Click to tap, drag to swipe.",
+    },
+}
+
+
+def _android_viewer_url(key: str) -> str:
+    # Trailing slash matters: the viewer page uses relative URLs (frame.jpg,
+    # tap, key), which resolve against the directory, not the parent.
+    return f"{ROOT_PATH}/android/{key}/"
+
+
+async def _android_viewer_rows() -> list:
+    rows = []
+    for key, cfg in ANDROID_VIEWERS.items():
+        rows.append({
+            "id": f"android-{key}",
+            "kind": "android",
+            "name": cfg["name"],
+            "running": await asyncio.to_thread(
+                _port_alive, cfg.get("host", "127.0.0.1"), cfg["port"]),
+            "managed": False,
+            "viewer_url": _android_viewer_url(key),
+            "external_url": _android_viewer_url(key),
+            "notes": cfg["notes"],
+        })
+    return rows
+
+
+@app.get("/android/{key}")
+async def android_viewer_root(key: str, request: Request):
+    if key not in ANDROID_VIEWERS:
+        return JSONResponse({"error": "unknown device"}, status_code=404)
+    return RedirectResponse(url=_android_viewer_url(key), status_code=307)
+
+
+@app.api_route("/android/{key}/{path:path}", methods=["GET", "POST"])
+async def android_viewer_proxy(key: str, request: Request, path: str = ""):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    cfg = ANDROID_VIEWERS.get(key)
+    if not cfg:
+        return JSONResponse({"error": "unknown device"}, status_code=404)
+    url = f"http://{cfg.get('host', '127.0.0.1')}:{cfg['port']}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body() if request.method == "POST" else None
+
+    # Call audio is an endless WAV: buffering it the way we buffer frames would
+    # simply never return, so this one path is relayed chunk by chunk.
+    if path.rsplit("/", 1)[-1] == "audio.wav":
+        client = httpx.AsyncClient(timeout=None)
+
+        async def relay():
+            try:
+                async with client.stream("GET", url) as r:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+            finally:
+                await client.aclose()
+
+        return StreamingResponse(relay(), media_type="audio/wav",
+                                 headers={"Cache-Control": "no-store"})
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.request(
+                request.method, url, content=body,
+                headers={"Content-Type": request.headers.get("content-type",
+                                                             "application/json")}
+                if body else None)
+    except Exception as e:
+        return JSONResponse({"error": f"viewer unreachable: {e}"}, status_code=502)
+    # Pass through only what the page needs; hop-by-hop headers (and any
+    # Content-Length from upstream) must not be copied onto a new body.
+    keep = {"content-type", "x-device-width", "x-device-height"}
+    return Response(
+        content=r.content, status_code=r.status_code,
+        headers={k: v for k, v in r.headers.items() if k.lower() in keep})
+
+
+@app.get("/api/wechat/recording/{cid}.wav")
+async def wechat_call_recording(cid: str, request: Request):
+    """Play back a recorded WeChat call.
+
+    The recordings live on wechat-voice, which is VPC-internal, so the raw URL in
+    a task is not clickable from a browser. This proxies it behind the dashboard's
+    admin auth so the link on the task actually plays.
+    """
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if not re.fullmatch(r"[0-9a-f-]{6,40}", cid or ""):
+        return JSONResponse({"error": "bad id"}, status_code=400)
+    url = f"http://10.128.0.89:8717/recording/{cid}.wav"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.get(url)
+    except Exception as e:
+        return JSONResponse({"error": f"recording unreachable: {e}"}, status_code=502)
+    if r.status_code != 200:
+        return JSONResponse({"error": "no recording"}, status_code=404)
+    return Response(content=r.content, media_type="audio/wav",
+                    headers={"Content-Disposition": f'inline; filename="{cid}.wav"'})
+
+
 class BrowserCreateBody(BaseModel):
     name: str = ""
 
@@ -10492,6 +10632,7 @@ async def api_browser_sessions(request: Request):
         row["last_url"] = str(st.get("url") or "")[:300]
         row["tabs"] = st.get("tabs")
         out.append(row)
+    out.extend(await _android_viewer_rows())
     extra = sum(1 for s in sessions if s.get("managed"))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
@@ -13010,6 +13151,19 @@ async def browser_autopark_watchdog():
     its display, the dashboard driving it, or — the signal this used to miss —
     any process holding a CDP socket open to it, which is what an agent's browser
     tool does for as long as it is working.
+
+    KNOWN INTERACTION, cost hours across several sessions before it was pinned
+    down on 2026-07-31. Some anti-bot flows (Cloudflare interstitials, Shopify
+    admin login) only pass if you DETACH CDP for 45 to 60 seconds, because the
+    challenge scores an attached debugger. With no socket held, this watchdog
+    reads the browser as idle, freezes it at BROWSER_FREEZE_IDLE_S and closes
+    every tab at BROWSER_AUTOPARK_IDLE_S. It surfaces as "the tab vanished
+    mid-login" or a misleading "Captcha couldn't load", so the browser gets
+    blamed instead of us. Do NOT lower the thresholds to work around it; they
+    are what stops Chrome eating a shared 4-core box. The caller's fix is to
+    hold a BROWSER-level websocket open (ws://…/devtools/browser/<id>, ping
+    Browser.getVersion, never attachToTarget): that keeps an established socket
+    here without attaching a debugger to the page the challenge inspects.
     """
     await asyncio.sleep(60)
     while True:
@@ -22473,6 +22627,26 @@ function renderBrowserTab(data){
     const id = esc(s.id);
     const dot = s.running ? '<span class="bs-dot on"></span>' : '<span class="bs-dot off"></span>';
     const status = s.running ? 'running' : 'stopped';
+    // Android device viewers are not Chrome/noVNC sessions. Freeze, Park,
+    // Fingerprint, New IP and Edit all call browser APIs keyed by session id,
+    // which would 404 for a phone — so render a card with only the controls
+    // that mean something here.
+    if(s.kind === 'android'){
+      const prev = s.running
+        ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
+        : '<div class="bs-off">Viewer not running — <code>systemctl start android-view</code></div>';
+      return '<div class="bs-card">'+
+        '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
+          '<span class="bs-meta">'+status+' · adb · wechat-vm-arm</span></div>'+
+        '<div class="bs-preview">'+prev+'</div>'+
+        '<div class="bs-badges"><span class="bs-badge ok">📱 Android device</span>'+
+          '<span class="bs-badge">click to tap · drag to swipe</span></div>'+
+        '<div class="bs-notes">'+esc(s.notes||'')+'</div>'+
+        '<div class="bs-actions">'+
+          '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
+        '</div>'+
+      '</div>';
+    }
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')"'+
@@ -25614,6 +25788,23 @@ def _projects_page_html(title: str, rows):
             "<div class=card><ul>%s</ul></div>"
             "<p class=muted>%s — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
             "</body></html>") % (title, BRAND_NAME, _PROJECTS_PAGE_CSS, title, items, BRAND_NAME)
+
+
+@app.get("/vacuum-sim")
+async def vacuum_tool_sim():
+    """Component map + firmware simulation for the CH32L103 vacuum lifter.
+
+    Standalone page, kept in its own file rather than inline: it is a tool about
+    Bill's firmware, not part of the dashboard. Registered above the
+    /{username} catch-all so the path is not read as a member name, and left
+    outside the middleware allowlist so it stays behind the dashboard login
+    (the firmware thresholds and pin map should not be public).
+    """
+    path = Path(__file__).resolve().parent / "vacuum_tool_sim.html"
+    if not path.exists():
+        return HTMLResponse("vacuum_tool_sim.html is missing", status_code=404)
+    return FileResponse(str(path), media_type="text/html",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/{username}", response_class=HTMLResponse)
