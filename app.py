@@ -19437,24 +19437,31 @@ function _isPaneChrome(line){
   return _CHROME_RULE_RE.test(line)||_CHROME_COMPOSER_RE.test(line)||_CHROME_HINT_RE.test(line)||_LIVE_DONE_RE.test(line);
 }
 // Codex's footer: the model it is on and the directory it is in, drawn under the
-// composer. Anchored on the ` · ` between a model name and a path so ordinary
-// prose containing a middle dot is never taken for it.
-const _CODEX_FOOTER_RE=/^\s{0,6}[\w.\-]+(?:\s+\w+)*\s+[·•]\s+[~\/][^\s]*\s*$/;
+// composer — "  gpt-5.6-sol max · ~/web-projects/guy/0zuqr". Anchored on the
+// ` · ` between a model name and a path, with a digit required somewhere in that
+// name (every model has one) and list markers excluded, so a markdown bullet
+// like "- Ops · /var/log" is never taken for it.
+const _CODEX_FOOTER_RE=/^\s{0,6}(?![-*+•]\s)[A-Za-z][\w.\-]*\d[\w.\-]*(?:\s+[\w.\-]+)*\s+[·•]\s+[~\/][^\s]*\s*$/;
 // The composer's placeholder ("› Use /skills to list available skills"), which
 // Codex rotates through a set of suggestions. It cannot be told from a real user
 // message by content — Codex echoes those with the same `›` — so it is found by
-// POSITION instead: the last `›` row in the pane, sitting directly above the
-// model/cwd footer with only blank rows in between. Nothing but the composer is
-// ever there.
+// POSITION instead: the row directly above the model/cwd footer, blank rows
+// aside. Nothing but the composer is ever there, because a message you sent is
+// redrawn above the spinner, not below it.
+//
+// Both are matched everywhere in the buffer, not just at its foot. The pane
+// redraws its chrome in place, so every frame that scrolled away left its own
+// composer and footer behind in tmux's history.
 function _stripPaneFooter(lines){
-  let i=lines.length-1;
-  while(i>=0&&lines[i].trim()==='')i--;
-  if(i<0||!_CODEX_FOOTER_RE.test(lines[i]))return lines;
-  const cut=[i];
-  i--;
-  while(i>=0&&lines[i].trim()==='')i--;
-  if(i>=0&&/^\s*[❯›»]/.test(lines[i]))cut.push(i);
-  return lines.filter((l,idx)=>cut.indexOf(idx)<0);
+  const cut={};
+  for(let i=0;i<lines.length;i++){
+    if(!_CODEX_FOOTER_RE.test(lines[i]))continue;
+    cut[i]=1;
+    let j=i-1;
+    while(j>=0&&lines[j].trim()==='')j--;
+    if(j>=0&&/^\s*[❯›»]/.test(lines[j]))cut[j]=1;
+  }
+  return lines.filter((l,idx)=>!cut[idx]);
 }
 // Pull the live status out of the buffer and read it. Runs in both views, and
 // runs before anything else, so a repaint of the counter alone never reaches the
