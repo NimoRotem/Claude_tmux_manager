@@ -32,7 +32,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, Response
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               FileResponse, Response, StreamingResponse)
 from pydantic import BaseModel, Field
 import openai
 import uvicorn
@@ -1192,8 +1193,10 @@ var GERR={domain:'That Google account is not allowed. Use your company Google ac
           failed:'Google sign-in failed — please try again.'};
 if(q.get('gerr')){e.textContent=GERR[q.get('gerr')]||GERR.failed;e.style.display='block';}
 /* Carry the deep link through the login so signing in from e.g. a noVNC viewer
-   URL lands back on the viewer instead of the dashboard home. */
-var nxt=location.pathname+location.search;
+   URL lands back on the viewer instead of the dashboard home. An explicit
+   ?next= wins: that is how a sibling app on rotem.ai (Analytics, ...) asks to
+   be returned to, since its own URL is not the one showing this page. */
+var nxt=q.get('next')||location.pathname+location.search;
 document.getElementById('next').value=nxt;
 var g=document.getElementById('gbtn');
 if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
@@ -1233,7 +1236,9 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # The mic is allowed for our own origin only: the WeChat desktop viewer needs
+    # getUserMedia to put you inside a call. Camera and geolocation stay off.
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
     # CSP: allow inline scripts/styles (needed for the embedded single-page HTML) and blob: for xterm.js
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
@@ -1336,6 +1341,11 @@ async def auth_middleware(request: Request, call_next):
     # Google sign-in: both legs run before there is a session cookie.
     if "/auth/google/" in path:
         return await call_next(request)
+    # The vacuum-lifter simulator is public at Nimo's request (2026-07-30). It is
+    # a read-only page with no data behind it, but note it does put the firmware's
+    # thresholds and the CH32L103 pin map on the open internet.
+    if path in ("/vacuum-sim", rp + "/vacuum-sim"):
+        return await call_next(request)
     # Public project serving: /<username>/<project>[/...] is served publicly (the
     # /<username> project-list page itself stays gated below).
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
@@ -1401,6 +1411,29 @@ def _check_login_rate_limit(ip: str) -> bool:
     for k in stale:
         del _login_attempts[k]
     return True
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    """Serve the sign-in page.
+
+    The auth middleware already returns this HTML for any gated path, but
+    ``/login`` itself is exempt from it (POST /login has to work while signed
+    out) — so without this route a plain ``GET /login`` 404s. That is exactly
+    where ``/logout`` sends you, and where the sibling apps on rotem.ai send a
+    lapsed session, so both landed on a 404 until now.
+
+    ``?next=`` is honoured, which is how a sibling app gets the user back to
+    the page they actually asked for.
+    """
+    nxt = (request.query_params.get("next") or "").strip()
+    if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
+        nxt = request.scope.get("root_path", "") + "/"
+    if _check_token(request.cookies.get("tmux_auth")):
+        return RedirectResponse(url=nxt, status_code=303)
+    resp = HTMLResponse(_login_page())
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.post("/login")
@@ -2173,196 +2206,158 @@ async def api_unimpersonate(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API registry — a managed catalog of all external API keys/services (Brave,
-# SerpApi, ScrapingBee, OpenAI, Anthropic, …) with plan/limit/cost notes and,
-# where the provider exposes one, a LIVE usage fetch so you can see how close to
-# the limit you are. Admin-only. Secrets never live in git: the seed below is
-# metadata only, and actual key values are hydrated at first run from
-# ~/CLAUDE_API_KEYS.md (or the environment). Once seeded, the full records live
-# in ~/.tmux-dashboard/api_registry.json (chmod 600, not in the repo).
-# ─────────────────────────────────────────────────────────────────────────────
+# API registry: the managed catalog of external API keys/services, with
+# plan/limit/cost notes and, where the provider exposes one, a LIVE usage fetch
+# so you can see how close to the limit you are. Admin-only.
+#
+# 2026-07-30: the catalogue MOVED OFF THIS HOST. Every value now lives in the
+# advisor (hk-proxy, https://advisor.rotem.ai), which all four builder
+# dashboards share; the old ~/CLAUDE_API_KEYS.md seed and
+# ~/.tmux-dashboard/api_registry.json are gone. Nothing below stores a key.
+# ──────────────────────────────────────────────────────────────────────────────
 import urllib.error
-
-API_REGISTRY_FILE = MESSAGES_DIR / "api_registry.json"
-_CLAUDE_API_KEYS_MD = Path.home() / "CLAUDE_API_KEYS.md"
-
-# Metadata-only seed (NO secret values). key_label is a substring hint used to
-# pick the right value when one env var appears multiple times in the md file.
-_API_SEED = [
-    # ── Search & Scrape ──────────────────────────────────────────────────────
-    {"seed_id": "brave", "name": "Brave Search", "provider": "brave", "category": "search",
-     "env_var": "BRAVE_API_KEY", "key_label": "", "plan": "Free/Data-for-Search",
-     "limits": "Free: ~2,000 q/mo · 1 q/s", "costs": "Free tier / from $3 CPM",
-     "usage_provider": "brave", "docs_url": "https://api-dashboard.search.brave.com/app/documentation",
-     "dashboard_url": "https://api-dashboard.search.brave.com/", "notes": "Web search API. Live rate-limit headers read on each fetch."},
-    {"seed_id": "serpapi", "name": "SerpApi", "provider": "serpapi", "category": "search",
-     "env_var": "SERPAPI_KEY", "key_label": "", "plan": "Production",
-     "limits": "15,000 searches/mo · 3,000/hr", "costs": "$150/mo",
-     "usage_provider": "serpapi", "docs_url": "https://serpapi.com/search-api",
-     "dashboard_url": "https://serpapi.com/dashboard", "notes": "Google/Bing/etc SERP scraping. Live usage supported."},
-    {"seed_id": "scrapingbee", "name": "ScrapingBee", "provider": "scrapingbee", "category": "search",
-     "env_var": "SCRAPINGBEE_API_KEY", "key_label": "", "plan": "",
-     "limits": "1,000,000 API credits/mo · 100 concurrency", "costs": "paid plan",
-     "usage_provider": "scrapingbee", "docs_url": "https://www.scrapingbee.com/documentation/",
-     "dashboard_url": "https://app.scrapingbee.com/dashboard", "notes": "Headless-browser scraping + JS render (SocialPanel gated-platform metrics). Live usage supported."},
-    {"seed_id": "firecrawl", "name": "Firecrawl", "provider": "firecrawl", "category": "search",
-     "env_var": "FIRECRAWL_API_KEY", "key_label": "", "plan": "",
-     "limits": "100,000 credits/period", "costs": "paid plan",
-     "usage_provider": "firecrawl", "docs_url": "https://docs.firecrawl.dev/",
-     "dashboard_url": "https://www.firecrawl.dev/app", "notes": "Crawl → markdown/JSON. Live usage supported."},
-    {"seed_id": "linkup", "name": "Linkup", "provider": "linkup", "category": "search",
-     "env_var": "LINKUP_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "linkup", "docs_url": "https://docs.linkup.so/",
-     "dashboard_url": "https://app.linkup.so/", "notes": "AI web search. Live credit balance supported."},
-    {"seed_id": "exa", "name": "Exa", "provider": "exa", "category": "search",
-     "env_var": "EXA_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "exa", "docs_url": "https://docs.exa.ai/",
-     "dashboard_url": "https://dashboard.exa.ai/", "notes": "Neural/semantic web search. No usage API — check dashboard."},
-    {"seed_id": "jina", "name": "Jina AI", "provider": "jina", "category": "search",
-     "env_var": "JINA_API_KEY", "key_label": "", "plan": "",
-     "limits": "token-based wallet", "costs": "pay-as-you-go",
-     "usage_provider": "jina", "docs_url": "https://jina.ai/reader/",
-     "dashboard_url": "https://jina.ai/api-dashboard/", "notes": "Reader (r.jina.ai) + embeddings + reranker. Live wallet balance supported."},
-    {"seed_id": "tavily", "name": "Tavily", "provider": "tavily", "category": "search",
-     "env_var": "TAVILY_API_KEY", "key_label": "", "plan": "Dev",
-     "limits": "credit-based", "costs": "free dev tier",
-     "usage_provider": "tavily", "docs_url": "https://docs.tavily.com/",
-     "dashboard_url": "https://app.tavily.com/", "notes": "AI search API. Live usage attempted."},
-    {"seed_id": "valyu", "name": "Valyu", "provider": "valyu", "category": "search",
-     "env_var": "VALYU_API_KEY", "key_label": "", "plan": "",
-     "limits": "credit-based", "costs": "pay-as-you-go",
-     "usage_provider": "valyu", "docs_url": "https://docs.valyu.network/",
-     "dashboard_url": "https://exchange.valyu.network/", "notes": "⚠️ Stored value currently duplicates the Tavily key — looks mislabeled; verify the real Valyu key."},
-    {"seed_id": "mistral", "name": "Mistral", "provider": "mistral", "category": "search",
-     "env_var": "MISTRAL_API_KEY", "key_label": "", "plan": "",
-     "limits": "token/req rate limits", "costs": "pay-as-you-go",
-     "usage_provider": "mistral", "docs_url": "https://docs.mistral.ai/",
-     "dashboard_url": "https://console.mistral.ai/", "notes": "LLM + OCR/document APIs. Key validated live; usage on dashboard."},
-    # ── LLM / AI models ──────────────────────────────────────────────────────
-    {"seed_id": "openai-grabo", "name": "OpenAI (GRABO-data)", "provider": "openai", "category": "llm",
-     "env_var": "OPENAI_API_KEY", "key_label": "GRABO-data", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
-     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20. Hit 429 insufficient_quota 2026-07-17 → Vertex fallback."},
-    {"seed_id": "openai-rotemai", "name": "OpenAI (rotemai)", "provider": "openai", "category": "llm",
-     "env_var": "OPENAI_API_KEY", "key_label": "rotemai", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "openai", "docs_url": "https://platform.openai.com/docs/",
-     "dashboard_url": "https://platform.openai.com/usage", "notes": "Rotated 2026-05-20."},
-    {"seed_id": "anthropic-grabo", "name": "Anthropic (grabo-data)", "provider": "anthropic", "category": "llm",
-     "env_var": "ANTHROPIC_API_KEY", "key_label": "grabo-data", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
-     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27. Cost/usage report needs an Admin API key."},
-    {"seed_id": "anthropic-docvault", "name": "Anthropic (docvault-GRABO)", "provider": "anthropic", "category": "llm",
-     "env_var": "ANTHROPIC_API_KEY", "key_label": "docvault", "plan": "",
-     "limits": "per-model TPM/RPM", "costs": "pay-as-you-go",
-     "usage_provider": "anthropic", "docs_url": "https://docs.claude.com/",
-     "dashboard_url": "https://console.anthropic.com/settings/usage", "notes": "Rotated 2026-05-27."},
-    {"seed_id": "gemini", "name": "Gemini (Direct API)", "provider": "gemini", "category": "llm",
-     "env_var": "GEMINI_API_KEY", "key_label": "", "plan": "",
-     "limits": "per-model RPM/RPD", "costs": "free tier + pay-as-you-go",
-     "usage_provider": "gemini", "docs_url": "https://ai.google.dev/gemini-api/docs",
-     "dashboard_url": "https://aistudio.google.com/app/apikey", "notes": "Non-Vertex. Project 808242700204, rotated 2026-05-20. Key validated live; usage in Google Cloud console."},
-    {"seed_id": "vertex", "name": "Vertex AI / Gemini (GCE SA)", "provider": "vertex", "category": "llm",
-     "env_var": "", "key_label": "", "plan": "GCP", "limits": "GCP quotas",
-     "costs": "GCP billing (nimo-gpt)", "usage_provider": "vertex",
-     "docs_url": "https://cloud.google.com/vertex-ai/docs", "dashboard_url": "https://console.cloud.google.com/vertex-ai",
-     "notes": "No API key — GCE service account nimo-843@nimo-gpt. google.genai(vertexai=True, project='nimo-gpt', location='us-central1'). OpenAI-quota fallback."},
-    # ── Email / Messaging ────────────────────────────────────────────────────
-    {"seed_id": "resend-alphabell", "name": "Resend (alphabell-relay)", "provider": "resend", "category": "mail",
-     "env_var": "RESEND_API_KEY", "key_label": "alphabell", "plan": "",
-     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
-     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
-     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain alphabell.com. Used by alphabell/lisa mail relays."},
-    {"seed_id": "resend-grabo", "name": "Resend (grabo-relay)", "provider": "resend", "category": "mail",
-     "env_var": "RESEND_API_KEY", "key_label": "grabo-relay", "plan": "",
-     "limits": "Free: 100/day · 3,000/mo", "costs": "free tier",
-     "usage_provider": "resend", "docs_url": "https://resend.com/docs",
-     "dashboard_url": "https://resend.com/overview", "notes": "Verified domain grabo.cc. Used by grabo-mail relay (2026-06-08)."},
-    {"seed_id": "twilio", "name": "Twilio (SMS + phone agent)", "provider": "twilio", "category": "mail",
-     "env_var": "", "key_label": "", "plan": "pay-as-you-go",
-     "limits": "account balance", "costs": "~$208 MTD (2026-07-17)",
-     "usage_provider": "twilio", "docs_url": "https://www.twilio.com/docs",
-     "dashboard_url": "https://console.twilio.com/", "notes": "SID ACe4d65af6… Live creds env-based on builder ~/phoneagent-app/.env (token not stored here). Killed Voice Intelligence auto-transcribe ~$27/day."},
-]
-
-
-def _parse_api_keys_md():
-    """Extract (env_var, label, value) triples from ~/CLAUDE_API_KEYS.md.
-    Lines look like `- SERPAPI_KEY: abc` or `- OPENAI_API_KEY (rotemai): sk-…`."""
-    out = []
-    try:
-        if not _CLAUDE_API_KEYS_MD.exists():
-            return out
-        for line in _CLAUDE_API_KEYS_MD.read_text(errors="replace").splitlines():
-            m = re.match(r"^\s*[-*]?\s*([A-Z][A-Z0-9_]{2,})\s*(?:\(([^)]*)\))?\s*:\s*(\S+)", line)
-            if m:
-                out.append((m.group(1), (m.group(2) or "").strip(), m.group(3).strip()))
-    except Exception:
-        logger.debug("Failed to parse CLAUDE_API_KEYS.md", exc_info=True)
-    return out
-
-
-def _resolve_seed_key(env_var, key_label):
-    """Best-effort hydrate a seed entry's key from the md file, then env."""
-    if not env_var:
-        return ""
-    triples = _parse_api_keys_md()
-    cands = [(lbl, val) for (ev, lbl_, val) in triples for lbl in [lbl_] if ev == env_var]
-    if cands:
-        if key_label:
-            hint = key_label.lower()
-            for lbl, val in cands:
-                if hint in lbl.lower():
-                    return val
-        return cands[0][1]
-    return os.environ.get(env_var, "") or ""
 
 
 def _new_api_id() -> str:
     return "api_" + secrets.token_hex(6)
 
 
-def _seed_api_registry() -> list:
-    items = []
-    for s in _API_SEED:
-        e = dict(s)
-        e["id"] = "api_" + s["seed_id"]
-        e["key"] = _resolve_seed_key(s.get("env_var", ""), s.get("key_label", ""))
-        e["status"] = "active"
-        e["created_at"] = time.time()
-        e["updated_at"] = time.time()
-        items.append(e)
-    return items
+# ── The advisor is the source of truth for every credential ──────────────────
+# No key value is stored on this host any more. The APIs tab reads them from the
+# advisor (hk-proxy, https://advisor.rotem.ai) on demand and writes edits back to
+# it, so all four builder dashboards see the same catalogue. `advisor_cache.json`
+# holds metadata ONLY (never a key) so the tab still renders when the advisor is
+# unreachable.
+ADVISOR_URL = (os.environ.get("ADVISOR_URL") or "https://advisor.rotem.ai").rstrip("/")
+ADVISOR_TOKEN_FILE = Path(os.environ.get("ADVISOR_TOKEN_FILE")
+                          or (Path.home() / ".advisor-token"))
+ADVISOR_META_CACHE = MESSAGES_DIR / "advisor_cache.json"
+_advisor_state = {"ts": 0.0, "items": [], "error": ""}
+_ADVISOR_TTL = 45.0
 
 
-def _load_api_registry() -> list:
-    if API_REGISTRY_FILE.exists():
+def _advisor_token() -> str:
+    try:
+        return ADVISOR_TOKEN_FILE.read_text().strip()
+    except Exception:
+        return os.environ.get("ADVISOR_TOKEN", "").strip()
+
+
+def _advisor_request(path: str, payload: Optional[dict] = None, method: str = "",
+                     timeout: float = 12.0) -> dict:
+    tok = _advisor_token()
+    if not tok:
+        raise RuntimeError("no advisor token (~/.advisor-token)")
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"{ADVISOR_URL}{path}", data=body,
+        method=method or ("POST" if body else "GET"),
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def _advisor_secret_to_entry(s: dict) -> dict:
+    """One advisor credential rendered in the shape the APIs tab expects."""
+    return {
+        "id": "api_" + s.get("name", ""),
+        "advisor_name": s.get("name", ""),
+        "seed_id": s.get("name", ""),
+        "name": s.get("title") or s.get("name", ""),
+        "provider": s.get("provider", ""),
+        "category": s.get("category", "other"),
+        "env_var": s.get("env_var", ""),
+        "key_label": s.get("account", ""),
+        "key": s.get("value", ""),
+        "plan": s.get("plan", ""),
+        "limits": s.get("limits", ""),
+        "costs": s.get("costs", ""),
+        "usage_provider": s.get("provider", ""),
+        "docs_url": s.get("docs_url", ""),
+        "dashboard_url": s.get("dashboard_url", ""),
+        "notes": s.get("notes", ""),
+        "status": s.get("status", "active"),
+        "created_at": s.get("created_at", ""),
+        "updated_at": s.get("updated_at", ""),
+    }
+
+
+def _entry_to_advisor_secret(e: dict) -> dict:
+    # Entries created in this UI carry a random id, so name them off the label.
+    name = e.get("advisor_name") or e.get("seed_id") or \
+        re.sub(r"[^a-z0-9]+", "-", (e.get("name", "") or "").lower()).strip("-") or \
+        (e.get("id", "") or "").replace("api_", "")
+    return {
+        "name": name,
+        "title": e.get("name", ""),
+        "provider": e.get("provider", ""),
+        "category": e.get("category", "other"),
+        "env_var": e.get("env_var", ""),
+        "value": e.get("key", ""),
+        "account": e.get("key_label", ""),
+        "plan": e.get("plan", ""),
+        "limits": e.get("limits", ""),
+        "costs": e.get("costs", ""),
+        "docs_url": e.get("docs_url", ""),
+        "dashboard_url": e.get("dashboard_url", ""),
+        "notes": e.get("notes", ""),
+        "status": e.get("status", "active"),
+    }
+
+
+def _write_advisor_meta_cache(items: list):
+    """Metadata only. A key value must never land on this disk."""
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        safe = [{k: v for k, v in e.items() if k != "key"} for e in items]
+        ADVISOR_META_CACHE.write_text(json.dumps({"apis": safe}, indent=1))
+        ADVISOR_META_CACHE.chmod(0o600)
+    except Exception:
+        logger.debug("advisor metadata cache write failed", exc_info=True)
+
+
+def _load_api_registry(force: bool = False) -> list:
+    now_ts = time.time()
+    if not force and _advisor_state["items"] and now_ts - _advisor_state["ts"] < _ADVISOR_TTL:
+        return _advisor_state["items"]
+    try:
+        data = _advisor_request("/api/catalog")
+        items = [_advisor_secret_to_entry(s) for s in (data.get("secrets") or [])]
+        _advisor_state.update({"ts": now_ts, "items": items, "error": ""})
+        _write_advisor_meta_cache(items)
+        return items
+    except Exception as exc:
+        _advisor_state["error"] = str(exc)[:160]
+        logger.warning("advisor unreachable (%s); serving metadata cache", exc)
+        if _advisor_state["items"]:
+            return _advisor_state["items"]
         try:
-            data = json.loads(API_REGISTRY_FILE.read_text())
-            items = data.get("apis") if isinstance(data, dict) else None
-            if isinstance(items, list):
-                return items
+            cached = json.loads(ADVISOR_META_CACHE.read_text()).get("apis") or []
+            return [dict(e, key="") for e in cached]
         except Exception:
-            logger.exception("Failed to read %s — re-seeding", API_REGISTRY_FILE)
-    items = _seed_api_registry()
-    _save_api_registry(items)
-    return items
+            return []
 
 
 def _save_api_registry(items: list):
+    """Push edits back to the advisor. Nothing is persisted locally."""
+    before = {e.get("id"): e for e in (_advisor_state.get("items") or [])}
+    after = {e.get("id"): e for e in items}
     try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        API_REGISTRY_FILE.write_text(json.dumps({"apis": items}, indent=2))
-        try:
-            API_REGISTRY_FILE.chmod(0o600)
-        except Exception:
-            logger.debug("chmod 600 on api_registry.json failed", exc_info=True)
+        for eid, e in after.items():
+            if before.get(eid) != e:
+                _advisor_request("/api/secrets", _entry_to_advisor_secret(e))
+        for eid, e in before.items():
+            if eid not in after:
+                name = e.get("advisor_name") or (eid or "").replace("api_", "")
+                _advisor_request("/api/secrets",
+                                 dict(_entry_to_advisor_secret(e), status="revoked",
+                                      notes=(e.get("notes", "") + "\nrevoked from the "
+                                             "builder dashboard").strip()))
+                logger.info("advisor: marked %s revoked (delete is a UI-side action)", name)
     except Exception:
-        logger.exception("Failed to save API registry to %s", API_REGISTRY_FILE)
+        logger.exception("Failed to push API changes to the advisor at %s", ADVISOR_URL)
+    _advisor_state["ts"] = 0.0
+    _load_api_registry(force=True)
 
 
 def _mask_key(k: str) -> str:
@@ -5689,6 +5684,26 @@ async def get_notes(session_name: str, full_output: str, existing_notes: str = "
     )
 
 
+# Pane furniture that reads as prose but is not: a COLLAPSED tool block still
+# starts with `●` and carries no recognisable `Tool(` prefix, so "Called advisor
+# (ctrl+o to expand)" and "Made 1 edit +108 (ctrl+o to expand)" used to land in
+# the Chat tab as if the agent had said them. The `(ctrl+o to expand)` suffix is
+# the reliable tell — Claude Code only prints it on collapsible tool output.
+_PANE_RESIDUE_RE = re.compile(
+    r"\(ctrl\s*\+?\s*o\s+to\s+(expand|view\s+transcript)\)\s*$"
+    r"|^(?:…|\.\.\.)?\s*\+\d+\s+lines?\b"
+    r"|^Shell cwd was reset\b"
+    r"|^Background command\b.*\b(completed|failed)\b"
+    r"|^(Running|Thinking|Working)…?\s*$",
+    re.I,
+)
+
+
+def _is_pane_residue(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(s) and bool(_PANE_RESIDUE_RE.search(s))
+
+
 def _extract_claude_text(terminal_output: str) -> str:
     """Extract Claude's human-readable text from terminal output.
 
@@ -5720,7 +5735,7 @@ def _extract_claude_text(terminal_output: str) -> str:
         if stripped.startswith("●"):
             content_after = stripped[1:].strip()
             # Check if this is a tool call
-            is_tool = any(content_after.startswith(t) for t in tool_names)
+            is_tool = any(content_after.startswith(t) for t in tool_names) or _is_pane_residue(content_after)
             if is_tool:
                 # End any current text block
                 if current_block:
@@ -5761,6 +5776,8 @@ def _extract_claude_text(terminal_output: str) -> str:
         elif in_text_block:
             # Continuation of Claude's text (indented lines under ●)
             # Claude indents continuation lines with 2 spaces
+            if _is_pane_residue(stripped):
+                continue
             current_block.append(stripped)
         elif in_tool_block:
             # Skip tool output continuation
@@ -5956,8 +5973,9 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
                 entry["realtime_at"] = now
         if "chat_summary" in result_map:
             cs = result_map["chat_summary"]
-            if cs and cs.get("summary"):
-                _append_assistant_msg(entry, cs["summary"], now)
+            if cs and (cs.get("summary") or cs.get("full")):
+                _append_assistant_msg(entry, cs.get("summary", ""), now,
+                                      full=cs.get("full", ""), links=cs.get("links") or [])
                 entry["chat_summary_sig"] = cs["sig"]
 
     cache[session_name] = entry
@@ -5977,16 +5995,20 @@ def _msg_similarity(a: str, b: str) -> float:
     return len(wa & wb) / max(len(wa), len(wb))
 
 
-def _append_assistant_msg(entry: dict, text: str, ts: float):
+def _append_assistant_msg(entry: dict, text: str, ts: float, full: str = "", links: list = None):
     """Update or append an assistant message for the current Claude response.
 
     Instead of appending multiple assistant messages per response, we maintain
     a single assistant message after the last user message that gets updated
     as Claude produces more text. This keeps the chat clean:
     user → single assistant response → user → single assistant response.
+
+    `text` is the short recap, `full` the reply as written and `links` the
+    deliverables it produced; the Chat tab renders all three.
     """
-    if not text or not text.strip():
+    if not (text or "").strip() and not (full or "").strip():
         return
+    text = text or ""
     msgs = entry.setdefault("messages", [])
 
     # Find the last user message index
@@ -6004,17 +6026,24 @@ def _append_assistant_msg(entry: dict, text: str, ts: float):
             break
 
     if last_assistant_idx >= 0:
-        # Update existing assistant message if content changed
-        if msgs[last_assistant_idx]["text"] == text:
+        prev = msgs[last_assistant_idx]
+        # The recap is regenerated by an LLM and wobbles between near-identical
+        # wordings, so it alone can't decide whether anything changed — the full
+        # reply and the deliverables can grow while the recap reads the same.
+        same_full = (prev.get("full") or "") == (full or "")
+        same_links = (prev.get("links") or []) == (links or [])
+        if prev["text"] == text and same_full and same_links:
             return  # No change
-        if _msg_similarity(msgs[last_assistant_idx]["text"], text) > 0.9:
+        if _msg_similarity(prev["text"], text) > 0.9 and same_full and same_links:
             return  # Too similar, skip
-        # Update the message with new content
-        msgs[last_assistant_idx]["text"] = text
-        msgs[last_assistant_idx]["ts"] = ts
+        prev["text"] = text
+        prev["ts"] = ts
+        prev["full"] = full or ""
+        prev["links"] = links or []
     else:
         # No assistant message after last user message — create one
-        msgs.append({"role": "assistant", "text": text, "ts": ts})
+        msgs.append({"role": "assistant", "text": text, "ts": ts,
+                     "full": full or "", "links": links or []})
 
     _save_messages()
 
@@ -6166,6 +6195,89 @@ def _trim_plain(text: str, limit: int = 600) -> str:
     return (cut[:i] if i > 0 else cut).strip() + " …"
 
 
+# --- Deliverables: the links and files a turn actually produced ---------------
+#
+# The Chat tab used to show a 70-word recap and nothing else, which loses the one
+# thing the reader came for: where the work IS. The user is remote — a path in
+# the recap ("saved to /home/.../REPORT.md") is unreachable from their phone — so
+# every file that really exists is handed over as a /file?path= link, which the
+# frontend resolves against the dashboard's own origin and which sits behind the
+# same login as the dashboard.
+_TURN_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'`]+")
+_TURN_PATH_RE = re.compile(
+    r"(?:^|[\s(\[|>*`])"
+    r"((?:~|/(?:home|root|var|opt|srv|usr|etc|tmp|mnt|media|data))/[^\s<>()\[\]{}\"'`,;]+)",
+    re.M,
+)
+_LINK_TRIM = ".,;:!?)]}'\"*`>"
+
+
+def _link_label(url: str) -> str:
+    """A chip caption: the last meaningful path segment, else the host."""
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(url)
+        seg = [s for s in (u.path or "").split("/") if s]
+        if seg and (len(seg[-1]) > 2 or "." in seg[-1]):
+            return seg[-1][:48]
+        return (u.netloc or url)[:48]
+    except Exception:
+        return url[:48]
+
+
+def _extract_turn_links(text: str, limit: int = 14) -> list:
+    """Web links and on-disk deliverables mentioned in one assistant turn.
+
+    Files are only offered when they exist right now — a path the agent merely
+    talked about would produce a link that 404s, which is worse than no link."""
+    out: list = []
+    seen: set = set()
+    body = text or ""
+    for m in _TURN_URL_RE.finditer(body):
+        u = m.group(0).rstrip(_LINK_TRIM)
+        while u and u.count("(") < u.count(")"):
+            u = u[:-1].rstrip(_LINK_TRIM)
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append({"kind": "url", "href": u, "label": _link_label(u)})
+        if len(out) >= limit:
+            return out
+    for m in _TURN_PATH_RE.finditer(body):
+        p = m.group(1).rstrip(_LINK_TRIM)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        try:
+            real = os.path.expanduser(p)
+            if not os.path.exists(real):
+                continue
+            is_dir = os.path.isdir(real)
+        except Exception:
+            continue
+        out.append({
+            "kind": "file",
+            "path": p,
+            "label": (os.path.basename(real.rstrip("/")) or p)[:48],
+            "dir": is_dir,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+# The stored copy of a turn is capped only to stop one runaway reply bloating the
+# per-user message file forever. Real prose never gets near this.
+_CHAT_FULL_MAX = 20000
+
+
+def _turn_full_text(text: str) -> str:
+    body = (text or "").strip()
+    if len(body) <= _CHAT_FULL_MAX:
+        return body
+    return body[:_CHAT_FULL_MAX].rstrip() + "\n\n[… reply truncated at 20,000 characters — open the Terminal view for the rest]"
+
+
 async def _summarize_turn(text: str) -> str:
     """Short, plain-language recap of one assistant turn for non-dev users."""
     body = (text or "").strip()
@@ -6192,7 +6304,12 @@ async def _summarize_turn(text: str) -> str:
 
 
 async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str = ""):
-    """Return {'sig','summary'} for the latest turn, or None when unchanged/empty."""
+    """Return {'sig','summary','full','links'} for the latest turn, or None when
+    unchanged/empty.
+
+    `summary` is the short recap; `full` is what the agent actually wrote, which
+    is what the Chat tab shows. The recap alone was cutting every answer off
+    after a couple of lines and dropping the links with it."""
     turn_text = await asyncio.to_thread(_extract_last_assistant_turn, session_name, last_user_text)
     turn_text = (turn_text or "").strip()
     if not turn_text:
@@ -6200,11 +6317,13 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
     sig = _output_signature(turn_text)
     if sig == prev_sig:
         return None  # this exact output was already summarized
+    full = _turn_full_text(turn_text)
     summary = await _summarize_turn(turn_text)
     summary = (summary or "").strip()
-    if not summary:
+    if not summary and not full:
         return None
-    return {"sig": sig, "summary": summary}
+    links = await asyncio.to_thread(_extract_turn_links, turn_text)
+    return {"sig": sig, "summary": summary or _trim_plain(full, 600), "full": full, "links": links}
 
 
 def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
@@ -10311,6 +10430,18 @@ def _browser_alive(s: dict) -> bool:
     return _browser_port_alive(int(s.get("cdp_port") or 0))
 
 
+def _port_alive(host: str, port: int) -> bool:
+    """Like _browser_port_alive but honours the host — the desktop viewer runs on
+    wechat-voice, not on builder."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            return s.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+
+
 def _next_browser_slot(sessions: list) -> int:
     used = {int(s.get("slot", 0)) for s in sessions}
     k = 1
@@ -10342,6 +10473,139 @@ def _browser_viewer_url(s: dict) -> str:
             "&reconnect=true&reconnect_delay=2000")
 
 
+# ── Android device viewers ───────────────────────────────────────────────────
+# These are NOT noVNC. redroid has no X display, so the Xvfb + x11vnc +
+# websockify + noVNC stack the Chrome sessions above rely on has nothing to
+# attach to. `androidview.py` instead talks to adb directly (screencap for
+# frames, `input` for touch/keys) and serves a plain page. We proxy it here so
+# it inherits this dashboard's admin auth rather than being exposed on its own,
+# and so the Browser tab's iframe preview stays same-origin.
+ANDROID_VIEWERS = {
+    # "host" defaults to builder itself; the desktop client lives on wechat-voice.
+    "wechat-desktop": {
+        "name": "WeChat desktop (voice)",
+        "host": "10.128.0.89",
+        "port": 8716,
+        "notes": "Official WeChat Linux client on wechat-voice, headless on Xvfb with "
+                 "PulseAudio virtual devices so call audio can be bridged to a voice agent. "
+                 "Sign in by scanning the on-screen QR from a phone already on that account.",
+    },
+    "wechat": {
+        "name": "WeChat (Android)",
+        "port": 8713,
+        "notes": "redroid Android 13 on wechat-vm-arm, signed in as 夏天 "
+                 "(Weixin ID Zytoolsbag). Click to tap, drag to swipe.",
+    },
+    "wechat-cn": {
+        "name": "WeChat CN (Android)",
+        "port": 8715,
+        "notes": "redroid Android 13 on wechat-vm-cn, for +86 189 2605 5158. "
+                 "All of its traffic leaves through a Shenzhen residential IP, "
+                 "so WeChat sees a Guangdong consumer connection, not a datacenter. "
+                 "Click to tap, drag to swipe.",
+    },
+}
+
+
+def _android_viewer_url(key: str) -> str:
+    # Trailing slash matters: the viewer page uses relative URLs (frame.jpg,
+    # tap, key), which resolve against the directory, not the parent.
+    return f"{ROOT_PATH}/android/{key}/"
+
+
+async def _android_viewer_rows() -> list:
+    rows = []
+    for key, cfg in ANDROID_VIEWERS.items():
+        rows.append({
+            "id": f"android-{key}",
+            "kind": "android",
+            "name": cfg["name"],
+            "running": await asyncio.to_thread(
+                _port_alive, cfg.get("host", "127.0.0.1"), cfg["port"]),
+            "managed": False,
+            "viewer_url": _android_viewer_url(key),
+            "external_url": _android_viewer_url(key),
+            "notes": cfg["notes"],
+        })
+    return rows
+
+
+@app.get("/android/{key}")
+async def android_viewer_root(key: str, request: Request):
+    if key not in ANDROID_VIEWERS:
+        return JSONResponse({"error": "unknown device"}, status_code=404)
+    return RedirectResponse(url=_android_viewer_url(key), status_code=307)
+
+
+@app.api_route("/android/{key}/{path:path}", methods=["GET", "POST"])
+async def android_viewer_proxy(key: str, request: Request, path: str = ""):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    cfg = ANDROID_VIEWERS.get(key)
+    if not cfg:
+        return JSONResponse({"error": "unknown device"}, status_code=404)
+    url = f"http://{cfg.get('host', '127.0.0.1')}:{cfg['port']}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body() if request.method == "POST" else None
+
+    # Call audio is an endless WAV: buffering it the way we buffer frames would
+    # simply never return, so this one path is relayed chunk by chunk.
+    if path.rsplit("/", 1)[-1] == "audio.wav":
+        client = httpx.AsyncClient(timeout=None)
+
+        async def relay():
+            try:
+                async with client.stream("GET", url) as r:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+            finally:
+                await client.aclose()
+
+        return StreamingResponse(relay(), media_type="audio/wav",
+                                 headers={"Cache-Control": "no-store"})
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.request(
+                request.method, url, content=body,
+                headers={"Content-Type": request.headers.get("content-type",
+                                                             "application/json")}
+                if body else None)
+    except Exception as e:
+        return JSONResponse({"error": f"viewer unreachable: {e}"}, status_code=502)
+    # Pass through only what the page needs; hop-by-hop headers (and any
+    # Content-Length from upstream) must not be copied onto a new body.
+    keep = {"content-type", "x-device-width", "x-device-height"}
+    return Response(
+        content=r.content, status_code=r.status_code,
+        headers={k: v for k, v in r.headers.items() if k.lower() in keep})
+
+
+@app.get("/api/wechat/recording/{cid}.wav")
+async def wechat_call_recording(cid: str, request: Request):
+    """Play back a recorded WeChat call.
+
+    The recordings live on wechat-voice, which is VPC-internal, so the raw URL in
+    a task is not clickable from a browser. This proxies it behind the dashboard's
+    admin auth so the link on the task actually plays.
+    """
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if not re.fullmatch(r"[0-9a-f-]{6,40}", cid or ""):
+        return JSONResponse({"error": "bad id"}, status_code=400)
+    url = f"http://10.128.0.89:8717/recording/{cid}.wav"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.get(url)
+    except Exception as e:
+        return JSONResponse({"error": f"recording unreachable: {e}"}, status_code=502)
+    if r.status_code != 200:
+        return JSONResponse({"error": "no recording"}, status_code=404)
+    return Response(content=r.content, media_type="audio/wav",
+                    headers={"Content-Disposition": f'inline; filename="{cid}.wav"'})
+
+
 class BrowserCreateBody(BaseModel):
     name: str = ""
 
@@ -10368,6 +10632,7 @@ async def api_browser_sessions(request: Request):
         row["last_url"] = str(st.get("url") or "")[:300]
         row["tabs"] = st.get("tabs")
         out.append(row)
+    out.extend(await _android_viewer_rows())
     extra = sum(1 for s in sessions if s.get("managed"))
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
                          "extra_count": extra, "root_path": ROOT_PATH})
@@ -12886,6 +13151,19 @@ async def browser_autopark_watchdog():
     its display, the dashboard driving it, or — the signal this used to miss —
     any process holding a CDP socket open to it, which is what an agent's browser
     tool does for as long as it is working.
+
+    KNOWN INTERACTION, cost hours across several sessions before it was pinned
+    down on 2026-07-31. Some anti-bot flows (Cloudflare interstitials, Shopify
+    admin login) only pass if you DETACH CDP for 45 to 60 seconds, because the
+    challenge scores an attached debugger. With no socket held, this watchdog
+    reads the browser as idle, freezes it at BROWSER_FREEZE_IDLE_S and closes
+    every tab at BROWSER_AUTOPARK_IDLE_S. It surfaces as "the tab vanished
+    mid-login" or a misleading "Captcha couldn't load", so the browser gets
+    blamed instead of us. Do NOT lower the thresholds to work around it; they
+    are what stops Chrome eating a shared 4-core box. The caller's fix is to
+    hold a BROWSER-level websocket open (ws://…/devtools/browser/<id>, ping
+    Browser.getVersion, never attachToTarget): that keeps an established socket
+    here without attaching a debugger to the page the challenge inspects.
     """
     await asyncio.sleep(60)
     while True:
@@ -13598,6 +13876,20 @@ async def api_session_relogin(session_name: str, request: Request):
             await asyncio.sleep(1)
             if not await _async_is_claude_running(session_name):
                 break
+        # NEVER send-keys while Claude is still up. `send-keys -l` types literal
+        # keystrokes into the pane: if /exit did not take (Claude busy in a long
+        # tool call), the launch command lands in Claude's INPUT BOX instead of a
+        # shell prompt and the trailing Enter submits it as a chat message. That
+        # leaks the long-lived CLAUDE_CODE_OAUTH_TOKEN into the transcript and
+        # reads to the model as if the user had asked it to run the command.
+        # Observed 2026-07-31 against a session mid-browser-automation.
+        if await _async_is_claude_running(session_name):
+            return JSONResponse(
+                {"error": "Claude is still running after /exit (20s). Not relaunching: "
+                          "typing the launch command now would land in Claude's prompt, "
+                          "not the shell. Wait for the current turn to finish, or stop it "
+                          "with Esc, then try again."},
+                status_code=409)
     # Re-export the session's profile CLAUDE_CONFIG_DIR (non-default) before the
     # relaunch, in case the shell was respawned and lost the env var.
     try:
@@ -16629,12 +16921,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-new-btn:hover{background:#2ea043}
 /* Workspace (project) switcher in the main nav */
 .nav-proj{position:relative;flex-shrink:0;margin-right:8px}
-.nav-proj-btn{display:flex;align-items:center;gap:6px;max-width:280px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;cursor:pointer;font-size:.78rem;line-height:1.2;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.nav-proj-btn{display:flex;align-items:center;gap:3px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 7px;cursor:pointer;font-size:.78rem;line-height:1.2;font-family:'SF Mono','Fira Code',Consolas,monospace}
 .nav-proj-btn:hover{border-color:#58a6ff;color:#e6edf3}
 .nav-proj.scoped .nav-proj-btn{border-color:#58a6ff66;color:#79c0ff;background:#0d1520}
 .nav-proj-ico{font-size:.85rem;flex-shrink:0;filter:grayscale(1) opacity(.8)}
 .nav-proj.scoped .nav-proj-ico{filter:none}
-.nav-proj-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Icon only. The project name was the widest thing in the header and it pushed
+   the session tabs off the right edge; the switcher is a folder glyph now. The
+   name is still written into this node (renderProjectNav) so it stays in the
+   button's tooltip, and the open menu shows every project with the current one
+   marked — nothing is lost, it just stops costing a third of the tab bar. */
+.nav-proj-name{display:none}
 .nav-proj-caret{color:#6e7681;flex-shrink:0;font-size:.7rem}
 /* FIXED, not absolute: .top-nav is an overflow-x:auto scroller, which clips any
    absolutely-positioned child (the menu had a correct 340x302 box and was still
@@ -16709,6 +17006,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
 .tab-more-item:hover{background:#1c2128;color:#c9d1d9}
 .tab-more-item.active{color:#58a6ff}
+.tab-more-hint{display:block;color:#6e7681;font-size:.68rem;margin-top:1px}
+/* View switcher (Terminal ⇄ Chat) — a tab that is also a dropdown, matching the
+   More/Info trigger beside it. */
+.tab-view-trigger{display:flex;align-items:center;gap:4px}
+.tab-view-arrow{color:#6e7681;font-size:.7rem}
+/* Clean view, nested under Auto-push inside the More menu. */
+.tab-more-switch{display:flex;align-items:center;gap:10px;padding:4px 16px 8px;cursor:pointer}
+.tab-more-switch .watchdog-toggle{flex:0 0 auto;transform:scale(.8);transform-origin:left center}
+.tab-more-switch-text{font-size:.75rem;color:#8b949e;line-height:1.3}
 /* Role-split rows in the More menu. The menu re-renders on every poll, so these
    are body-class rules rather than the one-shot display toggle used in the nav.
    Admins get one link into the Profiles window, which holds every one of these
@@ -16732,9 +17038,30 @@ body.member-admin .more-member-only{display:none}
 .chat-messages::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
 .chat-msg{max-width:85%;padding:12px 16px;border-radius:12px;font-size:1.05rem;line-height:1.6;position:relative}
 .chat-msg.user{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
-.chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
+/* An assistant bubble holds the whole reply now, so it gets room: wider than a
+   user bubble, and no clamp — nothing here is cut. */
+.chat-msg.assistant{align-self:flex-start;max-width:94%;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
+/* Newlines are the agent's paragraphing — keep them, wrap long tokens. */
+.chat-body{white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-body code{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:1px 5px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
+.chat-msg.user .chat-body code{background:#0b4ec2;border-color:#ffffff33;color:#fff}
+.chat-body .chat-h{display:block;margin:10px 0 2px;color:#e6edf3;font-size:.95em;letter-spacing:.01em}
+.chat-body .chat-h:first-child{margin-top:0}
+.chat-lead{white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:10px;padding:8px 12px;border-left:2px solid #58a6ff;background:#0d1117;border-radius:0 6px 6px 0;color:#8b949e;font-size:.88rem;line-height:1.5}
+.chat-link{color:#58a6ff;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
+.chat-link:hover{color:#79c0ff}
+.chat-msg.user .chat-link{color:#cfe3ff}
+/* Deliverables. The reader is remote — a path is only useful as a link this
+   dashboard can serve, so these open through /file behind the same login. */
+.chat-links{margin-top:12px;padding-top:10px;border-top:1px solid #21262d}
+.chat-links-title{color:#6e7681;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.chat-chips{display:flex;flex-wrap:wrap;gap:6px}
+.chat-chip{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:4px 10px;border-radius:12px;border:1px solid #30363d;background:#0d1117;color:#79c0ff;font-size:.75rem;text-decoration:none;line-height:1.3;overflow-wrap:anywhere}
+.chat-chip:hover{border-color:#58a6ff;background:#0d1520;color:#a5d6ff}
+.chat-chip-ico{filter:grayscale(1) opacity(.8);flex:0 0 auto}
+.chat-chip:hover .chat-chip-ico{filter:none}
 .chat-empty{align-self:center;margin:auto 0;max-width:80%;text-align:center;color:#6e7681;font-size:.9rem;line-height:1.6}
 .chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
@@ -16762,7 +17089,14 @@ body.member-admin .more-member-only{display:none}
 @keyframes composer-spin{to{transform:rotate(360deg)}}
 
 /* Raw tab */
-.tab-raw{padding-top:16px}
+.tab-raw{padding-top:16px;position:relative}
+/* Freeze (see toggleRawFreeze): the pill is the only cue when Keys & Commands
+   is collapsed, so it floats over the terminal's top-right corner. */
+.raw-frozen-pill{display:none;position:absolute;top:24px;right:22px;z-index:5;padding:4px 10px;border-radius:12px;background:#3d2c05;border:1px solid #d2992288;color:#e3b341;font-size:.68rem;font-weight:600;cursor:pointer;user-select:none;box-shadow:0 2px 8px rgba(0,0,0,.5)}
+.raw-frozen-pill.on{display:block}
+.raw-frozen-pill:hover{background:#4d3806;border-color:#d29922}
+.raw-output.frozen{border-color:#d2992255}
+.key-btn.key-freeze.active{background:#3d2c05;border-color:#d2992288;color:#e3b341}
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
@@ -16992,7 +17326,6 @@ body.member-simple .nav-tools-wrap{display:none}
 body.member-simple .claude-auth{display:none}
 body.member-simple .nav-server-stats{display:none}
 body.member-simple .nav-usage{display:none}
-body.member-simple .profile-select,body.member-simple .profile-wrap{display:none!important}
 body.member-simple .hide-in-simple{display:none!important}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
@@ -17082,14 +17415,6 @@ body.member-simple .hide-in-simple{display:none!important}
 .skills-editor:focus{border-color:#58a6ff}
 .skills-empty{color:#6e7681;font-size:.8rem;padding:12px 0;text-align:center}
 /* Profile selector — inside the "More" menu (it used to sit on the tab bar) */
-.profile-wrap{display:flex;align-items:center;gap:6px;padding:4px 16px 6px}
-.profile-wrap .profile-select{flex:1;min-width:0}
-.profile-label{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
-.profile-select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;font-size:.78rem;padding:4px 22px 4px 8px;border-radius:6px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%238b949e' d='M5 7L1 3h8z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center}
-.profile-select:focus{border-color:#58a6ff}
-.profile-restart-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:.85rem;line-height:1}
-.profile-restart-btn:hover{color:#c9d1d9;background:#30363d}
-.profile-restart-btn.pending{color:#d2a8ff;border-color:#d2a8ff44}
 
 /* Profile editor modal — this is a working window, not a dialog: it holds file
    trees, editors and a project list, so it takes the whole viewport. */
@@ -17116,16 +17441,6 @@ body.member-simple .hide-in-simple{display:none!important}
    automatic minimum size is the content's min-content width — so `width:0`
    alone leaves the sidebar sitting at its full 240px and the collapse silently
    does nothing. */
-.profiles-body.rail .profiles-list{width:0;min-width:0;padding-right:0;border-right:none;overflow:hidden;opacity:0}
-.profiles-list{width:240px;flex-shrink:0;display:flex;flex-direction:column;gap:8px;border-right:1px solid #21262d;padding-right:14px;overflow-y:auto;transition:width .14s ease,padding .14s ease,opacity .14s ease}
-.profile-row{padding:8px 10px;border:1px solid #21262d;border-radius:6px;cursor:pointer;background:#0d1117;display:flex;flex-direction:column;gap:2px}
-.profile-row:hover{background:#1c2128}
-.profile-row.selected{border-color:#58a6ff;background:#0d2340}
-.profile-row-name{color:#c9d1d9;font-size:.85rem;font-weight:500}
-.profile-row-meta{color:#6e7681;font-size:.7rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
-.profile-row-builtin{color:#d2a8ff;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em}
-.profile-new-btn{background:#1c2333;border:1px solid #388bfd44;color:#58a6ff;padding:7px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500}
-.profile-new-btn:hover{background:#253049}
 .profile-edit{flex:1;display:flex;flex-direction:column;gap:8px;overflow-y:auto;min-width:0}
 .profile-edit label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin-top:4px}
 .profile-edit input,.profile-edit textarea,.profile-edit select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.85rem;outline:none;font-family:'SF Mono','Fira Code',Consolas,monospace}
@@ -17490,6 +17805,11 @@ body.member-simple .hide-in-simple{display:none!important}
 .claudemd-extras .extras-editor textarea{min-height:160px;width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
 .claudemd-extras .extras-editor textarea:focus{border-color:#58a6ff}
 
+/* Mobile bottom strip. Empty and hidden on a wide screen — syncMobileBottomBar()
+   MOVES the browser badge, the usage bars and the CPU/RAM readout in here on a
+   narrow one so the header keeps its width for session tabs. */
+.mobile-bottom-bar{display:none}
+
 /* Mobile */
 @media(max-width:768px){
   .top-nav{padding:0 0 0 8px}
@@ -17498,10 +17818,22 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-item{padding:8px 10px;gap:5px}
   .nav-title{display:none}
   .nav-attached{display:none}
-  .nav-server-stats{display:none}
   .nav-status-text{display:none}
-  .nav-usage{display:none}
-  .nav-tools-usage{display:block}
+  /* The browser badge, the usage bars and the CPU/RAM readout are moved out of
+     the header entirely (syncMobileBottomBar) — they are glanceable, not
+     interactive, and the tabs need the room more. They now render at the very
+     bottom of the page, under the terminal and the upload area. The copies that
+     used to stand in for them inside the Tools menu are gone with them. */
+  .nav-server-stats,.nav-usage,.nav-tools-usage{display:none}
+  .mobile-bottom-bar.has-items{display:flex;align-items:center;flex-wrap:wrap;gap:14px;
+    padding:12px 14px calc(14px + env(safe-area-inset-bottom,0px));margin-top:10px;
+    border-top:1px solid #21262d;background:#0d1117}
+  body:not(.member-simple) .mobile-bottom-bar .nav-usage:not(.disabled){
+    display:flex;flex-direction:row;gap:16px;border:none;margin:0;padding:0}
+  body:not(.member-simple) .mobile-bottom-bar .nav-server-stats{
+    display:flex;border:none;margin:0;padding:0}
+  .mobile-bottom-bar .nav-usage-bar{width:96px;height:5px}
+  .mobile-bottom-bar .nav-browser-badge{padding:4px 9px}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
   .claude-auth .status-dot{width:10px;height:10px}
@@ -17607,7 +17939,7 @@ body.member-simple .hide-in-simple{display:none!important}
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x1F464;</span> Claude Profiles</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x2699;</span> Claude Config</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -17627,6 +17959,9 @@ body.member-simple .hide-in-simple{display:none!important}
   <div id="auth-dropdown-content"></div>
 </div>
 <div class="main" id="main"></div>
+<!-- Phone-only strip, filled by syncMobileBottomBar() with the real header
+     nodes (never copies, so every poller that writes to them keeps working). -->
+<div class="mobile-bottom-bar" id="mobile-bottom-bar"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal-content"></div>
 </div>
@@ -17677,9 +18012,8 @@ body.member-simple .hide-in-simple{display:none!important}
      whichever profile is selected, because that is what they are. -->
 <div class="profiles-overlay" id="profiles-overlay" onclick="if(event.target===this)closeProfiles()">
   <div class="profiles-panel">
-    <h3><span>Claude Profiles</span> <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
+    <h3><span>Claude Config</span> <button class="stats-close" onclick="closeProfiles()">&times;</button></h3>
     <div class="pf-toolbar">
-      <button class="pf-tb-btn" id="pf-rail-btn" onclick="toggleProfilesRail()" title="Collapse the profile list to widen the editor">&#9664; Profiles</button>
       <button class="pf-tb-btn" id="pf-hint-btn" onclick="toggleProfilesHint()" title="Show or hide the explainer">&#9432;</button>
       <span class="pf-tb-sep"></span>
       <!-- The project is chosen in the MAIN nav; this window follows it. Showing a
@@ -17687,10 +18021,9 @@ body.member-simple .hide-in-simple{display:none!important}
       <span class="pf-tb-label">Project</span>
       <span class="pf-tb-scope" id="pf-proj-scope" title="Set the working project in the top navigation bar">All projects</span>
     </div>
-    <div class="profiles-hint" id="profiles-hint">Everything Claude Code reads on this host, in one place — nothing that changes its behaviour lives anywhere else in this dashboard. Each profile is a fully isolated config (settings.json, CLAUDE.md, MEMORY.md, auto-memories, skills, agents, commands, MCP, login) under <code>~/.claude-&lt;id&gt;/</code>, selected per tmux session via <code>CLAUDE_CONFIG_DIR</code>; the <strong>Default</strong> profile uses the standard <code>~/.claude</code>. Anything marked <b>shared</b> is host-wide and reads the same under every profile: the host context files (<code>~/CLAUDE.md</code> and what it points at), the hook scripts, and the <b>Projects</b> tab's working-directory files, which load on top of whichever profile a session runs on.</div>
+    <div class="profiles-hint" id="profiles-hint">Everything Claude Code reads on this host, in one place — nothing that changes its behaviour lives anywhere else in this dashboard: <code>settings.json</code>, <code>CLAUDE.md</code>, <code>MEMORY.md</code>, auto-memories, skills, agents, commands, MCP and login, all under the standard <code>~/.claude</code>. The <b>Projects</b> tab's working-directory files are per-cwd and load on top.</div>
     <div class="profiles-body">
-      <div class="profiles-list" id="profiles-list">Loading...</div>
-      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Select a profile on the left, or create a new one.</div></div>
+      <div class="profile-edit" id="profile-edit"><div class="profile-empty">Loading…</div></div>
     </div>
   </div>
 </div>
@@ -17772,7 +18105,10 @@ let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
 const rawState={};
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0};return rawState[n]}
+// `frozen`/`frozenAtLines` back the Freeze toggle: polling and st.fullText carry
+// on exactly as before, only the paint is held. `lastHtml` is what is currently
+// on screen — see renderRawText for why re-writing identical HTML is not free.
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,lastHtml:null};return rawState[n]}
 
 // --- "Clean view" terminal filter ---
 // One switch. On, the terminal shows only what the agent SAID to you and drops
@@ -17827,6 +18163,28 @@ const _LEADING_BULLET_RE=/^[\s]*[●⏺•·]/;
 // with │ at column 0 and we do not want to eat that.
 const _OUTPUT_MARKER_RE=/^[\s]*⎿|^\s+[└╰]\s/;
 const _CALL_CONT_RE=/^\s+│/;
+// A rendered markdown TABLE is drawn with the same `│` Codex uses for a wrapped
+// command row, and its rules start with the same `└`/`├` used for tool output:
+//
+//   ┌──────────────┬──────────┐
+//   │   channel    │ visitors │     <- matched _CALL_CONT_RE -> mode='call'
+//   ├──────────────┼──────────┤
+//
+// so clean view used to swallow the whole table from its second line on, and
+// every indented line after it (the prose that followed the table) with it. The
+// discriminator is the column count: a wrapped command row carries exactly one
+// leading `│`, a table row has one per column boundary. Rule rows are pure
+// box-drawing. ASCII tables must open AND close with `|` — a bare `|` mid-line
+// is a shell pipe in a wrapped command, not a column.
+const _BOX_RULE_RE=/^[─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬╭╮╯╰━┃┏┓┗┛┣┫┳┻╋\s]+$/;
+function _isTableRow(line){
+  const s=(line||'').trim();
+  if(!s)return false;
+  if(s.charAt(0)==='│')return (s.match(/│/g)||[]).length>=2;
+  if('┌├└╭╰┏┣┗┬┼┴═╔╠╚'.indexOf(s.charAt(0))>=0)return _BOX_RULE_RE.test(s)&&s.length>=3;
+  if(s.charAt(0)==='|'&&s.charAt(s.length-1)==='|')return (s.match(/\|/g)||[]).length>=2;
+  return false;
+}
 const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+/;
 // Claude-style `ToolName(args)`. The "(" is required so ordinary prose starting
 // with a word like "Read"/"Write"/"Update"/"Add"/"Task" is never swallowed.
@@ -17922,6 +18280,12 @@ function applyRawFilter(text){
   let mode='';
   for(let i=0;i<lines.length;i++){
     const line=lines[i];
+    // Table rows are content, and they end any block that was being hidden —
+    // tested before the marker rules, which would otherwise claim them. Two
+    // blocks still win: a `⎿`/`└` result (a table printed BY a command is tool
+    // output, and breaking out would leak the rest of the block) and the
+    // launch-command block (whose tail is Claude Code's own `╭…│…╰` banner).
+    if(mode!=='output'&&mode!=='shell'&&_isTableRow(line)){mode='';out.push(line);continue;}
     if(_isNoise(line)){mode='noise';continue;}
     if(_CALL_CONT_RE.test(line)){mode='call';continue;}
     if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
@@ -18187,40 +18551,107 @@ function _hasSelectionWithin(el){
 }
 // Part 4: once the user clears a terminal selection, flush any render we deferred
 // while they were highlighting text to copy.
-document.addEventListener('selectionchange',()=>{
+function _flushDeferredRawRenders(){
   if(typeof rawState!=='object'||!rawState)return;
   for(const n in rawState){
     const st=rawState[n];
-    if(st&&st._pendingRender){
+    if(st&&st._pendingRender&&!st.frozen){
       const el=document.getElementById('raw-'+n);
       if(el&&!_hasSelectionWithin(el))renderRawText(n);
     }
   }
-});
-function renderRawText(name){
+}
+document.addEventListener('selectionchange',_flushDeferredRawRenders);
+// A selection that does not exist yet cannot be detected by selectionchange: for
+// the first pixels of a drag the range is still collapsed, so a re-render landing
+// in that window rips the nodes out from under the mouse and the highlight never
+// starts. Hold every terminal paint while a button is down inside one, and flush
+// on release. Delegated at the document level on purpose — the terminal element
+// is rebuilt on every detail re-render, so per-element listeners would leak.
+let _rawDragEl=null;
+document.addEventListener('mousedown',function(e){
+  _rawDragEl=(e.target&&e.target.closest)?e.target.closest('.raw-output'):null;
+},true);
+document.addEventListener('mouseup',function(){
+  if(!_rawDragEl)return;
+  _rawDragEl=null;
+  _flushDeferredRawRenders();
+},true);
+function renderRawText(name,force){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
-  // Part 4: don't clobber an active text selection inside the terminal — defer the
-  // re-render so the user can highlight & copy while output keeps streaming.
-  if(_hasSelectionWithin(rawEl)){st._pendingRender=true;return;}
+  if(!force){
+    // Frozen: keep buffering into st.fullText and leave the screen alone. The
+    // agent is untouched — only the paint waits, and unfreezing shows the lot.
+    if(st.frozen){st._pendingRender=true;updateFreezeUi(name);return;}
+    // Part 4: don't clobber an active (or in-progress) text selection inside the
+    // terminal — defer so the user can highlight & copy while output streams.
+    if(_rawDragEl===rawEl||_hasSelectionWithin(rawEl)){st._pendingRender=true;return;}
+  }
+  const filtered=applyRawFilter(st.fullText);
+  const html=_linkifyTerminalText(filtered,st.paneWidth);
+  // tmux redraws its pane far more often than the pane's content actually
+  // changes, and every `innerHTML=` throws away the layout, the scroll anchor
+  // and any nascent selection. Writing identical HTML is the single biggest
+  // cause of the terminal "jumping" while you try to read it — so don't.
+  if(html===st.lastHtml&&!force){st._pendingRender=false;return;}
+  st.lastHtml=html;
   st._pendingRender=false;
   const wasAtBottom=!st.userScrolledUp;
   const prevDistFromBottom=st.userScrolledUp?(rawEl.scrollHeight-rawEl.scrollTop):0;
-  const filtered=applyRawFilter(st.fullText);
   rawEl._programmaticScroll=true;
-  rawEl.innerHTML=_linkifyTerminalText(filtered,st.paneWidth);
-  if(wasAtBottom){
-    rawEl.scrollTop=rawEl.scrollHeight;
-  }else{
-    rawEl.scrollTop=Math.max(0,rawEl.scrollHeight-prevDistFromBottom);
-  }
+  rawEl.innerHTML=html;
+  const target=wasAtBottom?rawEl.scrollHeight:Math.max(0,rawEl.scrollHeight-prevDistFromBottom);
+  rawEl._progExpect=target;
+  if(Math.abs(rawEl.scrollTop-target)>1)rawEl.scrollTop=target;
+  else rawEl._programmaticScroll=false;   // nothing moved, so no scroll event is coming
+  updateFreezeUi(name);
 }
 function rerenderAllRaw(){
   // Called after the filter preference changes — re-render every cached buffer
   for(const n in rawState){
-    if(rawState[n]&&rawState[n].fullText)renderRawText(n);
+    if(rawState[n]&&rawState[n].fullText)renderRawText(n,true);
   }
+}
+
+// ── Freeze ──────────────────────────────────────────────────────────────────
+// "Stop moving so I can read this." Freezing holds the PAINT only: polling keeps
+// running, st.fullText keeps growing, and the agent never notices. Unfreezing
+// renders everything that arrived in between in one go.
+function toggleRawFreeze(name){
+  const st=getRawState(name);
+  st.frozen=!st.frozen;
+  st.frozenAtLines=st.frozen?(st.fullText||'').split('\n').length:0;
+  if(st.frozen){
+    updateFreezeUi(name);
+  }else{
+    st.userScrolledUp=false;   // catching up means going to the tail
+    renderRawText(name,true);
+  }
+}
+function _frozenNewLines(st){
+  if(!st.frozen)return 0;
+  return Math.max(0,(st.fullText||'').split('\n').length-(st.frozenAtLines||0));
+}
+function updateFreezeUi(name){
+  const st=getRawState(name);
+  const held=_frozenNewLines(st);
+  const btn=document.getElementById('freeze-btn-'+name);
+  if(btn){
+    btn.classList.toggle('active',!!st.frozen);
+    btn.innerHTML=st.frozen?('&#10052; Frozen'+(held?' &middot; '+held+' new':'')):'&#10052; Freeze';
+    btn.title=st.frozen
+      ? 'The view is held still. The agent is still working and everything it writes appears the moment you unfreeze. Click to resume.'
+      : 'Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.';
+  }
+  const pill=document.getElementById('raw-frozen-'+name);
+  if(pill){
+    pill.classList.toggle('on',!!st.frozen);
+    pill.innerHTML='&#10052; Frozen'+(held?' &middot; '+held+' new line'+(held===1?'':'s'):'')+' &mdash; click to resume';
+  }
+  const rawEl=document.getElementById('raw-'+name);
+  if(rawEl)rawEl.classList.toggle('frozen',!!st.frozen);
 }
 const CLEAN_VIEW_ON='On — only the agent\'s replies';
 const CLEAN_VIEW_OFF='Off — showing the full terminal';
@@ -18648,16 +19079,126 @@ async function removeProjectFromNav(){
   }catch(e){ alert('Failed to remove the project'); }
 }
 
+/* ── Chat bubbles ────────────────────────────────────────────────────────────
+   A bubble carries the agent's reply IN FULL, not a truncated recap. The recap
+   the server still generates is kept as a lead line on long answers only, where
+   a headline earns its space.
+
+   Everything is linkified on the way in. That matters more here than anywhere
+   else in the app: the reader is remote, so "I wrote /home/nimo/REPORT.md" is
+   useless to them unless it becomes a link this dashboard can serve. Absolute
+   and ~ paths become <BASE>/file?path=… (same origin, same login), and http(s)
+   links are left alone. */
+
+// One left-to-right pass over the RAW text: markdown link, then an absolute/~
+// path, then a bare URL. Every non-link slice is escaped as it is emitted, so
+// nothing we write can be re-read as markup.
+const _CHAT_LINK_RE=/\[([^\]\n]{1,160})\]\(([^)\s]{1,500})\)|(^|[\s(\[|>*])((?:~|\/(?:home|root|var|opt|srv|usr|etc|tmp|mnt|media|data))\/[^\s<>()\[\]{}"'`,;]*)|https?:\/\/[^\s<>()\[\]{}"'`]+/gm;
+const _CHAT_LINK_TRIM=/[.,;:!?)\]}'"*`>]+$/;
+function _splitLinkTail(s){
+  // Trailing sentence punctuation is prose, not part of the target.
+  let link=s.replace(_CHAT_LINK_TRIM,'');
+  while(link&&(link.split('(').length-1)<(link.split(')').length-1))link=link.slice(0,-1).replace(_CHAT_LINK_TRIM,'');
+  return {link:link,tail:s.slice(link.length)};
+}
+function _chatInline(s,plain){
+  if(!s)return'';
+  let h=esc(s);
+  if(plain)return h;                       // inside a code span: no markdown
+  h=h.replace(/\*\*([^*\n]{1,300})\*\*/g,'<strong>$1</strong>');
+  h=h.replace(/^\s*(#{1,6})\s+(.+)$/gm,'<strong class="chat-h">$2</strong>');
+  return h;
+}
+function _chatHref(target){
+  return /^https?:\/\//i.test(target)
+    ? target
+    : BASE+'/file?path='+encodeURIComponent(target);
+}
+function _chatAnchor(target,label,plain){
+  if(!/^(https?:\/\/|~\/|\/)/i.test(target))return _chatInline(label||target,plain);
+  return '<a class="chat-link" href="'+_escTermHtml(_chatHref(target))+'" target="_blank" rel="noopener"'
+    +' title="'+_escTermHtml(target)+'">'+_chatInline(label||target,plain)+'</a>';
+}
+function _chatRichSpan(text,plain){
+  if(!text)return'';
+  let out='',last=0,m;
+  _CHAT_LINK_RE.lastIndex=0;
+  while((m=_CHAT_LINK_RE.exec(text))!==null){
+    if(m[0]===''){_CHAT_LINK_RE.lastIndex++;continue;}
+    out+=_chatInline(text.slice(last,m.index),plain);
+    if(m[1]!==undefined&&m[2]!==undefined){          // [label](target)
+      out+=_chatAnchor(_splitLinkTail(m[2]).link,m[1],plain);
+    }else if(m[4]!==undefined){                      // leading char + path
+      const p=_splitLinkTail(m[4]);
+      out+=_chatInline(m[3]||'',plain)+_chatAnchor(p.link,null,plain)+_chatInline(p.tail,plain);
+    }else{                                           // bare URL
+      const u=_splitLinkTail(m[0]);
+      out+=_chatAnchor(u.link,null,plain)+_chatInline(u.tail,plain);
+    }
+    last=_CHAT_LINK_RE.lastIndex;
+  }
+  out+=_chatInline(text.slice(last),plain);
+  return out;
+}
+const _CHAT_CODE_RE=/`([^`\n]{1,300})`/g;
+function _chatRich(text){
+  if(!text)return'';
+  // Inline code spans are peeled off first, then linkified on their own. Agents
+  // write a deliverable as `~/REPORT.md` far more often than bare, and a path
+  // that renders as unclickable code is exactly the link the reader needed.
+  let out='',idx=0,cm;
+  _CHAT_CODE_RE.lastIndex=0;
+  while((cm=_CHAT_CODE_RE.exec(text))!==null){
+    out+=_chatRichSpan(text.slice(idx,cm.index),false);
+    out+='<code>'+_chatRichSpan(cm[1],true)+'</code>';
+    idx=_CHAT_CODE_RE.lastIndex;
+  }
+  out+=_chatRichSpan(text.slice(idx),false);
+  return out;
+}
+function _chatLinksHtml(links){
+  if(!links||!links.length)return'';
+  const chips=links.map(l=>{
+    const isFile=l.kind==='file';
+    const target=isFile?l.path:l.href;
+    if(!target)return'';
+    const ico=isFile?(l.dir?'&#128193;':'&#128196;'):'&#128279;';
+    return '<a class="chat-chip" href="'+_escTermHtml(_chatHref(target))+'" target="_blank" rel="noopener"'
+      +' title="'+_escTermHtml(target)+'"><span class="chat-chip-ico">'+ico+'</span>'
+      +esc(l.label||target)+'</a>';
+  }).join('');
+  if(!chips)return'';
+  return '<div class="chat-links"><div class="chat-links-title">Links &amp; files</div>'
+    +'<div class="chat-chips">'+chips+'</div></div>';
+}
+function _normLoose(s){return (s||'').replace(/\s+/g,' ').trim().toLowerCase()}
+// When the recap LLM is unavailable the server falls back to the reply's own
+// opening 600 characters. Showing that as a lead above the same reply is just
+// the first paragraph printed twice, so a prefix never earns the slot.
+function _isRecapWorthShowing(summary,full){
+  if(!summary||!full)return false;
+  const s=_normLoose(summary).replace(/[…\.]+$/,'').trim();
+  const f=_normLoose(full);
+  return !!s && s!==f && !f.startsWith(s);
+}
+function chatBubbleInner(m){
+  const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
+  if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
+  const full=(m.full||'').trim();
+  const summary=(m.text||'').trim();
+  let html='';
+  if(full.length>700&&_isRecapWorthShowing(summary,full))
+    html+='<div class="chat-lead">'+_chatRich(summary)+'</div>';
+  html+='<div class="chat-body">'+_chatRich(full||summary)+'</div>';
+  html+=_chatLinksHtml(m.links);
+  return html+ts;
+}
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Claude — each reply shows up here as a short summary.</div>';
+    return '<div class="chat-empty">No messages yet. Type below to talk to Claude — every reply shows up here in full, with links to anything it produced.</div>';
   }
-  return msgs.map(m=>`
-    <div class="chat-msg ${m.role}">
-      ${esc(m.text)}
-      <div class="chat-meta">${fmtTime(m.ts)}</div>
-    </div>`).join('');
+  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m)}</div>`).join('');
 }
 
 function saveRawCache(){
@@ -18689,18 +19230,40 @@ function renderDetail(){
 
   mainEl.innerHTML=`
     <div class="tab-bar">
-      <div class="tab ${tab==='raw'?'active':''}" onclick="switchTab('${s.name}','raw')">Terminal</div>
+      <!-- View switcher. Terminal and Chat are two ways of reading the SAME
+           session, so they belong on one control rather than one tab plus a
+           buried menu entry: whichever you are in, the other is one click away
+           in the same place. -->
       <div class="tab-more-wrap">
-        <div class="tab tab-more-trigger ${['chat','skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
+        <div class="tab tab-view-trigger ${['raw','chat'].includes(tab)?'active':''}" onclick="toggleViewMenu(event)"><span class="tab-view-label" id="tab-view-label-${esc(s.name)}">${tab==='chat'?'Chat':'Terminal'}</span><span class="tab-view-arrow"> &#9662;</span></div>
+        <div class="tab-more-menu" id="tab-view-menu">
+          <div class="tab-more-item ${tab==='raw'?'active':''}" data-tab="raw" onclick="switchTab('${s.name}','raw');closeViewMenu()">Terminal <span class="tab-more-hint">the agent's live screen</span></div>
+          <div class="tab-more-item ${tab==='chat'?'active':''}" data-tab="chat" onclick="switchTab('${s.name}','chat');closeViewMenu()">Chat <span class="tab-more-hint">replies in plain language</span></div>
+        </div>
+      </div>
+      <div class="tab-more-wrap">
+        <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
           <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
-          ${renderProfileDropdown(s)}
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
+          <!-- Clean view sits right under Auto-push because it is the other
+               switch people flip several times a day, and it used to be reachable
+               only by opening the whole Info tab. Same pref, same handler as the
+               copy in Info — toggleCleanView keeps every copy in step. -->
+          <div style="padding:8px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Terminal: Clean view</div>
+          <label class="tab-more-switch" onclick="event.stopPropagation()">
+            <span class="watchdog-toggle">
+              <input type="checkbox" id="cleanview-toggle-more-${esc(s.name)}"
+                onchange="toggleCleanView('${esc(s.name)}',this.checked)"
+                ${getCleanViewPref()?'checked':''}>
+              <span class="watchdog-toggle-slider"></span>
+            </span>
+            <span class="tab-more-switch-text" id="cleanview-status-more-${esc(s.name)}">${getCleanViewPref()?CLEAN_VIEW_ON:CLEAN_VIEW_OFF}</span>
+          </label>
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
-          <div class="tab-more-item ${tab==='chat'?'active':''}" onclick="switchTab('${s.name}','chat');closeTabMore()">Chat</div>
-          ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
-          <div class="tab-more-item ${tab==='info'?'active':''}" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
+          ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" data-tab="skills" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
+          <div class="tab-more-item ${tab==='info'?'active':''}" data-tab="info" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
           ${MEMBER_SIMPLE?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div class="tab-more-item more-admin-only" onclick="openProfilesAt('projects');closeTabMore()" title="Every file that reaches Claude — this directory's files, the host context, and this profile's config">Context &amp; project files&hellip;</div>
@@ -18758,6 +19321,10 @@ function renderDetail(){
            pane title all live in the header line next to Delete, which buys the
            terminal ~34px of height on every screen. -->
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
+      <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
+           which is collapsed by default, so the frozen state needs to announce
+           itself (and undo itself) from on top of the terminal. -->
+      <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
@@ -18884,19 +19451,22 @@ function renderDetail(){
       const cached=rawCache[s.name];
       const infoEl=document.getElementById('raw-info-'+s.name);
       if(cached){
-        // Restore unfiltered text into state, then render through the filter
+        // Restore unfiltered text into state, then render through the filter.
+        // Forced: the element is brand new, so paint it even when frozen — a
+        // freeze pins what is on screen, and there is nothing on screen yet.
         const st=getRawState(s.name);
         st.fullText=cached.text;
         st.userScrolledUp=false;
-        rawEl._programmaticScroll=true;
-        rawEl.innerHTML=_linkifyTerminalText(applyRawFilter(cached.text),st.paneWidth);
-        rawEl.scrollTop=rawEl.scrollHeight;
+        st.lastHtml=null;
+        if(st.frozen)st.frozenAtLines=(st.fullText||'').split('\n').length;
+        renderRawText(s.name,true);
         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
         startRawPolling(s.name);
       }else{
         loadRaw(s.name);
         startRawPolling(s.name);
       }
+      updateFreezeUi(s.name);
     }
   }
   if(tab==='info'){
@@ -18923,24 +19493,28 @@ function switchTab(name,tab){
   const tabBar=mainEl.querySelector('.tab-bar');
   if(tabBar){
     tabBar.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    if(tab==='raw'){
-      const rawTab=tabBar.querySelector('.tab');
-      if(rawTab)rawTab.classList.add('active');
-    }else{
-      const trigger=tabBar.querySelector('.tab-more-trigger');
-      if(trigger){trigger.classList.add('active');trigger.innerHTML='<span class="tab-more-label">'+({'chat':'Chat','skills':'Skills','info':'Info'}[tab]||'More')+'</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span>';}
+    const viewTrigger=tabBar.querySelector('.tab-view-trigger');
+    const moreTrigger=tabBar.querySelector('.tab-more-trigger');
+    if(tab==='raw'||tab==='chat'){
+      if(viewTrigger)viewTrigger.classList.add('active');
+    }else if(moreTrigger){
+      moreTrigger.classList.add('active');
+      moreTrigger.innerHTML='<span class="tab-more-label">'+({'skills':'Skills','info':'Info'}[tab]||'More')+'</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span>';
     }
-    tabBar.querySelectorAll('.tab-more-item').forEach(el=>el.classList.remove('active'));
-    const items=tabBar.querySelectorAll('.tab-more-item');
-    const moreIdx=['chat','skills','info'].indexOf(tab);
-    if(moreIdx>=0&&items[moreIdx])items[moreIdx].classList.add('active');
+    // The view trigger always names the view you are in, so Chat->Terminal and
+    // Terminal->Chat read the same way round.
+    const viewLabel=document.getElementById('tab-view-label-'+name);
+    if(viewLabel&&(tab==='raw'||tab==='chat'))viewLabel.textContent=(tab==='chat'?'Chat':'Terminal');
+    tabBar.querySelectorAll('.tab-more-item[data-tab]').forEach(el=>{
+      el.classList.toggle('active',el.getAttribute('data-tab')===tab);
+    });
   }
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
   stopAllRawPolling();
   stopStatsPolling();
   stopAllWatchdogPolling();
-  if(tab==='raw')startRawPolling(name);
+  if(tab==='raw'){startRawPolling(name);updateFreezeUi(name);}
   if(tab==='info'){
     startStatsPolling(name);
     const s=sessions.find(x=>x.name===name);
@@ -18969,11 +19543,24 @@ function switchTab(name,tab){
 // ── Tab-more dropdown ──
 function toggleTabMore(e){
   e.stopPropagation();
+  closeViewMenu();
   const menu=document.getElementById('tab-more-menu');
   if(menu)menu.classList.toggle('open');
 }
 function closeTabMore(){
   const menu=document.getElementById('tab-more-menu');
+  if(menu)menu.classList.remove('open');
+}
+
+// ── View dropdown (Terminal ⇄ Chat) ──
+function toggleViewMenu(e){
+  e.stopPropagation();
+  closeTabMore();
+  const menu=document.getElementById('tab-view-menu');
+  if(menu)menu.classList.toggle('open');
+}
+function closeViewMenu(){
+  const menu=document.getElementById('tab-view-menu');
   if(menu)menu.classList.remove('open');
 }
 
@@ -18989,7 +19576,7 @@ function closeToolsMenu(){
 }
 
 // Close dropdowns on outside click
-document.addEventListener('click',function(){closeTabMore();closeToolsMenu()});
+document.addEventListener('click',function(){closeTabMore();closeViewMenu();closeToolsMenu()});
 
 function mergeChatMessages(name, serverMsgs){
   // Merge server messages with local messages, preserving any locally-added
@@ -19018,19 +19605,21 @@ function isChatAtBottom(chatEl){
   return (chatEl.scrollHeight-chatEl.scrollTop-chatEl.clientHeight)<50;
 }
 
-function appendChatBubble(name,role,text,ts){
+function appendChatBubble(name,role,text,ts,extra){
   if(!chatMessages[name])chatMessages[name]=[];
   // Avoid duplicate assistant messages
   if(role==='assistant'){
     const msgs=chatMessages[name];
     for(let i=msgs.length-1;i>=0;i--){
       if(msgs[i].role==='assistant'){
-        if(msgs[i].text===text)return;
+        if(msgs[i].text===text&&(msgs[i].full||'')===((extra&&extra.full)||''))return;
         break;
       }
     }
   }
-  chatMessages[name].push({role,text,ts});
+  const msg={role,text,ts};
+  if(extra){msg.full=extra.full||'';msg.links=extra.links||[];}
+  chatMessages[name].push(msg);
   // If this session's chat is visible, append to DOM
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
     const chatEl=document.getElementById('chat-'+name);
@@ -19043,7 +19632,7 @@ function appendChatBubble(name,role,text,ts){
       if(typing)typing.remove();
       const bubble=document.createElement('div');
       bubble.className='chat-msg '+role;
-      bubble.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+      bubble.innerHTML=chatBubbleInner(msg);
       chatEl.appendChild(bubble);
       // Only auto-scroll if user was at bottom or this is their own message
       if(wasAtBottom||role==='user')chatEl.scrollTop=chatEl.scrollHeight;
@@ -19061,27 +19650,33 @@ function reconcileAssistantSummary(name, serverMsgs){
     if(serverMsgs[i].role==='assistant'){srv=serverMsgs[i];break;}
     if(serverMsgs[i].role==='user')break;
   }
-  if(!srv||!srv.text)return;
+  if(!srv||!(srv.text||srv.full))return;
   const local=chatMessages[name]||(chatMessages[name]=[]);
   // Latest local assistant message after the last local user message.
   let lu=-1;for(let i=local.length-1;i>=0;i--){if(local[i].role==='user'){lu=i;break;}}
   let la=-1;for(let i=local.length-1;i>lu;i--){if(local[i].role==='assistant'){la=i;break;}}
   if(la>=0){
-    if(local[la].text!==srv.text){
+    // The full reply and the deliverables grow as the turn settles even when the
+    // recap wording lands the same, so all three decide whether to repaint.
+    const changed=local[la].text!==srv.text
+      ||(local[la].full||'')!==(srv.full||'')
+      ||JSON.stringify(local[la].links||[])!==JSON.stringify(srv.links||[]);
+    if(changed){
       local[la].text=srv.text;local[la].ts=srv.ts;
-      updateLastAssistantBubble(name,srv.text,srv.ts);
+      local[la].full=srv.full||'';local[la].links=srv.links||[];
+      updateLastAssistantBubble(name,local[la]);
     }
   }else{
-    appendChatBubble(name,'assistant',srv.text,srv.ts);
+    appendChatBubble(name,'assistant',srv.text,srv.ts,{full:srv.full,links:srv.links});
   }
 }
-function updateLastAssistantBubble(name,text,ts){
+function updateLastAssistantBubble(name,msg){
   if(name!==selectedSession||(activeTabs[name]||'chat')!=='chat')return;
   const chatEl=document.getElementById('chat-'+name);
   if(!chatEl)return;
   const bubbles=chatEl.querySelectorAll('.chat-msg.assistant');
   const el=bubbles[bubbles.length-1];
-  if(el)el.innerHTML=esc(text)+'<div class="chat-meta">'+fmtTime(ts)+'</div>';
+  if(el)el.innerHTML=chatBubbleInner(msg);
 }
 
 function autoGrow(el){
@@ -19480,10 +20075,17 @@ function _ensureRawScrollTracking(rawEl,st){
   // get misclassified as user scrolls.
   rawEl.addEventListener('scroll',()=>{
     if(rawEl._programmaticScroll){
-      rawEl._programmaticScroll=false;
-      // Programmatic scroll-to-bottom keeps the "follow-tail" mode on
-      const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<10;
-      if(atBottom)st.userScrolledUp=false;
+      // One render can emit TWO scroll events: the browser clamping scrollTop to
+      // the new scrollHeight, then our own assignment. Clearing the flag on the
+      // first one made the second read as a user scroll and pinned the view
+      // away from the tail. Clear it only on the event that lands where we
+      // aimed; anything else is still ours to ignore.
+      if(rawEl._progExpect===undefined||Math.abs(rawEl.scrollTop-rawEl._progExpect)<2){
+        rawEl._programmaticScroll=false;
+        // Programmatic scroll-to-bottom keeps the "follow-tail" mode on
+        const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<10;
+        if(atBottom)st.userScrolledUp=false;
+      }
       return;
     }
     const atBottom=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)<24;
@@ -19559,6 +20161,11 @@ async function loadRaw(name){
   st.visibleHash='';
   st.firstLoad=true;
   st.fullText='';
+  st.lastHtml=null;
+  // Reload is an explicit "show me the terminal as it is now", which is the
+  // opposite of a freeze — so it lifts one.
+  st.frozen=false;st.frozenAtLines=0;
+  updateFreezeUi(name);
   const rawEl=document.getElementById('raw-'+name);
   if(rawEl)rawEl.textContent='Loading Claude Code...';
   const infoEl=document.getElementById('raw-info-'+name);
@@ -20549,6 +21156,8 @@ function buildKeyBar(name,tab){
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
+    ${tab==='raw'?`<span class="key-bar-sep"></span>
+    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
@@ -20941,8 +21550,8 @@ function _profileForSession(name){
 }
 
 // The skills UI is keyed by an element-id suffix. A session tab passes the
-// session name and the profile is looked up from it; the Profiles window passes
-// PF_SKILL_KEY and registers the profile it is editing here, so one set of
+// session name and the config dir is looked up from it; the Claude Config window
+// passes PF_SKILL_KEY and registers what it is editing here, so one set of
 // render/mutate functions drives both places.
 const _skillScopePid={};
 function _skillPid(key){
@@ -20956,7 +21565,7 @@ async function loadProfileSkills(name){
   const builtinEl=document.getElementById('skills-builtin-'+name);
   if(!activeEl||!libEl||!builtinEl)return;
   const pid=_skillPid(name);
-  if(meta)meta.innerHTML='Profile: <code>'+esc(pid)+'</code>';
+  if(meta)meta.innerHTML='Skills read from <code>'+esc(pid==='default'?'~/.claude/skills':('~/.claude-'+pid+'/skills'))+'</code>';
   activeEl.innerHTML='<div class="skills-empty">Loading...</div>';
   libEl.innerHTML='<div class="skills-empty">Loading...</div>';
   builtinEl.innerHTML='<div class="skills-empty">Loading...</div>';
@@ -21209,13 +21818,18 @@ function closeSkillEditor(name){
   _editingSkillName=null;
 }
 
-// ── Claude profiles ──
+// ── Claude config ──
+// The multi-profile picker is gone. It offered a set of preset personas (UI
+// Expert, UX Expert, Researcher, …), each a separate CLAUDE_CONFIG_DIR, chosen
+// per session — a whole axis of state nobody was using, and one more control
+// between the user and the session. Every session runs on the default config
+// (`~/.claude`), and the window below edits that one config. The /api/profiles
+// routes stay: they are what the editor reads and writes.
 let _profilesCache = null;        // [{id,name,model,effort,builtin}, ...]
 let _profilesEditing = null;       // currently-edited full profile object
-let _profilePending = {};          // sessionName -> "pending restart" flag
 
 async function loadProfiles(force){
-  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no profiles
+  if(MEMBER_SIMPLE){ _profilesCache=[]; return _profilesCache; }  // members have no config editor
   if(_profilesCache && !force) return _profilesCache;
   try{
     const resp = await fetch(BASE+'/api/profiles');
@@ -21223,89 +21837,6 @@ async function loadProfiles(force){
     _profilesCache = data.profiles || [];
   }catch(e){ _profilesCache = []; }
   return _profilesCache;
-}
-
-function renderProfileDropdown(s){
-  if(MEMBER_SIMPLE) return '';  // members have no profile selector
-  const cur = s.profile_id || 'default';
-  const list = _profilesCache || [];
-  const opts = list.length
-    ? list.map(p=>`<option value="${esc(p.id)}" ${p.id===cur?'selected':''}>${esc(p.name)}</option>`).join('')
-    : `<option value="default" selected>Default</option>`;
-  const pending = _profilePending[s.name] ? ' pending' : '';
-  const restartTitle = _profilePending[s.name]
-    ? 'Restart Claude to apply the new profile'
-    : 'Restart Claude with this profile';
-  // Lives inside the "More" menu, not on the tab bar: it is a set-once-per-session
-  // control, and on the tab bar it cost a permanent slot next to Terminal.
-  // onclick stops the bubble because the menu closes on any outside click and
-  // was swallowing the <select>.
-  return `<div class="profile-wrap" title="Claude profile (CLAUDE_CONFIG_DIR)" onclick="event.stopPropagation()">
-    <span class="profile-label">Profile</span>
-    <select class="profile-select" id="profile-select-${esc(s.name)}" onchange="onProfileChange('${esc(s.name)}',this.value)">${opts}</select>
-    <button class="profile-restart-btn${pending}" onclick="restartWithProfile('${esc(s.name)}')" title="${restartTitle}">↻</button>
-  </div>
-  <div class="tab-more-model-sep"></div>`;
-}
-
-async function onProfileChange(sessionName, profileId){
-  // First call: probe whether Claude is currently running in this session
-  // (we pass restart:false so we get back the running state). If it IS running,
-  // ask the user whether to restart now; otherwise the new profile won't take
-  // effect until Claude is next launched and the user's memory will appear to
-  // "spill" from the previous profile.
-  try{
-    let resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: profileId, restart: false})
-    });
-    let data = await resp.json();
-    if(!resp.ok){alert(data.error||'Failed to set profile'); return;}
-    const sess = sessions.find(x=>x.name===sessionName);
-    if(sess) sess.profile_id = profileId;
-
-    if(data.claude_was_running && !data.restarted){
-      const wantRestart = confirm(
-        'Profile switched to "' + profileId + '".\n\n' +
-        'Claude is still running with the previous profile and will keep using it ' +
-        '(including its memory) until you restart it.\n\n' +
-        'Restart Claude now?'
-      );
-      if(wantRestart){
-        resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({profile_id: profileId, restart: true})
-        });
-        data = await resp.json();
-        if(resp.ok && data.restarted){
-          delete _profilePending[sessionName];
-        }else{
-          _profilePending[sessionName] = true;
-        }
-      }else{
-        _profilePending[sessionName] = true;
-      }
-    }else{
-      delete _profilePending[sessionName];
-    }
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to set profile.'); }
-}
-
-async function restartWithProfile(sessionName){
-  const sess = sessions.find(x=>x.name===sessionName);
-  const pid = (sess && sess.profile_id) || 'default';
-  if(!confirm('Exit Claude in "'+sessionName+'" and relaunch with profile "'+pid+'"? Any unsaved Claude state will be lost.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/sessions/'+encodeURIComponent(sessionName)+'/profile', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({profile_id: pid, restart: true})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to restart'); return; }
-    delete _profilePending[sessionName];
-    if(selectedSession===sessionName) renderDetail();
-  }catch(e){ alert('Failed to restart Claude.'); }
 }
 
 // ── Current-user awareness ──────────────────────────────────────────────────
@@ -21339,6 +21870,8 @@ async function applyRoleVisibility(){
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
+  // Which widgets the phone strip can show depends on the role we just learned.
+  syncMobileBottomBar();
   if(isAdmin) startBrowserAuthPolling();
 }
 
@@ -21379,7 +21912,7 @@ function renderSettingsTabs(){
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
   const tabs = [];
   // "My Context" is an admin's ~/.claude — the same CLAUDE.md, MEMORY.md and
-  // settings.json the Claude Profiles window shows under Default, so it would be
+  // settings.json the Claude Config window shows, so it would be
   // the one file editor living in two places. Members have no profiles window,
   // and their config dir is their own, so they keep the tab.
   if(!isAdmin) tabs.push({id:'mycontext', label:'My Context'});
@@ -21557,6 +22090,26 @@ function renderBrowserTab(data){
     const id = esc(s.id);
     const dot = s.running ? '<span class="bs-dot on"></span>' : '<span class="bs-dot off"></span>';
     const status = s.running ? 'running' : 'stopped';
+    // Android device viewers are not Chrome/noVNC sessions. Freeze, Park,
+    // Fingerprint, New IP and Edit all call browser APIs keyed by session id,
+    // which would 404 for a phone — so render a card with only the controls
+    // that mean something here.
+    if(s.kind === 'android'){
+      const prev = s.running
+        ? '<iframe src="'+esc(s.viewer_url)+'" loading="lazy" title="'+esc(s.name)+'"></iframe>'
+        : '<div class="bs-off">Viewer not running — <code>systemctl start android-view</code></div>';
+      return '<div class="bs-card">'+
+        '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
+          '<span class="bs-meta">'+status+' · adb · wechat-vm-arm</span></div>'+
+        '<div class="bs-preview">'+prev+'</div>'+
+        '<div class="bs-badges"><span class="bs-badge ok">📱 Android device</span>'+
+          '<span class="bs-badge">click to tap · drag to swipe</span></div>'+
+        '<div class="bs-notes">'+esc(s.notes||'')+'</div>'+
+        '<div class="bs-actions">'+
+          '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
+        '</div>'+
+      '</div>';
+    }
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')"'+
@@ -23169,34 +23722,16 @@ function _pfPrefGet(k, d){ try{ const v=localStorage.getItem(k); return v===null
 function _pfPrefSet(k, v){ try{ localStorage.setItem(k, v?'1':'0'); }catch(e){} }
 
 function applyProfilesChrome(){
-  const rail = _pfPrefGet('pfRail', false);
   const hint = _pfPrefGet('pfHint', false);   // the long explainer stays hidden by default
-  const body = document.querySelector('#profiles-overlay .profiles-body');
-  if(body) body.classList.toggle('rail', rail);
-  const rb = document.getElementById('pf-rail-btn');
-  if(rb){
-    rb.classList.toggle('on', rail);
-    rb.innerHTML = (rail ? '&#9654;' : '&#9664;') + ' Profiles';
-    rb.title = rail ? 'Show the profile list' : 'Collapse the profile list to widen the editor';
-  }
   const hEl = document.getElementById('profiles-hint');
-  // The explainer is hidden whenever the sidebar is collapsed: collapsing is a
-  // request for room, and a six-line paragraph is the biggest thing in the way.
-  if(hEl) hEl.classList.toggle('hidden', !hint || rail);
+  if(hEl) hEl.classList.toggle('hidden', !hint);
   const hb = document.getElementById('pf-hint-btn');
   if(hb){
-    hb.classList.toggle('on', hint && !rail);
-    hb.title = rail ? 'Expand the profile list to show the explainer'
-                    : (hint ? 'Hide the explainer' : 'What is this window?');
+    hb.classList.toggle('on', hint);
+    hb.title = hint ? 'Hide the explainer' : 'What is this window?';
   }
 }
-function toggleProfilesRail(){
-  _pfPrefSet('pfRail', !_pfPrefGet('pfRail', false));
-  applyProfilesChrome();
-}
 function toggleProfilesHint(){
-  // Asking for the explainer while collapsed should give it to you, not no-op.
-  if(_pfPrefGet('pfRail', false)) _pfPrefSet('pfRail', false);
   _pfPrefSet('pfHint', !_pfPrefGet('pfHint', false));
   applyProfilesChrome();
 }
@@ -23206,17 +23741,9 @@ async function openProfiles(){
   overlay.classList.add('active');
   applyProfilesChrome();
   await loadProfiles(true);
-  renderProfilesList();
-  // Open on a profile rather than an empty pane: the shared host context and the
-  // global block live inside the profile view, so an empty pane hides them.
-  const list = _profilesCache || [];
-  const want = (_profilesEditing && list.some(p=>p.id===_profilesEditing.id))
-    ? _profilesEditing.id
-    : (selectedSession ? _profileForSession(selectedSession) : '');
-  const pick = list.find(p=>p.id===want) || list.find(p=>p.id==='default') || list[0];
-  if(pick){ await editProfile(pick.id); return; }
-  document.getElementById('profile-edit').innerHTML =
-    '<div class="profile-empty">Select a profile on the left, or create a new one.</div>';
+  // One config, always. There is no profile to choose any more, so this opens
+  // straight onto `~/.claude` instead of a list.
+  await editProfile('default');
 }
 
 // Deep link into a specific tab. The session "More" menu uses this instead of
@@ -23233,33 +23760,14 @@ function closeProfiles(){
   _profilesEditing = null;
 }
 
-function renderProfilesList(){
-  const list = _profilesCache || [];
-  const el = document.getElementById('profiles-list');
-  let html = '<button class="profile-new-btn" onclick="newProfilePrompt()">+ New profile</button>';
-  list.forEach(p => {
-    const sel = (_profilesEditing && _profilesEditing.id===p.id) ? ' selected' : '';
-    const tag = p.builtin
-      ? (p.id==='default' ? '<span class="profile-row-builtin">default</span>' : '<span class="profile-row-builtin">preset</span>')
-      : '';
-    const meta = (p.model||'') + (p.effort?(' &middot; '+esc(p.effort)):'');
-    html += `<div class="profile-row${sel}" onclick="editProfile('${esc(p.id)}')">
-      <div class="profile-row-name">${esc(p.name)} ${tag}</div>
-      <div class="profile-row-meta">${meta || '&mdash;'}</div>
-    </div>`;
-  });
-  el.innerHTML = html;
-}
-
 async function editProfile(profileId){
   try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId));
+    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId||'default'));
     const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to load profile'); return; }
+    if(!resp.ok){ alert(data.error||'Failed to load config'); return; }
     _profilesEditing = data;
-    renderProfilesList();
     renderProfileEdit();
-  }catch(e){ alert('Failed to load profile.'); }
+  }catch(e){ alert('Failed to load config.'); }
 }
 
 let _profileActiveTab = 'identity';
@@ -23267,7 +23775,7 @@ let _profileActiveTab = 'identity';
 // context it always loads, the memories it wrote itself, then the capabilities
 // (skills/agents/commands/MCP) and the raw config behind them.
 const _PROFILE_TABS = [
-  {id:'identity', label:'Identity'},
+  {id:'identity', label:'Defaults'},
   {id:'context',  label:'Context'},
   {id:'projects', label:'Projects'},
   {id:'memories', label:'Memories'},
@@ -23354,14 +23862,11 @@ function pfShowMemoryEditor(){
 function renderProfileEdit(){
   const p = _profilesEditing;
   const el = document.getElementById('profile-edit');
-  if(!p){ el.innerHTML = '<div class="profile-empty">Select a profile.</div>'; return; }
+  if(!p){ el.innerHTML = '<div class="profile-empty">Could not load the Claude config.</div>'; return; }
   const isDefault = (p.id === 'default');
   const permJson = JSON.stringify(p.permissions||{}, null, 2);
   const envJson = JSON.stringify(p.env||{}, null, 2);
   const dir = p.dir || (isDefault ? '~/.claude (merged)' : ('~/.claude-'+p.id));
-  const builtinTag = isDefault
-    ? ' <span class="profile-row-builtin">default</span>'
-    : (p.builtin ? ' <span class="profile-row-builtin">preset</span>' : '');
   // Effort glyphs requested by user
   const EFFORTS = [
     {v:'',      label:'(default)'},
@@ -23373,9 +23878,6 @@ function renderProfileEdit(){
   const effortOpts = EFFORTS.map(o =>
     `<option value="${o.v}"${(p.effort||'')===o.v?' selected':''}>${o.label}</option>`
   ).join('');
-  const deleteBtn = isDefault
-    ? ''
-    : `<button class="modal-confirm-delete" onclick="deleteProfile('${esc(p.id)}')">Delete profile</button>`;
   const headerNote = isDefault
     ? '<div class="profiles-hint" style="margin:0 0 6px">Settings → identity edits are merged into <code>~/.claude/settings.json</code> (only <code>model</code>, <code>env</code>, <code>permissions</code> touched). Backup at <code>~/.claude/settings.json.bak-pre-dashboard</code>.</div>'
     : '';
@@ -23385,13 +23887,14 @@ function renderProfileEdit(){
   ).join('');
 
   el.innerHTML = `
-    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}${builtinTag}</div>
+    <div style="font-size:.7rem;color:#6e7681;font-family:'SF Mono',Consolas,monospace">${esc(dir)}</div>
     ${headerNote}
     <div class="pf-tabs">${tabBar}</div>
 
     <div class="pf-section${_profileActiveTab==='identity'?' active':''}" id="pf-section-identity">
-      <label>Name</label>
-      <input id="ed-name" value="${esc(p.name||'')}">
+      <!-- The config's display name only ever appeared in the profile list, which
+           is gone. Kept as a hidden field so saveProfile still round-trips it. -->
+      <input type="hidden" id="ed-name" value="${esc(p.name||'')}">
       <div class="row2">
         <div>
           <label>Model</label>
@@ -23520,10 +24023,10 @@ function renderProfileEdit(){
     </div>
 
     <div class="profile-edit-actions">
-      ${deleteBtn || '<span></span>'}
+      <span></span>
       <div style="display:flex;gap:8px">
         <button class="modal-cancel" onclick="closeProfiles()">Close</button>
-        <button class="modal-confirm-create" onclick="saveProfile()">Save identity + context</button>
+        <button class="modal-confirm-create" onclick="saveProfile()">Save defaults + context</button>
       </div>
     </div>
   `;
@@ -24242,54 +24745,6 @@ async function saveProfile(){
   }catch(e){ alert('Failed to save profile.'); }
 }
 
-async function deleteProfile(profileId){
-  if(profileId==='default'){ alert("The default profile can't be deleted."); return; }
-  if(!confirm('Delete profile "'+profileId+'"? Sessions on this profile will revert to Default.\\n\\nNote: ~/.claude-'+profileId+'/ is left on disk -- remove manually if desired.')) return;
-  try{
-    const resp = await fetch(BASE+'/api/profiles/'+encodeURIComponent(profileId), {method:'DELETE'});
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to delete'); return; }
-    _profilesEditing = null;
-    await loadProfiles(true);
-    renderProfilesList();
-    document.getElementById('profile-edit').innerHTML =
-      '<div class="profile-empty">Profile deleted.</div>';
-    // Refresh visible session dropdowns
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to delete profile.'); }
-}
-
-async function newProfilePrompt(){
-  const list = _profilesCache || [];
-  const presets = list.filter(p => p.builtin && p.id!=='default');
-  let promptMsg = 'New profile name (e.g. "My UI Reviewer"):';
-  if(presets.length){
-    promptMsg += '\\n\\nLeave empty to start blank. To clone a preset, append " | preset-id" -- available preset ids:\\n  '
-      + presets.map(p=>p.id).join(', ');
-  }
-  const raw = window.prompt(promptMsg, '');
-  if(raw === null) return;
-  let name = raw.trim();
-  let fromPreset = '';
-  if(name.includes('|')){
-    const parts = name.split('|');
-    name = parts[0].trim();
-    fromPreset = parts[1].trim();
-  }
-  if(!name){ alert('Name is required.'); return; }
-  try{
-    const resp = await fetch(BASE+'/api/profiles', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name, from_preset: fromPreset})
-    });
-    const data = await resp.json();
-    if(!resp.ok){ alert(data.error||'Failed to create profile'); return; }
-    await loadProfiles(true);
-    await editProfile(data.id);
-    if(selectedSession) renderDetail();
-  }catch(e){ alert('Failed to create profile.'); }
-}
-
 // ── Project-scope file editor (per-session, cwd-bound) ──
 let _projFile = {sessionName:'', path:'', absPath:'', cwd:'', content:'', exists:false};
 
@@ -24699,9 +25154,59 @@ function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
 
+// ── Phone layout: header status widgets move to the bottom ──────────────────
+// On a phone the header has room for the project switcher and about two session
+// tabs, and the tabs are the thing you actually navigate with. The browser
+// badge, the 5h/7d usage bars and the CPU/RAM readout are all glance-only, so on
+// a narrow screen they move to a strip at the very bottom of the page — below
+// the terminal and the upload area.
+//
+// The ELEMENTS are moved, not cloned. Every poller writes by id
+// (#nav-usage-5h-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
+// have meant either dead widgets or a second set of updaters to keep in step.
+const _BOTTOM_BAR_IDS=['nav-browser-badge','nav-usage','nav-server-stats'];
+function syncMobileBottomBar(){
+  const bar=document.getElementById('mobile-bottom-bar');
+  const right=document.querySelector('.nav-right');
+  if(!bar||!right)return;
+  // The header's original child order, captured once before anything moves.
+  // Restoring by replaying this list is deterministic; restoring with
+  // insertBefore(el, el.nextSibling) is not — an anchor can still be sitting in
+  // the bar when the element that needs it comes back, and the two widgets end
+  // up swapped after a rotate-and-rotate-back.
+  if(!right._navOrder)right._navOrder=[].slice.call(right.children);
+  const narrow=window.matchMedia?window.matchMedia('(max-width:768px)').matches:(innerWidth<=768);
+  _BOTTOM_BAR_IDS.forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el)return;
+    if(narrow){
+      if(el.parentNode!==bar)bar.appendChild(el);
+    }else if(el.parentNode===bar){
+      right.appendChild(el);
+    }
+  });
+  // appendChild on a node already in the parent MOVES it, so replaying the
+  // recorded order puts everything back exactly where it started.
+  if(!narrow)right._navOrder.forEach(c=>{if(c.parentNode===right)right.appendChild(c)});
+  // A simplified team member sees none of these three, and an empty strip is
+  // still a bordered 40px band at the foot of the page. Show the bar with the
+  // class on, measure, then keep the class only if something actually rendered.
+  bar.classList.add('has-items');
+  if(!narrow||![].some.call(bar.children,c=>c.getBoundingClientRect().width>0))
+    bar.classList.remove('has-items');
+}
+if(window.matchMedia){
+  const _mq=window.matchMedia('(max-width:768px)');
+  if(_mq.addEventListener)_mq.addEventListener('change',syncMobileBottomBar);
+  else if(_mq.addListener)_mq.addListener(syncMobileBottomBar);
+}
+window.addEventListener('resize',syncMobileBottomBar);
+window.addEventListener('orientationchange',syncMobileBottomBar);
+
 // The impersonation ticket must be redeemed BEFORE the first identity fetch,
 // otherwise the page boots as the admin and then flips.
 async function bootstrapDashboard(){
+  syncMobileBottomBar();
   await bootstrapImpersonation();
   await loadCurrentUser();
   await applyRoleVisibility();
@@ -24746,6 +25251,23 @@ def _projects_page_html(title: str, rows):
             "<div class=card><ul>%s</ul></div>"
             "<p class=muted>%s — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
             "</body></html>") % (title, BRAND_NAME, _PROJECTS_PAGE_CSS, title, items, BRAND_NAME)
+
+
+@app.get("/vacuum-sim")
+async def vacuum_tool_sim():
+    """Component map + firmware simulation for the CH32L103 vacuum lifter.
+
+    Standalone page, kept in its own file rather than inline: it is a tool about
+    Bill's firmware, not part of the dashboard. Registered above the
+    /{username} catch-all so the path is not read as a member name, and left
+    outside the middleware allowlist so it stays behind the dashboard login
+    (the firmware thresholds and pin map should not be public).
+    """
+    path = Path(__file__).resolve().parent / "vacuum_tool_sim.html"
+    if not path.exists():
+        return HTMLResponse("vacuum_tool_sim.html is missing", status_code=404)
+    return FileResponse(str(path), media_type="text/html",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/{username}", response_class=HTMLResponse)
