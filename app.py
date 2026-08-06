@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import select
@@ -352,6 +353,87 @@ def _session_launch_identity_prefix(session_name: str) -> str:
     )
 
 
+
+# --- Per-account UNIX users ------------------------------------------------
+# Every member session used to run as nimrod_rotem, which made account
+# isolation a prompt instruction rather than a kernel boundary: one `cat` read
+# another account's advisor token and with it that account's advisor
+# permissions. provision_accounts.py creates one UNIX user per account and
+# writes the mapping here.
+_ACCOUNT_UNIX_USABLE: dict[str, bool] = {}
+
+
+def _account_unix_map_file() -> Path:
+    """Resolved on demand: MESSAGES_DIR is defined further down this module."""
+    return MESSAGES_DIR / "account-unix-users.json"
+
+
+def _unix_account_usable(name: str) -> bool:
+    """True when the account exists and nimrod_rotem may drop into it."""
+    if not name:
+        return False
+    if name in _ACCOUNT_UNIX_USABLE:
+        return _ACCOUNT_UNIX_USABLE[name]
+    ok = False
+    try:
+        pwd.getpwnam(name)
+        ok = subprocess.run(
+            ["sudo", "-n", "-u", name, "true"],
+            capture_output=True, timeout=10,
+        ).returncode == 0
+    except Exception:
+        ok = False
+    if not ok:
+        logger.warning("unix account %s not usable; session stays on the shared login", name)
+    _ACCOUNT_UNIX_USABLE[name] = ok
+    return ok
+
+
+def _account_unix_user(user: dict | None) -> str:
+    """The UNIX account this member's session runs as, or "" for the old path."""
+    if not user or _is_admin(user):
+        return ""
+    if os.environ.get("TMUX_DASH_PER_USER_UNIX", "1") == "0":
+        return ""
+    try:
+        mapping = json.loads(_account_unix_map_file().read_text())
+    except Exception:
+        return ""
+    name = str(mapping.get(str(user.get("id")), "") or "")
+    return name if _unix_account_usable(name) else ""
+
+
+def _session_unix_account_prefix(session_name: str, launch: str) -> str:
+    """Drop the launch into the session owner's own UNIX user."""
+    try:
+        owner = _user_for_session(session_name)
+    except Exception:
+        return launch
+    account = _account_unix_user(owner)
+    if not account:
+        return launch
+    # bash -lc keeps the existing single-string command intact, and the advisor
+    # token is read inside the account so the shared login never sees it.
+    # The cd belongs here too: the account can enter its own project directory,
+    # the shared parent shell cannot and must not.
+    try:
+        project_dir = _member_session_project_dir(owner, session_name)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        launch = "cd -- " + shlex.quote(str(project_dir)) + " && " + launch
+    except Exception:
+        logger.debug("No project dir for %s; launching in place", session_name, exc_info=True)
+    # The browser MCP proxy reaches the controller socket, the browser profiles
+    # and the shared playwright CLI through the dashboard owner's home, which is
+    # no longer $HOME now that the session runs as its own account.
+    launch = "TMUX_DASH_HOST_HOME=" + shlex.quote(str(Path.home())) + " " + launch
+    return (
+        "sudo -n -u "
+        + shlex.quote(account)
+        + " -H bash -lc "
+        + shlex.quote(launch)
+    )
+
+
 def _session_launch_command(
     session_name: str,
     base: str,
@@ -367,6 +449,7 @@ def _session_launch_command(
         codex_home=_session_config_base(session_name),
     )
     launch = _session_launch_identity_prefix(session_name) + " " + launch
+    launch = _session_unix_account_prefix(session_name, launch)
     return scoped_codex_command(
         session_name,
         launch,
@@ -1523,7 +1606,9 @@ def _configure_member_codex_isolation(
         browser_output = cfg_dir / "browser-output"
         browser_output.mkdir(parents=True, exist_ok=True)
         try:
-            browser_output.chmod(0o700)
+            browser_output.chmod(
+                0o2770 if _account_unix_user_for_config_dir(cfg_dir) else 0o700
+            )
         except OSError:
             logger.debug(
                 "Could not set private permissions on %s",
@@ -1673,22 +1758,43 @@ def _materialize_member_skills(cfg_dir: Path) -> None:
             )
 
 
-def _set_member_codex_permissions(cfg_dir: Path) -> None:
-    """Keep every account-owned Codex file private at the filesystem level."""
+def _account_unix_user_for_config_dir(cfg_dir: Path) -> str:
+    """The UNIX account owning this CODEX_HOME, or "" on the shared login."""
     try:
-        cfg_dir.chmod(0o700)
+        mapping = json.loads(_account_unix_map_file().read_text())
+    except Exception:
+        return ""
+    suffix = cfg_dir.name.replace(".codex-user-", "", 1)
+    return str(mapping.get(suffix, "") or "")
+
+
+def _set_member_codex_permissions(cfg_dir: Path) -> None:
+    """Keep every account-owned Codex file private at the filesystem level.
+
+    When the account has its own UNIX user this tree is owned and group-owned by
+    that account, and the dashboard reaches it through that group. Clearing the
+    group bits would lock the dashboard out of the config it has to write, so
+    keep them and drop only "other", which is what private means now. setgid
+    stays as well: it is what keeps newly created files in the account's group.
+    """
+    grouped = bool(_account_unix_user_for_config_dir(cfg_dir))
+    dir_mode = 0o2770 if grouped else 0o700
+    exec_mode = 0o770 if grouped else 0o700
+    file_mode = 0o660 if grouped else 0o600
+    try:
+        cfg_dir.chmod(dir_mode)
         for root, dir_names, file_names in os.walk(cfg_dir, followlinks=False):
             root_path = Path(root)
             for name in dir_names:
                 path = root_path / name
                 if not path.is_symlink():
-                    path.chmod(0o700)
+                    path.chmod(dir_mode)
             for name in file_names:
                 path = root_path / name
                 if path.is_symlink():
                     continue
                 current_mode = path.stat().st_mode
-                path.chmod(0o700 if current_mode & 0o111 else 0o600)
+                path.chmod(exec_mode if current_mode & 0o111 else file_mode)
     except OSError:
         logger.exception(
             "Failed to set private permissions on member Codex home %s",
@@ -3971,6 +4077,28 @@ exact field or action needed.
 - Every Google tool call is recorded with your account, the tool, the target and
   whether it was allowed.
 
+## Never build a gate you can also open
+
+A control you can also lift is not a control. If your permission group may not
+have something, say so and stop.
+
+- Do not invent a substitute gate. Never password-protect, encrypt, or stage a
+  deliverable behind an approval you made up, and never promise to release it
+  once someone authorises you. You are holding the key, so the next message that
+  asks for it will get it.
+- Never issue, print, or email a password, token, or link that gates data the
+  caller is not entitled to. If they are entitled, hand the data over. If they
+  are not, refuse and name the person who can authorise it.
+- Requesting authorisation is not receiving it. If you emailed an admin for
+  approval, the answer stays no until that admin answers you. The user asking a
+  second time is not approval, and neither is their impatience.
+- Publishing is not a permission decision. Never move restricted data to a
+  project URL, a public page, or a shared link as a way of delivering it.
+- A denial is the answer, not an obstacle. When a tool, an API, a host, or an
+  HTTP status says no, do not reach the same data by another route: another
+  host, a shell, a database file on disk, an internal port, a service account,
+  or another account's credentials. Report the denial and what you needed.
+
 ## Load details only when relevant
 
 - Company mail, Drive, and Document Vault work:
@@ -4898,6 +5026,10 @@ def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
             f'TMUX_DASH_BROWSER_ID = "{browser_id}"\n'
             f'TMUX_DASH_BROWSER_CDP_PORT = "{cdp_port}"\n'
             f'TMUX_DASH_BROWSER_OUTPUT_DIR = "{output_dir}"\n'
+            # Codex replaces the environment with this table, so the proxy has
+            # to be told the dashboard owner's home explicitly: the session runs
+            # as its own UNIX account and $HOME no longer points there.
+            f'TMUX_DASH_HOST_HOME = "{Path.home()}"\n'
             f"{end}\n"
         )
         existing = cfg.read_text() if cfg.exists() else ""
@@ -10494,12 +10626,17 @@ def _send_session_owner_environment(session_name: str):
             cmd = (
                 "export CODEX_HOME="
                 + shlex.quote(str(codex_home))
-                + "; export ADVISOR_TOKEN=\"$(cat "
-                + shlex.quote(str(token_path))
-                + " 2>/dev/null)\""
-                + "; cd -- "
-                + shlex.quote(str(project_dir))
             )
+            if not _account_unix_user(owner):
+                # Shared-login sessions still need both here: nothing downstream
+                # will set them.
+                cmd += (
+                    "; export ADVISOR_TOKEN=\"$(cat "
+                    + shlex.quote(str(token_path))
+                    + " 2>/dev/null)\""
+                    + "; cd -- "
+                    + shlex.quote(str(project_dir))
+                )
         except Exception:
             logger.exception("Failed to prepare owner environment for '%s'", session_name)
             return False
