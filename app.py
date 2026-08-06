@@ -1781,23 +1781,40 @@ def _set_member_codex_permissions(cfg_dir: Path) -> None:
     dir_mode = 0o2770 if grouped else 0o700
     exec_mode = 0o770 if grouped else 0o700
     file_mode = 0o660 if grouped else 0o600
+    ours = os.getuid()
+
+    def _chmod_if_ours(path: Path, mode: int) -> None:
+        """chmod needs ownership. The account owns nearly all of its own tree.
+
+        Those entries are already correct by construction (the account created
+        them under umask 007, inside a setgid directory), so skipping them is
+        right, not a compromise. Dying on the first one, which is what a bare
+        walk does here, silently stops the fix-up for everything else.
+        """
+        try:
+            if path.stat().st_uid != ours:
+                return
+            path.chmod(mode)
+        except OSError:
+            logger.debug("Could not set mode on %s", path, exc_info=True)
+
     try:
-        cfg_dir.chmod(dir_mode)
+        _chmod_if_ours(cfg_dir, dir_mode)
         for root, dir_names, file_names in os.walk(cfg_dir, followlinks=False):
             root_path = Path(root)
             for name in dir_names:
                 path = root_path / name
                 if not path.is_symlink():
-                    path.chmod(dir_mode)
+                    _chmod_if_ours(path, dir_mode)
             for name in file_names:
                 path = root_path / name
                 if path.is_symlink():
                     continue
                 current_mode = path.stat().st_mode
-                path.chmod(exec_mode if current_mode & 0o111 else file_mode)
+                _chmod_if_ours(path, exec_mode if current_mode & 0o111 else file_mode)
     except OSError:
         logger.exception(
-            "Failed to set private permissions on member Codex home %s",
+            "Failed to walk member Codex home %s",
             cfg_dir,
         )
 
