@@ -279,6 +279,7 @@ def scoped_codex_command(
     session_name: str,
     command: str,
     *,
+    unit_prefix: str = "codex",
     memory_high_mb: int = 1536,
     memory_max_mb: int = 3072,
     tasks_max: int = 512,
@@ -290,7 +291,10 @@ def scoped_codex_command(
     manager.  A successful scoped command is never run a second time.
     """
 
-    unit = f"codex-{_safe_unit_fragment(session_name)}-{int(time.time())}"
+    safe_prefix = "".join(
+        ch if ch.isalnum() or ch in "_.-" else "-" for ch in unit_prefix
+    )[:24].strip("-.") or "codex"
+    unit = f"{safe_prefix}-{_safe_unit_fragment(session_name)}-{int(time.time())}"
     inner = "exec " + command.strip()
     run = user_systemd_argv(
         "systemd-run",

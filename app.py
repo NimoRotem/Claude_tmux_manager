@@ -60,6 +60,61 @@ CODEX_API_FALLBACK_ENABLED = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
+STATE_DIR = Path(
+    os.environ.get("TMUX_DASH_STATE_DIR", str(Path.home() / ".tmux-dashboard"))
+).expanduser()
+AGENT_KIND = os.environ.get("TMUX_DASH_AGENT", "codex").strip().lower()
+if AGENT_KIND not in {"codex", "muse"}:
+    AGENT_KIND = "codex"
+AGENT_DISPLAY_NAME = "Muse" if AGENT_KIND == "muse" else "Codex"
+
+
+def _agent_supports_codex_controls() -> bool:
+    """Whether Codex-specific auto-typing and configuration controls are valid."""
+    return AGENT_KIND == "codex"
+
+
+def _settings_tab_defs(is_admin: bool) -> list[dict[str, str]]:
+    """Return settings workspaces that are meaningful for the selected agent."""
+    if AGENT_KIND == "muse":
+        tabs = [
+            {"id": "runtime", "label": "Runtime"},
+            {"id": "history", "label": "History"},
+            {"id": "browser", "label": "Browser"},
+        ]
+        if is_admin:
+            tabs.append({"id": "apis", "label": "APIs"})
+        return tabs
+    tabs = [
+        {"id": "mycontext", "label": "My Context"},
+        {"id": "history", "label": "History"},
+        {"id": "browser", "label": "Browser"},
+    ]
+    if is_admin:
+        tabs.insert(1, {"id": "global", "label": "Global Instructions"})
+        tabs.extend(
+            (
+                {"id": "context", "label": "Context Files"},
+                {"id": "apis", "label": "APIs"},
+                {"id": "login", "label": "Login"},
+            )
+        )
+    return tabs
+MUSE_BINARY = Path(
+    os.environ.get("TMUX_DASH_MUSE_BINARY", str(Path.home() / ".local/bin/muse"))
+).expanduser()
+MUSE_CONFIG_HOME = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_CONFIG_HOME",
+        str(STATE_DIR / "muse-config"),
+    )
+).expanduser()
+MUSE_DATA_HOME = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_DATA_HOME",
+        str(STATE_DIR / "muse-data"),
+    )
+).expanduser()
 PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
@@ -69,7 +124,11 @@ if PROCESS_ROLE not in {"combined", "api", "controller"}:
 # haven't been pre-configured.
 NEW_SESSION_CMD = os.environ.get(
     "TMUX_DASH_NEW_SESSION_CMD",
-    "codex --dangerously-bypass-approvals-and-sandbox",
+    (
+        f"{shlex.quote(str(MUSE_BINARY))} --yolo"
+        if AGENT_KIND == "muse"
+        else "codex --dangerously-bypass-approvals-and-sandbox"
+    ),
 )
 # Where the codex CLI keeps its state. Mirrors $CODEX_HOME.
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
@@ -77,24 +136,34 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 _CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
 _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
-    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
-).strip() or "gpt-5.6-sol"
-_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
-_CODEX_REASONING_EFFORT_ALIASES = {
-    "ultra": "max",
-    "extra-high": "xhigh",
-    "extra_high": "xhigh",
-}
+    os.environ.get(
+        "CODEX_DEFAULT_MODEL",
+        "muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol",
+    ),
+).strip() or ("muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol")
+_CODEX_REASONING_EFFORTS = (
+    ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
+    if AGENT_KIND == "muse"
+    else ("none", "low", "medium", "high", "xhigh", "max")
+)
+_CODEX_REASONING_EFFORT_ALIASES = (
+    {}
+    if AGENT_KIND == "muse"
+    else {"ultra": "max", "extra-high": "xhigh", "extra_high": "xhigh"}
+)
 _CODEX_DEFAULT_REASONING_EFFORT = os.environ.get(
     "TMUX_DASH_DEFAULT_REASONING_EFFORT",
-    os.environ.get("CODEX_DEFAULT_REASONING_EFFORT", "max"),
+    os.environ.get(
+        "CODEX_DEFAULT_REASONING_EFFORT",
+        "high" if AGENT_KIND == "muse" else "max",
+    ),
 ).strip().lower()
 _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
     _CODEX_DEFAULT_REASONING_EFFORT,
     _CODEX_DEFAULT_REASONING_EFFORT,
 )
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
-    _CODEX_DEFAULT_REASONING_EFFORT = "max"
+    _CODEX_DEFAULT_REASONING_EFFORT = "high" if AGENT_KIND == "muse" else "max"
 
 # Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
 # OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
@@ -106,15 +175,22 @@ _DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
 
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
-MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
-_SEED_MODEL_CATALOG = [
-    ["gpt-5.6-sol", "GPT-5.6 Sol"],
-    ["gpt-5.6", "GPT-5.6 (Sol alias)"],
-    ["gpt-5.6-terra", "GPT-5.6 Terra"],
-    ["gpt-5.6-luna", "GPT-5.6 Luna"],
-    ["gpt-5.5", "GPT-5.5"],
-    ["gpt-5.4", "GPT-5.4"],
-]
+MODELS_FILE = STATE_DIR / f"{AGENT_KIND}-models.json"
+_SEED_MODEL_CATALOG = (
+    [
+        ["muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor"],
+        ["muse-spark-1.2", "Muse Spark 1.2"],
+    ]
+    if AGENT_KIND == "muse"
+    else [
+        ["gpt-5.6-sol", "GPT-5.6 Sol"],
+        ["gpt-5.6", "GPT-5.6 (Sol alias)"],
+        ["gpt-5.6-terra", "GPT-5.6 Terra"],
+        ["gpt-5.6-luna", "GPT-5.6 Luna"],
+        ["gpt-5.5", "GPT-5.5"],
+        ["gpt-5.4", "GPT-5.4"],
+    ]
+)
 
 
 def _load_model_catalog() -> list:
@@ -140,6 +216,8 @@ def _save_model_catalog(catalog: list, last_check: float = 0.0):
 
 def _fetch_codex_model_catalog() -> list:
     """Read the model catalog bundled with the installed Codex CLI."""
+    if AGENT_KIND == "muse":
+        return [list(row) for row in _SEED_MODEL_CATALOG]
     result = subprocess.run(
         ["codex", "debug", "models", "--bundled"],
         capture_output=True,
@@ -195,8 +273,48 @@ def _codex_cli_readiness() -> tuple[bool, str, dict]:
     return True, "ready", details
 
 
+def _agent_cli_readiness() -> tuple[bool, str, dict]:
+    """Validate the selected CLI and its local credential before pane launch."""
+    if AGENT_KIND != "muse":
+        return _codex_cli_readiness()
+    configured = str(MUSE_BINARY)
+    binary = configured if MUSE_BINARY.is_absolute() else (shutil.which(configured) or "")
+    details = {
+        "agent": AGENT_KIND,
+        "binary": binary,
+        "version": "",
+        "auth_configured": False,
+    }
+    if not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
+        return False, "the Muse CLI is not installed", details
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        )
+        output = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        match = re.search(r"(\d+\.\d+\.\d+)", output)
+        details["version"] = match.group(1) if match else ""
+        if result.returncode != 0 or not details["version"]:
+            return False, "the Muse CLI version could not be determined", details
+    except Exception as exc:
+        return False, f"Muse CLI check failed: {type(exc).__name__}", details
+    auth_file = MUSE_CONFIG_HOME / "muse" / "auth.json"
+    try:
+        stat = auth_file.stat()
+        details["auth_configured"] = stat.st_size > 2
+        if stat.st_mode & 0o077:
+            return False, "the Muse credential permissions are too broad", details
+    except OSError:
+        pass
+    if not details["auth_configured"]:
+        return False, "the Muse credential is not configured", details
+    return True, "ready", details
+
+
 async def _refresh_model_catalog(force: bool = False) -> bool:
     global MODEL_CATALOG, ALLOWED_SESSION_MODELS
+    if AGENT_KIND == "muse":
+        return False
     try:
         last_check = 0.0
         try:
@@ -316,8 +434,51 @@ def _launch_codex_cmd(
     return out
 
 
+def _muse_launch_prefix() -> str:
+    """Environment that keeps Muse credentials and session data deployment-local."""
+    return " ".join(
+        (
+            "env",
+            "MUSE_NO_AUTO_UPDATE=1",
+            "XDG_CONFIG_HOME=" + shlex.quote(str(MUSE_CONFIG_HOME)),
+            "XDG_DATA_HOME=" + shlex.quote(str(MUSE_DATA_HOME)),
+        )
+    )
+
+
+def _launch_agent_cmd(
+    cmd: str,
+    pin_model: bool = True,
+    resume: bool = False,
+    codex_home: Path | None = None,
+) -> str:
+    """Build the configured coding-agent command without changing Codex defaults."""
+    if AGENT_KIND != "muse":
+        return _launch_codex_cmd(
+            cmd,
+            pin_model=pin_model,
+            resume=resume,
+            codex_home=codex_home,
+        )
+    if resume:
+        out = f"{shlex.quote(str(MUSE_BINARY))} --yolo resume --last"
+    else:
+        out = cmd.strip() or f"{shlex.quote(str(MUSE_BINARY))} --yolo"
+    return _muse_launch_prefix() + " " + out
+
+
+def _is_agent_process_command(command: str) -> bool:
+    """Recognize the process name used by the selected coding-agent binary."""
+    name = Path(str(command or "").strip().lower()).name
+    if AGENT_KIND == "muse":
+        return name == "muse" or name.startswith("muse-bin")
+    return name == "codex"
+
+
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
     """Use the canonical full-access launch for members and configured admin command."""
+    if AGENT_KIND == "muse":
+        return NEW_SESSION_CMD
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
         if owner and not _is_admin(owner):
@@ -441,8 +602,8 @@ def _session_launch_command(
     pin_model: bool = True,
     resume: bool = False,
 ) -> str:
-    """Build the Codex command and keep its process tree in a session scope."""
-    launch = _launch_codex_cmd(
+    """Build the configured agent command and keep its process tree scoped."""
+    launch = _launch_agent_cmd(
         base,
         pin_model=pin_model,
         resume=resume,
@@ -453,6 +614,7 @@ def _session_launch_command(
     return scoped_codex_command(
         session_name,
         launch,
+        unit_prefix=AGENT_KIND,
         memory_high_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_HIGH_MB", "2048")),
         memory_max_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_MAX_MB", "4096")),
         tasks_max=int(os.environ.get("TMUX_DASH_CODEX_TASKS_MAX", "768")),
@@ -469,6 +631,8 @@ def _launch_claude_cmd(
 
 def _restore_default_model_setting():
     """Keep the default Codex config aligned with the dashboard selection."""
+    if AGENT_KIND == "muse":
+        return
     try:
         CODEX_HOME.mkdir(parents=True, exist_ok=True)
         cfg = CODEX_HOME / "config.toml"
@@ -532,7 +696,7 @@ SAVED_INFO_PROMPT_VERSION = "v4"
 
 # Keep Grabo's established dashboard state directory so users, history, browser
 # sessions, and settings survive the runtime migration.
-MESSAGES_DIR = Path.home() / ".tmux-dashboard"
+MESSAGES_DIR = STATE_DIR
 CONTROLLER_SOCKET = Path(
     os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
 )
@@ -690,6 +854,8 @@ def _codex_home_auth_mode(codex_home: Path) -> str:
 
 def _session_real_auth_mode(session_name: str) -> str:
     """Resolve live per-session auth instead of trusting the process-local cache."""
+    if AGENT_KIND == "muse":
+        return "meta"
     try:
         resolved = _codex_home_auth_mode(_session_config_base(session_name))
         if resolved != "unconfigured":
@@ -794,12 +960,14 @@ def _load_simple_watchdog_disabled():
 #           before a task is finished. (This was the previous always-on behavior.)
 # New sessions default to "basic". Persisted per session to disk.
 AUTOPUSH_MODES = ("off", "basic", "full")
-AUTOPUSH_DEFAULT = "basic"
+AUTOPUSH_DEFAULT = "off" if AGENT_KIND == "muse" else "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: dict[str, str] = {}
 
 
 def _get_autopush_mode(session_name: str) -> str:
+    if not _agent_supports_codex_controls():
+        return "off"
     m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
     return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
 
@@ -845,7 +1013,7 @@ def _is_codex_running(session_name: str) -> bool:
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
+            if _is_agent_process_command(commands.get(current, "")):
                 return True
             pending.extend(children.get(current, ()))
         return False
@@ -860,12 +1028,12 @@ async def _async_is_codex_running(session_name: str) -> bool:
 
 async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = None,
                                 resume_uuid: str = None) -> bool:
-    """Restart a crashed Codex pane and resume its most recent local thread."""
+    """Restart a crashed agent pane and resume its most recent local thread."""
     alog = logging.getLogger("autonomous")
     if await _async_is_codex_running(session_name):
         return True
 
-    msg = f"Codex not running in '{session_name}' — restarting it"
+    msg = f"{AGENT_DISPLAY_NAME} not running in '{session_name}' — restarting it"
     alog.warning(msg)
     if log_fn and state:
         log_fn(state, msg)
@@ -885,21 +1053,22 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # Re-apply clean member auth before relaunch so an accidental /login (which
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
-        try:
-            if _multi_tenant_enabled():
-                _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
-                if _owner and not _is_admin(_owner):
-                    _apply_member_auth(_user_codex_config_dir(_owner))
-        except Exception:
-            logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
-        try:
-            await asyncio.to_thread(
-                _ensure_codex_auth_with_fallback,
-                _session_config_base(session_name),
-                True,
-            )
-        except Exception:
-            logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
+        if AGENT_KIND == "codex":
+            try:
+                if _multi_tenant_enabled():
+                    _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
+                    if _owner and not _is_admin(_owner):
+                        _apply_member_auth(_user_codex_config_dir(_owner))
+            except Exception:
+                logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
+            try:
+                await asyncio.to_thread(
+                    _ensure_codex_auth_with_fallback,
+                    _session_config_base(session_name),
+                    True,
+                )
+            except Exception:
+                logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
         # Codex stores local threads under CODEX_HOME. Resume the newest thread
         # for this working directory instead of opening the interactive picker.
         launch_base = _session_launch_base(session_name)
@@ -925,23 +1094,23 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
             ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5)
 
-        # Wait for codex to start (up to 30s)
+        # Wait for the selected agent to start (up to 30s).
         for _ in range(15):
             await asyncio.sleep(2)
             if await _async_is_codex_running(session_name):
-                alog.info(f"Codex restarted successfully in '{session_name}'")
+                alog.info(f"{AGENT_DISPLAY_NAME} restarted successfully in '{session_name}'")
                 if log_fn and state:
-                    log_fn(state, "Codex restarted successfully")
+                    log_fn(state, f"{AGENT_DISPLAY_NAME} restarted successfully")
                 # Give it a moment to fully initialize
                 await asyncio.sleep(5)
                 return True
 
-        alog.error(f"Failed to restart Codex in '{session_name}' after 30s")
+        alog.error(f"Failed to restart {AGENT_DISPLAY_NAME} in '{session_name}' after 30s")
         if log_fn and state:
-            log_fn(state, "Failed to restart Codex after 30s")
+            log_fn(state, f"Failed to restart {AGENT_DISPLAY_NAME} after 30s")
         return False
     except Exception as e:
-        alog.error(f"Error restarting Codex in '{session_name}': {e}")
+        alog.error(f"Error restarting {AGENT_DISPLAY_NAME} in '{session_name}': {e}")
         return False
 
 
@@ -961,8 +1130,8 @@ async def lifespan(_app: FastAPI):
     _shutting_down = False
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=8 if PROCESS_ROLE == "api" else 20))
-    logger.info("Codex Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
-                PROCESS_ROLE, PORT, ROOT_PATH,
+    logger.info("%s Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
+                AGENT_DISPLAY_NAME, PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
                 "configured" if OPENAI_API_KEY else "missing")
     if not AUTH_PASS:
@@ -970,7 +1139,10 @@ async def lifespan(_app: FastAPI):
                        "Set TMUX_DASH_PASS to enable auth.")
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
-    if not os.environ.get("TMUX_DASH_SECRET"):
+    if not (
+        os.environ.get("TMUX_DASH_SECRET")
+        or os.environ.get("TMUX_DASH_SECRET_FILE")
+    ):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
     _load_simple_watchdog_disabled()
@@ -1037,9 +1209,6 @@ async def lifespan(_app: FastAPI):
             logger.exception("Advisor account/group startup sync failed")
 
     controller_loops = (
-        ("auto-responder", _auto_responder_loop()),
-        ("autonomous watchdog", _watchdog_loop()),
-        ("simple watchdog", _simple_watchdog_loop()),
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
         ("codex health watchdog", _codex_health_watchdog_loop()),
@@ -1049,13 +1218,20 @@ async def lifespan(_app: FastAPI):
         ("controller snapshot", _controller_snapshot_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
+    if _agent_supports_codex_controls():
+        controller_loops = (
+            ("auto-responder", _auto_responder_loop()),
+            ("autonomous watchdog", _watchdog_loop()),
+            ("simple watchdog", _simple_watchdog_loop()),
+            *controller_loops,
+        )
     for label, coroutine in controller_loops:
         _background_tasks.append(asyncio.create_task(coroutine))
         logger.info("%s started", label)
 
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
-    if saved:
+    if saved and _agent_supports_codex_controls():
         session_names = {s["name"] for s in sessions}
         for name, modes in saved.items():
             if name not in session_names:
@@ -1131,9 +1307,31 @@ async def request_validation_error_handler(_request: Request, exc: RequestValida
     return JSONResponse({"error": message}, status_code=422)
 
 # --- Auth ---
+def _private_env_value(value_name: str, file_name: str) -> str:
+    direct = os.environ.get(value_name, "")
+    if direct:
+        return direct
+    path_value = os.environ.get(file_name, "").strip()
+    if not path_value:
+        return ""
+    try:
+        path = Path(path_value).expanduser()
+        stat = path.stat()
+        if stat.st_mode & 0o077:
+            logger.error("Refusing broadly-readable credential file %s", path)
+            return ""
+        return path.read_text().strip()
+    except OSError:
+        logger.exception("Could not read credential file from %s", file_name)
+        return ""
+
+
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
-AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
-AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
+AUTH_PASS = _private_env_value("TMUX_DASH_PASS", "TMUX_DASH_PASS_FILE")
+AUTH_SECRET = (
+    _private_env_value("TMUX_DASH_SECRET", "TMUX_DASH_SECRET_FILE")
+    or secrets.token_hex(32)
+)
 # Cookie name must be UNIQUE per dashboard instance, else two dashboards on the
 # same domain (e.g. knowva.ai/tmux + /codex) collide: both set "tmux_auth" at
 # Path=/, so logging into one overwrites/invalidates the other's cookie.
@@ -6742,6 +6940,13 @@ def _session_is_codex(name: str) -> bool:
     the state left behind after Codex exits or crashes. Other active foreground
     programs are hidden.
     """
+    # A dedicated Muse deployment must never adopt arbitrary Muse processes
+    # from the host's shared tmux server.  Its isolated owner registry is the
+    # deployment boundary, including for sessions whose agent is still live.
+    # Do this before consulting the process cache so adding/removing an owner
+    # takes effect immediately across API workers.
+    if AGENT_KIND == "muse" and name not in _load_session_owners():
+        return False
     now = time.time()
     cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
     if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
@@ -6764,19 +6969,20 @@ def _session_is_codex(name: str) -> bool:
         children, commands = _process_tree_snapshot()
         to_check = [pane_pid]
         seen: set[str] = set()
-        has_codex = False
+        has_agent = False
         while to_check and len(seen) < 10000:
             current = to_check.pop()
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
-                has_codex = True
+            if _is_agent_process_command(commands.get(current, "")):
+                has_agent = True
                 break
             to_check.extend(children.get(current, ()))
-        decision = has_codex or pane_command.lower() in {
+        bare_shell = pane_command.lower() in {
             "bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh",
         }
+        decision = has_agent or bare_shell
     except Exception:
         decision = False
     _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
@@ -9041,6 +9247,8 @@ async def _controller_dispatch(message: dict) -> dict:
         )
         return {"ok": stopped, "stopped": stopped}
     if op == "away_toggle":
+        if not _agent_supports_codex_controls():
+            return {"ok": False, "error": "Away Mode is not available for Muse sessions", "_status": 409}
         return await _away_toggle_local(
             str(message.get("session") or ""), bool(message.get("enabled"))
         )
@@ -9049,6 +9257,8 @@ async def _controller_dispatch(message: dict) -> dict:
             _away_mode_state.get(str(message.get("session") or ""), {})
         )}
     if op == "go_nuts_toggle":
+        if not _agent_supports_codex_controls():
+            return {"ok": False, "error": "Go Nuts Mode is not available for Muse sessions", "_status": 409}
         return await _go_nuts_toggle_local(
             str(message.get("session") or ""), bool(message.get("enabled"))
         )
@@ -9066,6 +9276,8 @@ async def _controller_dispatch(message: dict) -> dict:
     if op == "autopush_set":
         name = str(message.get("session") or "")
         mode = str(message.get("mode") or "").lower()
+        if not _agent_supports_codex_controls() and mode != "off":
+            return {"ok": False, "error": "Auto-push is not available for Muse sessions", "_status": 409}
         if mode not in AUTOPUSH_MODES:
             return {"ok": False, "error": f"mode must be one of {list(AUTOPUSH_MODES)}", "_status": 400}
         _autopush_mode[name] = mode
@@ -9276,26 +9488,28 @@ async def api_create_session(request: Request, body: CreateSession):
                 {"error": "This account's private data connection is not provisioned"},
                 status_code=503,
             )
-    await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
-    ready, reason, details = await asyncio.to_thread(_codex_cli_readiness)
+    if AGENT_KIND == "codex":
+        await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
+    ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
     if not ready:
         return JSONResponse(
-            {"error": f"Codex launch blocked: {reason}", "codex": details},
+            {
+                "error": f"{AGENT_DISPLAY_NAME} launch blocked: {reason}",
+                "agent": details,
+            },
             status_code=503,
         )
     try:
-        cmd = ["tmux", "new-session", "-d"]
+        cmd = ["tmux", "new-session", "-d", "-P", "-F", "#{session_name}"]
         if name:
             cmd += ["-s", name]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
         # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
+        created = name or (result.stdout or "").strip()
+        if not _is_valid_session_name(created):
+            return JSONResponse({"error": "tmux did not return a valid session name"}, status_code=500)
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
@@ -9347,7 +9561,9 @@ async def api_create_session(request: Request, body: CreateSession):
             )
         # Authenticate non-admin sessions from the shared Codex auth file.
         # Admin sessions use the default ~/.codex login directly.
-        if user and not _is_admin(user):
+        if AGENT_KIND == "muse":
+            _session_auth_mode[created] = "meta"
+        elif user and not _is_admin(user):
             _session_auth_mode[created] = _apply_member_auth(_user_codex_config_dir(user))
         else:
             try:
@@ -13668,6 +13884,22 @@ async def api_codex_auth_status():
     now = time.time()
     if now - _codex_auth_cache["ts"] < 60 and _codex_auth_cache["data"]:
         return JSONResponse(dict(_codex_auth_cache["data"]))
+    if AGENT_KIND == "muse":
+        ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        result = {
+            "loggedIn": ready,
+            "authMode": "meta" if ready else "unconfigured",
+            "activeMode": "meta" if ready else "unconfigured",
+            "subscriptionType": "Meta Model API" if ready else "",
+            "email": "Muse Code" if ready else "",
+            "model": DEFAULT_MODEL,
+            "effort": _CODEX_DEFAULT_REASONING_EFFORT,
+            "agent": AGENT_KIND,
+            "error": "" if ready else reason,
+            "details": details,
+        }
+        _codex_auth_cache.update({"ts": now, "data": result})
+        return JSONResponse(result)
     result = await asyncio.to_thread(_codex_auth_display)
     _codex_auth_cache.update({"ts": now, "data": result})
     return JSONResponse(result)
@@ -14520,17 +14752,18 @@ def _session_model_fields(session_name: str) -> dict:
             _session_model_pending.pop(session_name, None)
             pend = None
     effort = _CODEX_DEFAULT_REASONING_EFFORT
-    try:
-        cfg = (_session_config_base(session_name) / "config.toml").read_text()
-        match = re.search(
-            r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"',
-            cfg,
-            re.MULTILINE,
-        )
-        if match:
-            effort = match.group(1)
-    except Exception:
-        pass
+    if AGENT_KIND != "muse":
+        try:
+            cfg = (_session_config_base(session_name) / "config.toml").read_text()
+            match = re.search(
+                r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"',
+                cfg,
+                re.MULTILINE,
+            )
+            if match:
+                effort = match.group(1)
+        except Exception:
+            pass
     return {
         "model": model,
         "model_pending": (pend or {}).get("model", ""),
@@ -14540,6 +14773,8 @@ def _session_model_fields(session_name: str) -> dict:
 
 def _get_session_model(session_name: str) -> str:
     """Detect the current model for a session by reading its latest codex rollout."""
+    if AGENT_KIND == "muse":
+        return DEFAULT_MODEL
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
@@ -16426,6 +16661,17 @@ async def _codex_auth_health(force: bool = False) -> dict:
     age = now - float(_codex_health_auth.get("ts") or 0)
     if age < (_CODEX_AUTH_PROBE_FLOOR if force else _CODEX_AUTH_PROBE_MAX_AGE):
         return dict(_codex_health_auth)
+    if AGENT_KIND == "muse":
+        ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        _codex_health_auth.update({
+            "ts": now,
+            "loggedIn": ready,
+            "activeMode": "meta" if ready else "unconfigured",
+            "reason": "" if ready else reason,
+            "fallbackActive": False,
+            "agent": details,
+        })
+        return dict(_codex_health_auth)
     try:
         state = await asyncio.to_thread(
             _ensure_codex_auth_with_fallback, CODEX_HOME, True
@@ -16490,8 +16736,10 @@ async def _codex_health_watchdog_loop():
                     "codex-logged-out",
                     auth.get("reason") or "Codex has no usable credential",
                 )
-                repaired = await asyncio.to_thread(_repair_member_codex_auth)
-                hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
+                repaired = 0
+                if AGENT_KIND == "codex":
+                    repaired = await asyncio.to_thread(_repair_member_codex_auth)
+                    hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
                 auth = await _codex_auth_health(force=True)
                 if auth.get("loggedIn"):
                     _resolve_codex_alerts("*", "credential repaired")
@@ -19181,11 +19429,11 @@ body.member-simple .hide-in-simple{display:none!important}
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <!-- Open Codex health alerts. An alert nobody sees is not an alert, so the
+  <!-- Open agent health alerts. An alert nobody sees is not an alert, so the
        watchdog's findings surface here rather than only inside Stats. -->
   <span class="nav-codex-alert" id="nav-codex-alert" style="display:none"
-        title="Codex health alerts — click for details" onclick="openStats()"></span>
-  <!-- Generic browser-session status. Codex auto-auth is retired. -->
+        title="__AGENT_NAME__ health alerts — click for details" onclick="openStats()"></span>
+  <!-- Generic browser-session status. Agent auto-auth is retired. -->
   <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
         title="Browser sign-in status" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
@@ -19194,7 +19442,7 @@ body.member-simple .hide-in-simple{display:none!important}
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
       <div class="nav-tools-usage" id="nav-tools-usage">
-        <div class="nav-tools-usage-title">Codex plan limits</div>
+        <div class="nav-tools-usage-title">__AGENT_NAME__ plan limits</div>
         <div class="nav-tools-usage-row" id="tools-usage-primary-wrap" title="">
           <span class="nav-tools-usage-label" id="tools-usage-primary-label">plan</span>
           <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-primary-fill" style="width:0%"></span></span>
@@ -19212,7 +19460,7 @@ body.member-simple .hide-in-simple{display:none!important}
       <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openUsers();closeToolsMenu()"><span class="icon">&#x1F464;</span> Users</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
+      <div class="nav-tools-item nav-tools-admin codex-only" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -19304,6 +19552,18 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+const AGENT_KIND='__AGENT_KIND__';
+const AGENT_NAME='__AGENT_NAME__';
+const SETTINGS_TAB_DEFS=__SETTINGS_TAB_DEFS__;
+const SETTINGS_ADMIN_IDS=new Set(['global','context','apis','login']);
+document.body.dataset.agent=AGENT_KIND;
+if(AGENT_KIND==='muse'){
+  const usage=document.getElementById('nav-usage');
+  const toolsUsage=document.getElementById('nav-tools-usage');
+  if(usage)usage.style.display='none';
+  if(toolsUsage)toolsUsage.style.display='none';
+  document.querySelectorAll('.codex-only').forEach(el=>el.style.display='none');
+}
 const _nativeFetch=window.fetch.bind(window);
 function _storedImpersonationToken(){
   try{return sessionStorage.getItem('tmuxImpersonationToken')||'';}catch(e){return '';}
@@ -19653,10 +19913,10 @@ function splitLiveTail(lines){
 const _ENV_ASSIGN_RE=/^[A-Za-z_][A-Za-z0-9_]*=/;
 // The launch line itself, for the case where the prompt that carried it has
 // already scrolled out of tmux's history and only the command is left.
-const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=/;
+const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex|muse(?:-bin[^\s]*)?)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=/;
 // Its wrapped rows, which start mid-token and so match none of the above: the
 // launcher is one long `if … then exec env … fi`, and tmux breaks it anywhere.
-const _LAUNCH_FRAG_RE=/CODEX_HOME=|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
+const _LAUNCH_FRAG_RE=/CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=|MUSE_NO_AUTO_UPDATE|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
 function _stripStartupPreamble(lines){
   let i=0,sawShell=false;
   const limit=Math.min(lines.length,120);
@@ -19669,7 +19929,7 @@ function _stripStartupPreamble(lines){
     // fragments, the launcher's own shell plumbing, and the CLI's "starting…"
     // chatter.
     if(_ENV_ASSIGN_RE.test(t)||/^(export|cd|source|env|exec|nohup|&&|\|\|)\b/.test(t)||
-       /^--?[a-z]/.test(t)||/^(claude|codex)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
+       /^--?[a-z]/.test(t)||/^(claude|codex|muse(?:-bin[^\s]*)?)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
     // The compact start-up banner, which is the CLI's block-glyph logo with the
     // version, the model and the cwd set beside it. Not drawn as a box, so
     // _stripStartupBanner cannot see it; three or more logo glyphs on a row is
@@ -19682,7 +19942,7 @@ function _stripStartupPreamble(lines){
 // The welcome box each CLI draws on start-up — Codex's is the ">_ OpenAI Codex
 // (v0.146.0)" frame with model, directory and permissions in it. It is a box so
 // _isTableRow keeps it; drop it by content.
-const _BANNER_HINT_RE=/welcome (to|back)\b|(claude code|openai codex)\s+\(?v?\d|\/help for help|\/init to create|\/model to change|release-notes|tips for getting|what's new|cwd:|workdir:|directory:\s|permissions:\s|model:\s|approval:|sandbox:|press enter to continue/i;
+const _BANNER_HINT_RE=/welcome (to|back)\b|(claude code|openai codex|muse code)\s+\(?v?\d|\/help for help|\/init to create|\/model to change|release-notes|tips for getting|what's new|cwd:|workdir:|directory:\s|permissions:\s|model:\s|approval:|sandbox:|press enter to continue/i;
 function _stripStartupBanner(lines){
   const out=[];
   let box=null;
@@ -20598,7 +20858,7 @@ function openModelMenu(name,anchor,ev){
   const cur=s.model_pending||s.model||'';
   const menu=document.createElement('div');
   menu.className='model-menu';
-  let html='<div class="mm-title">Codex model · applies after restart</div>';
+  let html='<div class="mm-title">'+AGENT_NAME+' model · applies after restart</div>';
   MODEL_CHOICES.forEach(([id,label])=>{
     const sel=cur&&id===cur;
     html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
@@ -20644,13 +20904,13 @@ async function setSessionModel(name,model){
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
     if(d.codex_was_running){
-      const restart=confirm('Model saved as "'+model+'". Restart Codex now and resume the latest conversation?');
+      const restart=confirm('Model saved as "'+model+'". Restart '+AGENT_NAME+' now and resume the latest conversation?');
       if(restart){
         r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
           method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({model,restart:true})});
         d=await r.json().catch(()=>({}));
-        if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+        if(!r.ok||d.error||!d.restarted)throw new Error(d.error||(AGENT_NAME+' did not restart'));
         if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
       }else if(si>=0){sessions[si].model_pending=model;}
     }else if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
@@ -20674,12 +20934,12 @@ async function setSessionEffort(name,effort){
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
     if(s)s.effort=effort;
-    if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart Codex now and resume the latest conversation?')){
+    if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart '+AGENT_NAME+' now and resume the latest conversation?')){
       r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({effort,restart:true})});
       d=await r.json().catch(()=>({}));
-      if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+      if(!r.ok||d.error||!d.restarted)throw new Error(d.error||(AGENT_NAME+' did not restart'));
     }
     if(statusInfoEl)statusInfoEl.textContent='Reasoning effort → '+effort+(d.restarted?' · restarted':' · saved');
   }catch(e){
@@ -20832,7 +21092,7 @@ function chatBubbleInner(m,sessionName){
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Codex — every reply shows up here in full, with links to anything it produced.</div>';
+    return '<div class="chat-empty">No messages yet. Type below to talk to '+AGENT_NAME+' — every reply shows up here in full, with links to anything it produced.</div>';
   }
   return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m,name)}</div>`).join('');
 }
@@ -20881,9 +21141,9 @@ function renderDetail(){
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
-          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
-          <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
-          ${autopushSeg(s.name, s.autopush_mode, true)}
+          ${AGENT_KIND==='muse'?'':`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>`}
+          ${AGENT_KIND==='muse'?'':`<div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
+          ${autopushSeg(s.name, s.autopush_mode, true)}`}
           <!-- Clean view sits right under Auto-push because it is the other
                switch people flip several times a day, and it used to be reachable
                only by opening the whole Info tab. Same pref, same handler as the
@@ -20899,9 +21159,9 @@ function renderDetail(){
             <span class="tab-more-switch-text" id="cleanview-status-more-${esc(s.name)}">${getCleanViewPref()?CLEAN_VIEW_ON:CLEAN_VIEW_OFF}</span>
           </label>
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
-          ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" data-tab="skills" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
+          ${(MEMBER_SIMPLE||AGENT_KIND==='muse')?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" data-tab="skills" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" data-tab="info" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          ${MEMBER_SIMPLE?'':`
+          ${(MEMBER_SIMPLE||AGENT_KIND==='muse')?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
@@ -20918,9 +21178,9 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        ${AGENT_KIND==='muse'?'':`<span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="${AGENT_NAME} model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>`}
         ${s.attached?'<span class="badge attached">attached</span>':''}
-        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (${AGENT_NAME} publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
@@ -20929,7 +21189,7 @@ function renderDetail(){
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
         <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt ${AGENT_NAME} (Esc)">Stop</button>
         </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
@@ -20956,9 +21216,9 @@ function renderDetail(){
       <div class="raw-controls">
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt ${AGENT_NAME} (Esc)">Stop</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
+      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading ${AGENT_NAME}...</div>
       <!-- The spinner, the seconds counter and the token tally the CLI paints
            into the pane are cut out of the transcript and redrawn here, outside
            the scroll area, off a clock that ticks locally. See updateLiveBar. -->
@@ -21034,14 +21294,14 @@ function renderDetail(){
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="font-size:.85rem;color:#c9d1d9;margin-top:6px">
-          ${s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
+          ${s.auth_mode==='meta'?'Meta Model API':s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
           <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed for this account</span>
         </div>
       </div>
-      <div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
+      ${AGENT_KIND==='muse'?'':`<div class="tier" style="margin-top:12px" id="stats-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#79c0ff"></span>Usage &amp; Rate</div>
         <div id="stats-panel-${s.name}" style="margin-top:6px;color:#6e7681;font-size:.85rem">Loading stats...</div>
-      </div>
+      </div>`}
       <div class="tier" style="margin-top:12px" id="cleanview-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#f0883e"></span>Terminal: Clean view</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
@@ -21059,7 +21319,7 @@ function renderDetail(){
           Setting is shared across all sessions.
         </div>
       </div>
-      <div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
+      ${AGENT_KIND==='muse'?'':`<div class="tier" style="margin-top:12px" id="watchdog-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#56d364"></span>Auto-push</div>
         <div style="margin-top:8px">${autopushSeg(s.name, s.autopush_mode, false)}</div>
         <div id="autopush-status-${s.name}" style="font-size:.82rem;color:#8b949e;margin-top:8px">${autopushDesc(s.autopush_mode)}</div>
@@ -21096,7 +21356,7 @@ function renderDetail(){
           <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
         </div>
         <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
-      </div>
+      </div>`}
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
           <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
@@ -21151,9 +21411,11 @@ function renderDetail(){
     }
   }
   if(tab==='info'){
-    startStatsPolling(s.name);
-    if((s.autopush_mode||'basic')==='full')startWatchdogPolling(s.name);
-    else loadWatchdogStatus(s.name);
+    if(AGENT_KIND!=='muse'){
+      startStatsPolling(s.name);
+      if((s.autopush_mode||'basic')==='full')startWatchdogPolling(s.name);
+      else loadWatchdogStatus(s.name);
+    }
   }
   if(tab==='skills')loadAccountSkills(s.name);
 }
@@ -21205,10 +21467,12 @@ function switchTab(name,tab){
   stopAllWatchdogPolling();
   if(tab==='raw'){startRawPolling(name);updateFreezeUi(name);}
   if(tab==='info'){
-    startStatsPolling(name);
-    const s=sessions.find(x=>x.name===name);
-    if(s&&(s.autopush_mode||'basic')==='full')startWatchdogPolling(name);
-    else loadWatchdogStatus(name);
+    if(AGENT_KIND!=='muse'){
+      startStatsPolling(name);
+      const s=sessions.find(x=>x.name===name);
+      if(s&&(s.autopush_mode||'basic')==='full')startWatchdogPolling(name);
+      else loadWatchdogStatus(name);
+    }
   }
   if(tab==='skills')loadAccountSkills(name);
   if(tab==='chat'){
@@ -21795,7 +22059,7 @@ async function loadRaw(name){
   const rawEl=document.getElementById('raw-'+name);
   // Wiping to a text node takes the line elements with it — tell the renderer to
   // rebuild rather than diff against lines that no longer exist.
-  if(rawEl){rawEl.textContent='Loading Codex...';rawEl._lineMode=false}
+  if(rawEl){rawEl.textContent='Loading '+AGENT_NAME+'...';rawEl._lineMode=false}
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
   stopRawPolling(name);
@@ -22340,11 +22604,13 @@ async function checkCodexAuth(){
     // Keep last known good auth state instead of resetting to disconnected
     if(!_authCache)_authCache={loggedIn:false,error:true};
   }
-  try{
-    const usageResp=await fetch(BASE+'/api/auth/usage');
-    if(usageResp.ok) _usageCache=await usageResp.json();
-  }catch(e){
-    // Keep last known usage data
+  if(AGENT_KIND!=='muse'){
+    try{
+      const usageResp=await fetch(BASE+'/api/auth/usage');
+      if(usageResp.ok) _usageCache=await usageResp.json();
+    }catch(e){
+      // Keep last known usage data
+    }
   }
   renderAuthIndicator();
 }
@@ -22417,12 +22683,25 @@ function renderUsageHtml(){
 function renderAuthPanel(){
   const el=document.getElementById('auth-dropdown-content');
   if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
+  if(AGENT_KIND==='muse'){
+    if(_authCache.loggedIn){
+      el.innerHTML=`
+        <div class="auth-title">Muse Connected</div>
+        <div class="auth-row"><span class="auth-row-label">Provider</span><span class="auth-row-value">Meta Model API</span></div>
+        <div class="auth-row"><span class="auth-row-label">Model</span><span class="auth-row-value">${esc(_authCache.model||'muse-spark-1.2-contributor')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Credential</span><span class="auth-row-value" style="color:#3fb950">Verified</span></div>`;
+    }else{
+      el.innerHTML=`<div class="auth-title">Muse — Not Connected</div>
+        <p class="auth-hint">The deployment credential is unavailable. Run <code style="color:#79c0ff">muse login</code> on this server, then restart the service.</p>`;
+    }
+    return;
+  }
   const usageHtml=renderUsageHtml();
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
     el.innerHTML=`
-      <div class="auth-title">Codex Connected</div>
+      <div class="auth-title">${AGENT_NAME} Connected</div>
       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
       <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
       <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMode||'—')}</span></div>
@@ -22434,7 +22713,7 @@ function renderAuthPanel(){
     `;
   }else{
     el.innerHTML=`
-      <div class="auth-title">Codex — Not Connected</div>
+      <div class="auth-title">${AGENT_NAME} — Not Connected</div>
       <button class="auth-btn auth-btn-primary" style="margin-bottom:10px" onclick="document.getElementById('auth-dropdown').classList.remove('active');openSettings('login')">Sign in with ChatGPT</button>
       <p class="auth-hint">Or configure a fallback OpenAI API key for usage-based access:</p>
       <input type="password" class="auth-api-input" id="auth-api-key-input"
@@ -23343,7 +23622,7 @@ async function applyRoleVisibility(){
   document.body.classList.toggle('member-simple', MEMBER_SIMPLE);
   document.body.classList.toggle('member-admin', isAdmin);
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
-    el.style.display = isAdmin ? '' : 'none';
+    el.style.display = (isAdmin&&!(AGENT_KIND==='muse'&&el.classList.contains('codex-only'))) ? '' : 'none';
   });
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
@@ -23370,13 +23649,18 @@ async function doLogout(){
 }
 
 // ── Settings modal ────────────────────────────────────────────────────────
-let _settingsActiveTab = 'mycontext';
+let _settingsActiveTab = SETTINGS_TAB_DEFS.length?SETTINGS_TAB_DEFS[0].id:'history';
 let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
 
 async function openSettings(tab){
   await loadCurrentUser();
   closeUsers();
-  _settingsActiveTab = tab || 'mycontext';
+  const isAdmin=!!(_currentUser&&_currentUser.role==='admin');
+  const available=SETTINGS_TAB_DEFS.filter(t=>!SETTINGS_ADMIN_IDS.has(t.id)||isAdmin);
+  const requested=tab||_settingsActiveTab;
+  _settingsActiveTab=available.some(t=>t.id===requested)
+    ? requested
+    : (available.length?available[0].id:'history');
   _settingsHistoryDetail = null;
   const overlay = document.getElementById('settings-overlay');
   overlay.classList.add('active');
@@ -23393,15 +23677,7 @@ function closeSettings(){
 function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
-  const tabs = [
-    {id:'mycontext', label:'My Context'},
-    {id:'history',   label:'History'},
-    {id:'browser',   label:'Browser'},
-  ];
-  if(isAdmin) tabs.splice(1,0,{id:'global', label:'Global Instructions'});
-  if(isAdmin) tabs.push({id:'context', label:'Context Files'});
-  if(isAdmin) tabs.push({id:'apis', label:'APIs'});
-  if(isAdmin) tabs.push({id:'login', label:'Login'});
+  const tabs = SETTINGS_TAB_DEFS.filter(t=>!SETTINGS_ADMIN_IDS.has(t.id)||isAdmin);
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
@@ -23416,7 +23692,10 @@ function switchSettingsTab(tab){
 
 function renderSettingsContent(){
   const el = document.getElementById('settings-content');
-  if(_settingsActiveTab === 'mycontext'){
+  if(_settingsActiveTab === 'runtime'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading Muse runtime…</div></div>';
+    loadMuseRuntime();
+  }else if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
   }else if(_settingsActiveTab === 'global'){
@@ -23445,6 +23724,34 @@ function renderSettingsContent(){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading login status…</div></div>';
     loadLoginTab();
   }
+}
+
+async function loadMuseRuntime(){
+  const el=document.getElementById('settings-content');
+  let d;
+  try{
+    const response=await fetch(BASE+'/api/auth/codex-status');
+    d=await response.json();
+    if(!response.ok)throw new Error(d.error||'Failed to load Muse runtime');
+  }catch(e){
+    el.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load Muse runtime: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const details=d.details||{};
+  const connected=!!d.loggedIn;
+  const status=connected
+    ? '<span class="bs-dot on"></span> <b>Muse Code is connected.</b>'
+    : '<span class="bs-dot off"></span> <b>Muse Code is not ready.</b> '+esc(d.error||'');
+  const row=(label,value)=>'<label>'+esc(label)+'</label><div class="my-ctx-path" style="margin-bottom:12px;color:#c9d1d9">'+esc(value||'—')+'</div>';
+  el.innerHTML='<div class="settings-section">'+
+    '<div class="pf-banner">'+status+'</div>'+
+    row('Provider',d.subscriptionType||'Meta Model API')+
+    row('Muse Code version',details.version||'unknown')+
+    row('Model',d.model||'unknown')+
+    row('Reasoning effort',d.effort||'unknown')+
+    row('Credential',details.auth_configured?'Configured in private isolated storage':'Not configured')+
+    '<div class="pf-banner" style="color:#8b949e">This deployment keeps Muse credentials and session data separate from the Codex dashboard. Codex-only context editors and automatic terminal typing are disabled here.</div>'+
+    '</div>';
 }
 
 // --- Header browser-session badge ------------------------------------------
@@ -25432,6 +25739,17 @@ bootstrapDashboard();
 # Inject the actual ROOT_PATH into the JS BASE variable
 HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
+HTML_PAGE = HTML_PAGE.replace("__AGENT_KIND__", AGENT_KIND)
+HTML_PAGE = HTML_PAGE.replace("__AGENT_NAME__", AGENT_DISPLAY_NAME)
+HTML_PAGE = HTML_PAGE.replace(
+    "__SETTINGS_TAB_DEFS__",
+    "["
+    + ",".join(
+        "{id:" + repr(row["id"]) + ", label:" + repr(row["label"]) + "}"
+        for row in _settings_tab_defs(True)
+    )
+    + "]",
+)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
 _GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
