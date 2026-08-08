@@ -1226,6 +1226,7 @@ print(json.dumps({
     "usage_fetched": "if(AGENT_KIND!=='muse'){\n    try{\n      const usageResp" not in page,
     "stats_polled": "if(AGENT_KIND!=='muse'){\n      startStatsPolling" not in page,
     "native_label": "bundled with ${AGENT_NAME}; always available" in page,
+    "agent_health_label": "el.title=AGENT_NAME+' health: '" in page,
 }))
 '''
 
@@ -1246,6 +1247,7 @@ print(json.dumps({
         "usage_fetched": True,
         "stats_polled": True,
         "native_label": True,
+        "agent_health_label": True,
     }
 
 

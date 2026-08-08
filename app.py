@@ -17857,18 +17857,22 @@ async def _codex_health_watchdog_loop():
                 _record_codex_alert(
                     name,
                     "codex-not-running",
-                    _codex_failure_excerpt(recent) or "Codex exited to a shell",
+                    _codex_failure_excerpt(recent)
+                    or f"{AGENT_DISPLAY_NAME} exited to a shell",
                     username=username,
                 )
                 hlog.warning(
-                    "Relaunching Codex in '%s'%s (attempt %d)",
-                    name, f" for {username}" if username else "", state["attempts"],
+                    "Relaunching %s in '%s'%s (attempt %d)",
+                    AGENT_DISPLAY_NAME,
+                    name,
+                    f" for {username}" if username else "",
+                    state["attempts"],
                 )
                 if await _ensure_codex_running(name):
                     _seen_claude_running.add(name)
                     _codex_health_state.pop(name, None)
                     _resolve_codex_alerts(name, "relaunched by the health watchdog")
-                    hlog.warning("Session '%s' is back on Codex", name)
+                    hlog.warning("Session '%s' is back on %s", name, AGENT_DISPLAY_NAME)
                 else:
                     _record_codex_alert(
                         name,
@@ -17878,10 +17882,10 @@ async def _codex_health_watchdog_loop():
                         username=username,
                     )
         except asyncio.CancelledError:
-            hlog.info("Codex health watchdog cancelled")
+            hlog.info("%s health watchdog cancelled", AGENT_DISPLAY_NAME)
             raise
         except Exception:
-            logger.debug("Codex health watchdog iteration failed", exc_info=True)
+            logger.debug("Agent health watchdog iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
@@ -23363,7 +23367,7 @@ async function refreshCodexAlertBadge(){
     if(!open){el.style.display='none';return}
     const sessions=[...new Set((d.alerts||[]).map(a=>a.session_name==='*'?'all accounts':a.session_name))];
     el.textContent='⚠ '+open+' Codex alert'+(open===1?'':'s');
-    el.title='Codex health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
+    el.title=AGENT_NAME+' health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
     el.style.display='';
   }catch(e){el.style.display='none'}
 }
@@ -26693,7 +26697,7 @@ function renderStats(s,usage,byUser,alerts){
     const shown=(open.length?open:alerts.alerts).slice(0,12);
     const title=open.length
       ?open.length+' open Codex alert'+(open.length===1?'':'s')
-      :'Codex health (all clear)';
+      :AGENT_NAME+' health (all clear)';
     html+='<div class="stats-section"><div class="stats-section-title">'+esc(title)
       +' <button class="users-plain-btn" style="float:right;font-size:.65rem" onclick="clearCodexAlerts()">Clear</button></div>';
     if(alerts.auth&&alerts.auth.loggedIn===false){
