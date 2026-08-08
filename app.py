@@ -1531,7 +1531,9 @@ async def lifespan(_app: FastAPI):
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and AGENT_KIND == "muse":
+        logger.info("LLM summaries use the connected Muse Meta API fallback")
+    elif not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
     if not (
         os.environ.get("TMUX_DASH_SECRET")
@@ -1581,7 +1583,10 @@ async def lifespan(_app: FastAPI):
         _ensure_user_browser_session(member, start=False)
         if (config_dir / "config.toml").exists():
             synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
-    logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
+    if AGENT_KIND == "muse":
+        logger.info("Muse account browser MCP is bound through Muse runtime settings")
+    else:
+        logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
     try:
         migrated_prompts = _backfill_prompt_audit(users)
         if migrated_prompts:
@@ -1611,7 +1616,7 @@ async def lifespan(_app: FastAPI):
     controller_loops = (
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
-        ("codex health watchdog", _codex_health_watchdog_loop()),
+        ("agent health watchdog", _codex_health_watchdog_loop()),
         ("model refresh", _model_refresh_loop()),
         ("browser lifecycle", _browser_lifecycle_loop()),
         ("session lifecycle", _session_lifecycle_loop()),
