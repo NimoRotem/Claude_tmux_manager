@@ -4,8 +4,22 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from runtime_control import scoped_codex_command
+
+
+def test_muse_deploy_enables_admin_google_login():
+    config = (
+        Path(__file__).resolve().parent
+        / "deploy"
+        / "muse-dashboard.supervisor.conf"
+    ).read_text()
+
+    assert (
+        'TMUX_DASH_ADMIN_GOOGLE_EMAIL="nimrod.rotem@gmail.com"' in config,
+        'TMUX_DASH_GOOGLE_DOMAINS="grabo.com,nemopowertools.com"' in config,
+    ) == (True, True)
 
 
 def test_state_directory_can_be_isolated_per_deployment(tmp_path):

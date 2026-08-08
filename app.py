@@ -2205,7 +2205,8 @@ if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
 _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
     <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
     Continue with Google</a>
-  <div class="ghint">__GOOGLE_HINT__</div>"""
+  <div class="ghint">__GOOGLE_HINT__</div>
+  <div class="sep">or use username and password</div>"""
 
 _PASSWORD_LOGIN_HTML = """  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
@@ -2231,7 +2232,7 @@ def _login_page() -> str:
             "__GOOGLE_BTN__",
             _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint),
         )
-        .replace("__PASSWORD_LOGIN__", "")
+        .replace("__PASSWORD_LOGIN__", _PASSWORD_LOGIN_HTML)
     )
 
 
@@ -2551,6 +2552,32 @@ GOOGLE_WORKSPACE_REQUIRED_SCOPES = (
 )
 GOOGLE_LOGIN_SCOPES = "openid email profile"
 GOOGLE_LOGIN_STATE_COOKIE = AUTH_COOKIE + "_google_state"
+GOOGLE_LOGIN_STATE_TTL = 600
+
+
+def _set_google_login_state_cookie(
+    response: RedirectResponse, request: Request, state: str
+) -> RedirectResponse:
+    is_https = (
+        request.headers.get("x-forwarded-proto") == "https"
+        or request.url.scheme == "https"
+    )
+    response.set_cookie(
+        GOOGLE_LOGIN_STATE_COOKIE,
+        hashlib.sha256(state.encode()).hexdigest(),
+        max_age=GOOGLE_LOGIN_STATE_TTL,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+    )
+    return response
+
+
+def _google_login_redirect(url: str, status_code: int = 303) -> RedirectResponse:
+    response = RedirectResponse(url=url, status_code=status_code)
+    response.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
+    return response
 
 
 def _google_workspace_subject(user: dict | None) -> str:
@@ -2749,7 +2776,8 @@ async def google_login_start(request: Request):
         "prompt": "select_account",
         "state": state,
     })
-    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    response = RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    return _set_google_login_state_cookie(response, request, state)
 
 
 @app.get("/auth/google/callback")
@@ -2757,20 +2785,31 @@ async def google_login_callback(request: Request):
     rp = request.scope.get("root_path", "")
     ip = request.client.host if request.client else "unknown"
     if request.query_params.get("error"):
-        return RedirectResponse(url=rp + "/?gerr=denied", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=denied")
     if not _check_login_rate_limit(ip):
-        return HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+        response = HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+        response.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
+        return response
     code = request.query_params.get("code") or ""
-    payload = _verify_state(request.query_params.get("state") or "")
-    if not code or not payload or not payload.startswith("glogin:"):
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    state = request.query_params.get("state") or ""
+    browser_state = request.cookies.get(GOOGLE_LOGIN_STATE_COOKIE) or ""
+    expected_browser_state = hashlib.sha256(state.encode()).hexdigest()
+    payload = _verify_state(state)
+    if (
+        not code
+        or not payload
+        or not payload.startswith("glogin:")
+        or not browser_state
+        or not secrets.compare_digest(expected_browser_state, browser_state)
+    ):
+        return _google_login_redirect(url=rp + "/?gerr=state")
     try:
         _, ts, nxt_b64 = payload.split(":", 2)
         nxt = base64.urlsafe_b64decode(nxt_b64.encode()).decode()
     except Exception:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
-    if time.time() - int(ts) > 600:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=state")
+    if time.time() - int(ts) > GOOGLE_LOGIN_STATE_TTL:
+        return _google_login_redirect(url=rp + "/?gerr=state")
     if not (nxt.startswith("/") and not nxt.startswith("//")):
         nxt = rp + "/"
 
@@ -2787,24 +2826,24 @@ async def google_login_callback(request: Request):
         claims = _decode_id_token(tok.get("id_token") or "")
     except Exception:
         logger.exception("Google sign-in token exchange failed")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
 
     if claims.get("aud") != cid:
         logger.warning("Google sign-in: id_token audience mismatch")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
     if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         logger.warning("Google sign-in: unexpected issuer %s", claims.get("iss"))
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
     if float(claims.get("exp") or 0) < time.time():
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=state")
     email = (claims.get("email") or "").strip().lower()
     if not email or not claims.get("email_verified"):
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=domain")
 
     target_user = _google_login_user(email, claims.get("name") or "")
     if not target_user:
         logger.warning("Google sign-in rejected for %s (not an allowed domain)", email)
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=domain")
 
     ua = (request.headers.get("user-agent", "") or "")[:300]
     fwd = request.headers.get("x-forwarded-for", "")
@@ -2825,6 +2864,7 @@ async def google_login_callback(request: Request):
     logger.info("Google sign-in: %s -> user '%s' (%s)",
                 email, target_user.get("username"), target_user.get("role"))
     resp = RedirectResponse(url=nxt, status_code=303)
+    resp.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
     return _set_auth_cookie(resp, request, _make_token(target_user["id"]))
 
 
