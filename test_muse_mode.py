@@ -21,6 +21,14 @@ def test_muse_deploy_enables_admin_google_login():
         'TMUX_DASH_ADMIN_GOOGLE_EMAIL="nimrod.rotem@gmail.com"' in config,
         'TMUX_DASH_GOOGLE_DOMAINS="grabo.com,nemopowertools.com"' in config,
     ) == (True, True)
+    assert (
+        'TMUX_DASH_BROWSER_CONTROLLER_SOCKET="/home/nimrod_rotem/.tmux-dashboard/controller.sock"'
+        in config
+    )
+    assert (
+        'TMUX_DASH_BROWSER_STATE_DIR="/home/nimrod_rotem/.tmux-dashboard"'
+        in config
+    )
 
 
 def test_state_directory_can_be_isolated_per_deployment(tmp_path):
@@ -857,6 +865,7 @@ print(json.dumps(app._find_muse_session_jsonl_files("muse-test")))
 
 def test_muse_runtime_settings_connect_advisor_without_persisting_its_token(tmp_path):
     state_dir = tmp_path / "dashboard-state"
+    browser_controller = tmp_path / "shared-dashboard" / "controller.sock"
     home = Path.home()
     config_home = tmp_path / "muse-config"
     settings_file = config_home / "muse" / "settings.json"
@@ -870,6 +879,7 @@ def test_muse_runtime_settings_connect_advisor_without_persisting_its_token(tmp_
         {
             "TMUX_DASH_AGENT": "muse",
             "TMUX_DASH_STATE_DIR": str(state_dir),
+            "TMUX_DASH_BROWSER_CONTROLLER_SOCKET": str(browser_controller),
             "TMUX_DASH_MUSE_CONFIG_HOME": str(config_home),
             "TMUX_DASH_MUSE_MCP_PYTHON": "/opt/mcp/bin/python",
             "TMUX_DASH_MUSE_MCP_BRIDGE": "/opt/muse/muse_mcp_bridge.py",
@@ -937,12 +947,97 @@ print((app.MUSE_CONFIG_HOME / "muse" / "settings.json").read_text())
             "TMUX_DASH_BROWSER_CDP_PORT": "9222",
             "TMUX_DASH_BROWSER_ID": "default",
             "TMUX_DASH_BROWSER_OUTPUT_DIR": str(home / ".playwright-mcp" / "default"),
-            "TMUX_DASH_CONTROLLER_SOCKET": str(state_dir / "controller.sock"),
+            "TMUX_DASH_CONTROLLER_SOCKET": str(browser_controller),
             "TMUX_DASH_HOST_HOME": str(home),
         },
         "framing": "line_delimited_json",
     }
     assert settings_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_muse_routes_browser_calls_to_the_shared_controller(tmp_path):
+    state_dir = tmp_path / "dashboard-state"
+    browser_state_dir = tmp_path / "shared-dashboard"
+    browser_controller = browser_state_dir / "controller.sock"
+    env = os.environ.copy()
+    env.update(
+        {
+            "TMUX_DASH_AGENT": "muse",
+            "TMUX_DASH_STATE_DIR": str(state_dir),
+            "TMUX_DASH_BROWSER_STATE_DIR": str(browser_state_dir),
+            "TMUX_DASH_BROWSER_CONTROLLER_SOCKET": str(browser_controller),
+            "TMUX_DASH_SECRET": "muse-test-secret",
+            "TMUX_DASH_PASS": "muse-test-pass",
+        }
+    )
+    probe = """
+import asyncio
+import json
+import app
+
+seen = []
+
+async def fake_socket_request(path, message):
+    seen.append([str(path), message])
+    return {"ok": True, "source": "shared-browser-controller"}
+
+async def local_controller_must_not_run(*_args, **_kwargs):
+    raise AssertionError("browser call was routed to Muse's private controller")
+
+app._controller_socket_request = fake_socket_request
+app._controller_call = local_controller_must_not_run
+result = asyncio.run(app._browser_controller_call(
+    "browser_acquire", browser_id="default", kind="agent"
+))
+legacy_result = asyncio.run(app._controller_dispatch({
+    "op": "browser_acquire", "browser_id": "default", "kind": "agent"
+}))
+print(json.dumps({
+    "external": app._uses_external_browser_controller(),
+    "result": result,
+    "legacy_result": legacy_result,
+    "leases_file": str(app.BROWSER_LEASES_FILE),
+    "sessions_file": str(app.BROWSER_SESSIONS_FILE),
+    "seen": seen,
+}))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=os.path.dirname(__file__),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data == {
+        "external": True,
+        "result": {"ok": True, "source": "shared-browser-controller"},
+        "legacy_result": {"ok": True, "source": "shared-browser-controller"},
+        "leases_file": str(browser_state_dir / "browser-leases.json"),
+        "sessions_file": str(browser_state_dir / "browser_sessions.json"),
+        "seen": [
+            [
+                str(browser_controller),
+                {
+                    "op": "browser_acquire",
+                    "browser_id": "default",
+                    "kind": "agent",
+                },
+            ],
+            [
+                str(browser_controller),
+                {
+                    "op": "browser_acquire",
+                    "browser_id": "default",
+                    "kind": "agent",
+                },
+            ],
+        ],
+    }
 
 
 def test_muse_project_context_preserves_project_rules_and_adds_runtime_contract(tmp_path):

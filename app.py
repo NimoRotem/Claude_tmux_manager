@@ -581,7 +581,7 @@ def _ensure_muse_runtime_settings() -> bool:
                 "TMUX_DASH_BROWSER_OUTPUT_DIR": str(
                     Path.home() / ".playwright-mcp" / "default"
                 ),
-                "TMUX_DASH_CONTROLLER_SOCKET": str(CONTROLLER_SOCKET),
+                "TMUX_DASH_CONTROLLER_SOCKET": str(BROWSER_CONTROLLER_SOCKET),
                 "TMUX_DASH_HOST_HOME": str(Path.home()),
             },
             "framing": "line_delimited_json",
@@ -1094,8 +1094,19 @@ MESSAGES_DIR = STATE_DIR
 CONTROLLER_SOCKET = Path(
     os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
 )
-BROWSER_LEASES_FILE = MESSAGES_DIR / "browser-leases.json"
-BROWSER_RUNTIME_FILE = MESSAGES_DIR / "browser-runtime.json"
+# Multiple dashboard frontends may share one account browser while retaining
+# separate session/history state. Browser lifecycle must have exactly one
+# coordinator or an idle frontend can park Chrome while another frontend has a
+# live tool/viewer lease. Muse points this at the primary dashboard controller;
+# standalone installs keep the local controller default.
+BROWSER_CONTROLLER_SOCKET = Path(
+    os.environ.get("TMUX_DASH_BROWSER_CONTROLLER_SOCKET", str(CONTROLLER_SOCKET))
+)
+BROWSER_STATE_DIR = Path(
+    os.environ.get("TMUX_DASH_BROWSER_STATE_DIR", str(MESSAGES_DIR))
+)
+BROWSER_LEASES_FILE = BROWSER_STATE_DIR / "browser-leases.json"
+BROWSER_RUNTIME_FILE = BROWSER_STATE_DIR / "browser-runtime.json"
 SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
 CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
 BROWSER_LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
@@ -1613,12 +1624,20 @@ async def lifespan(_app: FastAPI):
         except Exception:
             logger.exception("Advisor account/group startup sync failed")
 
+    browser_controller_loops = ()
+    if _uses_external_browser_controller():
+        logger.info(
+            "Browser lifecycle delegated to shared controller at %s",
+            BROWSER_CONTROLLER_SOCKET,
+        )
+    else:
+        browser_controller_loops = (("browser lifecycle", _browser_lifecycle_loop()),)
     controller_loops = (
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
         ("agent health watchdog", _codex_health_watchdog_loop()),
         ("model refresh", _model_refresh_loop()),
-        ("browser lifecycle", _browser_lifecycle_loop()),
+        *browser_controller_loops,
         ("session lifecycle", _session_lifecycle_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
         ("advisor account sync", sync_advisor_accounts()),
@@ -9799,6 +9818,16 @@ async def _controller_snapshot_loop() -> None:
 
 async def _controller_dispatch(message: dict) -> dict:
     op = str(message.get("op") or "")
+    # Existing Muse processes may still have the former private controller
+    # socket in their MCP environment until their next restart. Forward those
+    # browser operations instead of reviving a second lifecycle owner.
+    if _uses_external_browser_controller() and op in {
+        "browser_acquire",
+        "browser_renew",
+        "browser_release",
+        "browser_stop",
+    }:
+        return await _controller_socket_request(BROWSER_CONTROLLER_SOCKET, message)
     if op == "ping":
         return {"ok": True, "pid": os.getpid(), "role": PROCESS_ROLE}
     if op == "runtime":
@@ -9972,11 +10001,16 @@ async def _controller_call(op: str, **fields) -> dict:
     message = {"op": op, **fields}
     if PROCESS_ROLE != "api":
         return await _controller_dispatch(message)
+    return await _controller_socket_request(CONTROLLER_SOCKET, message)
+
+
+async def _controller_socket_request(path: Path, message: dict) -> dict:
+    """Send one request to a specific controller Unix socket."""
     last_error = "controller unavailable"
     for _ in range(10):
         try:
             reader, writer = await asyncio.open_unix_connection(
-                str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
+                str(path), limit=32 * 1024 * 1024
             )
             writer.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
             await writer.drain()
@@ -9988,6 +10022,22 @@ async def _controller_call(op: str, **fields) -> dict:
             last_error = str(exc)
             await asyncio.sleep(0.2)
     return {"ok": False, "error": last_error}
+
+
+def _uses_external_browser_controller() -> bool:
+    """Whether browser leases/lifecycle belong to another dashboard process."""
+    return os.path.abspath(str(BROWSER_CONTROLLER_SOCKET)) != os.path.abspath(
+        str(CONTROLLER_SOCKET)
+    )
+
+
+async def _browser_controller_call(op: str, **fields) -> dict:
+    """Route shared browser state to its single lifecycle coordinator."""
+    if not _uses_external_browser_controller():
+        return await _controller_call(op, **fields)
+    return await _controller_socket_request(
+        BROWSER_CONTROLLER_SOCKET, {"op": op, **fields}
+    )
 
 
 async def _controller_terminal_connection(session_name: str):
@@ -11659,6 +11709,19 @@ async def api_stats():
     except Exception:
         stats["uptime"] = "unknown"
     controller = _controller_snapshot.read()
+    if _uses_external_browser_controller():
+        shared_browser = await _browser_controller_call("runtime")
+        if shared_browser.get("ok"):
+            controller = {
+                **controller,
+                "active_browser_leases": shared_browser.get(
+                    "active_browser_leases", 0
+                ),
+                "browser_leases_by_session": shared_browser.get(
+                    "browser_leases_by_session", {}
+                ),
+                "browser_runtime": shared_browser.get("browser_runtime", {}),
+            }
     by_browser = controller.get("browser_leases_by_session", {})
     stats["capacity"] = {
         # This is the scheduling signal. Parked/idle tmux sessions retain user
@@ -12048,7 +12111,7 @@ async def api_legacy_claude_auth_removed(request: Request):
 # viewers SAME-ORIGIN through this dashboard, so extra sessions are reachable
 # without needing a separate public browser host. The DEFAULT session is the
 # pre-existing systemd browser on display :99 / port 6080.
-BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
+BROWSER_SESSIONS_FILE = BROWSER_STATE_DIR / "browser_sessions.json"
 BROWSER_AUDIT_ROOT = MESSAGES_DIR / "browser-audit"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 _browser_starting: dict[str, float] = {}
@@ -12747,14 +12810,18 @@ async def api_my_browser(request: Request):
         start=False,
     )
     row = _browser_response_row(browser)
-    runtime = _browser_runtime_row(str(browser.get("id") or ""))
+    browser_state = await _browser_controller_call("runtime")
+    runtimes = browser_state.get("browser_runtime", {}) if browser_state.get("ok") else {}
+    leases_by_browser = (
+        browser_state.get("browser_leases_by_session", {})
+        if browser_state.get("ok")
+        else {}
+    )
+    runtime = runtimes.get(str(browser.get("id") or ""), {})
     row["running"] = await asyncio.to_thread(_browser_process_alive, browser)
     row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
     row["parked"] = not row["running"]
-    leases = await asyncio.to_thread(_browser_leases.snapshot)
-    row["active_leases"] = int(
-        leases.get("by_browser", {}).get(browser.get("id"), 0)
-    )
+    row["active_leases"] = int(leases_by_browser.get(browser.get("id"), 0))
     public = {
         key: row.get(key)
         for key in (
@@ -12775,14 +12842,20 @@ async def api_browser_sessions(request: Request):
         if _browser_owner_id(session) == "admin"
     ]
     out = []
-    leases = await asyncio.to_thread(_browser_leases.snapshot)
+    browser_state = await _browser_controller_call("runtime")
+    runtimes = browser_state.get("browser_runtime", {}) if browser_state.get("ok") else {}
+    leases_by_browser = (
+        browser_state.get("browser_leases_by_session", {})
+        if browser_state.get("ok")
+        else {}
+    )
     for s in sessions:
         row = _browser_response_row(s)
-        runtime = _browser_runtime_row(str(s.get("id") or ""))
+        runtime = runtimes.get(str(s.get("id") or ""), {})
         row["running"] = await asyncio.to_thread(_browser_process_alive, s)
         row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
         row["parked"] = not row["running"]
-        row["active_leases"] = int(leases.get("by_browser", {}).get(s.get("id"), 0))
+        row["active_leases"] = int(leases_by_browser.get(s.get("id"), 0))
         out.append(row)
     extra = sum(
         1
@@ -12819,7 +12892,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if await asyncio.to_thread(_browser_process_alive, entry):
         acquired = {"ok": True, "lease": {}}
     else:
-        acquired = await _controller_call(
+        acquired = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="create",
@@ -12856,7 +12929,9 @@ async def api_browser_delete(sid: str, request: Request):
                             status_code=400)
 
     await asyncio.to_thread(_browser_leases.release_browser, sid)
-    stopped = await _controller_call("browser_stop", browser_id=sid, reason="browser removed")
+    stopped = await _browser_controller_call(
+        "browser_stop", browser_id=sid, reason="browser removed"
+    )
     if not stopped.get("ok"):
         return JSONResponse({"error": stopped.get("error", "browser did not stop")}, status_code=502)
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
@@ -12877,7 +12952,7 @@ async def api_browser_lease_acquire(sid: str, body: BrowserLeaseBody, request: R
     """Acquire an explicit renewable browser lease and restore it on demand."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call(
+    result = await _browser_controller_call(
         "browser_acquire",
         browser_id=sid,
         kind=body.kind,
@@ -12892,7 +12967,9 @@ async def api_browser_lease_acquire(sid: str, body: BrowserLeaseBody, request: R
 async def api_browser_lease_renew(token: str, body: BrowserLeaseBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call("browser_renew", token=token, ttl=body.ttl)
+    result = await _browser_controller_call(
+        "browser_renew", token=token, ttl=body.ttl
+    )
     return JSONResponse(result, status_code=200 if result.get("ok") else 404)
 
 
@@ -12900,7 +12977,7 @@ async def api_browser_lease_renew(token: str, body: BrowserLeaseBody, request: R
 async def api_browser_lease_release(token: str, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call("browser_release", token=token)
+    result = await _browser_controller_call("browser_release", token=token)
     return JSONResponse(result, status_code=200 if result.get("ok") else 404)
 
 
@@ -13177,7 +13254,7 @@ async def _browser_busy_ctx(sid: str, what: str):
     _browser_busy[sid] = {"what": what, "since": time.time()}
     lease_token = ""
     try:
-        result = await _controller_call(
+        result = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="agent",
@@ -13191,7 +13268,7 @@ async def _browser_busy_ctx(sid: str, what: str):
         yield
     finally:
         if lease_token:
-            await _controller_call("browser_release", token=lease_token)
+            await _browser_controller_call("browser_release", token=lease_token)
         _browser_busy.pop(sid, None)
 
 
@@ -13977,7 +14054,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
     owner = "viewer"
     if ws.client:
         owner = f"viewer:{ws.client.host}"
-    acquired = await _controller_call(
+    acquired = await _browser_controller_call(
         "browser_acquire",
         browser_id=sid,
         kind="viewer",
@@ -13998,7 +14075,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
         async def renew_viewer_lease():
             while True:
                 await asyncio.sleep(max(30, BROWSER_LEASE_TTL // 2))
-                renewed = await _controller_call(
+                renewed = await _browser_controller_call(
                     "browser_renew", token=lease_token, ttl=BROWSER_LEASE_TTL
                 )
                 if not renewed.get("ok"):
@@ -14068,7 +14145,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
         if renew_task:
             renew_task.cancel()
         if lease_token:
-            await _controller_call("browser_release", token=lease_token)
+            await _browser_controller_call("browser_release", token=lease_token)
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
@@ -14084,7 +14161,7 @@ async def browser_proxy_http(sid: str, path: str, request: Request):
         # The HTML must be reachable before noVNC can open its WebSocket. Hold a
         # short bootstrap viewer lease; the socket replaces it with a renewable
         # lease and this one naturally expires if the page never connects.
-        acquired = await _controller_call(
+        acquired = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="viewer",
