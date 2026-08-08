@@ -42,7 +42,9 @@ def authed_client():
     """
     c = TestClient(app)
     c.cookies.set("tmux_auth", AUTH_TOKEN)
-    return c
+    owners = {session["name"]: "admin" for session in MOCK_SESSIONS}
+    with patch("app._load_session_owners", return_value=owners):
+        yield c
 
 
 # ─── Auth & Middleware Tests ───
@@ -941,13 +943,9 @@ class TestSessionStats:
         # When no JSONL files found, returns {"available": false}
         assert data["available"] is False
 
-    @patch("app._find_session_jsonl_files", return_value=[])
-    def test_session_stats_nonexistent_session(self, mock_jsonl, authed_client):
-        # The stats endpoint doesn't validate session existence — it just
-        # tries to find JSONL files and returns available:false if none found
+    def test_session_stats_nonexistent_session(self, authed_client):
         resp = authed_client.get("/api/sessions/nonexistent/stats")
-        assert resp.status_code == 200
-        assert resp.json()["available"] is False
+        assert resp.status_code == 404
 
     def test_session_stats_uses_cache(self, authed_client):
         """Second call within 15s should return cached result."""
@@ -958,7 +956,8 @@ class TestSessionStats:
         cached_result = {"available": False, "_ts": time.time(), "_from_cache": True}
         app._session_stats_cache[unique_session] = cached_result
         try:
-            resp = authed_client.get(f"/api/sessions/{unique_session}/stats")
+            with patch("app._load_session_owners", return_value={unique_session: "admin"}):
+                resp = authed_client.get(f"/api/sessions/{unique_session}/stats")
             assert resp.status_code == 200
             # _ts is internal — but _from_cache should pass through
             assert resp.json().get("_from_cache") is True
@@ -1147,6 +1146,7 @@ class TestUploadFileSizeLimit:
         app.cache.pop(fresh_name, None)  # Ensure no cache entry
         from io import BytesIO
         with patch("app.get_tmux_sessions", return_value=fresh_sessions), \
+             patch("app._load_session_owners", return_value={fresh_name: "admin"}), \
              patch("app.get_session_cwd", return_value=str(tmp_path)), \
              patch("app._load_session_messages", return_value=[]) as mock_load:
             resp = authed_client.post(
@@ -1502,18 +1502,15 @@ class TestFullSessionsList:
 
 
 class TestAwayModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
+    def test_returns_not_found_for_unknown_session(self, authed_client):
         resp = authed_client.get("/api/sessions/no-such-session/away-mode")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
-        assert "phase" in data
-        assert "log" in data
+        assert resp.status_code == 404
 
     def test_returns_disabled_for_known_session_not_running(self, authed_client):
         import app
         app._away_mode_state.pop("test-clean-session", None)
-        resp = authed_client.get("/api/sessions/test-clean-session/away-mode")
+        with patch("app._load_session_owners", return_value={"test-clean-session": "admin"}):
+            resp = authed_client.get("/api/sessions/test-clean-session/away-mode")
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
 
@@ -1522,14 +1519,13 @@ class TestAwayModeStatus:
 
 
 class TestGoNutsModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
+    def test_returns_not_found_for_unknown_session(self, authed_client):
         resp = authed_client.get("/api/sessions/no-such-session/go-nuts-mode")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
+        assert resp.status_code == 404
 
     def test_status_schema_has_required_fields(self, authed_client):
-        resp = authed_client.get("/api/sessions/any-session/go-nuts-mode")
+        with patch("app._load_session_owners", return_value={"any-session": "admin"}):
+            resp = authed_client.get("/api/sessions/any-session/go-nuts-mode")
         data = resp.json()
         for field in ("enabled", "phase", "log"):
             assert field in data, f"Missing field: {field}"
@@ -1808,8 +1804,7 @@ class TestCreateSession:
     @patch("app.subprocess.run")
     def test_create_session_auto_name(self, mock_run, mock_sessions, authed_client):
         """POST /api/sessions/create with empty name should auto-name the session."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.return_value = [{"name": "auto-1", "windows": "1", "created": "0", "attached": False}]
+        mock_run.return_value = MagicMock(returncode=0, stdout="auto-1\n", stderr="")
         resp = authed_client.post("/api/sessions/create", json={"name": ""})
         assert resp.status_code == 200
         data = resp.json()
