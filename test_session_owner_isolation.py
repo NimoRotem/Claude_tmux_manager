@@ -34,6 +34,68 @@ def test_admin_cannot_access_member_session_without_impersonation():
     assert allowed is False
 
 
+def test_admin_cannot_access_session_missing_from_this_dashboard_registry():
+    with patch.object(app_module, "_load_session_owners", return_value=OWNERS):
+        allowed = app_module._user_can_access_session(ADMIN, "foreign-muse")
+
+    assert allowed is False
+
+
+def test_admin_list_filter_excludes_session_missing_from_this_dashboard_registry():
+    sessions = SESSIONS + [
+        {"name": "foreign-muse", "windows": "1", "created": "3", "attached": False}
+    ]
+    with patch.object(app_module, "_load_session_owners", return_value=OWNERS):
+        visible = app_module._filter_sessions_for_user(sessions, ADMIN)
+
+    assert [session["name"] for session in visible] == ["admin-work"]
+
+
+def test_session_discovery_ignores_sessions_missing_from_this_dashboard_registry():
+    tmux_output = "admin-work:1:1:0\nforeign-muse:1:2:0\n"
+    with (
+        patch.object(
+            app_module.subprocess,
+            "run",
+            return_value=Mock(returncode=0, stdout=tmux_output, stderr=""),
+        ),
+        patch.object(app_module, "_session_is_codex", return_value=True),
+        patch.object(app_module, "_load_session_owners", return_value=OWNERS),
+        patch.object(
+            app_module._session_lifecycle,
+            "snapshot",
+            return_value={"sessions": {}},
+        ),
+    ):
+        sessions = app_module.get_tmux_sessions()
+
+    assert [session["name"] for session in sessions] == ["admin-work"]
+
+
+def test_auto_named_session_uses_name_printed_by_tmux():
+    with (
+        patch.object(app_module, "get_tmux_sessions", return_value=[]),
+        patch.object(
+            app_module.subprocess,
+            "run",
+            return_value=Mock(returncode=0, stdout="auto-1\n", stderr=""),
+        ),
+        patch.object(
+            app_module,
+            "_codex_cli_readiness",
+            return_value=(True, "ready", {"version": "test"}),
+        ),
+        patch.object(app_module, "_ensure_codex_auth_with_fallback"),
+        patch.object(app_module, "_set_session_owner"),
+        patch.object(app_module, "_send_session_owner_environment", return_value=True),
+        patch.object(app_module, "_multi_tenant_enabled", return_value=False),
+        patch.object(app_module, "NEW_SESSION_CMD", ""),
+    ):
+        response = _admin_client().post("/api/sessions/create", json={"name": ""})
+
+    assert response.json()["name"] == "auto-1"
+
+
 def test_all_scope_cannot_add_member_sessions_to_admin_workspace():
     activity = {"status": "idle", "command": "", "detail": ""}
     with (

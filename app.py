@@ -1917,7 +1917,8 @@ def _load_session_owners() -> dict[str, str]:
 
 def _session_owner_id(session_name: str) -> str:
     """Return the owner user_id for a session. Pre-existing sessions with no
-    recorded owner default to the admin."""
+    recorded owner default to the admin for legacy metadata only. Authorization
+    must use ``_user_can_access_session``, which fails closed."""
     owners = _load_session_owners()
     return owners.get(session_name, "admin")
 
@@ -1944,10 +1945,10 @@ def _user_for_session(session_name: str) -> dict | None:
 
 
 def _user_can_access_session(user: dict | None, session_name: str) -> bool:
-    """Return whether the effective signed-in account owns this session."""
+    """Return whether this dashboard explicitly owns the session for the user."""
     if not user:
         return False
-    return _session_owner_id(session_name) == user["id"]
+    return _load_session_owners().get(session_name) == user["id"]
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -2115,8 +2116,7 @@ async def session_ownership_middleware(request: Request, call_next):
 
     Admin accounts follow the same ownership rule as members. To access a
     member's session, an admin must use "Log in as" so that member becomes the
-    effective account. Sessions with no recorded owner default to admin so
-    legacy sessions stay with the built-in account.
+    effective account. Sessions with no record in this deployment fail closed.
     """
     if not AUTH_PASS:
         return await call_next(request)
@@ -6793,6 +6793,7 @@ def get_tmux_sessions() -> list[dict]:
         if result.returncode != 0:
             result.stdout = ""
         sessions = []
+        owners = _load_session_owners()
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
@@ -6800,6 +6801,8 @@ def get_tmux_sessions() -> list[dict]:
             name = parts[0]
             if name.startswith("__") and name.endswith("__"):
                 continue  # Skip internal sessions (e.g. __auth_login_tmp__)
+            if name not in owners:
+                continue  # Ignore sessions managed by another dashboard deployment
             if not _session_is_codex(name):
                 continue  # Hide non-Codex tmux sessions from the codex dashboard
             sessions.append({
@@ -6852,7 +6855,7 @@ def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
         return []
     owners = _load_session_owners()
     uid = user["id"]
-    return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+    return [s for s in sessions if owners.get(s["name"]) == uid]
 
 
 def _session_list_for_request(request: Request, sessions: list) -> tuple[list | None, str]:
@@ -9284,18 +9287,16 @@ async def api_create_session(request: Request, body: CreateSession):
             status_code=503,
         )
     try:
-        cmd = ["tmux", "new-session", "-d"]
+        cmd = ["tmux", "new-session", "-d", "-P", "-F", "#{session_name}"]
         if name:
             cmd += ["-s", name]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
         # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
+        created = name or (result.stdout or "").strip()
+        if not _is_valid_session_name(created):
+            return JSONResponse({"error": "tmux did not return a valid session name"}, status_code=500)
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)

@@ -480,7 +480,9 @@ class TestGetTmuxSessions:
         # box that happens to have a parked session.
         import app as _app
         empty = {"sessions": {}}
+        owners = {name: "admin" for name in ("main", "work", "lonely", "my")}
         with patch("app._session_is_codex", return_value=True), \
+             patch("app._load_session_owners", return_value=owners), \
              patch.object(_app._session_lifecycle, "snapshot", return_value=empty):
             yield
 
