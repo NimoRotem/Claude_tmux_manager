@@ -978,12 +978,14 @@ class TestLoginRateLimiter:
 class TestApiKeyShellQuoting:
     """Shell metadata is quoted and authentication never enters pane history."""
 
-    def test_shlex_quoted_in_session_create(self):
+    def test_session_create_never_types_launch_metadata_into_the_pane(self):
         import inspect
 
         import app
         source = inspect.getsource(app.api_create_session)
-        assert "shlex.quote" in source
+        assert "_launch_agent_pane" in source
+        assert "send-keys" not in source
+        assert "OPENAI_API_KEY" not in source
 
     def test_set_auth_mode_never_sends_credentials_to_tmux(self):
         import inspect
