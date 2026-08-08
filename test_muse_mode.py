@@ -105,6 +105,49 @@ print(json.dumps({
     assert data["processes"] == [True, True, False]
 
 
+def test_muse_startup_reports_the_meta_helper_instead_of_missing_summaries(tmp_path):
+    env = os.environ.copy()
+    env.pop("OPENAI_API_KEY", None)
+    env.update(
+        {
+            "TMUX_DASH_AGENT": "muse",
+            "TMUX_DASH_PROCESS_ROLE": "api",
+            "TMUX_DASH_STATE_DIR": str(tmp_path / "dashboard-state"),
+            "TMUX_DASH_SECRET": "muse-test-secret",
+            "TMUX_DASH_PASS": "muse-test-pass",
+        }
+    )
+    probe = r'''
+import asyncio
+import logging
+from io import StringIO
+import app
+
+stream = StringIO()
+handler = logging.StreamHandler(stream)
+app.logger.addHandler(handler)
+app.logger.setLevel(logging.INFO)
+async def run():
+    async with app.lifespan(app.app):
+        pass
+asyncio.run(run())
+print(stream.getvalue())
+'''
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=os.path.dirname(__file__),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Muse Meta API fallback" in result.stdout
+    assert "summaries will not work" not in result.stdout
+
+
 def test_session_launcher_routes_through_muse_backend(tmp_path):
     config_home = tmp_path / "muse-config"
     data_home = tmp_path / "muse-data"
