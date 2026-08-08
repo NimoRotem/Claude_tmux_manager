@@ -1333,6 +1333,7 @@ print(json.dumps({
     "admin_nav_visible": "body[data-agent=\"muse\"] .muse-connection" in page,
     "runtime_button": "Manage Google connections" in page,
     "agent_copy": "Give ${esc(AGENT_NAME)} access" in page,
+    "modal_unblocked": "async function openConnections(){\n  closeSettings();" in page,
 }))
 '''
 
@@ -1350,6 +1351,7 @@ print(json.dumps({
         "admin_nav_visible": True,
         "runtime_button": True,
         "agent_copy": True,
+        "modal_unblocked": True,
     }
 
 

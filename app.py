@@ -23587,6 +23587,7 @@ async function createSessionAuto(){
 
 // ── Connections (Drive / Gmail / Calendar) ──
 async function openConnections(){
+  closeSettings();
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`<h3>Connect data sources</h3><p class="conn-note">Loading…</p>`;
   document.getElementById('modal-overlay').classList.add('active');
