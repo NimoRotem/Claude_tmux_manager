@@ -21,6 +21,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 
 try:
     import tomllib
@@ -29,6 +30,7 @@ except ModuleNotFoundError:  # Python 3.9/3.10 production hosts
 import glob as globmod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("codex-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -60,6 +62,105 @@ CODEX_API_FALLBACK_ENABLED = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
+STATE_DIR = Path(
+    os.environ.get("TMUX_DASH_STATE_DIR", str(Path.home() / ".tmux-dashboard"))
+).expanduser()
+AGENT_KIND = os.environ.get("TMUX_DASH_AGENT", "codex").strip().lower()
+if AGENT_KIND not in {"codex", "muse"}:
+    AGENT_KIND = "codex"
+AGENT_DISPLAY_NAME = "Muse" if AGENT_KIND == "muse" else "Codex"
+
+
+def _agent_supports_codex_controls() -> bool:
+    """Whether Codex-specific auto-typing and configuration controls are valid."""
+    return AGENT_KIND == "codex"
+
+
+def _agent_supports_autopush() -> bool:
+    """Whether the selected terminal agent supports dashboard auto-push.
+
+    Away Mode, Go Nuts, Codex auth switching, and model hot-swapping remain
+    Codex-specific. Auto-push only needs a detectable idle composer plus tmux
+    input, both of which Muse provides.
+    """
+    return AGENT_KIND in {"codex", "muse"}
+
+
+def _settings_tab_defs(is_admin: bool) -> list[dict[str, str]]:
+    """Return settings workspaces that are meaningful for the selected agent."""
+    if AGENT_KIND == "muse":
+        tabs = [
+            {"id": "runtime", "label": "Runtime"},
+            {"id": "history", "label": "History"},
+            {"id": "browser", "label": "Browser"},
+        ]
+        if is_admin:
+            tabs.append({"id": "apis", "label": "APIs"})
+        return tabs
+    tabs = [
+        {"id": "mycontext", "label": "My Context"},
+        {"id": "history", "label": "History"},
+        {"id": "browser", "label": "Browser"},
+    ]
+    if is_admin:
+        tabs.insert(1, {"id": "global", "label": "Global Instructions"})
+        tabs.extend(
+            (
+                {"id": "context", "label": "Context Files"},
+                {"id": "apis", "label": "APIs"},
+                {"id": "login", "label": "Login"},
+            )
+        )
+    return tabs
+MUSE_BINARY = Path(
+    os.environ.get("TMUX_DASH_MUSE_BINARY", str(Path.home() / ".local/bin/muse"))
+).expanduser()
+MUSE_CONFIG_HOME = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_CONFIG_HOME",
+        str(STATE_DIR / "muse-config"),
+    )
+).expanduser()
+MUSE_DATA_HOME = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_DATA_HOME",
+        str(STATE_DIR / "muse-data"),
+    )
+).expanduser()
+MUSE_MCP_PYTHON = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_MCP_PYTHON",
+        str(Path.home() / ".tmux-dashboard" / "mcp" / "venv" / "bin" / "python"),
+    )
+).expanduser()
+MUSE_MCP_BRIDGE = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_MCP_BRIDGE",
+        str(Path(__file__).resolve().parent / "muse_mcp_bridge.py"),
+    )
+).expanduser()
+MUSE_GOOGLE_MCP_SCRIPT = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_GOOGLE_MCP_SCRIPT",
+        str(Path(__file__).resolve().with_name("google_workspace_mcp.py")),
+    )
+).expanduser()
+MUSE_BROWSER_MCP_PROXY = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_BROWSER_MCP_PROXY",
+        str(Path(__file__).resolve().with_name("browser_mcp_lease_proxy.py")),
+    )
+).expanduser()
+MUSE_ADVISOR_URL = os.environ.get(
+    "TMUX_DASH_MUSE_ADVISOR_URL",
+    "https://advisor.rotem.ai/mcp",
+).strip()
+MUSE_ADVISOR_TOKEN_FILE = Path(
+    os.environ.get(
+        "TMUX_DASH_MUSE_ADVISOR_TOKEN_FILE",
+        str(Path.home() / ".advisor-token"),
+    )
+).expanduser()
 PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
@@ -69,7 +170,11 @@ if PROCESS_ROLE not in {"combined", "api", "controller"}:
 # haven't been pre-configured.
 NEW_SESSION_CMD = os.environ.get(
     "TMUX_DASH_NEW_SESSION_CMD",
-    "codex --dangerously-bypass-approvals-and-sandbox",
+    (
+        f"{shlex.quote(str(MUSE_BINARY))} --yolo"
+        if AGENT_KIND == "muse"
+        else "codex --dangerously-bypass-approvals-and-sandbox"
+    ),
 )
 # Where the codex CLI keeps its state. Mirrors $CODEX_HOME.
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
@@ -77,24 +182,34 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 _CODEX_MIN_CLI_VERSION = os.environ.get("TMUX_DASH_MIN_CODEX_VERSION", "0.145.0").strip()
 _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
-    os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
-).strip() or "gpt-5.6-sol"
-_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
-_CODEX_REASONING_EFFORT_ALIASES = {
-    "ultra": "max",
-    "extra-high": "xhigh",
-    "extra_high": "xhigh",
-}
+    os.environ.get(
+        "CODEX_DEFAULT_MODEL",
+        "muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol",
+    ),
+).strip() or ("muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol")
+_CODEX_REASONING_EFFORTS = (
+    ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
+    if AGENT_KIND == "muse"
+    else ("none", "low", "medium", "high", "xhigh", "max")
+)
+_CODEX_REASONING_EFFORT_ALIASES = (
+    {}
+    if AGENT_KIND == "muse"
+    else {"ultra": "max", "extra-high": "xhigh", "extra_high": "xhigh"}
+)
 _CODEX_DEFAULT_REASONING_EFFORT = os.environ.get(
     "TMUX_DASH_DEFAULT_REASONING_EFFORT",
-    os.environ.get("CODEX_DEFAULT_REASONING_EFFORT", "max"),
+    os.environ.get(
+        "CODEX_DEFAULT_REASONING_EFFORT",
+        "high" if AGENT_KIND == "muse" else "max",
+    ),
 ).strip().lower()
 _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
     _CODEX_DEFAULT_REASONING_EFFORT,
     _CODEX_DEFAULT_REASONING_EFFORT,
 )
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
-    _CODEX_DEFAULT_REASONING_EFFORT = "max"
+    _CODEX_DEFAULT_REASONING_EFFORT = "high" if AGENT_KIND == "muse" else "max"
 
 # Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
 # OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
@@ -106,15 +221,22 @@ _DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
 
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
-MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
-_SEED_MODEL_CATALOG = [
-    ["gpt-5.6-sol", "GPT-5.6 Sol"],
-    ["gpt-5.6", "GPT-5.6 (Sol alias)"],
-    ["gpt-5.6-terra", "GPT-5.6 Terra"],
-    ["gpt-5.6-luna", "GPT-5.6 Luna"],
-    ["gpt-5.5", "GPT-5.5"],
-    ["gpt-5.4", "GPT-5.4"],
-]
+MODELS_FILE = STATE_DIR / f"{AGENT_KIND}-models.json"
+_SEED_MODEL_CATALOG = (
+    [
+        ["muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor"],
+        ["muse-spark-1.2", "Muse Spark 1.2"],
+    ]
+    if AGENT_KIND == "muse"
+    else [
+        ["gpt-5.6-sol", "GPT-5.6 Sol"],
+        ["gpt-5.6", "GPT-5.6 (Sol alias)"],
+        ["gpt-5.6-terra", "GPT-5.6 Terra"],
+        ["gpt-5.6-luna", "GPT-5.6 Luna"],
+        ["gpt-5.5", "GPT-5.5"],
+        ["gpt-5.4", "GPT-5.4"],
+    ]
+)
 
 
 def _load_model_catalog() -> list:
@@ -140,6 +262,8 @@ def _save_model_catalog(catalog: list, last_check: float = 0.0):
 
 def _fetch_codex_model_catalog() -> list:
     """Read the model catalog bundled with the installed Codex CLI."""
+    if AGENT_KIND == "muse":
+        return [list(row) for row in _SEED_MODEL_CATALOG]
     result = subprocess.run(
         ["codex", "debug", "models", "--bundled"],
         capture_output=True,
@@ -195,8 +319,291 @@ def _codex_cli_readiness() -> tuple[bool, str, dict]:
     return True, "ready", details
 
 
+def _muse_skills_inventory() -> list[dict]:
+    """Return Muse's own skill inventory in the small shape used by the UI."""
+    configured = str(MUSE_BINARY)
+    binary = configured if MUSE_BINARY.is_absolute() else (shutil.which(configured) or configured)
+    muse_env = os.environ.copy()
+    muse_env.update({
+        "MUSE_NO_AUTO_UPDATE": "1",
+        "XDG_CONFIG_HOME": str(MUSE_CONFIG_HOME),
+        "XDG_DATA_HOME": str(MUSE_DATA_HOME),
+    })
+    result = subprocess.run(
+        [binary, "skills", "list", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=muse_env,
+    )
+    if result.returncode != 0:
+        return []
+    payload = json.loads(result.stdout or "{}")
+    rows = payload.get("skills") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return []
+    inventory = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or row.get("display_name") or "").strip()
+        if not name:
+            continue
+        inventory.append({
+            "name": name,
+            "description": str(
+                row.get("description") or row.get("short_description") or ""
+            ).strip(),
+            "scope": str(row.get("scope") or "").strip(),
+        })
+    return inventory
+
+
+def _agent_cli_readiness() -> tuple[bool, str, dict]:
+    """Validate the selected CLI and its local credential before pane launch."""
+    if AGENT_KIND != "muse":
+        return _codex_cli_readiness()
+    configured = str(MUSE_BINARY)
+    binary = configured if MUSE_BINARY.is_absolute() else (shutil.which(configured) or "")
+    details = {
+        "agent": AGENT_KIND,
+        "binary": binary,
+        "version": "",
+        "auth_configured": False,
+        "config_home": str(MUSE_CONFIG_HOME),
+        "data_home": str(MUSE_DATA_HOME),
+        "mcp_servers": [],
+        "mcp_bridge_ready": False,
+        "advisor_token_ready": False,
+        "advisor_mcp_ready": False,
+        "google_mcp_ready": False,
+        "google_services": [],
+        "browser_mcp_ready": False,
+        "browser_id": "default",
+        "skills_total": 0,
+        "skills_user": 0,
+        "skills_builtin": 0,
+        "memory_tools": ["read_memory", "add_memory", "edit_memory"],
+    }
+    if not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
+        return False, "the Muse CLI is not installed", details
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        )
+        output = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        match = re.search(r"(\d+\.\d+\.\d+)", output)
+        details["version"] = match.group(1) if match else ""
+        if result.returncode != 0 or not details["version"]:
+            return False, "the Muse CLI version could not be determined", details
+    except Exception as exc:
+        return False, f"Muse CLI check failed: {type(exc).__name__}", details
+    auth_file = MUSE_CONFIG_HOME / "muse" / "auth.json"
+    try:
+        stat = auth_file.stat()
+        details["auth_configured"] = stat.st_size > 2
+        if stat.st_mode & 0o077:
+            return False, "the Muse credential permissions are too broad", details
+    except OSError:
+        pass
+    if not details["auth_configured"]:
+        return False, "the Muse credential is not configured", details
+    try:
+        settings = json.loads((MUSE_CONFIG_HOME / "muse" / "settings.json").read_text())
+        servers = settings.get("mcp_servers") if isinstance(settings, dict) else {}
+        if isinstance(servers, dict):
+            details["mcp_servers"] = sorted(str(name) for name in servers)
+    except Exception:
+        pass
+    details["mcp_bridge_ready"] = bool(
+        MUSE_MCP_PYTHON.is_file()
+        and os.access(MUSE_MCP_PYTHON, os.X_OK)
+        and MUSE_MCP_BRIDGE.is_file()
+    )
+    if os.environ.get("ADVISOR_TOKEN", "").strip():
+        details["advisor_token_ready"] = True
+    else:
+        try:
+            token_stat = MUSE_ADVISOR_TOKEN_FILE.stat()
+            details["advisor_token_ready"] = bool(
+                token_stat.st_uid == os.geteuid()
+                and not token_stat.st_mode & 0o077
+                and token_stat.st_size > 0
+            )
+        except OSError:
+            pass
+    details["advisor_mcp_ready"] = bool(
+        "advisor" in details["mcp_servers"]
+        and details["mcp_bridge_ready"]
+        and details["advisor_token_ready"]
+    )
+    google_credentials = MESSAGES_DIR / "connections" / "admin"
+    details["google_services"] = [
+        service
+        for service in ("drive", "gmail", "calendar")
+        if (google_credentials / f"{service}.json").is_file()
+    ]
+    details["google_mcp_ready"] = bool(
+        "google" in details["mcp_servers"]
+        and MUSE_MCP_PYTHON.is_file()
+        and MUSE_GOOGLE_MCP_SCRIPT.is_file()
+    )
+    details["browser_mcp_ready"] = bool(
+        "playwright-browser" in details["mcp_servers"]
+        and MUSE_MCP_PYTHON.is_file()
+        and MUSE_BROWSER_MCP_PROXY.is_file()
+        and PLAYWRIGHT_MCP_CLI.is_file()
+    )
+    try:
+        skills = _muse_skills_inventory()
+        details["skills_total"] = len(skills)
+        details["skills_user"] = sum(skill.get("scope") == "user" for skill in skills)
+        details["skills_builtin"] = sum(
+            skill.get("scope") in {"built-in", "bundled"} for skill in skills
+        )
+    except Exception:
+        logger.debug("Could not inventory Muse skills", exc_info=True)
+    if not details["advisor_mcp_ready"]:
+        return False, "the owner-bound Advisor MCP is not ready", details
+    return True, "ready", details
+
+
+def _muse_credential_display() -> dict:
+    """Return a safe identity for the Muse credential, never its secret value."""
+    auth_file = MUSE_CONFIG_HOME / "muse" / "auth.json"
+    try:
+        auth = json.loads(auth_file.read_text())
+    except Exception:
+        return {}
+    providers = auth.get("providers") if isinstance(auth, dict) else None
+    if not isinstance(providers, dict) or not providers:
+        return {}
+    provider, raw = next(
+        ((str(name), value) for name, value in providers.items() if isinstance(value, dict)),
+        ("", {}),
+    )
+    if not provider:
+        return {}
+    api_key = str(raw.get("api_key") or "")
+    access_token = str(raw.get("access_token") or "")
+    secret = api_key or access_token
+    suffix = secret[-4:] if secret else ""
+    provider_label = "Meta Model API" if provider.lower() == "meta" else provider.title()
+    credential_kind = "API key" if api_key else "access token"
+    api_url = str(raw.get("api_base_url") or "")
+    try:
+        api_host = urlsplit(api_url).hostname or ""
+    except ValueError:
+        api_host = ""
+    return {
+        "provider": provider,
+        "providerLabel": provider_label,
+        "accountEmail": str(raw.get("user_email") or ""),
+        "accountName": str(raw.get("user_full_name") or ""),
+        "mechanism": str(raw.get("mechanism") or ""),
+        "obtainedVia": str(raw.get("obtained_via") or ""),
+        "credentialLabel": (
+            f"{provider.title()} {credential_kind} ····{suffix}"
+            if suffix
+            else f"{provider.title()} {credential_kind}"
+        ),
+        "keySuffix": suffix,
+        "apiHost": api_host,
+    }
+
+
+def _ensure_muse_runtime_settings() -> bool:
+    """Merge the owner-bound Advisor bridge into Muse's private settings.
+
+    Muse's HTTP MCP transport cannot source a bearer token from an environment
+    variable. The stdio bridge reads ``ADVISOR_TOKEN`` from the process or its
+    owner-private token file and forwards it to HTTPS; the value is never
+    written to settings.
+    """
+    if AGENT_KIND != "muse":
+        return True
+    settings_file = MUSE_CONFIG_HOME / "muse" / "settings.json"
+    try:
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        settings_file.parent.chmod(0o700)
+        try:
+            settings = json.loads(settings_file.read_text())
+        except FileNotFoundError:
+            settings = {"schema_version": 1}
+        except Exception:
+            logger.exception("Refusing to overwrite malformed Muse settings %s", settings_file)
+            return False
+        if not isinstance(settings, dict):
+            logger.error("Refusing non-object Muse settings %s", settings_file)
+            return False
+        settings.setdefault("schema_version", 1)
+        servers = settings.get("mcp_servers")
+        if servers is None:
+            servers = {}
+            settings["mcp_servers"] = servers
+        if not isinstance(servers, dict):
+            logger.error("Muse mcp_servers must be an object in %s", settings_file)
+            return False
+        servers["advisor"] = {
+            "transport": "stdio",
+            "command": str(MUSE_MCP_PYTHON),
+            "args": [
+                str(MUSE_MCP_BRIDGE),
+                "--url",
+                MUSE_ADVISOR_URL,
+                "--bearer-env",
+                "ADVISOR_TOKEN",
+                "--bearer-file",
+                str(MUSE_ADVISOR_TOKEN_FILE),
+            ],
+            "env": {"PYTHONUNBUFFERED": "1"},
+            "framing": "line_delimited_json",
+        }
+        servers["google"] = {
+            "transport": "stdio",
+            "command": str(MUSE_MCP_PYTHON),
+            "args": [str(MUSE_GOOGLE_MCP_SCRIPT)],
+            "env": {
+                "GOOGLE_MCP_CREDENTIALS_DIR": str(MESSAGES_DIR / "connections" / "admin"),
+                "GOOGLE_OAUTH_CLIENT_FILE": str(MESSAGES_DIR / "google_oauth_client.json"),
+                "PYTHONUNBUFFERED": "1",
+            },
+            "framing": "line_delimited_json",
+        }
+        servers["playwright-browser"] = {
+            "transport": "stdio",
+            "command": str(MUSE_MCP_PYTHON),
+            "args": [str(MUSE_BROWSER_MCP_PROXY)],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "TMUX_DASH_BROWSER_CDP_PORT": "9222",
+                "TMUX_DASH_BROWSER_ID": "default",
+                "TMUX_DASH_BROWSER_OUTPUT_DIR": str(
+                    Path.home() / ".playwright-mcp" / "default"
+                ),
+                "TMUX_DASH_CONTROLLER_SOCKET": str(BROWSER_CONTROLLER_SOCKET),
+                "TMUX_DASH_HOST_HOME": str(Path.home()),
+            },
+            "framing": "line_delimited_json",
+        }
+        rendered = json.dumps(settings, indent=2, sort_keys=True) + "\n"
+        current = settings_file.read_text() if settings_file.exists() else ""
+        if rendered != current:
+            tmp = settings_file.with_name(settings_file.name + ".tmp")
+            tmp.write_text(rendered)
+            tmp.chmod(0o600)
+            os.replace(tmp, settings_file)
+        settings_file.chmod(0o600)
+        return True
+    except Exception:
+        logger.exception("Could not configure Muse runtime settings")
+        return False
+
+
 async def _refresh_model_catalog(force: bool = False) -> bool:
     global MODEL_CATALOG, ALLOWED_SESSION_MODELS
+    if AGENT_KIND == "muse":
+        return False
     try:
         last_check = 0.0
         try:
@@ -316,8 +723,51 @@ def _launch_codex_cmd(
     return out
 
 
+def _muse_launch_prefix() -> str:
+    """Environment that keeps Muse credentials and session data deployment-local."""
+    return " ".join(
+        (
+            "env",
+            "MUSE_NO_AUTO_UPDATE=1",
+            "XDG_CONFIG_HOME=" + shlex.quote(str(MUSE_CONFIG_HOME)),
+            "XDG_DATA_HOME=" + shlex.quote(str(MUSE_DATA_HOME)),
+        )
+    )
+
+
+def _launch_agent_cmd(
+    cmd: str,
+    pin_model: bool = True,
+    resume: bool = False,
+    codex_home: Path | None = None,
+) -> str:
+    """Build the configured coding-agent command without changing Codex defaults."""
+    if AGENT_KIND != "muse":
+        return _launch_codex_cmd(
+            cmd,
+            pin_model=pin_model,
+            resume=resume,
+            codex_home=codex_home,
+        )
+    if resume:
+        out = f"{shlex.quote(str(MUSE_BINARY))} --yolo resume --last"
+    else:
+        out = cmd.strip() or f"{shlex.quote(str(MUSE_BINARY))} --yolo"
+    return _muse_launch_prefix() + " " + out
+
+
+def _is_agent_process_command(command: str) -> bool:
+    """Recognize the process name used by the selected coding-agent binary."""
+    name = Path(str(command or "").strip().lower()).name
+    if AGENT_KIND == "muse":
+        return name == "muse" or name.startswith("muse-bin")
+    return name == "codex"
+
+
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
     """Use the canonical full-access launch for members and configured admin command."""
+    if AGENT_KIND == "muse":
+        return NEW_SESSION_CMD
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
         if owner and not _is_admin(owner):
@@ -441,8 +891,8 @@ def _session_launch_command(
     pin_model: bool = True,
     resume: bool = False,
 ) -> str:
-    """Build the Codex command and keep its process tree in a session scope."""
-    launch = _launch_codex_cmd(
+    """Build the configured agent command and keep its process tree scoped."""
+    launch = _launch_agent_cmd(
         base,
         pin_model=pin_model,
         resume=resume,
@@ -453,11 +903,117 @@ def _session_launch_command(
     return scoped_codex_command(
         session_name,
         launch,
+        unit_prefix=AGENT_KIND,
         memory_high_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_HIGH_MB", "2048")),
         memory_max_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_MAX_MB", "4096")),
         tasks_max=int(os.environ.get("TMUX_DASH_CODEX_TASKS_MAX", "768")),
         cpu_weight=int(os.environ.get("TMUX_DASH_CODEX_CPU_WEIGHT", "100")),
     )
+
+
+def _launch_agent_pane(
+    session_name: str,
+    project_dir: str | Path,
+    launch_command: str,
+    environment: dict[str, str],
+) -> bool:
+    """Replace a bootstrap pane with the agent without typing shell commands.
+
+    ``tmux send-keys`` makes exports and the full launch command part of the
+    terminal's visible screen and scrollback. ``respawn-pane`` supplies the
+    command, cwd, and environment out-of-band, so the first terminal frame is
+    the agent itself.
+    """
+    argv = [
+        "tmux",
+        "respawn-pane",
+        "-k",
+        "-t",
+        session_name,
+        "-c",
+        str(project_dir),
+    ]
+    for key, value in sorted(environment.items()):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
+            logger.error("Refusing invalid pane environment name %r", key)
+            return False
+        if "\x00" in str(value):
+            logger.error("Refusing NUL in pane environment value for %s", key)
+            return False
+        argv.extend(("-e", f"{key}={value}"))
+    argv.append(launch_command)
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        logger.exception("Could not launch %s in tmux session '%s'", AGENT_DISPLAY_NAME, session_name)
+        return False
+    if result.returncode != 0:
+        logger.error(
+            "Could not launch %s in tmux session '%s': %s",
+            AGENT_DISPLAY_NAME,
+            session_name,
+            (result.stderr or "unknown tmux error").strip(),
+        )
+        return False
+    return True
+
+
+_MUSE_PROJECT_CONTEXT_BEGIN = "<!-- BEGIN MUSE DASHBOARD RUNTIME (managed) -->"
+_MUSE_PROJECT_CONTEXT_END = "<!-- END MUSE DASHBOARD RUNTIME (managed) -->"
+
+
+def _prepare_muse_project_context(project_dir: str | Path) -> bool:
+    """Make Muse's real runtime/context contract load in the session workspace."""
+    if AGENT_KIND != "muse":
+        return True
+    root = Path(project_dir)
+    target = root / "AGENTS.md"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            logger.error("Refusing symlinked Muse project context %s", target)
+            return False
+        existing = target.read_text() if target.exists() else ""
+        try:
+            account_policy = _read_global_context().strip()
+        except Exception:
+            account_policy = "# MUSE account policy\n\nFollow the dashboard-managed account policy."
+        managed = (
+            f"{_MUSE_PROJECT_CONTEXT_BEGIN}\n"
+            "# Muse dashboard runtime\n\n"
+            f"- Muse is installed at `{MUSE_BINARY}`. This session uses "
+            f"`MUSE_CONFIG_HOME={MUSE_CONFIG_HOME}` and `MUSE_DATA_HOME={MUSE_DATA_HOME}`; "
+            "do not treat `CODEX_HOME` as Muse state.\n"
+            "- Use Muse's native `read_memory`, `add_memory`, and `edit_memory` tools for "
+            "durable Muse memory. Muse session logs live only under MUSE_DATA_HOME.\n"
+            "- Built-in Muse skills and the account skills under `~/.agents/skills` are loaded "
+            "at session open; read a skill with `read_skill` when its description applies.\n"
+            "- The `advisor` MCP is connected with this account's owner-bound `ADVISOR_TOKEN`. "
+            "Use its tools directly; never copy the token into a file or output.\n\n"
+            f"{account_policy}\n"
+            f"{_MUSE_PROJECT_CONTEXT_END}"
+        )
+        pattern = re.compile(
+            re.escape(_MUSE_PROJECT_CONTEXT_BEGIN)
+            + r".*?"
+            + re.escape(_MUSE_PROJECT_CONTEXT_END),
+            re.S,
+        )
+        if pattern.search(existing):
+            updated = pattern.sub(managed, existing)
+        else:
+            updated = existing.rstrip() + ("\n\n" if existing.strip() else "") + managed + "\n"
+        if updated != existing:
+            target.write_text(updated)
+        return True
+    except Exception:
+        logger.exception("Could not prepare Muse project context in %s", root)
+        return False
 
 
 # Compatibility aliases used by newer Grabo paths while the implementation is Codex.
@@ -469,6 +1025,8 @@ def _launch_claude_cmd(
 
 def _restore_default_model_setting():
     """Keep the default Codex config aligned with the dashboard selection."""
+    if AGENT_KIND == "muse":
+        return
     try:
         CODEX_HOME.mkdir(parents=True, exist_ok=True)
         cfg = CODEX_HOME / "config.toml"
@@ -532,12 +1090,23 @@ SAVED_INFO_PROMPT_VERSION = "v4"
 
 # Keep Grabo's established dashboard state directory so users, history, browser
 # sessions, and settings survive the runtime migration.
-MESSAGES_DIR = Path.home() / ".tmux-dashboard"
+MESSAGES_DIR = STATE_DIR
 CONTROLLER_SOCKET = Path(
     os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
 )
-BROWSER_LEASES_FILE = MESSAGES_DIR / "browser-leases.json"
-BROWSER_RUNTIME_FILE = MESSAGES_DIR / "browser-runtime.json"
+# Multiple dashboard frontends may share one account browser while retaining
+# separate session/history state. Browser lifecycle must have exactly one
+# coordinator or an idle frontend can park Chrome while another frontend has a
+# live tool/viewer lease. Muse points this at the primary dashboard controller;
+# standalone installs keep the local controller default.
+BROWSER_CONTROLLER_SOCKET = Path(
+    os.environ.get("TMUX_DASH_BROWSER_CONTROLLER_SOCKET", str(CONTROLLER_SOCKET))
+)
+BROWSER_STATE_DIR = Path(
+    os.environ.get("TMUX_DASH_BROWSER_STATE_DIR", str(MESSAGES_DIR))
+)
+BROWSER_LEASES_FILE = BROWSER_STATE_DIR / "browser-leases.json"
+BROWSER_RUNTIME_FILE = BROWSER_STATE_DIR / "browser-runtime.json"
 SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
 CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
 BROWSER_LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
@@ -690,6 +1259,8 @@ def _codex_home_auth_mode(codex_home: Path) -> str:
 
 def _session_real_auth_mode(session_name: str) -> str:
     """Resolve live per-session auth instead of trusting the process-local cache."""
+    if AGENT_KIND == "muse":
+        return "meta"
     try:
         resolved = _codex_home_auth_mode(_session_config_base(session_name))
         if resolved != "unconfigured":
@@ -800,6 +1371,8 @@ _autopush_mode: dict[str, str] = {}
 
 
 def _get_autopush_mode(session_name: str) -> str:
+    if not _agent_supports_autopush():
+        return "off"
     m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
     return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
 
@@ -845,7 +1418,7 @@ def _is_codex_running(session_name: str) -> bool:
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
+            if _is_agent_process_command(commands.get(current, "")):
                 return True
             pending.extend(children.get(current, ()))
         return False
@@ -860,12 +1433,12 @@ async def _async_is_codex_running(session_name: str) -> bool:
 
 async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = None,
                                 resume_uuid: str = None) -> bool:
-    """Restart a crashed Codex pane and resume its most recent local thread."""
+    """Restart a crashed agent pane and resume its most recent local thread."""
     alog = logging.getLogger("autonomous")
     if await _async_is_codex_running(session_name):
         return True
 
-    msg = f"Codex not running in '{session_name}' — restarting it"
+    msg = f"{AGENT_DISPLAY_NAME} not running in '{session_name}' — restarting it"
     alog.warning(msg)
     if log_fn and state:
         log_fn(state, msg)
@@ -885,21 +1458,22 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         # Re-apply clean member auth before relaunch so an accidental /login (which
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
-        try:
-            if _multi_tenant_enabled():
-                _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
-                if _owner and not _is_admin(_owner):
-                    _apply_member_auth(_user_codex_config_dir(_owner))
-        except Exception:
-            logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
-        try:
-            await asyncio.to_thread(
-                _ensure_codex_auth_with_fallback,
-                _session_config_base(session_name),
-                True,
-            )
-        except Exception:
-            logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
+        if AGENT_KIND == "codex":
+            try:
+                if _multi_tenant_enabled():
+                    _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
+                    if _owner and not _is_admin(_owner):
+                        _apply_member_auth(_user_codex_config_dir(_owner))
+            except Exception:
+                logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
+            try:
+                await asyncio.to_thread(
+                    _ensure_codex_auth_with_fallback,
+                    _session_config_base(session_name),
+                    True,
+                )
+            except Exception:
+                logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
         # Codex stores local threads under CODEX_HOME. Resume the newest thread
         # for this working directory instead of opening the interactive picker.
         launch_base = _session_launch_base(session_name)
@@ -925,23 +1499,23 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
             ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5)
 
-        # Wait for codex to start (up to 30s)
+        # Wait for the selected agent to start (up to 30s).
         for _ in range(15):
             await asyncio.sleep(2)
             if await _async_is_codex_running(session_name):
-                alog.info(f"Codex restarted successfully in '{session_name}'")
+                alog.info(f"{AGENT_DISPLAY_NAME} restarted successfully in '{session_name}'")
                 if log_fn and state:
-                    log_fn(state, "Codex restarted successfully")
+                    log_fn(state, f"{AGENT_DISPLAY_NAME} restarted successfully")
                 # Give it a moment to fully initialize
                 await asyncio.sleep(5)
                 return True
 
-        alog.error(f"Failed to restart Codex in '{session_name}' after 30s")
+        alog.error(f"Failed to restart {AGENT_DISPLAY_NAME} in '{session_name}' after 30s")
         if log_fn and state:
-            log_fn(state, "Failed to restart Codex after 30s")
+            log_fn(state, f"Failed to restart {AGENT_DISPLAY_NAME} after 30s")
         return False
     except Exception as e:
-        alog.error(f"Error restarting Codex in '{session_name}': {e}")
+        alog.error(f"Error restarting {AGENT_DISPLAY_NAME} in '{session_name}': {e}")
         return False
 
 
@@ -961,21 +1535,32 @@ async def lifespan(_app: FastAPI):
     _shutting_down = False
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=8 if PROCESS_ROLE == "api" else 20))
-    logger.info("Codex Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
-                PROCESS_ROLE, PORT, ROOT_PATH,
+    logger.info("%s Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
+                AGENT_DISPLAY_NAME, PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
                 "configured" if OPENAI_API_KEY else "missing")
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and AGENT_KIND == "muse":
+        logger.info("LLM summaries use the connected Muse Meta API fallback")
+    elif not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
-    if not os.environ.get("TMUX_DASH_SECRET"):
+    if not (
+        os.environ.get("TMUX_DASH_SECRET")
+        or os.environ.get("TMUX_DASH_SECRET_FILE")
+    ):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
+
+    if PROCESS_ROLE != "api" and AGENT_KIND == "muse":
+        if _ensure_muse_runtime_settings():
+            logger.info("Muse runtime settings synced (Advisor MCP is owner-bound)")
+        else:
+            logger.error("Muse runtime settings could not be synced")
 
     if PROCESS_ROLE == "api":
         # All mutation/watchdog ownership lives across the Unix socket in the
@@ -1009,7 +1594,10 @@ async def lifespan(_app: FastAPI):
         _ensure_user_browser_session(member, start=False)
         if (config_dir / "config.toml").exists():
             synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
-    logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
+    if AGENT_KIND == "muse":
+        logger.info("Muse account browser MCP is bound through Muse runtime settings")
+    else:
+        logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
     try:
         migrated_prompts = _backfill_prompt_audit(users)
         if migrated_prompts:
@@ -1036,26 +1624,42 @@ async def lifespan(_app: FastAPI):
         except Exception:
             logger.exception("Advisor account/group startup sync failed")
 
+    browser_controller_loops = ()
+    if _uses_external_browser_controller():
+        logger.info(
+            "Browser lifecycle delegated to shared controller at %s",
+            BROWSER_CONTROLLER_SOCKET,
+        )
+    else:
+        browser_controller_loops = (("browser lifecycle", _browser_lifecycle_loop()),)
     controller_loops = (
-        ("auto-responder", _auto_responder_loop()),
-        ("autonomous watchdog", _watchdog_loop()),
-        ("simple watchdog", _simple_watchdog_loop()),
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
-        ("codex health watchdog", _codex_health_watchdog_loop()),
+        ("agent health watchdog", _codex_health_watchdog_loop()),
         ("model refresh", _model_refresh_loop()),
-        ("browser lifecycle", _browser_lifecycle_loop()),
+        *browser_controller_loops,
         ("session lifecycle", _session_lifecycle_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
+    if _agent_supports_autopush():
+        controller_loops = (
+            ("auto-responder", _auto_responder_loop()),
+            ("simple watchdog", _simple_watchdog_loop()),
+            *controller_loops,
+        )
+    if _agent_supports_codex_controls():
+        controller_loops = (
+            ("autonomous watchdog", _watchdog_loop()),
+            *controller_loops,
+        )
     for label, coroutine in controller_loops:
         _background_tasks.append(asyncio.create_task(coroutine))
         logger.info("%s started", label)
 
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
-    if saved:
+    if saved and _agent_supports_codex_controls():
         session_names = {s["name"] for s in sessions}
         for name, modes in saved.items():
             if name not in session_names:
@@ -1131,9 +1735,31 @@ async def request_validation_error_handler(_request: Request, exc: RequestValida
     return JSONResponse({"error": message}, status_code=422)
 
 # --- Auth ---
+def _private_env_value(value_name: str, file_name: str) -> str:
+    direct = os.environ.get(value_name, "")
+    if direct:
+        return direct
+    path_value = os.environ.get(file_name, "").strip()
+    if not path_value:
+        return ""
+    try:
+        path = Path(path_value).expanduser()
+        stat = path.stat()
+        if stat.st_mode & 0o077:
+            logger.error("Refusing broadly-readable credential file %s", path)
+            return ""
+        return path.read_text().strip()
+    except OSError:
+        logger.exception("Could not read credential file from %s", file_name)
+        return ""
+
+
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
-AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
-AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
+AUTH_PASS = _private_env_value("TMUX_DASH_PASS", "TMUX_DASH_PASS_FILE")
+AUTH_SECRET = (
+    _private_env_value("TMUX_DASH_SECRET", "TMUX_DASH_SECRET_FILE")
+    or secrets.token_hex(32)
+)
 # Cookie name must be UNIQUE per dashboard instance, else two dashboards on the
 # same domain (e.g. knowva.ai/tmux + /codex) collide: both set "tmux_auth" at
 # Path=/, so logging into one overwrites/invalidates the other's cookie.
@@ -2007,7 +2633,8 @@ if(g)g.href=g.href+'?next='+encodeURIComponent(nxt);
 _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/google/start">
     <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.2-.4-4.7H24v8.9h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.3z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.3l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41.1 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.2c-.5-1.3-.7-2.7-.7-4.2s.3-2.9.7-4.2v-5.7H4.3C2.8 16.9 2 20.3 2 24s.8 7.1 2.3 9.9l7.3-5.7z"/><path fill="#EA4335" d="M24 10.7c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.1 30 2 24 2 15.4 2 7.9 6.9 4.3 14.1l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
     Continue with Google</a>
-  <div class="ghint">__GOOGLE_HINT__</div>"""
+  <div class="ghint">__GOOGLE_HINT__</div>
+  <div class="sep">or use username and password</div>"""
 
 _PASSWORD_LOGIN_HTML = """  <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus></div>
   <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password"></div>
@@ -2033,7 +2660,7 @@ def _login_page() -> str:
             "__GOOGLE_BTN__",
             _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint),
         )
-        .replace("__PASSWORD_LOGIN__", "")
+        .replace("__PASSWORD_LOGIN__", _PASSWORD_LOGIN_HTML)
     )
 
 
@@ -2353,6 +2980,32 @@ GOOGLE_WORKSPACE_REQUIRED_SCOPES = (
 )
 GOOGLE_LOGIN_SCOPES = "openid email profile"
 GOOGLE_LOGIN_STATE_COOKIE = AUTH_COOKIE + "_google_state"
+GOOGLE_LOGIN_STATE_TTL = 600
+
+
+def _set_google_login_state_cookie(
+    response: RedirectResponse, request: Request, state: str
+) -> RedirectResponse:
+    is_https = (
+        request.headers.get("x-forwarded-proto") == "https"
+        or request.url.scheme == "https"
+    )
+    response.set_cookie(
+        GOOGLE_LOGIN_STATE_COOKIE,
+        hashlib.sha256(state.encode()).hexdigest(),
+        max_age=GOOGLE_LOGIN_STATE_TTL,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+    )
+    return response
+
+
+def _google_login_redirect(url: str, status_code: int = 303) -> RedirectResponse:
+    response = RedirectResponse(url=url, status_code=status_code)
+    response.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
+    return response
 
 
 def _google_workspace_subject(user: dict | None) -> str:
@@ -2551,7 +3204,8 @@ async def google_login_start(request: Request):
         "prompt": "select_account",
         "state": state,
     })
-    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    response = RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    return _set_google_login_state_cookie(response, request, state)
 
 
 @app.get("/auth/google/callback")
@@ -2559,20 +3213,31 @@ async def google_login_callback(request: Request):
     rp = request.scope.get("root_path", "")
     ip = request.client.host if request.client else "unknown"
     if request.query_params.get("error"):
-        return RedirectResponse(url=rp + "/?gerr=denied", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=denied")
     if not _check_login_rate_limit(ip):
-        return HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+        response = HTMLResponse("Too many login attempts. Please wait a moment.", status_code=429)
+        response.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
+        return response
     code = request.query_params.get("code") or ""
-    payload = _verify_state(request.query_params.get("state") or "")
-    if not code or not payload or not payload.startswith("glogin:"):
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+    state = request.query_params.get("state") or ""
+    browser_state = request.cookies.get(GOOGLE_LOGIN_STATE_COOKIE) or ""
+    expected_browser_state = hashlib.sha256(state.encode()).hexdigest()
+    payload = _verify_state(state)
+    if (
+        not code
+        or not payload
+        or not payload.startswith("glogin:")
+        or not browser_state
+        or not secrets.compare_digest(expected_browser_state, browser_state)
+    ):
+        return _google_login_redirect(url=rp + "/?gerr=state")
     try:
         _, ts, nxt_b64 = payload.split(":", 2)
         nxt = base64.urlsafe_b64decode(nxt_b64.encode()).decode()
     except Exception:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
-    if time.time() - int(ts) > 600:
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=state")
+    if time.time() - int(ts) > GOOGLE_LOGIN_STATE_TTL:
+        return _google_login_redirect(url=rp + "/?gerr=state")
     if not (nxt.startswith("/") and not nxt.startswith("//")):
         nxt = rp + "/"
 
@@ -2589,24 +3254,24 @@ async def google_login_callback(request: Request):
         claims = _decode_id_token(tok.get("id_token") or "")
     except Exception:
         logger.exception("Google sign-in token exchange failed")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
 
     if claims.get("aud") != cid:
         logger.warning("Google sign-in: id_token audience mismatch")
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
     if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         logger.warning("Google sign-in: unexpected issuer %s", claims.get("iss"))
-        return RedirectResponse(url=rp + "/?gerr=failed", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=failed")
     if float(claims.get("exp") or 0) < time.time():
-        return RedirectResponse(url=rp + "/?gerr=state", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=state")
     email = (claims.get("email") or "").strip().lower()
     if not email or not claims.get("email_verified"):
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=domain")
 
     target_user = _google_login_user(email, claims.get("name") or "")
     if not target_user:
         logger.warning("Google sign-in rejected for %s (not an allowed domain)", email)
-        return RedirectResponse(url=rp + "/?gerr=domain", status_code=303)
+        return _google_login_redirect(url=rp + "/?gerr=domain")
 
     ua = (request.headers.get("user-agent", "") or "")[:300]
     fwd = request.headers.get("x-forwarded-for", "")
@@ -2627,6 +3292,7 @@ async def google_login_callback(request: Request):
     logger.info("Google sign-in: %s -> user '%s' (%s)",
                 email, target_user.get("username"), target_user.get("role"))
     resp = RedirectResponse(url=nxt, status_code=303)
+    resp.delete_cookie(GOOGLE_LOGIN_STATE_COOKIE, path="/")
     return _set_auth_cookie(resp, request, _make_token(target_user["id"]))
 
 
@@ -4191,10 +4857,46 @@ def _html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _agent_global_context(content: str) -> str:
+    """Translate stale Codex-only state wording for the selected agent."""
+    if AGENT_KIND != "muse":
+        return content
+    content = content.replace(
+        "- Treat this dashboard account's `CODEX_HOME`, project directory, browser,\n"
+        "  connections, memories, skills, uploads, and session history as private to this\n"
+        "  account. Never inspect or operate another account's corresponding resources.",
+        "- Treat this dashboard account's `MUSE_CONFIG_HOME`, `MUSE_DATA_HOME`, project\n"
+        "  directory, browser, connections, memories, skills, uploads, and session history\n"
+        "  as private to this account. Never inspect or operate another account's\n"
+        "  corresponding resources.",
+    )
+    content = content.replace(
+        "- Local Codex memory is private because every account has a separate\n"
+        "  `CODEX_HOME`. Use it as recall, never as the sole source of required policy or\n"
+        "  current external facts.",
+        "- Muse's native memory is private to this dashboard account. Use `read_memory`,\n"
+        "  `add_memory`, and `edit_memory` for recall, never as the sole source of required\n"
+        "  policy or current external facts.",
+    )
+    return content
+
+
 def _ensure_global_context_file():
     GLOBAL_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not GLOBAL_CONTEXT_FILE.exists():
-        GLOBAL_CONTEXT_FILE.write_text(_DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL))
+        initial = _DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL)
+        GLOBAL_CONTEXT_FILE.write_text(_agent_global_context(initial))
+        return
+    if AGENT_KIND == "muse":
+        current = GLOBAL_CONTEXT_FILE.read_text()
+        normalized = _agent_global_context(current)
+        if normalized != current:
+            backup = GLOBAL_CONTEXT_FILE.with_name(
+                f"{GLOBAL_CONTEXT_FILE.name}.bak-muse-{int(time.time() * 1000)}"
+            )
+            shutil.copy2(GLOBAL_CONTEXT_FILE, backup)
+            normalized = normalized if normalized.endswith("\n") else normalized + "\n"
+            GLOBAL_CONTEXT_FILE.write_text(normalized)
 
 
 def _read_global_context() -> str:
@@ -4860,7 +5562,38 @@ GOOGLE_SCOPES = {
     "gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
     "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
 }
+MUSE_GOOGLE_SCOPES = {
+    "drive": ["https://www.googleapis.com/auth/drive"],
+    "gmail": ["https://www.googleapis.com/auth/gmail.modify"],
+    "calendar": ["https://www.googleapis.com/auth/calendar"],
+}
 GOOGLE_LABELS = {"drive": "Google Drive", "gmail": "Gmail", "calendar": "Google Calendar"}
+
+
+def _google_scopes_for_service(service: str) -> list[str]:
+    """Return scopes that match the tools exposed by this agent runtime."""
+    scopes = MUSE_GOOGLE_SCOPES if AGENT_KIND == "muse" else GOOGLE_SCOPES
+    return list(scopes[service])
+
+
+def _google_mcp_is_ready() -> bool:
+    """Report the active agent's Google tool registration, not another runtime's."""
+    if AGENT_KIND != "muse":
+        return bool(os.environ.get("GOOGLE_MCP_COMMAND", ""))
+    try:
+        settings = json.loads(
+            (MUSE_CONFIG_HOME / "muse" / "settings.json").read_text()
+        )
+        servers = settings.get("mcp_servers") if isinstance(settings, dict) else {}
+    except Exception:
+        return False
+    return bool(
+        isinstance(servers, dict)
+        and "google" in servers
+        and MUSE_MCP_PYTHON.is_file()
+        and os.access(MUSE_MCP_PYTHON, os.X_OK)
+        and MUSE_GOOGLE_MCP_SCRIPT.is_file()
+    )
 
 
 def _google_client():
@@ -5085,6 +5818,9 @@ def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
 
 def _write_google_mcp(user: dict, service: str):
     """Called after a successful connect; ensures the google MCP server is registered."""
+    if AGENT_KIND == "muse":
+        _ensure_muse_runtime_settings()
+        return
     _ensure_google_mcp(_user_codex_config_dir(user), user)
 
 
@@ -5096,7 +5832,7 @@ async def api_connections(request: Request):
     cid, _ = _google_client()
     out = {
         "configured": bool(cid),
-        "mcp_ready": bool(os.environ.get("GOOGLE_MCP_COMMAND", "")),
+        "mcp_ready": _google_mcp_is_ready(),
         "services": [],
     }
     for svc in ("drive", "gmail", "calendar"):
@@ -5123,7 +5859,7 @@ async def api_connection_start(request: Request, service: str):
         "client_id": cid,
         "redirect_uri": _callback_uri(request),
         "response_type": "code",
-        "scope": " ".join(GOOGLE_SCOPES[service]),
+        "scope": " ".join(_google_scopes_for_service(service)),
         "access_type": "offline",
         "prompt": "consent",
         "include_granted_scopes": "true",
@@ -6742,6 +7478,13 @@ def _session_is_codex(name: str) -> bool:
     the state left behind after Codex exits or crashes. Other active foreground
     programs are hidden.
     """
+    # A dedicated Muse deployment must never adopt arbitrary Muse processes
+    # from the host's shared tmux server.  Its isolated owner registry is the
+    # deployment boundary, including for sessions whose agent is still live.
+    # Do this before consulting the process cache so adding/removing an owner
+    # takes effect immediately across API workers.
+    if AGENT_KIND == "muse" and name not in _load_session_owners():
+        return False
     now = time.time()
     cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
     if cached and now - cached[1] < _CODEX_DASH_VISIBILITY_TTL:
@@ -6764,19 +7507,20 @@ def _session_is_codex(name: str) -> bool:
         children, commands = _process_tree_snapshot()
         to_check = [pane_pid]
         seen: set[str] = set()
-        has_codex = False
+        has_agent = False
         while to_check and len(seen) < 10000:
             current = to_check.pop()
             if current in seen:
                 continue
             seen.add(current)
-            if commands.get(current) == "codex":
-                has_codex = True
+            if _is_agent_process_command(commands.get(current, "")):
+                has_agent = True
                 break
             to_check.extend(children.get(current, ()))
-        decision = has_codex or pane_command.lower() in {
+        bare_shell = pane_command.lower() in {
             "bash", "zsh", "sh", "fish", "dash", "-bash", "-zsh", "-sh",
         }
+        decision = has_agent or bare_shell
     except Exception:
         decision = False
     _CODEX_DASH_VISIBILITY_CACHE[name] = (decision, now)
@@ -6997,7 +7741,7 @@ _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
-_RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
+_RE_IDLE_PROMPT = re.compile(r'^(?:[❯➜⟩]\s*|.*\s⟩)$')
 _RE_TIP_CODEX = re.compile(r'Tip:.*codex')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
 
@@ -7275,7 +8019,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         # If the terminal hasn't changed in 20+ seconds and the foreground
         # command is codex/node, it's almost certainly idle — the text-based
         # checks above may have missed it or the output just looks ambiguous.
-        if content_is_static and cmd.lower() in ("codex", "codex", "node"):
+        if content_is_static and (_is_agent_process_command(cmd) or cmd.lower() == "node"):
             info["status"] = "idle"
             info["detail"] = ""
             return info
@@ -7290,8 +8034,8 @@ def _detect_activity_raw(session_name: str) -> dict:
             else:
                 info["status"] = "busy"
                 info["detail"] = cmd
-        elif cmd.lower() in ("codex", "codex", "node"):
-            # Codex with no spinner + no "esc to interrupt" = idle
+        elif _is_agent_process_command(cmd) or cmd.lower() == "node":
+            # A live agent with no spinner + no "esc to interrupt" is idle.
             info["status"] = "idle"
             info["detail"] = ""
         else:
@@ -7382,9 +8126,94 @@ async def async_detect_activity(session_name: str) -> dict:
     return await asyncio.to_thread(detect_activity, session_name)
 
 
+def _muse_meta_api_connection() -> tuple[str, str]:
+    """Return Muse's private Meta API base URL and bearer credential in memory."""
+    if AGENT_KIND != "muse":
+        return "", ""
+    try:
+        auth_file = MUSE_CONFIG_HOME / "muse" / "auth.json"
+        auth = json.loads(auth_file.read_text())
+        provider = (auth.get("providers") or {}).get("meta")
+        if not isinstance(provider, dict):
+            return "", ""
+        base_url = str(provider.get("api_base_url") or "").rstrip("/")
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "https" or parsed.hostname != "api.meta.ai":
+            logger.error("Refusing unexpected Muse Meta API host")
+            return "", ""
+        token = str(provider.get("api_key") or provider.get("access_token") or "").strip()
+        return base_url, token
+    except Exception:
+        logger.debug("Could not load Muse Meta API connection", exc_info=True)
+        return "", ""
+
+
+async def _muse_meta_llm_call(
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int,
+    response_format: dict | None,
+) -> str:
+    """Low-cost decision fallback for Muse dashboard helpers.
+
+    The contributor model is already connected to this deployment and is much
+    cheaper than the standard model. Minimal reasoning gives short routing and
+    watchdog decisions enough room without paying for a second provider.
+    """
+    base_url, token = _muse_meta_api_connection()
+    if not base_url or not token:
+        return ""
+    payload: dict = {
+        "model": DEFAULT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": max(64, int(max_tokens or 0)),
+        "temperature": 0.2,
+        "reasoning_effort": "minimal",
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as http_client:
+            response = await http_client.post(
+                base_url + "/chat/completions",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") if isinstance(data, dict) else []
+        message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+        content = message.get("content") if isinstance(message, dict) else ""
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict)
+            )
+        usage = data.get("usage") if isinstance(data, dict) else {}
+        logger.debug(
+            "Muse helper call completed with %d tokens",
+            int((usage or {}).get("total_tokens") or 0),
+        )
+        return str(content or "").strip()
+    except Exception as exc:
+        logger.error("Muse helper call failed: %s", type(exc).__name__)
+        return ""
+
+
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
                    response_format: dict = None) -> str:
     start = time.time()
+    if client is None and AGENT_KIND == "muse":
+        return await _muse_meta_llm_call(
+            system_prompt,
+            user_content,
+            max_tokens,
+            response_format,
+        )
     try:
         kwargs = dict(
             model="gpt-4o-mini",
@@ -7412,6 +8241,13 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
     except Exception as e:
         duration = time.time() - start
         logger.error("LLM call failed after %.1fs: %s", duration, e)
+        if AGENT_KIND == "muse":
+            return await _muse_meta_llm_call(
+                system_prompt,
+                user_content,
+                max_tokens,
+                response_format,
+            )
         # Return empty string (not the error text) so callers don't cache the
         # error as content. Downstream keyword checks (`"CONTINUE" not in ...`,
         # `"LEGITIMATE" in ...`) treat empty as a no-op, which is the right
@@ -8982,6 +9818,16 @@ async def _controller_snapshot_loop() -> None:
 
 async def _controller_dispatch(message: dict) -> dict:
     op = str(message.get("op") or "")
+    # Existing Muse processes may still have the former private controller
+    # socket in their MCP environment until their next restart. Forward those
+    # browser operations instead of reviving a second lifecycle owner.
+    if _uses_external_browser_controller() and op in {
+        "browser_acquire",
+        "browser_renew",
+        "browser_release",
+        "browser_stop",
+    }:
+        return await _controller_socket_request(BROWSER_CONTROLLER_SOCKET, message)
     if op == "ping":
         return {"ok": True, "pid": os.getpid(), "role": PROCESS_ROLE}
     if op == "runtime":
@@ -9041,6 +9887,8 @@ async def _controller_dispatch(message: dict) -> dict:
         )
         return {"ok": stopped, "stopped": stopped}
     if op == "away_toggle":
+        if not _agent_supports_codex_controls():
+            return {"ok": False, "error": "Away Mode is not available for Muse sessions", "_status": 409}
         return await _away_toggle_local(
             str(message.get("session") or ""), bool(message.get("enabled"))
         )
@@ -9049,6 +9897,8 @@ async def _controller_dispatch(message: dict) -> dict:
             _away_mode_state.get(str(message.get("session") or ""), {})
         )}
     if op == "go_nuts_toggle":
+        if not _agent_supports_codex_controls():
+            return {"ok": False, "error": "Go Nuts Mode is not available for Muse sessions", "_status": 409}
         return await _go_nuts_toggle_local(
             str(message.get("session") or ""), bool(message.get("enabled"))
         )
@@ -9066,6 +9916,8 @@ async def _controller_dispatch(message: dict) -> dict:
     if op == "autopush_set":
         name = str(message.get("session") or "")
         mode = str(message.get("mode") or "").lower()
+        if not _agent_supports_autopush() and mode != "off":
+            return {"ok": False, "error": "Auto-push is not available for this agent", "_status": 409}
         if mode not in AUTOPUSH_MODES:
             return {"ok": False, "error": f"mode must be one of {list(AUTOPUSH_MODES)}", "_status": 400}
         _autopush_mode[name] = mode
@@ -9149,11 +10001,16 @@ async def _controller_call(op: str, **fields) -> dict:
     message = {"op": op, **fields}
     if PROCESS_ROLE != "api":
         return await _controller_dispatch(message)
+    return await _controller_socket_request(CONTROLLER_SOCKET, message)
+
+
+async def _controller_socket_request(path: Path, message: dict) -> dict:
+    """Send one request to a specific controller Unix socket."""
     last_error = "controller unavailable"
     for _ in range(10):
         try:
             reader, writer = await asyncio.open_unix_connection(
-                str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
+                str(path), limit=32 * 1024 * 1024
             )
             writer.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
             await writer.drain()
@@ -9165,6 +10022,22 @@ async def _controller_call(op: str, **fields) -> dict:
             last_error = str(exc)
             await asyncio.sleep(0.2)
     return {"ok": False, "error": last_error}
+
+
+def _uses_external_browser_controller() -> bool:
+    """Whether browser leases/lifecycle belong to another dashboard process."""
+    return os.path.abspath(str(BROWSER_CONTROLLER_SOCKET)) != os.path.abspath(
+        str(CONTROLLER_SOCKET)
+    )
+
+
+async def _browser_controller_call(op: str, **fields) -> dict:
+    """Route shared browser state to its single lifecycle coordinator."""
+    if not _uses_external_browser_controller():
+        return await _controller_call(op, **fields)
+    return await _controller_socket_request(
+        BROWSER_CONTROLLER_SOCKET, {"op": op, **fields}
+    )
 
 
 async def _controller_terminal_connection(session_name: str):
@@ -9251,6 +10124,56 @@ def _is_valid_session_name(name: str) -> bool:
     return bool(name and len(name) <= 128 and re.fullmatch(r"[A-Za-z0-9_.-]+", name))
 
 
+def _session_pane_environment(user: dict | None, session_name: str) -> tuple[Path, dict[str, str]]:
+    """Return the publishing cwd and non-secret environment for one pane."""
+    owner_name = str((user or {}).get("username") or AUTH_USER or "admin")
+    owner_record = user or {"id": "admin", "username": owner_name, "role": "admin"}
+    project_dir = _member_session_project_dir(owner_record, session_name)
+    git_email = f"{owner_name}@{GIT_EMAIL_DOMAIN}"
+    environment = {
+        "DASH_USER": owner_name,
+        "DASH_SESSION": session_name,
+        "DASH_PROJECT_DIR": str(project_dir),
+        "DASH_PROJECT_URL": f"{PUB_URL}/{owner_name}/{session_name}",
+        "GIT_AUTHOR_NAME": owner_name,
+        "GIT_AUTHOR_EMAIL": git_email,
+        "GIT_COMMITTER_NAME": owner_name,
+        "GIT_COMMITTER_EMAIL": git_email,
+    }
+    return project_dir, environment
+
+
+def _prepare_session_owner_for_launch(
+    user: dict | None,
+    session_name: str,
+    project_dir: Path,
+) -> bool:
+    """Prepare private config/context without writing commands into the pane."""
+    try:
+        if user and not _is_admin(user):
+            _ensure_user_codex_config_dir(user)
+            codex_home = _user_codex_config_dir(user)
+            token_path = codex_home / "advisor-token"
+            if not token_path.is_file():
+                logger.error(
+                    "Refusing to configure member session '%s': private advisor token is missing",
+                    session_name,
+                )
+                return False
+            config_path = codex_home / "config.toml"
+            existing = config_path.read_text() if config_path.exists() else ""
+            trusted = _ensure_codex_project_trust(existing, str(project_dir))
+            if trusted != existing:
+                _backup_before_dashboard_write(config_path)
+                config_path.write_text(trusted)
+        if AGENT_KIND == "muse" and not _prepare_muse_project_context(project_dir):
+            return False
+        return True
+    except Exception:
+        logger.exception("Failed to prepare owner environment for '%s'", session_name)
+        return False
+
+
 @app.post("/api/sessions/create")
 async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
@@ -9276,49 +10199,43 @@ async def api_create_session(request: Request, body: CreateSession):
                 {"error": "This account's private data connection is not provisioned"},
                 status_code=503,
             )
-    await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
-    ready, reason, details = await asyncio.to_thread(_codex_cli_readiness)
+    if AGENT_KIND == "codex":
+        await asyncio.to_thread(_ensure_codex_auth_with_fallback, auth_home, True)
+    ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
     if not ready:
         return JSONResponse(
-            {"error": f"Codex launch blocked: {reason}", "codex": details},
+            {
+                "error": f"{AGENT_DISPLAY_NAME} launch blocked: {reason}",
+                "agent": details,
+            },
             status_code=503,
         )
     try:
-        cmd = ["tmux", "new-session", "-d"]
+        cmd = ["tmux", "new-session", "-d", "-P", "-F", "#{session_name}"]
         if name:
             cmd += ["-s", name]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
         # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
+        created = name or (result.stdout or "").strip()
+        if not name and not _is_valid_session_name(created):
+            # tmux -P normally prints the generated name. Keep a narrow
+            # fallback for older tmux wrappers that return an empty stdout: a
+            # single visible session can only be the one this call created.
+            visible = [
+                str(row.get("name") or "").strip()
+                for row in get_tmux_sessions()
+                if isinstance(row, dict)
+            ]
+            if len(visible) == 1:
+                created = visible[0]
+        if not _is_valid_session_name(created):
+            return JSONResponse({"error": "tmux did not return a valid session name"}, status_code=500)
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
-        # Export project-publishing convention env vars so Codex can publish to
-        # https://dianaotech.com/<username>/<session> reliably (see global context).
-        try:
-            _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
-            _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
-            _pub_base = PUB_URL
-            # Per-user git identity: every member shares ONE OS user, so set the
-            # commit author/committer per session → commits are attributed to the
-            # right person. Push still uses the box's shared GitHub creds.
-            _git_email = f"{_owner_name}@{GIT_EMAIL_DOMAIN}"
-            _exports = ("export DASH_USER={} DASH_SESSION={} DASH_PROJECT_DIR={} DASH_PROJECT_URL={} "
-                        "GIT_AUTHOR_NAME={} GIT_AUTHOR_EMAIL={} GIT_COMMITTER_NAME={} GIT_COMMITTER_EMAIL={}".format(
-                shlex.quote(_owner_name), shlex.quote(created),
-                shlex.quote(_proj_dir), shlex.quote(f"{_pub_base}/{_owner_name}/{created}"),
-                shlex.quote(_owner_name), shlex.quote(_git_email),
-                shlex.quote(_owner_name), shlex.quote(_git_email)))
-            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
-        except Exception:
-            logger.debug("Failed to export DASH_* project env for %s", created, exc_info=True)
+        project_dir, pane_environment = _session_pane_environment(user, created)
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
@@ -9330,10 +10247,9 @@ async def api_create_session(request: Request, body: CreateSession):
                 _sync_git_rules_into(acfg / "AGENTS.md")
         except Exception:
             logger.debug("Failed to harden admin team config", exc_info=True)
-        # Bind both CODEX_HOME and the advisor identity to the session owner.
-        # An unbound member pane would inherit the admin token from the shared
-        # Unix login shell, so a failed export is a hard launch failure.
-        if not _send_session_owner_environment(created):
+        # Bind the owner and context out-of-band. Secrets remain in the final
+        # launch process and no export/launch text enters terminal history.
+        if not _prepare_session_owner_for_launch(user, created, project_dir):
             subprocess.run(
                 ["tmux", "kill-session", "-t", created],
                 capture_output=True,
@@ -9347,7 +10263,9 @@ async def api_create_session(request: Request, body: CreateSession):
             )
         # Authenticate non-admin sessions from the shared Codex auth file.
         # Admin sessions use the default ~/.codex login directly.
-        if user and not _is_admin(user):
+        if AGENT_KIND == "muse":
+            _session_auth_mode[created] = "meta"
+        elif user and not _is_admin(user):
             _session_auth_mode[created] = _apply_member_auth(_user_codex_config_dir(user))
         else:
             try:
@@ -9359,20 +10277,25 @@ async def api_create_session(request: Request, body: CreateSession):
                 else "api" if mode == "apikey"
                 else "unconfigured"
             )
-        # Optionally launch a command in the new session. Members pin their model
-        # in the isolated account config; admins use the dashboard default.
-        if NEW_SESSION_CMD:
-            _pin_model = not (user and not _is_admin(user))
+        # Start the agent as the pane command rather than typing its command into
+        # a bootstrap shell. This is what keeps the terminal clean in raw view.
+        _pin_model = not (user and not _is_admin(user))
+        launch = _session_launch_command(
+            created,
+            _session_launch_base(created, user),
+            pin_model=_pin_model,
+        )
+        if not _launch_agent_pane(created, project_dir, launch, pane_environment):
             subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
-                 _session_launch_command(
-                     created, _session_launch_base(created, user), pin_model=_pin_model
-                 )],
-                capture_output=True, text=True, timeout=5
+                ["tmux", "kill-session", "-t", created],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
+            _clear_session_owner(created)
+            return JSONResponse(
+                {"error": f"Could not start {AGENT_DISPLAY_NAME} in the new session"},
+                status_code=503,
             )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
@@ -10109,12 +11032,25 @@ class SkillLibraryBody(BaseModel):
 
 
 def _account_skills_dir(user: dict) -> Path:
-    skills_dir = _user_codex_config_dir(user) / "skills"
+    if AGENT_KIND == "muse" and _is_admin(user):
+        # Muse discovers personal skills from ~/.agents/skills. The Muse
+        # deployment is single-owner, so expose that native root instead of
+        # showing the unrelated CODEX_HOME directory.
+        skills_dir = Path.home() / ".agents" / "skills"
+    else:
+        skills_dir = _user_codex_config_dir(user) / "skills"
     if skills_dir.is_symlink():
         raise ValueError("Account skills root cannot be a symlink")
     skills_dir.mkdir(parents=True, exist_ok=True)
     skills_dir.chmod(0o700)
     return skills_dir
+
+
+def _account_skill_trash_dir(user: dict) -> Path:
+    """Keep recoverable skill archives in the selected agent's private state."""
+    if AGENT_KIND == "muse" and _is_admin(user):
+        return MUSE_CONFIG_HOME / "muse" / ".skill-trash"
+    return _user_codex_config_dir(user) / ".skill-trash"
 
 
 @app.get("/api/my/skills")
@@ -10217,7 +11153,7 @@ async def api_delete_my_skill(request: Request, skill_name: str):
         return JSONResponse({"error": "Invalid account skill path"}, status_code=400)
     if not target.is_dir():
         return JSONResponse({"error": "Skill not found"}, status_code=404)
-    trash_dir = _user_codex_config_dir(user) / ".skill-trash"
+    trash_dir = _account_skill_trash_dir(user)
     trash_dir.mkdir(parents=True, exist_ok=True)
     trash_dir.chmod(0o700)
     trash_target = trash_dir / f"{name}-{int(time.time() * 1000)}"
@@ -10378,7 +11314,20 @@ async def api_delete_library_skill(skill_name: str):
 
 @app.get("/api/builtin-skills")
 async def api_list_builtin_skills():
-    """Return the list of skills bundled with Codex itself (read-only)."""
+    """Return the selected agent's bundled skills (read-only)."""
+    if AGENT_KIND == "muse":
+        try:
+            inventory = await asyncio.to_thread(_muse_skills_inventory)
+        except Exception:
+            logger.debug("Could not list Muse built-in skills", exc_info=True)
+            inventory = []
+        return JSONResponse({
+            "skills": [
+                {"name": skill["name"], "description": skill["description"]}
+                for skill in inventory
+                if skill.get("scope") in {"built-in", "bundled"}
+            ],
+        })
     return JSONResponse({"skills": list(_BUILTIN_SKILLS)})
 
 
@@ -10760,6 +11709,19 @@ async def api_stats():
     except Exception:
         stats["uptime"] = "unknown"
     controller = _controller_snapshot.read()
+    if _uses_external_browser_controller():
+        shared_browser = await _browser_controller_call("runtime")
+        if shared_browser.get("ok"):
+            controller = {
+                **controller,
+                "active_browser_leases": shared_browser.get(
+                    "active_browser_leases", 0
+                ),
+                "browser_leases_by_session": shared_browser.get(
+                    "browser_leases_by_session", {}
+                ),
+                "browser_runtime": shared_browser.get("browser_runtime", {}),
+            }
     by_browser = controller.get("browser_leases_by_session", {})
     stats["capacity"] = {
         # This is the scheduling signal. Parked/idle tmux sessions retain user
@@ -11149,7 +12111,7 @@ async def api_legacy_claude_auth_removed(request: Request):
 # viewers SAME-ORIGIN through this dashboard, so extra sessions are reachable
 # without needing a separate public browser host. The DEFAULT session is the
 # pre-existing systemd browser on display :99 / port 6080.
-BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
+BROWSER_SESSIONS_FILE = BROWSER_STATE_DIR / "browser_sessions.json"
 BROWSER_AUDIT_ROOT = MESSAGES_DIR / "browser-audit"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 _browser_starting: dict[str, float] = {}
@@ -11848,14 +12810,18 @@ async def api_my_browser(request: Request):
         start=False,
     )
     row = _browser_response_row(browser)
-    runtime = _browser_runtime_row(str(browser.get("id") or ""))
+    browser_state = await _browser_controller_call("runtime")
+    runtimes = browser_state.get("browser_runtime", {}) if browser_state.get("ok") else {}
+    leases_by_browser = (
+        browser_state.get("browser_leases_by_session", {})
+        if browser_state.get("ok")
+        else {}
+    )
+    runtime = runtimes.get(str(browser.get("id") or ""), {})
     row["running"] = await asyncio.to_thread(_browser_process_alive, browser)
     row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
     row["parked"] = not row["running"]
-    leases = await asyncio.to_thread(_browser_leases.snapshot)
-    row["active_leases"] = int(
-        leases.get("by_browser", {}).get(browser.get("id"), 0)
-    )
+    row["active_leases"] = int(leases_by_browser.get(browser.get("id"), 0))
     public = {
         key: row.get(key)
         for key in (
@@ -11876,14 +12842,20 @@ async def api_browser_sessions(request: Request):
         if _browser_owner_id(session) == "admin"
     ]
     out = []
-    leases = await asyncio.to_thread(_browser_leases.snapshot)
+    browser_state = await _browser_controller_call("runtime")
+    runtimes = browser_state.get("browser_runtime", {}) if browser_state.get("ok") else {}
+    leases_by_browser = (
+        browser_state.get("browser_leases_by_session", {})
+        if browser_state.get("ok")
+        else {}
+    )
     for s in sessions:
         row = _browser_response_row(s)
-        runtime = _browser_runtime_row(str(s.get("id") or ""))
+        runtime = runtimes.get(str(s.get("id") or ""), {})
         row["running"] = await asyncio.to_thread(_browser_process_alive, s)
         row["mode"] = runtime.get("mode", "headed" if row["running"] else "parked")
         row["parked"] = not row["running"]
-        row["active_leases"] = int(leases.get("by_browser", {}).get(s.get("id"), 0))
+        row["active_leases"] = int(leases_by_browser.get(s.get("id"), 0))
         out.append(row)
     extra = sum(
         1
@@ -11920,7 +12892,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     if await asyncio.to_thread(_browser_process_alive, entry):
         acquired = {"ok": True, "lease": {}}
     else:
-        acquired = await _controller_call(
+        acquired = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="create",
@@ -11957,7 +12929,9 @@ async def api_browser_delete(sid: str, request: Request):
                             status_code=400)
 
     await asyncio.to_thread(_browser_leases.release_browser, sid)
-    stopped = await _controller_call("browser_stop", browser_id=sid, reason="browser removed")
+    stopped = await _browser_controller_call(
+        "browser_stop", browser_id=sid, reason="browser removed"
+    )
     if not stopped.get("ok"):
         return JSONResponse({"error": stopped.get("error", "browser did not stop")}, status_code=502)
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
@@ -11978,7 +12952,7 @@ async def api_browser_lease_acquire(sid: str, body: BrowserLeaseBody, request: R
     """Acquire an explicit renewable browser lease and restore it on demand."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call(
+    result = await _browser_controller_call(
         "browser_acquire",
         browser_id=sid,
         kind=body.kind,
@@ -11993,7 +12967,9 @@ async def api_browser_lease_acquire(sid: str, body: BrowserLeaseBody, request: R
 async def api_browser_lease_renew(token: str, body: BrowserLeaseBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call("browser_renew", token=token, ttl=body.ttl)
+    result = await _browser_controller_call(
+        "browser_renew", token=token, ttl=body.ttl
+    )
     return JSONResponse(result, status_code=200 if result.get("ok") else 404)
 
 
@@ -12001,7 +12977,7 @@ async def api_browser_lease_renew(token: str, body: BrowserLeaseBody, request: R
 async def api_browser_lease_release(token: str, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    result = await _controller_call("browser_release", token=token)
+    result = await _browser_controller_call("browser_release", token=token)
     return JSONResponse(result, status_code=200 if result.get("ok") else 404)
 
 
@@ -12278,7 +13254,7 @@ async def _browser_busy_ctx(sid: str, what: str):
     _browser_busy[sid] = {"what": what, "since": time.time()}
     lease_token = ""
     try:
-        result = await _controller_call(
+        result = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="agent",
@@ -12292,7 +13268,7 @@ async def _browser_busy_ctx(sid: str, what: str):
         yield
     finally:
         if lease_token:
-            await _controller_call("browser_release", token=lease_token)
+            await _browser_controller_call("browser_release", token=lease_token)
         _browser_busy.pop(sid, None)
 
 
@@ -13078,7 +14054,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
     owner = "viewer"
     if ws.client:
         owner = f"viewer:{ws.client.host}"
-    acquired = await _controller_call(
+    acquired = await _browser_controller_call(
         "browser_acquire",
         browser_id=sid,
         kind="viewer",
@@ -13099,7 +14075,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
         async def renew_viewer_lease():
             while True:
                 await asyncio.sleep(max(30, BROWSER_LEASE_TTL // 2))
-                renewed = await _controller_call(
+                renewed = await _browser_controller_call(
                     "browser_renew", token=lease_token, ttl=BROWSER_LEASE_TTL
                 )
                 if not renewed.get("ok"):
@@ -13169,7 +14145,7 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
         if renew_task:
             renew_task.cancel()
         if lease_token:
-            await _controller_call("browser_release", token=lease_token)
+            await _browser_controller_call("browser_release", token=lease_token)
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
@@ -13185,7 +14161,7 @@ async def browser_proxy_http(sid: str, path: str, request: Request):
         # The HTML must be reachable before noVNC can open its WebSocket. Hold a
         # short bootstrap viewer lease; the socket replaces it with a renewable
         # lease and this one naturally expires if the page never connects.
-        acquired = await _controller_call(
+        acquired = await _browser_controller_call(
             "browser_acquire",
             browser_id=sid,
             kind="viewer",
@@ -13668,6 +14644,24 @@ async def api_codex_auth_status():
     now = time.time()
     if now - _codex_auth_cache["ts"] < 60 and _codex_auth_cache["data"]:
         return JSONResponse(dict(_codex_auth_cache["data"]))
+    if AGENT_KIND == "muse":
+        ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        credential = await asyncio.to_thread(_muse_credential_display)
+        result = {
+            "loggedIn": ready,
+            "authMode": "meta" if ready else "unconfigured",
+            "activeMode": "meta" if ready else "unconfigured",
+            "subscriptionType": "Meta Model API" if ready else "",
+            "email": credential.get("accountEmail") or ("Muse Code" if ready else ""),
+            "model": DEFAULT_MODEL,
+            "effort": _CODEX_DEFAULT_REASONING_EFFORT,
+            "agent": AGENT_KIND,
+            "error": "" if ready else reason,
+            "details": details,
+            "credential": credential,
+        }
+        _codex_auth_cache.update({"ts": now, "data": result})
+        return JSONResponse(result)
     result = await asyncio.to_thread(_codex_auth_display)
     _codex_auth_cache.update({"ts": now, "data": result})
     return JSONResponse(result)
@@ -13905,12 +14899,50 @@ async def api_openai_usage_limits():
 
 @app.get("/api/auth/usage")
 async def api_codex_usage():
-    """Token usage for today, parsed from codex session rollout JSONL files."""
+    """Token usage for today, parsed from the selected agent's session JSONL."""
     now = time.time()
-    if now - _usage_cache["ts"] < 60:
+    cache_seconds = 5 if AGENT_KIND == "muse" else 60
+    if now - _usage_cache["ts"] < cache_seconds:
         return JSONResponse(_usage_cache["data"])
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_dt = datetime.now(timezone.utc)
+    today = today_dt.strftime("%Y-%m-%d")
+    if AGENT_KIND == "muse":
+        today_start = today_dt.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        ).timestamp()
+        sessions_dir = MUSE_DATA_HOME / "muse" / "sessions"
+        today_dir = sessions_dir / today_dt.strftime("%Y/%m/%d")
+        files = list(today_dir.rglob("session.jsonl")) if today_dir.is_dir() else []
+        stats = await asyncio.to_thread(
+            _parse_muse_usage_files,
+            files,
+            now_epoch=now,
+            since_epoch=today_start,
+        )
+        data = {
+            "date": today,
+            "messages": int(stats.get("messageCount") or 0),
+            "inputTokens": int(stats.get("totalInput") or 0),
+            "outputTokens": int(stats.get("totalOutput") or 0),
+            "cacheReadTokens": int(stats.get("cacheRead") or 0),
+            "cacheCreateTokens": int(stats.get("cacheCreate") or 0),
+            "reasoningTokens": int(stats.get("reasoningTokens") or 0),
+            "totalTokens": int(stats.get("totalTokens") or 0),
+            "estimatedCost": float(stats.get("estimatedCost") or 0),
+            "recentOutputRate": int(stats.get("recentOutputRate") or 0),
+            "peakOutputRate": int(stats.get("peakOutputRate") or 0),
+            "requestsPerMinute": int(stats.get("requestsPerMinute") or 0),
+            "rateStatus": str(stats.get("rateStatus") or "normal"),
+            "providerStatus": str(stats.get("providerStatus") or "Waiting for API activity"),
+            "retryCount": int(stats.get("retryCount") or 0),
+        }
+        _usage_cache.update({"ts": now, "data": data})
+        return JSONResponse(data)
+
     files = _all_codex_rollouts()
 
     input_tok = 0
@@ -14508,6 +15540,367 @@ _session_model_cache: dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 _session_model_pending: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 
 
+def _muse_catalog_prices() -> dict[str, dict]:
+    """Read Muse's own cached model catalog and normalize per-million prices."""
+    prices: dict[str, dict] = {}
+    catalog_dir = MUSE_DATA_HOME / "muse" / "model-catalog"
+    if not catalog_dir.is_dir():
+        return prices
+    for path in catalog_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            logger.debug("Could not read Muse model catalog %s", path, exc_info=True)
+            continue
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            model_id = str(row.get("model_id") or "")
+            cost = row.get("cost")
+            if not model_id or not isinstance(cost, dict):
+                continue
+            try:
+                prices[model_id] = {
+                    "input": Decimal(str(cost.get("input") or "0")),
+                    "output": Decimal(str(cost.get("output") or "0")),
+                    "cached": Decimal(str(cost.get("cached") or cost.get("input") or "0")),
+                    "currency": str(cost.get("currency") or "USD"),
+                    "contextLimit": int(row.get("context_limit") or 0),
+                    "outputLimit": int(row.get("output_limit") or 0),
+                }
+            except (InvalidOperation, TypeError, ValueError):
+                logger.debug("Invalid Muse pricing row for %s", model_id, exc_info=True)
+    return prices
+
+
+def _muse_recorded_epoch(value: object) -> float:
+    """Muse records Unix microseconds; accept seconds too for forward compatibility."""
+    try:
+        recorded = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return recorded / 1_000_000 if recorded > 10_000_000_000 else recorded
+
+
+def _muse_model_cost(
+    usage: dict,
+    model: str,
+    prices: dict[str, dict],
+) -> Decimal:
+    """Estimate one request without double-counting cached or reasoning tokens."""
+    price = prices.get(model)
+    if not price:
+        return Decimal("0")
+    try:
+        input_tokens = max(0, int(usage.get("input_tokens") or 0))
+        output_tokens = max(0, int(usage.get("output_tokens") or 0))
+        cached_tokens = max(
+            0,
+            int(usage.get("cached_tokens") or usage.get("cache_read_tokens") or 0),
+        )
+    except (TypeError, ValueError):
+        return Decimal("0")
+    cached_tokens = min(cached_tokens, input_tokens)
+    fresh_tokens = input_tokens - cached_tokens
+    million = Decimal(1_000_000)
+    return (
+        Decimal(fresh_tokens) * price["input"]
+        + Decimal(cached_tokens) * price["cached"]
+        + Decimal(output_tokens) * price["output"]
+    ) / million
+
+
+def _find_muse_session_jsonl_files(session_name: str) -> list[str]:
+    """Bind one tmux pane to its exact Muse root log and all child-agent logs."""
+    sessions_dir = MUSE_DATA_HOME / "muse" / "sessions"
+    if not sessions_dir.is_dir():
+        return []
+    try:
+        pane_result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pane_id = (pane_result.stdout or "").strip() if pane_result.returncode == 0 else ""
+    except Exception:
+        pane_id = ""
+    try:
+        cwd = (get_session_cwd(session_name) or "").rstrip("/")
+    except Exception:
+        cwd = ""
+
+    matches: list[tuple[float, Path]] = []
+    fallback: list[tuple[float, Path]] = []
+    for root_log in sessions_dir.glob("*/*/*/*/session.jsonl"):
+        route_ts = 0.0
+        route_pane = ""
+        route_cwd = ""
+        try:
+            with root_log.open() as stream:
+                for _ in range(32):
+                    line = stream.readline()
+                    if not line:
+                        break
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("payload_type") != "runtime.session.route_facts":
+                        continue
+                    record = ((row.get("payload") or {}).get("record") or {})
+                    if not isinstance(record, dict):
+                        break
+                    route_ts = _muse_recorded_epoch(row.get("recorded_at"))
+                    route_pane = str(record.get("tmux_pane") or "")
+                    route_cwd = str(record.get("cwd") or "").rstrip("/")
+                    break
+        except OSError:
+            continue
+        if pane_id and (route_pane == pane_id or route_pane.endswith("." + pane_id)):
+            matches.append((route_ts or root_log.stat().st_mtime, root_log))
+        elif cwd and route_cwd == cwd:
+            fallback.append((route_ts or root_log.stat().st_mtime, root_log))
+
+    candidates = matches or fallback
+    if not candidates:
+        return []
+    root_log = max(candidates, key=lambda item: item[0])[1]
+    child_logs = sorted((root_log.parent / "subagent").glob("**/session.jsonl"))
+    return [str(root_log), *(str(path) for path in child_logs)]
+
+
+def _parse_muse_usage_files(
+    files: list[str | Path],
+    *,
+    now_epoch: float | None = None,
+    since_epoch: float | None = None,
+) -> dict:
+    """Parse Muse JSONL usage, price it, and derive live provider health."""
+    now = float(now_epoch if now_epoch is not None else time.time())
+    prices = _muse_catalog_prices()
+    completions: list[dict] = []
+    provider_events: list[dict] = []
+    provider = "meta"
+    default_model = DEFAULT_MODEL
+
+    for raw_path in files:
+        path = Path(raw_path)
+        try:
+            with path.open() as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = _muse_recorded_epoch(row.get("recorded_at"))
+                    payload_type = str(row.get("payload_type") or "")
+                    payload = row.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload_type == "runtime.session.metadata":
+                        record = payload.get("record") or {}
+                        if isinstance(record, dict):
+                            provider = str(record.get("provider_id") or provider)
+                            default_model = str(record.get("model_id") or default_model)
+                        continue
+                    if since_epoch is not None and ts < since_epoch:
+                        continue
+                    if payload_type != "runtime.session":
+                        continue
+                    event = payload.get("event") or {}
+                    if not isinstance(event, dict):
+                        continue
+                    kind = str(event.get("kind") or "")
+                    if payload.get("kind") == "run" and kind == "model_completed":
+                        usage = event.get("usage") or {}
+                        if not isinstance(usage, dict):
+                            continue
+                        model = str(event.get("model") or default_model)
+                        try:
+                            duration_ms = max(0, int(event.get("duration_ms") or 0))
+                        except (TypeError, ValueError):
+                            duration_ms = 0
+                        completions.append({
+                            "ts": ts,
+                            "model": model,
+                            "usage": usage,
+                            "durationMs": duration_ms,
+                        })
+                        continue
+                    if payload.get("kind") != "task" or kind != "status":
+                        continue
+                    details = event.get("details") or {}
+                    facets = details.get("facets") if isinstance(details, dict) else None
+                    if not isinstance(facets, list):
+                        continue
+                    attempt_facet = next(
+                        (
+                            facet
+                            for facet in facets
+                            if isinstance(facet, dict)
+                            and facet.get("kind") == "external_attempt"
+                            and facet.get("operation") == "model.response"
+                        ),
+                        None,
+                    )
+                    if not attempt_facet:
+                        continue
+                    producer = next(
+                        (
+                            facet.get("detail")
+                            for facet in facets
+                            if isinstance(facet, dict)
+                            and facet.get("kind") == "producer"
+                            and isinstance(facet.get("detail"), dict)
+                        ),
+                        {},
+                    )
+                    stream_info = producer.get("stream") if isinstance(producer, dict) else {}
+                    if not isinstance(stream_info, dict):
+                        stream_info = {}
+                    try:
+                        attempt = max(1, int(attempt_facet.get("attempt") or 1))
+                        maximum = max(attempt, int(attempt_facet.get("max_attempts") or attempt))
+                    except (TypeError, ValueError):
+                        attempt = maximum = 1
+                    provider_events.append({
+                        "ts": ts,
+                        "attempt": attempt,
+                        "maximum": maximum,
+                        "error": str(attempt_facet.get("error_kind") or ""),
+                        "message": str(event.get("message") or ""),
+                        "task": str(event.get("task_id") or payload.get("task_id") or ""),
+                        "provider": str(attempt_facet.get("system") or producer.get("provider") or provider),
+                        "ttfeMs": int(stream_info.get("time_to_first_event_ms") or 0),
+                    })
+        except OSError:
+            logger.debug("Could not read Muse session log %s", path, exc_info=True)
+
+    if not completions and not provider_events:
+        return {"available": False}
+    completions.sort(key=lambda entry: entry["ts"])
+    provider_events.sort(key=lambda entry: entry["ts"])
+
+    total_input = total_output = cache_read = cache_write = reasoning = 0
+    estimated_cost = Decimal("0")
+    models_seen: dict[str, int] = {}
+    rates: list[tuple[float, int]] = []
+    latest_context = latest_input = context_window = 0
+    for completion in completions:
+        usage = completion["usage"]
+        try:
+            inp = max(0, int(usage.get("input_tokens") or 0))
+            out = max(0, int(usage.get("output_tokens") or 0))
+            cached = max(0, int(usage.get("cached_tokens") or usage.get("cache_read_tokens") or 0))
+            written = max(0, int(usage.get("cache_write_tokens") or 0))
+            thought = max(0, int(usage.get("reasoning_tokens") or 0))
+        except (TypeError, ValueError):
+            continue
+        model = completion["model"]
+        total_input += inp
+        total_output += out
+        cache_read += min(cached, inp)
+        cache_write += written
+        reasoning += min(thought, out)
+        estimated_cost += _muse_model_cost(usage, model, prices)
+        models_seen[model] = models_seen.get(model, 0) + 1
+        latest_input = inp
+        latest_context = inp
+        context_window = int((prices.get(model) or {}).get("contextLimit") or 0)
+        duration = completion["durationMs"]
+        if duration > 0:
+            rates.append((completion["ts"], int(out * 60_000 / duration)))
+
+    latest_provider = provider_events[-1] if provider_events else {}
+    error_text = " ".join(
+        (
+            str(latest_provider.get("error") or ""),
+            str(latest_provider.get("message") or ""),
+        )
+    ).lower()
+    is_rate_limited = bool(
+        re.search(r"rate.?limit|too.?many.?requests|\b429\b|quota", error_text)
+    )
+    attempt = int(latest_provider.get("attempt") or 1)
+    maximum = int(latest_provider.get("maximum") or attempt)
+    successful = str(latest_provider.get("error") or "") in {
+        "stream_succeeded",
+        "succeeded",
+        "success",
+    }
+    if is_rate_limited:
+        rate_status = "rate_limited"
+        provider_status = f"Rate limited · retry {attempt}/{maximum}"
+    elif successful and attempt > 1:
+        rate_status = "recovered"
+        provider_status = f"Connected · recovered on retry {attempt}/{maximum}"
+    elif successful or completions:
+        rate_status = "normal"
+        provider_status = "Connected · no rate limit detected"
+    else:
+        rate_status = "error"
+        provider_status = str(latest_provider.get("error") or "Provider error").replace("_", " ").title()
+
+    retry_attempts = {
+        (entry.get("task"), entry.get("attempt"))
+        for entry in provider_events
+        if int(entry.get("attempt") or 1) > 1
+    }
+    recent_rates = [rate for ts, rate in rates if now - ts <= 600][-3:]
+    last_activity = max(
+        [entry["ts"] for entry in completions]
+        + [entry["ts"] for entry in provider_events]
+        + [0],
+    )
+    first_activity = min(
+        [entry["ts"] for entry in completions if entry["ts"]]
+        + [entry["ts"] for entry in provider_events if entry["ts"]]
+        + ([last_activity] if last_activity else [0]),
+    )
+    latest_model = completions[-1]["model"] if completions else default_model
+    latest_duration = completions[-1]["durationMs"] if completions else 0
+    latest_ttfe = int(latest_provider.get("ttfeMs") or 0)
+    requests_last_minute = sum(1 for entry in completions if 0 <= now - entry["ts"] <= 60)
+
+    return {
+        "available": True,
+        "provider": str(latest_provider.get("provider") or provider),
+        "model": latest_model,
+        "messageCount": len(completions),
+        "totalInput": total_input,
+        "totalOutput": total_output,
+        "cacheRead": cache_read,
+        "cacheCreate": cache_write,
+        "reasoningTokens": reasoning,
+        "totalTokens": total_input + total_output,
+        "estimatedCost": float(round(estimated_cost, 10)),
+        "pricingAvailable": latest_model in prices,
+        "pricingCurrency": str((prices.get(latest_model) or {}).get("currency") or "USD"),
+        "recentOutputRate": int(sum(recent_rates) / len(recent_rates)) if recent_rates else 0,
+        "peakOutputRate": max((rate for _, rate in rates), default=0),
+        "recentTotalRate": int(sum(recent_rates) / len(recent_rates)) if recent_rates else 0,
+        "peakTotalRate": max((rate for _, rate in rates), default=0),
+        "requestsPerMinute": requests_last_minute,
+        "lastDurationMs": latest_duration,
+        "lastTtfeMs": latest_ttfe,
+        "rateStatus": rate_status,
+        "providerStatus": provider_status,
+        "ratePct": 0 if is_rate_limited else 100,
+        "retryCount": len(retry_attempts),
+        "activeMinutes": max(0, int(sum(entry["durationMs"] for entry in completions) / 60_000)),
+        "sessionDurationMin": max(0, int((last_activity - first_activity) / 60)) if last_activity else 0,
+        "secsSinceLastActivity": max(0, int(now - last_activity)) if last_activity else -1,
+        "modelsUsed": models_seen,
+        "contextPct": round(latest_context / context_window * 100, 1) if context_window else 0,
+        "lastInputTokens": latest_input,
+        "ctxWindowSize": context_window,
+    }
+
+
 def _session_model_fields(session_name: str) -> dict:
     """Model, effort, and pending model for session API payloads. Clears pending once
     the transcript confirms the switch, or after 15 min (request abandoned)."""
@@ -14520,17 +15913,18 @@ def _session_model_fields(session_name: str) -> dict:
             _session_model_pending.pop(session_name, None)
             pend = None
     effort = _CODEX_DEFAULT_REASONING_EFFORT
-    try:
-        cfg = (_session_config_base(session_name) / "config.toml").read_text()
-        match = re.search(
-            r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"',
-            cfg,
-            re.MULTILINE,
-        )
-        if match:
-            effort = match.group(1)
-    except Exception:
-        pass
+    if AGENT_KIND != "muse":
+        try:
+            cfg = (_session_config_base(session_name) / "config.toml").read_text()
+            match = re.search(
+                r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"',
+                cfg,
+                re.MULTILINE,
+            )
+            if match:
+                effort = match.group(1)
+        except Exception:
+            pass
     return {
         "model": model,
         "model_pending": (pend or {}).get("model", ""),
@@ -14540,6 +15934,8 @@ def _session_model_fields(session_name: str) -> dict:
 
 def _get_session_model(session_name: str) -> str:
     """Detect the current model for a session by reading its latest codex rollout."""
+    if AGENT_KIND == "muse":
+        return DEFAULT_MODEL
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
@@ -14629,8 +16025,16 @@ def _parse_session_stats(session_name: str) -> dict:
     """Parse JSONL files and compute per-session token stats with rate tracking."""
     now = time.time()
     cached = _session_stats_cache.get(session_name)
-    if cached and now - cached.get("_ts", 0) < 15:
+    cache_seconds = 5 if AGENT_KIND == "muse" else 15
+    if cached and now - cached.get("_ts", 0) < cache_seconds:
         return cached
+
+    if AGENT_KIND == "muse":
+        files = _find_muse_session_jsonl_files(session_name)
+        result = _parse_muse_usage_files(files, now_epoch=now)
+        result["_ts"] = now
+        _session_stats_cache[session_name] = result
+        return result
 
     files = _find_session_jsonl_files(session_name)
     if not files:
@@ -15279,13 +16683,13 @@ _auto_respond_log: list = []    # recent auto-respond events (for debugging)
 
 
 def _detect_interactive_prompt(visible_text: str) -> str | None:
-    """Check if visible terminal shows a Codex interactive prompt.
+    """Check if the visible terminal shows an agent selection prompt.
 
     Returns a description of the detected prompt, or None.
 
-    SAFETY: We require the ❯ cursor to sit DIRECTLY on a numbered option
-    line (e.g. "❯ 1. Yes"). If ❯ is followed by free text (e.g.
-    "❯ test it in the browser") that is the user input prompt, not a
+    SAFETY: We require the agent's selector to sit directly on a numbered
+    option line (for example, ``❯ 1. Yes`` or ``› 1. Yes``). If a composer
+    glyph is followed by free text, that is the user input prompt, not a
     selection — Enter would submit that text instead of selecting an option,
     which is the "phantom message" bug we must avoid.
     """
@@ -15293,8 +16697,8 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     last_25 = lines[-25:]
     text = "\n".join(last_25)
 
-    # Must have the ❯ selection cursor
-    if "\u276f" not in text and "❯" not in text:
+    # Codex uses ❯ and Muse uses › for the active menu row.
+    if "❯" not in text and "›" not in text:
         return None
 
     # Count lines that look like numbered options: "  1. text" or "❯ 1. text"
@@ -15303,13 +16707,13 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     selector_followed_by_text = False
     for line in last_25:
         stripped = line.strip()
-        if re.match(r"^[❯\u276f\s]*\d+\.\s", stripped):
+        if re.match(r"^[❯›\s]*\d+\.\s", stripped):
             numbered += 1
-        if re.match(r"^❯\s*\d+\.", stripped) or re.match(r"^\u276f\s*\d+\.", stripped):
+        if re.match(r"^[❯›]\s*\d+\.", stripped):
             has_selector_on_option = True
-        # ❯ followed by non-numeric text = user input prompt with text waiting.
+        # A composer followed by non-numeric text means user input is waiting.
         # Enter on this would submit that text — never auto-fire here.
-        if re.match(r"^[❯\u276f]\s+\S", stripped) and not re.match(r"^[❯\u276f]\s*\d+\.", stripped):
+        if re.match(r"^[❯⟩]\s+\S", stripped) and not re.match(r"^❯\s*\d+\.", stripped):
             selector_followed_by_text = True
 
     # Bail if cursor is in the user input box with text waiting.
@@ -15339,7 +16743,7 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
 
 
 _MENU_PICK_SYSTEM_PROMPT = (
-    "A Codex agent is showing a numbered selection menu and THE USER IS AWAY and will "
+    "A coding agent is showing a numbered selection menu and THE USER IS AWAY and will "
     "not answer. Pick the option number that best lets the agent CONTINUE and COMPLETE the work "
     "on its own.\n"
     "- Strongly prefer options that proceed / do the work / say Yes / auto-accept / "
@@ -15354,14 +16758,14 @@ _MENU_PICK_SYSTEM_PROMPT = (
 
 
 def _parse_menu_options(visible_text: str):
-    """Parse a Codex numbered menu. Returns (options, selected_idx) where
+    """Parse a Codex or Muse numbered menu. Returns (options, selected_idx) where
     options = [(number, label), ...] in visual order and selected_idx is the
     0-based position of the ❯-highlighted option (0 if none found)."""
     options = []
     selected = None
     for line in visible_text.split("\n"):
         s = line.strip()
-        m = re.match(r"^(❯|❯)?\s*(\d+)\.\s+(\S.*)$", s)
+        m = re.match(r"^([❯›])?\s*(\d+)\.\s+(\S.*)$", s)
         if not m:
             continue
         if m.group(1):
@@ -15502,7 +16906,7 @@ _SIMPLE_WATCHDOG_MAX_LOG = 20
 _SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
 
 _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
-    "You are an autonomous operator keeping a Codex agent moving while THE USER IS AWAY. "
+    "You are an autonomous operator keeping a coding agent moving while THE USER IS AWAY. "
     "You are shown the bottom of the agent's terminal; the agent has gone idle. If it has stopped "
     "and is in ANY way waiting on the user before it can keep working, write the exact message to "
     "send so it continues on its own. The user is not here and will not answer — waiting wastes time.\n\n"
@@ -16426,6 +17830,17 @@ async def _codex_auth_health(force: bool = False) -> dict:
     age = now - float(_codex_health_auth.get("ts") or 0)
     if age < (_CODEX_AUTH_PROBE_FLOOR if force else _CODEX_AUTH_PROBE_MAX_AGE):
         return dict(_codex_health_auth)
+    if AGENT_KIND == "muse":
+        ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        _codex_health_auth.update({
+            "ts": now,
+            "loggedIn": ready,
+            "activeMode": "meta" if ready else "unconfigured",
+            "reason": "" if ready else reason,
+            "fallbackActive": False,
+            "agent": details,
+        })
+        return dict(_codex_health_auth)
     try:
         state = await asyncio.to_thread(
             _ensure_codex_auth_with_fallback, CODEX_HOME, True
@@ -16490,8 +17905,10 @@ async def _codex_health_watchdog_loop():
                     "codex-logged-out",
                     auth.get("reason") or "Codex has no usable credential",
                 )
-                repaired = await asyncio.to_thread(_repair_member_codex_auth)
-                hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
+                repaired = 0
+                if AGENT_KIND == "codex":
+                    repaired = await asyncio.to_thread(_repair_member_codex_auth)
+                    hlog.warning("Repaired Codex auth for %d member home(s)", repaired)
                 auth = await _codex_auth_health(force=True)
                 if auth.get("loggedIn"):
                     _resolve_codex_alerts("*", "credential repaired")
@@ -16517,18 +17934,22 @@ async def _codex_health_watchdog_loop():
                 _record_codex_alert(
                     name,
                     "codex-not-running",
-                    _codex_failure_excerpt(recent) or "Codex exited to a shell",
+                    _codex_failure_excerpt(recent)
+                    or f"{AGENT_DISPLAY_NAME} exited to a shell",
                     username=username,
                 )
                 hlog.warning(
-                    "Relaunching Codex in '%s'%s (attempt %d)",
-                    name, f" for {username}" if username else "", state["attempts"],
+                    "Relaunching %s in '%s'%s (attempt %d)",
+                    AGENT_DISPLAY_NAME,
+                    name,
+                    f" for {username}" if username else "",
+                    state["attempts"],
                 )
                 if await _ensure_codex_running(name):
                     _seen_claude_running.add(name)
                     _codex_health_state.pop(name, None)
                     _resolve_codex_alerts(name, "relaunched by the health watchdog")
-                    hlog.warning("Session '%s' is back on Codex", name)
+                    hlog.warning("Session '%s' is back on %s", name, AGENT_DISPLAY_NAME)
                 else:
                     _record_codex_alert(
                         name,
@@ -16538,21 +17959,21 @@ async def _codex_health_watchdog_loop():
                         username=username,
                     )
         except asyncio.CancelledError:
-            hlog.info("Codex health watchdog cancelled")
+            hlog.info("%s health watchdog cancelled", AGENT_DISPLAY_NAME)
             raise
         except Exception:
-            logger.debug("Codex health watchdog iteration failed", exc_info=True)
+            logger.debug("Agent health watchdog iteration failed", exc_info=True)
 
 
 def _has_pending_user_input(visible: str) -> bool:
-    """True if the visible pane shows the ❯ user-input box with text already typed.
+    """True if the visible pane shows an agent input box with text already typed.
 
-    Pattern: a line like '❯ some text the user is typing'. We must NOT send
+    Pattern: a line like '❯ some text' or '⟩ some text'. We must not send
     'continue' in that case — it would concatenate or submit the user's draft.
     Empty input (just '❯' or '❯ ') is fine.
     """
     for line in visible.split("\n")[-20:]:
-        m = re.search(r"❯\s+(\S.*)", line)
+        m = re.search(r"[❯⟩]\s+(\S.*)", line)
         if not m:
             continue
         tail = m.group(1).strip()
@@ -16566,12 +17987,16 @@ def _has_pending_user_input(visible: str) -> bool:
     return False
 
 
-# Codex TUI markers used only by the opt-in full auto-push guard.
+# Agent TUI markers used only by the opt-in full auto-push guard.
 _CODEX_CONVERSATION_RE = re.compile(
-    r"esc to interrupt|Worked for \d|tokens used|You have \d+ weighted tokens left",
+    r"esc to interrupt|Worked for \d|tokens used|You have \d+ weighted tokens left|"
+    r"model_completed|tool call|thinking",
     re.I,
 )
-_CODEX_WELCOME_RE = re.compile(r"OpenAI Codex|Codex CLI|gpt-5\.", re.I)
+_CODEX_WELCOME_RE = re.compile(
+    r"OpenAI Codex|Codex CLI|gpt-5\.|Muse Code|muse-spark",
+    re.I,
+)
 
 
 def _looks_like_fresh_claude_session(visible: str) -> bool:
@@ -18619,11 +20044,15 @@ body.member-simple .nav-codex-alert{display:none !important}
 .rate-bar-track{flex:1;height:6px;background:#21262d;border-radius:3px;overflow:hidden}
 .rate-bar-fill{height:100%;border-radius:3px;transition:width .5s ease}
 .rate-bar-fill.normal{background:#3fb950}
+.rate-bar-fill.recovered{background:#d29922}
+.rate-bar-fill.rate_limited,.rate-bar-fill.error{background:#f85149}
 .rate-bar-fill.limited{background:#d29922}
 .rate-bar-fill.severely_limited{background:#f85149}
 .rate-label{font-size:.75rem;color:#8b949e;min-width:60px;text-align:right}
 .rate-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
 .rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
+.rate-badge.recovered{background:rgba(210,153,34,.15);color:#d29922}
+.rate-badge.rate_limited,.rate-badge.error{background:rgba(248,81,73,.15);color:#f85149}
 .rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
 .rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
@@ -18748,6 +20177,7 @@ body.member-simple .nav-codex-alert{display:none !important}
 /* --- Team (simplified member) mode --- */
 .member-only{display:none}
 body.member-simple .member-only{display:inline-flex;align-items:center;justify-content:center}
+body[data-agent="muse"] .muse-connection{display:inline-flex;align-items:center;justify-content:center}
 body.member-simple .nav-tools-wrap{display:none}
 body.member-simple .codex-auth{display:none}
 body.member-simple .nav-server-stats{display:none}
@@ -19181,11 +20611,11 @@ body.member-simple .hide-in-simple{display:none!important}
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <!-- Open Codex health alerts. An alert nobody sees is not an alert, so the
+  <!-- Open agent health alerts. An alert nobody sees is not an alert, so the
        watchdog's findings surface here rather than only inside Stats. -->
   <span class="nav-codex-alert" id="nav-codex-alert" style="display:none"
-        title="Codex health alerts — click for details" onclick="openStats()"></span>
-  <!-- Generic browser-session status. Codex auto-auth is retired. -->
+        title="__AGENT_NAME__ health alerts — click for details" onclick="openStats()"></span>
+  <!-- Generic browser-session status. Agent auto-auth is retired. -->
   <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
         title="Browser sign-in status" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
@@ -19194,7 +20624,7 @@ body.member-simple .hide-in-simple{display:none!important}
     <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
     <div class="nav-tools-menu" id="nav-tools-menu">
       <div class="nav-tools-usage" id="nav-tools-usage">
-        <div class="nav-tools-usage-title">Codex plan limits</div>
+        <div class="nav-tools-usage-title">__AGENT_NAME__ plan limits</div>
         <div class="nav-tools-usage-row" id="tools-usage-primary-wrap" title="">
           <span class="nav-tools-usage-label" id="tools-usage-primary-label">plan</span>
           <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-primary-fill" style="width:0%"></span></span>
@@ -19212,7 +20642,7 @@ body.member-simple .hide-in-simple{display:none!important}
       <!-- Settings owns all configuration editors, including Context Files. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openUsers();closeToolsMenu()"><span class="icon">&#x1F464;</span> Users</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
+      <div class="nav-tools-item nav-tools-admin codex-only" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
@@ -19221,7 +20651,7 @@ body.member-simple .hide-in-simple{display:none!important}
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
   <button class="nav-icon-btn member-only" id="nav-my-browser-btn" onclick="openSettings('browser')" title="My private browser"><span class="icon">&#x1F310;</span></button>
-  <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
+  <button class="nav-icon-btn member-only muse-connection" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
   <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
     <span class="status-dot unknown" id="codex-auth-dot"></span>
@@ -19304,6 +20734,18 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+const AGENT_KIND='__AGENT_KIND__';
+const AGENT_NAME='__AGENT_NAME__';
+const SETTINGS_TAB_DEFS=__SETTINGS_TAB_DEFS__;
+const SETTINGS_ADMIN_IDS=new Set(['global','context','apis','login']);
+document.body.dataset.agent=AGENT_KIND;
+if(AGENT_KIND==='muse'){
+  const usage=document.getElementById('nav-usage');
+  const toolsUsage=document.getElementById('nav-tools-usage');
+  if(usage)usage.style.display='none';
+  if(toolsUsage)toolsUsage.style.display='none';
+  document.querySelectorAll('.codex-only').forEach(el=>el.style.display='none');
+}
 const _nativeFetch=window.fetch.bind(window);
 function _storedImpersonationToken(){
   try{return sessionStorage.getItem('tmuxImpersonationToken')||'';}catch(e){return '';}
@@ -19653,10 +21095,10 @@ function splitLiveTail(lines){
 const _ENV_ASSIGN_RE=/^[A-Za-z_][A-Za-z0-9_]*=/;
 // The launch line itself, for the case where the prompt that carried it has
 // already scrolled out of tmux's history and only the command is left.
-const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=/;
+const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex|muse(?:-bin[^\s]*)?)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=/;
 // Its wrapped rows, which start mid-token and so match none of the above: the
 // launcher is one long `if … then exec env … fi`, and tmux breaks it anywhere.
-const _LAUNCH_FRAG_RE=/CODEX_HOME=|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
+const _LAUNCH_FRAG_RE=/CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=|MUSE_NO_AUTO_UPDATE|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
 function _stripStartupPreamble(lines){
   let i=0,sawShell=false;
   const limit=Math.min(lines.length,120);
@@ -19669,7 +21111,7 @@ function _stripStartupPreamble(lines){
     // fragments, the launcher's own shell plumbing, and the CLI's "starting…"
     // chatter.
     if(_ENV_ASSIGN_RE.test(t)||/^(export|cd|source|env|exec|nohup|&&|\|\|)\b/.test(t)||
-       /^--?[a-z]/.test(t)||/^(claude|codex)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
+       /^--?[a-z]/.test(t)||/^(claude|codex|muse(?:-bin[^\s]*)?)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
     // The compact start-up banner, which is the CLI's block-glyph logo with the
     // version, the model and the cwd set beside it. Not drawn as a box, so
     // _stripStartupBanner cannot see it; three or more logo glyphs on a row is
@@ -19682,7 +21124,7 @@ function _stripStartupPreamble(lines){
 // The welcome box each CLI draws on start-up — Codex's is the ">_ OpenAI Codex
 // (v0.146.0)" frame with model, directory and permissions in it. It is a box so
 // _isTableRow keeps it; drop it by content.
-const _BANNER_HINT_RE=/welcome (to|back)\b|(claude code|openai codex)\s+\(?v?\d|\/help for help|\/init to create|\/model to change|release-notes|tips for getting|what's new|cwd:|workdir:|directory:\s|permissions:\s|model:\s|approval:|sandbox:|press enter to continue/i;
+const _BANNER_HINT_RE=/welcome (to|back)\b|(claude code|openai codex|muse code)\s+\(?v?\d|\/help for help|\/init to create|\/model to change|release-notes|tips for getting|what's new|cwd:|workdir:|directory:\s|permissions:\s|model:\s|approval:|sandbox:|press enter to continue/i;
 function _stripStartupBanner(lines){
   const out=[];
   let box=null;
@@ -20598,7 +22040,7 @@ function openModelMenu(name,anchor,ev){
   const cur=s.model_pending||s.model||'';
   const menu=document.createElement('div');
   menu.className='model-menu';
-  let html='<div class="mm-title">Codex model · applies after restart</div>';
+  let html='<div class="mm-title">'+AGENT_NAME+' model · applies after restart</div>';
   MODEL_CHOICES.forEach(([id,label])=>{
     const sel=cur&&id===cur;
     html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
@@ -20644,13 +22086,13 @@ async function setSessionModel(name,model){
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
     if(d.codex_was_running){
-      const restart=confirm('Model saved as "'+model+'". Restart Codex now and resume the latest conversation?');
+      const restart=confirm('Model saved as "'+model+'". Restart '+AGENT_NAME+' now and resume the latest conversation?');
       if(restart){
         r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/model',{
           method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({model,restart:true})});
         d=await r.json().catch(()=>({}));
-        if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+        if(!r.ok||d.error||!d.restarted)throw new Error(d.error||(AGENT_NAME+' did not restart'));
         if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
       }else if(si>=0){sessions[si].model_pending=model;}
     }else if(si>=0){sessions[si].model=model;sessions[si].model_pending='';}
@@ -20674,12 +22116,12 @@ async function setSessionEffort(name,effort){
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
     if(s)s.effort=effort;
-    if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart Codex now and resume the latest conversation?')){
+    if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart '+AGENT_NAME+' now and resume the latest conversation?')){
       r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({effort,restart:true})});
       d=await r.json().catch(()=>({}));
-      if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+      if(!r.ok||d.error||!d.restarted)throw new Error(d.error||(AGENT_NAME+' did not restart'));
     }
     if(statusInfoEl)statusInfoEl.textContent='Reasoning effort → '+effort+(d.restarted?' · restarted':' · saved');
   }catch(e){
@@ -20832,7 +22274,7 @@ function chatBubbleInner(m,sessionName){
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Codex — every reply shows up here in full, with links to anything it produced.</div>';
+    return '<div class="chat-empty">No messages yet. Type below to talk to '+AGENT_NAME+' — every reply shows up here in full, with links to anything it produced.</div>';
   }
   return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m,name)}</div>`).join('');
 }
@@ -20881,7 +22323,7 @@ function renderDetail(){
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
-          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
+          ${AGENT_KIND==='muse'?'':`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>`}
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <!-- Clean view sits right under Auto-push because it is the other
@@ -20901,7 +22343,7 @@ function renderDetail(){
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" data-tab="skills" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" data-tab="info" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          ${MEMBER_SIMPLE?'':`
+          ${(MEMBER_SIMPLE||AGENT_KIND==='muse')?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
@@ -20918,9 +22360,9 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        ${AGENT_KIND==='muse'?'':`<span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="${AGENT_NAME} model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>`}
         ${s.attached?'<span class="badge attached">attached</span>':''}
-        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (${AGENT_NAME} publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
@@ -20929,7 +22371,7 @@ function renderDetail(){
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
         <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt ${AGENT_NAME} (Esc)">Stop</button>
         </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
@@ -20956,9 +22398,9 @@ function renderDetail(){
       <div class="raw-controls">
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt ${AGENT_NAME} (Esc)">Stop</button>
       </div>
-      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
+      <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading ${AGENT_NAME}...</div>
       <!-- The spinner, the seconds counter and the token tally the CLI paints
            into the pane are cut out of the transcript and redrawn here, outside
            the scroll area, off a clock that ticks locally. See updateLiveBar. -->
@@ -21003,13 +22445,13 @@ function renderDetail(){
           <div class="skills-list" id="skills-active-${s.name}"></div>
         </div>
         <div class="skills-section">
-          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with Codex; always available)</span></div>
+          <div class="skills-section-header">Built-in <span class="skills-section-hint">(bundled with ${AGENT_NAME}; always available)</span></div>
           <div class="skills-list" id="skills-builtin-${s.name}"></div>
         </div>
         <div class="skills-editor-wrap" id="skills-editor-wrap-${s.name}" style="display:none">
           <div class="skills-editor-header">
             <input id="skills-filename-${s.name}" placeholder="skill-name (e.g. my-skill)">
-            <input id="skills-description-${s.name}" placeholder="One-line description (used by Codex to discover the skill)">
+            <input id="skills-description-${s.name}" placeholder="One-line description (used by ${AGENT_NAME} to discover the skill)">
             <button class="btn" onclick="saveAccountSkill('${s.name}')">Save</button>
             <button class="btn" onclick="closeSkillEditor('${s.name}')">Cancel</button>
           </div>
@@ -21034,7 +22476,7 @@ function renderDetail(){
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="font-size:.85rem;color:#c9d1d9;margin-top:6px">
-          ${s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
+          ${s.auth_mode==='meta'?'Meta Model API':s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
           <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed for this account</span>
         </div>
       </div>
@@ -21064,13 +22506,14 @@ function renderDetail(){
         <div style="margin-top:8px">${autopushSeg(s.name, s.autopush_mode, false)}</div>
         <div id="autopush-status-${s.name}" style="font-size:.82rem;color:#8b949e;margin-top:8px">${autopushDesc(s.autopush_mode)}</div>
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.5">
-          <b style="color:#8b949e">Off</b> — the dashboard never types into this terminal.<br>
-          <b style="color:#79c0ff">Basic</b> — auto-selects from Codex's option menus and confirms permission/plan prompts (presses Enter), and keeps the session logged in. No free-form messages.<br>
-          <b style="color:#56d364">Full</b> — everything in Basic, plus it writes a "keep going" instruction when Codex pauses or seems to stop before the task is 100% finished.
+          <b style="color:#8b949e">Off</b>: the dashboard never types into this terminal.<br>
+          <b style="color:#79c0ff">Basic</b>: auto-selects from ${AGENT_NAME}'s option menus, confirms permission or plan prompts, and keeps the session logged in. No free-form messages.<br>
+          <b style="color:#56d364">Full</b>: everything in Basic, plus a "keep going" instruction when ${AGENT_NAME} pauses before the task is finished.
         </div>
-        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when Codex is paused waiting for confirmation to keep going on the current task.</div>
+        <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when ${AGENT_NAME} is waiting for confirmation on the current task.</div>
         <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
       </div>
+      ${AGENT_KIND==='muse'?'':`
       <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
@@ -21096,7 +22539,7 @@ function renderDetail(){
           <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
         </div>
         <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
-      </div>
+      </div>`}
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
           <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
@@ -21795,7 +23238,7 @@ async function loadRaw(name){
   const rawEl=document.getElementById('raw-'+name);
   // Wiping to a text node takes the line elements with it — tell the renderer to
   // rebuild rather than diff against lines that no longer exist.
-  if(rawEl){rawEl.textContent='Loading Codex...';rawEl._lineMode=false}
+  if(rawEl){rawEl.textContent='Loading '+AGENT_NAME+'...';rawEl._lineMode=false}
   const infoEl=document.getElementById('raw-info-'+name);
   if(infoEl)infoEl.textContent='Loading terminal...';
   stopRawPolling(name);
@@ -21961,7 +23404,7 @@ async function pollStatus(){
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
   _authPollCount++;
-  if(_authPollCount%5===0)checkCodexAuth();
+  if(AGENT_KIND==='muse'||_authPollCount%5===0)checkCodexAuth();
   // Refresh inline server stats every 3rd poll (~30s)
   if(_authPollCount%3===0)refreshNavStats();
 }
@@ -22001,7 +23444,7 @@ async function refreshCodexAlertBadge(){
     if(!open){el.style.display='none';return}
     const sessions=[...new Set((d.alerts||[]).map(a=>a.session_name==='*'?'all accounts':a.session_name))];
     el.textContent='⚠ '+open+' Codex alert'+(open===1?'':'s');
-    el.title='Codex health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
+    el.title=AGENT_NAME+' health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
     el.style.display='';
   }catch(e){el.style.display='none'}
 }
@@ -22221,6 +23664,7 @@ async function createSessionAuto(){
 
 // ── Connections (Drive / Gmail / Calendar) ──
 async function openConnections(){
+  closeSettings();
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`<h3>Connect data sources</h3><p class="conn-note">Loading…</p>`;
   document.getElementById('modal-overlay').classList.add('active');
@@ -22235,9 +23679,9 @@ async function openConnections(){
       </div>`).join('');
     const note = !d.configured
       ? 'Google connections aren’t configured yet — ask the admin to add the OAuth client.'
-      : (d.mcp_ready ? '' : 'Connected accounts are saved securely; Codex’s live access turns on once the admin enables the Google tool.');
+      : (d.mcp_ready ? '' : 'Connected accounts are saved securely; '+AGENT_NAME+' live access turns on once the Google tool is ready.');
     modal.innerHTML=`<h3>Connect data sources</h3>
-      <p class="conn-note">Give Codex access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
+      <p class="conn-note">Give ${esc(AGENT_NAME)} access to your own Google Drive, Gmail, and Calendar in your sessions.</p>
       ${rows}${note?`<p class="conn-note">${note}</p>`:''}
       <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;
   }catch(e){
@@ -22414,15 +23858,58 @@ function renderUsageHtml(){
     +'<p class="auth-hint" style="margin-top:6px">'+usageNote+'</p>';
 }
 
+function renderMuseUsageHtml(){
+  const u=_usageCache||{};
+  const total=Number(u.totalTokens||0);
+  const cost=Number(u.estimatedCost||0);
+  const rateStatus=u.rateStatus||'normal';
+  const statusColor=rateStatus==='rate_limited'||rateStatus==='error'
+    ? '#f85149'
+    : rateStatus==='recovered' ? '#d29922' : '#3fb950';
+  const costText=cost>0&&cost<0.01 ? cost.toFixed(6) : cost.toFixed(2);
+  return '<hr class="auth-divider">'
+    +'<div class="auth-title" style="margin-bottom:4px">Today\'s API Usage</div>'
+    +'<div class="auth-row"><span class="auth-row-label">Requests</span><span class="auth-row-value">'+Number(u.messages||0)+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Total tokens</span><span class="auth-row-value">'+fmtTokens(total)+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Input / output</span><span class="auth-row-value">'+fmtTokens(Number(u.inputTokens||0))+' / '+fmtTokens(Number(u.outputTokens||0))+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Cache read</span><span class="auth-row-value">'+fmtTokens(Number(u.cacheReadTokens||0))+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Reasoning</span><span class="auth-row-value">'+fmtTokens(Number(u.reasoningTokens||0))+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Estimated cost</span><span class="auth-row-value" style="color:#3fb950">$'+costText+'</span></div>'
+    +'<hr class="auth-divider">'
+    +'<div class="auth-title" style="margin-bottom:4px">Live API Rate</div>'
+    +'<div class="auth-row"><span class="auth-row-label">Output rate</span><span class="auth-row-value">'+fmtRate(Number(u.recentOutputRate||0))+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Requests / min</span><span class="auth-row-value">'+Number(u.requestsPerMinute||0)+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Retries</span><span class="auth-row-value">'+Number(u.retryCount||0)+'</span></div>'
+    +'<div class="auth-row"><span class="auth-row-label">Provider</span><span class="auth-row-value" style="color:'+statusColor+'">'+esc(u.providerStatus||'Waiting for API activity')+'</span></div>';
+}
+
 function renderAuthPanel(){
   const el=document.getElementById('auth-dropdown-content');
   if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
+  if(AGENT_KIND==='muse'){
+    if(_authCache.loggedIn){
+      const credential=_authCache.credential||{};
+      el.innerHTML=`
+        <div class="auth-title">Muse Connected</div>
+        <div class="auth-row"><span class="auth-row-label">Account</span><span class="auth-row-value">${esc(_authCache.email||credential.accountEmail||'Muse Code')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Provider</span><span class="auth-row-value">${esc(credential.providerLabel||'Meta Model API')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Model</span><span class="auth-row-value">${esc(_authCache.model||'muse-spark-1.2-contributor')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Credential</span><span class="auth-row-value" style="color:#3fb950">${esc(credential.credentialLabel||'Verified')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Auth method</span><span class="auth-row-value">${esc(credential.mechanism||credential.obtainedVia||'Managed credential')}</span></div>
+        ${credential.apiHost?`<div class="auth-row"><span class="auth-row-label">API host</span><span class="auth-row-value">${esc(credential.apiHost)}</span></div>`:''}
+        ${renderMuseUsageHtml()}`;
+    }else{
+      el.innerHTML=`<div class="auth-title">Muse — Not Connected</div>
+        <p class="auth-hint">The deployment credential is unavailable. Run <code style="color:#79c0ff">muse login</code> on this server, then restart the service.</p>`;
+    }
+    return;
+  }
   const usageHtml=renderUsageHtml();
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
     el.innerHTML=`
-      <div class="auth-title">Codex Connected</div>
+      <div class="auth-title">${AGENT_NAME} Connected</div>
       <div class="auth-row"><span class="auth-row-label">Email</span><span class="auth-row-value">${esc(_authCache.email||'—')}</span></div>
       <div class="auth-row"><span class="auth-row-label">Plan</span><span class="auth-row-value"><span class="auth-plan-badge ${planClass}">${esc(plan)}</span></span></div>
       <div class="auth-row"><span class="auth-row-label">Auth</span><span class="auth-row-value">${esc(_authCache.authMode||'—')}</span></div>
@@ -22434,7 +23921,7 @@ function renderAuthPanel(){
     `;
   }else{
     el.innerHTML=`
-      <div class="auth-title">Codex — Not Connected</div>
+      <div class="auth-title">${AGENT_NAME} — Not Connected</div>
       <button class="auth-btn auth-btn-primary" style="margin-bottom:10px" onclick="document.getElementById('auth-dropdown').classList.remove('active');openSettings('login')">Sign in with ChatGPT</button>
       <p class="auth-hint">Or configure a fallback OpenAI API key for usage-based access:</p>
       <input type="password" class="auth-api-input" id="auth-api-key-input"
@@ -22626,26 +24113,31 @@ async function loadSessionStats(name){
     const resp=await fetch(BASE+'/api/sessions/'+name+'/stats');
     const st=await resp.json();
     if(!st.available){
-      panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Codex activity.</span>';
+      panel.innerHTML='<span style="color:#6e7681">No token data yet. Waiting for '+esc(AGENT_NAME)+' activity.</span>';
       return;
     }
     const rateCls=st.rateStatus;
-    const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    const rateLabel=rateCls==='rate_limited'?'Rate limited':rateCls==='recovered'?'Recovered':rateCls==='error'?'Provider error':rateCls==='severely_limited'?'Severely limited':rateCls==='limited'?'Limited':'Normal';
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
+    const cost=Number(st.estimatedCost||0);
+    const costText=cost>0&&cost<0.01?cost.toFixed(6):cost.toFixed(2);
     panel.innerHTML=`
       <div class="stats-grid">
         <div class="stat-item"><span class="stat-label">Model</span><span class="stat-value"><span class="model-tag">${esc(st.model)}</span></span></div>
         <div class="stat-item"><span class="stat-label">Messages</span><span class="stat-value">${st.messageCount}</span></div>
         <div class="stat-item"><span class="stat-label">Input tokens</span><span class="stat-value">${fmtTokens(st.totalInput)}</span></div>
         <div class="stat-item"><span class="stat-label">Output tokens</span><span class="stat-value">${fmtTokens(st.totalOutput)}</span></div>
+        ${AGENT_KIND==='muse'?`<div class="stat-item"><span class="stat-label">Reasoning</span><span class="stat-value">${fmtTokens(st.reasoningTokens||0)}</span></div>`:''}
         <div class="stat-item"><span class="stat-label">Cache read</span><span class="stat-value">${fmtTokens(st.cacheRead)}</span></div>
         <div class="stat-item"><span class="stat-label">Cache write</span><span class="stat-value">${fmtTokens(st.cacheCreate)}</span></div>
         <div class="stats-divider"></div>
-        <div class="stat-item"><span class="stat-label">API equiv.</span><span class="stat-value cost">$${st.estimatedCost.toFixed(2)}</span></div>
+        <div class="stat-item"><span class="stat-label">Estimated API cost</span><span class="stat-value cost">$${costText}</span></div>
         <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
         <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
         <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
+        ${AGENT_KIND==='muse'?`<div class="stat-item"><span class="stat-label">Requests / min</span><span class="stat-value">${st.requestsPerMinute||0}</span></div>
+        <div class="stat-item"><span class="stat-label">Last response</span><span class="stat-value">${st.lastDurationMs?Math.round(st.lastDurationMs/100)/10+'s':'—'}</span></div>`:''}
       </div>
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
         <span style="font-size:.75rem;color:#8b949e">Rate</span>
@@ -22653,6 +24145,7 @@ async function loadSessionStats(name){
         <span style="font-size:.75rem;color:#6e7681">${fmtRate(st.recentOutputRate)} output</span>
         <span style="font-size:.65rem;color:#484f58">peak ${fmtRate(st.peakOutputRate)}</span>
       </div>
+      ${AGENT_KIND==='muse'?`<div style="font-size:.72rem;color:#8b949e;margin-top:7px">${esc(st.providerStatus||'Waiting for API activity')}${st.retryCount?' · '+st.retryCount+' retries':''}</div>`:''}
       <div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
@@ -22665,7 +24158,7 @@ async function loadSessionStats(name){
 function startStatsPolling(name){
   stopStatsPolling();
   loadSessionStats(name);
-  _statsTimers[name]=setInterval(()=>loadSessionStats(name),15000);
+  _statsTimers[name]=setInterval(()=>loadSessionStats(name),AGENT_KIND==='muse'?5000:15000);
 }
 function stopStatsPolling(){
   Object.values(_statsTimers).forEach(t=>clearInterval(t));
@@ -22675,14 +24168,14 @@ function stopStatsPolling(){
 // ── Auto-push (auto-responder + autopilot watchdog) ──
 let _watchdogTimers={};
 const AUTOPUSH_TITLES={
-  off:'Off — the dashboard never types into this terminal',
-  basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
-  full:'Full — Basic, plus write a "keep going" instruction when Codex pauses before finishing'
+  off:'Off: the dashboard never types into this terminal',
+  basic:"Basic: auto-pick option menus, confirm permission or plan prompts, keep logged in",
+  full:'Full: Basic plus a "keep going" instruction when the agent pauses before finishing'
 };
 function autopushDesc(mode){
-  return ({off:'Off — no auto-typing',
-           basic:'Basic — picks options + confirms prompts',
-           full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
+  return ({off:'Off: no auto-typing',
+           basic:'Basic: picks options and confirms prompts',
+           full:'Full: options, confirms and keep-going nudges'})[mode||'basic'];
 }
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
 function autopushSeg(name,mode,compact){
@@ -23168,7 +24661,7 @@ async function sendSlashCommand(name,cmd){
 
 // ── Skills Tab ──
 // Skills are account-scoped: every session owned by the signed-in account uses
-// the same CODEX_HOME/skills directory.
+// the selected agent's native personal skill directory.
 let _builtinSkillsCache=null;
 let _editingSkillName=null;
 
@@ -23192,7 +24685,7 @@ async function loadAccountSkills(sessionName){
     if(!activeResp.ok)throw new Error(activeData.error||'Failed to load account skills');
     if(!builtinResp.ok)throw new Error(builtinData.error||'Failed to load built-in skills');
     _builtinSkillsCache=builtinData.skills||[];
-    if(meta)meta.innerHTML='Account skills: <code>'+esc(activeData.path||'CODEX_HOME/skills')+'</code>';
+    if(meta)meta.innerHTML='Account skills: <code>'+esc(activeData.path||(AGENT_KIND==='muse'?'~/.agents/skills':'CODEX_HOME/skills'))+'</code>';
     renderAccountSkills(sessionName,activeData);
     renderBuiltinSkills(sessionName,_builtinSkillsCache);
   }catch(e){
@@ -23251,7 +24744,7 @@ function newAccountSkill(sessionName){
   nameEl.value='';
   nameEl.disabled=false;
   if(descEl)descEl.value='';
-  editor.value='# New skill\n\nDescribe the workflow and when Codex should use it.\n';
+  editor.value='# New skill\n\nDescribe the workflow and when '+AGENT_NAME+' should use it.\n';
   wrap.style.display='flex';
   nameEl.focus();
 }
@@ -23343,7 +24836,7 @@ async function applyRoleVisibility(){
   document.body.classList.toggle('member-simple', MEMBER_SIMPLE);
   document.body.classList.toggle('member-admin', isAdmin);
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
-    el.style.display = isAdmin ? '' : 'none';
+    el.style.display = (isAdmin&&!(AGENT_KIND==='muse'&&el.classList.contains('codex-only'))) ? '' : 'none';
   });
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
@@ -23370,13 +24863,18 @@ async function doLogout(){
 }
 
 // ── Settings modal ────────────────────────────────────────────────────────
-let _settingsActiveTab = 'mycontext';
+let _settingsActiveTab = SETTINGS_TAB_DEFS.length?SETTINGS_TAB_DEFS[0].id:'history';
 let _settingsHistoryDetail = null; // {session_name, ...} or null when showing list
 
 async function openSettings(tab){
   await loadCurrentUser();
   closeUsers();
-  _settingsActiveTab = tab || 'mycontext';
+  const isAdmin=!!(_currentUser&&_currentUser.role==='admin');
+  const available=SETTINGS_TAB_DEFS.filter(t=>!SETTINGS_ADMIN_IDS.has(t.id)||isAdmin);
+  const requested=tab||_settingsActiveTab;
+  _settingsActiveTab=available.some(t=>t.id===requested)
+    ? requested
+    : (available.length?available[0].id:'history');
   _settingsHistoryDetail = null;
   const overlay = document.getElementById('settings-overlay');
   overlay.classList.add('active');
@@ -23393,15 +24891,7 @@ function closeSettings(){
 function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
-  const tabs = [
-    {id:'mycontext', label:'My Context'},
-    {id:'history',   label:'History'},
-    {id:'browser',   label:'Browser'},
-  ];
-  if(isAdmin) tabs.splice(1,0,{id:'global', label:'Global Instructions'});
-  if(isAdmin) tabs.push({id:'context', label:'Context Files'});
-  if(isAdmin) tabs.push({id:'apis', label:'APIs'});
-  if(isAdmin) tabs.push({id:'login', label:'Login'});
+  const tabs = SETTINGS_TAB_DEFS.filter(t=>!SETTINGS_ADMIN_IDS.has(t.id)||isAdmin);
   tabsEl.innerHTML = tabs.map(t =>
     `<div class="settings-tab${_settingsActiveTab===t.id?' active':''}" onclick="switchSettingsTab('${t.id}')">${t.label}</div>`
   ).join('');
@@ -23416,7 +24906,10 @@ function switchSettingsTab(tab){
 
 function renderSettingsContent(){
   const el = document.getElementById('settings-content');
-  if(_settingsActiveTab === 'mycontext'){
+  if(_settingsActiveTab === 'runtime'){
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading Muse runtime…</div></div>';
+    loadMuseRuntime();
+  }else if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
   }else if(_settingsActiveTab === 'global'){
@@ -23445,6 +24938,53 @@ function renderSettingsContent(){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading login status…</div></div>';
     loadLoginTab();
   }
+}
+
+async function loadMuseRuntime(){
+  const el=document.getElementById('settings-content');
+  let d;
+  try{
+    const response=await fetch(BASE+'/api/auth/codex-status');
+    d=await response.json();
+    if(!response.ok)throw new Error(d.error||'Failed to load Muse runtime');
+  }catch(e){
+    el.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load Muse runtime: '+esc(e.message||e)+'</div></div>';
+    return;
+  }
+  const details=d.details||{};
+  const credential=d.credential||{};
+  const connected=!!d.loggedIn;
+  const status=connected
+    ? '<span class="bs-dot on"></span> <b>Muse Code is connected.</b>'
+    : '<span class="bs-dot off"></span> <b>Muse Code is not ready.</b> '+esc(d.error||'');
+  const row=(label,value)=>'<label>'+esc(label)+'</label><div class="my-ctx-path" style="margin-bottom:12px;color:#c9d1d9">'+esc(value||'—')+'</div>';
+  el.innerHTML='<div class="settings-section">'+
+    '<div class="pf-banner">'+status+'</div>'+
+    row('Provider',d.subscriptionType||'Meta Model API')+
+    row('Muse Code version',details.version||'unknown')+
+    row('Executable',details.binary||'unknown')+
+    row('Model',d.model||'unknown')+
+    row('Reasoning effort',d.effort||'unknown')+
+    row('Account',d.email||credential.accountEmail||'unknown')+
+    row('Credential',credential.credentialLabel||(details.auth_configured?'Verified in private storage':'Not configured'))+
+    row('API host',credential.apiHost||'managed by Muse')+
+    row('Config home',details.config_home||'unknown')+
+    row('Session data',details.data_home||'unknown')+
+    row('Skills',(details.skills_total||0)+' total ('+(details.skills_user||0)+' personal, '+(details.skills_builtin||0)+' built-in)')+
+    row('MCP servers',(details.mcp_servers||[]).join(', ')||'none')+
+    row('Advisor bridge',details.advisor_mcp_ready?'Connected with owner-bound token':'Not ready')+
+    row('Google Workspace',details.google_mcp_ready
+      ? ((details.google_services||[]).length
+          ? 'Connected: '+details.google_services.join(', ')
+          : 'Tool server ready; account sign-in required')
+      : 'Not ready')+
+    row('Account browser',details.browser_mcp_ready?'playwright-browser bound to default (owner admin)':'Not ready')+
+    row('Native memory tools',(details.memory_tools||[]).join(', ')||'none')+
+    row('Project context','AGENTS.md plus the managed Muse runtime contract')+
+    row('Auto-push','Off, Basic and Full modes are available per session')+
+    '<div class="my-ctx-actions" style="margin:4px 0 14px"><button class="btn btn-full" onclick="openConnections()">Manage Google connections</button></div>'+
+    '<div class="pf-banner" style="color:#8b949e">Muse credentials, settings, native memories and session logs stay in the isolated Muse directories shown above. The Advisor credential is loaded at process startup from owner-private storage and its value is never written to Muse settings.</div>'+
+    '</div>';
 }
 
 // --- Header browser-session badge ------------------------------------------
@@ -25235,7 +26775,7 @@ function renderStats(s,usage,byUser,alerts){
     const shown=(open.length?open:alerts.alerts).slice(0,12);
     const title=open.length
       ?open.length+' open Codex alert'+(open.length===1?'':'s')
-      :'Codex health (all clear)';
+      :AGENT_NAME+' health (all clear)';
     html+='<div class="stats-section"><div class="stats-section-title">'+esc(title)
       +' <button class="users-plain-btn" style="float:right;font-size:.65rem" onclick="clearCodexAlerts()">Clear</button></div>';
     if(alerts.auth&&alerts.auth.loggedIn===false){
@@ -25432,6 +26972,17 @@ bootstrapDashboard();
 # Inject the actual ROOT_PATH into the JS BASE variable
 HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
+HTML_PAGE = HTML_PAGE.replace("__AGENT_KIND__", AGENT_KIND)
+HTML_PAGE = HTML_PAGE.replace("__AGENT_NAME__", AGENT_DISPLAY_NAME)
+HTML_PAGE = HTML_PAGE.replace(
+    "__SETTINGS_TAB_DEFS__",
+    "["
+    + ",".join(
+        "{id:" + repr(row["id"]) + ", label:" + repr(row["label"]) + "}"
+        for row in _settings_tab_defs(True)
+    )
+    + "]",
+)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
 _GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
