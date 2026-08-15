@@ -10999,7 +10999,18 @@ async def api_delete_session(request: Request, session_name: str):
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
+            # Killing the pane's child process can make a wrapper shell exit,
+            # which closes the tmux session just before kill-session runs.
+            # That race is already the requested outcome; still clear the
+            # dashboard's retained owner/runtime state below.
+            still_exists = any(
+                row.get("name") == session_name for row in get_tmux_sessions()
+            )
+            if still_exists:
+                return JSONResponse(
+                    {"error": result.stderr.strip() or "Failed to kill session"},
+                    status_code=500,
+                )
         # Clean up all per-session state from global dicts
         cache.pop(session_name, None)
         _auto_approve_sent.pop(session_name, None)

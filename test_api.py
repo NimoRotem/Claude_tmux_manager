@@ -1934,6 +1934,21 @@ class TestDeleteSession:
         assert resp.status_code == 500
         assert "error" in resp.json()
 
+    @patch("app.get_tmux_sessions", side_effect=[MOCK_SESSIONS, []])
+    @patch("app.subprocess.run")
+    def test_delete_session_accepts_wrapper_exit_race(self, mock_run, mock_sessions, authed_client):
+        """Child cleanup may close the pane before tmux kill-session runs."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="can't find session: test-session",
+        )
+
+        resp = authed_client.delete("/api/sessions/test-session")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "killed": "test-session"}
+
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
     def test_delete_session_with_pane_pids(self, mock_run, mock_sessions, authed_client):
