@@ -706,6 +706,53 @@ print(json.dumps({"visible": app._session_is_codex("foreign-session"), "processC
     assert json.loads(result.stdout) == {"visible": False, "processCalls": 0}
 
 
+def test_grok_activity_detection_sees_agent_behind_launch_wrapper(tmp_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "TMUX_DASH_AGENT": "grok",
+            "TMUX_DASH_STATE_DIR": str(tmp_path / "dashboard-state"),
+            "TMUX_DASH_SECRET": "grok-test-secret",
+            "TMUX_DASH_PASS": "grok-test-pass",
+        }
+    )
+    probe = r'''
+import json
+from types import SimpleNamespace
+import app
+
+visible = """GROK_DIAG_READY
+Worked for 6.1s
+Help improve Grok
+Off by default. Opt-in to allow diagnostic data.
+Read Terms and Privacy Policy.
+"""
+
+def fake_run(args, **_kwargs):
+    if args[:2] == ["tmux", "display-message"]:
+        return SimpleNamespace(returncode=0, stdout="bash:123\n", stderr="")
+    if args[:2] == ["tmux", "capture-pane"]:
+        return SimpleNamespace(returncode=0, stdout=visible, stderr="")
+    raise AssertionError(args)
+
+app.subprocess.run = fake_run
+app._process_tree_snapshot = lambda: ({"123": ["124"]}, {"123": "bash", "124": "grok"})
+print(json.dumps(app._detect_activity_raw("wrapped-grok")))
+'''
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "idle", "command": "bash", "detail": ""}
+
+
 def test_grok_dashboard_runtime_ui_uses_native_labels_and_project_files(tmp_path):
     env = os.environ.copy()
     env.update(

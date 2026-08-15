@@ -1907,8 +1907,26 @@ def _load_autopush_mode():
         logger.debug("Failed to load autopush-mode map", exc_info=True)
 
 
+def _pane_has_live_agent(pane_pid: str) -> bool:
+    """Return whether a pane root has the selected native agent below it."""
+    if not pane_pid.isdigit():
+        return False
+    children, commands = _process_tree_snapshot()
+    pending = [pane_pid]
+    seen: set[str] = set()
+    while pending and len(seen) < 10000:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if _is_agent_process_command(commands.get(current, "")):
+            return True
+        pending.extend(children.get(current, ()))
+    return False
+
+
 def _is_codex_running(session_name: str) -> bool:
-    """Return True only when the tmux pane has a live Codex descendant."""
+    """Return True only when the tmux pane has a live agent descendant."""
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-t", session_name, "-p", "#{pane_pid}"],
@@ -1919,18 +1937,7 @@ def _is_codex_running(session_name: str) -> bool:
         pane_pid = (result.stdout or "").strip()
         if not pane_pid.isdigit():
             return False
-        children, commands = _process_tree_snapshot()
-        pending = [pane_pid]
-        seen: set[str] = set()
-        while pending and len(seen) < 10000:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            if _is_agent_process_command(commands.get(current, "")):
-                return True
-            pending.extend(children.get(current, ()))
-        return False
+        return _pane_has_live_agent(pane_pid)
     except Exception:
         return False
 
@@ -8432,6 +8439,8 @@ def _detect_activity_raw(session_name: str) -> dict:
 
         parts = result.stdout.strip().split(":")
         cmd = parts[0] if parts else ""
+        pane_pid = parts[1] if len(parts) > 1 else ""
+        has_live_agent = _is_agent_process_command(cmd) or _pane_has_live_agent(pane_pid)
         info["command"] = cmd
 
         # Capture the very bottom of the visible pane — this is the ground truth.
@@ -8569,7 +8578,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         # If the terminal hasn't changed in 20+ seconds and the foreground
         # command is codex/node, it's almost certainly idle — the text-based
         # checks above may have missed it or the output just looks ambiguous.
-        if content_is_static and (_is_agent_process_command(cmd) or cmd.lower() == "node"):
+        if content_is_static and (has_live_agent or cmd.lower() == "node"):
             info["status"] = "idle"
             info["detail"] = ""
             return info
@@ -8577,17 +8586,18 @@ def _detect_activity_raw(session_name: str) -> dict:
         # --- Step 7: Shell prompt check ---
         last_line = bottom[-1].strip() if bottom else ""
         shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
-        if cmd.lower() in shell_cmds:
+        if has_live_agent or cmd.lower() == "node":
+            # Supervisor/systemd wrappers may remain the pane's foreground
+            # command while the actual agent is their live child.
+            info["status"] = "idle"
+            info["detail"] = ""
+        elif cmd.lower() in shell_cmds:
             if _RE_SHELL_PROMPT.search(last_line) or not last_line:
                 info["status"] = "idle"
                 info["detail"] = "Shell prompt"
             else:
                 info["status"] = "busy"
                 info["detail"] = cmd
-        elif _is_agent_process_command(cmd) or cmd.lower() == "node":
-            # A live agent with no spinner + no "esc to interrupt" is idle.
-            info["status"] = "idle"
-            info["detail"] = ""
         else:
             info["status"] = "busy"
             info["detail"] = cmd
