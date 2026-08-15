@@ -66,9 +66,9 @@ STATE_DIR = Path(
     os.environ.get("TMUX_DASH_STATE_DIR", str(Path.home() / ".tmux-dashboard"))
 ).expanduser()
 AGENT_KIND = os.environ.get("TMUX_DASH_AGENT", "codex").strip().lower()
-if AGENT_KIND not in {"codex", "muse"}:
+if AGENT_KIND not in {"codex", "muse", "grok"}:
     AGENT_KIND = "codex"
-AGENT_DISPLAY_NAME = "Muse" if AGENT_KIND == "muse" else "Codex"
+AGENT_DISPLAY_NAME = {"codex": "Codex", "muse": "Muse", "grok": "Grok"}[AGENT_KIND]
 
 
 def _agent_supports_codex_controls() -> bool:
@@ -81,14 +81,19 @@ def _agent_supports_autopush() -> bool:
 
     Away Mode, Go Nuts, Codex auth switching, and model hot-swapping remain
     Codex-specific. Auto-push only needs a detectable idle composer plus tmux
-    input, both of which Muse provides.
+    input, which both Muse and Grok provide.
     """
-    return AGENT_KIND in {"codex", "muse"}
+    return AGENT_KIND in {"codex", "muse", "grok"}
+
+
+def _agent_process_search_name() -> str:
+    """Return the native executable name used by the system-stats probe."""
+    return {"codex": "codex", "muse": "muse", "grok": "grok"}[AGENT_KIND]
 
 
 def _settings_tab_defs(is_admin: bool) -> list[dict[str, str]]:
     """Return settings workspaces that are meaningful for the selected agent."""
-    if AGENT_KIND == "muse":
+    if AGENT_KIND in {"muse", "grok"}:
         tabs = [
             {"id": "runtime", "label": "Runtime"},
             {"id": "history", "label": "History"},
@@ -161,6 +166,52 @@ MUSE_ADVISOR_TOKEN_FILE = Path(
         str(Path.home() / ".advisor-token"),
     )
 ).expanduser()
+GROK_BINARY = Path(
+    os.environ.get("TMUX_DASH_GROK_BINARY", str(Path.home() / ".grok/bin/grok"))
+).expanduser()
+GROK_HOME = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_HOME",
+        str(STATE_DIR / "grok-home"),
+    )
+).expanduser()
+GROK_MCP_PYTHON = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_MCP_PYTHON",
+        str(Path.home() / ".tmux-dashboard" / "mcp" / "venv" / "bin" / "python"),
+    )
+).expanduser()
+GROK_MCP_BRIDGE = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_MCP_BRIDGE",
+        str(Path(__file__).resolve().parent / "muse_mcp_bridge.py"),
+    )
+).expanduser()
+GROK_GOOGLE_MCP_SCRIPT = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_GOOGLE_MCP_SCRIPT",
+        str(Path(__file__).resolve().with_name("google_workspace_mcp.py")),
+    )
+).expanduser()
+GROK_BROWSER_MCP_PROXY = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_BROWSER_MCP_PROXY",
+        str(Path(__file__).resolve().with_name("browser_mcp_lease_proxy.py")),
+    )
+).expanduser()
+GROK_ADVISOR_URL = os.environ.get(
+    "TMUX_DASH_GROK_ADVISOR_URL",
+    "https://advisor.rotem.ai/mcp",
+).strip()
+GROK_ADVISOR_TOKEN_FILE = Path(
+    os.environ.get(
+        "TMUX_DASH_GROK_ADVISOR_TOKEN_FILE",
+        str(Path.home() / ".advisor-token"),
+    )
+).expanduser()
+_GROK_MIN_CLI_VERSION = os.environ.get(
+    "TMUX_DASH_MIN_GROK_VERSION", "1.0.4"
+).strip()
 PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
@@ -173,7 +224,12 @@ NEW_SESSION_CMD = os.environ.get(
     (
         f"{shlex.quote(str(MUSE_BINARY))} --yolo"
         if AGENT_KIND == "muse"
-        else "codex --dangerously-bypass-approvals-and-sandbox"
+        else (
+            f"{shlex.quote(str(GROK_BINARY))} --always-approve "
+            "--reasoning-effort xhigh --experimental-memory"
+            if AGENT_KIND == "grok"
+            else "codex --dangerously-bypass-approvals-and-sandbox"
+        )
     ),
 )
 # Where the codex CLI keeps its state. Mirrors $CODEX_HOME.
@@ -184,24 +240,36 @@ _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
     os.environ.get(
         "CODEX_DEFAULT_MODEL",
-        "muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol",
+        (
+            "muse-spark-1.2-contributor"
+            if AGENT_KIND == "muse"
+            else "grok-4.6" if AGENT_KIND == "grok" else "gpt-5.6-sol"
+        ),
     ),
-).strip() or ("muse-spark-1.2-contributor" if AGENT_KIND == "muse" else "gpt-5.6-sol")
+).strip() or (
+    "muse-spark-1.2-contributor"
+    if AGENT_KIND == "muse"
+    else "grok-4.6" if AGENT_KIND == "grok" else "gpt-5.6-sol"
+)
 _CODEX_REASONING_EFFORTS = (
     ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
     if AGENT_KIND == "muse"
-    else ("none", "low", "medium", "high", "xhigh", "max")
+    else (
+        ("low", "medium", "high", "xhigh")
+        if AGENT_KIND == "grok"
+        else ("none", "low", "medium", "high", "xhigh", "max")
+    )
 )
 _CODEX_REASONING_EFFORT_ALIASES = (
     {}
-    if AGENT_KIND == "muse"
+    if AGENT_KIND in {"muse", "grok"}
     else {"ultra": "max", "extra-high": "xhigh", "extra_high": "xhigh"}
 )
 _CODEX_DEFAULT_REASONING_EFFORT = os.environ.get(
     "TMUX_DASH_DEFAULT_REASONING_EFFORT",
     os.environ.get(
         "CODEX_DEFAULT_REASONING_EFFORT",
-        "high" if AGENT_KIND == "muse" else "max",
+        "high" if AGENT_KIND == "muse" else "xhigh" if AGENT_KIND == "grok" else "max",
     ),
 ).strip().lower()
 _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
@@ -209,7 +277,9 @@ _CODEX_DEFAULT_REASONING_EFFORT = _CODEX_REASONING_EFFORT_ALIASES.get(
     _CODEX_DEFAULT_REASONING_EFFORT,
 )
 if _CODEX_DEFAULT_REASONING_EFFORT not in _CODEX_REASONING_EFFORTS:
-    _CODEX_DEFAULT_REASONING_EFFORT = "high" if AGENT_KIND == "muse" else "max"
+    _CODEX_DEFAULT_REASONING_EFFORT = (
+        "high" if AGENT_KIND == "muse" else "xhigh" if AGENT_KIND == "grok" else "max"
+    )
 
 # Codex 0.146 can leave its TUI blocked in MCP startup for minutes when the
 # OpenAI developer-docs HTTP server is configured. Dashboard sessions have web
@@ -228,14 +298,18 @@ _SEED_MODEL_CATALOG = (
         ["muse-spark-1.2", "Muse Spark 1.2"],
     ]
     if AGENT_KIND == "muse"
-    else [
-        ["gpt-5.6-sol", "GPT-5.6 Sol"],
-        ["gpt-5.6", "GPT-5.6 (Sol alias)"],
-        ["gpt-5.6-terra", "GPT-5.6 Terra"],
-        ["gpt-5.6-luna", "GPT-5.6 Luna"],
-        ["gpt-5.5", "GPT-5.5"],
-        ["gpt-5.4", "GPT-5.4"],
-    ]
+    else (
+        [["grok-4.6", "Grok 4.6"]]
+        if AGENT_KIND == "grok"
+        else [
+            ["gpt-5.6-sol", "GPT-5.6 Sol"],
+            ["gpt-5.6", "GPT-5.6 (Sol alias)"],
+            ["gpt-5.6-terra", "GPT-5.6 Terra"],
+            ["gpt-5.6-luna", "GPT-5.6 Luna"],
+            ["gpt-5.5", "GPT-5.5"],
+            ["gpt-5.4", "GPT-5.4"],
+        ]
+    )
 )
 
 
@@ -262,7 +336,7 @@ def _save_model_catalog(catalog: list, last_check: float = 0.0):
 
 def _fetch_codex_model_catalog() -> list:
     """Read the model catalog bundled with the installed Codex CLI."""
-    if AGENT_KIND == "muse":
+    if AGENT_KIND in {"muse", "grok"}:
         return [list(row) for row in _SEED_MODEL_CATALOG]
     result = subprocess.run(
         ["codex", "debug", "models", "--bundled"],
@@ -359,10 +433,180 @@ def _muse_skills_inventory() -> list[dict]:
     return inventory
 
 
+def _grok_skills_inventory() -> list[dict]:
+    """Return the skills Grok itself reports after all discovery layers."""
+    configured = str(GROK_BINARY)
+    binary = configured if GROK_BINARY.is_absolute() else (shutil.which(configured) or configured)
+    grok_env = os.environ.copy()
+    grok_env.update(
+        {
+            "GROK_HOME": str(GROK_HOME),
+            "GROK_TELEMETRY_ENABLED": "0",
+            "GROK_FEEDBACK_ENABLED": "0",
+        }
+    )
+    result = subprocess.run(
+        [binary, "inspect", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=grok_env,
+    )
+    if result.returncode != 0:
+        return []
+    payload = json.loads(result.stdout or "{}")
+    rows = payload.get("skills") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return []
+    inventory = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        inventory.append(
+            {
+                "name": name,
+                "description": str(row.get("description") or "").strip(),
+                "scope": str(source.get("type") or "").strip(),
+                "path": str(source.get("path") or "").strip(),
+                "userInvocable": bool(row.get("userInvocable", True)),
+            }
+        )
+    return inventory
+
+
+def _grok_cli_readiness() -> tuple[bool, str, dict]:
+    """Validate the isolated Grok CLI, refreshable login, and Advisor bridge."""
+    configured = str(GROK_BINARY)
+    binary = configured if GROK_BINARY.is_absolute() else (shutil.which(configured) or "")
+    details = {
+        "agent": AGENT_KIND,
+        "binary": binary,
+        "minimum": _GROK_MIN_CLI_VERSION,
+        "version": "",
+        "auth_configured": False,
+        "auth_refreshable": False,
+        "account_email": "",
+        "grok_home": str(GROK_HOME),
+        "mcp_servers": [],
+        "mcp_bridge_ready": False,
+        "advisor_token_ready": False,
+        "advisor_mcp_ready": False,
+        "google_mcp_ready": False,
+        "google_services": [],
+        "browser_mcp_ready": False,
+        "browser_id": "default",
+        "skills_total": 0,
+        "skills_user": 0,
+        "skills_builtin": 0,
+        "memory_tools": ["memory_search", "memory_get", "/memory", "/flush"],
+    }
+    if not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
+        return False, "the Grok CLI is not installed", details
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        )
+        output = ((result.stdout or "") + " " + (result.stderr or "")).strip()
+        match = re.search(r"(\d+\.\d+\.\d+)", output)
+        details["version"] = match.group(1) if match else ""
+        if result.returncode != 0 or not details["version"]:
+            return False, "the Grok CLI version could not be determined", details
+        current = tuple(int(part) for part in details["version"].split("."))
+        minimum = tuple(int(part) for part in _GROK_MIN_CLI_VERSION.split("."))
+        if current < minimum:
+            return False, f"Grok {details['version']} is older than required {_GROK_MIN_CLI_VERSION}", details
+    except Exception as exc:
+        return False, f"Grok CLI check failed: {type(exc).__name__}", details
+
+    auth_file = GROK_HOME / "auth.json"
+    try:
+        auth_stat = auth_file.stat()
+        if auth_stat.st_mode & 0o077:
+            return False, "the Grok credential permissions are too broad", details
+        auth = json.loads(auth_file.read_text())
+        rows = [row for row in auth.values() if isinstance(row, dict)] if isinstance(auth, dict) else []
+        active = next((row for row in rows if str(row.get("key") or "").strip()), {})
+        details["auth_configured"] = bool(active)
+        details["auth_refreshable"] = bool(str(active.get("refresh_token") or "").strip())
+        details["account_email"] = str(active.get("email") or "").strip()
+    except Exception:
+        pass
+    if not details["auth_configured"]:
+        return False, "the Grok credential is not configured", details
+    if not details["auth_refreshable"]:
+        return False, "the Grok login cannot refresh unattended", details
+
+    try:
+        config = tomllib.loads((GROK_HOME / "config.toml").read_text())
+        servers = config.get("mcp_servers") if isinstance(config, dict) else {}
+        if isinstance(servers, dict):
+            details["mcp_servers"] = sorted(str(name) for name in servers)
+    except Exception:
+        pass
+    details["mcp_bridge_ready"] = bool(
+        GROK_MCP_PYTHON.is_file()
+        and os.access(GROK_MCP_PYTHON, os.X_OK)
+        and GROK_MCP_BRIDGE.is_file()
+    )
+    if os.environ.get("ADVISOR_TOKEN", "").strip():
+        details["advisor_token_ready"] = True
+    else:
+        try:
+            token_stat = GROK_ADVISOR_TOKEN_FILE.stat()
+            details["advisor_token_ready"] = bool(
+                token_stat.st_uid == os.geteuid()
+                and not token_stat.st_mode & 0o077
+                and token_stat.st_size > 0
+            )
+        except OSError:
+            pass
+    details["advisor_mcp_ready"] = bool(
+        "advisor" in details["mcp_servers"]
+        and details["mcp_bridge_ready"]
+        and details["advisor_token_ready"]
+    )
+    details["google_mcp_ready"] = bool(
+        "google" in details["mcp_servers"]
+        and GROK_MCP_PYTHON.is_file()
+        and GROK_GOOGLE_MCP_SCRIPT.is_file()
+    )
+    google_credentials = MESSAGES_DIR / "connections" / "admin"
+    details["google_services"] = [
+        service
+        for service in ("drive", "gmail", "calendar")
+        if (google_credentials / f"{service}.json").is_file()
+    ]
+    details["browser_mcp_ready"] = bool(
+        "playwright-browser" in details["mcp_servers"]
+        and GROK_MCP_PYTHON.is_file()
+        and GROK_BROWSER_MCP_PROXY.is_file()
+    )
+    try:
+        skills = _grok_skills_inventory()
+        details["skills_total"] = len(skills)
+        details["skills_user"] = sum(
+            skill.get("scope") in {"personal", "user"} for skill in skills
+        )
+        details["skills_builtin"] = sum(
+            skill.get("scope") in {"built-in", "bundled"} for skill in skills
+        )
+    except Exception:
+        logger.debug("Could not inventory Grok skills", exc_info=True)
+    if not details["advisor_mcp_ready"]:
+        return False, "the owner-bound Advisor MCP is not ready", details
+    return True, "ready", details
+
+
 def _agent_cli_readiness() -> tuple[bool, str, dict]:
     """Validate the selected CLI and its local credential before pane launch."""
-    if AGENT_KIND != "muse":
+    if AGENT_KIND == "codex":
         return _codex_cli_readiness()
+    if AGENT_KIND == "grok":
+        return _grok_cli_readiness()
     configured = str(MUSE_BINARY)
     binary = configured if MUSE_BINARY.is_absolute() else (shutil.which(configured) or "")
     details = {
@@ -512,6 +756,34 @@ def _muse_credential_display() -> dict:
     }
 
 
+def _grok_credential_display() -> dict:
+    """Return xAI account identity without returning either bearer token."""
+    try:
+        auth = json.loads((GROK_HOME / "auth.json").read_text())
+    except Exception:
+        return {}
+    rows = [row for row in auth.values() if isinstance(row, dict)] if isinstance(auth, dict) else []
+    active = next((row for row in rows if str(row.get("key") or "").strip()), {})
+    if not active:
+        return {}
+    full_name = " ".join(
+        part
+        for part in (
+            str(active.get("first_name") or "").strip(),
+            str(active.get("last_name") or "").strip(),
+        )
+        if part
+    )
+    return {
+        "provider": "xai",
+        "providerLabel": "xAI",
+        "accountEmail": str(active.get("email") or "").strip(),
+        "accountName": full_name,
+        "mechanism": str(active.get("auth_mode") or "device_auth").strip(),
+        "credentialLabel": "xAI account",
+    }
+
+
 def _ensure_muse_runtime_settings() -> bool:
     """Merge the owner-bound Advisor bridge into Muse's private settings.
 
@@ -597,6 +869,110 @@ def _ensure_muse_runtime_settings() -> bool:
         return True
     except Exception:
         logger.exception("Could not configure Muse runtime settings")
+        return False
+
+
+_GROK_RUNTIME_CONFIG_BEGIN = "# BEGIN GROK DASHBOARD RUNTIME (managed)"
+_GROK_RUNTIME_CONFIG_END = "# END GROK DASHBOARD RUNTIME (managed)"
+
+
+def _grok_toml_string(value: str | Path) -> str:
+    """Render a TOML basic string using JSON's compatible escaping rules."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _ensure_grok_runtime_config() -> bool:
+    """Repair Grok's owner-bound MCPs without replacing xAI-owned settings."""
+    if AGENT_KIND != "grok":
+        return True
+    config_file = GROK_HOME / "config.toml"
+    try:
+        GROK_HOME.mkdir(parents=True, exist_ok=True)
+        GROK_HOME.chmod(0o700)
+        existing = config_file.read_text() if config_file.exists() else ""
+        pattern = re.compile(
+            re.escape(_GROK_RUNTIME_CONFIG_BEGIN)
+            + r".*?"
+            + re.escape(_GROK_RUNTIME_CONFIG_END),
+            re.S,
+        )
+        unmanaged = pattern.sub("", existing).rstrip()
+        if unmanaged:
+            try:
+                parsed = tomllib.loads(unmanaged)
+            except Exception:
+                logger.exception("Refusing to overwrite malformed Grok config %s", config_file)
+                return False
+            managed_servers = {"advisor", "google", "playwright-browser"}
+            declared = parsed.get("mcp_servers") if isinstance(parsed, dict) else None
+            if isinstance(declared, dict) and managed_servers.intersection(declared):
+                logger.error(
+                    "Refusing unmanaged Grok MCP definitions for dashboard-owned servers in %s",
+                    config_file,
+                )
+                return False
+
+        quote = _grok_toml_string
+        managed = "\n".join(
+            (
+                _GROK_RUNTIME_CONFIG_BEGIN,
+                "[memory]",
+                "enabled = true",
+                "",
+                "[mcp_servers.advisor]",
+                f"command = {quote(GROK_MCP_PYTHON)}",
+                "args = ["
+                + ", ".join(
+                    quote(value)
+                    for value in (
+                        GROK_MCP_BRIDGE,
+                        "--url",
+                        GROK_ADVISOR_URL,
+                        "--bearer-env",
+                        "ADVISOR_TOKEN",
+                        "--bearer-file",
+                        GROK_ADVISOR_TOKEN_FILE,
+                    )
+                )
+                + "]",
+                "",
+                "[mcp_servers.advisor.env]",
+                'PYTHONUNBUFFERED = "1"',
+                "",
+                "[mcp_servers.google]",
+                f"command = {quote(GROK_MCP_PYTHON)}",
+                f"args = [{quote(GROK_GOOGLE_MCP_SCRIPT)}]",
+                "",
+                "[mcp_servers.google.env]",
+                f"GOOGLE_MCP_CREDENTIALS_DIR = {quote(MESSAGES_DIR / 'connections' / 'admin')}",
+                f"GOOGLE_OAUTH_CLIENT_FILE = {quote(MESSAGES_DIR / 'google_oauth_client.json')}",
+                'PYTHONUNBUFFERED = "1"',
+                "",
+                '[mcp_servers."playwright-browser"]',
+                f"command = {quote(GROK_MCP_PYTHON)}",
+                f"args = [{quote(GROK_BROWSER_MCP_PROXY)}]",
+                "",
+                '[mcp_servers."playwright-browser".env]',
+                'PYTHONUNBUFFERED = "1"',
+                'TMUX_DASH_BROWSER_CDP_PORT = "9222"',
+                'TMUX_DASH_BROWSER_ID = "default"',
+                f"TMUX_DASH_BROWSER_OUTPUT_DIR = {quote(Path.home() / '.playwright-mcp' / 'default')}",
+                f"TMUX_DASH_CONTROLLER_SOCKET = {quote(BROWSER_CONTROLLER_SOCKET)}",
+                f"TMUX_DASH_HOST_HOME = {quote(Path.home())}",
+                _GROK_RUNTIME_CONFIG_END,
+            )
+        )
+        rendered = (unmanaged + "\n\n" if unmanaged else "") + managed + "\n"
+        tomllib.loads(rendered)
+        if rendered != existing:
+            tmp = config_file.with_name(config_file.name + ".tmp")
+            tmp.write_text(rendered)
+            tmp.chmod(0o600)
+            os.replace(tmp, config_file)
+        config_file.chmod(0o600)
+        return True
+    except Exception:
+        logger.exception("Could not configure Grok runtime")
         return False
 
 
@@ -735,6 +1111,18 @@ def _muse_launch_prefix() -> str:
     )
 
 
+def _grok_launch_prefix() -> str:
+    """Environment that keeps Grok credentials and sessions deployment-local."""
+    return " ".join(
+        (
+            "env",
+            "GROK_HOME=" + shlex.quote(str(GROK_HOME)),
+            "GROK_TELEMETRY_ENABLED=0",
+            "GROK_FEEDBACK_ENABLED=0",
+        )
+    )
+
+
 def _launch_agent_cmd(
     cmd: str,
     pin_model: bool = True,
@@ -742,13 +1130,21 @@ def _launch_agent_cmd(
     codex_home: Path | None = None,
 ) -> str:
     """Build the configured coding-agent command without changing Codex defaults."""
-    if AGENT_KIND != "muse":
+    if AGENT_KIND == "codex":
         return _launch_codex_cmd(
             cmd,
             pin_model=pin_model,
             resume=resume,
             codex_home=codex_home,
         )
+    if AGENT_KIND == "grok":
+        out = cmd.strip() or (
+            f"{shlex.quote(str(GROK_BINARY))} --always-approve "
+            "--reasoning-effort xhigh --experimental-memory"
+        )
+        if resume and "--continue" not in out and " -c" not in f" {out}":
+            out += " --continue"
+        return _grok_launch_prefix() + " " + out
     if resume:
         out = f"{shlex.quote(str(MUSE_BINARY))} --yolo resume --last"
     else:
@@ -761,12 +1157,14 @@ def _is_agent_process_command(command: str) -> bool:
     name = Path(str(command or "").strip().lower()).name
     if AGENT_KIND == "muse":
         return name == "muse" or name.startswith("muse-bin")
+    if AGENT_KIND == "grok":
+        return name == "grok" or name.startswith("grok-")
     return name == "codex"
 
 
 def _session_launch_base(session_name: str = "", user: dict | None = None) -> str:
     """Use the canonical full-access launch for members and configured admin command."""
-    if AGENT_KIND == "muse":
+    if AGENT_KIND in {"muse", "grok"}:
         return NEW_SESSION_CMD
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
@@ -965,6 +1363,9 @@ def _launch_agent_pane(
 
 _MUSE_PROJECT_CONTEXT_BEGIN = "<!-- BEGIN MUSE DASHBOARD RUNTIME (managed) -->"
 _MUSE_PROJECT_CONTEXT_END = "<!-- END MUSE DASHBOARD RUNTIME (managed) -->"
+_GROK_PROJECT_CONTEXT_BEGIN = "<!-- BEGIN GROK DASHBOARD RUNTIME (managed) -->"
+_GROK_PROJECT_CONTEXT_END = "<!-- END GROK DASHBOARD RUNTIME (managed) -->"
+_GROK_GLOBAL_RULE_FILES = ("Agents.md", "Claude.md", "AGENT.md", "AGENTS.md")
 
 
 def _prepare_muse_project_context(project_dir: str | Path) -> bool:
@@ -1016,6 +1417,112 @@ def _prepare_muse_project_context(project_dir: str | Path) -> bool:
         return False
 
 
+def _grok_policy_chunks(content: str, limit: int = 8500) -> list[str]:
+    """Split policy on line boundaries below Grok's 10k per-rule-file cap."""
+    chunks: list[str] = []
+    current = ""
+    for line in content.splitlines(keepends=True):
+        pieces = [line[pos : pos + limit] for pos in range(0, len(line), limit)] or [""]
+        for piece in pieces:
+            if current and len(current) + len(piece) > limit:
+                chunks.append(current.rstrip() + "\n")
+                current = ""
+            current += piece
+    if current.strip():
+        chunks.append(current.rstrip() + "\n")
+    return chunks
+
+
+def _sync_grok_global_instructions() -> bool:
+    """Expose the entire dashboard policy through Grok's global rule files."""
+    if AGENT_KIND != "grok":
+        return True
+    try:
+        GROK_HOME.mkdir(parents=True, exist_ok=True)
+        GROK_HOME.chmod(0o700)
+        chunks = _grok_policy_chunks(_agent_global_context(_read_global_context()))
+        if len(chunks) > len(_GROK_GLOBAL_RULE_FILES):
+            logger.error(
+                "Grok global policy needs %d rule files; only %d are supported",
+                len(chunks),
+                len(_GROK_GLOBAL_RULE_FILES),
+            )
+            return False
+        for index, filename in enumerate(_GROK_GLOBAL_RULE_FILES, start=1):
+            target = GROK_HOME / filename
+            if target.is_symlink():
+                logger.error("Refusing symlinked Grok global rules %s", target)
+                return False
+            existing = target.read_text() if target.exists() else ""
+            begin = f"<!-- BEGIN GROK DASHBOARD GLOBAL POLICY {index} (managed) -->"
+            end = f"<!-- END GROK DASHBOARD GLOBAL POLICY {index} (managed) -->"
+            pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.S)
+            unmanaged = pattern.sub("", existing).strip()
+            if index <= len(chunks):
+                block = f"{begin}\n{chunks[index - 1].rstrip()}\n{end}"
+                updated = (unmanaged + "\n\n" if unmanaged else "") + block + "\n"
+            else:
+                updated = unmanaged + ("\n" if unmanaged else "")
+            if updated != existing:
+                tmp = target.with_name(target.name + ".tmp")
+                tmp.write_text(updated)
+                tmp.chmod(0o600)
+                os.replace(tmp, target)
+            if target.exists():
+                target.chmod(0o600)
+        return True
+    except Exception:
+        logger.exception("Could not sync Grok global instructions")
+        return False
+
+
+def _prepare_grok_project_context(project_dir: str | Path) -> bool:
+    """Attach Grok runtime facts while preserving repository-owned rules."""
+    if AGENT_KIND != "grok":
+        return True
+    if not _sync_grok_global_instructions():
+        return False
+    root = Path(project_dir)
+    target = root / "AGENTS.md"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            logger.error("Refusing symlinked Grok project context %s", target)
+            return False
+        existing = target.read_text() if target.exists() else ""
+        managed = (
+            f"{_GROK_PROJECT_CONTEXT_BEGIN}\n"
+            "# Grok dashboard runtime\n\n"
+            f"- Grok Build is installed at `{GROK_BINARY}`. This session uses "
+            f"`GROK_HOME={GROK_HOME}` for its refreshable xAI login, sessions, "
+            "configuration, and native memory; do not treat `CODEX_HOME` as Grok state.\n"
+            "- Grok loads the dashboard account policy from its isolated global rule files "
+            "and loads repository rules from this file. Preserve both.\n"
+            "- Grok skills, plugins, MCP servers, hooks, and project instructions can be "
+            "verified with `grok inspect --json`. Read an applicable skill before acting.\n"
+            "- The `advisor` MCP uses this account's owner-bound credential, and "
+            "`playwright-browser` is bound to the dashboard's private browser. Never copy "
+            "credentials into project files or output.\n"
+            f"{_GROK_PROJECT_CONTEXT_END}"
+        )
+        pattern = re.compile(
+            re.escape(_GROK_PROJECT_CONTEXT_BEGIN)
+            + r".*?"
+            + re.escape(_GROK_PROJECT_CONTEXT_END),
+            re.S,
+        )
+        if pattern.search(existing):
+            updated = pattern.sub(managed, existing)
+        else:
+            updated = existing.rstrip() + ("\n\n" if existing.strip() else "") + managed + "\n"
+        if updated != existing:
+            target.write_text(updated)
+        return True
+    except Exception:
+        logger.exception("Could not prepare Grok project context in %s", root)
+        return False
+
+
 # Compatibility aliases used by newer Grabo paths while the implementation is Codex.
 def _launch_claude_cmd(
     cmd: str, pin_model: bool = True, codex_home: Path | None = None
@@ -1025,7 +1532,7 @@ def _launch_claude_cmd(
 
 def _restore_default_model_setting():
     """Keep the default Codex config aligned with the dashboard selection."""
-    if AGENT_KIND == "muse":
+    if AGENT_KIND != "codex":
         return
     try:
         CODEX_HOME.mkdir(parents=True, exist_ok=True)
@@ -1261,6 +1768,8 @@ def _session_real_auth_mode(session_name: str) -> str:
     """Resolve live per-session auth instead of trusting the process-local cache."""
     if AGENT_KIND == "muse":
         return "meta"
+    if AGENT_KIND == "grok":
+        return "xai"
     try:
         resolved = _codex_home_auth_mode(_session_config_base(session_name))
         if resolved != "unconfigured":
@@ -1398,8 +1907,26 @@ def _load_autopush_mode():
         logger.debug("Failed to load autopush-mode map", exc_info=True)
 
 
+def _pane_has_live_agent(pane_pid: str) -> bool:
+    """Return whether a pane root has the selected native agent below it."""
+    if not pane_pid.isdigit():
+        return False
+    children, commands = _process_tree_snapshot()
+    pending = [pane_pid]
+    seen: set[str] = set()
+    while pending and len(seen) < 10000:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if _is_agent_process_command(commands.get(current, "")):
+            return True
+        pending.extend(children.get(current, ()))
+    return False
+
+
 def _is_codex_running(session_name: str) -> bool:
-    """Return True only when the tmux pane has a live Codex descendant."""
+    """Return True only when the tmux pane has a live agent descendant."""
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-t", session_name, "-p", "#{pane_pid}"],
@@ -1410,18 +1937,7 @@ def _is_codex_running(session_name: str) -> bool:
         pane_pid = (result.stdout or "").strip()
         if not pane_pid.isdigit():
             return False
-        children, commands = _process_tree_snapshot()
-        pending = [pane_pid]
-        seen: set[str] = set()
-        while pending and len(seen) < 10000:
-            current = pending.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            if _is_agent_process_command(commands.get(current, "")):
-                return True
-            pending.extend(children.get(current, ()))
-        return False
+        return _pane_has_live_agent(pane_pid)
     except Exception:
         return False
 
@@ -1544,6 +2060,8 @@ async def lifespan(_app: FastAPI):
                        "Set TMUX_DASH_PASS to enable auth.")
     if not OPENAI_API_KEY and AGENT_KIND == "muse":
         logger.info("LLM summaries use the connected Muse Meta API fallback")
+    elif not OPENAI_API_KEY and AGENT_KIND == "grok":
+        logger.info("LLM summaries are disabled; Grok remains fully available in sessions")
     elif not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
     if not (
@@ -1556,11 +2074,15 @@ async def lifespan(_app: FastAPI):
     _load_autopush_mode()
     _restore_default_model_setting()
 
-    if PROCESS_ROLE != "api" and AGENT_KIND == "muse":
-        if _ensure_muse_runtime_settings():
-            logger.info("Muse runtime settings synced (Advisor MCP is owner-bound)")
+    if PROCESS_ROLE != "api" and AGENT_KIND in {"muse", "grok"}:
+        if AGENT_KIND == "grok":
+            runtime_ready = _ensure_grok_runtime_config() and _sync_grok_global_instructions()
         else:
-            logger.error("Muse runtime settings could not be synced")
+            runtime_ready = _ensure_muse_runtime_settings()
+        if runtime_ready:
+            logger.info("%s runtime settings synced (Advisor MCP is owner-bound)", AGENT_DISPLAY_NAME)
+        else:
+            logger.error("%s runtime settings could not be synced", AGENT_DISPLAY_NAME)
 
     if PROCESS_ROLE == "api":
         # All mutation/watchdog ownership lives across the Unix socket in the
@@ -1592,10 +2114,10 @@ async def lifespan(_app: FastAPI):
             # start, not only when they create a brand-new tmux session.
             _sync_projects_note_into(config_dir / "AGENTS.md")
         _ensure_user_browser_session(member, start=False)
-        if (config_dir / "config.toml").exists():
+        if AGENT_KIND == "codex" and (config_dir / "config.toml").exists():
             synced_browser_mcp += int(_ensure_browser_mcp(config_dir, member))
-    if AGENT_KIND == "muse":
-        logger.info("Muse account browser MCP is bound through Muse runtime settings")
+    if AGENT_KIND in {"muse", "grok"}:
+        logger.info("%s account browser MCP is bound through native runtime settings", AGENT_DISPLAY_NAME)
     else:
         logger.info("Playwright lease proxy synced to %d Codex homes", synced_browser_mcp)
     try:
@@ -4859,24 +5381,43 @@ def _html_escape(s: str) -> str:
 
 def _agent_global_context(content: str) -> str:
     """Translate stale Codex-only state wording for the selected agent."""
-    if AGENT_KIND != "muse":
+    if AGENT_KIND not in {"muse", "grok"}:
         return content
+    if AGENT_KIND == "muse":
+        private_state = (
+            "- Treat this dashboard account's `MUSE_CONFIG_HOME`, `MUSE_DATA_HOME`, project\n"
+            "  directory, browser, connections, memories, skills, uploads, and session history\n"
+            "  as private to this account. Never inspect or operate another account's\n"
+            "  corresponding resources."
+        )
+        native_memory = (
+            "- Muse's native memory is private to this dashboard account. Use `read_memory`,\n"
+            "  `add_memory`, and `edit_memory` for recall, never as the sole source of required\n"
+            "  policy or current external facts."
+        )
+    else:
+        private_state = (
+            "- Treat this dashboard account's `GROK_HOME`, project directory, browser,\n"
+            "  connections, native memory, skills, plugins, uploads, and session history as\n"
+            "  private to this account. Never inspect or operate another account's\n"
+            "  corresponding resources."
+        )
+        native_memory = (
+            "- Grok's native memory under `GROK_HOME` is private to this dashboard account.\n"
+            "  Use `memory_search`, `memory_get`, and `/memory` for recall, never as the sole\n"
+            "  source of required policy or current external facts."
+        )
     content = content.replace(
         "- Treat this dashboard account's `CODEX_HOME`, project directory, browser,\n"
         "  connections, memories, skills, uploads, and session history as private to this\n"
         "  account. Never inspect or operate another account's corresponding resources.",
-        "- Treat this dashboard account's `MUSE_CONFIG_HOME`, `MUSE_DATA_HOME`, project\n"
-        "  directory, browser, connections, memories, skills, uploads, and session history\n"
-        "  as private to this account. Never inspect or operate another account's\n"
-        "  corresponding resources.",
+        private_state,
     )
     content = content.replace(
         "- Local Codex memory is private because every account has a separate\n"
         "  `CODEX_HOME`. Use it as recall, never as the sole source of required policy or\n"
         "  current external facts.",
-        "- Muse's native memory is private to this dashboard account. Use `read_memory`,\n"
-        "  `add_memory`, and `edit_memory` for recall, never as the sole source of required\n"
-        "  policy or current external facts.",
+        native_memory,
     )
     return content
 
@@ -4887,12 +5428,12 @@ def _ensure_global_context_file():
         initial = _DEFAULT_GLOBAL_CONTEXT.replace("__BRAND__", BRAND_NAME).replace("__PUBURL__", PUB_URL)
         GLOBAL_CONTEXT_FILE.write_text(_agent_global_context(initial))
         return
-    if AGENT_KIND == "muse":
+    if AGENT_KIND in {"muse", "grok"}:
         current = GLOBAL_CONTEXT_FILE.read_text()
         normalized = _agent_global_context(current)
         if normalized != current:
             backup = GLOBAL_CONTEXT_FILE.with_name(
-                f"{GLOBAL_CONTEXT_FILE.name}.bak-muse-{int(time.time() * 1000)}"
+                f"{GLOBAL_CONTEXT_FILE.name}.bak-{AGENT_KIND}-{int(time.time() * 1000)}"
             )
             shutil.copy2(GLOBAL_CONTEXT_FILE, backup)
             normalized = normalized if normalized.endswith("\n") else normalized + "\n"
@@ -5572,12 +6113,25 @@ GOOGLE_LABELS = {"drive": "Google Drive", "gmail": "Gmail", "calendar": "Google 
 
 def _google_scopes_for_service(service: str) -> list[str]:
     """Return scopes that match the tools exposed by this agent runtime."""
-    scopes = MUSE_GOOGLE_SCOPES if AGENT_KIND == "muse" else GOOGLE_SCOPES
+    scopes = MUSE_GOOGLE_SCOPES if AGENT_KIND in {"muse", "grok"} else GOOGLE_SCOPES
     return list(scopes[service])
 
 
 def _google_mcp_is_ready() -> bool:
     """Report the active agent's Google tool registration, not another runtime's."""
+    if AGENT_KIND == "grok":
+        try:
+            config = tomllib.loads((GROK_HOME / "config.toml").read_text())
+            servers = config.get("mcp_servers") if isinstance(config, dict) else {}
+        except Exception:
+            return False
+        return bool(
+            isinstance(servers, dict)
+            and "google" in servers
+            and GROK_MCP_PYTHON.is_file()
+            and os.access(GROK_MCP_PYTHON, os.X_OK)
+            and GROK_GOOGLE_MCP_SCRIPT.is_file()
+        )
     if AGENT_KIND != "muse":
         return bool(os.environ.get("GOOGLE_MCP_COMMAND", ""))
     try:
@@ -5820,6 +6374,9 @@ def _write_google_mcp(user: dict, service: str):
     """Called after a successful connect; ensures the google MCP server is registered."""
     if AGENT_KIND == "muse":
         _ensure_muse_runtime_settings()
+        return
+    if AGENT_KIND == "grok":
+        _ensure_grok_runtime_config()
         return
     _ensure_google_mcp(_user_codex_config_dir(user), user)
 
@@ -7478,12 +8035,12 @@ def _session_is_codex(name: str) -> bool:
     the state left behind after Codex exits or crashes. Other active foreground
     programs are hidden.
     """
-    # A dedicated Muse deployment must never adopt arbitrary Muse processes
+    # Dedicated Muse/Grok deployments must never adopt arbitrary agent processes
     # from the host's shared tmux server.  Its isolated owner registry is the
     # deployment boundary, including for sessions whose agent is still live.
     # Do this before consulting the process cache so adding/removing an owner
     # takes effect immediately across API workers.
-    if AGENT_KIND == "muse" and name not in _load_session_owners():
+    if AGENT_KIND in {"muse", "grok"} and name not in _load_session_owners():
         return False
     now = time.time()
     cached = _CODEX_DASH_VISIBILITY_CACHE.get(name)
@@ -7882,6 +8439,8 @@ def _detect_activity_raw(session_name: str) -> dict:
 
         parts = result.stdout.strip().split(":")
         cmd = parts[0] if parts else ""
+        pane_pid = parts[1] if len(parts) > 1 else ""
+        has_live_agent = _is_agent_process_command(cmd) or _pane_has_live_agent(pane_pid)
         info["command"] = cmd
 
         # Capture the very bottom of the visible pane — this is the ground truth.
@@ -8019,7 +8578,7 @@ def _detect_activity_raw(session_name: str) -> dict:
         # If the terminal hasn't changed in 20+ seconds and the foreground
         # command is codex/node, it's almost certainly idle — the text-based
         # checks above may have missed it or the output just looks ambiguous.
-        if content_is_static and (_is_agent_process_command(cmd) or cmd.lower() == "node"):
+        if content_is_static and (has_live_agent or cmd.lower() == "node"):
             info["status"] = "idle"
             info["detail"] = ""
             return info
@@ -8027,17 +8586,18 @@ def _detect_activity_raw(session_name: str) -> dict:
         # --- Step 7: Shell prompt check ---
         last_line = bottom[-1].strip() if bottom else ""
         shell_cmds = {"bash", "zsh", "sh", "fish", "tmux"}
-        if cmd.lower() in shell_cmds:
+        if has_live_agent or cmd.lower() == "node":
+            # Supervisor/systemd wrappers may remain the pane's foreground
+            # command while the actual agent is their live child.
+            info["status"] = "idle"
+            info["detail"] = ""
+        elif cmd.lower() in shell_cmds:
             if _RE_SHELL_PROMPT.search(last_line) or not last_line:
                 info["status"] = "idle"
                 info["detail"] = "Shell prompt"
             else:
                 info["status"] = "busy"
                 info["detail"] = cmd
-        elif _is_agent_process_command(cmd) or cmd.lower() == "node":
-            # A live agent with no spinner + no "esc to interrupt" is idle.
-            info["status"] = "idle"
-            info["detail"] = ""
         else:
             info["status"] = "busy"
             info["detail"] = cmd
@@ -8833,11 +9393,85 @@ def _resolve_session_transcript(session_name: str, last_user_text: str):
     return None
 
 
+def _grok_history_text(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(part.get("text") or "").strip()
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") == "text"
+        and str(part.get("text") or "").strip()
+    ).strip()
+
+
+def _grok_last_genuine_user_text(history_file: Path) -> str:
+    last = ""
+    for line in _read_jsonl_tail(str(history_file)):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if event.get("type") != "user" or event.get("synthetic_reason"):
+            continue
+        text = _grok_history_text(event.get("content"))
+        if text:
+            last = text
+    return last
+
+
+def _resolve_grok_history(session_name: str, last_user_text: str) -> Path | None:
+    histories = [
+        directory / "chat_history.jsonl"
+        for directory in _grok_session_dirs(session_name)
+        if (directory / "chat_history.jsonl").is_file()
+    ]
+    if len(histories) == 1:
+        return histories[0]
+    want = _norm_text(last_user_text)
+    if not want:
+        return histories[-1] if histories else None
+    key = want[:60]
+    for history in reversed(histories):
+        latest_user = _norm_text(_grok_last_genuine_user_text(history))
+        if latest_user and (latest_user.startswith(key) or key in latest_user):
+            return history
+    return None
+
+
+def _extract_grok_last_assistant_turn(session_name: str, last_user_text: str) -> str:
+    history = _resolve_grok_history(session_name, last_user_text)
+    if history is None:
+        return ""
+    texts: list[str] = []
+    for line in _read_jsonl_tail(str(history)):
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "user" and not event.get("synthetic_reason"):
+            texts = []
+            continue
+        if event_type != "assistant":
+            continue
+        text = _grok_history_text(event.get("content"))
+        if text:
+            texts.append(text)
+    return "\n\n".join(texts).strip()
+
+
 def _extract_last_assistant_turn(session_name: str, last_user_text: str = "") -> str:
     """Clean text of Codex's most recent turn: every agent_message event
     since the last user_message in the rollout. Reasoning and tool
     calls/results are excluded. Falls back to this session's terminal pane when
     the transcript can't be unambiguously matched to this session."""
+    if AGENT_KIND == "grok":
+        native = _extract_grok_last_assistant_turn(session_name, last_user_text)
+        if native:
+            return native
     path = _resolve_session_transcript(session_name, last_user_text)
     if path:
         try:
@@ -10168,6 +10802,8 @@ def _prepare_session_owner_for_launch(
                 config_path.write_text(trusted)
         if AGENT_KIND == "muse" and not _prepare_muse_project_context(project_dir):
             return False
+        if AGENT_KIND == "grok" and not _prepare_grok_project_context(project_dir):
+            return False
         return True
     except Exception:
         logger.exception("Failed to prepare owner environment for '%s'", session_name)
@@ -10239,7 +10875,7 @@ async def api_create_session(request: Request, body: CreateSession):
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
-            if _multi_tenant_enabled() and _is_admin(user):
+            if AGENT_KIND == "codex" and _multi_tenant_enabled() and _is_admin(user):
                 acfg = _user_codex_config_dir(user)
                 _sync_projects_note_into(acfg / "AGENTS.md")
                 _ensure_google_mcp(acfg, user)
@@ -10265,6 +10901,8 @@ async def api_create_session(request: Request, body: CreateSession):
         # Admin sessions use the default ~/.codex login directly.
         if AGENT_KIND == "muse":
             _session_auth_mode[created] = "meta"
+        elif AGENT_KIND == "grok":
+            _session_auth_mode[created] = "xai"
         elif user and not _is_admin(user):
             _session_auth_mode[created] = _apply_member_auth(_user_codex_config_dir(user))
         else:
@@ -10361,7 +10999,18 @@ async def api_delete_session(request: Request, session_name: str):
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
+            # Killing the pane's child process can make a wrapper shell exit,
+            # which closes the tmux session just before kill-session runs.
+            # That race is already the requested outcome; still clear the
+            # dashboard's retained owner/runtime state below.
+            still_exists = any(
+                row.get("name") == session_name for row in get_tmux_sessions()
+            )
+            if still_exists:
+                return JSONResponse(
+                    {"error": result.stderr.strip() or "Failed to kill session"},
+                    status_code=500,
+                )
         # Clean up all per-session state from global dicts
         cache.pop(session_name, None)
         _auto_approve_sent.pop(session_name, None)
@@ -11032,10 +11681,10 @@ class SkillLibraryBody(BaseModel):
 
 
 def _account_skills_dir(user: dict) -> Path:
-    if AGENT_KIND == "muse" and _is_admin(user):
-        # Muse discovers personal skills from ~/.agents/skills. The Muse
-        # deployment is single-owner, so expose that native root instead of
-        # showing the unrelated CODEX_HOME directory.
+    if AGENT_KIND in {"muse", "grok"} and _is_admin(user):
+        # Muse and Grok both discover personal skills from ~/.agents/skills.
+        # These deployments are single-owner, so expose that native root
+        # instead of showing the unrelated CODEX_HOME directory.
         skills_dir = Path.home() / ".agents" / "skills"
     else:
         skills_dir = _user_codex_config_dir(user) / "skills"
@@ -11050,6 +11699,8 @@ def _account_skill_trash_dir(user: dict) -> Path:
     """Keep recoverable skill archives in the selected agent's private state."""
     if AGENT_KIND == "muse" and _is_admin(user):
         return MUSE_CONFIG_HOME / "muse" / ".skill-trash"
+    if AGENT_KIND == "grok" and _is_admin(user):
+        return GROK_HOME / ".skill-trash"
     return _user_codex_config_dir(user) / ".skill-trash"
 
 
@@ -11328,6 +11979,19 @@ async def api_list_builtin_skills():
                 if skill.get("scope") in {"built-in", "bundled"}
             ],
         })
+    if AGENT_KIND == "grok":
+        try:
+            inventory = await asyncio.to_thread(_grok_skills_inventory)
+        except Exception:
+            logger.debug("Could not list Grok built-in skills", exc_info=True)
+            inventory = []
+        return JSONResponse({
+            "skills": [
+                {"name": skill["name"], "description": skill["description"]}
+                for skill in inventory
+                if skill.get("scope") in {"built-in", "bundled"}
+            ],
+        })
     return JSONResponse({"skills": list(_BUILTIN_SKILLS)})
 
 
@@ -11458,16 +12122,21 @@ class SetSessionModelBody(BaseModel):
 # Surface them in the session's "More" dropdown so the user can edit per-project
 # rules without leaving the dashboard.
 
-_PROJECT_FILES = [
-    ("AGENTS.md", "md",
-     "Project rules loaded on top of the account AGENTS.md."),
-    (".codex/config.toml", "toml",
-     "Project config (model, env, hooks) loaded on top of account config."),
-    (".codex/config.local.toml", "toml",
-     "Project-local config (not committed). Loaded last; wins over everything."),
-    (".mcp.json", "json",
-     "Project-scope MCP servers added to the account MCP servers."),
-]
+_PROJECT_FILES = (
+    [
+        ("AGENTS.md", "md", "Project rules loaded after Grok's global rules."),
+        (".grok/config.toml", "toml", "Project-scoped Grok MCP servers."),
+    ]
+    if AGENT_KIND == "grok"
+    else [
+        ("AGENTS.md", "md", "Project rules loaded on top of the account AGENTS.md."),
+        (".codex/config.toml", "toml",
+         "Project config (model, env, hooks) loaded on top of account config."),
+        (".codex/config.local.toml", "toml",
+         "Project-local config (not committed). Loaded last; wins over everything."),
+        (".mcp.json", "json", "Project-scope MCP servers added to the account MCP servers."),
+    ]
+)
 
 
 def _safe_project_path(cwd: str, rel: str) -> Path | None:
@@ -11628,7 +12297,7 @@ def _send_session_owner_environment(session_name: str):
 
 @app.get("/api/stats")
 async def api_stats():
-    """System stats: CPU, disk, memory, tmux sessions, Codex processes."""
+    """System stats: CPU, disk, memory, tmux sessions, and agent processes."""
     stats = {}
     # CPU load
     try:
@@ -11677,10 +12346,12 @@ async def api_stats():
         stats["disk"] = {}
     # tmux sessions
     stats["tmux_sessions"] = get_tmux_sessions()
-    # Codex processes
+    # Keep the legacy response keys for frontend/API compatibility, but inspect
+    # the executable that belongs to this dashboard runtime.
+    agent_process = _agent_process_search_name()
     try:
         result = subprocess.run(
-            ["pgrep", "-a", "codex"],
+            ["pgrep", "-a", agent_process],
             capture_output=True, text=True, timeout=5
         )
         stats["codex_processes"] = [
@@ -11688,10 +12359,10 @@ async def api_stats():
         ]
     except Exception:
         stats["codex_processes"] = []
-    # Codex-related processes
+    # Related agent processes (wrappers and launch shells included).
     try:
         result = subprocess.run(
-            ["pgrep", "-a", "-f", "codex"],
+            ["pgrep", "-a", "-f", agent_process],
             capture_output=True, text=True, timeout=5
         )
         stats["codex_related"] = len([
@@ -14662,6 +15333,24 @@ async def api_codex_auth_status():
         }
         _codex_auth_cache.update({"ts": now, "data": result})
         return JSONResponse(result)
+    if AGENT_KIND == "grok":
+        ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        credential = await asyncio.to_thread(_grok_credential_display)
+        result = {
+            "loggedIn": ready,
+            "authMode": "xai" if ready else "unconfigured",
+            "activeMode": "xai" if ready else "unconfigured",
+            "subscriptionType": "Grok Build" if ready else "",
+            "email": credential.get("accountEmail") or ("xAI account" if ready else ""),
+            "model": DEFAULT_MODEL,
+            "effort": _CODEX_DEFAULT_REASONING_EFFORT,
+            "agent": AGENT_KIND,
+            "error": "" if ready else reason,
+            "details": details,
+            "credential": credential,
+        }
+        _codex_auth_cache.update({"ts": now, "data": result})
+        return JSONResponse(result)
     result = await asyncio.to_thread(_codex_auth_display)
     _codex_auth_cache.update({"ts": now, "data": result})
     return JSONResponse(result)
@@ -14901,12 +15590,50 @@ async def api_openai_usage_limits():
 async def api_codex_usage():
     """Token usage for today, parsed from the selected agent's session JSONL."""
     now = time.time()
-    cache_seconds = 5 if AGENT_KIND == "muse" else 60
+    cache_seconds = 5 if AGENT_KIND in {"muse", "grok"} else 60
     if now - _usage_cache["ts"] < cache_seconds:
         return JSONResponse(_usage_cache["data"])
 
     today_dt = datetime.now(timezone.utc)
     today = today_dt.strftime("%Y-%m-%d")
+    if AGENT_KIND == "grok":
+        today_start = today_dt.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        ).timestamp()
+        sessions_root = GROK_HOME / "sessions"
+        directories = (
+            [path.parent for path in sessions_root.rglob("summary.json")]
+            if sessions_root.is_dir()
+            else []
+        )
+        stats = await asyncio.to_thread(
+            _parse_grok_usage_dirs,
+            directories,
+            now_epoch=now,
+            since_epoch=today_start,
+        )
+        data = {
+            "date": today,
+            "messages": int(stats.get("messageCount") or 0),
+            "inputTokens": int(stats.get("totalInput") or 0),
+            "outputTokens": int(stats.get("totalOutput") or 0),
+            "cacheReadTokens": int(stats.get("cacheRead") or 0),
+            "cacheCreateTokens": int(stats.get("cacheCreate") or 0),
+            "reasoningTokens": int(stats.get("reasoningTokens") or 0),
+            "totalTokens": int(stats.get("totalTokens") or 0),
+            "estimatedCost": float(stats.get("estimatedCost") or 0),
+            "recentOutputRate": int(stats.get("recentOutputRate") or 0),
+            "peakOutputRate": int(stats.get("peakOutputRate") or 0),
+            "requestsPerMinute": int(stats.get("requestsPerMinute") or 0),
+            "rateStatus": str(stats.get("rateStatus") or "normal"),
+            "providerStatus": str(stats.get("providerStatus") or "Waiting for xAI activity"),
+            "retryCount": int(stats.get("retryCount") or 0),
+        }
+        _usage_cache.update({"ts": now, "data": data})
+        return JSONResponse(data)
     if AGENT_KIND == "muse":
         today_start = today_dt.replace(
             hour=0,
@@ -15901,6 +16628,209 @@ def _parse_muse_usage_files(
     }
 
 
+def _grok_session_dirs(session_name: str) -> list[Path]:
+    """Find Grok session directories whose native summary records this pane cwd."""
+    cwd = get_session_cwd(session_name)
+    if not cwd:
+        return []
+    expected = str(Path(cwd).resolve()).rstrip("/")
+    sessions_root = GROK_HOME / "sessions"
+    if not sessions_root.is_dir():
+        return []
+    matches: list[Path] = []
+    for summary_file in sessions_root.rglob("summary.json"):
+        try:
+            if time.time() - summary_file.stat().st_mtime > 30 * 86400:
+                continue
+            summary = json.loads(summary_file.read_text())
+            info = summary.get("info") if isinstance(summary, dict) else {}
+            recorded = str((info or {}).get("cwd") or "").rstrip("/")
+            if recorded and str(Path(recorded).resolve()).rstrip("/") == expected:
+                matches.append(summary_file.parent)
+        except Exception:
+            logger.debug("Failed to inspect Grok summary %s", summary_file, exc_info=True)
+    return sorted(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _grok_session_identity(session_name: str) -> dict[str, str]:
+    """Read model and reasoning effort from the newest native Grok summary."""
+    directories = _grok_session_dirs(session_name)
+    if not directories:
+        return {"model": DEFAULT_MODEL, "effort": _CODEX_DEFAULT_REASONING_EFFORT}
+    try:
+        summary = json.loads((directories[-1] / "summary.json").read_text())
+    except Exception:
+        summary = {}
+    return {
+        "model": str(summary.get("current_model_id") or DEFAULT_MODEL),
+        "effort": str(summary.get("reasoning_effort") or _CODEX_DEFAULT_REASONING_EFFORT),
+    }
+
+
+def _grok_iso_epoch(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_grok_usage_dirs(
+    directories: list[Path],
+    *,
+    now_epoch: float | None = None,
+    since_epoch: float | None = None,
+) -> dict:
+    """Aggregate xAI's native per-turn usage and session signals."""
+    now = time.time() if now_epoch is None else now_epoch
+    records: list[dict] = []
+    summaries: list[tuple[float, dict, dict]] = []
+    models_seen: dict[str, int] = {}
+    errors = 0
+    for directory in directories:
+        try:
+            summary = json.loads((directory / "summary.json").read_text())
+            if not isinstance(summary, dict):
+                summary = {}
+        except Exception:
+            summary = {}
+        try:
+            signals = json.loads((directory / "signals.json").read_text())
+            if not isinstance(signals, dict):
+                signals = {}
+        except Exception:
+            signals = {}
+        updated = _grok_iso_epoch(
+            summary.get("last_active_at") or summary.get("updated_at") or summary.get("created_at")
+        )
+        summaries.append((updated, summary, signals))
+        errors += int(signals.get("errorCount") or 0)
+        for model in signals.get("modelsUsed") or []:
+            name = str(model or "").strip()
+            if name:
+                models_seen[name] = models_seen.get(name, 0) + 1
+        updates_file = directory / "updates.jsonl"
+        if not updates_file.is_file():
+            continue
+        try:
+            for line in updates_file.read_text(errors="replace").splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw_ts = event.get("timestamp")
+                try:
+                    ts = float(raw_ts or updated or 0)
+                except (TypeError, ValueError):
+                    ts = updated
+                if ts > 10_000_000_000:
+                    ts /= 1000
+                if since_epoch is not None and ts < since_epoch:
+                    continue
+                params = event.get("params") if isinstance(event, dict) else {}
+                update = params.get("update") if isinstance(params, dict) else {}
+                usage = update.get("usage") if isinstance(update, dict) else None
+                if not isinstance(usage, dict):
+                    continue
+                try:
+                    record = {
+                        "ts": ts,
+                        "input": max(0, int(usage.get("inputTokens") or 0)),
+                        "output": max(0, int(usage.get("outputTokens") or 0)),
+                        "cache_read": max(0, int(usage.get("cachedReadTokens") or 0)),
+                        "cache_create": max(0, int(usage.get("cacheCreationTokens") or 0)),
+                        "reasoning": max(0, int(usage.get("reasoningTokens") or 0)),
+                        "calls": max(1, int(usage.get("modelCalls") or 1)),
+                        "duration": max(0, int(usage.get("apiDurationMs") or 0)),
+                        "cost_ticks": max(0, int(usage.get("costUsdTicks") or 0)),
+                    }
+                except (TypeError, ValueError):
+                    continue
+                records.append(record)
+        except OSError:
+            logger.debug("Could not read Grok updates %s", updates_file, exc_info=True)
+
+    if not records and not summaries:
+        return {"available": False}
+    records.sort(key=lambda row: row["ts"])
+    summaries.sort(key=lambda row: row[0])
+    latest_summary = summaries[-1][1] if summaries else {}
+    latest_signals = summaries[-1][2] if summaries else {}
+    model = str(latest_summary.get("current_model_id") or DEFAULT_MODEL)
+    if model:
+        models_seen[model] = max(1, models_seen.get(model, 0))
+    total_input = sum(row["input"] for row in records)
+    total_output = sum(row["output"] for row in records)
+    cache_read = sum(row["cache_read"] for row in records)
+    cache_create = sum(row["cache_create"] for row in records)
+    reasoning = sum(row["reasoning"] for row in records)
+    message_count = sum(row["calls"] for row in records)
+    durations = [row for row in records if row["duration"] > 0]
+    rates = [int(row["output"] * 60_000 / row["duration"]) for row in durations]
+    recent_rates = [
+        int(row["output"] * 60_000 / row["duration"])
+        for row in durations
+        if 0 <= now - row["ts"] <= 600
+    ][-3:]
+    last_activity = max(
+        [row["ts"] for row in records]
+        + [entry[0] for entry in summaries]
+        + [0],
+    )
+    first_activity = min(
+        [row["ts"] for row in records if row["ts"]]
+        + [
+            _grok_iso_epoch(entry[1].get("created_at"))
+            for entry in summaries
+            if _grok_iso_epoch(entry[1].get("created_at"))
+        ]
+        + ([last_activity] if last_activity else [0]),
+    )
+    context_used = max(0, int(latest_signals.get("contextTokensUsed") or 0))
+    context_window = max(0, int(latest_signals.get("contextWindowTokens") or 0))
+    session_duration = max(0, int(latest_signals.get("sessionDurationSeconds") or 0))
+    return {
+        "available": True,
+        "provider": "xAI",
+        "model": model,
+        "messageCount": message_count,
+        "totalInput": total_input,
+        "totalOutput": total_output,
+        "cacheRead": cache_read,
+        "cacheCreate": cache_create,
+        "reasoningTokens": reasoning,
+        "totalTokens": total_input + total_output,
+        "estimatedCost": sum(row["cost_ticks"] for row in records) / 1_000_000_000,
+        "pricingAvailable": bool(records),
+        "pricingCurrency": "USD",
+        "recentOutputRate": int(sum(recent_rates) / len(recent_rates)) if recent_rates else 0,
+        "peakOutputRate": max(rates, default=0),
+        "recentTotalRate": int(sum(recent_rates) / len(recent_rates)) if recent_rates else 0,
+        "peakTotalRate": max(rates, default=0),
+        "requestsPerMinute": sum(
+            row["calls"] for row in records if 0 <= now - row["ts"] <= 60
+        ),
+        "lastDurationMs": records[-1]["duration"] if records else 0,
+        "lastTtfeMs": max(0, int(latest_signals.get("avgTimeToFirstTokenMs") or 0)),
+        "rateStatus": "error" if errors else "normal",
+        "providerStatus": "xAI reported session errors" if errors else "Connected to xAI",
+        "ratePct": 0 if errors else 100,
+        "retryCount": errors,
+        "activeMinutes": max(0, int(session_duration / 60)),
+        "sessionDurationMin": max(
+            int(session_duration / 60),
+            max(0, int((last_activity - first_activity) / 60)) if last_activity else 0,
+        ),
+        "secsSinceLastActivity": max(0, int(now - last_activity)) if last_activity else -1,
+        "modelsUsed": models_seen,
+        "contextPct": round(context_used / context_window * 100, 1) if context_window else 0,
+        "lastInputTokens": records[-1]["input"] if records else context_used,
+        "ctxWindowSize": context_window,
+    }
+
+
 def _session_model_fields(session_name: str) -> dict:
     """Model, effort, and pending model for session API payloads. Clears pending once
     the transcript confirms the switch, or after 15 min (request abandoned)."""
@@ -15913,7 +16843,9 @@ def _session_model_fields(session_name: str) -> dict:
             _session_model_pending.pop(session_name, None)
             pend = None
     effort = _CODEX_DEFAULT_REASONING_EFFORT
-    if AGENT_KIND != "muse":
+    if AGENT_KIND == "grok":
+        effort = _grok_session_identity(session_name)["effort"]
+    elif AGENT_KIND != "muse":
         try:
             cfg = (_session_config_base(session_name) / "config.toml").read_text()
             match = re.search(
@@ -15936,6 +16868,8 @@ def _get_session_model(session_name: str) -> str:
     """Detect the current model for a session by reading its latest codex rollout."""
     if AGENT_KIND == "muse":
         return DEFAULT_MODEL
+    if AGENT_KIND == "grok":
+        return _grok_session_identity(session_name)["model"]
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
@@ -16025,13 +16959,19 @@ def _parse_session_stats(session_name: str) -> dict:
     """Parse JSONL files and compute per-session token stats with rate tracking."""
     now = time.time()
     cached = _session_stats_cache.get(session_name)
-    cache_seconds = 5 if AGENT_KIND == "muse" else 15
+    cache_seconds = 5 if AGENT_KIND in {"muse", "grok"} else 15
     if cached and now - cached.get("_ts", 0) < cache_seconds:
         return cached
 
     if AGENT_KIND == "muse":
         files = _find_muse_session_jsonl_files(session_name)
         result = _parse_muse_usage_files(files, now_epoch=now)
+        result["_ts"] = now
+        _session_stats_cache[session_name] = result
+        return result
+
+    if AGENT_KIND == "grok":
+        result = _parse_grok_usage_dirs(_grok_session_dirs(session_name), now_epoch=now)
         result["_ts"] = now
         _session_stats_cache[session_name] = result
         return result
@@ -16610,6 +17550,11 @@ def _write_session_codex_settings(session_name: str, managed: dict) -> Path:
 
 @app.post("/api/sessions/{session_name}/effort")
 async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
+    if AGENT_KIND != "codex":
+        return JSONResponse(
+            {"error": f"{AGENT_DISPLAY_NAME} model settings are managed by its native runtime"},
+            status_code=409,
+        )
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -16640,6 +17585,11 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
 @app.post("/api/sessions/{session_name}/model")
 async def api_set_session_model(session_name: str, body: SetSessionModelBody):
     """Persist the account's Codex model and optionally restart the live pane."""
+    if AGENT_KIND != "codex":
+        return JSONResponse(
+            {"error": f"{AGENT_DISPLAY_NAME} model settings are managed by its native runtime"},
+            status_code=409,
+        )
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -17830,12 +18780,13 @@ async def _codex_auth_health(force: bool = False) -> dict:
     age = now - float(_codex_health_auth.get("ts") or 0)
     if age < (_CODEX_AUTH_PROBE_FLOOR if force else _CODEX_AUTH_PROBE_MAX_AGE):
         return dict(_codex_health_auth)
-    if AGENT_KIND == "muse":
+    if AGENT_KIND in {"muse", "grok"}:
         ready, reason, details = await asyncio.to_thread(_agent_cli_readiness)
+        active_mode = "meta" if AGENT_KIND == "muse" else "xai"
         _codex_health_auth.update({
             "ts": now,
             "loggedIn": ready,
-            "activeMode": "meta" if ready else "unconfigured",
+            "activeMode": active_mode if ready else "unconfigured",
             "reason": "" if ready else reason,
             "fallbackActive": False,
             "agent": details,
@@ -20739,7 +21690,7 @@ const AGENT_NAME='__AGENT_NAME__';
 const SETTINGS_TAB_DEFS=__SETTINGS_TAB_DEFS__;
 const SETTINGS_ADMIN_IDS=new Set(['global','context','apis','login']);
 document.body.dataset.agent=AGENT_KIND;
-if(AGENT_KIND==='muse'){
+if(AGENT_KIND!=='codex'){
   const usage=document.getElementById('nav-usage');
   const toolsUsage=document.getElementById('nav-tools-usage');
   if(usage)usage.style.display='none';
@@ -21095,10 +22046,10 @@ function splitLiveTail(lines){
 const _ENV_ASSIGN_RE=/^[A-Za-z_][A-Za-z0-9_]*=/;
 // The launch line itself, for the case where the prompt that carried it has
 // already scrolled out of tmux's history and only the command is left.
-const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex|muse(?:-bin[^\s]*)?)\b|--dangerously-skip-permissions|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=/;
+const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex|grok(?:-[^\s]*)?|muse(?:-bin[^\s]*)?)\b|--dangerously-skip-permissions|--always-approve|--yolo\b|CLAUDE_CODE_OAUTH_TOKEN=|CODEX_HOME=|GROK_HOME=|XDG_(?:CONFIG|DATA)_HOME=/;
 // Its wrapped rows, which start mid-token and so match none of the above: the
 // launcher is one long `if … then exec env … fi`, and tmux breaks it anywhere.
-const _LAUNCH_FRAG_RE=/CODEX_HOME=|XDG_(?:CONFIG|DATA)_HOME=|MUSE_NO_AUTO_UPDATE|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
+const _LAUNCH_FRAG_RE=/CODEX_HOME=|GROK_(?:HOME|TELEMETRY_ENABLED|FEEDBACK_ENABLED)=|XDG_(?:CONFIG|DATA)_HOME=|MUSE_NO_AUTO_UPDATE|ADVISOR_TOKEN|OPENAI_API_KEY|advisor-token|\$\(cat |2>\/dev\/null|exec env|--always-approve|--experimental-memory|--reasoning-effort|--yolo\b|;\s*(?:then|else|fi)\b|^\s*fi\s*$/;
 function _stripStartupPreamble(lines){
   let i=0,sawShell=false;
   const limit=Math.min(lines.length,120);
@@ -21111,7 +22062,7 @@ function _stripStartupPreamble(lines){
     // fragments, the launcher's own shell plumbing, and the CLI's "starting…"
     // chatter.
     if(_ENV_ASSIGN_RE.test(t)||/^(export|cd|source|env|exec|nohup|&&|\|\|)\b/.test(t)||
-       /^--?[a-z]/.test(t)||/^(claude|codex|muse(?:-bin[^\s]*)?)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
+       /^--?[a-z]/.test(t)||/^(claude|codex|grok(?:-[^\s]*)?|muse(?:-bin[^\s]*)?)\b/.test(t)||_LAUNCH_FRAG_RE.test(t)){i++;continue}
     // The compact start-up banner, which is the CLI's block-glyph logo with the
     // version, the model and the cwd set beside it. Not drawn as a box, so
     // _stripStartupBanner cannot see it; three or more logo glyphs on a row is
@@ -22323,7 +23274,7 @@ function renderDetail(){
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
-          ${AGENT_KIND==='muse'?'':`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>`}
+          ${AGENT_KIND==='codex'?`<div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>`:''}
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <!-- Clean view sits right under Auto-push because it is the other
@@ -22343,7 +23294,7 @@ function renderDetail(){
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           ${MEMBER_SIMPLE?'':`<div class="tab-more-item ${tab==='skills'?'active':''}" data-tab="skills" onclick="switchTab('${s.name}','skills');closeTabMore()">Skills</div>`}
           <div class="tab-more-item ${tab==='info'?'active':''}" data-tab="info" onclick="switchTab('${s.name}','info');closeTabMore()">Info</div>
-          ${(MEMBER_SIMPLE||AGENT_KIND==='muse')?'':`
+          ${(MEMBER_SIMPLE||AGENT_KIND!=='codex')?'':`
           <div style="height:1px;background:#21262d;margin:4px 0"></div>
           <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Session files (cwd-bound)</div>
           <div class="tab-more-item" onclick="openSessionMemory('${esc(s.name)}');closeTabMore()">Auto-memory MEMORY.md</div>
@@ -22352,6 +23303,12 @@ function renderDetail(){
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.codex/config.local.toml');closeTabMore()">Project config.local.toml</div>
           <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.mcp.json');closeTabMore()">Project .mcp.json</div>
           `}
+          ${(!MEMBER_SIMPLE&&AGENT_KIND==='grok')?`
+          <div style="height:1px;background:#21262d;margin:4px 0"></div>
+          <div style="padding:4px 16px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Grok project files</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','AGENTS.md');closeTabMore()">Project AGENTS.md</div>
+          <div class="tab-more-item" onclick="openProjectFile('${esc(s.name)}','.grok/config.toml');closeTabMore()">Project Grok MCP config</div>
+          `:''}
         </div>
       </div>
       <div class="detail-badges">
@@ -22360,7 +23317,7 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        ${AGENT_KIND==='muse'?'':`<span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="${AGENT_NAME} model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>`}
+        ${AGENT_KIND==='codex'?`<span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="${AGENT_NAME} model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>`:''}
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (${AGENT_NAME} publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
@@ -22476,7 +23433,7 @@ function renderDetail(){
       <div class="tier" style="margin-top:12px">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="font-size:.85rem;color:#c9d1d9;margin-top:6px">
-          ${s.auth_mode==='meta'?'Meta Model API':s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
+          ${s.auth_mode==='xai'?'xAI account':s.auth_mode==='meta'?'Meta Model API':s.auth_mode==='api'?'API key':s.auth_mode==='subscription'?'ChatGPT subscription':'Not configured'}
           <span style="font-size:.72rem;color:#8b949e;margin-left:8px">Managed for this account</span>
         </div>
       </div>
@@ -22513,7 +23470,7 @@ function renderDetail(){
         <div style="font-size:.72rem;color:#6e7681;margin-top:6px;line-height:1.4">Auto-replies "continue" when ${AGENT_NAME} is waiting for confirmation on the current task.</div>
         <div class="watchdog-log" id="watchdog-log-${s.name}"></div>
       </div>
-      ${AGENT_KIND==='muse'?'':`
+      ${AGENT_KIND==='codex'?`
       <div class="tier" style="margin-top:12px" id="away-tier-${s.name}">
         <div class="tier-label"><span class="dot" style="background:#d2a8ff"></span>Away Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
@@ -22539,7 +23496,7 @@ function renderDetail(){
           <span id="gonuts-status-${s.name}" style="font-size:.82rem;color:#8b949e">${s.go_nuts_mode?'Running...':'Off'}</span>
         </div>
         <div class="gonuts-log" id="gonuts-log-${s.name}"></div>
-      </div>`}
+      </div>`:''}
       <div class="detail-footer" style="margin-top:24px">
         <div class="timestamps">
           <div class="ts">project: <span id="ts-desc-${s.name}">${timeAgo(s.description_at)}</span></div>
@@ -23404,7 +24361,7 @@ async function pollStatus(){
     if(!changed)statusInfoEl.textContent='Watching for changes...';
   }catch(e){statusInfoEl.textContent='Status poll failed'}
   _authPollCount++;
-  if(AGENT_KIND==='muse'||_authPollCount%5===0)checkCodexAuth();
+  if(AGENT_KIND!=='codex'||_authPollCount%5===0)checkCodexAuth();
   // Refresh inline server stats every 3rd poll (~30s)
   if(_authPollCount%3===0)refreshNavStats();
 }
@@ -23904,6 +24861,24 @@ function renderAuthPanel(){
     }
     return;
   }
+  if(AGENT_KIND==='grok'){
+    if(_authCache.loggedIn){
+      const credential=_authCache.credential||{};
+      el.innerHTML=`
+        <div class="auth-title">Grok Connected</div>
+        <div class="auth-row"><span class="auth-row-label">Account</span><span class="auth-row-value">${esc(_authCache.email||credential.accountEmail||'xAI account')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Provider</span><span class="auth-row-value">${esc(credential.providerLabel||'xAI')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Product</span><span class="auth-row-value">${esc(_authCache.subscriptionType||'Grok Build')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Model</span><span class="auth-row-value">${esc(_authCache.model||'grok-4.6')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Reasoning</span><span class="auth-row-value">${esc(_authCache.effort||'max')}</span></div>
+        <div class="auth-row"><span class="auth-row-label">Auth method</span><span class="auth-row-value">${esc(credential.mechanism||'device_auth')}</span></div>
+        ${renderMuseUsageHtml()}`;
+    }else{
+      el.innerHTML=`<div class="auth-title">Grok — Not Connected</div>
+        <p class="auth-hint">The deployment's xAI login is unavailable. Run <code style="color:#79c0ff">grok login --device-auth</code> on this server, then restart the service.</p>`;
+    }
+    return;
+  }
   const usageHtml=renderUsageHtml();
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
@@ -24128,7 +25103,7 @@ async function loadSessionStats(name){
         <div class="stat-item"><span class="stat-label">Messages</span><span class="stat-value">${st.messageCount}</span></div>
         <div class="stat-item"><span class="stat-label">Input tokens</span><span class="stat-value">${fmtTokens(st.totalInput)}</span></div>
         <div class="stat-item"><span class="stat-label">Output tokens</span><span class="stat-value">${fmtTokens(st.totalOutput)}</span></div>
-        ${AGENT_KIND==='muse'?`<div class="stat-item"><span class="stat-label">Reasoning</span><span class="stat-value">${fmtTokens(st.reasoningTokens||0)}</span></div>`:''}
+        ${AGENT_KIND!=='codex'?`<div class="stat-item"><span class="stat-label">Reasoning</span><span class="stat-value">${fmtTokens(st.reasoningTokens||0)}</span></div>`:''}
         <div class="stat-item"><span class="stat-label">Cache read</span><span class="stat-value">${fmtTokens(st.cacheRead)}</span></div>
         <div class="stat-item"><span class="stat-label">Cache write</span><span class="stat-value">${fmtTokens(st.cacheCreate)}</span></div>
         <div class="stats-divider"></div>
@@ -24136,7 +25111,7 @@ async function loadSessionStats(name){
         <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
         <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
         <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
-        ${AGENT_KIND==='muse'?`<div class="stat-item"><span class="stat-label">Requests / min</span><span class="stat-value">${st.requestsPerMinute||0}</span></div>
+        ${AGENT_KIND!=='codex'?`<div class="stat-item"><span class="stat-label">Requests / min</span><span class="stat-value">${st.requestsPerMinute||0}</span></div>
         <div class="stat-item"><span class="stat-label">Last response</span><span class="stat-value">${st.lastDurationMs?Math.round(st.lastDurationMs/100)/10+'s':'—'}</span></div>`:''}
       </div>
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
@@ -24145,7 +25120,7 @@ async function loadSessionStats(name){
         <span style="font-size:.75rem;color:#6e7681">${fmtRate(st.recentOutputRate)} output</span>
         <span style="font-size:.65rem;color:#484f58">peak ${fmtRate(st.peakOutputRate)}</span>
       </div>
-      ${AGENT_KIND==='muse'?`<div style="font-size:.72rem;color:#8b949e;margin-top:7px">${esc(st.providerStatus||'Waiting for API activity')}${st.retryCount?' · '+st.retryCount+' retries':''}</div>`:''}
+      ${AGENT_KIND!=='codex'?`<div style="font-size:.72rem;color:#8b949e;margin-top:7px">${esc(st.providerStatus||'Waiting for API activity')}${st.retryCount?' · '+st.retryCount+' retries':''}</div>`:''}
       <div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
@@ -24158,7 +25133,7 @@ async function loadSessionStats(name){
 function startStatsPolling(name){
   stopStatsPolling();
   loadSessionStats(name);
-  _statsTimers[name]=setInterval(()=>loadSessionStats(name),AGENT_KIND==='muse'?5000:15000);
+  _statsTimers[name]=setInterval(()=>loadSessionStats(name),AGENT_KIND!=='codex'?5000:15000);
 }
 function stopStatsPolling(){
   Object.values(_statsTimers).forEach(t=>clearInterval(t));
@@ -24685,7 +25660,7 @@ async function loadAccountSkills(sessionName){
     if(!activeResp.ok)throw new Error(activeData.error||'Failed to load account skills');
     if(!builtinResp.ok)throw new Error(builtinData.error||'Failed to load built-in skills');
     _builtinSkillsCache=builtinData.skills||[];
-    if(meta)meta.innerHTML='Account skills: <code>'+esc(activeData.path||(AGENT_KIND==='muse'?'~/.agents/skills':'CODEX_HOME/skills'))+'</code>';
+    if(meta)meta.innerHTML='Account skills: <code>'+esc(activeData.path||(AGENT_KIND!=='codex'?'~/.agents/skills':'CODEX_HOME/skills'))+'</code>';
     renderAccountSkills(sessionName,activeData);
     renderBuiltinSkills(sessionName,_builtinSkillsCache);
   }catch(e){
@@ -24836,7 +25811,7 @@ async function applyRoleVisibility(){
   document.body.classList.toggle('member-simple', MEMBER_SIMPLE);
   document.body.classList.toggle('member-admin', isAdmin);
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
-    el.style.display = (isAdmin&&!(AGENT_KIND==='muse'&&el.classList.contains('codex-only'))) ? '' : 'none';
+    el.style.display = (isAdmin&&!(AGENT_KIND!=='codex'&&el.classList.contains('codex-only'))) ? '' : 'none';
   });
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
@@ -24907,8 +25882,8 @@ function switchSettingsTab(tab){
 function renderSettingsContent(){
   const el = document.getElementById('settings-content');
   if(_settingsActiveTab === 'runtime'){
-    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading Muse runtime…</div></div>';
-    loadMuseRuntime();
+    el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading '+AGENT_NAME+' runtime…</div></div>';
+    loadAgentRuntime();
   }else if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
@@ -24940,36 +25915,38 @@ function renderSettingsContent(){
   }
 }
 
-async function loadMuseRuntime(){
+async function loadAgentRuntime(){
   const el=document.getElementById('settings-content');
   let d;
   try{
     const response=await fetch(BASE+'/api/auth/codex-status');
     d=await response.json();
-    if(!response.ok)throw new Error(d.error||'Failed to load Muse runtime');
+    if(!response.ok)throw new Error(d.error||'Failed to load '+AGENT_NAME+' runtime');
   }catch(e){
-    el.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load Muse runtime: '+esc(e.message||e)+'</div></div>';
+    el.innerHTML='<div class="settings-section"><div class="pf-banner">Failed to load '+esc(AGENT_NAME)+' runtime: '+esc(e.message||e)+'</div></div>';
     return;
   }
   const details=d.details||{};
   const credential=d.credential||{};
   const connected=!!d.loggedIn;
+  const isGrok=AGENT_KIND==='grok';
+  const runtimeName=isGrok?'Grok Build':'Muse Code';
   const status=connected
-    ? '<span class="bs-dot on"></span> <b>Muse Code is connected.</b>'
-    : '<span class="bs-dot off"></span> <b>Muse Code is not ready.</b> '+esc(d.error||'');
+    ? '<span class="bs-dot on"></span> <b>'+runtimeName+' is connected.</b>'
+    : '<span class="bs-dot off"></span> <b>'+runtimeName+' is not ready.</b> '+esc(d.error||'');
   const row=(label,value)=>'<label>'+esc(label)+'</label><div class="my-ctx-path" style="margin-bottom:12px;color:#c9d1d9">'+esc(value||'—')+'</div>';
   el.innerHTML='<div class="settings-section">'+
     '<div class="pf-banner">'+status+'</div>'+
-    row('Provider',d.subscriptionType||'Meta Model API')+
-    row('Muse Code version',details.version||'unknown')+
+    row('Provider',d.subscriptionType||(isGrok?'Grok Build':'Meta Model API'))+
+    row(runtimeName+' version',details.version||'unknown')+
     row('Executable',details.binary||'unknown')+
     row('Model',d.model||'unknown')+
     row('Reasoning effort',d.effort||'unknown')+
     row('Account',d.email||credential.accountEmail||'unknown')+
     row('Credential',credential.credentialLabel||(details.auth_configured?'Verified in private storage':'Not configured'))+
-    row('API host',credential.apiHost||'managed by Muse')+
-    row('Config home',details.config_home||'unknown')+
-    row('Session data',details.data_home||'unknown')+
+    row('API host',credential.apiHost||(isGrok?'managed by xAI':'managed by Muse'))+
+    row('Config home',isGrok?(details.grok_home||'unknown'):(details.config_home||'unknown'))+
+    row('Session data',isGrok?((details.grok_home||'unknown')+'/sessions'):(details.data_home||'unknown'))+
     row('Skills',(details.skills_total||0)+' total ('+(details.skills_user||0)+' personal, '+(details.skills_builtin||0)+' built-in)')+
     row('MCP servers',(details.mcp_servers||[]).join(', ')||'none')+
     row('Advisor bridge',details.advisor_mcp_ready?'Connected with owner-bound token':'Not ready')+
@@ -24980,10 +25957,10 @@ async function loadMuseRuntime(){
       : 'Not ready')+
     row('Account browser',details.browser_mcp_ready?'playwright-browser bound to default (owner admin)':'Not ready')+
     row('Native memory tools',(details.memory_tools||[]).join(', ')||'none')+
-    row('Project context','AGENTS.md plus the managed Muse runtime contract')+
+    row('Project context','AGENTS.md plus the managed '+AGENT_NAME+' runtime contract')+
     row('Auto-push','Off, Basic and Full modes are available per session')+
     '<div class="my-ctx-actions" style="margin:4px 0 14px"><button class="btn btn-full" onclick="openConnections()">Manage Google connections</button></div>'+
-    '<div class="pf-banner" style="color:#8b949e">Muse credentials, settings, native memories and session logs stay in the isolated Muse directories shown above. The Advisor credential is loaded at process startup from owner-private storage and its value is never written to Muse settings.</div>'+
+    '<div class="pf-banner" style="color:#8b949e">'+runtimeName+' credentials, settings, native memory and session logs stay in the isolated runtime home shown above. The Advisor credential is loaded from owner-private storage and its value is never written to runtime settings.</div>'+
     '</div>';
 }
 
@@ -26438,13 +27415,15 @@ let _projFile = {sessionName:'', path:'', absPath:'', cwd:'', content:'', exists
 
 const _PROJFILE_LABELS = {
   'AGENTS.md': 'Project AGENTS.md',
+  '.grok/config.toml': 'Project Grok MCP config',
   '.codex/config.toml': 'Project config.toml',
   '.codex/config.local.toml': 'Project config.local.toml',
   '.mcp.json': 'Project .mcp.json',
 };
 
 const _PROJFILE_DESCRIPTIONS = {
-  'AGENTS.md': 'Markdown rules loaded on top of the account AGENTS.md whenever Codex runs inside this cwd. Use this for repo-specific conventions.',
+  'AGENTS.md': 'Markdown rules loaded after the account-level rules whenever the agent runs inside this cwd. Use this for repo-specific conventions.',
+  '.grok/config.toml': 'TOML. Project-scoped MCP servers loaded by Grok in this cwd.',
   '.codex/config.toml': 'TOML. Project-level config (model, env, hooks, permissions). Loaded on top of account config.',
   '.codex/config.local.toml': 'TOML. Project-local overrides (typically gitignored). Loaded last and wins over account and project config.',
   '.mcp.json': 'JSON. Project-scope MCP servers merged with the account MCP servers when Codex runs in this cwd.',
@@ -26769,17 +27748,17 @@ async function clearCodexAlerts(){
 
 function renderStats(s,usage,byUser,alerts){
   let html='';
-  // Codex health first — an open alert is the thing you opened Stats to see.
+  // Agent health first — an open alert is the thing you opened Stats to see.
   if(alerts&&alerts.alerts&&alerts.alerts.length){
     const open=alerts.alerts.filter(a=>!a.resolved);
     const shown=(open.length?open:alerts.alerts).slice(0,12);
     const title=open.length
-      ?open.length+' open Codex alert'+(open.length===1?'':'s')
+      ?open.length+' open '+AGENT_NAME+' alert'+(open.length===1?'':'s')
       :AGENT_NAME+' health (all clear)';
     html+='<div class="stats-section"><div class="stats-section-title">'+esc(title)
       +' <button class="users-plain-btn" style="float:right;font-size:.65rem" onclick="clearCodexAlerts()">Clear</button></div>';
     if(alerts.auth&&alerts.auth.loggedIn===false){
-      html+='<div class="stats-row"><span class="stats-row-label" style="color:#f85149">Codex login</span>'
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#f85149">'+esc(AGENT_NAME)+' login</span>'
         +'<span class="stats-row-value" style="color:#f85149">'+esc(alerts.auth.reason||'no usable credential')+'</span></div>';
     }
     shown.forEach(a=>{
@@ -26840,25 +27819,25 @@ function renderStats(s,usage,byUser,alerts){
     });
     html+='</div>';
   }
-  // Codex Processes
-  html+='<div class="stats-section"><div class="stats-section-title">Codex Processes</div>';
+  // Native agent processes
+  html+='<div class="stats-section"><div class="stats-section-title">'+esc(AGENT_NAME)+' Processes</div>';
   if(s.codex_processes&&s.codex_processes.length){
     s.codex_processes.forEach(p=>{
       const short=p.length>80?p.substring(0,80)+'...':p;
       html+='<div class="stats-row" style="word-break:break-all"><span class="stats-row-value" style="font-size:.7rem">'+esc(short)+'</span></div>';
     });
   }else{
-    html+='<div class="stats-row"><span class="stats-row-label">No Codex processes found</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label">No '+esc(AGENT_NAME)+' processes found</span></div>';
   }
   if(s.codex_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.codex_related+'</span></div>';
   html+='</div>';
 
-  // Codex Usage
+  // Native agent usage
   if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
     function fmtTok(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
     function fmtCost(n){if(!n)return'—';return'$'+n.toFixed(2)}
     function modelTag(m){if(!m||m==='unknown')return'';const short=m.replace('gpt-','').replace(/-\d{8}$/,'');let bg='#30363d';if(short.includes('mini'))bg='#3b82f6';else if(short.includes('o3'))bg='#f59e0b';else if(short.includes('5'))bg='#10a37f';return'<span class="model-tag" style="background:'+bg+'">'+esc(short)+'</span>'}
-    html+='<div class="stats-section"><div class="stats-section-title">Codex Usage</div>';
+    html+='<div class="stats-section"><div class="stats-section-title">'+esc(AGENT_NAME)+' Usage</div>';
     html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Session</th><th>Model</th><th>5h Tokens</th><th>5h Cost</th><th>Week Tokens</th><th>Week Cost</th></tr></thead><tbody>';
     usage.sessions.forEach(sess=>{
       html+='<tr><td>'+esc(sess.name)+'</td><td>'+modelTag(sess.model)+'</td>';
@@ -26895,7 +27874,7 @@ function renderStats(s,usage,byUser,alerts){
     html+='<td>'+fmtN(t.promptsToday)+'</td><td>'+fmtN(t.tokensToday)+'</td><td>'+fmtC(t.costToday)+'</td>';
     html+='<td>'+fmtN(t.promptsWeek)+'</td><td>'+fmtN(t.tokensWeek)+'</td><td>'+fmtC(t.costWeek)+'</td></tr>';
     html+='</tbody></table>';
-    html+='<div class="stats-row"><span class="stats-row-label" style="font-size:.65rem">Totals cover retained audited prompts and Codex rollouts. Windowed tokens are turn deltas. Cost is a list-price estimate, not billing.</span></div>';
+    html+='<div class="stats-row"><span class="stats-row-label" style="font-size:.65rem">Totals cover retained audited prompts and '+esc(AGENT_NAME)+' session logs. Windowed tokens are turn deltas. Cost is an estimate from native usage records, not billing.</span></div>';
     html+='</div>';
   }
 
