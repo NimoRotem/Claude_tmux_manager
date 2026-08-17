@@ -9990,10 +9990,9 @@ async def _stop_controller_socket() -> None:
         _controller_server.close()
         await _controller_server.wait_closed()
         _controller_server = None
-    try:
-        CONTROLLER_SOCKET.unlink()
-    except FileNotFoundError:
-        pass
+    # A replacement controller may already have rebound this pathname while an
+    # old process drains during a Supervisor restart. Startup always removes a
+    # stale socket before binding, so shutdown must never unlink the pathname.
 
 
 async def _controller_call(op: str, **fields) -> dict:
