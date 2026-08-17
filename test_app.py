@@ -1,4 +1,5 @@
 """Tests for tmux Dashboard app.py — utility functions and API logic."""
+import asyncio
 import hashlib
 import hmac
 import json
@@ -1061,3 +1062,23 @@ class TestAtomicWriteJson:
         _atomic_write_json(target, {"tok": "abc"})
         mode = oct(target.stat().st_mode & 0o777)
         assert mode == "0o600", f"Expected 0o600, got {mode}"
+
+
+@pytest.mark.asyncio
+async def test_old_controller_shutdown_preserves_replacement_socket(tmp_path, monkeypatch):
+    """A retiring controller must not unlink its replacement's IPC socket."""
+    import app
+
+    socket_path = tmp_path / "controller.sock"
+    monkeypatch.setattr(app, "CONTROLLER_SOCKET", socket_path)
+    await app._start_controller_socket()
+
+    socket_path.unlink()
+    replacement = await asyncio.start_unix_server(lambda _reader, _writer: None, path=socket_path)
+    try:
+        await app._stop_controller_socket()
+        assert socket_path.exists()
+    finally:
+        replacement.close()
+        await replacement.wait_closed()
+        socket_path.unlink(missing_ok=True)
