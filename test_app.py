@@ -1,4 +1,5 @@
 """Tests for tmux Dashboard app.py — utility functions and API logic."""
+import asyncio
 import hashlib
 import hmac
 import json
@@ -1059,3 +1060,58 @@ class TestAtomicWriteJson:
         _atomic_write_json(target, {"tok": "abc"})
         mode = oct(target.stat().st_mode & 0o777)
         assert mode == "0o600", f"Expected 0o600, got {mode}"
+
+
+class TestControllerSocketOwnership:
+    """A retiring controller must never unlink its successor's IPC socket.
+
+    Shutdown used to delete the pathname unconditionally. Once a new generation
+    had already bound its own socket there, the old process removed it on the
+    way out: the new controller kept listening on an unlinked inode, every API
+    worker's connect() raised FileNotFoundError, and no terminal streamed until
+    somebody restarted the service.
+    """
+
+    @staticmethod
+    def _run(coro):
+        """Drive one coroutine; these tests need no pytest-asyncio."""
+        return asyncio.run(coro)
+
+    def test_successor_socket_survives_old_controller_exit(self, tmp_path, monkeypatch):
+        import app
+
+        socket_path = tmp_path / "controller.sock"
+        monkeypatch.setattr(app, "CONTROLLER_SOCKET", socket_path)
+
+        async def scenario():
+            await app._start_controller_socket()
+            # A replacement controller rebinds the pathname while we drain.
+            socket_path.unlink()
+            replacement = await asyncio.start_unix_server(
+                lambda _reader, _writer: None, path=str(socket_path))
+            try:
+                await app._stop_controller_socket()
+                return socket_path.exists()
+            finally:
+                replacement.close()
+                await replacement.wait_closed()
+
+        assert self._run(scenario()), \
+            "the retiring controller deleted its successor's socket"
+
+    def test_controller_still_removes_its_own_socket(self, tmp_path, monkeypatch):
+        """The ownership check must not decay into never cleaning up at all."""
+        import app
+
+        socket_path = tmp_path / "controller.sock"
+        monkeypatch.setattr(app, "CONTROLLER_SOCKET", socket_path)
+
+        async def scenario():
+            await app._start_controller_socket()
+            bound = socket_path.exists()
+            await app._stop_controller_socket()
+            return bound, socket_path.exists()
+
+        bound, still_there = self._run(scenario())
+        assert bound, "controller never bound its socket"
+        assert not still_there, "controller left its own socket behind"

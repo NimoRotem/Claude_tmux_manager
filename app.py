@@ -8294,6 +8294,9 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 # workers only relay its line-delimited JSON over authenticated WebSockets.
 _terminal_channels: dict[str, dict] = {}
 _controller_server = None
+# (st_dev, st_ino) of the socket file this process bound, so a controller
+# that is slow to shut down never unlinks its successor's socket.
+_controller_socket_id = None
 
 
 class _TerminalQueueWriter:
@@ -8970,7 +8973,7 @@ async def _controller_client(
 
 
 async def _start_controller_socket() -> None:
-    global _controller_server
+    global _controller_server, _controller_socket_id
     CONTROLLER_SOCKET.parent.mkdir(parents=True, exist_ok=True)
     try:
         CONTROLLER_SOCKET.unlink()
@@ -8980,15 +8983,40 @@ async def _start_controller_socket() -> None:
         _controller_client, path=str(CONTROLLER_SOCKET), limit=1024 * 1024
     )
     CONTROLLER_SOCKET.chmod(0o600)
+    try:
+        bound = CONTROLLER_SOCKET.stat()
+        _controller_socket_id = (bound.st_dev, bound.st_ino)
+    except OSError:
+        _controller_socket_id = None
     logger.info("Controller IPC listening on %s", CONTROLLER_SOCKET)
 
 
 async def _stop_controller_socket() -> None:
-    global _controller_server
+    """Close the listener, and remove the socket file only if it is still ours.
+
+    A controller that is slow to die used to unlink whatever happened to sit at
+    this path. When the next generation had already bound its own socket there,
+    the old one deleted it on the way out: the new controller kept a live
+    listener on an unlinked inode, every API worker's connect() got ENOENT, and
+    no terminal streamed until the next restart. Compare the inode we bound with
+    the one on disk and leave a successor's socket where it is.
+    """
+    global _controller_server, _controller_socket_id
     if _controller_server:
         _controller_server.close()
         await _controller_server.wait_closed()
         _controller_server = None
+    ours, _controller_socket_id = _controller_socket_id, None
+    if ours is None:
+        return
+    try:
+        current = CONTROLLER_SOCKET.stat()
+    except OSError:
+        return
+    if (current.st_dev, current.st_ino) != ours:
+        logger.info("Controller socket at %s belongs to a newer controller — leaving it",
+                    CONTROLLER_SOCKET)
+        return
     try:
         CONTROLLER_SOCKET.unlink()
     except FileNotFoundError:
