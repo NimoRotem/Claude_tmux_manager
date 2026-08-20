@@ -10785,6 +10785,16 @@ async def api_browser_live(sid: str, body: BrowserLiveBody, request: Request):
 # tool with a different UI.
 _ladder_active: Dict[str, float] = {}      # run id -> started, for runs this process owns
 
+# Its own two threads, not the shared default executor. Everything the ladder
+# endpoints do is a sub-second file read, but the shared pool is where the tmux
+# capture and the CDP probes queue up, and behind those a 0.3s read was taking
+# 12 to 21 seconds, long enough that the panel painted empty and looked broken.
+_ladder_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ladder-api")
+
+
+async def _ladder_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_ladder_pool, fn, *args)
+
 
 def _ladder_start(url: str, opts: dict) -> str:
     """Kick a run off on a worker thread and hand back its id immediately.
@@ -10820,9 +10830,9 @@ class LadderRunBody(BaseModel):
 async def api_ladder(request: Request, limit: int = 25):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    runs = await asyncio.to_thread(browser_ladder.list_runs, max(1, min(int(limit), 100)))
-    rungs = await asyncio.to_thread(browser_ladder.doctor)
-    mem = await asyncio.to_thread(browser_ladder.Memory()._read)
+    runs = await _ladder_thread(browser_ladder.list_runs, max(1, min(int(limit), 100)))
+    rungs = await _ladder_thread(browser_ladder.doctor)
+    mem = await _ladder_thread(browser_ladder.Memory()._read)
     learned = sorted(
         ({"host": h, **row} for h, row in mem.items()),
         key=lambda r: r.get("ts", 0), reverse=True)[:40]
@@ -10862,7 +10872,7 @@ async def api_ladder_run(body: LadderRunBody, request: Request):
 async def api_ladder_run_get(run_id: str, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    rec = await asyncio.to_thread(browser_ladder.load_run, run_id)
+    rec = await _ladder_thread(browser_ladder.load_run, run_id)
     if not rec:
         # A run this process just started has no file until its first step lands.
         if run_id in _ladder_active:
@@ -10884,7 +10894,7 @@ async def api_ladder_artifact(run_id: str, name: str, request: Request):
     same-origin inside the dashboard."""
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    path = await asyncio.to_thread(browser_ladder.run_artifact, run_id, name)
+    path = await _ladder_thread(browser_ladder.run_artifact, run_id, name)
     if not path:
         return JSONResponse({"error": "no such artefact"}, status_code=404)
     suffix = path.suffix.lower()
@@ -10913,8 +10923,8 @@ async def api_ladder_forget(body: LadderForgetBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     host = (body.host or "").strip().lower()
-    n = await asyncio.to_thread(browser_ladder.Memory().forget,
-                                "" if host in ("", "all", "*") else host)
+    n = await _ladder_thread(browser_ladder.Memory().forget,
+                             "" if host in ("", "all", "*") else host)
     logger.info("Ladder memory: forgot %s", host or "everything")
     return JSONResponse({"ok": True, "forgot": n})
 
@@ -18024,6 +18034,67 @@ body.member-simple .hide-in-simple{display:none!important}
 .nav-browser-badge.busy .nbb-glyph{filter:none;animation:nbb-pulse 1.4s ease-in-out infinite}
 @keyframes nbb-spin{to{transform:rotate(360deg)}}
 @keyframes nbb-pulse{0%,100%{opacity:1}50%{opacity:.45}}
+/* Ladder panel: the same layout at every rung, deliberately. A fetch that
+   needed a residential browser and one that needed curl are the same shape of
+   answer, and the only thing that should look different is which line is lit. */
+.lad-form{display:flex;gap:6px;margin:8px 0 12px;flex-wrap:wrap}
+.lad-form input{flex:1 1 320px;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+  color:#e6edf3;padding:7px 10px;font-size:.82rem;outline:none}
+.lad-form input:focus{border-color:#58a6ff}
+.lad-form select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;
+  padding:7px 8px;font-size:.75rem;outline:none}
+.lad-rungs{padding:0 0 4px}
+.lad-cols{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:12px;align-items:start}
+@media (max-width:820px){.lad-cols{grid-template-columns:minmax(0,1fr)}}
+.lad-trace{border:1px solid #30363d;border-radius:8px;background:#0d1117;padding:10px 12px;min-height:120px}
+.lad-url-line{font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;color:#c9d1d9;
+  border-bottom:1px solid #21262d;padding-bottom:6px;margin-bottom:8px;word-break:break-all}
+.lad-startwhy{font-size:.7rem;color:#d29922;margin:-4px 0 8px}
+.lad-step{border-radius:6px;padding:2px 0}
+.lad-step.open{background:#0b1017;border:1px solid #21262d;padding:6px 8px}
+.lad-step-head{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.8rem}
+.lad-step-head:hover .lad-lvl{color:#58a6ff}
+.lad-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6e7681}
+.lad-dot.good{background:#3fb950;box-shadow:0 0 6px #3fb95088}
+.lad-dot.bad{background:#f85149;box-shadow:0 0 6px #f8514988}
+.lad-dot.step{background:#d29922;box-shadow:0 0 6px #d2992288}
+.lad-lvl{font-weight:600;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;
+  min-width:104px;letter-spacing:.03em}
+.lad-ms{color:#8b949e;font-size:.72rem;font-variant-numeric:tabular-nums;min-width:62px;text-align:right}
+.lad-bits{color:#6e7681;font-size:.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lad-why{color:#8b949e;font-size:.72rem;padding:1px 0 3px 17px;line-height:1.45}
+.lad-arrow{color:#30363d;font-size:.8rem;padding-left:2px;line-height:1.1}
+.lad-end{font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.78rem;font-weight:600;padding-top:2px}
+.lad-end.good{color:#3fb950}
+.lad-end.bad{color:#f85149}
+.lad-end.running{color:#58a6ff}
+.lad-detail{margin:6px 0 2px 17px;border-left:1px solid #21262d;padding-left:10px}
+.lad-shot{max-width:100%;border:1px solid #21262d;border-radius:4px;display:block;margin-bottom:8px;background:#010409}
+.lad-meta{width:100%;border-collapse:collapse;font-size:.7rem;margin-bottom:8px}
+.lad-meta td{padding:2px 6px 2px 0;vertical-align:top;color:#c9d1d9;word-break:break-all}
+.lad-meta td:first-child{color:#6e7681;white-space:nowrap;width:1%;text-transform:uppercase;
+  letter-spacing:.03em;font-size:.63rem;padding-top:3px}
+.lad-sub{font-size:.63rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;
+  font-weight:600;margin:6px 0 3px}
+.lad-log{max-height:150px;overflow-y:auto;background:#010409;border:1px solid #21262d;
+  border-radius:4px;padding:4px 6px;margin-bottom:8px}
+.lad-log-row{font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.66rem;color:#8b949e;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.6}
+.lad-log-row.error,.lad-log-row.pageerror{color:#f85149}
+.lad-log-row.warn,.lad-log-row.warning{color:#d29922}
+.lad-files{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.lad-side{display:flex;flex-direction:column;gap:2px}
+.lad-side-title{font-size:.63rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;
+  font-weight:600;margin:4px 0 4px}
+.lad-hint{text-transform:none;letter-spacing:0;color:#6e7681;font-weight:400}
+.lad-run{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:5px;cursor:pointer;
+  font-size:.7rem;color:#8b949e;border:1px solid transparent}
+.lad-run:hover{background:#0d1117}
+.lad-run.on{background:#0d1117;border-color:#30363d}
+.lad-run-url{color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
+.lad-run-lvl{color:#6e7681;flex:0 0 auto;font-size:.63rem;text-transform:uppercase}
+.lad-run-ms{color:#6e7681;flex:0 0 auto;font-variant-numeric:tabular-nums}
+
 /* Browser tab */
 .bs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
 .bs-badges{display:flex;gap:5px;flex-wrap:wrap;padding:0 10px 8px}
@@ -23310,11 +23381,246 @@ function renderBrowserTab(data){
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
         'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
         'once nobody is watching. <b>History</b> is the audit trail.</div>'+
+      '<div id="ladder-panel">'+renderLadderPanel()+'</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
       renderUnmanagedBrowsers()+
     '</div>';
+}
+
+// --- The ladder ------------------------------------------------------------
+// One panel for every rung. The point of showing it at all is that "which rung
+// answered, and why did it have to climb" is the only way to tell a site that
+// is genuinely hostile from one we are fetching expensively out of habit, and
+// the ladder is invisible from the outside otherwise, because a page fetched
+// with curl and the same page fetched with a residential browser look identical
+// once you are holding the page.
+let _ladderData = null;    // /api/browser/ladder payload
+let _ladderRun = null;     // the run currently on screen
+let _ladderStep = -1;      // which step is expanded
+let _ladderUrl = '';       // kept out of the DOM: the tab re-renders under us
+let _ladderTimer = null;
+let _ladderCeiling = 4;
+
+async function loadLadder(){
+  try{
+    const r = await fetch(BASE+'/api/browser/ladder');
+    if(!r.ok) return;
+    _ladderData = await r.json();
+    _paintLadder();
+  }catch(e){ /* the tab is still useful without it */ }
+}
+
+function _paintLadder(){
+  const el = document.getElementById('ladder-panel');
+  if(el) el.innerHTML = renderLadderPanel();
+}
+
+function _ladVerdictClass(v){
+  if(v==='ok') return 'good';
+  if(v==='skipped'||v==='needs_js'||v==='unavailable') return 'step';
+  return 'bad';
+}
+
+function renderLadderPanel(){
+  const d = _ladderData||{};
+  // The tab re-renders whenever the proxy or sign-in probes land, and those
+  // finish at unpredictable times, so anything that paints before the ladder
+  // payload has arrived has to ask for it again rather than sit empty.
+  if(!_ladderData) setTimeout(loadLadder, 0);
+  const rungs = _ladderData
+    ? (d.rungs||[]).map(r=>{
+        const cls = r.state==='ok' ? 'ok' : (r.state==='tight'||r.state==='degraded' ? 'warn' : 'bad');
+        return '<span class="bs-badge '+cls+'" title="'+esc(r.detail)+'">'+esc(r.name)+'</span>';
+      }).join('')
+    : '<span class="bs-badge">checking which rungs are installed…</span>';
+  const opts = [[-1,'L-1 internal only'],[0,'L0 fetch, never opens a browser'],
+                [1,'L1 light, a DOM but still no browser'],[2,'L2 chromium'],
+                [3,'L3 chromium + datacenter egress'],[4,'L4 residential + takeover']]
+    .map(o=>'<option value="'+o[0]+'"'+(_ladderCeiling===o[0]?' selected':'')+'>'+esc(o[1])+'</option>').join('');
+  const form =
+    '<div class="lad-form">'+
+      '<input id="lad-url" placeholder="https://example.com, fetched at the cheapest rung that works" '+
+        'value="'+esc(_ladderUrl)+'" oninput="_ladderUrl=this.value" '+
+        'onkeydown="if(event.key===\'Enter\')runLadder()">'+
+      '<select id="lad-max" onchange="_ladderCeiling=parseInt(this.value,10)" '+
+        'title="How far it is allowed to climb. Anything above L1 starts a real browser.">'+opts+'</select>'+
+      '<button class="btn btn-primary" onclick="runLadder()">Run</button>'+
+    '</div>';
+  const runs = (d.runs||[]).map(r=>{
+    const res = r.result||{};
+    const cls = r.running ? 'step' : _ladVerdictClass(res.verdict);
+    const lvl = res.level_label || (r.running ? 'running' : '?');
+    return '<div class="lad-run'+(_ladderRun&&_ladderRun.id===r.id?' on':'')+'" '+
+      'onclick="openLadderRun(\''+esc(r.id)+'\')" title="'+esc(res.why||'')+'">'+
+      '<span class="lad-dot '+cls+'"></span>'+
+      '<span class="lad-run-url">'+esc((r.url||'').replace(/^https?:\/\//,''))+'</span>'+
+      '<span class="lad-run-lvl">'+esc(lvl)+'</span>'+
+      '<span class="lad-run-ms">'+(r.ms||0)+'ms</span>'+
+      '</div>';
+  }).join('') || '<div class="history-empty">'+(_ladderData?'No runs yet.':'Loading…')+'</div>';
+  const learned = (d.learned||[]).slice(0,12).map(m=>
+    '<span class="bs-badge" title="'+esc(m.why||'')+'. Click to forget, so the next run climbs '+
+      'from the bottom again" style="cursor:pointer" onclick="ladderForget(\''+esc(m.host)+'\')">'+
+      esc(m.host)+' → '+esc(((d.levels||{})[String(m.level)]||{}).label||'?')+'</span>').join('');
+  return '<div class="bs-section-title">Ladder: how a page actually gets fetched</div>'+
+    '<div class="pf-banner">Every fetch starts at the bottom and climbs only on a real failure: '+
+      '<b>L-1</b> our own hosts, <b>L0</b> an HTTP request carrying a real Chrome TLS fingerprint, '+
+      '<b>L1</b> a DOM and a JS engine with no browser around them, <b>L2</b> an ephemeral '+
+      'Chromium, <b>L3</b> the same browser windowed on a different egress, <b>L4</b> the '+
+      'resident browser on a residential exit that a human can take over. '+
+      'Nothing above L1 stays running: each rung is launched for one page and killed. '+
+      'Agents get the same thing from <code>browser-ctl get &lt;url&gt;</code>.</div>'+
+    '<div class="bs-badges lad-rungs">'+rungs+'</div>'+
+    form+
+    '<div class="lad-cols">'+
+      '<div class="lad-trace">'+renderLadderTrace()+'</div>'+
+      '<div class="lad-side">'+
+        '<div class="lad-side-title">Recent runs</div>'+runs+
+        (learned? '<div class="lad-side-title">Learned <span class="lad-hint">click to forget</span></div>'+
+                  '<div class="bs-badges">'+learned+'</div>' : '')+
+      '</div>'+
+    '</div>';
+}
+
+function renderLadderTrace(){
+  const rec = _ladderRun;
+  if(!rec) return '<div class="history-empty">Pick a run, or fetch something.</div>';
+  const res = rec.result||{};
+  const steps = (rec.steps||[]).map((s,i)=>{
+    const cls = _ladVerdictClass(s.verdict);
+    const bits = [];
+    if(s.status) bits.push(s.status);
+    if(s.bytes) bits.push(_fmtBytes(s.bytes));
+    if(s.text_len) bits.push(s.text_len+' chars');
+    if(s.egress&&s.egress.ip) bits.push(s.egress.ip+(s.egress.datacenter?' · datacenter':''));
+    if(s.mode) bits.push(s.mode);
+    const head =
+      '<div class="lad-step-head" onclick="toggleLadderStep('+i+')">'+
+        '<span class="lad-dot '+cls+'"></span>'+
+        '<span class="lad-lvl">'+esc(s.label||'')+'</span>'+
+        '<span class="lad-ms">'+(s.ms||0)+' ms</span>'+
+        '<span class="lad-bits">'+esc(bits.join('  ·  '))+'</span>'+
+      '</div>'+
+      '<div class="lad-why">'+esc(s.why||'')+'</div>';
+    return '<div class="lad-step'+(_ladderStep===i?' open':'')+'">'+head+
+      (_ladderStep===i? renderLadderStepDetail(rec, s) : '')+'</div>';
+  }).join('<div class="lad-arrow">↓</div>');
+  const tail = rec.running
+    ? '<div class="lad-end running">⟳ climbing…</div>'
+    : (res.ok
+        ? '<div class="lad-end good">✓ DONE  '+esc(res.level_label||'')+' in '+(res.ms||0)+' ms</div>'
+        : '<div class="lad-end bad">✗ FAILED  '+esc(res.verdict||'')+': '+esc(res.why||'')+'</div>');
+  const startWhy = res.start_why
+    ? '<div class="lad-startwhy">Started above the bottom: '+esc(res.start_why)+'</div>' : '';
+  return '<div class="lad-url-line">'+esc(rec.url||'')+'</div>'+startWhy+
+    (steps? steps+'<div class="lad-arrow">↓</div>' : '')+tail;
+}
+
+function renderLadderStepDetail(rec, s){
+  const a = s.artifact_urls||{};
+  const out = [];
+  if(a.screenshot){
+    // The rung's own view of the page. L0 and L1 have nothing to show here, and
+    // that is the honest answer: neither of them ever rasterised anything.
+    out.push('<img class="lad-shot" src="'+esc(a.screenshot)+'" loading="lazy" alt="What '+
+      esc(s.label||'')+' saw">');
+  }
+  const meta = [];
+  if(s.engine) meta.push(['engine', s.engine]);
+  if(s.route) meta.push(['route', s.route]);
+  if(s.final_url && s.final_url!==rec.url) meta.push(['landed on', s.final_url]);
+  if(s.content_type) meta.push(['content-type', s.content_type]);
+  if(s.ua) meta.push(['user-agent', s.ua]);
+  if(s.stealth) meta.push(['fingerprint shim', s.stealth]);
+  if(s.egress&&s.egress.org) meta.push(['egress', (s.egress.ip||'')+' · '+s.egress.org+
+    (s.egress.country?' · '+s.egress.country:'')]);
+  if((s.challenge||[]).length) meta.push(['wall', s.challenge.join(', ')]);
+  if((s.challenge_passed||[]).length) meta.push(['wall cleared', s.challenge_passed.join(', ')]);
+  if(s.browser) meta.push(['browser', s.browser]);
+  if(meta.length){
+    out.push('<table class="lad-meta">'+meta.map(m=>
+      '<tr><td>'+esc(m[0])+'</td><td>'+esc(String(m[1]).slice(0,300))+'</td></tr>').join('')+'</table>');
+  }
+  const hdrs = s.headers||{};
+  const hk = Object.keys(hdrs);
+  if(hk.length){
+    out.push('<div class="lad-sub">Response headers</div><table class="lad-meta">'+
+      hk.slice(0,18).map(k=>'<tr><td>'+esc(k)+'</td><td>'+esc(String(hdrs[k]).slice(0,200))+'</td></tr>').join('')+
+      '</table>');
+  }
+  if((s.console||[]).length){
+    out.push('<div class="lad-sub">Console ('+s.console.length+')</div><div class="lad-log">'+
+      s.console.slice(0,25).map(c=>'<div class="lad-log-row '+esc(c.level||'')+'">'+
+        esc(c.level||'log')+'  '+esc(c.text||'')+'</div>').join('')+'</div>');
+  }
+  if((s.requests||[]).length){
+    out.push('<div class="lad-sub">Network ('+s.requests.length+')</div><div class="lad-log">'+
+      s.requests.slice(0,25).map(q=>'<div class="lad-log-row">'+
+        esc(String(q.status||q.method||''))+'  '+esc((q.url||'').slice(0,110))+'</div>').join('')+'</div>');
+  }
+  const files = Object.keys(a).filter(k=>k!=='screenshot');
+  if(files.length){
+    out.push('<div class="lad-files">'+files.map(k=>
+      '<a class="btn btn-ghost" href="'+esc(a[k])+'" target="_blank" rel="noopener">'+esc(k)+' ↗</a>').join(' ')+
+      '</div>');
+  }
+  if(s.takeover_url){
+    out.push('<div class="lad-files"><button class="btn" onclick="openBrowserSession(\''+
+      esc(s.browser||'default')+'\')">Take it over ↗</button></div>');
+  }
+  return '<div class="lad-detail">'+(out.join('')||'<div class="lad-sub">Nothing captured at this rung.</div>')+'</div>';
+}
+
+async function runLadder(){
+  const url = (_ladderUrl||'').trim();
+  if(!url){ showToast('A URL first'); return; }
+  try{
+    const r = await fetch(BASE+'/api/browser/ladder/run',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url:url, max_level:_ladderCeiling, note:'from the dashboard'})});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'failed');
+    _ladderStep = -1;
+    openLadderRun(d.run_id);
+  }catch(e){ showToast('Ladder: '+(e.message||e)); }
+}
+
+async function openLadderRun(id){
+  if(_ladderTimer){ clearTimeout(_ladderTimer); _ladderTimer = null; }
+  try{
+    const r = await fetch(BASE+'/api/browser/ladder/run/'+encodeURIComponent(id));
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||'no such run');
+    if(_ladderRun && _ladderRun.id !== d.id) _ladderStep = -1;
+    _ladderRun = d;
+    _paintLadder();
+    // Poll only while it is climbing, and only while this tab is on screen: a
+    // finished run is a static file, and a tab nobody is looking at does not
+    // need either.
+    if(d.running && _settingsActiveTab==='browser'){
+      _ladderTimer = setTimeout(()=>openLadderRun(id), 1200);
+    }else{
+      loadLadder();
+    }
+  }catch(e){ showToast('Ladder: '+(e.message||e)); }
+}
+
+function toggleLadderStep(i){
+  _ladderStep = (_ladderStep===i ? -1 : i);
+  _paintLadder();
+}
+
+async function ladderForget(host){
+  try{
+    const r = await fetch(BASE+'/api/browser/ladder/forget',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({host:host})});
+    if(!r.ok) throw new Error('failed');
+    showToast('Forgot '+host+'. The next run climbs from the bottom again');
+    loadLadder();
+  }catch(e){ showToast('Could not forget '+host); }
 }
 
 // Chromes running on this box that are NOT in our session list — the ones an
