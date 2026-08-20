@@ -596,6 +596,14 @@ def warp_start(wait_s: float = 12.0) -> bool:
     binary, conf = cfg["warp_bin"], cfg["warp_conf"]
     if not (Path(binary).exists() and Path(conf).exists()):
         return False
+    # A config with no [Interface] is a half-finished install, not an egress.
+    # Without this check wireproxy is spawned, fails, and the rung burns the
+    # full 12s start timeout on every single L3 attempt before giving up.
+    try:
+        if "[Interface]" not in Path(conf).read_text() or "PrivateKey" not in Path(conf).read_text():
+            return False
+    except Exception:
+        return False
     try:
         logf = open(CB_ROOT / "logs" / "warp.log", "ab", buffering=0)
     except Exception:
@@ -1748,11 +1756,22 @@ def doctor() -> List[dict]:
                  "detail": "playwright-core %s, %d chromium build(s)"
                            % ("present" if have_pw else "missing", len(chrome))})
     warp = warp_running()
-    rows.append({"level": CHROMIUM_DC, "name": "L3  +dc egress",
-                 "state": "ok" if (warp or Path(cfg["warp_bin"]).exists()) else "missing",
-                 "detail": "WARP " + ("up on :%s" % cfg["warp_port"] if warp
-                                      else "installed, starts on demand"
-                                      if Path(cfg["warp_bin"]).exists() else "not installed")})
+    conf_ok = False
+    try:
+        conf_ok = "[Interface]" in Path(cfg["warp_conf"]).read_text()
+    except Exception:
+        conf_ok = False
+    rows.append({"level": CHROMIUM_DC,
+                 "name": "L3  +dc egress",
+                 "state": "ok" if (warp or conf_ok) else "missing",
+                 "detail": "WARP " + (
+                     "up on :%s" % cfg["warp_port"] if warp else
+                     "installed, starts on demand" if conf_ok else
+                     "binary present but no wireguard profile: run `wgcf register "
+                     "--accept-tos && wgcf generate` in %s, then append a [Socks5] "
+                     "BindAddress = 127.0.0.1:%s block"
+                     % (Path(cfg["warp_conf"]).parent, cfg["warp_port"])
+                     if Path(cfg["warp_bin"]).exists() else "not installed")})
     sess = Run("https://x/", run_id="doctor")._resident_session()
     sess_ok = _port_alive(int(sess.get("cdp_port") or 0))
     rows.append({"level": RESIDENT, "name": "L4  residential",
