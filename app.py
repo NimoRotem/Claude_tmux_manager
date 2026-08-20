@@ -25,6 +25,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 import glob as globmod
 
+import browser_ladder
 import browser_resource_guard
 
 logger = logging.getLogger("tmux-dashboard")
@@ -10775,6 +10776,149 @@ async def api_browser_live(sid: str, body: BrowserLiveBody, request: Request):
     return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
+# --- The ladder: one viewer for every rung -----------------------------------
+# browser_ladder decides how to fetch a page — from an HTTP request with a real
+# Chrome TLS fingerprint up to the resident browser on a residential exit — and
+# writes every attempt, with its verdict and its reason, to a run file. These
+# endpoints are the window onto that: the same panel whichever rung is running,
+# because the point is that the rung is a detail of the answer, not a different
+# tool with a different UI.
+_ladder_active: Dict[str, float] = {}      # run id -> started, for runs this process owns
+
+
+def _ladder_start(url: str, opts: dict) -> str:
+    """Kick a run off on a worker thread and hand back its id immediately.
+
+    Runs write their progress to disk step by step, so the browser polls the
+    run file rather than holding a socket open for what can be three minutes of
+    escalation."""
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    _ladder_active[run_id] = time.time()
+
+    def work():
+        try:
+            browser_ladder.fetch(url, run_id=run_id, **opts)
+        except Exception:
+            logger.exception("Ladder run %s failed", run_id)
+        finally:
+            _ladder_active.pop(run_id, None)
+
+    threading.Thread(target=work, name="ladder-%s" % run_id, daemon=True).start()
+    return run_id
+
+
+class LadderRunBody(BaseModel):
+    url: str
+    max_level: int = 4
+    level: Optional[int] = None      # exactly this rung, no escalation
+    takeover: bool = False           # at L4, bring up the stream for a human
+    use_memory: bool = True
+    note: str = ""
+
+
+@app.get("/api/browser/ladder")
+async def api_ladder(request: Request, limit: int = 25):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    runs = await asyncio.to_thread(browser_ladder.list_runs, max(1, min(int(limit), 100)))
+    rungs = await asyncio.to_thread(browser_ladder.doctor)
+    mem = await asyncio.to_thread(browser_ladder.Memory()._read)
+    learned = sorted(
+        ({"host": h, **row} for h, row in mem.items()),
+        key=lambda r: r.get("ts", 0), reverse=True)[:40]
+    return JSONResponse({
+        "runs": runs, "rungs": rungs, "learned": learned,
+        "levels": {str(k): v for k, v in browser_ladder.LEVELS.items()},
+        "active": sorted(_ladder_active.keys()),
+    })
+
+
+@app.post("/api/browser/ladder/run")
+async def api_ladder_run(body: LadderRunBody, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    url = (body.url or "").strip()
+    if not url:
+        return JSONResponse({"error": "a URL is required"}, status_code=400)
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    if not re.match(r"^https?://", url, re.I):
+        return JSONResponse({"error": "http and https only"}, status_code=400)
+    opts = {
+        "max_level": max(-1, min(int(body.max_level), 4)),
+        "only_level": None if body.level is None else max(-1, min(int(body.level), 4)),
+        "use_memory": bool(body.use_memory),
+        "takeover": bool(body.takeover),
+        "note": (body.note or "")[:200],
+        "agent": "dashboard",
+    }
+    run_id = _ladder_start(url, opts)
+    logger.info("Ladder run %s started for %s (ceiling L%d%s)", run_id, url,
+                opts["max_level"], ", takeover" if opts["takeover"] else "")
+    return JSONResponse({"ok": True, "run_id": run_id, "url": url})
+
+
+@app.get("/api/browser/ladder/run/{run_id}")
+async def api_ladder_run_get(run_id: str, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    rec = await asyncio.to_thread(browser_ladder.load_run, run_id)
+    if not rec:
+        # A run this process just started has no file until its first step lands.
+        if run_id in _ladder_active:
+            return JSONResponse({"id": run_id, "running": True, "steps": [], "result": {}})
+        return JSONResponse({"error": "no such run"}, status_code=404)
+    for s in rec.get("steps") or []:
+        arts = s.get("artifacts") or {}
+        s["artifact_urls"] = {
+            k: f"{ROOT_PATH}/api/browser/ladder/run/{rec['id']}/artifact/{v}"
+            for k, v in arts.items() if v}
+    return JSONResponse(rec)
+
+
+@app.get("/api/browser/ladder/run/{run_id}/artifact/{name}")
+async def api_ladder_artifact(run_id: str, name: str, request: Request):
+    """One captured artefact: the HTML a rung got, its screenshot, its console
+    or its network log. Served as an attachment for anything that is not an
+    image, because a captured page is untrusted HTML and must never be rendered
+    same-origin inside the dashboard."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    path = await asyncio.to_thread(browser_ladder.run_artifact, run_id, name)
+    if not path:
+        return JSONResponse({"error": "no such artefact"}, status_code=404)
+    suffix = path.suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        return FileResponse(str(path), media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=300"})
+    if suffix == ".png":
+        return FileResponse(str(path), media_type="image/png",
+                            headers={"Cache-Control": "private, max-age=300"})
+    media = "application/json" if suffix == ".json" else "text/plain; charset=utf-8"
+    return FileResponse(str(path), media_type=media, headers={
+        "Content-Disposition": 'attachment; filename="%s"' % path.name,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    })
+
+
+class LadderForgetBody(BaseModel):
+    host: str = ""
+
+
+@app.post("/api/browser/ladder/forget")
+async def api_ladder_forget(body: LadderForgetBody, request: Request):
+    """Drop what the ladder learned about a host, so the next run climbs from
+    the bottom again. The everyday use is a site that has stopped fighting."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    host = (body.host or "").strip().lower()
+    n = await asyncio.to_thread(browser_ladder.Memory().forget,
+                                "" if host in ("", "all", "*") else host)
+    logger.info("Ladder memory: forgot %s", host or "everything")
+    return JSONResponse({"ok": True, "forgot": n})
+
+
 # --- Per-account browsers ----------------------------------------------------
 # Each non-admin account gets its own persistent Chrome/noVNC stack, bound to
 # that account's Claude via a Playwright MCP entry pointing at its CDP port.
@@ -15087,6 +15231,9 @@ def _session_model_fields(session_name: str) -> dict:
 
     return {
         "model": model, "model_pending": (pend or {}).get("model", ""),
+        # False when several sessions share a working directory and this one's
+        # transcript could not be told apart from its siblings.
+        "detect_sure": bool(detected.get("sure", True)),
         # Until the session has produced one assistant turn there is nothing in
         # the transcript to read, so fall back to what it was launched with.
         "effort": effort or DEFAULT_EFFORT,
@@ -15108,8 +15255,129 @@ def _get_session_effort(session_name: str) -> str:
     return _detect_session_model_effort(session_name).get("effort", "")
 
 
+_session_transcript_cache: Dict[str, dict] = {}  # {name: {"path": str, "ts": float}}
+
+
+def _pick_session_transcript_file(session_name: str, files: list) -> Optional[str]:
+    """Pick the transcript belonging to THIS session.
+
+    Transcripts are stored per working directory, so several tmux sessions
+    opened on the same repo all land in one project dir and "newest by mtime"
+    hands every one of them whichever session typed last. That is why five
+    sessions on the same checkout showed one session's model and effort.
+
+    When the directory holds one transcript there is nothing to disambiguate.
+    When it holds several, match distinctive lines from the session's own pane
+    against each transcript's tail, which is the same trick crash recovery uses
+    to avoid resuming the wrong conversation."""
+    files = [f for f in files if not os.path.basename(f).startswith("agent-")]
+    if not files:
+        return None
+    newest = max(files, key=lambda f: os.path.getmtime(f))
+    if len(files) == 1:
+        return newest
+
+    now = time.time()
+    cached = _session_transcript_cache.get(session_name)
+    if cached and now - cached.get("ts", 0) < 90:
+        p = cached.get("path")
+        if p and os.path.exists(p):
+            return p
+
+    resolved, confident = newest, False
+    try:
+        cand = _pane_match_fragments(session_name)
+        if cand:
+            best, best_score = None, 0
+            # Newest first: on a tie the most recently written wins, which is
+            # the old behaviour and the safer fallback.
+            for f in sorted(files, key=lambda f: os.path.getmtime(f), reverse=True)[:12]:
+                hay = _transcript_match_text(f)
+                if not hay:
+                    continue
+                score = sum(1 for c in cand if c in hay)
+                if score > best_score:
+                    best, best_score = f, score
+            if best is not None and best_score >= 2:
+                resolved, confident = best, True
+    except Exception:
+        logger.debug("Transcript disambiguation failed for '%s'", session_name,
+                     exc_info=True)
+    _session_transcript_cache[session_name] = {"path": resolved, "ts": now,
+                                               "confident": confident}
+    return resolved
+
+
+# TUI chrome that prefixes wrapped output lines in the pane but is not in the
+# transcript: bullets, tool-result elbows, box drawing, diff gutters.
+_PANE_CHROME_RE = re.compile(r"^[\s│┃╭╰─⎿●✻✳⏵◻◼✓✗>+\-\d]+")
+
+
+def _pane_match_fragments(session_name: str) -> list:
+    """Distinctive text fragments from a session's pane, normalised for
+    matching against a transcript.
+
+    The pane hard-wraps mid-sentence and decorates lines, and the transcript is
+    JSON so its quotes are escaped. Comparing the two raw finds almost nothing,
+    which is why the first cut of this fell back to the wrong file. Both sides
+    are reduced to lowercase word runs instead."""
+    try:
+        scroll = capture_pane_recent(session_name, 160)
+    except Exception:
+        return []
+    out = []
+    for ln in scroll.split("\n"):
+        s = _PANE_CHROME_RE.sub("", ln).strip()
+        if _SHELL_PROMPT_RE.search(s):
+            continue
+        # Keep only letters, digits and spaces so escaped quotes, box glyphs and
+        # punctuation cannot break an otherwise identical run of words.
+        s = _norm_text(re.sub(r"[^0-9A-Za-z ]+", " ", s))
+        if len(s) < 24 or len(s.split()) < 5:
+            continue
+        out.append(s)
+    return sorted(dict.fromkeys(out), key=len, reverse=True)[:8]
+
+
+_transcript_text_cache: Dict[str, dict] = {}
+
+
+def _transcript_match_text(path: str) -> str:
+    """Normalised text of a transcript's tail, for pane matching. Cached per
+    file+mtime so a poll over many sessions does not re-decode the same files."""
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        return ""
+    c = _transcript_text_cache.get(path)
+    if c and c.get("mtime") == mtime:
+        return c.get("text", "")
+    parts = []
+    for ln in _read_jsonl_tail(path, 400_000):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+    text = _norm_text(re.sub(r"[^0-9A-Za-z ]+", " ", " ".join(parts)))
+    if len(_transcript_text_cache) > 400:
+        _transcript_text_cache.clear()
+    _transcript_text_cache[path] = {"mtime": mtime, "text": text}
+    return text
+
+
 def _detect_session_model_effort(session_name: str) -> dict:
-    """Read model + effort out of the newest transcript in one pass.
+    """Read model + effort out of this session's transcript in one pass.
 
     Both live on `type: "assistant"` entries: `model` inside the message (or at
     the top level on older writes), `effort` at the top level. They are read
@@ -15123,11 +15391,15 @@ def _detect_session_model_effort(session_name: str) -> dict:
     if not files:
         _session_model_cache[session_name] = blank
         return blank
-    # Find newest file by mtime
-    newest = max(files, key=lambda f: os.path.getmtime(f), default=None)
+    newest = _pick_session_transcript_file(session_name, files)
     if not newest:
         _session_model_cache[session_name] = blank
         return blank
+    # Was the file actually identified as this session's, or is it just the
+    # most recent one in a shared project dir? The caller marks the badge so a
+    # guess is never shown as fact.
+    sure = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
+                or len(files) == 1)
     model, effort = "", ""
     try:
         with open(newest, "rb") as f:
@@ -15156,7 +15428,7 @@ def _detect_session_model_effort(session_name: str) -> dict:
                 continue
     except Exception:
         logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
-    out = {"model": model, "effort": effort, "ts": now}
+    out = {"model": model, "effort": effort, "ts": now, "sure": sure}
     _session_model_cache[session_name] = out
     return out
 
@@ -17139,6 +17411,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .model-menu .mm-item:hover{background:#21262d}
 .model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
 .tab-more-model-value{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+.badge.unsure{opacity:.55;font-style:italic}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
 .btn-danger:hover{background:#3d1214}
 
@@ -20042,8 +20315,8 @@ function renderDetail(){
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
-        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
-        <span class="badge model-badge${s.effort_pending?' pending':''}" id="effort-badge-${s.name}" title="Reasoning effort — click to switch (runs /effort in this session)" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="model-badge-${s.name}" title="${s.detect_sure===false?'Claude model (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Claude model — click to switch (runs /model in this session)'}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.effort_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="effort-badge-${s.name}" title="${s.detect_sure===false?'Reasoning effort (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Reasoning effort — click to switch (runs /effort in this session)'}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <!-- The terminal line count lived here. It is a number nobody acts on, sitting
@@ -22837,6 +23110,7 @@ async function loadBrowserTab(){
   _browserSessions = data.sessions||[];
   _bsData = data;
   renderBrowserTab(data);
+  loadLadder();
   // Proxy state second: the exit-IP lookups go out over the network, so let the
   // cards paint first and fill the badges in when they land.
   loadBrowserProxy(true);
