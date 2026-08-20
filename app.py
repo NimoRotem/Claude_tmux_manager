@@ -50,6 +50,10 @@ NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claud
 # choice — or a new release's auto-default — into ~/.claude/settings.json (that
 # drift is how default sessions silently became Sonnet 4.6, then Fable 5).
 DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
+# Reasoning effort every new session launches on, exported as
+# CLAUDE_CODE_EFFORT_LEVEL by _claude_launch_env_prefix(). Sessions can still be
+# switched individually from the header dropdown, which runs /effort.
+DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "high")
 
 # --- Model catalog (session header dropdown) --------------------------------
 # The models offered in the per-session dropdown. Seeded with the current
@@ -171,6 +175,16 @@ def _save_model_catalog(catalog: list, last_check: float = 0.0):
 MODEL_CATALOG = _load_model_catalog()
 # Backend allowlist for /api/sessions/{name}/model validation (ids only).
 ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+# Reasoning effort, as the CLI's /effort command accepts it. Keep in sync with
+# EFFORT_CHOICES in the frontend.
+EFFORT_CATALOG = [
+    ["low", "Low"],
+    ["medium", "Medium"],
+    ["high", "High"],
+    ["xhigh", "xHigh"],
+    ["max", "Max"],
+]
+ALLOWED_SESSION_EFFORTS = [row[0] for row in EFFORT_CATALOG]
 # The configured default must always be selectable.
 for _dm in (DEFAULT_MODEL, _model_base_id(DEFAULT_MODEL)):
     if _dm and _dm not in ALLOWED_SESSION_MODELS:
@@ -276,6 +290,10 @@ def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
     out = cmd
     if pin_model and DEFAULT_MODEL and "claude" in cmd and "--model" not in cmd:
         out = f"{cmd} --model {shlex.quote(DEFAULT_MODEL)}"
+    # Same idea for reasoning effort. --effort sets the session's starting level
+    # without pinning it, so the header dropdown (/effort) can still change it.
+    if DEFAULT_EFFORT and "claude" in cmd and "--effort" not in out:
+        out = f"{out} --effort {shlex.quote(DEFAULT_EFFORT)}"
     return _claude_launch_env_prefix() + out
 
 
@@ -330,7 +348,7 @@ PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH 
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
 TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
-TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
+TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", DEFAULT_EFFORT)
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
 GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "dianaotech.com")
@@ -433,11 +451,19 @@ def _claude_launch_env_prefix() -> str:
     """Shell env prefix for launching `claude`. Exports a stored long-lived token
     when present (so sessions stop rotating the shared credential and never get
     revoked); otherwise falls back to unsetting both auth vars. ANTHROPIC_API_KEY
-    is always unset so inference stays on the plan, never the metered API."""
+    is always unset so inference stays on the plan, never the metered API.
+
+    CLAUDE_CODE_EFFORT_LEVEL is unset deliberately: when it is present the CLI
+    treats the effort as pinned for the whole session and refuses /effort with
+    "CLAUDE_CODE_EFFORT_LEVEL=... overrides this session", which would break the
+    effort dropdown. The default is passed as `--effort` instead, which sets the
+    starting level and still allows switching."""
     tok = _load_longlived_token()
     if tok:
-        return "export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok) + "; unset ANTHROPIC_API_KEY; "
-    return "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; "
+        return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
+                + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
+    return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
+            "CLAUDE_CODE_EFFORT_LEVEL; ")
 
 
 def _load_anthropic_key() -> str:
@@ -1388,7 +1414,11 @@ async def api_auth_verify(request: Request):
     """
     u = _user_from_token(request.cookies.get("tmux_auth"))
     if u and u.get("sso", True) is not False:
-        return JSONResponse({"ok": True})
+        # Expose the signed-in user to SSO-gated siblings via auth_request_set
+        # (e.g. tester32 records who authorized each scan). Harmless to apps that
+        # ignore it. ASCII-safe: header values must not carry raw unicode.
+        uname = str(u.get("username") or u.get("email") or "").encode("ascii", "ignore").decode()
+        return JSONResponse({"ok": True}, headers={"X-Sso-User": uname})
     return JSONResponse({"ok": False}, status_code=401)
 
 
@@ -3379,9 +3409,10 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
 
 
 def _set_team_model_effort(cfg_dir: Path):
-    """Pin the team default model + reasoning effort (Opus 4.8, max effort) into a
-    config dir's settings.json so every session launches on it. Claude Code reads
-    `model` from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`."""
+    """Pin the team default model + reasoning effort into a config dir's
+    settings.json so every session launches on it. Claude Code reads `model`
+    from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`. Defaults are
+    TEAM_MODEL / TEAM_EFFORT (Opus 4.8 at high effort)."""
     sp = cfg_dir / "settings.json"
     try:
         s = json.loads(sp.read_text()) if sp.exists() else {}
@@ -14924,6 +14955,7 @@ _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 # Model switches requested via the header dropdown, not yet confirmed by the
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
 _session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+_session_effort_pending: Dict[str, dict] = {}  # {session_name: {"effort": str, "ts": float}}
 
 
 # --- How is each session actually signed in? --------------------------------
@@ -15032,9 +15064,12 @@ def _session_auth_fields(session_name: str) -> dict:
 
 
 def _session_model_fields(session_name: str) -> dict:
-    """`model` + `model_pending` for API payloads. Clears the pending marker once
-    the transcript confirms the switch, or after 15 min (request abandoned)."""
-    model = _get_session_model(session_name)
+    """`model`/`effort` plus their pending markers, for API payloads. A pending
+    marker clears once the transcript confirms the switch, or after 15 min
+    (request abandoned)."""
+    detected = _detect_session_model_effort(session_name)
+    model, effort = detected.get("model", ""), detected.get("effort", "")
+
     pend = _session_model_pending.get(session_name)
     if pend:
         base = pend.get("model", "").split("[", 1)[0]
@@ -15042,25 +15077,58 @@ def _session_model_fields(session_name: str) -> dict:
         if confirmed or time.time() - pend.get("ts", 0) > 900:
             _session_model_pending.pop(session_name, None)
             pend = None
-    return {"model": model, "model_pending": (pend or {}).get("model", "")}
+
+    epend = _session_effort_pending.get(session_name)
+    if epend:
+        want = epend.get("effort", "")
+        if (effort and want and effort == want) or time.time() - epend.get("ts", 0) > 900:
+            _session_effort_pending.pop(session_name, None)
+            epend = None
+
+    return {
+        "model": model, "model_pending": (pend or {}).get("model", ""),
+        # Until the session has produced one assistant turn there is nothing in
+        # the transcript to read, so fall back to what it was launched with.
+        "effort": effort or DEFAULT_EFFORT,
+        "effort_detected": bool(effort),
+        "effort_pending": (epend or {}).get("effort", ""),
+    }
 
 
 def _get_session_model(session_name: str) -> str:
     """Detect the current model for a session by reading the latest JSONL entries."""
+    return _detect_session_model_effort(session_name).get("model", "")
+
+
+def _get_session_effort(session_name: str) -> str:
+    """Detect the effort level a session is actually running at.
+
+    Assistant entries in the transcript carry a top-level `effort`, so this is
+    the live value rather than whatever the session was launched with."""
+    return _detect_session_model_effort(session_name).get("effort", "")
+
+
+def _detect_session_model_effort(session_name: str) -> dict:
+    """Read model + effort out of the newest transcript in one pass.
+
+    Both live on `type: "assistant"` entries: `model` inside the message (or at
+    the top level on older writes), `effort` at the top level. They are read
+    together so the tail is only decoded once."""
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
-        return cached.get("model", "")
+        return cached
+    blank = {"model": "", "effort": "", "ts": now}
     files = _find_session_jsonl_files(session_name)
     if not files:
-        _session_model_cache[session_name] = {"model": "", "ts": now}
-        return ""
+        _session_model_cache[session_name] = blank
+        return blank
     # Find newest file by mtime
     newest = max(files, key=lambda f: os.path.getmtime(f), default=None)
     if not newest:
-        _session_model_cache[session_name] = {"model": "", "ts": now}
-        return ""
-    model = ""
+        _session_model_cache[session_name] = blank
+        return blank
+    model, effort = "", ""
     try:
         with open(newest, "rb") as f:
             # Read last ~32KB to find recent model entries
@@ -15071,18 +15139,26 @@ def _get_session_model(session_name: str) -> str:
         for line in reversed(tail.strip().split("\n")):
             try:
                 d = json.loads(line)
-                if d.get("type") == "assistant":
+                if d.get("type") != "assistant":
+                    continue
+                if not effort:
+                    e = d.get("effort", "")
+                    if isinstance(e, str) and e:
+                        effort = e
+                if not model:
                     msg = d if "model" in d else d.get("message", {})
                     m = msg.get("model", "")
                     if m:
                         model = m
-                        break
+                if model and effort:
+                    break
             except (json.JSONDecodeError, KeyError):
                 continue
     except Exception:
         logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
-    _session_model_cache[session_name] = {"model": model, "ts": now}
-    return model
+    out = {"model": model, "effort": effort, "ts": now}
+    _session_model_cache[session_name] = out
+    return out
 
 
 def _find_session_jsonl_files(session_name: str) -> list:
@@ -15562,6 +15638,10 @@ class ModelBody(BaseModel):
     model: str
 
 
+class EffortBody(BaseModel):
+    effort: str
+
+
 @app.get("/api/models")
 async def api_models():
     """The model dropdown catalog ([id, label] rows) + the launch default. Kept
@@ -15659,6 +15739,76 @@ async def api_set_session_model(session_name: str, body: ModelBody):
                     session_name, mid, " (downgraded from 1M)" if downgraded else "")
         return JSONResponse({"ok": True, "model": mid, "pending": True,
                              "downgraded": downgraded})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/sessions/{session_name}/effort")
+async def api_set_session_effort(session_name: str, body: EffortBody):
+    """Switch a running session's reasoning effort from the header dropdown by
+    typing `/effort <level>` into the pane, the same as running the slash
+    command. Session-scoped and takes effect from the next reply; the badge
+    shows a pending state until an assistant turn in the transcript confirms
+    it."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    level = (body.effort or "").strip().lower()
+    if level not in ALLOWED_SESSION_EFFORTS:
+        return JSONResponse({"error": f"Unknown effort level: {level}"},
+                            status_code=400)
+    if not await _async_is_claude_running(session_name):
+        return JSONResponse(
+            {"error": "Claude isn't running in this session — restart it first"},
+            status_code=409)
+    try:
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "-l", "/effort " + level],
+            capture_output=True, text=True, timeout=5)
+        await asyncio.sleep(0.3)
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True, text=True, timeout=5)
+        # Watch the pane for the outcome. Switching effort can put up a
+        # "Change effort level?" confirmation first, so poll for a few seconds
+        # rather than reading once: an early read catches the dialog, not the
+        # result, and would report success for a switch that never happened.
+        confirmed = False
+        for _ in range(8):
+            await asyncio.sleep(0.8)
+            try:
+                tail = await asyncio.to_thread(capture_pane_recent, session_name, 12)
+            except Exception:
+                logger.debug("Pane check after /effort failed", exc_info=True)
+                break
+            low = tail.lower()
+            # An exported CLAUDE_CODE_EFFORT_LEVEL pins the session and the CLI
+            # refuses to switch. Dashboard launches unset it, but a session
+            # started by hand from a shell that exports it will land here.
+            if "overrides this session" in low:
+                return JSONResponse(
+                    {"error": "This session has CLAUDE_CODE_EFFORT_LEVEL set in its "
+                              "environment, which pins the effort level. Restart it "
+                              "from the dashboard to switch effort."},
+                    status_code=409)
+            if "unknown effort" in low or "invalid effort" in low:
+                return JSONResponse(
+                    {"error": f"Claude rejected the effort level '{level}' — it "
+                              "may not be available on this CLI version"},
+                    status_code=400)
+            if "set effort level to " + level in low:
+                confirmed = True
+                break
+        if not confirmed:
+            logger.info("Session '%s': no confirmation seen for /effort %s",
+                        session_name, level)
+        _session_effort_pending[session_name] = {"effort": level,
+                                                 "ts": time.time()}
+        _session_model_cache.pop(session_name, None)
+        logger.info("Session '%s' effort switch requested -> %s%s",
+                    session_name, level, "" if confirmed else " (unconfirmed)")
+        return JSONResponse({"ok": True, "effort": level, "pending": True,
+                             "confirmed": confirmed})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -19298,6 +19448,82 @@ function modelChoiceLabel(id){
   const c=MODEL_CHOICES.find(c=>c[0]===id);
   return c?c[1]:formatModelName(id);
 }
+// Reasoning effort. Keep in sync with EFFORT_CATALOG in the Python backend.
+const EFFORT_CHOICES=[
+  ['low','Low'],
+  ['medium','Medium'],
+  ['high','High'],
+  ['xhigh','xHigh'],
+  ['max','Max'],
+];
+function effortChoiceLabel(id){
+  const c=EFFORT_CHOICES.find(c=>c[0]===id);
+  return c?c[1]:(id||'');
+}
+function effortBadgeLabel(s){
+  if(s&&s.effort_pending)return effortChoiceLabel(s.effort_pending)+'…';
+  return effortChoiceLabel((s&&s.effort)||'')||'effort';
+}
+let _effortMenuEl=null;
+function closeEffortMenu(){
+  if(_effortMenuEl){_effortMenuEl.remove();_effortMenuEl=null;
+    document.removeEventListener('click',_effortMenuDocClose,true);}
+}
+function _effortMenuDocClose(e){
+  if(_effortMenuEl&&!_effortMenuEl.contains(e.target))closeEffortMenu();
+}
+function openEffortMenu(name,anchor,ev){
+  if(ev){ev.stopPropagation();ev.preventDefault();}
+  if(_effortMenuEl){closeEffortMenu();return;}
+  closeModelMenu();
+  const s=sessions.find(x=>x.name===name)||{};
+  const cur=s.effort_pending||s.effort||'';
+  const menu=document.createElement('div');
+  menu.className='model-menu';
+  let html='<div class="mm-title">Effort · applies from next reply</div>';
+  EFFORT_CHOICES.forEach(([id,label])=>{
+    const sel=cur&&id===cur;
+    html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionEffort(\''+esc(name)+'\',\''+id+'\')">'
+      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
+  });
+  menu.innerHTML=html;
+  document.body.appendChild(menu);
+  const r=anchor.getBoundingClientRect();
+  menu.style.top=Math.min(window.innerHeight-menu.offsetHeight-8,r.bottom+6)+'px';
+  menu.style.left=Math.max(8,Math.min(window.innerWidth-menu.offsetWidth-8,r.right-menu.offsetWidth))+'px';
+  _effortMenuEl=menu;
+  setTimeout(()=>document.addEventListener('click',_effortMenuDocClose,true),0);
+}
+function _paintEffortBadge(name){
+  const s=sessions.find(x=>x.name===name);
+  const lbl=effortBadgeLabel(s);
+  const eb=document.getElementById('effort-badge-'+name);
+  if(eb){
+    eb.classList.toggle('pending',!!(s&&s.effort_pending));
+    eb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
+  }
+  const me=document.getElementById('more-effort-'+name);
+  if(me)me.textContent=lbl+' ▾';
+}
+async function setSessionEffort(name,effort){
+  closeEffortMenu();
+  const si=sessions.findIndex(s=>s.name===name);
+  const prev=si>=0?(sessions[si].effort_pending||''):'';
+  if(si>=0)sessions[si].effort_pending=effort;
+  _paintEffortBadge(name);
+  try{
+    const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({effort})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    if(statusInfoEl)statusInfoEl.textContent='Effort → '+effortChoiceLabel(effort)+' (applies from the next reply)';
+  }catch(e){
+    if(si>=0)sessions[si].effort_pending=prev;
+    _paintEffortBadge(name);
+    alert('Effort switch failed: '+(e&&e.message?e.message:e));
+  }
+}
 function modelBadgeLabel(s){
   if(s&&s.model_pending)return modelChoiceLabel(s.model_pending)+'…';
   if(s&&s.model)return formatModelName(s.model);
@@ -19314,6 +19540,7 @@ function _modelMenuDocClose(e){
 function openModelMenu(name,anchor,ev){
   if(ev){ev.stopPropagation();ev.preventDefault();}
   if(_modelMenuEl){closeModelMenu();return;}
+  closeEffortMenu();
   const s=sessions.find(x=>x.name===name)||{};
   const cur=s.model_pending||s.model||'';
   const curBase=cur.replace(/\[1m\]$/,'');
@@ -19776,7 +20003,7 @@ function renderDetail(){
       <div class="tab-more-wrap">
         <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
         <div class="tab-more-menu" id="tab-more-menu">
-          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
+          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-row"><span class="tab-more-model-label">Effort</span><span class="tab-more-model-value" id="more-effort-${esc(s.name)}" title="Click to switch reasoning effort" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
           <!-- Clean view sits right under Auto-push because it is the other
@@ -19816,6 +20043,7 @@ function renderDetail(){
         </span>
         ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Claude model — click to switch (runs /model in this session)" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.effort_pending?' pending':''}" id="effort-badge-${s.name}" title="Reasoning effort — click to switch (runs /effort in this session)" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <!-- The terminal line count lived here. It is a number nobody acts on, sitting
@@ -20858,6 +21086,11 @@ async function pollStatus(){
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
         if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
         if(badgeChanged)_paintModelBadge(st.name);
+        let effortChanged=false;
+        const epend=st.effort_pending||'';
+        if((sessions[si].effort_pending||'')!==epend){sessions[si].effort_pending=epend;effortChanged=true;}
+        if(st.effort&&sessions[si].effort!==st.effort){sessions[si].effort=st.effort;effortChanged=true;}
+        if(effortChanged)_paintEffortBadge(st.name);
         if(navChanged)renderNav();
       }
     }
@@ -24407,6 +24640,7 @@ function renderProfileEdit(){
   // Effort glyphs requested by user
   const EFFORTS = [
     {v:'',      label:'(default)'},
+    {v:'low',   label:'low (○)'},
     {v:'medium',label:'medium (◐)'},
     {v:'high',  label:'high (●)'},
     {v:'xhigh', label:'xhigh (◉)'},
