@@ -316,6 +316,63 @@ def _restore_default_model_setting():
         logger.debug("Failed to restore default model in %s", sp, exc_info=True)
 
 
+def _effort_settings_slice(effort: str) -> dict:
+    """The settings.json keys that make `effort` the default for NEW sessions
+    without pinning it.
+
+    Never `env.CLAUDE_CODE_EFFORT_LEVEL`. The CLI injects settings `env` into its
+    own process, sees the variable, and then refuses /effort with
+    "CLAUDE_CODE_EFFORT_LEVEL=... overrides this session" — which is exactly the
+    header dropdown going dead. `effortLevel` is the non-pinning equivalent.
+
+    It only accepts low/medium/high/xhigh: "max" is a session-only level the CLI
+    refuses to persist ("max is session-only, nothing saved"), so it is carried by
+    the `--effort` launch flag alone and nothing goes into settings for it."""
+    e = (effort or "").strip().lower()
+    if e in ("low", "medium", "high", "xhigh"):
+        return {"effortLevel": e}
+    return {}
+
+
+def _apply_effort_to_settings(s: dict, effort: str) -> bool:
+    """Point a settings dict at `effort` and strip the env pin. True if changed."""
+    changed = False
+    env = s.get("env")
+    if isinstance(env, dict) and env.pop("CLAUDE_CODE_EFFORT_LEVEL", None) is not None:
+        s["env"] = env
+        changed = True
+    keys = _effort_settings_slice(effort)
+    for k, v in keys.items():
+        if s.get(k) != v:
+            s[k] = v
+            changed = True
+    if keys and s.get("ultracode"):
+        s["ultracode"] = False  # ultracode:true forces xhigh and outranks effortLevel
+        changed = True
+    return changed
+
+
+def _restore_default_effort_setting():
+    """Keep ~/.claude/settings.json on DEFAULT_EFFORT, and free of the env pin.
+
+    Two drifts to heal. `env.CLAUDE_CODE_EFFORT_LEVEL` pins the effort for a whole
+    session and kills the dropdown (see _effort_settings_slice) — strip it wherever
+    it comes from. And /effort persists its choice as the global default, the same
+    drift _restore_default_model_setting() undoes for the model."""
+    sp = Path.home() / ".claude" / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            return
+        if _apply_effort_to_settings(s, DEFAULT_EFFORT):
+            _backup_before_dashboard_write(sp)
+            sp.write_text(json.dumps(s, indent=2))
+            logger.info("Restored default effort in %s -> %s", sp,
+                        DEFAULT_EFFORT or "(unset)")
+    except Exception:
+        logger.debug("Failed to restore default effort in %s", sp, exc_info=True)
+
+
 def _model_flag_for_relaunch(session_name: str) -> str:
     """` --model <id>` for a crash/relogin relaunch: preserve the session's
     last-used model (so a deliberate /model switch survives a restart), mapping
@@ -458,7 +515,11 @@ def _claude_launch_env_prefix() -> str:
     treats the effort as pinned for the whole session and refuses /effort with
     "CLAUDE_CODE_EFFORT_LEVEL=... overrides this session", which would break the
     effort dropdown. The default is passed as `--effort` instead, which sets the
-    starting level and still allows switching."""
+    starting level and still allows switching.
+
+    Unsetting it here is necessary but NOT sufficient: the CLI also injects
+    settings.json `env` into its own process, so a pin written there survives
+    this prefix. _restore_default_effort_setting() strips that one."""
     tok = _load_longlived_token()
     if tok:
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
@@ -733,6 +794,7 @@ async def lifespan(_app: FastAPI):
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
+    _restore_default_effort_setting()
     try:
         migrated_prompts = await asyncio.to_thread(_backfill_prompt_audit, _load_users())
         if migrated_prompts:
@@ -3410,10 +3472,13 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
 
 
 def _set_team_model_effort(cfg_dir: Path):
-    """Pin the team default model + reasoning effort into a config dir's
-    settings.json so every session launches on it. Claude Code reads `model`
-    from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`. Defaults are
-    TEAM_MODEL / TEAM_EFFORT (Opus 4.8 at high effort)."""
+    """Put the team default model + reasoning effort into a config dir's
+    settings.json so every session launches on them. Claude Code reads `model`
+    and `effortLevel` from settings. Defaults are TEAM_MODEL / TEAM_EFFORT.
+
+    Both are starting points, not pins: a member can still switch either from the
+    session header dropdown. That is why the effort goes to `effortLevel` and not
+    to env CLAUDE_CODE_EFFORT_LEVEL — see _effort_settings_slice()."""
     sp = cfg_dir / "settings.json"
     try:
         s = json.loads(sp.read_text()) if sp.exists() else {}
@@ -3425,12 +3490,8 @@ def _set_team_model_effort(cfg_dir: Path):
     if TEAM_MODEL and s.get("model") != TEAM_MODEL:
         s["model"] = TEAM_MODEL
         changed = True
-    if TEAM_EFFORT:
-        env = s.get("env") if isinstance(s.get("env"), dict) else {}
-        if env.get("CLAUDE_CODE_EFFORT_LEVEL") != TEAM_EFFORT:
-            env["CLAUDE_CODE_EFFORT_LEVEL"] = TEAM_EFFORT
-            s["env"] = env
-            changed = True
+    if _apply_effort_to_settings(s, TEAM_EFFORT):
+        changed = True
     if changed:
         try:
             sp.parent.mkdir(parents=True, exist_ok=True)
@@ -8281,10 +8342,14 @@ def _materialize_profile(profile: dict):
     if profile.get("model"):
         managed["model"] = profile["model"]
     env = dict(profile.get("env") or {})
-    if profile.get("effort"):
-        env.setdefault("CLAUDE_CODE_EFFORT_LEVEL", profile["effort"])
+    # The profile's effort is a starting level, never a pin: it goes to
+    # `effortLevel`, and an env pin typed into the profile's env editor is
+    # dropped, so the session header dropdown keeps working. See
+    # _effort_settings_slice().
+    env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     if env:
         managed["env"] = env
+    managed.update(_effort_settings_slice(profile.get("effort") or ""))
     if profile.get("permissions"):
         managed["permissions"] = profile["permissions"]
 
@@ -8308,7 +8373,7 @@ def _materialize_profile(profile: dict):
                     except Exception:
                         logger.debug("Failed to back up ~/.claude/settings.json", exc_info=True)
             merged = dict(existing)
-            for key in ("model", "env", "permissions"):
+            for key in ("model", "env", "permissions", "effortLevel"):
                 if key in managed:
                     merged[key] = managed[key]
                 # If user blanked the field via the editor, drop it from settings
@@ -16064,14 +16129,16 @@ async def api_set_session_effort(session_name: str, body: EffortBody):
                 logger.debug("Pane check after /effort failed", exc_info=True)
                 break
             low = tail.lower()
-            # An exported CLAUDE_CODE_EFFORT_LEVEL pins the session and the CLI
-            # refuses to switch. Dashboard launches unset it, but a session
-            # started by hand from a shell that exports it will land here.
+            # CLAUDE_CODE_EFFORT_LEVEL pins the session and the CLI refuses to
+            # switch. Launches unset it in the shell and the dashboard strips it
+            # from settings.json on startup, so this is a session that predates
+            # the strip, or one started by hand from a shell that exports it.
             if "overrides this session" in low:
                 return JSONResponse(
                     {"error": "This session has CLAUDE_CODE_EFFORT_LEVEL set in its "
-                              "environment, which pins the effort level. Restart it "
-                              "from the dashboard to switch effort."},
+                              "environment, which pins the effort level for its whole "
+                              "run. Restart the session from the dashboard and the "
+                              "dropdown will work."},
                     status_code=409)
             if "unknown effort" in low or "invalid effort" in low:
                 return JSONResponse(
@@ -16087,6 +16154,11 @@ async def api_set_session_effort(session_name: str, body: EffortBody):
         _session_effort_pending[session_name] = {"effort": level,
                                                  "ts": time.time()}
         _session_model_cache.pop(session_name, None)
+        # /effort persists the choice as the default for NEW sessions, same as
+        # /model does. Undo that: the switch stays for THIS session, the global
+        # default stays DEFAULT_EFFORT.
+        await asyncio.sleep(0.8)
+        _restore_default_effort_setting()
         logger.info("Session '%s' effort switch requested -> %s%s",
                     session_name, level, "" if confirmed else " (unconfirmed)")
         return JSONResponse({"ok": True, "effort": level, "pending": True,
