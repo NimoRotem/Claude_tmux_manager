@@ -1238,18 +1238,56 @@ _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/googl
   <div class="sep">or sign in with a password</div>"""
 
 
-def _login_page() -> str:
+# --- Two front doors for one process ---------------------------------------
+# Each box is reachable both under a path on a shared domain (knowva.ai/tmux,
+# rotem.ai/build) and, since the builder1/2/3.rotem.ai move, at the root of its
+# own hostname. The path front door cannot simply be dropped: knowva.ai/tmux is
+# the login that nginx's auth_request hands to /sales-update, /crm, /tester32,
+# /ctx-audit and /matcher, and a cookie set on builder1.rotem.ai would never be
+# sent to knowva.ai.
+#
+# So the prefix is per request, not per process. nginx states it with
+# X-Forwarded-Prefix ("/" meaning the root, since nginx drops a header whose
+# value is empty); with no header we fall back to the TMUX_DASH_ROOT_PATH the
+# process was started with, which is what every other caller still sends.
+def _req_prefix(request: Request) -> str:
+    hdr = request.headers.get("x-forwarded-prefix")
+    if hdr is None:
+        return ROOT_PATH
+    hdr = hdr.strip().rstrip("/")
+    return hdr if hdr.startswith("/") else ""
+
+
+_page_cache: Dict[tuple, str] = {}
+
+
+def _render_page(kind: str, prefix: str) -> str:
+    """A page template with this request's prefix baked in. Cached per prefix:
+    the dashboard HTML is ~500KB and only a couple of prefixes ever exist."""
+    key = (kind, prefix)
+    hit = _page_cache.get(key)
+    if hit is not None:
+        return hit
+    out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
+    _page_cache[key] = out
+    return out
+
+
+def _login_page(request: Optional[Request] = None) -> str:
     """The login page, with the Google button rendered only when configured.
 
     Resolved per request rather than at import so dropping in
     ~/.tmux-dashboard/google_oauth_client.json takes effect on the next page
     load instead of needing the app restarted.
     """
+    prefix = _req_prefix(request) if request is not None else ROOT_PATH
+    page = _render_page("login", prefix)
     if not _google_login_enabled():
-        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+        return page.replace("__GOOGLE_BTN__", "")
     domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
     hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
-    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
+    btn = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", prefix)
+    return page.replace("__GOOGLE_BTN__", btn.replace("__GOOGLE_HINT__", hint))
 
 
 @app.middleware("http")
@@ -1380,7 +1418,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get("tmux_auth")
     if not _check_token(token):
-        resp = HTMLResponse(_login_page())
+        resp = HTMLResponse(_login_page(request))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
@@ -1389,7 +1427,7 @@ async def auth_middleware(request: Request, call_next):
     # the login screen.
     user = _user_from_token(token)
     if not user:
-        resp = HTMLResponse(_login_page())
+        resp = HTMLResponse(_login_page(request))
         resp.delete_cookie("tmux_auth")
         return resp
     # Hand the resolved cookie identity to _current_user() as the *base* user;
@@ -1398,6 +1436,20 @@ async def auth_middleware(request: Request, call_next):
     # The route's own _current_user() call may return early from cache, so
     # presence is recorded here too or it never fires.
     _touch_user_presence(user)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def forwarded_prefix_middleware(request: Request, call_next):
+    """Make this request's front door the one every redirect is built from.
+
+    Registered last, so it is the OUTERMOST middleware and runs before the auth
+    and ownership layers, both of which slice root_path off the path and build
+    login redirects from it. Routing is unaffected: nginx already strips the
+    prefix with a trailing-slash proxy_pass, so the ASGI path arrives relative
+    either way, and root_path is only ever used to build URLs.
+    """
+    request.scope["root_path"] = _req_prefix(request)
     return await call_next(request)
 
 
@@ -1462,7 +1514,7 @@ async def login_page(request: Request):
         nxt = request.scope.get("root_path", "") + "/"
     if _check_token(request.cookies.get("tmux_auth")):
         return RedirectResponse(url=nxt, status_code=303)
-    resp = HTMLResponse(_login_page())
+    resp = HTMLResponse(_login_page(request))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
@@ -6398,7 +6450,8 @@ async def index(request: Request):
     # Inject the per-user "simple" flag so the member UI is correct from the very
     # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
     simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
-    return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
+    return HTMLResponse(_render_page("dash", _req_prefix(request))
+                        .replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
@@ -26662,12 +26715,11 @@ bootstrapDashboard();
 </body></html>
 """
 
-# Inject the actual ROOT_PATH into the JS BASE variable
-HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
+# __ROOT_PATH__ is deliberately NOT substituted here: it is baked in per request
+# by _render_page(), because one process now answers on both its path front door
+# and the root of its own builder<N>.rotem.ai hostname. Brand is process-wide.
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
-LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
-_GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
 # ===========================================================================
@@ -26722,7 +26774,7 @@ async def user_projects_page(request: Request, username: str):
         return HTMLResponse("Not found", status_code=404)
     viewer = _current_user(request)
     if not viewer:
-        return HTMLResponse(LOGIN_PAGE, status_code=401)
+        return HTMLResponse(_login_page(request), status_code=401)
     is_admin = _is_admin(viewer)
     if viewer.get("id") != target["id"] and not is_admin:
         return HTMLResponse("Forbidden — you can only view your own projects.", status_code=403)
