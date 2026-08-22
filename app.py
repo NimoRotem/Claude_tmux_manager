@@ -285,18 +285,27 @@ _CODEX_DOCS_MCP_OVERRIDE = f"mcp_servers.{_CODEX_DOCS_MCP_SERVER}.enabled=false"
 _CODEX_DOCS_OVERRIDE_RE = re.compile(
     r"\s+-c\s+(['\"]?)" + re.escape(_CODEX_DOCS_MCP_OVERRIDE) + r"\1"
 )
+_CODEX_THREAD_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def _launch_codex_cmd(
     cmd: str,
     pin_model: bool = True,
     resume: bool = False,
+    resume_uuid: str | None = None,
     codex_home: Path | None = None,
 ) -> str:
     """Build a Codex launch command using the account's standard configuration."""
     out = cmd.strip() or NEW_SESSION_CMD
-    if resume:
-        out = "codex resume --last"
+    if (
+        resume
+        and isinstance(resume_uuid, str)
+        and _CODEX_THREAD_ID_RE.fullmatch(resume_uuid)
+    ):
+        out = "codex resume " + shlex.quote(resume_uuid)
         if "--yolo" in cmd or "--dangerously-bypass-approvals-and-sandbox" in cmd:
             out += " --yolo"
         elif "--sandbox" in cmd or " -s " in f" {cmd} ":
@@ -440,12 +449,14 @@ def _session_launch_command(
     *,
     pin_model: bool = True,
     resume: bool = False,
+    resume_uuid: str | None = None,
 ) -> str:
     """Build the Codex command and keep its process tree in a session scope."""
     launch = _launch_codex_cmd(
         base,
         pin_model=pin_model,
         resume=resume,
+        resume_uuid=resume_uuid,
         codex_home=_session_config_base(session_name),
     )
     launch = _session_launch_identity_prefix(session_name) + " " + launch
@@ -860,7 +871,7 @@ async def _async_is_codex_running(session_name: str) -> bool:
 
 async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = None,
                                 resume_uuid: str = None) -> bool:
-    """Restart a crashed Codex pane and resume its most recent local thread."""
+    """Restart a crashed Codex pane using only its session-bound thread."""
     alog = logging.getLogger("autonomous")
     if await _async_is_codex_running(session_name):
         return True
@@ -900,11 +911,21 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
             )
         except Exception:
             logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
-        # Codex stores local threads under CODEX_HOME. Resume the newest thread
-        # for this working directory instead of opening the interactive picker.
+        # A shared CODEX_HOME can have many dashboard sessions. Resolve the
+        # thread bound to this session and never resume another session's
+        # globally newest thread.
+        if not resume_uuid:
+            resume_uuid = await asyncio.to_thread(
+                _find_session_transcript_uuid,
+                session_name,
+            )
         launch_base = _session_launch_base(session_name)
         launch = _session_launch_command(
-            session_name, launch_base, pin_model=True, resume=True
+            session_name,
+            launch_base,
+            pin_model=True,
+            resume=bool(resume_uuid),
+            resume_uuid=resume_uuid,
         )
         # C-c first: an unterminated paste leaves bash on a `>` continuation
         # prompt, where C-u only clears the current line and the relaunch would
@@ -2935,56 +2956,37 @@ def _set_auth_cookie(resp, request: Request, token: str):
 
 _IMPERSONATION_TICKET_TTL = 60
 _IMPERSONATION_SESSION_TTL = 8 * 60 * 60
-_impersonation_lock = threading.Lock()
-_impersonation_tickets: dict[str, dict] = {}
-_impersonation_sessions: dict[str, dict] = {}
 IMPERSONATION_SESSIONS_FILE = MESSAGES_DIR / "impersonation-sessions.json"
-_impersonation_sessions_loaded = False
 
 
-def _load_impersonation_sessions_locked() -> None:
-    """Load active opaque tab sessions once; caller holds the lock."""
-    global _impersonation_sessions_loaded
-    if _impersonation_sessions_loaded:
-        return
-    loaded = {}
-    try:
-        data = json.loads(IMPERSONATION_SESSIONS_FILE.read_text())
-        rows = data.get("sessions", {}) if isinstance(data, dict) else {}
-        if isinstance(rows, dict):
-            loaded = {
-                str(token): record
-                for token, record in rows.items()
-                if isinstance(record, dict)
-            }
-    except (OSError, json.JSONDecodeError, UnicodeError):
-        loaded = {}
-    _impersonation_sessions.clear()
-    _impersonation_sessions.update(loaded)
-    _impersonation_sessions_loaded = True
-
-
-def _save_impersonation_sessions_locked() -> None:
-    """Persist opaque tab sessions privately; caller holds the lock."""
-    _atomic_write_json(
+def _impersonation_store() -> LockedJsonStore:
+    """Return the file-backed state shared by every API worker."""
+    return LockedJsonStore(
         IMPERSONATION_SESSIONS_FILE,
-        {"sessions": _impersonation_sessions},
+        lambda: {"version": 1, "tickets": {}, "sessions": {}},
     )
 
 
-def _purge_expired_impersonation_tokens(now: float | None = None) -> None:
-    """Purge expired records; caller holds ``_impersonation_lock``."""
-    _load_impersonation_sessions_locked()
-    timestamp = now or time.time()
-    sessions_changed = False
-    for store in (_impersonation_tickets, _impersonation_sessions):
-        for token, record in list(store.items()):
-            if float(record.get("expires_at", 0) or 0) <= timestamp:
-                store.pop(token, None)
-                if store is _impersonation_sessions:
-                    sessions_changed = True
-    if sessions_changed:
-        _save_impersonation_sessions_locked()
+def _purge_expired_impersonation_records(value: dict, now: float) -> None:
+    """Remove expired ticket and session records from locked state."""
+    value["version"] = 1
+    for key in ("tickets", "sessions"):
+        records = value.get(key)
+        if not isinstance(records, dict):
+            records = {}
+            value[key] = records
+        for token, record in list(records.items()):
+            if _impersonation_record_expired(record, now):
+                records.pop(token, None)
+
+
+def _impersonation_record_expired(record: object, now: float) -> bool:
+    if not isinstance(record, dict):
+        return True
+    try:
+        return float(record.get("expires_at", 0) or 0) <= now
+    except (TypeError, ValueError):
+        return True
 
 
 def _user_from_impersonation_session(
@@ -2992,15 +2994,16 @@ def _user_from_impersonation_session(
     authenticated_admin: dict,
 ) -> dict | None:
     """Resolve a tab-scoped session only when its original admin is logged in."""
-    with _impersonation_lock:
-        _purge_expired_impersonation_tokens()
-        record = _impersonation_sessions.get(token)
-        if (
-            not record
-            or record.get("admin_id") != authenticated_admin.get("id")
-        ):
-            return None
-        target_id = str(record.get("target_id", ""))
+    value = _impersonation_store().read()
+    sessions = value.get("sessions")
+    sessions = sessions if isinstance(sessions, dict) else {}
+    record = sessions.get(token)
+    if (
+        _impersonation_record_expired(record, time.time())
+        or record.get("admin_id") != authenticated_admin.get("id")
+    ):
+        return None
+    target_id = str(record.get("target_id", ""))
     target = _find_user_by_id(target_id)
     return target if target and target.get("id") != authenticated_admin.get("id") else None
 
@@ -3021,13 +3024,17 @@ async def api_admin_impersonate(request: Request, user_id: str):
     if target["id"] == admin["id"]:
         return JSONResponse({"error": "That's already you"}, status_code=400)
     ticket = secrets.token_urlsafe(32)
-    with _impersonation_lock:
-        _purge_expired_impersonation_tokens()
-        _impersonation_tickets[ticket] = {
+    now = time.time()
+
+    def issue(value: dict) -> None:
+        _purge_expired_impersonation_records(value, now)
+        value["tickets"][ticket] = {
             "admin_id": admin["id"],
             "target_id": target["id"],
-            "expires_at": time.time() + _IMPERSONATION_TICKET_TTL,
+            "expires_at": now + _IMPERSONATION_TICKET_TTL,
         }
+
+    _impersonation_store().update(issue)
     url = (
         f"{ROOT_PATH or ''}/?impersonate_ticket="
         f"{urllib.parse.quote(ticket, safe='')}"
@@ -3055,29 +3062,41 @@ async def api_admin_impersonation_exchange(
     if not _is_admin(admin):
         return JSONResponse({"error": "Admin only"}, status_code=403)
     now = time.time()
-    with _impersonation_lock:
-        _purge_expired_impersonation_tokens(now)
-        record = _impersonation_tickets.get(body.ticket)
-        if not record:
-            return JSONResponse(
-                {"error": "Impersonation ticket expired or already used"},
-                status_code=410,
-            )
+    token = secrets.token_urlsafe(48)
+
+    def exchange(value: dict) -> dict:
+        _purge_expired_impersonation_records(value, now)
+        record = value["tickets"].get(body.ticket)
+        if not isinstance(record, dict):
+            return {"status": "missing"}
         if record.get("admin_id") != admin.get("id"):
-            return JSONResponse({"error": "Ticket belongs to another admin"}, status_code=403)
-        _impersonation_tickets.pop(body.ticket, None)
-        token = secrets.token_urlsafe(48)
-        _impersonation_sessions[token] = {
+            return {"status": "wrong_admin"}
+        value["tickets"].pop(body.ticket, None)
+        value["sessions"][token] = {
             "admin_id": admin["id"],
             "target_id": record["target_id"],
             "expires_at": now + _IMPERSONATION_SESSION_TTL,
         }
-        _save_impersonation_sessions_locked()
+        return {"status": "ok", "record": dict(record)}
+
+    _value, result = _impersonation_store().update(exchange)
+    if result.get("status") == "missing":
+        return JSONResponse(
+            {"error": "Impersonation ticket expired or already used"},
+            status_code=410,
+        )
+    if result.get("status") == "wrong_admin":
+        return JSONResponse(
+            {"error": "Ticket belongs to another admin"},
+            status_code=403,
+        )
+    record = result["record"]
     target = _find_user_by_id(str(record["target_id"]))
     if not target:
-        with _impersonation_lock:
-            _impersonation_sessions.pop(token, None)
-            _save_impersonation_sessions_locked()
+        def remove_missing_target(value: dict) -> None:
+            value.setdefault("sessions", {}).pop(token, None)
+
+        _impersonation_store().update(remove_missing_target)
         return JSONResponse({"error": "User no longer exists"}, status_code=404)
     return JSONResponse({
         "ok": True,
@@ -3095,16 +3114,22 @@ async def api_end_impersonation(request: Request):
     target = _current_user(request)
     if not token or not _is_admin(impersonator) or not target:
         return JSONResponse({"error": "Not impersonating"}, status_code=400)
-    with _impersonation_lock:
-        record = _impersonation_sessions.get(token)
+
+    def revoke(value: dict) -> bool:
+        _purge_expired_impersonation_records(value, time.time())
+        record = value["sessions"].get(token)
         if (
-            not record
+            not isinstance(record, dict)
             or record.get("admin_id") != impersonator.get("id")
             or record.get("target_id") != target.get("id")
         ):
-            return JSONResponse({"error": "Not impersonating"}, status_code=400)
-        _impersonation_sessions.pop(token, None)
-        _save_impersonation_sessions_locked()
+            return False
+        value["sessions"].pop(token, None)
+        return True
+
+    _value, revoked = _impersonation_store().update(revoke)
+    if not revoked:
+        return JSONResponse({"error": "Not impersonating"}, status_code=400)
     return JSONResponse({"ok": True})
 
 
@@ -6886,6 +6911,149 @@ def capture_pane_full(session_name: str) -> str:
         return ""
 
 
+_visible_transcript_cache: dict[str, dict] = {}
+_visible_transcript_lock = threading.Lock()
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_UNSAFE_TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _safe_transcript_message(value: object) -> str:
+    text = value if isinstance(value, str) else ""
+    text = _ANSI_ESCAPE_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    return _UNSAFE_TERMINAL_CONTROL_RE.sub("", text).strip()
+
+
+def _visible_transcript_block(event: dict) -> tuple[str, str, str] | None:
+    """Convert only user-visible Codex events into a terminal-safe block."""
+    if event.get("type") != "event_msg":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    if event_type == "context_compacted":
+        marker = "[Context compacted]"
+        return "context", marker, marker
+    if event_type not in ("user_message", "agent_message"):
+        return None
+    message = _safe_transcript_message(payload.get("message"))
+    if not message:
+        return None
+    label = "User" if event_type == "user_message" else "Codex"
+    return event_type, message, f"{label}:\n{message}"
+
+
+def _read_visible_codex_blocks(path: str | Path) -> list[tuple[str, str, str]]:
+    """Incrementally read the safe, visible conversation from one rollout."""
+    rollout = Path(path)
+    try:
+        stat = rollout.stat()
+    except OSError:
+        return []
+    key = str(rollout)
+    with _visible_transcript_lock:
+        cached = _visible_transcript_cache.get(key)
+        identity = (stat.st_dev, stat.st_ino)
+        if (
+            not cached
+            or cached.get("identity") != identity
+            or stat.st_size < int(cached.get("offset", 0))
+        ):
+            cached = {
+                "identity": identity,
+                "offset": 0,
+                "carry": b"",
+                "blocks": [],
+            }
+            _visible_transcript_cache[key] = cached
+        offset = int(cached.get("offset", 0))
+        carry = cached.get("carry", b"")
+        blocks = cached["blocks"]
+        try:
+            with rollout.open("rb") as stream:
+                stream.seek(offset)
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    parts = (carry + chunk).split(b"\n")
+                    carry = parts.pop()
+                    for raw in parts:
+                        if not raw:
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        block = _visible_transcript_block(event)
+                        if block:
+                            blocks.append(block)
+                cached["offset"] = stream.tell()
+                cached["carry"] = carry
+        except OSError:
+            return list(blocks)
+        return list(blocks)
+
+
+def _read_visible_codex_transcript(path: str | Path) -> str:
+    """Render user messages, Codex messages and compaction markers only."""
+    return "\n\n".join(
+        rendered for _kind, _message, rendered in _read_visible_codex_blocks(path)
+    )
+
+
+def _normalized_transcript_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _capture_session_full_output(session_name: str) -> str:
+    """Restore missing visible conversation before the live tmux scrollback."""
+    pane = capture_pane_full(session_name)
+    try:
+        rollout = _find_session_rollout_path(session_name)
+    except Exception:
+        logger.debug(
+            "Could not resolve Codex transcript for '%s'",
+            session_name,
+            exc_info=True,
+        )
+        return pane
+    if not rollout:
+        return pane
+    try:
+        blocks = _read_visible_codex_blocks(rollout)
+    except Exception:
+        logger.debug(
+            "Failed to restore Codex transcript for '%s'",
+            session_name,
+            exc_info=True,
+        )
+        return pane
+    if not blocks:
+        return pane
+    pane_normalized = _normalized_transcript_text(pane)
+    overlap_index = None
+    for index, (kind, message, _rendered) in enumerate(blocks):
+        if kind == "context":
+            continue
+        normalized = _normalized_transcript_text(message)
+        if len(normalized) >= 20 and normalized in pane_normalized:
+            overlap_index = index
+            break
+    missing = blocks if overlap_index is None else blocks[:overlap_index]
+    if not missing:
+        return pane
+    restored = "\n\n".join(rendered for _kind, _message, rendered in missing)
+    return (
+        "[Earlier Codex conversation restored from the session log]\n\n"
+        + restored
+        + "\n\n[Live terminal scrollback]\n\n"
+        + pane
+    )
+
+
 def capture_pane_recent(session_name: str, lines: int = 80) -> str:
     try:
         result = subprocess.run(
@@ -8341,7 +8509,7 @@ async def api_raw_output(session_name: str):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    raw = await asyncio.to_thread(capture_pane_full, session_name)
+    raw = await asyncio.to_thread(_capture_session_full_output, session_name)
     activity = await async_detect_activity(session_name)
     pane_width = await asyncio.to_thread(get_pane_width, session_name)
     return JSONResponse({
@@ -8393,7 +8561,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
-        raw = await asyncio.to_thread(capture_pane_full, session_name)
+        raw = await asyncio.to_thread(_capture_session_full_output, session_name)
         return JSONResponse({
             "mode": "full",
             "raw": raw,
@@ -8406,7 +8574,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     # No scrollback growth, but visible content changed (TUI redraw) → full
     if current_total <= known_lines:
         if last_hash and vis_hash and last_hash != vis_hash:
-            raw = await asyncio.to_thread(capture_pane_full, session_name)
+            raw = await asyncio.to_thread(_capture_session_full_output, session_name)
             return JSONResponse({
                 "mode": "full",
                 "raw": raw,
@@ -8479,7 +8647,7 @@ def _terminal_full_payload(session_name: str) -> tuple[dict, str, int, str, int]
     pane_total = int(pos.get("total_lines", 0))
     visible_hash = _visible_pane_hash(session_name)
     pane_width = get_pane_width(session_name)
-    raw = capture_pane_full(session_name)
+    raw = _capture_session_full_output(session_name)
     payload = {
         "mode": "full",
         "raw": raw,
@@ -9178,16 +9346,43 @@ async def _controller_terminal_connection(session_name: str):
     return reader, writer
 
 
+_WS_IMPERSONATION_PROTOCOL = "tmux-impersonate"
+
+
+def _websocket_impersonation_offer(ws: WebSocket) -> tuple[bool, str]:
+    """Read a tab token from requested WebSocket subprotocols."""
+    raw = ws.headers.get("sec-websocket-protocol", "")
+    protocols = [item.strip() for item in raw.split(",") if item.strip()]
+    if _WS_IMPERSONATION_PROTOCOL not in protocols:
+        return False, ""
+    marker = protocols.index(_WS_IMPERSONATION_PROTOCOL)
+    token = protocols[marker + 1] if marker + 1 < len(protocols) else ""
+    if not 20 <= len(token) <= 200:
+        token = ""
+    return True, token
+
+
 @app.websocket("/ws/sessions/{session_name}/raw")
 async def ws_session_raw(ws: WebSocket, session_name: str):
     if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
         await ws.close(code=1008)
         return
     user = _current_user(ws)
+    has_impersonation, impersonation_token = _websocket_impersonation_offer(ws)
+    accepted_protocol = None
+    if has_impersonation:
+        target = None
+        if impersonation_token and _is_admin(user):
+            target = _user_from_impersonation_session(impersonation_token, user)
+        if not target:
+            await ws.close(code=1008)
+            return
+        user = target
+        accepted_protocol = _WS_IMPERSONATION_PROTOCOL
     if not _user_can_access_session(user, session_name):
         await ws.close(code=1008)
         return
-    await ws.accept()
+    await ws.accept(subprotocol=accepted_protocol)
     reader = writer = None
     local_writer = None
     try:
@@ -9222,7 +9417,10 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
-            task.result()
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -15162,11 +15360,16 @@ async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
         if not exported:
             return False, False
         await asyncio.sleep(0.3)
+        resume_uuid = await asyncio.to_thread(
+            _find_session_transcript_uuid,
+            session_name,
+        )
         launch = _session_launch_command(
             session_name,
             _session_launch_base(session_name),
             pin_model=False,
-            resume=True,
+            resume=bool(resume_uuid),
+            resume_uuid=resume_uuid,
         )
         await asyncio.to_thread(
             subprocess.run,
@@ -16310,9 +16513,141 @@ def _project_dir_for_cwd(cwd: str) -> Path | None:
     return None
 
 
+_session_thread_cache: dict[tuple[str, str], dict] = {}
+_session_rollout_path_cache: dict[tuple[str, str], Path] = {}
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
+def _prompt_match_score(audit_prompt: str, history_prompt: object) -> int:
+    """Score prompt identity while tolerating a clipped terminal prefix."""
+    left = _normalized_transcript_text(audit_prompt).casefold()
+    right = _normalized_transcript_text(
+        history_prompt if isinstance(history_prompt, str) else ""
+    ).casefold()
+    if not left or not right:
+        return 1
+    if left == right:
+        return 3
+    if min(len(left), len(right)) >= 12 and (left in right or right in left):
+        return 2
+    return 0
+
+
 def _find_session_transcript_uuid(session_name: str) -> str | None:
-    """Codex recovery uses `resume --last`; no Claude transcript UUID lookup."""
-    return None
+    """Map one dashboard session to its Codex thread using prompt timestamps."""
+    codex_home = _session_config_base(session_name)
+    history_file = codex_home / "history.jsonl"
+    signature = (
+        _file_signature(PROMPT_AUDIT_FILE),
+        _file_signature(history_file),
+    )
+    cache_key = (str(codex_home), session_name)
+    cached = _session_thread_cache.get(cache_key)
+    if cached and cached.get("signature") == signature:
+        return cached.get("thread_id") or None
+    if not all(signature):
+        _session_thread_cache[cache_key] = {
+            "signature": signature,
+            "thread_id": None,
+        }
+        return None
+
+    audits: list[tuple[float, str]] = []
+    try:
+        for entry in _iter_prompt_audit_reverse() or ():
+            if str(entry.get("session_name") or "") != session_name:
+                continue
+            try:
+                timestamp = float(entry.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if timestamp <= 0:
+                continue
+            audits.append((timestamp, str(entry.get("prompt") or "")))
+            if len(audits) >= 500:
+                break
+    except OSError:
+        audits = []
+
+    by_second: dict[int, list[tuple[float, str]]] = {}
+    for timestamp, prompt in audits:
+        for second in range(int(timestamp) - 2, int(timestamp) + 3):
+            by_second.setdefault(second, []).append((timestamp, prompt))
+
+    best_key: tuple[float, int, float] | None = None
+    best_thread = None
+    if by_second:
+        try:
+            for raw in _iter_jsonl_reverse(history_file):
+                try:
+                    row = json.loads(raw)
+                    timestamp = float(row.get("ts") or 0)
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+                    continue
+                candidates = by_second.get(int(timestamp), ())
+                for audit_timestamp, prompt in candidates:
+                    delta = abs(timestamp - audit_timestamp)
+                    if delta > 2.0:
+                        continue
+                    thread_id = str(row.get("session_id") or "")
+                    if not _CODEX_THREAD_ID_RE.fullmatch(thread_id):
+                        continue
+                    score = _prompt_match_score(prompt, row.get("text"))
+                    if score <= 0:
+                        continue
+                    candidate_key = (audit_timestamp, score, -delta)
+                    if best_key is None or candidate_key > best_key:
+                        best_key = candidate_key
+                        best_thread = thread_id
+        except OSError:
+            best_thread = None
+
+    _session_thread_cache[cache_key] = {
+        "signature": signature,
+        "thread_id": best_thread,
+    }
+    return best_thread
+
+
+def _find_session_rollout_path(session_name: str) -> Path | None:
+    """Return the owner-bound rollout file for a dashboard session."""
+    thread_id = _find_session_transcript_uuid(session_name)
+    if not thread_id:
+        return None
+    try:
+        sessions_root = (_session_config_base(session_name) / "sessions").resolve()
+        if not sessions_root.is_dir():
+            return None
+    except OSError:
+        return None
+    cache_key = (str(sessions_root), thread_id)
+    cached = _session_rollout_path_cache.get(cache_key)
+    if cached and cached.is_file():
+        return cached
+    candidates = []
+    try:
+        for candidate in sessions_root.rglob(f"rollout-*-{thread_id}.jsonl"):
+            resolved = candidate.resolve()
+            if os.path.commonpath((str(sessions_root), str(resolved))) != str(sessions_root):
+                continue
+            candidates.append(resolved)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    try:
+        selected = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    except OSError:
+        selected = candidates[0]
+    _session_rollout_path_cache[cache_key] = selected
+    return selected
 
 
 async def _crash_recovery_loop():
@@ -20240,10 +20575,6 @@ function _setRawScroll(el,target){
   if(Math.abs(el.scrollTop-target)<1)return;
   el.scrollTop=target;
 }
-// A very long scrollback is bounded, with hysteresis so the window does not
-// crawl forward a line at a time (which would repaint everything, every poll).
-const RAW_MAX_LINES=5000;
-
 function renderRawText(name,force){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
@@ -20280,7 +20611,6 @@ function renderRawText(name,force){
     // otherwise fits exactly.
     rows=rows.map(l=>l.replace(/\s+$/,''));
   }
-  if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
   let htmlLines;
   if(!rows.length||!rows.join('').trim()){
     htmlLines=(st.fullText||'').trim()
@@ -21680,7 +22010,11 @@ function startRawPolling(name){
   if(st.socket&&(st.socket.readyState===WebSocket.OPEN||st.socket.readyState===WebSocket.CONNECTING))return;
   if(st.reconnectTimer){clearTimeout(st.reconnectTimer);st.reconnectTimer=null}
   const scheme=location.protocol==='https:'?'wss://':'ws://';
-  const socket=new WebSocket(scheme+location.host+BASE+'/ws/sessions/'+encodeURIComponent(name)+'/raw');
+  const socketUrl=scheme+location.host+BASE+'/ws/sessions/'+encodeURIComponent(name)+'/raw';
+  const impersonationToken=_storedImpersonationToken();
+  const socket=impersonationToken
+    ?new WebSocket(socketUrl,['tmux-impersonate',impersonationToken])
+    :new WebSocket(socketUrl);
   st.socket=socket;
   socket.onopen=()=>{st.backoff=500};
   socket.onmessage=(event)=>{
