@@ -3512,8 +3512,11 @@ def _apply_member_auth(cfg_dir: Path) -> str:
 
 def _seed_trust(cfg_dir: Path, cwd: str):
     """Pre-accept Claude Code's per-folder trust dialog for `cwd` in this config
-    dir's .claude.json so it doesn't prompt (which would hang a detached session)."""
-    cj = cfg_dir / ".claude.json"
+    dir's .claude.json so it doesn't prompt (which would hang a detached session).
+
+    Via _profile_claude_json, so the default dir gets ~/.claude.json — the file
+    Claude Code actually reads — instead of a dead ~/.claude/.claude.json copy."""
+    cj = _profile_claude_json(cfg_dir)
     try:
         d = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(d, dict):
@@ -3820,7 +3823,7 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
     cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
     if not cmd or not user or not user.get("id"):
         return
-    cj = cfg_dir / ".claude.json"
+    cj = _profile_claude_json(cfg_dir)
     try:
         data = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(data, dict):
@@ -9971,12 +9974,15 @@ def _account_identity(config_dir) -> dict:
     except Exception:
         pass
     # The big config (with oauthAccount.emailAddress) lives at <dir>/.claude.json,
-    # except the default ~/.claude whose config is the home-level ~/.claude.json.
-    cj = config_dir / ".claude.json"
+    # except the default ~/.claude, which runs with CLAUDE_CONFIG_DIR unset and so
+    # keeps its config at the home-level ~/.claude.json. Take that file
+    # unconditionally, never "only if the in-dir copy is missing": a home seeded by
+    # copying somebody else's ~/.claude (that is exactly how tmux2-home was built)
+    # carries a dead ~/.claude/.claude.json, and preferring it named the PREVIOUS
+    # account in the header for ever after the box had been signed in to another one.
+    cj = _profile_claude_json(config_dir)
     profile_fetched = 0.0
     try:
-        if not cj.exists() and config_dir == Path.home() / ".claude":
-            cj = Path.home() / ".claude.json"
         oa = json.loads(cj.read_text()).get("oauthAccount", {})
         email = oa.get("emailAddress", "") or ""
         org = oa.get("organizationUuid", "") or ""
@@ -11034,7 +11040,7 @@ def _configure_member_browser_mcp(cfg_dir: Path, user: dict, browser: dict) -> N
     Removed again if the browser stops belonging to them, so a recycled browser
     never leaves a stale binding behind.
     """
-    cj = cfg_dir / ".claude.json"
+    cj = _profile_claude_json(cfg_dir)
     try:
         data = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(data, dict):
@@ -14637,6 +14643,26 @@ def _usage_access_token() -> tuple[str, str]:
         return "", "none"
 
 
+def _usage_account(token_source: str) -> dict:
+    """Whose usage the bars are showing: {email, plan}.
+
+    A bar sitting at 0% is only reassuring if you can see which account it was
+    read for. On a box that has just been signed in to a second account, "0%"
+    and "not connected" look identical, and the dedicated usage credential can
+    belong to a different account from the one the sessions actually run on.
+    """
+    if token_source == "dedicated":
+        try:
+            email = json.loads(_USAGE_OAUTH_FILE.read_text()).get("account") or ""
+        except Exception:
+            email = ""
+        if email:
+            return {"email": email, "plan": "", "source": token_source}
+    ident = _account_identity(Path.home() / ".claude")
+    return {"email": ident.get("email", ""), "plan": ident.get("plan", ""),
+            "source": token_source}
+
+
 def _load_anthropic_limits_cache():
     try:
         d = json.loads(_ANTHROPIC_LIMITS_CACHE_FILE.read_text())
@@ -14728,6 +14754,10 @@ async def api_anthropic_usage_limits():
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
     fp = hashlib.sha1(token.encode()).hexdigest()[:16]
+    # Stamped on the way out, not only when a fetch happens, so a payload that
+    # was cached (or persisted across a restart) before this field existed still
+    # tells the UI whose numbers it is showing.
+    acct = _usage_account(token_source)
     # Serve cache only if fresh (<1h), same token, AND none of its windows have
     # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
     # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
@@ -14735,7 +14765,7 @@ async def api_anthropic_usage_limits():
             and _anthropic_limits_cache["data"]
             and _anthropic_limits_cache.get("fp") == fp
             and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
-        return JSONResponse(_anthropic_limits_cache["data"])
+        return JSONResponse({**_anthropic_limits_cache["data"], "account": acct})
 
     def _stale_or_error():
         """Serve the last good payload rather than an error whenever we have one.
@@ -14832,7 +14862,9 @@ async def api_anthropic_usage_limits():
         shared = _shared_claude_token()
         hdr = await asyncio.to_thread(_usage_from_headers, shared or token)
         if hdr and (hdr.get("five_hour") or hdr.get("seven_day")):
-            payload = {"fetched_at": now, **hdr}
+            payload = {"fetched_at": now,
+                       "account": _usage_account("shared" if shared else token_source),
+                       **hdr}
             _anthropic_limits_cache.update({
                 "ts": now, "data": payload,
                 "fp": hashlib.sha1((shared or token).encode()).hexdigest()[:16],
@@ -15363,7 +15395,7 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
     try:
         cand = _pane_match_fragments(session_name)
         if cand:
-            best, best_score = None, 0
+            best, best_score, runner_up = None, 0, 0
             # Newest first: on a tie the most recently written wins, which is
             # the old behaviour and the safer fallback.
             for f in sorted(files, key=lambda f: os.path.getmtime(f), reverse=True)[:12]:
@@ -15372,8 +15404,13 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
                     continue
                 score = sum(1 for c in cand if c in hay)
                 if score > best_score:
-                    best, best_score = f, score
-            if best is not None and best_score >= 2:
+                    best, best_score, runner_up = f, score, best_score
+                elif score > runner_up:
+                    runner_up = score
+            # Clear the floor AND beat the field. A score two transcripts both
+            # reach says the fragments were not distinctive, and picking one of
+            # them anyway is how a guess gets presented as a fact.
+            if best is not None and best_score >= 2 and best_score > runner_up:
                 resolved, confident = best, True
     except Exception:
         logger.debug("Transcript disambiguation failed for '%s'", session_name,
@@ -15428,7 +15465,11 @@ def _transcript_match_text(path: str) -> str:
     if c and c.get("mtime") == mtime:
         return c.get("text", "")
     parts = []
-    for ln in _read_jsonl_tail(path, 400_000):
+    # 1.5MB of tail, not 400KB: a single tool result can be hundreds of KB, so
+    # the old budget often decoded two or three records and yielded a few hundred
+    # characters to match against — which is why every session on this checkout
+    # fell back to "newest file" and showed its neighbour's model and tokens.
+    for ln in _read_jsonl_tail(path, 1_500_000):
         ln = ln.strip()
         if not ln:
             continue
@@ -15442,8 +15483,20 @@ def _transcript_match_text(path: str) -> str:
             parts.append(content)
         elif isinstance(content, list):
             for b in content:
-                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                if not isinstance(b, dict):
+                    continue
+                if isinstance(b.get("text"), str):
                     parts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    # The commands a session ran are all over its pane and are
+                    # most of what survives normalisation, so they are the
+                    # strongest fingerprint available. Tool RESULTS are excluded
+                    # on purpose: a session that captures another's pane (this
+                    # dashboard's own sessions do it constantly) would otherwise
+                    # absorb its fingerprint and be identified as it. Measured:
+                    # including results made one session match its neighbour's
+                    # transcript with a confident score.
+                    parts.append(json.dumps(b.get("input") or {})[:4000])
     text = _norm_text(re.sub(r"[^0-9A-Za-z ]+", " ", " ".join(parts)))
     if len(_transcript_text_cache) > 400:
         _transcript_text_cache.clear()
@@ -15553,6 +15606,21 @@ def _parse_session_stats(session_name: str) -> dict:
         result = {"available": False, "_ts": now}
         _session_stats_cache[session_name] = result
         return result
+
+    # The same trap the model badge fell into: transcripts are stored per working
+    # directory, so every tmux session open on one checkout shares a project dir.
+    # Summing all of them reported the neighbours' tokens as this session's, and
+    # measured the rate over minutes that belonged to whoever typed last — which
+    # is how a session that had been busy for an hour could read "0/min output,
+    # last activity 44m ago". Pin to this session's own transcript, and fall back
+    # to the whole directory (flagged, so the panel can say so) only when the
+    # session genuinely cannot be told apart from its siblings.
+    own = _pick_session_transcript_file(session_name, files)
+    session_scoped = bool(own) and bool(
+        (_session_transcript_cache.get(session_name) or {}).get("confident")
+        or len([f for f in files if not os.path.basename(f).startswith("agent-")]) == 1)
+    if session_scoped:
+        files = [own]
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_epoch = now
@@ -15713,6 +15781,9 @@ def _parse_session_stats(session_name: str) -> dict:
         "sessionDurationMin": session_duration_min,
         "secsSinceLastActivity": secs_since_last,
         "modelsUsed": models_seen,
+        # False = these are every transcript in the working directory, not this
+        # session's own. Shown as such rather than passed off as a fact.
+        "sessionScoped": session_scoped,
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -17764,6 +17835,7 @@ body.member-admin .more-member-only{display:none}
 .rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
 .rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
 .rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
+.rate-badge.idle{background:rgba(139,148,158,.14);color:#8b949e}
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
@@ -21623,6 +21695,16 @@ async function refreshUsageLimits(){
       const el=document.getElementById(id); if(el)el.textContent=v+'%';
     });
     const staleNote=data.stale?' · last known value (upstream unreachable)':'';
+    // Which account, and when it was read. Without these a live 0% is
+    // indistinguishable from a dead widget — which is exactly how it reads
+    // after a box is signed in to a second, unused account.
+    const acct=data.account||{};
+    const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
+    let readNote='';
+    if(data.fetched_at){
+      const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
+      readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
+    }
     // Where the number came from, and whether spend has moved to overage credits
     // (the 7-day window being spent is exactly when that starts to cost money).
     const srcNote=data.source==='ratelimit_headers'
@@ -21632,8 +21714,8 @@ async function refreshUsageLimits(){
       ? ' · ⚠ plan window spent — running on overage credits'+
         (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
       : '';
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+staleNote+srcNote+ovNote;
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+staleNote+srcNote+ovNote;
+    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
+    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
     if(fhWrap)fhWrap.title=fhTitle;
@@ -21657,8 +21739,11 @@ function _scheduleUsageRetry(){
 function startUsageLimitsPolling(){
   if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
   refreshUsageLimits();
-  // Poll every hour (3600s) while page is open — backend caches upstream calls
-  _usageLimitsTimer=setInterval(refreshUsageLimits,3600*1000);
+  // Poll every 10 min, not hourly. Upstream is still hit at most once an hour —
+  // the backend cache enforces that — but the cache is keyed on the token, so a
+  // login switch busts it, and an hourly page timer meant the bars kept showing
+  // the PREVIOUS account's numbers for up to an hour after the switch.
+  _usageLimitsTimer=setInterval(refreshUsageLimits,600*1000);
 }
 startUsageLimitsPolling();
 
@@ -22171,8 +22256,14 @@ async function loadSessionStats(name){
       panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Claude Code activity.</span>';
       return;
     }
-    const rateCls=st.rateStatus;
-    const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    // "Normal · 0/min output" is what an idle session used to read as, and it
+    // looks exactly like a broken meter. The backend only measures output over
+    // the last 10 minutes, so with nothing in that window there is no rate to
+    // report — say that, instead of reporting a zero that isn't a measurement.
+    const idle=!st.recentOutputRate&&!st.ratePct;
+    const rateCls=idle?'idle':st.rateStatus;
+    const rateLabel=idle?'Idle':rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    const rateText=idle?'no output in the last 10 min':fmtRate(st.recentOutputRate)+' output';
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
     panel.innerHTML=`
@@ -22192,13 +22283,14 @@ async function loadSessionStats(name){
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
         <span style="font-size:.75rem;color:#8b949e">Rate</span>
         <span class="rate-badge ${rateCls}">${rateLabel}</span>
-        <span style="font-size:.75rem;color:#6e7681">${fmtRate(st.recentOutputRate)} output</span>
+        <span style="font-size:.75rem;color:#6e7681">${rateText}</span>
         <span style="font-size:.65rem;color:#484f58">peak ${fmtRate(st.peakOutputRate)}</span>
       </div>
-      <div class="rate-bar">
+      ${st.sessionScoped===false?'<div style="font-size:.65rem;color:#6e7681;margin-top:6px" title="Transcripts are stored per working directory. This session could not be told apart from the others open on the same checkout, so these figures cover all of them.">every session in this working directory, not just this one</div>':''}
+      ${idle?'':`<div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
-      </div>`;
+      </div>`}`;
   }catch(e){
     panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
   }
