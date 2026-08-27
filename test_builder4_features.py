@@ -557,26 +557,35 @@ async def test_admin_can_trigger_durable_recovery(monkeypatch):
     assert b'"restored":["drafting"]' in response.body
 
 
-def test_tab_labels_are_two_words_persistent_and_ignore_continue(monkeypatch, tmp_path: Path):
+def test_a_spaced_session_name_is_shown_but_never_given_to_tmux(monkeypatch, tmp_path: Path):
     import app
     from runtime_control import LockedJsonStore
 
     store = LockedJsonStore(
-        tmp_path / "session-tab-labels.json",
+        tmp_path / "session-display-names.json",
         lambda: {"version": 1, "sessions": {}},
     )
-    monkeypatch.setattr(app, "SESSION_TAB_LABELS", store)
+    monkeypatch.setattr(app, "SESSION_DISPLAY_NAMES", store)
 
-    first = app._set_session_tab_label(
-        "drafting",
-        "admin",
-        "Please fix durable session recovery on builder4",
-    )
-    continued = app._set_session_tab_label("drafting", "admin", "continue")
+    assert app._split_session_name("  word1   word2 ") == ("word1word2", "word1 word2")
+    assert app._split_session_name("plain") == ("plain", "plain")
+    assert app._split_session_name("bad;rm -rf /") == ("", "")
 
-    assert first == "Durable Session"
-    assert continued == first
-    assert app._session_tab_label("drafting") == "Durable Session"
+    app._set_session_display_name("word1word2", "word1 word2")
+    assert app._session_display_name("word1word2") == "word1 word2"
+    # A name with no spaces needs no row, and an unknown session is its own name.
+    app._set_session_display_name("plain", "plain")
+    assert store.read()["sessions"] == {
+        "word1word2": store.read()["sessions"]["word1word2"]
+    }
+    assert app._session_display_name("plain") == "plain"
+
+    # A recycled tmux name must not inherit a stale display name.
+    app._set_session_display_name("word1word2", "other name")
+    assert app._session_display_name("word1word2") == "word1word2"
+
+    app._remove_session_display_name("word1word2")
+    assert store.read()["sessions"] == {}
 
 
 def test_clipboard_images_become_sendable_composer_attachments():
@@ -607,6 +616,18 @@ def test_session_and_view_are_deep_linked_through_the_hash():
     assert "function applySessionRoute()" in html
     assert "window.addEventListener('hashchange',applySessionRoute)" in html
     assert "history.pushState(null,'',_sessionRouteHash(name,tab))" in html
+
+
+def test_a_session_tab_shows_the_typed_name_and_no_two_word_label():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "function sessionLabel(sessionOrName)" in html
+    assert '<span class="nav-session-id">${esc(sessionLabel(s))}</span>' in html
+    # The two-word label that used to sit beside the name is gone for good.
+    assert "tab_label" not in html
+    assert "nav-title" not in html
 
 
 def test_nav_status_includes_memory_and_admin_recovery_control():

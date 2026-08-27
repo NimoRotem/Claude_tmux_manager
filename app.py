@@ -507,84 +507,34 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
 SESSION_LIFECYCLE = SessionLifecycleStore(MESSAGES_DIR / "session-lifecycle.json")
-SESSION_TAB_LABELS = LockedJsonStore(
-    MESSAGES_DIR / "session-tab-labels.json",
+# A session's tmux name has no spaces, because it is also a shell argument, a
+# URL segment and a DOM id all over this app. What the user typed is kept here
+# and shown in the tab instead, so "word1 word2" reads the way it was written.
+SESSION_DISPLAY_NAMES = LockedJsonStore(
+    MESSAGES_DIR / "session-display-names.json",
     lambda: {"version": 1, "sessions": {}},
 )
 TMUX_MUTATION_LOCK = MESSAGES_DIR / "tmux-mutation.lock"
 _stored_anthropic_key: str = ""
 
-_TAB_LABEL_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
-_TAB_LABEL_ACTIONS = frozenset(
-    {
-        "add", "build", "check", "create", "debug", "design", "diagnose",
-        "fix", "implement", "improve", "merge", "refactor", "remove",
-        "repair", "review", "test", "update", "write",
-    }
-)
-_TAB_LABEL_STOP_WORDS = frozenset(
-    {
-        "a", "about", "all", "an", "and", "at", "be", "by", "can", "code",
-        "do", "for", "from", "here", "how", "i", "in", "into", "is", "it",
-        "just", "me", "my", "new", "now", "of", "on", "or", "please", "the",
-        "this", "to", "up", "we", "what", "with", "you", "your",
-    }
-)
-_TAB_LABEL_CONTINUATIONS = frozenset(
-    {
-        "continue", "do it", "go ahead", "implement it", "ok", "okay",
-        "proceed", "sounds good", "start", "yes", "yep",
-    }
-)
-_TAB_LABEL_ACRONYMS = {
-    "ai": "AI", "api": "API", "css": "CSS", "dns": "DNS", "html": "HTML",
-    "js": "JS", "json": "JSON", "oauth": "OAuth", "ssh": "SSH",
-    "tmux": "tmux", "ui": "UI", "url": "URL", "ux": "UX",
-}
+
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]+$")
 
 
-def _tab_label_word(word: str) -> str:
-    normalized = str(word or "")[:24]
-    lower = normalized.lower()
-    if lower in _TAB_LABEL_ACRONYMS:
-        return _TAB_LABEL_ACRONYMS[lower]
-    if normalized.isupper() and len(normalized) <= 8:
-        return normalized
-    return normalized.capitalize()
+def _split_session_name(raw: str) -> tuple[str, str]:
+    """Split a typed name into the tmux name and the name to show.
+
+    'word1 word2' -> ('word1word2', 'word1 word2'). Returns ('', '') when the
+    input is not a usable name.
+    """
+    display = " ".join(str(raw or "").split())
+    if not display or not _SESSION_NAME_RE.match(display):
+        return "", ""
+    return display.replace(" ", ""), display
 
 
-def _normalize_two_word_tab_label(value: str, fallback: str = "Active Task") -> str:
-    words = _TAB_LABEL_WORD_RE.findall(str(value or ""))[:2]
-    if not words:
-        words = _TAB_LABEL_WORD_RE.findall(fallback)[:2] or ["Active", "Task"]
-    if len(words) == 1:
-        words.append("Task")
-    return " ".join(_tab_label_word(word) for word in words[:2])
-
-
-def _fallback_two_word_tab_label(prompt: str) -> str:
-    text = re.sub(r"https?://\S+", " ", str(prompt or ""))
-    tokens = _TAB_LABEL_WORD_RE.findall(text)
-    content = []
-    seen = set()
-    for token in tokens:
-        lower = token.lower()
-        if (
-            lower in _TAB_LABEL_STOP_WORDS
-            or lower in _TAB_LABEL_ACTIONS
-            or lower in seen
-            or (len(token) < 2 and not token.isupper())
-        ):
-            continue
-        seen.add(lower)
-        content.append(token)
-        if len(content) == 2:
-            break
-    return _normalize_two_word_tab_label(" ".join(content), "Active Task")
-
-
-def _session_tab_label_rows() -> dict[str, dict]:
-    rows = SESSION_TAB_LABELS.read().get("sessions", {})
+def _session_display_name_rows() -> dict[str, dict]:
+    rows = SESSION_DISPLAY_NAMES.read().get("sessions", {})
     return {
         str(name): dict(row)
         for name, row in rows.items()
@@ -592,57 +542,35 @@ def _session_tab_label_rows() -> dict[str, dict]:
     }
 
 
-def _session_tab_label(session_name: str, rows: dict | None = None) -> str:
-    rows = rows if rows is not None else _session_tab_label_rows()
-    label = str((rows.get(session_name) or {}).get("label") or "")
-    return _normalize_two_word_tab_label(label) if label else ""
+def _session_display_name(session_name: str, rows: dict | None = None) -> str:
+    """What the user typed, or the tmux name when they typed no spaces."""
+    rows = rows if rows is not None else _session_display_name_rows()
+    display = str((rows.get(session_name) or {}).get("display") or "")
+    # A stored name that no longer collapses to this session is not this
+    # session's name: fall back rather than mislabel a recycled tmux name.
+    if display and display.replace(" ", "") == session_name:
+        return display
+    return session_name
 
 
-def _set_session_tab_label(session_name: str, owner_id: str, prompt: str) -> str:
-    """Persist a free, deterministic two-word label for one session."""
-    normalized_prompt = " ".join(_TAB_LABEL_WORD_RE.findall(str(prompt or ""))).casefold()
-
-    def mutate(data: dict) -> str:
+def _set_session_display_name(session_name: str, display: str) -> None:
+    """Remember a spaced name. A name with no spaces needs no row."""
+    def mutate(data: dict) -> None:
         data["version"] = 1
         rows = data.setdefault("sessions", {})
-        previous = rows.get(session_name)
-        row = dict(previous) if isinstance(previous, dict) else {}
-        if normalized_prompt in _TAB_LABEL_CONTINUATIONS and row.get("label"):
-            return str(row["label"])
-        label = _fallback_two_word_tab_label(prompt)
-        used = {
-            str(other.get("label") or "").casefold()
-            for other_name, other in rows.items()
-            if other_name != session_name
-            and isinstance(other, dict)
-            and str(other.get("owner_id") or "") == owner_id
-        }
-        if label.casefold() in used:
-            first, second = label.split(" ", 1)
-            for suffix in range(2, 100):
-                candidate = f"{first} {second[:20]}-{suffix}"
-                if candidate.casefold() not in used:
-                    label = candidate
-                    break
-        row.update(
-            {
-                "owner_id": str(owner_id or "admin")[:256],
-                "label": label,
-                "updated_at": time.time(),
-            }
-        )
-        rows[session_name] = row
-        return label
+        if not display or display == session_name:
+            rows.pop(session_name, None)
+            return
+        rows[session_name] = {"display": display, "updated_at": time.time()}
 
-    _data, label = SESSION_TAB_LABELS.update(mutate)
-    return label
+    SESSION_DISPLAY_NAMES.update(mutate)
 
 
-def _remove_session_tab_label(session_name: str) -> None:
+def _remove_session_display_name(session_name: str) -> None:
     def mutate(data: dict) -> None:
         data.setdefault("sessions", {}).pop(session_name, None)
 
-    SESSION_TAB_LABELS.update(mutate)
+    SESSION_DISPLAY_NAMES.update(mutate)
 
 
 def _acquire_tmux_mutation_fd(timeout: float = 45.0) -> int:
@@ -6995,13 +6923,13 @@ def build_session_response(
     sess: dict,
     data: dict,
     activity: dict = None,
-    tab_labels: dict | None = None,
+    display_names: dict | None = None,
 ) -> dict:
     if activity is None:
         activity = detect_activity(sess["name"])
     return {
         "name": sess["name"],
-        "tab_label": _session_tab_label(sess["name"], tab_labels),
+        "display_name": _session_display_name(sess["name"], display_names),
         "windows": sess["windows"],
         "attached": sess["attached"],
         "cwd": sess.get("cwd", ""),     # the project this session belongs to
@@ -7046,9 +6974,9 @@ async def api_sessions(request: Request):
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
     )
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     return JSONResponse([
-        build_session_response(sess, data, activity=act, tab_labels=tab_labels)
+        build_session_response(sess, data, activity=act, display_names=display_names)
         for sess, data, act in zip(sessions, results, activities)
     ])
 
@@ -7063,7 +6991,7 @@ async def api_sessions_fast(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     _owners_map = _load_session_owners()
     _uid_to_name = {u["id"]: u.get("username", "") for u in _load_users()}
     for sess, activity in zip(sessions, activities):
@@ -7075,7 +7003,7 @@ async def api_sessions_fast(request: Request):
         cache[sess["name"]] = entry
         out.append({
             "name": sess["name"],
-            "tab_label": _session_tab_label(sess["name"], tab_labels),
+            "display_name": _session_display_name(sess["name"], display_names),
             "windows": sess["windows"],
             "attached": sess["attached"],
             # The working directory IS the project: it selects the CLAUDE.md,
@@ -7138,11 +7066,11 @@ async def api_status(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     for sess, activity in zip(sessions, activities):
         out.append({
             "name": sess["name"],
-            "tab_label": _session_tab_label(sess["name"], tab_labels),
+            "display_name": _session_display_name(sess["name"], display_names),
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
@@ -7151,20 +7079,6 @@ async def api_status(request: Request):
             **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
-
-
-@app.get("/api/tab-labels")
-async def api_tab_labels(request: Request):
-    """Return only labels visible to the current dashboard account."""
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
-    rows = await asyncio.to_thread(_session_tab_label_rows)
-    return JSONResponse(
-        [
-            {"name": session["name"], "tab_label": _session_tab_label(session["name"], rows)}
-            for session in sessions
-        ]
-    )
 
 
 @app.get("/api/sessions/{session_name}/raw")
@@ -7572,14 +7486,16 @@ class CreateSession(BaseModel):
 async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
     user = _current_user(request)
-    name = body.name.strip()
+    # Spaces are allowed in what the user types. tmux gets the name with the
+    # spaces taken out (it is a shell argument and a URL segment everywhere
+    # else); the typed form is kept for the tab.
+    name, display_name = _split_session_name(body.name)
+    if body.name.strip() and not name:
+        return JSONResponse({"error": "Invalid name. Use letters, numbers, spaces, dash, underscore."}, status_code=400)
     if name:
-        # Validate name: alphanumeric, dash, underscore only
-        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-            return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+            return JSONResponse({"error": f"Session '{display_name}' already exists."}, status_code=409)
     # The project the session belongs to. A session's cwd is what decides which
     # CLAUDE.md, .mcp.json and auto-memories Claude Code loads, so "open a session
     # in project B" has to mean starting tmux there — everything else follows.
@@ -7608,8 +7524,11 @@ async def api_create_session(request: Request, body: CreateSession):
         # requests can both pass the earlier friendly validation before either
         # reaches tmux.
         if name and any(session["name"] == name for session in get_tmux_sessions()):
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+            return JSONResponse({"error": f"Session '{display_name}' already exists."}, status_code=409)
         created_id, created = _create_exact_tmux_session(name, start_cwd)
+        # Remember the spaced form only if tmux gave us the name we asked for;
+        # an auto-assigned name is its own display name.
+        _set_session_display_name(created, display_name if created == name else "")
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
@@ -7744,7 +7663,8 @@ async def api_create_session(request: Request, body: CreateSession):
             expected_generation=lifecycle_generation,
         )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
-        return JSONResponse({"ok": True, "name": created})
+        return JSONResponse({"ok": True, "name": created,
+                             "display_name": _session_display_name(created)})
     except Exception as e:
         logger.error("Failed to create session '%s': %s", name, e)
         if created_id:
@@ -7766,6 +7686,7 @@ async def api_create_session(request: Request, body: CreateSession):
         if created_id:
             _clear_session_owner(created)
             _clear_session_convo(created)
+            _remove_session_display_name(created)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         await asyncio.to_thread(_release_tmux_mutation_fd, mutation_fd)
@@ -7886,7 +7807,7 @@ async def api_delete_session(request: Request, session_name: str):
         # A new session that reuses this name must not inherit the dead one's
         # conversation — that is the same mix-up by another route.
         _clear_session_convo(session_name)
-        _remove_session_tab_label(session_name)
+        _remove_session_display_name(session_name)
         SESSION_LIFECYCLE.remove(
             session_name,
             expected_generation=lifecycle_generation,
@@ -17225,15 +17146,6 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
         except Exception:
             logger.exception(
                 "Failed to append prompt audit for session '%s'", session_name)
-        try:
-            await asyncio.to_thread(
-                _set_session_tab_label,
-                session_name,
-                _session_owner_id(session_name),
-                body.command,
-            )
-        except Exception:
-            logger.exception("Failed to update tab label for session '%s'", session_name)
         return JSONResponse({"ok": True, "sent": cmd_text,
                              "attached": [i.get("path") for i in pending]})
     except Exception as e:
@@ -18779,7 +18691,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
-.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
+.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
 .nav-indicators{display:flex;align-items:center;gap:5px}
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
@@ -21681,6 +21593,15 @@ function authBadge(s){
          esc(s.auth_detail||'')+'">'+esc(s.auth_label)+'</span>';
 }
 
+/* A session's tmux name carries no spaces: it is a shell argument, a URL
+   segment and a DOM id. This is the name the user typed, for reading. */
+function sessionLabel(sessionOrName){
+  if(sessionOrName&&typeof sessionOrName==='object')
+    return sessionOrName.display_name||sessionOrName.name||'';
+  const s=(sessions||[]).find(x=>x.name===sessionOrName);
+  return (s&&s.display_name)||sessionOrName||'';
+}
+
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   // Session tabs sit AFTER the project switcher, not between it and the brand.
@@ -21689,10 +21610,10 @@ function renderNav(){
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.title=s.name;
+    item.title=sessionLabel(s);
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
-      <span class="nav-session-id">${esc(s.name)}</span>
+      <span class="nav-session-id">${esc(sessionLabel(s))}</span>
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
@@ -23400,6 +23321,9 @@ async function pollStatus(){
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
+        if(st.display_name&&(sessions[si].display_name||'')!==st.display_name){
+          sessions[si].display_name=st.display_name;navChanged=true;
+        }
         let badgeChanged=false;
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
@@ -23618,7 +23542,7 @@ function renderLoginHealth(){
   });
 }
 async function reloginSession(name){
-  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch on this session\'s own conversation, which is preserved.'))return;
+  if(!confirm('Restart Claude in "'+sessionLabel(name)+'" on the current login?\n\nIt will exit and relaunch on this session\'s own conversation, which is preserved.'))return;
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/relogin',{method:'POST'});
     const data=await resp.json();
@@ -23648,10 +23572,10 @@ function showCreateModal(){
     : `<p class="conn-note">No project selected, so it starts in the default directory. Pick one in the top bar to open sessions inside a project.</p>`;
   modal.innerHTML=`
     <h3>New __BRAND__ session</h3>
-    <p>${MEMBER_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
+    <p>${MEMBER_SIMPLE ? 'A name is pre-filled, keep it or type your own. Spaces are fine.' : 'Leave blank for an auto-assigned name, or enter a custom name. Spaces are fine: the tab shows them, tmux gets the name without them.'}</p>
     ${where}
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
-      placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
+      placeholder="e.g. my project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
@@ -23776,7 +23700,7 @@ async function saveGlobalContext(){
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>Kill session ${esc(name)}?</h3>
+    <h3>Kill session ${esc(sessionLabel(name))}?</h3>
     <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
