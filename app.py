@@ -18759,8 +18759,16 @@ HTML_PAGE = r"""<!doctype html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
 
-/* Nav wrapper — keeps right-side items pinned while tabs scroll */
-.nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0}
+/* Nav wrapper: keeps right-side items pinned while tabs scroll, and stays put
+   while the page scrolls. The session tabs, the Stop button and the usage bars
+   are all things you reach for mid-scroll. z-index 40 is deliberate: it clears
+   the page content but stays UNDER the overlays
+   (modals 100, stats/profiles/CLAUDE.md 200), which are position:fixed over the
+   whole viewport and would otherwise be sliced by a nav painted on top of them.
+   The menus inside the nav are clamped into this stacking context, which is
+   fine: they are never open at the same time as an overlay. */
+.nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0;
+  position:sticky;top:0;z-index:40}
 /* Nav bar — scrollable session tabs area */
 .top-nav{padding:0 0 0 24px;display:flex;align-items:center;gap:0;overflow-x:auto;flex:1;min-width:0}
 .top-nav::-webkit-scrollbar{height:0}
@@ -20131,7 +20139,6 @@ let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's 
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
-let tabLabelPollTimer=null;
 const activeTabs={};
 let _applyingSessionRoute=false;
 
@@ -21688,7 +21695,7 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
-      <span class="nav-title" id="nav-label-${s.name}"${s.tab_label?'':' hidden'}>${esc(s.tab_label||'')}</span>
+      ${s.tab_label?'<span class="nav-title">'+esc(s.tab_label)+'</span>':''}
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
@@ -23333,7 +23340,6 @@ async function loadAll(){
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
-  startTabLabelPolling();
   // Phase 2: Background LLM refresh for each session
   lazyRefreshAll();
 }
@@ -23378,53 +23384,6 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
-// ── Session tab labels ─────────────────────────────────────────────────────
-// The label is what tells two identically-named panes apart at a glance, so it
-// gets its own 2-second poll rather than riding the 10-second status poll: a
-// label that arrives eight seconds after the work started is a label you have
-// already scrolled past. The endpoint returns names and labels only, so this
-// stays far cheaper than /api/status.
-function sessionTabLabel(session){
-  return ((session&&session.tab_label)||(session&&session.name)||'').trim();
-}
-
-function _paintSessionTabLabel(name){
-  const session=sessions.find(s=>s.name===name);
-  const label=document.getElementById('nav-label-'+name);
-  const item=document.getElementById('nav-'+name);
-  if(!session||!label)return;
-  label.textContent=session.tab_label||'';
-  label.hidden=!session.tab_label;
-  const title=session.tab_label
-    ? session.name+' · '+session.tab_label
-    : session.name;
-  label.title=title;
-  if(item)item.title=title;
-}
-
-function startTabLabelPolling(){
-  if(tabLabelPollTimer)clearInterval(tabLabelPollTimer);
-  tabLabelPollTimer=setInterval(pollTabLabels,2000);
-}
-
-async function pollTabLabels(){
-  if(document.hidden)return;
-  try{
-    const resp=await fetch(BASE+'/api/tab-labels',{cache:'no-store'});
-    if(!resp.ok)return;
-    const labels=await resp.json();
-    if(!Array.isArray(labels))return;
-    for(const row of labels){
-      const session=sessions.find(s=>s.name===row.name);
-      if(!session)continue;
-      const next=row.tab_label||'';
-      if((session.tab_label||'')===next)continue;
-      session.tab_label=next;
-      _paintSessionTabLabel(row.name);
-    }
-  }catch(e){}
-}
-
 async function pollStatus(){
   try{
     const resp=await fetch(BASE+'/api/status');
@@ -23446,7 +23405,7 @@ async function pollStatus(){
         let navChanged=false;
         if((sessions[si].tab_label||'')!==(st.tab_label||'')){
           sessions[si].tab_label=st.tab_label||'';
-          _paintSessionTabLabel(st.name);
+          navChanged=true;
         }
         let badgeChanged=false;
         const pend=st.model_pending||'';
