@@ -113,9 +113,9 @@ def test_tmpfiles_config_recreates_the_trusted_pytest_lock_after_reboot():
         if line.strip() and not line.lstrip().startswith("#")
     }
 
-    assert "d /run/lock/builder4 0700 root root -" in lines
-    assert "f /run/lock/builder4/pytest-heavy.lock 0400 root root -" in lines
-    assert "z /run/lock/builder4/pytest-heavy.lock 0400 root root -" in lines
+    assert "d /run/lock/builder4 0750 root nimrod_rotem -" in lines
+    assert "f /run/lock/builder4/pytest-heavy.lock 0440 root nimrod_rotem -" in lines
+    assert "z /run/lock/builder4/pytest-heavy.lock 0440 root nimrod_rotem -" in lines
 
 
 def test_claude_launch_is_scoped_and_inherits_the_pytest_gate(monkeypatch):
