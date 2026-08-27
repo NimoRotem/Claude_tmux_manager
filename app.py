@@ -18781,7 +18781,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
 .nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
-.nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
 .nav-indicators{display:flex;align-items:center;gap:5px}
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
 .nav-dot.busy{width:10px;height:10px;background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #f8514988}
@@ -19844,7 +19843,6 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-right{padding-right:8px}
   .nav-brand{padding:10px 8px 10px 0;margin-right:2px;font-size:.75rem}
   .nav-item{padding:8px 10px;gap:5px}
-  .nav-title{display:none}
   .nav-attached{display:none}
   .nav-status-text{display:none}
   /* The browser badge, the usage bars and the CPU/RAM readout are moved out of
@@ -21691,11 +21689,10 @@ function renderNav(){
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.title=s.tab_label?(s.name+' · '+s.tab_label):s.name;
+    item.title=s.name;
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
-      ${s.tab_label?'<span class="nav-title">'+esc(s.tab_label)+'</span>':''}
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
@@ -23403,10 +23400,6 @@ async function pollStatus(){
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
-        if((sessions[si].tab_label||'')!==(st.tab_label||'')){
-          sessions[si].tab_label=st.tab_label||'';
-          navChanged=true;
-        }
         let badgeChanged=false;
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
