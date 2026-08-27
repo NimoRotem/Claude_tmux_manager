@@ -20,6 +20,7 @@ import tempfile
 import mimetypes
 import threading
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
@@ -800,15 +801,108 @@ async def _async_is_claude_running(session_name: str) -> bool:
     return await asyncio.to_thread(_is_claude_running, session_name)
 
 
+def _session_cwd(session_name: str) -> str:
+    try:
+        return subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _neighbours_sharing_cwd(session_name: str) -> list:
+    """Other live sessions whose Claude is running in the same directory.
+
+    They are the ones whose conversation `--continue` would hand us."""
+    cwd = _session_cwd(session_name)
+    if not cwd:
+        return []
+    out = []
+    try:
+        names = [s["name"] for s in get_tmux_sessions()]
+    except Exception:
+        return []
+    for name in names:
+        if name == session_name:
+            continue
+        if _session_cwd(name) == cwd and _is_claude_running(name):
+            out.append(name)
+    return out
+
+
+def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
+    """The resume flag for relaunching this pane's Claude, in order of trust.
+
+    1. `--resume <uuid>` for the conversation we launched this pane on, or that
+       a caller identified. Exact, and the only option that cannot pick up a
+       neighbour's work.
+    2. The scrollback-matching heuristic, for panes that predate (1).
+    3. `--continue` — ONLY when no other live session shares this cwd. It means
+       "the most recent conversation here", which on a box where every session
+       runs in one directory is a coin toss.
+    4. Nothing: start fresh. Losing this pane's own context is bad; silently
+       joining a colleague's live conversation and working their task is worse.
+    """
+    uuid_s = resume_uuid or _session_convo(session_name)
+    if uuid_s and _UUID_RE.fullmatch(uuid_s):
+        return "--resume " + uuid_s
+    guessed = _find_session_transcript_uuid(session_name)
+    if guessed:
+        _set_session_convo(session_name, guessed)
+        return "--resume " + guessed
+    busy = _neighbours_sharing_cwd(session_name)
+    if busy:
+        logger.error("Relaunching '%s' WITHOUT its conversation: no session id on record "
+                     "and --continue here would resume %s's work (same cwd). Starting a "
+                     "fresh conversation instead.", session_name, ", ".join(busy))
+        new_id = str(uuid.uuid4())
+        _set_session_convo(session_name, new_id)
+        return "--session-id " + new_id
+    return "--continue"
+
+
+async def _async_resume_flag(session_name: str, resume_uuid: str = None) -> str:
+    return await asyncio.to_thread(_resume_flag, session_name, resume_uuid)
+
+
+def _learn_session_convo(session_name: str) -> str:
+    """Best-effort: read this pane's conversation id off its own scrollback.
+
+    Claude prints its per-session scratchpad path (`/tmp/claude-<uid>/<encoded
+    cwd>/<conversation uuid>/scratchpad`) in tool output, and our own launch line
+    carries `--resume`/`--session-id`. Either one names the conversation without
+    guessing. Only accepts an id that has a transcript on disk."""
+    have = _session_convo(session_name)
+    if have:
+        return have
+    try:
+        scroll = capture_pane_recent(session_name, 400)
+    except Exception:
+        return ""
+    proj = _project_dir_for_cwd(_session_cwd(session_name) or str(Path.cwd()))
+    found = ""
+    for m in re.finditer(r"(?:/tmp/claude-\d+/[^\s/]+/|--resume\s+|--session-id\s+)"
+                         r"([0-9a-fA-F-]{36})", scroll):
+        cand = m.group(1)
+        if not _UUID_RE.fullmatch(cand):
+            continue
+        if proj and not (proj / (cand + ".jsonl")).exists():
+            continue
+        found = cand          # last match wins: the newest thing on screen
+    if found:
+        _set_session_convo(session_name, found)
+        logger.info("Learned conversation %s for session '%s'", found, session_name)
+    return found
+
+
 async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = None,
                                  resume_uuid: str = None) -> bool:
     """Check if Claude Code is running; if not, restart it. Returns True if Claude is running after check.
 
     This handles OOM crashes where Claude dies and the pane falls back to bash.
-    The relaunch reattaches to the crashed conversation so the task continues:
-    `--resume <uuid>` when the exact conversation is known (preferred — sessions
-    can share a cwd, which makes plain --continue grab the wrong one), otherwise
-    `--continue`. A larger Node heap is set to reduce repeat OOMs.
+    The relaunch reattaches to the crashed conversation so the task continues;
+    which flag that takes is _resume_flag's decision. A larger Node heap is set
+    to reduce repeat OOMs.
     """
     alog = logging.getLogger("autonomous")
     if await _async_is_claude_running(session_name):
@@ -839,12 +933,13 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
                     _apply_member_auth(_user_claude_config_dir(_owner))
         except Exception:
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
-        # Relaunch Claude on the bare shell, resuming the prior conversation.
-        resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
-        launch = (_claude_launch_env_prefix() +
-                  "NODE_OPTIONS=--max-old-space-size=8192 "
-                  f"claude --dangerously-skip-permissions {resume_flag}"
-                  f"{_model_flag_for_relaunch(session_name)}")
+        # Relaunch Claude on the bare shell, resuming THIS pane's conversation.
+        resume_flag = await _async_resume_flag(session_name, resume_uuid)
+        launch = _relaunch_line(
+            session_name,
+            "NODE_OPTIONS=--max-old-space-size=8192 "
+            f"claude --dangerously-skip-permissions {resume_flag}"
+            f"{_model_flag_for_relaunch(session_name)}")
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -1351,6 +1446,65 @@ def _clear_session_owner(session_name: str):
     if session_name in owners:
         owners.pop(session_name, None)
         _save_session_owners()
+
+
+# --- Which conversation belongs to which session ---------------------------
+# Every session on this box starts in the SAME cwd, so every one of them writes
+# into the same ~/.claude/projects/<encoded>/ directory. `claude --continue`
+# resumes "the most recent conversation in this directory", which is whichever
+# NEIGHBOUR spoke last — not this pane's own. On 2026-08-27 that put 'humansketch'
+# into 'crmaddons' conversation and had two panes working one task for 50 minutes.
+# So the dashboard names the conversation itself (`--session-id` at launch) and
+# relaunches with `--resume <that id>`. --continue is the last resort, and only
+# when no other live session could have written the file we would land on.
+SESSION_CONVOS_FILE = MESSAGES_DIR / "session_conversations.json"
+_session_convos_cache: Optional[Dict[str, str]] = None
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _load_session_convos() -> Dict[str, str]:
+    global _session_convos_cache
+    if _session_convos_cache is not None:
+        return _session_convos_cache
+    try:
+        if SESSION_CONVOS_FILE.exists():
+            data = json.loads(SESSION_CONVOS_FILE.read_text())
+            if isinstance(data, dict):
+                _session_convos_cache = {str(k): str(v) for k, v in data.items()}
+                return _session_convos_cache
+    except Exception:
+        logger.debug("Failed to load session conversations", exc_info=True)
+    _session_convos_cache = {}
+    return _session_convos_cache
+
+
+def _set_session_convo(session_name: str, convo_uuid: str):
+    """Remember which Claude conversation this pane is running."""
+    if not session_name or not convo_uuid or not _UUID_RE.fullmatch(convo_uuid):
+        return
+    convos = _load_session_convos()
+    if convos.get(session_name) == convo_uuid:
+        return
+    convos[session_name] = convo_uuid
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_CONVOS_FILE.write_text(json.dumps(convos, indent=2))
+    except Exception:
+        logger.debug("Failed to save session conversations", exc_info=True)
+
+
+def _session_convo(session_name: str) -> str:
+    return _load_session_convos().get(session_name, "")
+
+
+def _clear_session_convo(session_name: str):
+    convos = _load_session_convos()
+    if convos.pop(session_name, None) is not None:
+        try:
+            SESSION_CONVOS_FILE.write_text(json.dumps(convos, indent=2))
+        except Exception:
+            logger.debug("Failed to save session conversations", exc_info=True)
 
 
 def _user_for_session(session_name: str) -> Optional[dict]:
@@ -2281,6 +2435,7 @@ async def api_admin_delete_user(request: Request, user_id: str):
         except Exception:
             logger.debug("Failed to kill session '%s' during user delete", name, exc_info=True)
         _clear_session_owner(name)
+        _clear_session_convo(name)
     # Remove the user record.
     users = [u for u in users if u["id"] != user_id]
     _save_users(users)
@@ -7003,15 +7158,25 @@ async def api_create_session(request: Request, body: CreateSession):
                         _pin_model = False
             except Exception:
                 logger.debug("Profile model lookup failed on create", exc_info=True)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
-                 _launch_claude_cmd(NEW_SESSION_CMD, pin_model=_pin_model)],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            _cmd_line, _model, _effort = _claude_cmd_with_flags(NEW_SESSION_CMD, pin_model=_pin_model)
+            # Name the conversation ourselves. Every session on this box starts in
+            # the same cwd, so a later `--continue` would otherwise resume whichever
+            # neighbour spoke last; with an id on record every relaunch is --resume.
+            if "claude" in _cmd_line and not re.search(
+                    r"--(session-id|resume|continue)\b", _cmd_line):
+                _convo = str(uuid.uuid4())
+                _cmd_line = f"{_cmd_line} --session-id {_convo}"
+                _set_session_convo(created, _convo)
+            _banner = _launch_banner(created, _owner_name, _model, _effort)
+            _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
+            _boot.append(_cmd_line)
+        # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
+        _line = _launch_script_line(created, _boot, _banner)
+        if _line:
+            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _line],
+                           capture_output=True, text=True, timeout=5)
+            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"],
+                           capture_output=True, text=True, timeout=5)
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
     except Exception as e:
@@ -7088,6 +7253,9 @@ async def api_delete_session(request: Request, session_name: str):
         # Drop the ownership record. Messages/notes are kept on disk so they
         # show up in the user's History tab even after the live session dies.
         _clear_session_owner(session_name)
+        # A new session that reuses this name must not inherit the dead one's
+        # conversation — that is the same mix-up by another route.
+        _clear_session_convo(session_name)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -14303,8 +14471,10 @@ async def _auto_fix_login(session_name: str) -> dict:
     holds a valid Max token (or a stored long-lived one) and only this session's
     claude process lost it (rotation race, stale process, a config dir with no
     creds). So: clear whatever login prompt is stranded on screen, make sure the
-    session's config dir has the good credential, and relaunch on --continue.
-    Takes ~15s and the user does nothing.
+    session's config dir has the good credential, and relaunch on this pane's own
+    conversation (_resume_flag — a bare --continue here is what put 'humansketch'
+    into 'crmaddons' conversation on 2026-08-27). Takes ~15s and the user does
+    nothing.
 
     This is the primary recovery path. Driving the OAuth consent page in a
     browser is NOT usable — claude.ai blocks it (see _extract_oauth_code)."""
@@ -14342,11 +14512,12 @@ async def _auto_fix_login(session_name: str) -> dict:
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "C-u"],
         capture_output=True, text=True, timeout=5)
-    await _send_line(session_name,
-                     _claude_launch_env_prefix() +
-                     "NODE_OPTIONS=--max-old-space-size=8192 "
-                     "claude --dangerously-skip-permissions --continue" +
-                     _model_flag_for_relaunch(session_name))
+    await _send_line(session_name, _relaunch_line(
+        session_name,
+        "NODE_OPTIONS=--max-old-space-size=8192 "
+        "claude --dangerously-skip-permissions "
+        + await _async_resume_flag(session_name)
+        + _model_flag_for_relaunch(session_name)))
     # 4. Confirm it came back authenticated.
     for _ in range(20):
         await asyncio.sleep(2)
@@ -14592,7 +14763,7 @@ async def browser_proxy_http(sid: str, path: str, request: Request):
 @app.post("/api/sessions/{session_name}/relogin")
 async def api_session_relogin(session_name: str, request: Request):
     """Gracefully exit Claude and relaunch it on the CURRENT login, preserving
-    the conversation via --continue. Fixes a session stuck on a previous account."""
+    this pane's own conversation. Fixes a session stuck on a previous account."""
     user = _current_user(request)
     if not _user_can_access_session(user, session_name):
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -14630,10 +14801,11 @@ async def api_session_relogin(session_name: str, request: Request):
         logger.debug("relogin: profile re-export failed", exc_info=True)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "-l",
-         _claude_launch_env_prefix() +
-         "NODE_OPTIONS=--max-old-space-size=8192 "
-         "claude --dangerously-skip-permissions --continue"
-         + _model_flag_for_relaunch(session_name)],
+         _relaunch_line(session_name,
+                        "NODE_OPTIONS=--max-old-space-size=8192 "
+                        "claude --dangerously-skip-permissions "
+                        + await _async_resume_flag(session_name)
+                        + _model_flag_for_relaunch(session_name))],
         capture_output=True, text=True, timeout=5)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -17610,6 +17782,11 @@ async def _crash_recovery_loop():
                     if st:
                         st["attempts"] = 0
                         st["gave_up"] = False
+                    # Learn the conversation id WHILE the pane is healthy. After a
+                    # crash the scrollback may be a stack trace and a bare shell,
+                    # and that is precisely when we need the id.
+                    if not _session_convo(name):
+                        await asyncio.to_thread(_learn_session_convo, name)
                     continue
                 # Pane is a bare shell. Only touch sessions we manage / have seen run Claude.
                 if name not in owners and name not in _seen_claude_running:
@@ -17635,13 +17812,14 @@ async def _crash_recovery_loop():
                                    "manual restart needed", name, state["attempts"])
                         state["gave_up"] = True
                     continue
-                uuid = await asyncio.to_thread(_find_session_transcript_uuid, name)
+                convo = _session_convo(name) or await asyncio.to_thread(
+                    _find_session_transcript_uuid, name)
                 state["attempts"] = state.get("attempts", 0) + 1
                 state["last_action"] = now
                 rlog.warning("Session '%s' crashed to shell — relaunching Claude (%s), attempt %d/%d",
-                             name, ("--resume " + uuid) if uuid else "--continue",
+                             name, ("--resume " + convo) if convo else "no id on record",
                              state["attempts"], _CRASH_RECOVERY_MAX_ATTEMPTS)
-                ok = await _ensure_claude_running(name, resume_uuid=uuid)
+                ok = await _ensure_claude_running(name, resume_uuid=convo)
                 if ok:
                     _seen_claude_running.add(name)
                     _crash_recovery_state[name] = {"attempts": 0, "last_action": now, "gave_up": False}
@@ -22190,8 +22368,17 @@ async function refreshUsageLimits(){
       ? ' · ⚠ plan window spent — running on overage credits'+
         (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
       : '';
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
+    // Anthropic returns resets_at null for a window nothing has been spent in
+    // yet, so "resets " used to trail off into blank space — which reads as a
+    // broken widget at exactly the moment the honest answer is "this window just
+    // rolled over". Say that instead.
+    const _when=(blk,pct)=>{
+      const t=_fmtResetTime(blk.resets_at);
+      if(t)return'resets '+t;
+      return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
+    };
+    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
+    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
     if(fhWrap)fhWrap.title=fhTitle;
@@ -22245,7 +22432,7 @@ function renderLoginHealth(){
     if(s&&s.stale){
       const curAcct=acct.email?(esc(acct.email)+(acct.plan?' · '+esc(acct.plan):'')):'the current login';
       el.innerHTML='<div style="margin-top:12px;background:#3d1d1d;border:1px solid #f85149;border-radius:8px;padding:10px 12px;color:#ffdcd6;font-size:.82rem;display:flex;flex-direction:column;gap:8px">'
-        +'<span>⚠ This session\'s Claude started on a <b>previous login</b> and is still using it. Its in-terminal 5-hour usage bar reflects that older account — not the current login ('+curAcct+'). Restart to move it onto the current account (the conversation is preserved via --continue).</span>'
+        +'<span>⚠ This session\'s Claude started on a <b>previous login</b> and is still using it. Its in-terminal 5-hour usage bar reflects that older account, not the current login ('+curAcct+'). Restart to move it onto the current account (the conversation is preserved).</span>'
         +'<button onclick="reloginSession(\''+esc(name)+'\')" style="align-self:flex-start;background:#da3633;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:.8rem;cursor:pointer">Restart Claude on current login</button>'
         +'</div>';
     }else{
@@ -22254,7 +22441,7 @@ function renderLoginHealth(){
   });
 }
 async function reloginSession(name){
-  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch with --continue to preserve the conversation.'))return;
+  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch on this session\'s own conversation, which is preserved.'))return;
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/relogin',{method:'POST'});
     const data=await resp.json();
