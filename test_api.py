@@ -1,4 +1,5 @@
 """Integration tests for tmux Dashboard API endpoints using FastAPI TestClient."""
+import hashlib
 import json
 import os
 import time
@@ -79,6 +80,33 @@ class TestAuthMiddleware:
             data={"username": AUTH_USER, "password": AUTH_PASS},
             follow_redirects=False,
         )
+        assert resp.status_code == 303
+        assert "tmux_auth" in resp.cookies
+
+    def test_login_accepts_non_ascii_legacy_password(self, client):
+        password = "builder-pass-密码"
+        salt = "test-salt"
+        user = {
+            "id": "admin",
+            "username": "Nimo",
+            "password_hash": hashlib.sha256((salt + password).encode("utf-8")).hexdigest(),
+            "password_salt": salt,
+            "role": "admin",
+            "last_login": 0,
+        }
+        with (
+            patch("app.AUTH_USER", "Nimo"),
+            patch("app.AUTH_PASS", password),
+            patch("app._find_user_by_username", return_value=user),
+            patch("app._load_users", return_value=[user]),
+            patch("app._save_users"),
+        ):
+            resp = client.post(
+                "/login",
+                data={"username": "Nimo", "password": password},
+                follow_redirects=False,
+            )
+
         assert resp.status_code == 303
         assert "tmux_auth" in resp.cookies
 

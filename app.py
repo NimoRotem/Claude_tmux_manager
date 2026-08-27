@@ -2116,8 +2116,8 @@ async def do_login(request: Request):
     # if users.json was deleted by hand.
     legacy_ok = (
         AUTH_PASS
-        and hmac.compare_digest(username, AUTH_USER)
-        and hmac.compare_digest(password, AUTH_PASS)
+        and hmac.compare_digest(username.encode("utf-8"), AUTH_USER.encode("utf-8"))
+        and hmac.compare_digest(password.encode("utf-8"), AUTH_PASS.encode("utf-8"))
     )
     user = _find_user_by_username(username)
     if user and _verify_password(user, password):
