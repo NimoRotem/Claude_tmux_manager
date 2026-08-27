@@ -3,8 +3,8 @@
 import json
 import os
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import app as dashboard
-
 
 ADMIN = {"id": "admin", "username": "admin", "role": "admin"}
 MEMBER = {"id": "u_member", "username": "member@example.com", "role": "user"}
@@ -340,10 +339,12 @@ def test_exact_resume_never_uses_global_last_thread(tmp_path):
         pin_model=False,
         resume=True,
         resume_uuid=thread_id,
+        resume_cwd=str(tmp_path),
         codex_home=tmp_path,
     )
 
-    assert f"codex resume {thread_id}" in command
+    assert "codex resume -C" in command
+    assert thread_id in command
     assert "resume --last" not in command
 
 
@@ -357,8 +358,15 @@ async def test_crash_recovery_passes_the_session_bound_thread_to_launcher():
         patch.object(dashboard, "_multi_tenant_enabled", return_value=False),
         patch.object(dashboard, "_ensure_codex_auth_with_fallback", return_value={}),
         patch.object(dashboard, "_find_session_transcript_uuid", return_value=thread_id),
+        patch.object(dashboard, "_exact_tmux_session_id", return_value="$1"),
+        patch.object(dashboard, "get_session_cwd", return_value="/workspace/work"),
+        patch.object(
+            dashboard, "_saved_session_model_effort", return_value=(None, None)
+        ),
         patch.object(dashboard, "_session_launch_command", return_value="launch") as launcher,
-        patch.object(dashboard.subprocess, "run"),
+        patch.object(
+            dashboard.subprocess, "run", return_value=MagicMock(returncode=0)
+        ),
         patch.object(dashboard.asyncio, "sleep", AsyncMock()),
     ):
         assert await dashboard._ensure_codex_running("work") is True
@@ -366,7 +374,11 @@ async def test_crash_recovery_passes_the_session_bound_thread_to_launcher():
     launcher.assert_called_once_with(
         "work",
         dashboard._session_launch_base("work"),
-        pin_model=True,
+        expected_owner_id=None,
+        pin_model=False,
         resume=True,
+        model=None,
+        effort=None,
         resume_uuid=thread_id,
+        resume_cwd="/workspace/work",
     )

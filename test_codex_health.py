@@ -11,7 +11,6 @@ os.environ.setdefault("TMUX_DASH_USER", "admin")
 
 import app
 
-
 # The pane text a member session really showed while this bug was live.
 BROKEN_PANE = """\
 _36f0fc4837a8f21b ADVISOR_TOKEN="$(cat /home/nimrod_rotem/.codex-user-u_36f0fc48\
@@ -97,6 +96,47 @@ def test_missing_config_file_means_no_override(tmp_path):
         "codex --yolo", pin_model=False, codex_home=tmp_path / "nope"
     )
     assert "openaiDeveloperDocs" not in out
+
+
+def test_explicit_resume_uses_thread_id_and_cwd_instead_of_last(tmp_path):
+    home = _write_config(tmp_path, "")
+    thread_id = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+    recovered_cwd = tmp_path / "recovered workspace"
+    recovered_cwd.mkdir()
+
+    out = app._launch_codex_cmd(
+        "codex --yolo",
+        pin_model=False,
+        resume=True,
+        resume_uuid=thread_id,
+        resume_cwd=str(recovered_cwd),
+        codex_home=home,
+    )
+
+    assert f"resume -C '{recovered_cwd}'" in out
+    assert thread_id in out
+    assert "--last" not in out
+    assert "--yolo" in out
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "cwd"),
+    [("--last", "/tmp"), ("01a020d4-d4e0-75a3-b832-b830e6f4fd87", "")],
+)
+def test_exact_resume_fails_closed_for_invalid_identity_or_cwd(
+    tmp_path, thread_id, cwd
+):
+    home = _write_config(tmp_path, "")
+
+    with pytest.raises(ValueError):
+        app._launch_codex_cmd(
+            "codex --yolo",
+            pin_model=False,
+            resume=True,
+            resume_uuid=thread_id,
+            resume_cwd=cwd,
+            codex_home=home,
+        )
 
 
 def test_config_cache_follows_edits(tmp_path):
@@ -265,7 +305,7 @@ def test_token_usage_sums_turn_deltas_not_running_totals(tmp_path):
     assert totals["today"]["cacheReadTokens"] == 50
     assert totals["today"]["reasoningTokens"] == 5
     # cached input is a SUBSET of input and reasoning a subset of output, so the
-    # total is input + output — exactly Codex's own total_tokens, not 385.
+    # total is input + output - exactly Codex's own total_tokens, not 385.
     assert totals["today"]["totalTokens"] == 330
     assert totals["today"]["turns"] == 2
 
@@ -379,7 +419,7 @@ nimrod_rotem@grabo-tech:~/p$ exec env CODEX_HOME=/home/nimrod_rotem/.codex-user-
 def test_starting_session_is_never_relaunched_into():
     """Codex takes seconds to appear in the process tree, so a poll can catch a
     session that is still booting. The pane then shows the launch command still
-    sitting on the prompt line and nothing after it — which reads as pending
+    sitting on the prompt line and nothing after it - which reads as pending
     input, and blocks the relaunch. Without that, a watchdog would type a second
     launch line into a booting TUI."""
     assert app._codex_launch_was_attempted(STARTING_PANE)
@@ -418,7 +458,7 @@ def test_recoverable_shell_rejects_half_typed_input():
     assert not app._pane_is_recoverable_shell(pane)
 
 
-def test_recoverable_shell_accepts_a_stuck_continuation(): 
+def test_recoverable_shell_accepts_a_stuck_continuation():
     pane = ("exec env CODEX_HOME=/home/x/.codex-user-u_x codex --yolo\n"
             "Error loading config.toml: invalid transport\n"
             "nimrod_rotem@grabo-tech:~/p$ echo \"unterminated\n>\n")
