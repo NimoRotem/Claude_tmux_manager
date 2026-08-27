@@ -814,3 +814,62 @@ def test_nav_status_includes_memory_and_admin_recovery_control():
     assert "onclick=\"recoverSessions();closeToolsMenu()\"" in html
     assert "async function recoverSessions()" in html
     assert "BASE+'/api/admin/sessions/recover'" in html
+
+
+def test_every_admin_commits_under_their_own_name(monkeypatch):
+    """Three admins share one OS user and one git config. Without per-account
+    identity, git log files all their work under the box owner."""
+    import app
+
+    monkeypatch.setattr(app, "TEAM_MODE", False)
+    monkeypatch.setattr(app, "GIT_OWNER_NAME", "Nimo")
+    monkeypatch.setattr(app, "GIT_OWNER_EMAIL", "nimo@lisa.my")
+    monkeypatch.setattr(app, "GIT_EMAIL_DOMAIN", "lisa.my")
+
+    owner = {"id": "admin", "username": "Nimo", "role": "admin",
+             "google_email": "nimrod.rotem@gmail.com"}
+    michiel = {"id": "u_61b301c4a914b160", "username": "Michiel", "role": "admin",
+               "google_email": "michielrauws@gmail.com"}
+    no_google = {"id": "u_deadbeef", "username": "Sam", "role": "admin"}
+
+    assert app._git_identity_for(owner, "Nimo") == ("Nimo", "nimo@lisa.my")
+    assert app._git_identity_for(michiel, "Nimo") == ("Michiel", "michielrauws@gmail.com")
+    assert app._git_identity_for(no_google, "Nimo") == ("Sam", "Sam@lisa.my")
+    # No account at all is still the box's own identity, not a synthesised one.
+    assert app._git_identity_for(None, "Nimo") == ("Nimo", "nimo@lisa.my")
+
+
+def test_browser_launcher_bootstrap_writes_the_file_it_sources(tmp_path, monkeypatch):
+    """browser-session.sh sources chrome-common.sh. Writing one without the
+    other is how every browser on a rebuilt box died on `CB_ROOT: unbound
+    variable` while browser_sessions.json still listed one per account."""
+    import app
+
+    launcher = tmp_path / "bin" / "browser-session.sh"
+    common = tmp_path / "bin" / "chrome-common.sh"
+    monkeypatch.setattr(app, "BROWSER_LAUNCHER", str(launcher))
+    monkeypatch.setattr(app, "CHROME_COMMON", str(common))
+
+    app._ensure_browser_launcher()
+
+    assert launcher.exists() and common.exists()
+    assert "chrome-common.sh" in launcher.read_text()
+    for fn in ("cb_chrome_env", "cb_chrome_flags", "CB_ROOT=", "CB_SCREEN_W="):
+        assert fn in common.read_text()
+    # Rewritten when it drifts, not just when it is missing.
+    common.write_text("stale\n")
+    app._ensure_browser_launcher()
+    assert "cb_chrome_flags" in common.read_text()
+
+
+def test_chrome_flags_skip_a_proxy_that_is_not_listening():
+    """Pointing Chrome at a dead proxy port fails every page load in that
+    browser, so the flag is conditional on the port answering."""
+    import app
+
+    script = app._CHROME_COMMON_SCRIPT
+
+    assert "cb_port_open" in script
+    assert 'if [ -n "$port" ] && cb_port_open "$port"; then' in script
+    assert "--user-data-dir=$profile" in script
+    assert "--remote-debugging-port=$cdp" in script

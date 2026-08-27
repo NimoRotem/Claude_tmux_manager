@@ -491,6 +491,16 @@ def _git_identity_for(user, owner_name: str):
     the owner/admin gets the box's real identity."""
     if TEAM_MODE and user and not _is_admin(user):
         return owner_name, "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN)
+    # A box can have several admins (claude.lisa.my and codex.lisa.my both run
+    # Nimo, Michiel and Monica, all role admin). They share one OS user and one
+    # git config, so without this every one of them commits as the box owner and
+    # `git log` cannot say who did the work. Only the owner account, id "admin",
+    # carries the box's identity; anyone else commits as themselves, preferring
+    # the address they sign in with.
+    if user and str(user.get("id") or "") != "admin":
+        name = str(user.get("username") or "").strip() or owner_name
+        email = str(user.get("google_email") or "").strip()
+        return name, email or "%s@%s" % (name, GIT_EMAIL_DOMAIN)
     return (GIT_OWNER_NAME or _git_config_value("user.name") or owner_name,
             GIT_OWNER_EMAIL or _git_config_value("user.email")
             or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
@@ -11596,24 +11606,102 @@ nice -n 5 dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
 '''
 
+# What the launcher sources. It carries the settings every browser on the box
+# shares, so a flag changed here reaches the default browser and each account's
+# at their next start.
+#
+# This used to be a hand-placed file, present only on the box someone first
+# wrote it on. A rebuilt box got the launcher above (which we write) with
+# nothing to source, so every browser died on "CB_ROOT: unbound variable" while
+# browser_sessions.json still listed a browser per account: configured, and
+# unstartable (lisa-claude, 2026-08-27). It is versioned here now, like the
+# launcher, and written the same way.
+_CHROME_COMMON_SCRIPT = r'''#!/usr/bin/env bash
+# Shared Chrome settings for every browser session on this box.
+# Written by the dashboard (app.py). Local edits are overwritten.
+CB_ROOT="${CB_ROOT:-$HOME/.claude-browser}"
+CB_BIN="${CB_BIN:-$CB_ROOT/bin}"
+CB_SCREEN_W="${CB_SCREEN_W:-1440}"
+CB_SCREEN_H="${CB_SCREEN_H:-900}"
+export CB_ROOT CB_BIN CB_SCREEN_W CB_SCREEN_H
+
+# Per-session runtime dirs. Chrome writes config and cache outside its profile
+# too; without these each browser scribbles into the box's own XDG dirs and two
+# accounts end up sharing state they are supposed to keep apart.
+cb_chrome_env() {   # <id>
+  export CB_SESSION_ID="$1"
+  export XDG_CONFIG_HOME="$CB_ROOT/sessions/$1/xdg"
+  export XDG_CACHE_HOME="$CB_ROOT/sessions/$1/cache"
+  mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+}
+
+cb_proxy_port() {   # <id> -> the relay port for this session, or nothing
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.path.expanduser("~/.claude-browser/proxy.json")))
+except Exception:
+    sys.exit(0)
+s = (d.get("sessions") or {}).get(sys.argv[1]) or {}
+if s.get("enabled") and s.get("local_port"):
+    print(int(s["local_port"]))
+PY
+}
+
+cb_port_open() {    # <port>
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null || return 1
+  exec 3>&-
+  return 0
+}
+
+# One flag per line: the launcher reads this with mapfile.
+cb_chrome_flags() { # <profile> <cdp> <id>
+  local profile="$1" cdp="$2" id="$3" port
+  cat <<FLAGS
+--user-data-dir=$profile
+--remote-debugging-port=$cdp
+--remote-debugging-address=127.0.0.1
+--no-first-run
+--no-default-browser-check
+--disable-session-crashed-bubble
+--disable-features=Translate,MediaRouter,AutofillServerCommunication
+--password-store=basic
+--window-position=0,0
+--window-size=${CB_SCREEN_W},${CB_SCREEN_H}
+--disable-dev-shm-usage
+FLAGS
+  # Sticky per-session exit IP, only when the relay is actually up: pointing
+  # Chrome at a proxy port nothing is listening on fails every page load in
+  # that browser, which is worse than sharing the box's own IP.
+  port="$(cb_proxy_port "$id")"
+  if [ -n "$port" ] && cb_port_open "$port"; then
+    printf -- '--proxy-server=http://127.0.0.1:%s\n' "$port"
+  fi
+}
+'''
+CHROME_COMMON = str(Path.home() / ".claude-browser" / "bin" / "chrome-common.sh")
+
 
 def _ensure_browser_launcher():
-    """Keep the on-disk launcher in sync with the copy above.
+    """Keep the on-disk launcher and the file it sources in sync with the copies
+    above.
 
     It used to be write-if-missing, which meant a launcher written before the
-    anti-fingerprinting work stayed frozen at the old flags forever — new
+    anti-fingerprinting work stayed frozen at the old flags forever: new
     browsers would still start with --no-sandbox/--disable-gpu and no proxy.
-    Rewrite whenever the content differs instead (it's ours; nothing else
-    edits it)."""
-    p = Path(BROWSER_LAUNCHER)
-    try:
-        if not p.exists() or p.read_text() != _BROWSER_LAUNCHER_SCRIPT:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(_BROWSER_LAUNCHER_SCRIPT)
-            p.chmod(0o755)
-            logger.info("Browser launcher script written to %s", p)
-    except Exception:
-        logger.debug("Failed to write browser launcher", exc_info=True)
+    Rewrite whenever the content differs instead (they're ours; nothing else
+    edits them)."""
+    for path, body in ((BROWSER_LAUNCHER, _BROWSER_LAUNCHER_SCRIPT),
+                       (CHROME_COMMON, _CHROME_COMMON_SCRIPT)):
+        p = Path(path)
+        try:
+            if not p.exists() or p.read_text() != body:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body)
+                p.chmod(0o755)
+                logger.info("Browser script written to %s", p)
+        except Exception:
+            logger.debug("Failed to write %s", path, exc_info=True)
 # The default session's ports are host-dependent: 5900/6080 is the convention,
 # but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
 # maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
@@ -11629,11 +11717,21 @@ def _ensure_browser_launcher():
 # CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
 # everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
 # only correct way in.
+#
+# `managed` says who starts the thing. It is False by default because on the
+# hosts this began on, display :99 belongs to a systemd unit (claude-vnc) that
+# owns the browser's whole lifecycle and the dashboard must not fight it. A box
+# built without such a unit has the opposite problem: the default browser is the
+# ADMIN's account browser (_browser_owner_id maps it to "admin"), so with nobody
+# managing it the owner is the one person on the box whose browser can never
+# start, while every other account's does (lisa-claude, 2026-08-27). Set
+# CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222, "managed": False,
+    "cdp_port": 9222,
+    "managed": os.environ.get("CB_DEFAULT_MANAGED", "") == "1",
     "external_url": os.environ.get("CB_DEFAULT_EXTERNAL_URL", ""),
 }
 
