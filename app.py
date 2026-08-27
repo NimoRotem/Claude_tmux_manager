@@ -4152,6 +4152,9 @@ def _seed_trust(cfg_dir: Path, cwd: str):
 # client to accept the one-time "Bypass Permissions" warning. A detached session
 # (no client) can't confirm it and claude exits, so members would otherwise hang.
 PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
+# Its throwaway tmux sessions are named with this prefix, and the auto-responder
+# leaves them alone: the script answers their menu itself.
+_PRIME_SESSION_PREFIX = "prime_"
 _PRIME_SCRIPT = r'''#!/usr/bin/env bash
 # Accept the one-time --dangerously-skip-permissions warning for a config dir.
 CFG="$1"
@@ -7521,12 +7524,25 @@ def _restore_durable_session(candidate: dict) -> dict:
         raise
 
 
+def _is_ephemeral_session(name: str) -> bool:
+    """True for tmux sessions that are scaffolding, not somebody's tab.
+
+    The dashboard drives short-lived sessions of its own: `_authsetup` for the
+    token flow, `prime_<pid>` for accepting the bypass warning in a new config
+    dir. They are created, used and killed in seconds. Durable recovery must not
+    adopt them: it recreates whatever it has a row for, so a checkpointed
+    scaffold session comes back from the dead every 20s after its owner killed
+    it (2026-08-27). The leading underscore is the existing internal-name
+    convention; prime_ is named by the primer script."""
+    return name.startswith("_") or name.startswith(_PRIME_SESSION_PREFIX)
+
+
 def _checkpoint_live_sessions() -> int:
     """Persist the owner, cwd, and exact Claude conversation for live tabs."""
     checkpointed = 0
     for session in get_tmux_sessions():
         name = str(session.get("name") or "")
-        if not name:
+        if not name or _is_ephemeral_session(name):
             continue
         owner_id = _session_owner_id(name)
         resume_uuid = _session_convo(name)
@@ -7586,6 +7602,7 @@ def _durable_session_candidates(live_names: set[str]) -> list[dict]:
         row = rows.get(name)
         if (
             name in live_names
+            or _is_ephemeral_session(name)
             or not isinstance(row, dict)
             or not row.get("managed")
             or str(row.get("desired_state") or "") != "running"
@@ -7764,11 +7781,17 @@ async def api_create_session(request: Request, body: CreateSession):
                 _boot.append(_profile_export_line(requested_profile))
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
-        # When authenticating via a shared API key, prime the config dir's one-time
-        # bypass-permissions acceptance BEFORE launching, or the detached session's
-        # claude would hit the warning with no attached client and exit. Runs once
-        # per config dir (marker-guarded); first session per user waits ~10-20s.
-        if _stored_anthropic_key:
+        # Prime the config dir's one-time bypass-permissions acceptance BEFORE
+        # launching, or the detached session's claude hits that warning with no
+        # attached client. Its highlighted default is "1. No, exit", so the
+        # auto-responder's Enter kills the pane and durable recovery respawns it
+        # into the same prompt forever: a member's very first session could never
+        # come up (lisa-claude, 2026-08-27). This used to run only when a shared
+        # API key was stored, which left every subscription-auth box exposed even
+        # though _prime_claude_config handles subscription creds perfectly well.
+        # Runs once per config dir (marker-guarded); the first session for an
+        # account waits ~10-20s. The admin's own ~/.claude is primed by daily use.
+        if _stored_anthropic_key or (user and not _is_admin(user)):
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session. Pin the default model
         # unless the chosen profile pins its own via its settings.json.
@@ -17821,6 +17844,31 @@ def _parse_menu_options(visible_text: str):
     return options, (selected if selected is not None else 0)
 
 
+# Menu labels, matched on the option text alone, for the LLM-free fallback.
+_MENU_PROCEED_RE = re.compile(
+    r"^(?:yes\b|y\b|accept|proceed|continue|approve|allow|run\b|ok\b|got it)", re.I)
+_MENU_STOP_RE = re.compile(
+    r"^(?:no\b|n\b|exit|quit|cancel|stop|abort|reject|deny|don'?t\b|never)", re.I)
+
+
+def _pick_menu_option_offline(options: list, selected_idx: int):
+    """Choose a menu option without the LLM. Returns an option NUMBER or None.
+
+    Only speaks up when pressing Enter would be actively wrong: the highlighted
+    default stops the agent and exactly one other option clearly proceeds. That
+    is the bypass-permissions warning to the letter, whose default is "1. No,
+    exit" and whose Enter therefore kills a freshly launched session. Anything
+    less clear-cut is left to the LLM or to a human, because guessing at a menu
+    is how an agent ends up answering a question nobody asked it."""
+    if len(options) < 2 or not (0 <= selected_idx < len(options)):
+        return None
+    if not _MENU_STOP_RE.match(options[selected_idx][1].strip()):
+        return None
+    proceeding = [num for i, (num, label) in enumerate(options)
+                  if i != selected_idx and _MENU_PROCEED_RE.match(label.strip())]
+    return proceeding[0] if len(proceeding) == 1 else None
+
+
 async def _llm_pick_menu_option(name: str, visible: str, options: list):
     """Ask the LLM which menu option best continues the work. Returns the chosen
     option NUMBER, or None to fall back to the default (Enter)."""
@@ -17877,6 +17925,13 @@ async def _auto_responder_loop():
                 # Auto-push "off" means never type anything into this terminal.
                 if _get_autopush_mode(name) == "off":
                     continue
+                # The priming sessions drive their own menu (prime_claude.sh
+                # walks to "Yes, I accept" itself). Two actors sending Down and
+                # Enter to one menu land on whichever option the race leaves
+                # highlighted, which is how priming a member's config dir kept
+                # exiting claude and never wrote its marker (2026-08-27).
+                if name.startswith(_PRIME_SESSION_PREFIX):
+                    continue
                 # Check cooldown
                 last = _auto_respond_cooldown.get(name, 0)
                 if now - last < _AUTO_RESPOND_COOLDOWN:
@@ -17909,6 +17964,11 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
+                    if target is None:
+                        # No LLM (no key, or the call failed): Enter would take
+                        # the highlighted option, and on some menus that is the
+                        # one that stops the agent dead.
+                        target = _pick_menu_option_offline(options, selected_idx)
                     if target is not None:
                         chosen = await _select_menu_option(name, options, selected_idx, target)
                     else:

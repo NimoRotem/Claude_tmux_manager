@@ -873,3 +873,80 @@ def test_chrome_flags_skip_a_proxy_that_is_not_listening():
     assert 'if [ -n "$port" ] && cb_port_open "$port"; then' in script
     assert "--user-data-dir=$profile" in script
     assert "--remote-debugging-port=$cdp" in script
+
+
+def test_offline_menu_pick_rescues_the_bypass_permissions_prompt():
+    """Claude's bypass-permissions warning highlights "No, exit". With no LLM to
+    ask, pressing Enter kills the session that was just launched."""
+    import app
+
+    options, selected = app._parse_menu_options(
+        "  WARNING: Claude Code running in Bypass Permissions mode\n"
+        "  ❯ 1. No, exit\n"
+        "    2. Yes, I accept\n"
+        "  Enter to confirm · Esc to cancel\n"
+    )
+
+    assert options == [(1, "No, exit"), (2, "Yes, I accept")]
+    assert selected == 0
+    assert app._pick_menu_option_offline(options, selected) == 2
+
+
+def test_offline_menu_pick_stays_out_of_every_other_menu():
+    """It only overrides Enter when the default stops the agent and exactly one
+    other option clearly proceeds. Guessing at anything else is worse than Enter."""
+    import app
+
+    # Default already proceeds: leave it alone.
+    assert app._pick_menu_option_offline([(1, "Yes, proceed"), (2, "No, exit")], 0) is None
+    # Two ways to proceed: ambiguous, that is the LLM's job.
+    assert app._pick_menu_option_offline(
+        [(1, "No, keep planning"), (2, "Yes, run it"), (3, "Accept edits")], 0) is None
+    # Nothing proceeds.
+    assert app._pick_menu_option_offline([(1, "No, exit"), (2, "Cancel")], 0) is None
+    # Not a menu.
+    assert app._pick_menu_option_offline([(1, "No, exit")], 0) is None
+    assert app._pick_menu_option_offline([], 0) is None
+
+
+def test_scaffold_sessions_are_never_adopted_by_durable_recovery(monkeypatch):
+    """The dashboard's own throwaway sessions (_authsetup, prime_<pid>) must not
+    be checkpointed or restored: recovery recreates whatever it has a row for,
+    so an adopted scaffold session comes back every 20s after it is killed."""
+    import app
+
+    registered: list[str] = []
+
+    class FakeLifecycle:
+        def get(self, _name):
+            return {}
+
+        def register_active(self, name, **kwargs):
+            registered.append(name)
+            return {"generation": "g", **kwargs}
+
+        def snapshot(self):
+            return {"sessions": {
+                "prime_4242": {"managed": True, "generation": "g1", "owner_id": "admin",
+                               "desired_state": "running", "restore_on_startup": True},
+                "_authsetup": {"managed": True, "generation": "g2", "owner_id": "admin",
+                               "desired_state": "running", "restore_on_startup": True},
+                "drafting": {"managed": True, "generation": "g3", "owner_id": "admin",
+                             "desired_state": "running", "restore_on_startup": True},
+            }}
+
+    monkeypatch.setattr(app, "SESSION_LIFECYCLE", FakeLifecycle())
+    monkeypatch.setattr(app, "get_tmux_sessions", lambda: [
+        {"name": "drafting", "cwd": "/srv/drafting"},
+        {"name": "prime_4242", "cwd": "/home/x"},
+        {"name": "_authsetup", "cwd": "/home/x"},
+    ])
+    monkeypatch.setattr(app, "_session_owner_id", lambda _name: "admin")
+    monkeypatch.setattr(app, "_session_convo", lambda _name: "12345678-1234-1234-1234-123456789abc")
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: True)
+
+    assert app._checkpoint_live_sessions() == 1
+    assert registered == ["drafting"]
+    assert [row["name"] for row in app._durable_session_candidates(set())] == ["drafting"]
+    assert app._is_ephemeral_session("prime_4242") and app._is_ephemeral_session("_authsetup")
+    assert not app._is_ephemeral_session("authsetup")

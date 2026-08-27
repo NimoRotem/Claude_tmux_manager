@@ -276,6 +276,17 @@ cg="$1"
 quota="$2"
 period="$3"
 shift 3
+# The cpu controller has to be delegated to the root's children before any
+# child cgroup HAS a cpu.max to write. systemd only enables it once some unit
+# asks for CPU accounting, so on a box where nothing has, subtree_control reads
+# "memory pids" and every run of this guard died on "cannot create cpu.max:
+# Permission denied" (lisa-claude, 2026-08-27). Enabling it is idempotent and
+# additive: it does not disturb the controllers already delegated.
+root=/sys/fs/cgroup
+case " $(cat "$root/cgroup.subtree_control" 2>/dev/null || true) " in
+    *" cpu "*) ;;
+    *) printf '+cpu\n' > "$root/cgroup.subtree_control" 2>/dev/null || true ;;
+esac
 mkdir -p "$cg"
 printf '%s %s\n' "$quota" "$period" > "$cg/cpu.max"
 for pid in "$@"; do
