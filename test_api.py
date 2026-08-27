@@ -1338,12 +1338,27 @@ class TestGoNutsModeToggle:
 
 
 class TestCreateSession:
+    @pytest.fixture(autouse=True)
+    def _isolate_lifecycle_state(self, monkeypatch, tmp_path):
+        import app
+        from runtime_control import SessionLifecycleStore
+
+        monkeypatch.setattr(
+            app,
+            "SESSION_LIFECYCLE",
+            SessionLifecycleStore(tmp_path / "session-lifecycle.json"),
+        )
+        monkeypatch.setattr(app, "TMUX_MUTATION_LOCK", tmp_path / "tmux-mutation.lock")
+
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run")
     def test_create_session_with_valid_name(self, mock_run, mock_sessions, authed_client):
         """POST /api/sessions/create with a valid name should return ok=True."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.side_effect = [[], [{"name": "my-session", "windows": "1", "created": "0", "attached": False}]]
+        def run_tmux(command, **_kwargs):
+            stdout = "$1\tmy-session\n" if command[:2] == ["tmux", "new-session"] else ""
+            return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+        mock_run.side_effect = run_tmux
         resp = authed_client.post("/api/sessions/create", json={"name": "my-session"})
         assert resp.status_code == 200
         data = resp.json()
@@ -1354,8 +1369,11 @@ class TestCreateSession:
     @patch("app.subprocess.run")
     def test_create_session_auto_name(self, mock_run, mock_sessions, authed_client):
         """POST /api/sessions/create with empty name should auto-name the session."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.return_value = [{"name": "auto-1", "windows": "1", "created": "0", "attached": False}]
+        def run_tmux(command, **_kwargs):
+            stdout = "$2\tauto-1\n" if command[:2] == ["tmux", "new-session"] else ""
+            return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+        mock_run.side_effect = run_tmux
         resp = authed_client.post("/api/sessions/create", json={"name": ""})
         assert resp.status_code == 200
         data = resp.json()
@@ -1422,6 +1440,18 @@ class TestCreateSession:
 
 
 class TestDeleteSession:
+    @pytest.fixture(autouse=True)
+    def _isolate_lifecycle_state(self, monkeypatch, tmp_path):
+        import app
+        from runtime_control import SessionLifecycleStore
+
+        monkeypatch.setattr(
+            app,
+            "SESSION_LIFECYCLE",
+            SessionLifecycleStore(tmp_path / "session-lifecycle.json"),
+        )
+        monkeypatch.setattr(app, "TMUX_MUTATION_LOCK", tmp_path / "tmux-mutation.lock")
+
     @patch("app.get_tmux_sessions", return_value=[])
     def test_delete_missing_session_returns_404(self, mock_sessions, authed_client):
         """DELETE on unknown session must return 404."""
@@ -1432,9 +1462,13 @@ class TestDeleteSession:
     @patch("app.subprocess.run")
     def test_delete_session_success(self, mock_run, mock_sessions, authed_client):
         """Successful session deletion should return ok=True and session name."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        def run_tmux(command, **_kwargs):
+            stdout = "$1\ttest-session\n" if command[:2] == ["tmux", "display-message"] else ""
+            return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+        mock_run.side_effect = run_tmux
         resp = authed_client.delete("/api/sessions/test-session")
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["ok"] is True
         assert data["killed"] == "test-session"
@@ -1495,6 +1529,8 @@ class TestDeleteSession:
         kill_ok = MagicMock(returncode=0, stdout="", stderr="")
 
         def run_side_effect(cmd, **kw):
+            if cmd[:2] == ["tmux", "display-message"]:
+                return MagicMock(returncode=0, stdout="$1\ttest-session\n", stderr="")
             if "pkill" in cmd:
                 raise OSError("no permission")
             if "list-panes" in cmd:
@@ -1503,7 +1539,7 @@ class TestDeleteSession:
 
         mock_run.side_effect = run_side_effect
         resp = authed_client.delete("/api/sessions/test-session")
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         assert resp.json()["ok"] is True
 
 
@@ -5005,4 +5041,3 @@ class TestWatchdogRestartMode:
             _app._away_mode_state.pop("restart-dead", None)
 
         assert state["enabled"] is False
-

@@ -4,6 +4,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+import fcntl
 import hashlib
 import hmac
 import json
@@ -28,6 +29,12 @@ import glob as globmod
 
 import browser_ladder
 import browser_resource_guard
+from runtime_control import (
+    LockedJsonStore,
+    SessionLifecycleStore,
+    build_pytest_gate_env_prefix,
+    scoped_agent_command,
+)
 
 logger = logging.getLogger("tmux-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -46,6 +53,42 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
+PYTEST_PLUGIN_DIR = Path(
+    os.environ.get(
+        "TMUX_DASH_PYTEST_PLUGIN_DIR",
+        "/usr/local/libexec/builder4-python-hooks",
+    )
+)
+AGENT_SLICE_NAME = os.environ.get(
+    "TMUX_DASH_AGENT_SLICE",
+    "builder4-agents.slice",
+)
+AGENT_MEMORY_HIGH_MB = int(os.environ.get("TMUX_DASH_AGENT_MEMORY_HIGH_MB", "6144"))
+AGENT_MEMORY_MAX_MB = int(os.environ.get("TMUX_DASH_AGENT_MEMORY_MAX_MB", "8192"))
+AGENT_AGGREGATE_CPU_PERCENT = int(
+    os.environ.get("TMUX_DASH_AGENT_AGGREGATE_CPU_PERCENT", "400")
+)
+AGENT_AGGREGATE_MEMORY_HIGH_PERCENT = int(
+    os.environ.get("TMUX_DASH_AGENT_AGGREGATE_MEMORY_HIGH_PERCENT", "55")
+)
+AGENT_AGGREGATE_MEMORY_MAX_PERCENT = int(
+    os.environ.get("TMUX_DASH_AGENT_AGGREGATE_MEMORY_MAX_PERCENT", "70")
+)
+
+
+def _managed_agent_command(session_name: str, command: str) -> str:
+    """Apply builder4-only test and resource controls to one Claude launch."""
+    pytest_env = build_pytest_gate_env_prefix(PYTEST_PLUGIN_DIR, account="builder4")
+    return scoped_agent_command(
+        session_name,
+        f"{pytest_env} {command.strip()}",
+        memory_high_mb=AGENT_MEMORY_HIGH_MB,
+        memory_max_mb=AGENT_MEMORY_MAX_MB,
+        slice_name=AGENT_SLICE_NAME,
+        aggregate_cpu_quota_percent=AGENT_AGGREGATE_CPU_PERCENT,
+        aggregate_memory_high_percent=AGENT_AGGREGATE_MEMORY_HIGH_PERCENT,
+        aggregate_memory_max_percent=AGENT_AGGREGATE_MEMORY_MAX_PERCENT,
+    )
 
 # Default model for dashboard-launched sessions. Passed as an explicit `--model`
 # flag at launch so the default can't drift when Claude Code persists a /model
@@ -463,7 +506,175 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 # --- Claude Code API key storage ---
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
+SESSION_LIFECYCLE = SessionLifecycleStore(MESSAGES_DIR / "session-lifecycle.json")
+SESSION_TAB_LABELS = LockedJsonStore(
+    MESSAGES_DIR / "session-tab-labels.json",
+    lambda: {"version": 1, "sessions": {}},
+)
+TMUX_MUTATION_LOCK = MESSAGES_DIR / "tmux-mutation.lock"
 _stored_anthropic_key: str = ""
+
+_TAB_LABEL_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
+_TAB_LABEL_ACTIONS = frozenset(
+    {
+        "add", "build", "check", "create", "debug", "design", "diagnose",
+        "fix", "implement", "improve", "merge", "refactor", "remove",
+        "repair", "review", "test", "update", "write",
+    }
+)
+_TAB_LABEL_STOP_WORDS = frozenset(
+    {
+        "a", "about", "all", "an", "and", "at", "be", "by", "can", "code",
+        "do", "for", "from", "here", "how", "i", "in", "into", "is", "it",
+        "just", "me", "my", "new", "now", "of", "on", "or", "please", "the",
+        "this", "to", "up", "we", "what", "with", "you", "your",
+    }
+)
+_TAB_LABEL_CONTINUATIONS = frozenset(
+    {
+        "continue", "do it", "go ahead", "implement it", "ok", "okay",
+        "proceed", "sounds good", "start", "yes", "yep",
+    }
+)
+_TAB_LABEL_ACRONYMS = {
+    "ai": "AI", "api": "API", "css": "CSS", "dns": "DNS", "html": "HTML",
+    "js": "JS", "json": "JSON", "oauth": "OAuth", "ssh": "SSH",
+    "tmux": "tmux", "ui": "UI", "url": "URL", "ux": "UX",
+}
+
+
+def _tab_label_word(word: str) -> str:
+    normalized = str(word or "")[:24]
+    lower = normalized.lower()
+    if lower in _TAB_LABEL_ACRONYMS:
+        return _TAB_LABEL_ACRONYMS[lower]
+    if normalized.isupper() and len(normalized) <= 8:
+        return normalized
+    return normalized.capitalize()
+
+
+def _normalize_two_word_tab_label(value: str, fallback: str = "Active Task") -> str:
+    words = _TAB_LABEL_WORD_RE.findall(str(value or ""))[:2]
+    if not words:
+        words = _TAB_LABEL_WORD_RE.findall(fallback)[:2] or ["Active", "Task"]
+    if len(words) == 1:
+        words.append("Task")
+    return " ".join(_tab_label_word(word) for word in words[:2])
+
+
+def _fallback_two_word_tab_label(prompt: str) -> str:
+    text = re.sub(r"https?://\S+", " ", str(prompt or ""))
+    tokens = _TAB_LABEL_WORD_RE.findall(text)
+    content = []
+    seen = set()
+    for token in tokens:
+        lower = token.lower()
+        if (
+            lower in _TAB_LABEL_STOP_WORDS
+            or lower in _TAB_LABEL_ACTIONS
+            or lower in seen
+            or (len(token) < 2 and not token.isupper())
+        ):
+            continue
+        seen.add(lower)
+        content.append(token)
+        if len(content) == 2:
+            break
+    return _normalize_two_word_tab_label(" ".join(content), "Active Task")
+
+
+def _session_tab_label_rows() -> dict[str, dict]:
+    rows = SESSION_TAB_LABELS.read().get("sessions", {})
+    return {
+        str(name): dict(row)
+        for name, row in rows.items()
+        if isinstance(row, dict)
+    }
+
+
+def _session_tab_label(session_name: str, rows: dict | None = None) -> str:
+    rows = rows if rows is not None else _session_tab_label_rows()
+    label = str((rows.get(session_name) or {}).get("label") or "")
+    return _normalize_two_word_tab_label(label) if label else ""
+
+
+def _set_session_tab_label(session_name: str, owner_id: str, prompt: str) -> str:
+    """Persist a free, deterministic two-word label for one session."""
+    normalized_prompt = " ".join(_TAB_LABEL_WORD_RE.findall(str(prompt or ""))).casefold()
+
+    def mutate(data: dict) -> str:
+        data["version"] = 1
+        rows = data.setdefault("sessions", {})
+        previous = rows.get(session_name)
+        row = dict(previous) if isinstance(previous, dict) else {}
+        if normalized_prompt in _TAB_LABEL_CONTINUATIONS and row.get("label"):
+            return str(row["label"])
+        label = _fallback_two_word_tab_label(prompt)
+        used = {
+            str(other.get("label") or "").casefold()
+            for other_name, other in rows.items()
+            if other_name != session_name
+            and isinstance(other, dict)
+            and str(other.get("owner_id") or "") == owner_id
+        }
+        if label.casefold() in used:
+            first, second = label.split(" ", 1)
+            for suffix in range(2, 100):
+                candidate = f"{first} {second[:20]}-{suffix}"
+                if candidate.casefold() not in used:
+                    label = candidate
+                    break
+        row.update(
+            {
+                "owner_id": str(owner_id or "admin")[:256],
+                "label": label,
+                "updated_at": time.time(),
+            }
+        )
+        rows[session_name] = row
+        return label
+
+    _data, label = SESSION_TAB_LABELS.update(mutate)
+    return label
+
+
+def _remove_session_tab_label(session_name: str) -> None:
+    def mutate(data: dict) -> None:
+        data.setdefault("sessions", {}).pop(session_name, None)
+
+    SESSION_TAB_LABELS.update(mutate)
+
+
+def _acquire_tmux_mutation_fd(timeout: float = 45.0) -> int:
+    """Take the cross-process fence used by every tmux create/delete/recover."""
+    TMUX_MUTATION_LOCK.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(TMUX_MUTATION_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise TimeoutError("timed out waiting for tmux mutation lock") from None
+            time.sleep(0.01)
+
+
+def _release_tmux_mutation_fd(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@asynccontextmanager
+async def _async_tmux_mutation_lock(timeout: float = 45.0):
+    fd = await asyncio.to_thread(_acquire_tmux_mutation_fd, timeout)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(_release_tmux_mutation_fd, fd)
 
 
 # --- Backup-before-write -----------------------------------------------------
@@ -645,7 +856,10 @@ def _relaunch_line(session_name: str, claude_cmd: str) -> str:
     known failure where /exit didn't take and send-keys lands in Claude's input
     box instead of a shell prompt. Flags are taken as given: unlike a fresh
     session this must not add its own --model/--effort."""
-    lines = [_claude_launch_env_prefix().strip().rstrip(";"), claude_cmd]
+    lines = [
+        _claude_launch_env_prefix().strip().rstrip(";"),
+        _managed_agent_command(session_name, claude_cmd),
+    ]
     banner = _launch_banner(session_name, _session_owner_name(session_name),
                             _flag_value(claude_cmd, "model"),
                             _flag_value(claude_cmd, "effort"))
@@ -999,6 +1213,16 @@ async def lifespan(_app: FastAPI):
             logger.info("Team mode: shared git config applied")
         except Exception:
             logger.debug("shared git config setup failed", exc_info=True)
+    try:
+        durable_report = await _reconcile_durable_sessions()
+        logger.info(
+            "Durable sessions ready: %d healthy, %d restored, %d failed",
+            durable_report.get("healthy", 0),
+            len(durable_report.get("restored", [])),
+            len(durable_report.get("failed", [])),
+        )
+    except Exception:
+        logger.exception("Initial durable session reconciliation failed")
     sessions = get_tmux_sessions()
     logger.info("Found %d existing tmux sessions", len(sessions))
     # Auto-responder: presses Enter ONLY when the visible pane shows a
@@ -1045,6 +1269,10 @@ async def lifespan(_app: FastAPI):
     crash_recovery_task = asyncio.create_task(_crash_recovery_loop())
     _background_tasks.append(crash_recovery_task)
     logger.info("Crash-recovery watchdog started")
+
+    durable_recovery_task = asyncio.create_task(_durable_session_recovery_loop())
+    _background_tasks.append(durable_recovery_task)
+    logger.info("Durable session recovery started")
 
     model_refresh_task = asyncio.create_task(_model_refresh_loop())
     _background_tasks.append(model_refresh_task)
@@ -6763,11 +6991,17 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
     return {"sig": sig, "summary": summary or _trim_plain(full, 600), "full": full, "links": links}
 
 
-def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
+def build_session_response(
+    sess: dict,
+    data: dict,
+    activity: dict = None,
+    tab_labels: dict | None = None,
+) -> dict:
     if activity is None:
         activity = detect_activity(sess["name"])
     return {
         "name": sess["name"],
+        "tab_label": _session_tab_label(sess["name"], tab_labels),
         "windows": sess["windows"],
         "attached": sess["attached"],
         "cwd": sess.get("cwd", ""),     # the project this session belongs to
@@ -6812,8 +7046,9 @@ async def api_sessions(request: Request):
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
     )
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
     return JSONResponse([
-        build_session_response(sess, data, activity=act)
+        build_session_response(sess, data, activity=act, tab_labels=tab_labels)
         for sess, data, act in zip(sessions, results, activities)
     ])
 
@@ -6828,6 +7063,7 @@ async def api_sessions_fast(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
     _owners_map = _load_session_owners()
     _uid_to_name = {u["id"]: u.get("username", "") for u in _load_users()}
     for sess, activity in zip(sessions, activities):
@@ -6839,6 +7075,7 @@ async def api_sessions_fast(request: Request):
         cache[sess["name"]] = entry
         out.append({
             "name": sess["name"],
+            "tab_label": _session_tab_label(sess["name"], tab_labels),
             "windows": sess["windows"],
             "attached": sess["attached"],
             # The working directory IS the project: it selects the CLAUDE.md,
@@ -6901,9 +7138,11 @@ async def api_status(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
     for sess, activity in zip(sessions, activities):
         out.append({
             "name": sess["name"],
+            "tab_label": _session_tab_label(sess["name"], tab_labels),
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
@@ -6912,6 +7151,20 @@ async def api_status(request: Request):
             **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
+
+
+@app.get("/api/tab-labels")
+async def api_tab_labels(request: Request):
+    """Return only labels visible to the current dashboard account."""
+    user = _current_user(request)
+    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
+    rows = await asyncio.to_thread(_session_tab_label_rows)
+    return JSONResponse(
+        [
+            {"name": session["name"], "tab_label": _session_tab_label(session["name"], rows)}
+            for session in sessions
+        ]
+    )
 
 
 @app.get("/api/sessions/{session_name}/raw")
@@ -7017,6 +7270,298 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     })
 
 
+def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]:
+    """Create one tmux session and return the immutable id printed by tmux."""
+    command = [
+        "tmux",
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}\t#{session_name}",
+    ]
+    if name:
+        command += ["-s", name]
+    if cwd:
+        command += ["-c", cwd]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Failed to create session")
+    created_id, separator, created_name = result.stdout.strip().partition("\t")
+    if (
+        not separator
+        or not re.fullmatch(r"\$\d+", created_id)
+        or not re.fullmatch(r"[a-zA-Z0-9_-]+", created_name)
+        or (name and created_name != name)
+    ):
+        raise RuntimeError("tmux returned an invalid session identity")
+    return created_id, created_name
+
+
+def _exact_tmux_session_id(session_name: str) -> str:
+    """Resolve a name once, then require tmux to report that same exact name."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            session_name,
+            "-p",
+            "#{session_id}\t#{session_name}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Session not found")
+    session_id, separator, reported_name = result.stdout.strip().partition("\t")
+    if (
+        not separator
+        or not re.fullmatch(r"\$\d+", session_id)
+        or reported_name != session_name
+    ):
+        raise RuntimeError("tmux session identity changed")
+    return session_id
+
+
+def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
+    """Build a managed Claude command bound to one exact conversation."""
+    if not _UUID_RE.fullmatch(str(resume_uuid or "")):
+        raise ValueError("invalid Claude resume UUID")
+    command, _model, _effort = _claude_cmd_with_flags(
+        NEW_SESSION_CMD or "claude --dangerously-skip-permissions",
+    )
+    command = re.sub(
+        r"\s+--(?:session-id|resume)\s+(?:'[^']*'|\"[^\"]*\"|\S+)",
+        "",
+        command,
+    )
+    command = re.sub(r"\s+--continue\b", "", command)
+    command = command.strip() + " --resume " + resume_uuid
+    return _managed_agent_command(session_name, command)
+
+
+def _restore_durable_session(candidate: dict) -> dict:
+    """Recreate one missing tmux shell from an owner-bound lifecycle row."""
+    name = str(candidate.get("name") or "")
+    generation = str(candidate.get("generation") or "")
+    owner_id = str(candidate.get("owner_id") or "")
+    cwd_text = str(candidate.get("cwd") or "")
+    resume_uuid = str(candidate.get("resume_uuid") or "")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise ValueError("invalid durable session name")
+    if not generation or not owner_id:
+        raise ValueError("durable session binding is incomplete")
+    if not _UUID_RE.fullmatch(resume_uuid):
+        raise ValueError("durable session has no exact Claude conversation")
+    try:
+        cwd = Path(cwd_text).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("durable session directory is unavailable") from None
+    if not cwd.is_dir():
+        raise ValueError("durable session directory is unavailable")
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        raise ValueError("durable session owner no longer exists")
+    if _session_owner_id(name) != owner_id:
+        raise ValueError("durable session owner binding changed")
+    if not SESSION_LIFECYCLE.matches(
+        name,
+        generation=generation,
+        owner_id=owner_id,
+        desired_states={"running"},
+        resume_uuid=resume_uuid,
+        restore_on_startup=True,
+    ):
+        return {"name": name, "status": "stale"}
+
+    created_id = ""
+    try:
+        created_id, created_name = _create_exact_tmux_session(name, str(cwd))
+        if created_name != name or not SESSION_LIFECYCLE.matches(
+            name,
+            generation=generation,
+            owner_id=owner_id,
+            desired_states={"running"},
+            resume_uuid=resume_uuid,
+            restore_on_startup=True,
+        ):
+            raise RuntimeError("session lifecycle changed during recovery")
+        _set_session_owner(name, owner_id)
+        _set_session_convo(name, resume_uuid)
+
+        owner_name = str(owner.get("username") or AUTH_USER or "admin")
+        git_name, git_email = _git_identity_for(owner, owner_name)
+        boot = [
+            "export DASH_USER=%s DASH_SESSION=%s"
+            % (shlex.quote(owner_name), shlex.quote(name)),
+            "export GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s "
+            "GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s"
+            % (
+                shlex.quote(git_name),
+                shlex.quote(git_email),
+                shlex.quote(git_name),
+                shlex.quote(git_email),
+            ),
+        ]
+        if PUBLIC_BASE_URL or TEAM_MODE:
+            boot.append(
+                "export DASH_PROJECT_DIR=%s DASH_PROJECT_URL=%s"
+                % (
+                    shlex.quote(str(PROJECTS_ROOT / owner_name / name)),
+                    shlex.quote("%s/%s/%s" % (PUB_URL, owner_name, name)),
+                )
+            )
+        if not _is_admin(owner):
+            _ensure_user_claude_config_dir(owner)
+            _apply_member_auth(_user_claude_config_dir(owner))
+            boot.append(
+                "export CLAUDE_CONFIG_DIR=%s"
+                % shlex.quote(str(_user_claude_config_dir(owner)))
+            )
+        elif (profile_id := _get_session_profile_id(name)) != DEFAULT_PROFILE_ID:
+            boot.append(_profile_export_line(profile_id))
+        boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
+        boot.append(_claude_recovery_command(name, resume_uuid))
+        launch = _launch_script_line(
+            name,
+            boot,
+            _launch_banner(name, owner_name, DEFAULT_MODEL, DEFAULT_EFFORT),
+        )
+        for command in (
+            ["tmux", "send-keys", "-t", created_id, "-l", launch],
+            ["tmux", "send-keys", "-t", created_id, "Enter"],
+        ):
+            sent = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if sent.returncode != 0:
+                raise RuntimeError(sent.stderr.strip() or "Failed to restore Claude")
+        SESSION_LIFECYCLE.checkpoint_active(
+            name,
+            cwd=_session_cwd(created_id) or str(cwd),
+            owner_id=owner_id,
+            resume_uuid=resume_uuid,
+            source="durable-recovery",
+            expected_generation=generation,
+        )
+        return {"name": name, "status": "restored", "tmux_id": created_id}
+    except Exception:
+        if created_id:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", created_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                logger.exception("Failed to roll back recovered tmux session %s", created_id)
+        raise
+
+
+def _checkpoint_live_sessions() -> int:
+    """Persist the owner, cwd, and exact Claude conversation for live tabs."""
+    checkpointed = 0
+    for session in get_tmux_sessions():
+        name = str(session.get("name") or "")
+        if not name:
+            continue
+        owner_id = _session_owner_id(name)
+        resume_uuid = _session_convo(name)
+        if not resume_uuid:
+            try:
+                resume_uuid = _learn_session_convo(name)
+            except Exception:
+                logger.debug("Could not learn conversation for '%s'", name, exc_info=True)
+        cwd = str(session.get("cwd") or _session_cwd(name))
+        try:
+            row = SESSION_LIFECYCLE.get(name)
+            if row:
+                SESSION_LIFECYCLE.checkpoint_active(
+                    name,
+                    cwd=cwd,
+                    owner_id=owner_id,
+                    resume_uuid=resume_uuid,
+                    source="live-checkpoint",
+                    expected_generation=str(row.get("generation") or ""),
+                )
+            else:
+                SESSION_LIFECYCLE.register_active(
+                    name,
+                    cwd=cwd,
+                    owner_id=owner_id,
+                    resume_uuid=resume_uuid,
+                    source="live-checkpoint",
+                )
+            checkpointed += 1
+        except Exception:
+            logger.exception("Failed to checkpoint live session '%s'", name)
+    return checkpointed
+
+
+def _durable_session_candidates(live_names: set[str]) -> list[dict]:
+    """Return only missing generations whose persisted intent is still running."""
+    rows = SESSION_LIFECYCLE.snapshot().get("sessions", {})
+    candidates = []
+    for name in sorted(rows):
+        row = rows.get(name)
+        if (
+            name in live_names
+            or not isinstance(row, dict)
+            or not row.get("managed")
+            or str(row.get("desired_state") or "") != "running"
+            or not row.get("restore_on_startup")
+        ):
+            continue
+        candidates.append({"name": name, **row})
+    return candidates
+
+
+def _reconcile_durable_sessions_locked() -> dict:
+    """Checkpoint live tabs and recreate each missing durable generation once."""
+    checkpointed = _checkpoint_live_sessions()
+    live_names = {str(row.get("name") or "") for row in get_tmux_sessions()}
+    restored = []
+    failed = []
+    for candidate in _durable_session_candidates(live_names):
+        name = str(candidate.get("name") or "")
+        try:
+            result = _restore_durable_session(candidate)
+            if result.get("status") == "restored":
+                restored.append(name)
+                live_names.add(name)
+        except Exception as exc:
+            logger.error("Durable recovery failed for '%s': %s", name, exc)
+            failed.append({"name": name, "error": str(exc)})
+    return {
+        "checkpointed": checkpointed,
+        "healthy": len(live_names),
+        "restored": restored,
+        "failed": failed,
+    }
+
+
+async def _reconcile_durable_sessions() -> dict:
+    async with _async_tmux_mutation_lock():
+        return await asyncio.to_thread(_reconcile_durable_sessions_locked)
+
+
+async def _durable_session_recovery_loop() -> None:
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await _reconcile_durable_sessions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Durable session reconciliation failed")
+
+
 class CreateSession(BaseModel):
     name: str = ""
     profile_id: str = ""
@@ -7053,23 +7598,28 @@ async def api_create_session(request: Request, body: CreateSession):
             return JSONResponse({"error": "Not a known project directory."}, status_code=400)
         start_cwd = str(cand)
     try:
-        cmd = ["tmux", "new-session", "-d"]
-        if name:
-            cmd += ["-s", name]
-        if start_cwd:
-            cmd += ["-c", start_cwd]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
-        # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
+        mutation_fd = await asyncio.to_thread(_acquire_tmux_mutation_fd, 45.0)
+    except TimeoutError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    created_id = ""
+    lifecycle_generation = ""
+    try:
+        # Repeat the name check inside the cross-process mutation fence. Two API
+        # requests can both pass the earlier friendly validation before either
+        # reaches tmux.
+        if name and any(session["name"] == name for session in get_tmux_sessions()):
+            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+        created_id, created = _create_exact_tmux_session(name, start_cwd)
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
+        lifecycle = SESSION_LIFECYCLE.register_active(
+            created,
+            cwd=start_cwd or _session_cwd(created_id),
+            owner_id=owner_id,
+            resume_uuid="",
+        )
+        lifecycle_generation = str(lifecycle.get("generation") or "")
         # Everything below is COLLECTED, not typed. It used to go into the pane as
         # three or four send-keys lines, which is what made a fresh session open on
         # a screenful of exports; it is written to a boot script and sourced in one
@@ -7169,19 +7719,56 @@ async def api_create_session(request: Request, body: CreateSession):
                 _set_session_convo(created, _convo)
             _banner = _launch_banner(created, _owner_name, _model, _effort)
             _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
-            _boot.append(_cmd_line)
+            _boot.append(_managed_agent_command(created, _cmd_line))
         # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
         _line = _launch_script_line(created, _boot, _banner)
         if _line:
-            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _line],
-                           capture_output=True, text=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"],
-                           capture_output=True, text=True, timeout=5)
+            for command in (
+                ["tmux", "send-keys", "-t", created_id, "-l", _line],
+                ["tmux", "send-keys", "-t", created_id, "Enter"],
+            ):
+                sent = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if sent.returncode != 0:
+                    raise RuntimeError(sent.stderr.strip() or "Failed to start Claude")
+        SESSION_LIFECYCLE.checkpoint_active(
+            created,
+            cwd=start_cwd or _session_cwd(created_id),
+            owner_id=owner_id,
+            resume_uuid=_session_convo(created),
+            source="session-create-ready",
+            expected_generation=lifecycle_generation,
+        )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
     except Exception as e:
         logger.error("Failed to create session '%s': %s", name, e)
+        if created_id:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", created_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                logger.exception("Failed to roll back tmux session %s", created_id)
+        if lifecycle_generation:
+            SESSION_LIFECYCLE.remove(
+                created,
+                expected_generation=lifecycle_generation,
+                owner_id=owner_id,
+            )
+        if created_id:
+            _clear_session_owner(created)
+            _clear_session_convo(created)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        await asyncio.to_thread(_release_tmux_mutation_fd, mutation_fd)
 
 
 @app.delete("/api/sessions/{session_name}")
@@ -7192,13 +7779,47 @@ async def api_delete_session(request: Request, session_name: str):
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
+        mutation_fd = await asyncio.to_thread(_acquire_tmux_mutation_fd, 45.0)
+    except TimeoutError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    transitioned = False
+    killed = False
+    lifecycle_generation = ""
+    lifecycle_owner = ""
+    try:
+        # Re-resolve access and capture the immutable tmux id while holding the
+        # same fence used by create and recovery. A recycled name must never let
+        # an older delete request kill a newer session.
+        _, sess = _find_session_for_user(session_name, user)
+        if not sess:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        exact_id = _exact_tmux_session_id(session_name)
+        lifecycle_owner = _session_owner_id(session_name)
+        lifecycle = SESSION_LIFECYCLE.get(session_name)
+        if not lifecycle:
+            lifecycle = SESSION_LIFECYCLE.register_active(
+                session_name,
+                cwd=str(sess.get("cwd") or _session_cwd(exact_id)),
+                owner_id=lifecycle_owner,
+                resume_uuid=_session_convo(session_name),
+                source="delete-adopt",
+            )
+        lifecycle_generation = str(lifecycle.get("generation") or "")
+        SESSION_LIFECYCLE.begin_transition(
+            session_name,
+            owner_id=lifecycle_owner,
+            desired_state="deleting",
+            expected_generation=lifecycle_generation,
+            expected_desired_states={"running"},
+        )
+        transitioned = True
         # First, find and kill all processes in the session's panes.
         # This ensures Claude Code (node) processes are terminated cleanly
         # before the tmux session is destroyed.
         try:
             # Get all pane PIDs in this session
             pane_result = subprocess.run(
-                ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+                ["tmux", "list-panes", "-t", exact_id, "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5
             )
             if pane_result.returncode == 0:
@@ -7216,12 +7837,21 @@ async def api_delete_session(request: Request, session_name: str):
         except Exception:
             logger.debug("Process cleanup failed for session '%s' — kill-session will still clean up", session_name, exc_info=True)
 
+        if _exact_tmux_session_id(session_name) != exact_id or not SESSION_LIFECYCLE.matches(
+            session_name,
+            generation=lifecycle_generation,
+            owner_id=lifecycle_owner,
+            desired_states={"deleting"},
+            restore_on_startup=False,
+        ):
+            raise RuntimeError("session identity changed during delete")
         result = subprocess.run(
-            ["tmux", "kill-session", "-t", session_name],
+            ["tmux", "kill-session", "-t", exact_id],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
+            raise RuntimeError(result.stderr.strip() or "Failed to kill session")
+        killed = True
         # Clean up all per-session state from global dicts
         cache.pop(session_name, None)
         _auto_approve_sent.pop(session_name, None)
@@ -7256,10 +7886,44 @@ async def api_delete_session(request: Request, session_name: str):
         # A new session that reuses this name must not inherit the dead one's
         # conversation — that is the same mix-up by another route.
         _clear_session_convo(session_name)
+        _remove_session_tab_label(session_name)
+        SESSION_LIFECYCLE.remove(
+            session_name,
+            expected_generation=lifecycle_generation,
+            owner_id=lifecycle_owner,
+        )
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
+        if transitioned and not killed:
+            try:
+                SESSION_LIFECYCLE.checkpoint_active(
+                    session_name,
+                    cwd=str((sess or {}).get("cwd") or _session_cwd(session_name)),
+                    owner_id=lifecycle_owner,
+                    resume_uuid=_session_convo(session_name),
+                    source="delete-rollback",
+                    expected_generation=lifecycle_generation,
+                )
+            except Exception:
+                logger.exception("Failed to roll back lifecycle for '%s'", session_name)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        await asyncio.to_thread(_release_tmux_mutation_fd, mutation_fd)
+
+
+@app.post("/api/admin/sessions/recover")
+async def api_admin_recover_sessions(request: Request):
+    """Checkpoint healthy tabs and restore missing durable Claude sessions."""
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    try:
+        return JSONResponse(await _reconcile_durable_sessions())
+    except TimeoutError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except Exception as exc:
+        logger.exception("Manual durable recovery failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 def get_session_cwd(session_name: str) -> str:
@@ -16561,6 +17225,15 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
         except Exception:
             logger.exception(
                 "Failed to append prompt audit for session '%s'", session_name)
+        try:
+            await asyncio.to_thread(
+                _set_session_tab_label,
+                session_name,
+                _session_owner_id(session_name),
+                body.command,
+            )
+        except Exception:
+            logger.exception("Failed to update tab label for session '%s'", session_name)
         return JSONResponse({"ok": True, "sent": cmd_text,
                              "attached": [i.get("path") for i in pending]})
     except Exception as e:
@@ -18105,7 +18778,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
 .nav-dot.busy{width:10px;height:10px;background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #f8514988}
 .nav-dot.idle{background:#3fb950}
+.nav-dot.idle.completed-unread{width:10px;height:10px;animation:completed-pulse 1.2s ease-in-out infinite;box-shadow:0 0 7px #3fb950aa}
 .nav-dot.unknown{background:#d2a8ff}
+@keyframes completed-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.72)}}
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
@@ -18304,6 +18979,15 @@ body.member-admin .more-member-only{display:none}
 .cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:44px;max-height:400px;line-height:1.4;overflow-y:auto}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
+.composer-attachments{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;flex-shrink:0}
+.composer-attachments.has-files{display:flex}
+.composer-attachment{display:flex;align-items:center;gap:8px;max-width:100%;padding:5px 7px 5px 5px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9}
+.composer-attachment-preview{width:48px;height:48px;flex:0 0 48px;object-fit:cover;border-radius:4px;background:#21262d}
+.composer-attachment-meta{min-width:0;max-width:260px}
+.composer-attachment-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.composer-attachment-status{margin-top:2px;color:#8b949e;font-size:.65rem}
+.composer-attachment-remove{flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #30363d;border-radius:50%;background:#21262d;color:#8b949e;cursor:pointer;font-size:.8rem;line-height:1}
+.composer-attachment-remove:hover{background:#da3633;border-color:#da3633;color:#fff}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
 .cmd-send:hover{background:#30363d}
@@ -18501,16 +19185,19 @@ body.member-admin .more-member-only{display:none}
 .watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
 .watchdog-log-entry .watchdog-ts{color:#56d364}
 /* Auto-push 3-way segmented control (off / basic / full) */
-.autopush-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
-.autopush-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
-.autopush-seg button:last-child{border-right:none}
-.autopush-seg button:hover{background:#161b22;color:#c9d1d9}
-.autopush-seg button.active{color:#fff;font-weight:600}
+.autopush-seg,.idle-nudge-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
+.autopush-seg button,.idle-nudge-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
+.autopush-seg button:last-child,.idle-nudge-seg button:last-child{border-right:none}
+.autopush-seg button:hover,.idle-nudge-seg button:hover{background:#161b22;color:#c9d1d9}
+.autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
 .autopush-seg button.ap-full.active{background:#238636}
-.tab-more-menu .autopush-seg{margin:2px 16px 4px}
-.tab-more-menu .autopush-seg button{padding:4px 11px;font-size:.72rem}
+.idle-nudge-seg button.in-off.active{background:#484f58}
+.idle-nudge-seg button.in-light.active{background:#1f6feb}
+.idle-nudge-seg button.in-adhd.active{background:#da3633}
+.tab-more-menu .autopush-seg,.tab-more-menu .idle-nudge-seg{margin:2px 16px 4px}
+.tab-more-menu .autopush-seg button,.tab-more-menu .idle-nudge-seg button{padding:4px 11px;font-size:.72rem}
 
 /* Footer */
 .detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
@@ -19279,6 +19966,7 @@ body.member-simple .hide-in-simple{display:none!important}
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
+      <div class="nav-tools-item nav-tools-admin" onclick="recoverSessions();closeToolsMenu()"><span class="icon">&#x21BB;</span> Recover sessions</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x2699;</span> Claude Config</div>
       <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
       <div class="nav-tools-divider"></div>
@@ -19444,6 +20132,39 @@ let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
 const activeTabs={};
+let _applyingSessionRoute=false;
+
+function _sessionRouteHash(name,tab){
+  return '#/session/'+encodeURIComponent(name)+'/'+encodeURIComponent(tab||'raw');
+}
+function _sessionRoute(){
+  const match=(location.hash||'').match(/^#\/session\/([^/]+)\/(raw|chat|skills|info)$/);
+  if(!match)return null;
+  try{return{name:decodeURIComponent(match[1]),tab:decodeURIComponent(match[2])}}
+  catch(e){return null}
+}
+function _allowedSessionTab(tab){
+  if(!['raw','chat','skills','info'].includes(tab))return MEMBER_SIMPLE?'chat':'raw';
+  if(MEMBER_SIMPLE&&tab==='skills')return'chat';
+  return tab;
+}
+function _writeSessionRoute(name,tab,replace){
+  if(_applyingSessionRoute||!name)return;
+  const hash=_sessionRouteHash(name,tab);
+  if(location.hash===hash)return;
+  if(replace)history.replaceState(null,'',hash);
+  else history.pushState(null,'',_sessionRouteHash(name,tab));
+}
+function applySessionRoute(){
+  const route=_sessionRoute();
+  if(!route||!projectSessions().some(s=>s.name===route.name))return false;
+  _applyingSessionRoute=true;
+  activeTabs[route.name]=_allowedSessionTab(route.tab);
+  selectSession(route.name,false);
+  _applyingSessionRoute=false;
+  return true;
+}
+window.addEventListener('hashchange',applySessionRoute);
 const rawState={};
 // `frozen`/`frozenAtLines` back the Freeze toggle: polling and st.fullText carry
 // on exactly as before, only the paint is held.
@@ -20492,6 +21213,210 @@ function toggleCleanView(name,checked){
   rerenderAllRaw();
 }
 const lastStatus={};
+const _completedUnread={};
+const IDLE_NUDGE_INTERVAL_MS=20000;
+const IDLE_NUDGE_TITLES={
+  off:'Off - only play the normal completion chime once',
+  light:'Light - chime every 20 seconds until every completed tab is viewed',
+  adhd:'ADHD - chime every 20 seconds until every completed tab is given new work'
+};
+const _idleNudgeAdhdPending={};
+let _idleNudgeTimer=null;
+let _idleNudgeModeCache=null;
+
+function getIdleNudgeMode(){
+  if(_idleNudgeModeCache)return _idleNudgeModeCache;
+  try{
+    const saved=localStorage.getItem('idleNudgeMode');
+    _idleNudgeModeCache=['off','light','adhd'].includes(saved)?saved:'off';
+  }catch(e){_idleNudgeModeCache='off'}
+  return _idleNudgeModeCache;
+}
+
+function idleNudgeSeg(){
+  const mode=getIdleNudgeMode();
+  const b=(m,label)=>'<button type="button" class="in-'+m+(mode===m?' active':'')+
+    '" aria-pressed="'+(mode===m?'true':'false')+'" title="'+esc(IDLE_NUDGE_TITLES[m])+
+    '" onclick="event.stopPropagation();setIdleNudgeMode(\''+m+'\')">'+label+'</button>';
+  return '<div class="idle-nudge-seg" role="group" aria-label="Idle nudge mode">'+
+    b('off','Off')+b('light','Light')+b('adhd','ADHD')+'</div>';
+}
+
+function syncIdleNudgeUI(mode){
+  mode=['off','light','adhd'].includes(mode)?mode:'off';
+  document.querySelectorAll('.idle-nudge-seg').forEach(seg=>{
+    seg.querySelectorAll('button').forEach(btn=>{
+      const active=btn.classList.contains('in-'+mode);
+      btn.classList.toggle('active',active);
+      btn.setAttribute('aria-pressed',active?'true':'false');
+    });
+  });
+}
+
+function _idleNudgeNames(mode){
+  const pending=mode==='adhd'?_idleNudgeAdhdPending:_completedUnread;
+  const current=new Set(sessions.map(s=>s.name));
+  return Object.keys(pending).filter(name=>current.has(name));
+}
+
+function _stopIdleNudgeTimer(){
+  if(_idleNudgeTimer!==null)clearTimeout(_idleNudgeTimer);
+  _idleNudgeTimer=null;
+}
+
+function _syncIdleNudgeTimer(restart){
+  if(restart)_stopIdleNudgeTimer();
+  const mode=getIdleNudgeMode();
+  if(mode==='off'||!_idleNudgeNames(mode).length){
+    _stopIdleNudgeTimer();
+    return;
+  }
+  if(_idleNudgeTimer!==null)return;
+  _idleNudgeTimer=setTimeout(function(){
+    _idleNudgeTimer=null;
+    const currentMode=getIdleNudgeMode();
+    if(currentMode==='off'||!_idleNudgeNames(currentMode).length)return;
+    playCompletionChime();
+    _syncIdleNudgeTimer();
+  },IDLE_NUDGE_INTERVAL_MS);
+}
+
+function setIdleNudgeMode(mode){
+  if(!['off','light','adhd'].includes(mode))return;
+  const previous=getIdleNudgeMode();
+  _idleNudgeModeCache=mode;
+  try{localStorage.setItem('idleNudgeMode',mode)}catch(e){}
+  if(mode==='adhd'&&previous!=='adhd'){
+    Object.keys(_completedUnread).forEach(name=>{_idleNudgeAdhdPending[name]=true});
+  }else if(mode!=='adhd'){
+    Object.keys(_idleNudgeAdhdPending).forEach(name=>delete _idleNudgeAdhdPending[name]);
+  }
+  syncIdleNudgeUI(mode);
+  unlockCompletionAudio();
+  _syncIdleNudgeTimer(true);
+}
+
+function _idleNudgeNavDotClass(name,status){
+  const state=status||'unknown';
+  return 'nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
+}
+
+function _paintIdleNudgeNavDot(name,status){
+  const navDot=document.getElementById('nav-dot-'+name);
+  if(navDot)navDot.className=_idleNudgeNavDotClass(name,status);
+}
+
+function _markCompletionUnread(name){
+  _completedUnread[name]=true;
+  _paintIdleNudgeNavDot(name,lastStatus[name]);
+  _syncIdleNudgeTimer();
+}
+
+function _acknowledgeCompletion(name){
+  if(!_completedUnread[name])return false;
+  delete _completedUnread[name];
+  const session=sessions.find(s=>s.name===name);
+  _paintIdleNudgeNavDot(name,lastStatus[name]||(session&&session.activity_status));
+  _syncIdleNudgeTimer();
+  return true;
+}
+
+function _clearIdleNudgeForNewWork(name){
+  const wasPending=!!(_completedUnread[name]||_idleNudgeAdhdPending[name]);
+  delete _completedUnread[name];
+  delete _idleNudgeAdhdPending[name];
+  if(wasPending)_syncIdleNudgeTimer();
+  return wasPending;
+}
+
+const _completionWatch={};
+let _completionAudioCtx=null;
+let _completionAudioPrimed=false;
+
+function _getCompletionAudioContext(){
+  const AudioContextCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioContextCtor)return null;
+  if(!_completionAudioCtx)_completionAudioCtx=new AudioContextCtor();
+  return _completionAudioCtx;
+}
+
+function unlockCompletionAudio(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const prime=function(){
+    if(_completionAudioPrimed||ctx.state!=='running')return;
+    const src=ctx.createBufferSource();
+    src.buffer=ctx.createBuffer(1,1,ctx.sampleRate);
+    src.connect(ctx.destination);
+    src.start();
+    _completionAudioPrimed=true;
+  };
+  if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(prime).catch(()=>{});
+  else prime();
+}
+
+function armCompletionChime(name){
+  _completionWatch[name]=true;
+  unlockCompletionAudio();
+}
+
+function _glassPartial(ctx,destination,frequency,start,duration,level){
+  const osc=ctx.createOscillator();
+  const gain=ctx.createGain();
+  osc.type='sine';
+  osc.frequency.setValueAtTime(frequency,start);
+  gain.gain.setValueAtTime(0.0001,start);
+  gain.gain.exponentialRampToValueAtTime(level,start+0.008);
+  gain.gain.exponentialRampToValueAtTime(0.0001,start+duration);
+  osc.connect(gain);gain.connect(destination);osc.start(start);osc.stop(start+duration+0.02);
+  osc.onended=function(){try{osc.disconnect();gain.disconnect()}catch(e){}};
+}
+
+function playCompletionChime(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const play=function(){
+    if(ctx.state!=='running')return;
+    const now=ctx.currentTime+0.015;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.84,now);
+    master.gain.exponentialRampToValueAtTime(0.0001,now+0.8);
+    master.connect(ctx.destination);
+    [[1046.5,0,0.52,0.16],[2093,0.002,0.38,0.055],[3139.5,0.004,0.26,0.024],
+     [1318.5,0.075,0.60,0.12],[2637,0.078,0.41,0.040],[3955.5,0.080,0.25,0.018]]
+      .forEach(t=>_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3]));
+    setTimeout(function(){try{master.disconnect()}catch(e){}},900);
+  };
+  if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
+  else play();
+}
+
+function trackSessionStatus(name,status,interrupted){
+  const prev=lastStatus[name];
+  lastStatus[name]=status;
+  const completed=prev==='busy'&&status==='idle';
+  if(status==='busy'&&_idleNudgeAdhdPending[name]){
+    delete _idleNudgeAdhdPending[name];
+    _syncIdleNudgeTimer();
+  }
+  if(completed&&!interrupted){
+    _markCompletionUnread(name);
+    if(getIdleNudgeMode()==='adhd'){
+      _idleNudgeAdhdPending[name]=true;
+      _syncIdleNudgeTimer();
+    }
+  }
+  if(completed&&_completionWatch[name]&&!interrupted){
+    delete _completionWatch[name];
+    playCompletionChime();
+    return true;
+  }
+  return false;
+}
+
+['pointerdown','keydown','touchstart'].forEach(function(eventName){
+  document.addEventListener(eventName,unlockCompletionAudio,{capture:true,passive:true});
+});
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
 // Preserve textarea drafts across re-renders
@@ -20758,11 +21683,13 @@ function renderNav(){
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
+    item.title=s.tab_label?(s.name+' · '+s.tab_label):s.name;
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
+      ${s.tab_label?'<span class="nav-title">'+esc(s.tab_label)+'</span>':''}
       <span class="nav-indicators">
-        <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
+        <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
     anchor.after(item);
   });
@@ -21148,6 +22075,8 @@ function renderDetail(){
           <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-row"><span class="tab-more-model-label">Effort</span><span class="tab-more-model-value" id="more-effort-${esc(s.name)}" title="Click to switch reasoning effort" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
+          <div style="padding:8px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Idle nudge</div>
+          ${idleNudgeSeg()}
           <!-- Clean view sits right under Auto-push because it is the other
                switch people flip several times a day, and it used to be reachable
                only by opening the whole Info tab. Same pref, same handler as the
@@ -21204,11 +22133,13 @@ function renderDetail(){
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
+        <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
-            placeholder="Send a message..."
+            placeholder="Send a message or paste an image..."
             onkeydown="handleChatKey(event,'${s.name}')"
+            onpaste="handleComposerPaste(event,'${s.name}','chat')"
             oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
           <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
@@ -21239,11 +22170,13 @@ function renderDetail(){
            itself (and undo itself) from on top of the terminal. -->
       <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
       <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
+      <div class="composer-attachments" id="composer-attachments-raw-${s.name}" aria-live="polite"></div>
       <div class="cmd-bar" style="position:relative">
         <span class="cmd-prompt">$</span>
         <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a message or command…"
+          placeholder="Type a command or paste an image..."
           onkeydown="handleRawKey(event,'${s.name}')"
+          onpaste="handleComposerPaste(event,'${s.name}','raw')"
           oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
         <button class="btn cmd-send is-mic" id="cmd-send-raw-${s.name}" onclick="composerAction('raw-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
@@ -21348,6 +22281,8 @@ function renderDetail(){
 
   // Restore draft text in textareas
   restoreDrafts();
+  renderComposerAttachments(s.name,'chat');
+  renderComposerAttachments(s.name,'raw');
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
@@ -21390,16 +22325,20 @@ function renderDetail(){
   if(tab==='skills')loadProfileSkills(s.name);
 }
 
-function selectSession(name){
+function selectSession(name,updateRoute=true){
   stopAllRawPolling();
   selectedSession=name;
+  _acknowledgeCompletion(name);
   navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const navItem=document.getElementById('nav-'+name);
   if(navItem)navItem.classList.add('active');
   renderDetail();
+  if(updateRoute)_writeSessionRoute(name,activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'),false);
 }
 
-function switchTab(name,tab){
+function switchTab(name,tab,updateRoute=true){
+  _acknowledgeCompletion(name);
+  tab=_allowedSessionTab(tab);
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
   allTabs.forEach(t=>t.classList.remove('active'));
@@ -21451,6 +22390,7 @@ function switchTab(name,tab){
       chatEl.scrollTop=chatEl.scrollHeight;
     }
   }
+  if(updateRoute)_writeSessionRoute(name,tab,false);
 }
 
 // ── Tab-more dropdown ──
@@ -21486,6 +22426,20 @@ function toggleToolsMenu(e){
 function closeToolsMenu(){
   const menu=document.getElementById('nav-tools-menu');
   if(menu)menu.classList.remove('open');
+}
+async function recoverSessions(){
+  showToast('Checking durable sessions...');
+  try{
+    const resp=await fetch(BASE+'/api/admin/sessions/recover',{method:'POST'});
+    const data=await resp.json();
+    if(!resp.ok)throw new Error(data.error||'Session recovery failed');
+    const restored=Array.isArray(data.restored)?data.restored:[];
+    const failed=Array.isArray(data.failed)?data.failed:[];
+    if(failed.length)showToast('Recovered '+restored.length+' session(s); '+failed.length+' need attention.');
+    else if(restored.length)showToast('Recovered '+restored.length+' session(s).');
+    else showToast('All durable sessions are healthy.');
+    await loadAll();
+  }catch(e){showToast(e.message||'Session recovery failed.')}
 }
 
 // Close dropdowns on outside click
@@ -21628,15 +22582,25 @@ const _recording={},_mediaRec={},_audioChunks={};
 function updateComposerBtn(key){
   const inp=document.getElementById('cmd-'+key),btn=document.getElementById('cmd-send-'+key);
   if(!inp||!btn||_recording[key])return;
-  const hasText=inp.value.trim().length>0;
-  btn.classList.toggle('is-send',hasText);
-  btn.classList.toggle('is-mic',!hasText);
-  btn.innerHTML=hasText?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
-  btn.title=hasText?'Send message':'Record voice message';
+  if(_composerUploadTasks[key]){
+    btn.disabled=true;
+    btn.classList.remove('is-mic','is-send');
+    btn.classList.add('is-transcribing');
+    btn.innerHTML='<span class="composer-spin"></span>';
+    btn.title='Attaching pasted image...';
+    return;
+  }
+  btn.disabled=false;
+  btn.classList.remove('is-transcribing');
+  const hasContent=inp.value.trim().length>0||(_composerAttachments[key]||[]).length>0;
+  btn.classList.toggle('is-send',hasContent);
+  btn.classList.toggle('is-mic',!hasContent);
+  btn.innerHTML=hasContent?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
+  btn.title=hasContent?'Send message':'Record voice message';
 }
 function composerAction(key){
   const inp=document.getElementById('cmd-'+key);
-  if(inp&&inp.value.trim().length>0){
+  if(inp&&(inp.value.trim().length>0||(_composerAttachments[key]||[]).length>0)){
     if(key.indexOf('raw-')===0)sendCmd(key.slice(4),'raw');
     else sendChat(key.slice(5));
   }else{toggleRecording(key);}
@@ -21680,32 +22644,43 @@ async function toggleRecording(key){
 async function sendChat(name){
   const input=document.getElementById('cmd-chat-'+name);
   if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
   input.disabled=true;
-  // Show user bubble immediately
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  // Immediately show busy state — user just sent a message so it must be working
-  setOptimisticBusy(name);
+  let sent=false;
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const key='chat-'+name;
+    await _awaitComposerUploads(key);
+    const typed=input.value.trim();
+    const attachments=_composerAttachments[key]||[];
+    const cmd=_commandWithComposerAttachments(typed,attachments);
+    if(!cmd){input.disabled=false;input.focus();return;}
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
     input.value='';input.style.height='auto';updateComposerBtn('chat-'+name);
-  }catch(e){alert('Failed to send.')}
+    _clearComposerAttachments(name,'chat');
+    delete draftText[key];
+    refreshUploadedFiles(name);
+    sent=true;
+  }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
   input.focus();
   // After a delay, verify the busy state from the actual terminal
-  scheduleBusyVerification(name);
+  if(sent)scheduleBusyVerification(name);
 }
 
 function setOptimisticBusy(name){
+  _clearIdleNudgeForNewWork(name);
+  armCompletionChime(name);
   // Update local session state
   const idx=sessions.findIndex(s=>s.name===name);
   if(idx>=0){sessions[idx].activity_status='busy';sessions[idx].activity_detail='Processing...'}
-  lastStatus[name]='busy';
+  trackSessionStatus(name,'busy');
   // Update status pill and nav dot
   updateStatusPill(name,'busy','Processing...');
   if(name===selectedSession)updateFavicon('busy');
@@ -21734,7 +22709,7 @@ function scheduleBusyVerification(name){
       if(st.activity_status==='busy'){
         // Confirmed busy — update detail from server
         updateStatusPill(name,st.activity_status,st.activity_detail);
-        lastStatus[name]=st.activity_status;
+        trackSessionStatus(name,st.activity_status);
         return;
       }
       // Server says idle — but might be a brief gap.  Check once more after 3s.
@@ -21745,7 +22720,7 @@ function scheduleBusyVerification(name){
           const st2=statuses2.find(s=>s.name===name);
           if(!st2)return;
           // Now accept whatever the server says
-          lastStatus[name]=st2.activity_status;
+          trackSessionStatus(name,st2.activity_status);
           updateStatusPill(name,st2.activity_status,st2.activity_detail);
           if(name===selectedSession)updateFavicon(st2.activity_status);
           // Update typing indicator
@@ -21772,6 +22747,9 @@ function scheduleBusyVerification(name){
 
 // Track which tab triggered the upload so progress shows in the right key bar
 let _uploadTab={};
+const _composerAttachments={};
+const _composerUploadTasks={};
+let _clipboardImageSeq=0;
 
 function _formatSize(bytes){
   if(bytes<1024)return bytes+' B';
@@ -21799,6 +22777,8 @@ function _uploadOneFile(name,tab,file){
       }
     });
     xhr.addEventListener('load',function(){
+      let data={};
+      try{data=JSON.parse(xhr.responseText||'{}')}catch(e){}
       if(xhr.status>=200&&xhr.status<300){
         progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('done')}});
         progName.forEach(function(el){if(el)el.textContent=file.name+' uploaded'});
@@ -21812,14 +22792,16 @@ function _uploadOneFile(name,tab,file){
         appendChatBubble(name,'assistant',msg,Date.now()/1000);
       }
       setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
-      resolve();
+      resolve(xhr.status>=200&&xhr.status<300?{
+        ok:true,path:data.path||'',name:file.name,size:file.size,type:file.type||''
+      }:null);
     });
     xhr.addEventListener('error',function(){
       progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('error')}});
       progName.forEach(function(el){if(el)el.textContent='Upload failed: network error'});
       appendChatBubble(name,'assistant','Upload failed: network error',Date.now()/1000);
       setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
-      resolve();
+      resolve(null);
     });
     xhr.open('POST',BASE+'/api/sessions/'+name+'/upload');
     xhr.send(fd);
@@ -21833,6 +22815,149 @@ async function uploadFile(name,input){
     await _uploadOneFile(name,tab,file);
   }
   if(input.value!==undefined)input.value='';
+}
+
+function _clipboardImageExtension(type){
+  const extensions={
+    'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp',
+    'image/heic':'heic','image/heif':'heif','image/tiff':'tiff','image/bmp':'bmp',
+    'image/avif':'avif','image/svg+xml':'svg'
+  };
+  return extensions[(type||'').toLowerCase()]||'png';
+}
+
+function _clipboardImageFile(blob){
+  const type=(blob.type||'image/png').toLowerCase();
+  const filename='pasted-image-'+Date.now()+'-'+(++_clipboardImageSeq)+'.'+_clipboardImageExtension(type);
+  return new File([blob],filename,{type:type,lastModified:Date.now()});
+}
+
+function _clipboardImagePreview(file){
+  return new Promise(function(resolve){
+    const reader=new FileReader();
+    reader.addEventListener('load',function(){
+      resolve(typeof reader.result==='string'?reader.result:'');
+    });
+    reader.addEventListener('error',function(){resolve('')});
+    reader.readAsDataURL(file);
+  });
+}
+
+function _clipboardImages(event){
+  const data=event&&event.clipboardData;
+  if(!data)return [];
+  const images=[];
+  const items=data.items||[];
+  for(let i=0;i<items.length;i++){
+    const item=items[i];
+    if(item&&item.kind==='file'&&String(item.type||'').toLowerCase().startsWith('image/')){
+      const file=item.getAsFile();
+      if(file)images.push(file);
+    }
+  }
+  if(!images.length&&data.files){
+    for(let i=0;i<data.files.length;i++){
+      const file=data.files[i];
+      if(file&&String(file.type||'').toLowerCase().startsWith('image/'))images.push(file);
+    }
+  }
+  return images;
+}
+
+function renderComposerAttachments(name,tab){
+  const key=tab+'-'+name;
+  const tray=document.getElementById('composer-attachments-'+key);
+  if(!tray)return;
+  const attachments=_composerAttachments[key]||[];
+  tray.replaceChildren();
+  tray.classList.toggle('has-files',attachments.length>0);
+  attachments.forEach(function(attachment,index){
+    const item=document.createElement('div');
+    item.className='composer-attachment';
+    const preview=document.createElement('img');
+    preview.className='composer-attachment-preview';
+    preview.src=attachment.previewUrl;
+    preview.alt='Preview of '+attachment.name;
+    item.appendChild(preview);
+    const meta=document.createElement('div');
+    meta.className='composer-attachment-meta';
+    const filename=document.createElement('div');
+    filename.className='composer-attachment-name';
+    filename.textContent=attachment.name;
+    const status=document.createElement('div');
+    status.className='composer-attachment-status';
+    status.textContent='Pasted image · '+_formatSize(attachment.size);
+    meta.appendChild(filename);meta.appendChild(status);item.appendChild(meta);
+    const remove=document.createElement('button');
+    remove.type='button';remove.className='composer-attachment-remove';remove.textContent='x';
+    remove.title='Remove pasted image';
+    remove.addEventListener('click',function(){removeComposerAttachment(name,tab,index)});
+    item.appendChild(remove);tray.appendChild(item);
+  });
+}
+
+function removeComposerAttachment(name,tab,index){
+  const key=tab+'-'+name;
+  const attachments=_composerAttachments[key]||[];
+  const removed=attachments.splice(index,1)[0];
+  if(!attachments.length)delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+  updateComposerBtn(key);
+  if(removed&&removed.name)deleteUploadedFile(name,encodeURIComponent(removed.name));
+}
+
+function _clearComposerAttachments(name,tab){
+  const key=tab+'-'+name;
+  delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+}
+
+async function _awaitComposerUploads(key){
+  while(_composerUploadTasks[key])await _composerUploadTasks[key];
+}
+
+function _commandWithComposerAttachments(text,attachments){
+  const paths=(attachments||[]).map(function(a){return a.path}).filter(Boolean);
+  if(!paths.length)return text;
+  const refs=paths.length===1
+    ?'Attached image: '+paths[0]
+    :'Attached images:\n'+paths.map(function(path){return '- '+path}).join('\n');
+  if(text)return text+'\n\n'+refs;
+  return 'Please inspect '+(paths.length===1?'the attached image.':'the attached images.')+'\n\n'+refs;
+}
+
+function handleComposerPaste(event,name,tab){
+  const blobs=_clipboardImages(event);
+  if(!blobs.length)return;
+  event.preventDefault();
+  const key=tab+'-'+name;
+  const previous=_composerUploadTasks[key]||Promise.resolve();
+  const task=previous.then(async function(){
+    _uploadTab[name]=tab;
+    for(let i=0;i<blobs.length;i++){
+      const file=_clipboardImageFile(blobs[i]);
+      const uploaded=await _uploadOneFile(name,tab,file);
+      if(!uploaded||!uploaded.path)continue;
+      const attachment={
+        name:file.name,path:uploaded.path,size:file.size,type:file.type,
+        previewUrl:await _clipboardImagePreview(file)
+      };
+      (_composerAttachments[key]||(_composerAttachments[key]=[])).push(attachment);
+      renderComposerAttachments(name,tab);
+    }
+  }).catch(function(error){
+    console.warn('clipboard image upload failed:',error);
+    appendChatBubble(name,'assistant','Could not attach the pasted image.',Date.now()/1000);
+  });
+  _composerUploadTasks[key]=task;
+  updateComposerBtn(key);
+  task.finally(function(){
+    if(_composerUploadTasks[key]===task)delete _composerUploadTasks[key];
+    renderComposerAttachments(name,tab);
+    updateComposerBtn(key);
+    const input=document.getElementById('cmd-'+key);
+    if(input)input.focus();
+  });
 }
 
 function handleDrop(event,name,tab){
@@ -21924,21 +23049,27 @@ async function sendCmd(name,source){
   const inputId='cmd-'+source+'-'+name;
   const input=document.getElementById(inputId);
   if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
   input.disabled=true;
-  // Also record in chat
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  // Immediately show busy state
-  setOptimisticBusy(name);
+  let sent=false;
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const key=source+'-'+name;
+    await _awaitComposerUploads(key);
+    const typed=input.value.trim();
+    const attachments=_composerAttachments[key]||[];
+    const cmd=_commandWithComposerAttachments(typed,attachments);
+    if(!cmd){input.disabled=false;input.focus();return;}
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
     input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
-    delete draftText[source+'-'+name];
+    delete draftText[key];
+    _clearComposerAttachments(name,source);
     // Any pending uploads were just attached to this message — clear the badges.
     refreshUploadedFiles(name);
     if(source==='raw'){
@@ -21947,10 +23078,11 @@ async function sendCmd(name,source){
       st.userScrolledUp=false;
       setTimeout(()=>pollRawDelta(name),500);
     }
-  }catch(e){alert('Failed to send.')}
+    sent=true;
+  }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
   input.focus();
-  scheduleBusyVerification(name);
+  if(sent)scheduleBusyVerification(name);
 }
 
 // ── Raw Output Streaming ──
@@ -22096,7 +23228,7 @@ function updateStatusPill(name,status,detail){
   }
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
-  if(navDot)navDot.className='nav-dot '+(status||'unknown');
+  if(navDot)navDot.className=_idleNudgeNavDotClass(name,status);
 }
 
 function updateCard(s){
@@ -22144,17 +23276,23 @@ async function loadAll(){
     const resp=await fetch(BASE+'/api/sessions-fast');
     sessions=await resp.json();
     sessions.forEach(s=>{
-      lastStatus[s.name]=s.activity_status;
+      trackSessionStatus(s.name,s.activity_status);
       if(s.messages&&s.messages.length)mergeChatMessages(s.name, s.messages);
     });
     // Default the selection to the CURRENT project's sessions, not the global
     // first one, or switching workspaces would land you on a foreign session.
     const _inScope=projectSessions();
+    const _route=_sessionRoute();
+    if(_route&&_inScope.some(s=>s.name===_route.name)){
+      selectedSession=_route.name;
+      activeTabs[_route.name]=_allowedSessionTab(_route.tab);
+    }
     if((!selectedSession || !_inScope.some(s=>s.name===selectedSession)) && _inScope.length>0){
       selectedSession=_inScope[0].name;
     }
     renderNav();
     renderDetail();
+    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),true);
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
@@ -22211,18 +23349,20 @@ async function pollStatus(){
       const prev=lastStatus[st.name];
       if(prev&&prev!==st.activity_status){
         changed=true;
-        lastStatus[st.name]=st.activity_status;
         statusInfoEl.textContent='Session '+st.name+' changed...';
         refreshOne(st.name);
-      }else{
-        lastStatus[st.name]=st.activity_status;
       }
+      trackSessionStatus(st.name,st.activity_status);
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
       // Update model badge in nav
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
+        if((sessions[si].tab_label||'')!==(st.tab_label||'')){
+          sessions[si].tab_label=st.tab_label||'';
+          navChanged=true;
+        }
         let badgeChanged=false;
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
@@ -22256,7 +23396,7 @@ async function refreshNavStats(){
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
     const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
     const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span>';
+    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span><span>RAM <span class="stat-val '+memClass+'">'+memPct+'%</span></span>';
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
@@ -22811,7 +23951,7 @@ async function interruptSession(name){
     // Clear busy state
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx].activity_status='idle';sessions[idx].activity_detail=''}
-    lastStatus[name]='idle';
+    trackSessionStatus(name,'idle',true);
     updateStatusPill(name,'idle','');
     toggleInterruptButtons(name,false);
     if(name===selectedSession)updateFavicon('idle');
