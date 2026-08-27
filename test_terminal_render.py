@@ -1,8 +1,8 @@
 """The terminal renderer's parsing rules, run as JavaScript.
 
-Everything the terminal does to a pane before it paints it — cutting the live
+Everything the terminal does to a pane before it paints it - cutting the live
 status line out, dropping the pane's chrome, undoing the CLI's hard wraps,
-diffing one paint against the last — is regex-heavy JS living inside app.py's
+diffing one paint against the last - is regex-heavy JS living inside app.py's
 HTML_PAGE. It is fitted to what Codex actually draws, and a stray character in
 one of those patterns is the difference between a clean transcript and a page
 that eats the conversation.
@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 # A pane the way tmux hands it over: the launcher's shell line, the start-up
-# banner, a turn, and the chrome Codex parks at the foot of every frame — twice,
+# banner, a turn, and the chrome Codex parks at the foot of every frame - twice,
 # because the frame that scrolled away left its own copy behind in the history.
 PANE = """\
 nimrod_rotem@grabo-tech:~$ if [ -f /home/nimrod_rotem/.codex-user-u_36f0/auth.json ]; then exec e
@@ -53,7 +53,7 @@ x-user-u_36f0/advisor-token 2>/dev/null)" env -u OPENAI_API_KEY codex --yolo; fi
   │ ss -ltn '( sport = :9234 )' | tail -n +2
   └ clean
 
-• Done — I submitted an Editor access request for susie@nemopowertools.com.
+• Done - I submitted an Editor access request for susie@nemopowertools.com.
   Google confirmed “Request sent.”
 
   You’ll become an editor after the file owner approves it. Open the spreadsheet
@@ -101,6 +101,15 @@ process.stdout.write(JSON.stringify({
   diff_append: ctx._lineDiff(['a','b','c'], ['a','b','c','d']),
   diff_same: ctx._lineDiff(['a','b'], ['a','b']),
   diff_middle: ctx._lineDiff(['a','b','c'], ['a','B','c']),
+  prompt_flags: ctx._userPromptLineFlags([
+    '› A submitted message that wraps',
+    '  onto another terminal row',
+    '',
+    '• The assistant reply stays white',
+    '› Use /skills to list available skills',
+    '',
+    '  gpt-5.6-sol max · /tmp/termqa',
+  ]),
 }));
 """
 
@@ -134,7 +143,7 @@ def test_live_status_is_read_off_the_spinner_row(rendered):
 
 
 def test_live_status_row_never_reaches_the_transcript(rendered):
-    assert not any("esc to interrupt" in l for l in rendered["body"])
+    assert not any("esc to interrupt" in line for line in rendered["body"])
 
 
 def test_prose_that_merely_mentions_seconds_is_not_a_status_row():
@@ -154,7 +163,9 @@ def test_a_status_row_caught_mid_repaint_is_still_chrome():
     # prose never writes that.
     torn = "◦ Workingli4es00ctrl + t to view tran · 1 background terminal running · /ps to view"
     out = _run("• a real reply\n" + torn)
-    assert not any("background terminal running" in l for l in out["body"]), out["body"]
+    assert not any(
+        "background terminal running" in line for line in out["body"]
+    ), out["body"]
     # ...while prose that merely mentions the same words stays.
     keep = _run("• The background terminal running the build is still alive.")
     assert len(keep["body"]) == 1
@@ -203,7 +214,7 @@ def test_raw_view_passes_the_pane_through_untouched():
     out = _run(PANE, clean_view=False)
     assert "CODEX_HOME=" in "\n".join(out["clean"])
     # ...but the live row is still cut, in both views.
-    assert not any("esc to interrupt" in l for l in out["body"])
+    assert not any("esc to interrupt" in line for line in out["body"])
 
 
 def test_flow_mode_rejoins_a_url_cut_at_the_margin(rendered):
@@ -216,7 +227,9 @@ def test_flow_mode_leaves_structure_alone():
     # Two short list items are not one paragraph, however close to the margin
     # the first one ends.
     out = _run("• head\n  - Item one.\n  - Item two.")
-    assert not any("Item one." in l and "Item two." in l for l in out["flow"]), out["flow"]
+    assert not any(
+        "Item one." in line and "Item two." in line for line in out["flow"]
+    ), out["flow"]
 
 
 def test_flow_mode_keeps_a_rendered_table_intact():
@@ -235,3 +248,10 @@ def test_the_paint_rewrites_only_what_moved(rendered):
     assert rendered["diff_append"] == {"from": 3, "remove": 0, "insert": 1}
     assert rendered["diff_same"] == {"from": 2, "remove": 0, "insert": 0}
     assert rendered["diff_middle"] == {"from": 1, "remove": 1, "insert": 1}
+
+
+def test_submitted_user_messages_get_the_green_terminal_style(rendered):
+    assert rendered["prompt_flags"] == [True, True, False, False, False, False, False]
+    source = APP.read_text()
+    assert ".raw-output .tl-user-prompt{color:#3fb950;font-weight:600}" in source
+    assert '<span class="tl-user-prompt">' in source

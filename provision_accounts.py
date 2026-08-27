@@ -18,13 +18,16 @@ in the project.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -38,12 +41,26 @@ NETGUARD_UNIT = Path("/etc/systemd/system/grabo-session-netguard.service")
 NETGUARD_SH = Path("/usr/local/sbin/grabo-session-netguard")
 PREFIX = "gx-"
 AUTH_GROUP = "gxauth"
+PYTEST_GROUP = "pytestgate"
+PYTEST_LOCK_DIR = Path("/run/lock/tmux-dashboard")
+PYTEST_LOCK = PYTEST_LOCK_DIR / "pytest-heavy.lock"
+DAILY_TEST_LOCK = PYTEST_LOCK_DIR / "dashboard-daily.lock"
+PYTEST_TMPFILES = Path("/etc/tmpfiles.d/tmux-dashboard.conf")
+PYTEST_HOOK_SOURCE = (
+    Path(__file__).resolve().parent
+    / "runtime_hooks"
+    / "tmux_dashboard_pytest_gate.py"
+)
+PYTEST_HOOK_DIR = Path("/usr/local/libexec/tmux-dashboard-python-hooks")
+PYTEST_HOOK_TARGET = PYTEST_HOOK_DIR / "tmux_dashboard_pytest_gate.py"
+PYTEST_HOOK_OWNER_UID = 0
+PYTEST_HOOK_OWNER_GID = 0
 METADATA_IP = "169.254.169.254"
 
 # Readable by a session: shared reference material the policy tells it to load.
 SHARED_READABLE = ["context", "skills", "skill-library"]
 # Never readable by a session: credentials, other accounts, audit trails.
-DASH_PRIVATE_KEEP_TRAVERSABLE = 0o711
+DASH_PRIVATE_KEEP_TRAVERSABLE = 0o710
 
 
 def sh(*args, check=True, **kw):
@@ -84,6 +101,37 @@ def project_dir(user: dict) -> Path:
     return HOME / "web-projects" / str(user.get("username") or user["id"])
 
 
+def configure_browser_ipc_group(
+    accounts: list[str], *, dry: bool = False
+) -> list[str]:
+    """Provision the narrow group used only to traverse and call browser IPC."""
+    members = ["nimrod_rotem", *sorted(set(accounts))]
+    if dry:
+        return [
+            f"would provision {AUTH_GROUP} for {', '.join(members)}",
+            f"would share {DASH}/controller.sock as nimrod_rotem:{AUTH_GROUP} 0660",
+        ]
+
+    sh("groupadd", "-f", AUTH_GROUP)
+    for member in members:
+        try:
+            pwd.getpwnam(member)
+        except KeyError:
+            continue
+        sh("usermod", "-aG", AUTH_GROUP, member)
+    if DASH.exists():
+        shutil.chown(DASH, user="nimrod_rotem", group=AUTH_GROUP)
+        DASH.chmod(DASH_PRIVATE_KEEP_TRAVERSABLE)
+    sock = DASH / "controller.sock"
+    if sock.exists():
+        shutil.chown(sock, user="nimrod_rotem", group=AUTH_GROUP)
+        sock.chmod(0o660)
+    return [
+        f"browser IPC: {AUTH_GROUP} includes {', '.join(members)}",
+        f"browser IPC: {DASH} is 0710 and controller socket is group-callable",
+    ]
+
+
 # --------------------------------------------------------------------------
 # harden: the shared secrets any session could read today
 # --------------------------------------------------------------------------
@@ -101,6 +149,13 @@ def harden(dry: bool = False) -> list[str]:
         out.append(f"{'would ' if dry else ''}chmod {oct(cur)} -> {oct(mode)}  {path}   [{why}]")
         if not dry:
             path.chmod(mode)
+
+    out.extend(
+        configure_browser_ipc_group(
+            sorted(set(load_map().values())),
+            dry=dry,
+        )
+    )
 
     # The single worst one: the admin advisor token, the dashboard admin
     # password and the cookie signing secret, all world readable.
@@ -157,15 +212,6 @@ def harden(dry: bool = False) -> list[str]:
                     sh("chmod", "-R", "o-rwx", str(d), check=False)
         out.append(f"{'would ' if dry else ''}share  {repo} (0755; .git and .venv closed)")
 
-    # The browser lease proxy talks to the dashboard over this socket. Sessions
-    # could always reach it; keep that, scoped to the session-account group.
-    sock = DASH / "controller.sock"
-    if sock.exists() and not dry:
-        sh("groupadd", "-f", AUTH_GROUP, check=False)
-        sh("chown", f"nimrod_rotem:{AUTH_GROUP}", str(sock), check=False)
-        sock.chmod(0o660)
-        out.append(f"share  {sock} (0660 nimrod_rotem:{AUTH_GROUP})")
-
     # Shared playwright MCP CLI and launcher, no per-account data in them.
     for sub in ("node_modules", "bin"):
         d = HOME / ".claude-browser" / sub
@@ -195,6 +241,8 @@ def harden(dry: bool = False) -> list[str]:
         if not dry:
             sh("chmod", "-R", "o+rX", str(ms))
         out.append(f"{'would ' if dry else ''}share  {ms} (o+rX)")
+    out.extend(install_pytest_hook(dry=dry))
+    out.extend(configure_pytest_gate(sorted(set(load_map().values())), dry=dry))
     return out
 
 
@@ -238,6 +286,166 @@ def ensure_account(name: str) -> str:
 def join_dashboard_to_group(name: str) -> None:
     """The dashboard reaches an account's files through that account's group."""
     sh("usermod", "-aG", name, "nimrod_rotem", check=False)
+
+
+def _read_regular_no_follow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PermissionError(f"not a single regular file: {path}")
+        chunks = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        return bytes(chunks)
+    finally:
+        os.close(fd)
+
+
+def pytest_hook_status(expected: bytes | None = None) -> tuple[bool, str]:
+    """Verify the immutable installed pytest hook and its containing directory."""
+    try:
+        source = expected if expected is not None else _read_regular_no_follow(
+            PYTEST_HOOK_SOURCE
+        )
+        directory = PYTEST_HOOK_DIR.lstat()
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or PYTEST_HOOK_DIR.is_symlink()
+            or directory.st_uid != PYTEST_HOOK_OWNER_UID
+            or directory.st_gid != PYTEST_HOOK_OWNER_GID
+            or stat.S_IMODE(directory.st_mode) != 0o755
+        ):
+            return False, "hook directory is not root-owned mode 0755"
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        fd = os.open(PYTEST_HOOK_TARGET, flags)
+        try:
+            installed = os.fstat(fd)
+            if (
+                not stat.S_ISREG(installed.st_mode)
+                or installed.st_nlink != 1
+                or installed.st_uid != PYTEST_HOOK_OWNER_UID
+                or installed.st_gid != PYTEST_HOOK_OWNER_GID
+                or stat.S_IMODE(installed.st_mode) != 0o444
+            ):
+                return False, "installed hook is not root-owned mode 0444"
+            chunks = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+        finally:
+            os.close(fd)
+        if bytes(chunks) != source:
+            return False, "installed hook content does not match runtime_hooks source"
+        digest = hashlib.sha256(source).hexdigest()
+        return True, f"installed hook verified sha256={digest}"
+    except (OSError, ValueError) as exc:
+        return False, f"installed hook unavailable: {exc}"
+
+
+def install_pytest_hook(*, dry: bool = False) -> list[str]:
+    """Atomically install the mandatory pytest plugin as immutable root state."""
+    source = _read_regular_no_follow(PYTEST_HOOK_SOURCE)
+    digest = hashlib.sha256(source).hexdigest()
+    if dry:
+        return [
+            f"would install pytest hook {PYTEST_HOOK_TARGET} (sha256={digest})"
+        ]
+
+    PYTEST_HOOK_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    directory = PYTEST_HOOK_DIR.lstat()
+    if not stat.S_ISDIR(directory.st_mode) or PYTEST_HOOK_DIR.is_symlink():
+        raise PermissionError(f"unsafe pytest hook directory: {PYTEST_HOOK_DIR}")
+    os.chown(PYTEST_HOOK_DIR, PYTEST_HOOK_OWNER_UID, PYTEST_HOOK_OWNER_GID)
+    PYTEST_HOOK_DIR.chmod(0o755)
+
+    valid, _detail = pytest_hook_status(source)
+    if not valid:
+        fd, temporary = tempfile.mkstemp(
+            prefix=PYTEST_HOOK_TARGET.name + ".",
+            suffix=".tmp",
+            dir=PYTEST_HOOK_DIR,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(source)
+                handle.flush()
+                os.fchown(
+                    handle.fileno(),
+                    PYTEST_HOOK_OWNER_UID,
+                    PYTEST_HOOK_OWNER_GID,
+                )
+                os.fchmod(handle.fileno(), 0o444)
+                os.fsync(handle.fileno())
+            os.replace(temporary, PYTEST_HOOK_TARGET)
+            directory_fd = os.open(
+                PYTEST_HOOK_DIR,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    valid, detail = pytest_hook_status(source)
+    if not valid:
+        raise PermissionError(detail)
+    return [f"pytest hook: {detail}"]
+
+
+def configure_pytest_gate(accounts: list[str], *, dry: bool = False) -> list[str]:
+    """Provision the narrow group and immutable locks shared by test runners."""
+    members = ["nimrod_rotem", *sorted(set(accounts))]
+    if dry:
+        return [
+            f"would provision {PYTEST_GROUP} for {', '.join(members)}",
+            f"would provision root:{PYTEST_GROUP} 0440 locks below {PYTEST_LOCK_DIR}",
+        ]
+
+    sh("groupadd", "-f", PYTEST_GROUP)
+    for member in members:
+        try:
+            pwd.getpwnam(member)
+        except KeyError:
+            continue
+        sh("usermod", "-aG", PYTEST_GROUP, member)
+
+    tmpfiles = (
+        f"d {PYTEST_LOCK_DIR} 0750 root {PYTEST_GROUP} -\n"
+        f"f {PYTEST_LOCK} 0440 root {PYTEST_GROUP} -\n"
+        f"f {DAILY_TEST_LOCK} 0440 root {PYTEST_GROUP} -\n"
+        f"a+ {PYTEST_LOCK_DIR} - - - - u:nimrod_rotem:r-x\n"
+        f"a+ {PYTEST_LOCK} - - - - u:nimrod_rotem:r--\n"
+        f"a+ {DAILY_TEST_LOCK} - - - - u:nimrod_rotem:r--\n"
+    )
+    temporary = PYTEST_TMPFILES.with_suffix(".conf.tmp")
+    temporary.write_text(tmpfiles)
+    temporary.chmod(0o644)
+    temporary.replace(PYTEST_TMPFILES)
+    sh("systemd-tmpfiles", "--create", str(PYTEST_TMPFILES))
+    return [
+        f"pytest gate: {PYTEST_GROUP} includes {', '.join(members)}",
+        f"pytest gate: root-owned locks provisioned below {PYTEST_LOCK_DIR}",
+    ]
 
 
 def share_codex_login(name: str) -> None:
@@ -384,6 +592,9 @@ def apply(names: list[str], dry: bool = False) -> list[str]:
     if not dry:
         save_map(mapping)
         write_sudoers(sorted(set(mapping.values())))
+        out.extend(configure_browser_ipc_group(sorted(set(mapping.values()))))
+        out.extend(install_pytest_hook())
+        out.extend(configure_pytest_gate(sorted(set(mapping.values()))))
         out.append(f"sudoers: {SUDOERS} written for {len(set(mapping.values()))} accounts")
     return out
 
@@ -481,7 +692,7 @@ WantedBy=multi-user.target
     NETGUARD_SH.chmod(0o755)
     NETGUARD_UNIT.write_text(unit)
     sh("systemctl", "daemon-reload")
-    r = sh("systemctl", "enable", "--now", "grabo-session-netguard.service", check=False)
+    sh("systemctl", "enable", "--now", "grabo-session-netguard.service", check=False)
     run = sh("/usr/local/sbin/grabo-session-netguard", check=False)
     out = [(run.stdout + run.stderr).strip() or "netguard applied"]
     if run.returncode != 0:
@@ -491,13 +702,14 @@ WantedBy=multi-user.target
 
 # --------------------------------------------------------------------------
 def verify() -> list[str]:
-    out = []
+    hook_ok, hook_detail = pytest_hook_status()
+    out = [f"  [{'PASS' if hook_ok else 'FAIL'}] pytest hook: {hook_detail}"]
     mapping = load_map()
     if not mapping:
-        return ["nothing provisioned"]
+        out.append("nothing provisioned")
+        return out
     accounts = sorted(set(mapping.values()))
     probe = accounts[0]
-    others = [a for a in accounts if a != probe]
 
     def as_probe(cmd: str) -> tuple[int, str]:
         r = subprocess.run(
@@ -535,6 +747,18 @@ def verify() -> list[str]:
     positives = [
         ("can read shared context", f"test -r {DASH}/context/browser-policy.md"),
         ("can run codex", "command -v codex"),
+        ("can traverse browser IPC directory", f"test -x {DASH}"),
+        ("can reach the controller socket", f"test -w {DASH}/controller.sock"),
+        ("can read the pytest host lock", f"test -r {PYTEST_LOCK}"),
+        (
+            "can read and compile the installed pytest hook",
+            "python3 -c "
+            + repr(
+                "from pathlib import Path; "
+                f"compile(Path({str(PYTEST_HOOK_TARGET)!r}).read_text(), "
+                "'tmux_dashboard_pytest_gate.py', 'exec')"
+            ),
+        ),
     ]
     for label, cmd in positives:
         rc, _ = as_probe(cmd)

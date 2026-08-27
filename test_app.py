@@ -1,4 +1,4 @@
-"""Tests for tmux Dashboard app.py — utility functions and API logic."""
+"""Tests for tmux Dashboard app.py - utility functions and API logic."""
 import hashlib
 import hmac
 import json
@@ -267,7 +267,7 @@ class TestAwayStateSummary:
             "started_at": 1000.0,
             "log": [{"ts": 1, "phase": 1, "step": 1, "action": "test"}],
             "report": "all good",
-            "task": "SHOULD_NOT_APPEAR",  # asyncio.Task — not JSON-safe
+            "task": "SHOULD_NOT_APPEAR",  # asyncio.Task - not JSON-safe
         }
         summary = _away_state_summary(state)
         assert summary["enabled"] is True
@@ -481,6 +481,10 @@ class TestGetTmuxSessions:
         import app as _app
         empty = {"sessions": {}}
         with patch("app._session_is_codex", return_value=True), \
+             patch(
+                 "app._load_session_owners",
+                 return_value={name: "admin" for name in ("main", "work", "lonely", "my")},
+             ), \
              patch.object(_app._session_lifecycle, "snapshot", return_value=empty):
             yield
 
@@ -610,16 +614,16 @@ class TestDetectActivityHysteresis:
         mock_raw.return_value = {"status": "busy", "command": "claude", "detail": "Working"}
         detect_activity("test-sess")
 
-        # First idle reading — should stay busy
+        # First idle reading - should stay busy
         mock_raw.return_value = {"status": "idle", "command": "claude", "detail": "Waiting"}
         result = detect_activity("test-sess")
         assert result["status"] == "busy"  # held busy
 
-        # Second idle reading — still busy (need IDLE_CONFIRM_COUNT=3)
+        # Second idle reading - still busy (need IDLE_CONFIRM_COUNT=3)
         result = detect_activity("test-sess")
         assert result["status"] == "busy"  # still held
 
-        # Third idle reading — NOW transitions to idle
+        # Third idle reading - NOW transitions to idle
         result = detect_activity("test-sess")
         assert result["status"] == "idle"
 
@@ -676,6 +680,28 @@ class TestDetectActivityHysteresis:
         result = detect_activity("test-sess")
         assert result["status"] == "custom_status"
         assert _activity_state["test-sess"]["consecutive_idle"] == 0
+
+
+@patch("app.subprocess.run")
+def test_frozen_codex_work_counter_is_reported_as_stalled(mock_run):
+    import app
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="codex:123\n"),
+        MagicMock(returncode=0, stdout="Working (42s, esc to interrupt)\n"),
+    ]
+    app._codex_work_seen["frozen-session"] = (
+        "Working",
+        42,
+        time.time() - app._CODEX_STALL_AFTER - 1,
+    )
+    try:
+        result = app._detect_activity_raw("frozen-session")
+    finally:
+        app._codex_work_seen.pop("frozen-session", None)
+
+    assert result["status"] == "stalled"
+    assert result["detail"] == "Stalled (42s, not advancing)"
 
 
 # ─── build_session_response Tests ───
@@ -982,7 +1008,7 @@ class TestApiKeyShellQuoting:
         import inspect
 
         import app
-        source = inspect.getsource(app.api_create_session)
+        source = inspect.getsource(app._send_session_owner_environment)
         assert "shlex.quote" in source
 
     def test_set_auth_mode_never_sends_credentials_to_tmux(self):
