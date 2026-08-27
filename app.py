@@ -20131,6 +20131,7 @@ let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's 
 let sessions=[];
 let selectedSession=null;
 let pollTimer=null;
+let tabLabelPollTimer=null;
 const activeTabs={};
 let _applyingSessionRoute=false;
 
@@ -21687,7 +21688,7 @@ function renderNav(){
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(s.name)}</span>
-      ${s.tab_label?'<span class="nav-title">'+esc(s.tab_label)+'</span>':''}
+      <span class="nav-title" id="nav-label-${s.name}"${s.tab_label?'':' hidden'}>${esc(s.tab_label||'')}</span>
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
@@ -22121,7 +22122,7 @@ function renderDetail(){
              between the model chip and the buttons, so it is kept in the DOM (the raw
              view still writes to it) but not shown. -->
         <span class="raw-info" id="raw-info-${s.name}" hidden>Loading terminal...</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}',activeTabs['${s.name}'])" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="reloadActive('${esc(s.name)}')" title="Re-read this session's terminal from tmux">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
@@ -22662,6 +22663,7 @@ async function sendChat(name){
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
+    _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';updateComposerBtn('chat-'+name);
     _clearComposerAttachments(name,'chat');
     delete draftText[key];
@@ -22906,6 +22908,40 @@ function removeComposerAttachment(name,tab,index){
   if(removed&&removed.name)deleteUploadedFile(name,encodeURIComponent(removed.name));
 }
 
+// ── Stop puts your prompt back in the box ──────────────────────────────────
+// Interrupting is nearly always "that came out wrong, let me redo it", and the
+// text was already cleared on send. Keep the last submitted draft per session
+// so Stop can hand it back instead of making the prompt be retyped from memory.
+let lastSubmittedDraft={};
+function _copyComposerAttachments(attachments){
+  return (attachments||[]).map(a=>({
+    name:a.name,path:a.path,size:a.size,type:a.type,previewUrl:a.previewUrl
+  }));
+}
+function _rememberSubmittedDraft(name,text,attachments){
+  lastSubmittedDraft[name]={text:text||'',attachments:_copyComposerAttachments(attachments)};
+}
+function _restoreSubmittedDraft(name,source){
+  const submitted=lastSubmittedDraft[name];
+  const tab=source==='chat'?'chat':'raw';
+  const key=tab+'-'+name;
+  const input=document.getElementById('cmd-'+key);
+  if(!submitted||!input)return false;
+  // Never overwrite something typed while the agent was still working.
+  if(input.value.length||(_composerAttachments[key]||[]).length){input.focus();return false}
+  input.value=submitted.text;
+  if(submitted.text)draftText[key]=submitted.text; else delete draftText[key];
+  const attachments=_copyComposerAttachments(submitted.attachments);
+  if(attachments.length)_composerAttachments[key]=attachments; else delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+  autoGrow(input);
+  updateComposerBtn(key);
+  try{input.focus({preventScroll:true})}catch(e){input.focus()}
+  if(typeof input.setSelectionRange==='function')input.setSelectionRange(input.value.length,input.value.length);
+  delete lastSubmittedDraft[name];
+  return true;
+}
+
 function _clearComposerAttachments(name,tab){
   const key=tab+'-'+name;
   delete _composerAttachments[key];
@@ -23067,6 +23103,7 @@ async function sendCmd(name,source){
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
+    _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
     delete draftText[key];
     _clearComposerAttachments(name,source);
@@ -23296,6 +23333,7 @@ async function loadAll(){
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
+  startTabLabelPolling();
   // Phase 2: Background LLM refresh for each session
   lazyRefreshAll();
 }
@@ -23340,6 +23378,53 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// ── Session tab labels ─────────────────────────────────────────────────────
+// The label is what tells two identically-named panes apart at a glance, so it
+// gets its own 2-second poll rather than riding the 10-second status poll: a
+// label that arrives eight seconds after the work started is a label you have
+// already scrolled past. The endpoint returns names and labels only, so this
+// stays far cheaper than /api/status.
+function sessionTabLabel(session){
+  return ((session&&session.tab_label)||(session&&session.name)||'').trim();
+}
+
+function _paintSessionTabLabel(name){
+  const session=sessions.find(s=>s.name===name);
+  const label=document.getElementById('nav-label-'+name);
+  const item=document.getElementById('nav-'+name);
+  if(!session||!label)return;
+  label.textContent=session.tab_label||'';
+  label.hidden=!session.tab_label;
+  const title=session.tab_label
+    ? session.name+' · '+session.tab_label
+    : session.name;
+  label.title=title;
+  if(item)item.title=title;
+}
+
+function startTabLabelPolling(){
+  if(tabLabelPollTimer)clearInterval(tabLabelPollTimer);
+  tabLabelPollTimer=setInterval(pollTabLabels,2000);
+}
+
+async function pollTabLabels(){
+  if(document.hidden)return;
+  try{
+    const resp=await fetch(BASE+'/api/tab-labels',{cache:'no-store'});
+    if(!resp.ok)return;
+    const labels=await resp.json();
+    if(!Array.isArray(labels))return;
+    for(const row of labels){
+      const session=sessions.find(s=>s.name===row.name);
+      if(!session)continue;
+      const next=row.tab_label||'';
+      if((session.tab_label||'')===next)continue;
+      session.tab_label=next;
+      _paintSessionTabLabel(row.name);
+    }
+  }catch(e){}
+}
+
 async function pollStatus(){
   try{
     const resp=await fetch(BASE+'/api/status');
@@ -23361,7 +23446,7 @@ async function pollStatus(){
         let navChanged=false;
         if((sessions[si].tab_label||'')!==(st.tab_label||'')){
           sessions[si].tab_label=st.tab_label||'';
-          navChanged=true;
+          _paintSessionTabLabel(st.name);
         }
         let badgeChanged=false;
         const pend=st.model_pending||'';
@@ -23944,9 +24029,12 @@ document.addEventListener('click',function(e){
 });
 
 // ── Interrupt Session ──
-async function interruptSession(name){
+async function interruptSession(name,source){
   try{
     await fetch(BASE+'/api/sessions/'+name+'/interrupt',{method:'POST'});
+    // Hand the prompt back before anything else, so it is in the box by the
+    // time the busy state clears. Falls back to whichever tab is open.
+    _restoreSubmittedDraft(name,source||activeTabs[name]||'raw');
     appendChatBubble(name,'user','[interrupted]',Date.now()/1000);
     // Clear busy state
     const idx=sessions.findIndex(s=>s.name===name);
