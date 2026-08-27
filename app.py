@@ -1044,12 +1044,40 @@ def _neighbours_sharing_cwd(session_name: str) -> list:
     return out
 
 
+def _convo_has_transcript(session_name: str, convo_uuid: str) -> bool:
+    """True when Claude has a transcript on disk for this conversation.
+
+    `--resume <id>` is fatal without one: Claude prints "No conversation found
+    with session ID: <id>" and exits before it draws anything, so the pane drops
+    to bash and the tab reads to the user as a logout (seen on 'smoke',
+    2026-08-27). A conversation we named ourselves with `--session-id` has no
+    file until its first message, so a tab relaunched before anyone typed in it
+    is exactly the case that hits this. Look in the session's OWN config dir
+    only: a member cannot resume a transcript that lives in another one.
+    """
+    if not convo_uuid or not _UUID_RE.fullmatch(convo_uuid):
+        return False
+    try:
+        base = _session_config_base(session_name)
+    except Exception:
+        base = Path.home() / ".claude"
+    try:
+        # Match on the id across every project dir rather than deriving one from
+        # the pane's cwd: the id is unique, and a pane that has since cd'd
+        # elsewhere would otherwise look transcript-less.
+        return any((base / "projects").glob("*/" + convo_uuid + ".jsonl"))
+    except Exception:
+        return False
+
+
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """The resume flag for relaunching this pane's Claude, in order of trust.
 
     1. `--resume <uuid>` for the conversation we launched this pane on, or that
        a caller identified. Exact, and the only option that cannot pick up a
-       neighbour's work.
+       neighbour's work. When that conversation has no transcript yet it becomes
+       `--session-id <same uuid>`: same conversation, but Claude has to create it
+       rather than load it, and every record pointing at this pane stays valid.
     2. The scrollback-matching heuristic, for panes that predate (1).
     3. `--continue` — ONLY when no other live session shares this cwd. It means
        "the most recent conversation here", which on a box where every session
@@ -1059,7 +1087,12 @@ def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """
     uuid_s = resume_uuid or _session_convo(session_name)
     if uuid_s and _UUID_RE.fullmatch(uuid_s):
-        return "--resume " + uuid_s
+        if _convo_has_transcript(session_name, uuid_s):
+            return "--resume " + uuid_s
+        logger.info("Session '%s': conversation %s has no transcript yet, "
+                    "launching it with --session-id, not --resume (which would "
+                    "abort and leave the pane at a shell)", session_name, uuid_s)
+        return "--session-id " + uuid_s
     guessed = _find_session_transcript_uuid(session_name)
     if guessed:
         _set_session_convo(session_name, guessed)
@@ -7326,7 +7359,12 @@ def _exact_tmux_session_id(session_name: str) -> str:
 
 
 def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
-    """Build a managed Claude command bound to one exact conversation."""
+    """Build a managed Claude command bound to one exact conversation.
+
+    `--resume` when Claude has that conversation on disk, `--session-id` when it
+    does not: either way the pane comes back on the id every lifecycle row and
+    tab label already points at. See _convo_has_transcript for why the second
+    case is not hypothetical."""
     if not _UUID_RE.fullmatch(str(resume_uuid or "")):
         raise ValueError("invalid Claude resume UUID")
     command, _model, _effort = _claude_cmd_with_flags(
@@ -7338,7 +7376,8 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
         command,
     )
     command = re.sub(r"\s+--continue\b", "", command)
-    command = command.strip() + " --resume " + resume_uuid
+    flag = "--resume" if _convo_has_transcript(session_name, resume_uuid) else "--session-id"
+    command = command.strip() + " " + flag + " " + resume_uuid
     return _managed_agent_command(session_name, command)
 
 
@@ -7349,12 +7388,20 @@ def _restore_durable_session(candidate: dict) -> dict:
     owner_id = str(candidate.get("owner_id") or "")
     cwd_text = str(candidate.get("cwd") or "")
     resume_uuid = str(candidate.get("resume_uuid") or "")
+    recorded_uuid = resume_uuid          # what the row is bound to, may be empty
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError("invalid durable session name")
     if not generation or not owner_id:
         raise ValueError("durable session binding is incomplete")
     if not _UUID_RE.fullmatch(resume_uuid):
-        raise ValueError("durable session has no exact Claude conversation")
+        # A row reaches here with no conversation when its tab died before Claude
+        # ever wrote one. Refusing to restore made the reconcile loop retry every
+        # 20s forever and the tab never came back ('authsetup', 2026-08-27).
+        # Minting one is safe: a fresh --session-id starts its own conversation
+        # and can never pick up a neighbour's the way --continue can.
+        resume_uuid = str(uuid.uuid4())
+        logger.warning("Durable session '%s' has no conversation on record, "
+                       "restoring it on a fresh one (%s)", name, resume_uuid)
     try:
         cwd = Path(cwd_text).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
@@ -7371,7 +7418,7 @@ def _restore_durable_session(candidate: dict) -> dict:
         generation=generation,
         owner_id=owner_id,
         desired_states={"running"},
-        resume_uuid=resume_uuid,
+        resume_uuid=recorded_uuid,
         restore_on_startup=True,
     ):
         return {"name": name, "status": "stale"}
@@ -7384,7 +7431,7 @@ def _restore_durable_session(candidate: dict) -> dict:
             generation=generation,
             owner_id=owner_id,
             desired_states={"running"},
-            resume_uuid=resume_uuid,
+            resume_uuid=recorded_uuid,
             restore_on_startup=True,
         ):
             raise RuntimeError("session lifecycle changed during recovery")
@@ -7473,6 +7520,23 @@ def _checkpoint_live_sessions() -> int:
             continue
         owner_id = _session_owner_id(name)
         resume_uuid = _session_convo(name)
+        # An id with no transcript is stale as well as unusable: the pane is
+        # running some OTHER conversation (the recorded one was never written,
+        # so Claude cannot be in it). Re-learn rather than checkpoint a pointer
+        # to nothing, but keep the old id if the pane won't tell us a better one.
+        if resume_uuid and not _convo_has_transcript(name, resume_uuid):
+            try:
+                _clear_session_convo(name)
+                relearned = _learn_session_convo(name)
+                if relearned:
+                    logger.info("Session '%s': recorded conversation %s has no "
+                                "transcript, corrected to %s", name, resume_uuid, relearned)
+                    resume_uuid = relearned
+                else:
+                    _set_session_convo(name, resume_uuid)
+            except Exception:
+                _set_session_convo(name, resume_uuid)
+                logger.debug("Could not re-learn conversation for '%s'", name, exc_info=True)
         if not resume_uuid:
             try:
                 resume_uuid = _learn_session_convo(name)
@@ -18330,9 +18394,20 @@ _CRASH_OOM_RE = re.compile(
 )
 
 
+# Claude refusing to start at all. It exits immediately with one of these lines
+# and no TUI, which looks identical to a logout from the tab. Recovering is the
+# same relaunch, and _resume_flag now picks a flag that cannot repeat the abort.
+_CRASH_LAUNCH_ABORT_RE = re.compile(
+    r"No conversation found with session ID"
+    r"|Session ID [0-9a-fA-F-]{36} is already in use",
+)
+
+
 def _looks_like_crash(text: str) -> bool:
-    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
-    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
+    """True if recent pane output shows Claude dying (OOM/SIGABRT/etc.) or
+    refusing to launch on the conversation it was given."""
+    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text)
+                or _CRASH_LAUNCH_ABORT_RE.search(text))
 
 # A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
 _SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")

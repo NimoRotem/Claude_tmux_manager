@@ -225,6 +225,7 @@ def test_recovery_command_resumes_the_exact_claude_conversation(monkeypatch):
         "_managed_agent_command",
         lambda name, command: f"SCOPED[{name}] {command}",
     )
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: True)
 
     command = app._claude_recovery_command(
         "drafting",
@@ -235,6 +236,77 @@ def test_recovery_command_resumes_the_exact_claude_conversation(monkeypatch):
     assert "--resume 12345678-1234-1234-1234-123456789abc" in command
     assert "--continue" not in command
     assert "--session-id" not in command
+
+
+def test_recovery_command_creates_a_conversation_that_was_never_written(monkeypatch):
+    """`--resume` on a conversation with no transcript aborts Claude and leaves
+    the pane at a shell, which reads as a logout. Same id, creating flag."""
+    import app
+
+    monkeypatch.setattr(app, "NEW_SESSION_CMD", "claude --dangerously-skip-permissions")
+    monkeypatch.setattr(
+        app,
+        "_claude_cmd_with_flags",
+        lambda command, pin_model=True: (command, "opus", "high"),
+    )
+    monkeypatch.setattr(
+        app,
+        "_managed_agent_command",
+        lambda name, command: f"SCOPED[{name}] {command}",
+    )
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: False)
+
+    command = app._claude_recovery_command(
+        "drafting",
+        "12345678-1234-1234-1234-123456789abc",
+    )
+
+    assert "--session-id 12345678-1234-1234-1234-123456789abc" in command
+    assert "--resume" not in command
+
+
+def test_convo_has_transcript_reads_the_sessions_own_config_dir(monkeypatch, tmp_path: Path):
+    import app
+
+    convo = "12345678-1234-1234-1234-123456789abc"
+    proj = tmp_path / "projects" / "-srv-drafting"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(app, "_session_config_base", lambda _name: tmp_path)
+
+    assert not app._convo_has_transcript("drafting", convo)
+    (proj / (convo + ".jsonl")).write_text("{}\n")
+    assert app._convo_has_transcript("drafting", convo)
+    assert not app._convo_has_transcript("drafting", "not-a-uuid")
+
+
+def test_resume_flag_never_resumes_a_conversation_with_no_transcript(monkeypatch):
+    import app
+
+    convo = "12345678-1234-1234-1234-123456789abc"
+    monkeypatch.setattr(app, "_session_convo", lambda _name: convo)
+    monkeypatch.setattr(
+        app,
+        "_find_session_transcript_uuid",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not guess")),
+    )
+
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: True)
+    assert app._resume_flag("drafting") == "--resume " + convo
+
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: False)
+    assert app._resume_flag("drafting") == "--session-id " + convo
+
+
+def test_a_launch_that_aborts_on_its_conversation_counts_as_a_crash():
+    import app
+
+    assert app._looks_like_crash(
+        "No conversation found with session ID: 1bd36661-ef36-4fd5-8223-4a0c5776634f"
+    )
+    assert app._looks_like_crash(
+        "Session ID 1bd36661-ef36-4fd5-8223-4a0c5776634f is already in use"
+    )
+    assert not app._looks_like_crash("nimrod_rotem@lisa-claude:~/lisa-my$ ")
 
 
 @pytest.mark.asyncio
@@ -421,6 +493,70 @@ def test_durable_restore_recreates_the_exact_claude_conversation(monkeypatch, tm
     assert checkpoints[-1]["expected_generation"] == "generation-1"
 
 
+def test_durable_restore_mints_a_conversation_when_the_row_has_none(monkeypatch, tmp_path: Path):
+    """A row whose tab died before Claude wrote a conversation used to fail the
+    reconcile loop every 20s forever and never come back."""
+    import app
+
+    checkpoints: list[dict] = []
+    launched: list[str] = []
+    matched: list[dict] = []
+
+    class FakeLifecycle:
+        def matches(self, _name, **kwargs):
+            matched.append(kwargs)
+            return True
+
+        def checkpoint_active(self, _name, **kwargs):
+            checkpoints.append(kwargs)
+            return kwargs
+
+    monkeypatch.setattr(app, "SESSION_LIFECYCLE", FakeLifecycle())
+    monkeypatch.setattr(
+        app,
+        "_find_user_by_id",
+        lambda owner: {"id": owner, "username": "Nimo", "role": "admin"},
+    )
+    monkeypatch.setattr(app, "_session_owner_id", lambda _name: "admin")
+    monkeypatch.setattr(app, "_create_exact_tmux_session", lambda name, cwd: ("$24", name))
+    monkeypatch.setattr(app, "_set_session_owner", lambda *_args: None)
+    monkeypatch.setattr(app, "_set_session_convo", lambda *_args: None)
+    monkeypatch.setattr(app, "_git_identity_for", lambda *_args: ("Nimo", "nimo@lisa.my"))
+    monkeypatch.setattr(
+        app,
+        "_claude_recovery_command",
+        lambda name, convo: launched.append(convo) or f"SCOPED[{name}] --session-id {convo}",
+    )
+    monkeypatch.setattr(app, "_claude_launch_env_prefix", lambda: "unset ANTHROPIC_API_KEY; ")
+    monkeypatch.setattr(app, "_launch_banner", lambda *_args: "restored")
+    monkeypatch.setattr(app, "_launch_script_line", lambda *_args: "source launch.sh")
+    monkeypatch.setattr(app, "_session_cwd", lambda _target: str(tmp_path))
+    monkeypatch.setattr(
+        app.subprocess,
+        "run",
+        lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = app._restore_durable_session(
+        {
+            "name": "authsetup",
+            "generation": "generation-1",
+            "owner_id": "admin",
+            "cwd": str(tmp_path),
+            "resume_uuid": "",
+            "desired_state": "running",
+            "restore_on_startup": True,
+        }
+    )
+
+    assert result["status"] == "restored"
+    # The binding check still asks about the row as stored, not the minted id.
+    assert all(row["resume_uuid"] == "" for row in matched)
+    minted = launched[0]
+    assert app._UUID_RE.fullmatch(minted)
+    assert checkpoints[-1]["resume_uuid"] == minted
+
+
 def test_durable_restore_rejects_an_owner_registry_mismatch(monkeypatch, tmp_path: Path):
     import app
 
@@ -482,6 +618,7 @@ def test_live_sessions_are_checkpointed_with_owner_and_conversation(monkeypatch)
         "_session_convo",
         lambda _name: "12345678-1234-1234-1234-123456789abc",
     )
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: True)
 
     assert app._checkpoint_live_sessions() == 1
     assert registrations == [
@@ -495,6 +632,65 @@ def test_live_sessions_are_checkpointed_with_owner_and_conversation(monkeypatch)
             },
         )
     ]
+
+
+def test_checkpoint_corrects_a_recorded_conversation_that_was_never_written(monkeypatch):
+    """A recorded id with no transcript points at nothing: the pane must be in
+    some other conversation, so checkpointing it would strand the next restore."""
+    import app
+
+    registrations: list[tuple[str, dict]] = []
+    stale = "12345678-1234-1234-1234-123456789abc"
+    live = "abcdef12-1234-1234-1234-123456789abc"
+
+    class FakeLifecycle:
+        def get(self, _name):
+            return {}
+
+        def register_active(self, name, **kwargs):
+            registrations.append((name, kwargs))
+            return {"generation": "generation-1", **kwargs}
+
+    monkeypatch.setattr(app, "SESSION_LIFECYCLE", FakeLifecycle())
+    monkeypatch.setattr(app, "get_tmux_sessions", lambda: [{"name": "drafting", "cwd": "/srv/drafting"}])
+    monkeypatch.setattr(app, "_session_owner_id", lambda _name: "admin")
+    monkeypatch.setattr(app, "_session_convo", lambda _name: stale)
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: False)
+    monkeypatch.setattr(app, "_clear_session_convo", lambda _name: None)
+    monkeypatch.setattr(app, "_set_session_convo", lambda *_args: None)
+    monkeypatch.setattr(app, "_learn_session_convo", lambda _name: live)
+
+    assert app._checkpoint_live_sessions() == 1
+    assert registrations[-1][1]["resume_uuid"] == live
+
+
+def test_checkpoint_keeps_a_stale_id_when_the_pane_offers_nothing_better(monkeypatch):
+    import app
+
+    registrations: list[tuple[str, dict]] = []
+    restored: list[tuple] = []
+    stale = "12345678-1234-1234-1234-123456789abc"
+
+    class FakeLifecycle:
+        def get(self, _name):
+            return {}
+
+        def register_active(self, name, **kwargs):
+            registrations.append((name, kwargs))
+            return {"generation": "generation-1", **kwargs}
+
+    monkeypatch.setattr(app, "SESSION_LIFECYCLE", FakeLifecycle())
+    monkeypatch.setattr(app, "get_tmux_sessions", lambda: [{"name": "drafting", "cwd": "/srv/drafting"}])
+    monkeypatch.setattr(app, "_session_owner_id", lambda _name: "admin")
+    monkeypatch.setattr(app, "_session_convo", lambda _name: stale)
+    monkeypatch.setattr(app, "_convo_has_transcript", lambda *_args: False)
+    monkeypatch.setattr(app, "_clear_session_convo", lambda _name: None)
+    monkeypatch.setattr(app, "_set_session_convo", lambda *args: restored.append(args))
+    monkeypatch.setattr(app, "_learn_session_convo", lambda _name: "")
+
+    assert app._checkpoint_live_sessions() == 1
+    assert registrations[-1][1]["resume_uuid"] == stale
+    assert restored == [("drafting", stale)]
 
 
 def test_durable_candidates_exclude_live_and_intentionally_deleted_sessions(monkeypatch):
