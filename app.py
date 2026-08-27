@@ -13293,11 +13293,23 @@ def _codex_app_server_process(codex_home: Path):
     codex_home.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["CODEX_HOME"] = str(codex_home)
+    command = [
+        "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
+        "--stdio",
+    ]
+    account = _account_unix_user_for_config_dir(codex_home)
+    if account:
+        env.pop("CODEX_HOME", None)
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("ADVISOR_TOKEN", None)
+        command = [
+            "sudo", "-n", "-u", account, "-H",
+            "env", "-u", "OPENAI_API_KEY", "-u", "ADVISOR_TOKEN",
+            f"CODEX_HOME={codex_home}",
+            *command,
+        ]
     return subprocess.Popen(
-        [
-            "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
-            "--stdio",
-        ],
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

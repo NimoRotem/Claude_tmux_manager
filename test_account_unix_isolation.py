@@ -111,6 +111,33 @@ def test_member_project_dirs_are_writable_by_the_unix_account(tmp_path, monkeypa
     } == {(account_gid, 0o2770)}
 
 
+def test_member_codex_auth_probe_runs_as_the_unix_account(tmp_path, monkeypatch):
+    codex_home = tmp_path / ".codex-user-u_abc"
+    captured = {}
+    sentinel = object()
+    monkeypatch.setattr(
+        app,
+        "_account_unix_user_for_config_dir",
+        lambda path: "gx-someone",
+    )
+
+    def capture(command, **kwargs):
+        captured["command"] = command
+        return sentinel
+
+    monkeypatch.setattr(app.subprocess, "Popen", capture)
+
+    app._codex_app_server_process(codex_home)
+
+    assert captured["command"] == [
+        "sudo", "-n", "-u", "gx-someone", "-H", "env",
+        "-u", "OPENAI_API_KEY", "-u", "ADVISOR_TOKEN",
+        f"CODEX_HOME={codex_home}",
+        "codex", "app-server", "-c", 'cli_auth_credentials_store="file"',
+        "--stdio",
+    ]
+
+
 def test_member_codex_home_keeps_the_group_the_dashboard_needs(tmp_path, monkeypatch):
     """Forcing 0700/0600 here locks the dashboard out of the config it writes."""
     cfg_dir = tmp_path / ".codex-user-u_abc"
