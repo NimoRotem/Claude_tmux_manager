@@ -1375,8 +1375,24 @@ def _member_session_project_dir(user: dict, session_name: str) -> Path:
         safe_session = "session-" + hashlib.sha256(
             safe_session.encode("utf-8")
         ).hexdigest()[:16]
-    project_dir = PROJECTS_ROOT / username / safe_session
-    project_dir.mkdir(parents=True, exist_ok=True)
+    member_root = PROJECTS_ROOT / username
+    project_dir = member_root / safe_session
+    member_root.mkdir(parents=True, exist_ok=True, mode=0o770)
+    project_dir.mkdir(exist_ok=True, mode=0o770)
+    account = _account_unix_user(user)
+    if account:
+        account_gid = pwd.getpwnam(account).pw_gid
+        for path in (member_root, project_dir):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                current = os.fstat(fd)
+                group_changed = current.st_gid != account_gid
+                if group_changed:
+                    os.fchown(fd, -1, account_gid)
+                if group_changed or current.st_mode & 0o7777 != 0o2770:
+                    os.fchmod(fd, 0o2770)
+            finally:
+                os.close(fd)
     return project_dir
 
 

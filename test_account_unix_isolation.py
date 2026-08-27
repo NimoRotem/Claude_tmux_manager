@@ -5,6 +5,8 @@ advisor token and with it that account's advisor permissions. These cover the
 launch-path half of the fix; provision_accounts.py verify covers the kernel half.
 """
 import json
+import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,6 +91,24 @@ def test_shared_login_sessions_are_left_exactly_as_they_were(mapped, monkeypatch
     mapped({})
     monkeypatch.setattr(app, "_user_for_session", lambda name: MEMBER)
     assert app._session_unix_account_prefix("sess", "codex --yolo") == "codex --yolo"
+
+
+def test_member_project_dirs_are_writable_by_the_unix_account(tmp_path, monkeypatch):
+    account_gid = next(gid for gid in os.getgroups() if gid != os.getgid())
+    monkeypatch.setattr(app, "PROJECTS_ROOT", tmp_path)
+    monkeypatch.setattr(app, "_account_unix_user", lambda user: "gx-someone")
+    monkeypatch.setattr(
+        app.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_gid=account_gid),
+    )
+
+    project_dir = app._member_session_project_dir(MEMBER, "sess")
+
+    paths = (project_dir.parent, project_dir)
+    assert {
+        (path.stat().st_gid, path.stat().st_mode & 0o7777) for path in paths
+    } == {(account_gid, 0o2770)}
 
 
 def test_member_codex_home_keeps_the_group_the_dashboard_needs(tmp_path, monkeypatch):
