@@ -105,6 +105,19 @@ def test_pytest_gate_rejects_a_user_mutable_host_lock(tmp_path: Path):
         _open_trusted_host_lock(lock)
 
 
+def test_tmpfiles_config_recreates_the_trusted_pytest_lock_after_reboot():
+    config = Path(__file__).parent / "runtime_hooks" / "builder4-pytest.conf"
+    lines = {
+        line.strip()
+        for line in config.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert "d /run/lock/builder4 0700 root root -" in lines
+    assert "f /run/lock/builder4/pytest-heavy.lock 0400 root root -" in lines
+    assert "z /run/lock/builder4/pytest-heavy.lock 0400 root root -" in lines
+
+
 def test_claude_launch_is_scoped_and_inherits_the_pytest_gate(monkeypatch):
     import app
 
