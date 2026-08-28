@@ -9262,6 +9262,56 @@ def _profile_dir(profile_id: str) -> Path:
     return Path.home() / f".claude-{profile_id}"
 
 
+# Claude Code records how it was installed in <CLAUDE_CONFIG_DIR>/.claude.json,
+# and a config dir we create starts without those keys. Left unset, the updater
+# cannot tell it is running a native install, and the moment anything writes
+# autoUpdates:false into that profile the auto-updater switches itself off
+# silently -- which is how this box sat on an old version. Seed the keys from
+# the authoritative ~/.claude.json, never overwriting what is already there.
+_UPDATE_CONFIG_KEYS = ("installMethod", "autoUpdates", "autoUpdatesProtectedForNative")
+
+
+def _seed_profile_update_config(config_dir: Path):
+    source = Path.home() / ".claude.json"
+    try:
+        base = json.loads(source.read_text())
+    except Exception:
+        return
+    if not isinstance(base, dict):
+        return
+    seed = {k: base[k] for k in _UPDATE_CONFIG_KEYS if k in base}
+    if not seed:
+        return
+    target = config_dir / ".claude.json"
+    current: dict = {}
+    if target.exists():
+        try:
+            loaded = json.loads(target.read_text())
+            current = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            logger.debug("%s was not valid JSON; leaving it alone", target)
+            return
+    # All three keys are one unit. The updater reads them together as
+    # `autoUpdates is false AND (installMethod is not native OR not protected)
+    # => disabled`, so dropping autoUpdates:false onto a profile that records a
+    # different installMethod would switch its updates off. Only seed a config
+    # that has no installMethod of its own; one that has it maintains itself.
+    if "installMethod" in current:
+        return
+    missing = {k: v for k, v in seed.items() if k not in current}
+    if not missing:
+        return
+    current.update(missing)
+    try:
+        tmp = target.with_suffix(".json.seedtmp")
+        tmp.write_text(json.dumps(current, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        logger.info("Seeded update config %s into %s", sorted(missing), target)
+    except Exception:
+        logger.debug("Failed to seed update config into %s", target, exc_info=True)
+
+
 def _materialize_profile(profile: dict):
     """Write settings.json, CLAUDE.md, and ensure skills/ exists.
 
@@ -9277,6 +9327,7 @@ def _materialize_profile(profile: dict):
     d = _profile_dir(pid)
     d.mkdir(parents=True, exist_ok=True)
     (d / "skills").mkdir(parents=True, exist_ok=True)
+    _seed_profile_update_config(d)
     is_default = (pid == DEFAULT_PROFILE_ID)
 
     settings_path = d / "settings.json"
