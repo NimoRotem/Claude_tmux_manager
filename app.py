@@ -1508,6 +1508,11 @@ def _ensure_user_claude_config_dir(user: dict):
             "hasCompletedOnboarding": True,
             "numStartups": 1,
         }, indent=2))
+    # ...and tell it how Claude Code was installed, or its auto-updater cannot
+    # tell this is a native install and switches itself off the first time an
+    # update fails. Must run after the stub exists so the merge keeps
+    # hasCompletedOnboarding. See _seed_profile_update_config.
+    _seed_profile_update_config(d)
     # Team mode: shared Claude auth token, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
