@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import browser_live
+import docsign
 import patent_forms
 import patent_packet as pkt
 import patent_store as store
@@ -478,6 +479,131 @@ async def api_forms_list(packet_id: str):
     return JSONResponse({"forms": meta.get("forms") or []})
 
 
+
+# ==========================================================================
+# send for signature (GRABO Sign)
+# ==========================================================================
+@router.get("/api/docsign/health")
+async def api_docsign_health():
+    try:
+        res = await asyncio.to_thread(docsign.probe)
+        cfg = res.get("config") or {}
+        return JSONResponse({"ok": True, "user": cfg.get("user"),
+                             "email": cfg.get("userEmail"),
+                             "ai_fields": bool(cfg.get("llmAvailable")),
+                             "url": cfg.get("publicUrl")})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)[:300]})
+
+
+@router.post("/api/packet/{packet_id}/sign")
+async def api_packet_sign(packet_id: str, request: Request):
+    """Send generated forms to their signers through GRABO Sign.
+
+    One document per form, because each inventor signs their own declaration and
+    they should not see each other's. GRABO Sign detects the fields with AI, emails
+    a private link per party, and stamps a final PDF with an audit page.
+    """
+    body = await request.json()
+    d = _packet_dir(packet_id)
+    if not d.exists():
+        return _err("unknown packet", 404)
+    meta = _load_meta(d)
+    items = body.get("items") or []
+    if not items:
+        return _err("nothing selected to send")
+    message = (body.get("message") or "").strip()
+    forms = {f["name"]: f for f in (meta.get("forms") or [])}
+    sigs = meta.setdefault("signatures", {})
+    results, data = [], store.load()
+
+    for item in items:
+        name = item.get("form_name")
+        form = forms.get(name)
+        if not form:
+            results.append({"form": name, "ok": False, "error": "not a generated form"})
+            continue
+        signer_name = (item.get("signer_name") or "").strip()
+        signer_email = (item.get("signer_email") or "").strip()
+        if not signer_email:
+            results.append({"form": name, "ok": False,
+                            "error": "no email address for %s" % (signer_name or "the signer")})
+            continue
+        try:
+            res = await asyncio.to_thread(
+                docsign.send, form["path"],
+                item.get("title") or form.get("label") or name,
+                [{"name": signer_name or signer_email, "email": signer_email}],
+                message, "Patent panel", (data.get("correspondence") or [{}])[0].get("email1", ""))
+        except Exception as exc:
+            results.append({"form": name, "ok": False, "error": str(exc)[:300]})
+            continue
+        sent = (res.get("sent") or [{}])[0]
+        sigs[name] = {"document_id": res["document_id"], "title": res["title"],
+                      "signer_name": signer_name, "signer_email": signer_email,
+                      # GRABO Sign answers camelCase here; keep the link because the
+                      # owner endpoint never returns a signing token again.
+                      "sign_url": sent.get("signUrl") or sent.get("sign_url") or "",
+                      "emailed": bool(sent.get("ok")),
+                      "view_url": res.get("view_url", ""),
+                      "fields": res.get("fields_assigned", 0),
+                      "sent_at": time.time(), "status": "sent"}
+        results.append({"form": name, "ok": True, **sigs[name]})
+        # Remember the address, so the next filing does not ask again.
+        inv_id = item.get("inventor_id")
+        if inv_id and signer_email:
+            row = store.find(data, "inventors", inv_id)
+            if row and not (row.get("email") or "").strip():
+                store.upsert("inventors", {"id": inv_id, "email": signer_email})
+                data = store.load()
+
+    _save_meta(d, meta)
+    return JSONResponse({"ok": any(r.get("ok") for r in results), "results": results,
+                         "signatures": sigs})
+
+
+@router.post("/api/packet/{packet_id}/sign/refresh")
+async def api_packet_sign_refresh(packet_id: str):
+    """Poll every sent document and pull back the ones that are finished."""
+    d = _packet_dir(packet_id)
+    meta = _load_meta(d)
+    sigs = meta.get("signatures") or {}
+    if not sigs:
+        return JSONResponse({"ok": True, "signatures": {}})
+    forms = {f["name"]: f for f in (meta.get("forms") or [])}
+    for name, rec in sigs.items():
+        try:
+            st = await asyncio.to_thread(docsign.status, rec["document_id"])
+        except Exception as exc:
+            rec["error"] = str(exc)[:200]
+            continue
+        rec.pop("error", None)
+        rec["status"] = st.get("status") or rec.get("status")
+        rec["signed"] = st.get("signed", 0)
+        rec["total"] = st.get("total", 0)
+        rec["viewed"] = bool((st.get("parties") or [{}])[0].get("viewed_at"))
+        if rec["status"] == "completed" and not rec.get("signed_file"):
+            signed_name = "SIGNED_" + name
+            try:
+                await asyncio.to_thread(docsign.final_pdf, rec["document_id"],
+                                        d / "forms" / signed_name)
+            except Exception as exc:
+                rec["error"] = str(exc)[:200]
+                continue
+            rec["signed_file"] = signed_name
+            # The signed copy is what gets filed, so it joins the form list and
+            # travels to the agent instead of the unsigned original.
+            entry = dict(forms.get(name) or {})
+            entry.update({"name": signed_name, "path": str(d / "forms" / signed_name),
+                          "label": (entry.get("label") or name) + " (signed)",
+                          "note": "Signed through GRABO Sign, with its audit page.",
+                          "verify": patent_forms.verify(d / "forms" / signed_name)})
+            meta.setdefault("forms", []).append(entry)
+            forms[signed_name] = entry
+    _save_meta(d, meta)
+    return JSONResponse({"ok": True, "signatures": sigs, "forms": meta.get("forms") or []})
+
+
 # ==========================================================================
 # hand off to an agent
 # ==========================================================================
@@ -629,8 +755,25 @@ async def api_packet_submit(packet_id: str, request: Request):
         file_lines.append("- %s -> %s (Patent Center description: %s)"
                           % (f["name"], f["role"],
                              pkt.DOC_DESCRIPTIONS.get(f["role"], "choose one")))
+    sigs = meta.get("signatures") or {}
+    superseded = {n for n, r in sigs.items() if r.get("signed_file")}
     for f in meta.get("forms") or []:
-        file_lines.append("- %s -> generated form, %s" % (f["name"], f["label"]))
+        if f["name"] in superseded:
+            continue                       # the signed copy below replaces it
+        note = ""
+        rec = sigs.get(f["name"])
+        if rec and not rec.get("signed_file"):
+            note = " [OUT FOR SIGNATURE, %s, not signed yet]" % rec.get("signer_email", "")
+        file_lines.append("- %s -> generated form, %s%s" % (f["name"], f["label"], note))
+    if superseded:
+        file_lines.append("- the signed copies above replace the unsigned originals; "
+                          "file the SIGNED_ files, not the drafts")
+    unsigned_out = [n for n, r in sigs.items() if not r.get("signed_file")]
+    if unsigned_out:
+        file_lines.append("- STILL UNSIGNED and out with a signer: " + ", ".join(unsigned_out)
+                          + ". Do not file a declaration that has not come back signed; "
+                            "filing without the oath costs the 37 CFR 1.16(f) surcharge "
+                            "($68 small entity) and a Notice to File Missing Parts.")
 
     base = str(request.base_url).rstrip("/")
     brief = BRIEF.format(
@@ -672,7 +815,8 @@ async def api_packet_submit(packet_id: str, request: Request):
             uploads = [brief_path, d / "filing.json"]
             uploads += [Path(f["path"]) for f in (meta.get("files") or [])
                         if f.get("role") != "exclude"]
-            uploads += [Path(f["path"]) for f in (meta.get("forms") or [])]
+            uploads += [Path(f["path"]) for f in (meta.get("forms") or [])
+                        if f["name"] not in superseded]
             for path in uploads:
                 if not path.exists():
                     continue
@@ -938,6 +1082,22 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
         <div id="formlist" style="margin-top:10px"></div>
       </div>
       <div class="card" style="margin-top:14px">
+        <h3>Send for signature</h3>
+        <p class="muted">Sends each form to its signer through <b>GRABO Sign</b>
+          (grabo.cc/data-dashboard/docsign). It detects the fields with AI, emails a private
+          link, and stamps a final PDF with an audit page. The signed copy comes back here and
+          is what gets filed. <span id="dshealth" class="pill"></span></p>
+        <div id="signrows"><span class="muted">Generate the forms first.</span></div>
+        <label>Message to the signers (optional)</label>
+        <input id="signmsg" placeholder="Please sign the inventor declaration for the vibration device application.">
+        <div class="row" style="margin-top:10px">
+          <button class="b fix" id="sendsign">Send selected</button>
+          <button class="g fix" id="refreshsign">Check signatures</button>
+          <span class="fix" id="signstat"></span>
+        </div>
+        <div id="signstate" style="margin-top:10px"></div>
+      </div>
+      <div class="card" style="margin-top:14px">
         <h3>Submit</h3>
         <p class="muted">Opens a Claude session in tmux with the packet, the resolved party
         data and a written brief. It re-checks everything, drives Patent Center in a
@@ -1144,7 +1304,7 @@ async function genForms(wanted){
       body:JSON.stringify({title:$('title').value,docket:$('docket').value,inventor_ids:picked(),
         applicant_id:$('applicant').value,wanted})});
     packet.forms=j.forms; $('formstat').textContent='';
-    drawForms();
+    drawForms(); drawSignRows();
   }catch(e){$('formstat').textContent='';toast('Form generation failed: '+e.message);}
 }
 $('genforms').onclick=()=>{
@@ -1188,6 +1348,88 @@ $('preview').onclick=async()=>{
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     $('briefout').style.display='block'; $('briefout').textContent=j.brief; $('substat').textContent='';}
   catch(e){$('substat').textContent='';toast(e.message);}
+};
+// ---- signatures ----
+api('/api/docsign/health').then(h=>{
+  $('dshealth').textContent = h.ok ? ('connected as '+h.user+(h.ai_fields?', AI field detection on':'')) : 'not reachable';
+  $('dshealth').className = 'pill '+(h.ok?'ok':'bad');
+}).catch(()=>{$('dshealth').textContent='not reachable';$('dshealth').className='pill bad';});
+
+function signerFor(formName){
+  // A declaration or an age petition belongs to the inventor named in its filename.
+  for(const i of (S.inventors||[])){
+    const slug=(i.given+'-'+i.family).toLowerCase().replace(/[^a-z0-9]+/g,'-');
+    if(formName.toLowerCase().includes(slug)) return i;
+  }
+  return (S.inventors||[]).find(i=>picked().includes(i.id)) || null;
+}
+function drawSignRows(){
+  const fs=(packet&&packet.forms)||[];
+  const unsigned=fs.filter(f=>!f.name.startsWith('SIGNED_'));
+  if(!unsigned.length){$('signrows').innerHTML='<span class="muted">Generate the forms first.</span>';return;}
+  const sigs=(packet&&packet.signatures)||{};
+  $('signrows').innerHTML=`<table><tr><th></th><th>Form</th><th>Signer</th><th>Email</th><th>State</th></tr>`+
+    unsigned.map(f=>{
+      const inv=signerFor(f.name); const rec=sigs[f.name]||null;
+      const nm=inv?`${inv.given} ${inv.family}`:'';
+      const em=rec?rec.signer_email:(inv&&inv.email)||'';
+      return `<tr><td><input type="checkbox" class="signpick" data-f="${esc(f.name)}"
+                 data-inv="${inv?inv.id:''}" ${rec?'':'checked'} style="width:auto"></td>
+        <td class="mono" style="font-size:12px">${esc(f.name)}</td>
+        <td><input class="signname" data-f="${esc(f.name)}" value="${esc(nm)}"></td>
+        <td><input class="signemail" data-f="${esc(f.name)}" value="${esc(em)}" placeholder="name@example.com"></td>
+        <td>${rec?signBadge(rec):'<span class="muted">not sent</span>'}</td></tr>`;
+    }).join('')+`</table>`;
+}
+function signBadge(r){
+  if(r.error)return `<span class="pill bad">${esc(r.error.slice(0,60))}</span>`;
+  if(r.status==='completed')return `<span class="pill ok">signed</span>`;
+  const seen=r.viewed?' opened':'';
+  return `<span class="pill warn">sent${esc(seen)}</span>`;
+}
+function drawSignState(){
+  const sigs=(packet&&packet.signatures)||{};
+  const rows=Object.entries(sigs);
+  if(!rows.length){$('signstate').innerHTML='';return;}
+  $('signstate').innerHTML=`<table><tr><th>Document</th><th>Signer</th><th>State</th><th>Link</th></tr>`+
+    rows.map(([n,r])=>`<tr><td class="mono" style="font-size:12px">${esc(n)}</td>
+      <td>${esc(r.signer_name||'')}<div class="hint">${esc(r.signer_email||'')}</div></td>
+      <td>${signBadge(r)}${r.emailed===false?'<div class="hint">email failed, send the link yourself</div>':''}</td>
+      <td>${r.sign_url?`<a href="${esc(r.sign_url)}" target="_blank" style="color:var(--acc)">signing link</a><br>`:''}
+          ${r.view_url?`<a href="${esc(r.view_url)}" target="_blank" class="hint">in GRABO Sign</a>`:''}</td></tr>`).join('')+`</table>`;
+}
+$('sendsign').onclick=async()=>{
+  if(!packet||!(packet.forms||[]).length)return toast('Generate the forms first.');
+  const items=[...document.querySelectorAll('.signpick:checked')].map(c=>{
+    const f=c.dataset.f;
+    return {form_name:f, inventor_id:c.dataset.inv||'',
+      signer_name:(document.querySelector(`.signname[data-f="${CSS.escape(f)}"]`)||{}).value||'',
+      signer_email:(document.querySelector(`.signemail[data-f="${CSS.escape(f)}"]`)||{}).value||''};
+  });
+  if(!items.length)return toast('Tick at least one form.');
+  const noEmail=items.filter(i=>!i.signer_email.trim());
+  if(noEmail.length)return toast('Add an email address for: '+noEmail.map(i=>i.form_name).join(', '));
+  $('signstat').textContent='sending, this takes a moment per document...';
+  try{
+    const j=await api('/api/packet/'+packet.id+'/sign',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({items,message:$('signmsg').value})});
+    packet.signatures=j.signatures; $('signstat').textContent='';
+    drawSignRows(); drawSignState();
+    const bad=j.results.filter(r=>!r.ok);
+    toast(bad.length?('Some failed: '+bad.map(b=>b.form+': '+b.error).join('; '))
+                    :'Sent. Each signer has an email with a private link.');
+  }catch(e){$('signstat').textContent='';toast('Send failed: '+e.message);}
+};
+$('refreshsign').onclick=async()=>{
+  if(!packet)return; $('signstat').textContent='checking...';
+  try{
+    const j=await api('/api/packet/'+packet.id+'/sign/refresh',{method:'POST'});
+    packet.signatures=j.signatures; packet.forms=j.forms;
+    $('signstat').textContent=''; drawSignRows(); drawSignState(); drawForms();
+    const done=Object.values(j.signatures).filter(r=>r.status==='completed').length;
+    toast(done?(done+' signed and pulled back into the packet.'):'Nothing signed yet.');
+  }catch(e){$('signstat').textContent='';toast(e.message);}
 };
 $('submit').onclick=async()=>{
   if(!$('title').value.trim())return toast('Give the invention a title first.');
