@@ -31,6 +31,7 @@ STORE_PATH = DATA_DIR / "store.json"
 FORMS_DIR = DATA_DIR / "forms"
 PACKETS_DIR = DATA_DIR / "packets"
 SIGNATURES_DIR = DATA_DIR / "signatures"
+SAMPLES_DIR = DATA_DIR / "samples"
 AUTH_DIR = DATA_DIR / "auth"
 
 _LOCK = threading.RLock()

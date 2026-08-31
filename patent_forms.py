@@ -258,6 +258,107 @@ def verify(path) -> dict:
     return out
 
 
+def stamp_pdf(src, dest, items, images=None) -> dict:
+    """Draw text and signature images onto an existing PDF and re-distil it.
+
+    `items`: [{page, x, y, w, h, kind, value, image}] with x/y/w/h as fractions of
+    the page, so the panel can place things on a rendered PNG at any zoom and the
+    server does not need to know what size it drew at.
+
+    Same two rules as `render`: text goes in an embedded font, and the result is
+    re-distilled so no BaseFont name carries a space, because Patent Center rejects
+    that as "non-embedded" even when the font is there.
+    """
+    src, dest = Path(src), Path(dest)
+    images = dict(images or {})
+    if not src.exists():
+        raise FormError("no such file: %s" % src)
+    doc = pymupdf.open(str(src))
+    placed = 0
+    try:
+        for page in doc:
+            page.insert_font(fontname=FONT_ALIAS, fontfile=FONT_FILE)
+        for item in items:
+            pno = int(item.get("page") or 0)
+            if pno < 0 or pno >= doc.page_count:
+                continue
+            page = doc[pno]
+            pr = page.rect
+            x = float(item.get("x", 0)) * pr.width
+            y = float(item.get("y", 0)) * pr.height
+            w = max(float(item.get("w", 0.2)) * pr.width, 8.0)
+            h = max(float(item.get("h", 0.03)) * pr.height, 6.0)
+            kind = (item.get("kind") or "text").lower()
+            if kind in ("signature", "initials"):
+                img = images.get(item.get("image") or "")
+                if not img or not Path(img).exists():
+                    continue
+                try:
+                    with pymupdf.open(str(img)) as im:
+                        iw, ih = im[0].rect.width, im[0].rect.height
+                except Exception:
+                    iw = ih = 0
+                if iw > 0 and ih > 0:
+                    scale = min(w / iw, h / ih)
+                    w2, h2 = iw * scale, ih * scale
+                else:
+                    w2, h2 = w, h
+                page.insert_image(pymupdf.Rect(x, y, x + w2, y + h2), filename=str(img),
+                                  keep_proportion=True, overlay=True)
+                placed += 1
+            else:
+                value = str(item.get("value") or "")
+                if not value:
+                    continue
+                size = float(item.get("size") or 11.0)
+                font = pymupdf.Font(fontfile=FONT_FILE)
+                while size > 5.0 and font.text_length(value, size) > w:
+                    size -= 0.5
+                page.insert_text((x, y + size), value, fontname=FONT_ALIAS,
+                                 fontsize=size, color=(0, 0, 0))
+                placed += 1
+
+        with tempfile.TemporaryDirectory(prefix="ptstamp_") as tmp:
+            stage = Path(tmp) / "stage.pdf"
+            doc.save(str(stage), garbage=4, deflate=True, clean=True)
+            doc.close()
+            final = Path(tmp) / "gs.pdf"
+            if shutil.which("gs"):
+                r = subprocess.run(
+                    ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
+                     "-dPDFSETTINGS=/prepress", "-dEmbedAllFonts=true", "-dSubsetFonts=true",
+                     "-dCompatibilityLevel=1.5", "-dAutoRotatePages=/None",
+                     "-sOutputFile=" + str(final), str(stage)],
+                    capture_output=True, text=True, timeout=180)
+                if r.returncode != 0 or not final.exists():
+                    raise FormError("ghostscript failed: %s" % (r.stderr or "")[:300])
+            else:
+                final = stage
+            reader = PdfReader(str(final))
+            writer = PdfWriter()
+            for pg in reader.pages:
+                writer.add_page(pg)
+            root = writer._root_object
+            for key in ("/AcroForm", "/OpenAction", "/AA", "/Names", "/JavaScript"):
+                if key in root:
+                    del root[key]
+            writer.add_metadata({"/Title": dest.stem, "/Producer": "", "/Creator": ""})
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as fh:
+                writer.write(fh)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return {"ok": True, "path": str(dest), "placed": placed}
+
+
+def page_sizes(path) -> list:
+    with pymupdf.open(str(path)) as doc:
+        return [{"w": round(p.rect.width, 1), "h": round(p.rect.height, 1)} for p in doc]
+
+
 def _today() -> str:
     return datetime.date.today().isoformat()
 

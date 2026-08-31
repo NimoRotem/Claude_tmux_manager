@@ -272,10 +272,14 @@ async def api_packet_forms(packet_id: str, request: Request):
     forms_dir.mkdir(parents=True, exist_ok=True)
     made = []
 
-    def _add(path, label, note=""):
+    def _add(path, label, note="", signed_by="", presigned=False):
         report = patent_forms.verify(path)
         made.append({"path": str(path), "name": Path(path).name, "label": label,
-                     "note": note, "verify": report})
+                     "note": note, "verify": report,
+                     # A form whose signer already has a signature image on file comes
+                     # out signed. It never needs a signing round trip, and the panel
+                     # must not offer to email it to the person who just signed it.
+                     "signed_by": signed_by, "presigned": bool(presigned)})
 
     try:
         invs = [store.find(data, "inventors", i) for i in inv_ids]
@@ -289,7 +293,8 @@ async def api_packet_forms(packet_id: str, request: Request):
                 await asyncio.to_thread(patent_forms.build_declaration, out, name, title,
                                         "", "", _signature_path(inv))
                 _add(out, "Declaration 37 CFR 1.63 (PTO/AIA/01), %s" % name,
-                     "Carries the 1.63(a)(4) statement that hand-built packets usually miss.")
+                     "Carries the 1.63(a)(4) statement that hand-built packets usually miss.",
+                     signed_by=name, presigned=bool(_signature_path(inv)))
         if "age_petition" in wanted:
             for inv in invs:
                 if not inv.get("age_65_plus"):
@@ -305,7 +310,7 @@ async def api_packet_forms(packet_id: str, request: Request):
                     signature_image=_signature_path(inv))
                 _add(out, "Petition to Make Special on Age (PTO/SB/130), %s" % name,
                      "No fee under 37 CFR 1.102(c)(1). File it after the application "
-                     "number exists.")
+                     "number exists.", signed_by=name, presigned=bool(_signature_path(inv)))
         if "poa" in wanted:
             applicant = store.find(data, "applicants", body.get("applicant_id") or "")
             prac = store.find(data, "practitioners", body.get("practitioner_id") or "")
@@ -328,7 +333,9 @@ async def api_packet_forms(packet_id: str, request: Request):
             _add(out, "Power of Attorney (PTO/AIA/82)",
                  "Appoints %s. Providing representative details on an ADS is NOT a power "
                  "of attorney (37 CFR 1.32), so this form is the thing that actually does it."
-                 % (prac.get("firm") or prac.get("name") or "the practitioner"))
+                 % (prac.get("firm") or prac.get("name") or "the practitioner"),
+                 signed_by=store.full_name(signer) if signer else "",
+                 presigned=bool(_signature_path(signer)))
         if "statement_373" in wanted:
             applicant = store.find(data, "applicants", body.get("applicant_id") or "")
             out = forms_dir / "STATEMENT_3_73.pdf"
@@ -343,7 +350,9 @@ async def api_packet_forms(packet_id: str, request: Request):
                 signature_image=_signature_path(invs[0] if invs else {}))
             _add(out, "Statement under 37 CFR 3.73(c) (PTO/AIA/96)",
                  "Only needed when an assignee takes an action, including becoming the "
-                 "applicant under 37 CFR 1.46(c)(2).")
+                 "applicant under 37 CFR 1.46(c)(2).",
+                 signed_by=store.full_name(invs[0]) if invs else "",
+                 presigned=bool(_signature_path(invs[0] if invs else {})))
     except patent_forms.FormError as exc:
         return _err(str(exc), 500)
     except Exception as exc:
@@ -480,6 +489,152 @@ async def api_forms_list(packet_id: str):
 
 
 
+
+# ==========================================================================
+# sign on screen, no email, nothing sent
+# ==========================================================================
+@router.get("/api/packet/{packet_id}/form/{name}/layout")
+async def api_form_layout(packet_id: str, name: str):
+    try:
+        path = _form_file(packet_id, name)
+    except (FileNotFoundError, ValueError):
+        return _err("no such form", 404)
+    pages = await asyncio.to_thread(patent_forms.page_sizes, path)
+    data = store.load()
+    people = []
+    for coll in ("inventors", "practitioners"):
+        for row in data.get(coll) or []:
+            if row.get("signature_file"):
+                people.append({"id": row["id"],
+                               "name": store.full_name(row) if coll == "inventors"
+                                       else row.get("name", ""),
+                               "file": row["signature_file"]})
+    return JSONResponse({"pages": pages, "signatures": people})
+
+
+@router.post("/api/packet/{packet_id}/form/{name}/stamp")
+async def api_form_stamp(packet_id: str, name: str, request: Request):
+    """Apply what the user placed on screen and save it as the signed copy.
+
+    Nothing leaves the box: this is the fill-and-sign-it-yourself path, for when
+    the signer is the person at the keyboard and an email round trip is silly.
+    """
+    body = await request.json()
+    items = body.get("items") or []
+    if not items:
+        return _err("nothing placed on the document")
+    d = _packet_dir(packet_id)
+    try:
+        src = _form_file(packet_id, name)
+    except (FileNotFoundError, ValueError):
+        return _err("no such form", 404)
+    data = store.load()
+    images = {}
+    for coll in ("inventors", "practitioners"):
+        for row in data.get(coll) or []:
+            p = _signature_path(row)
+            if p:
+                images[row["id"]] = p
+    out_name = name if name.startswith("SIGNED_") else "SIGNED_" + name
+    dest = d / "forms" / out_name
+    try:
+        res = await asyncio.to_thread(patent_forms.stamp_pdf, src, dest, items, images)
+    except Exception as exc:
+        return _err("could not stamp: %s" % exc, 500)
+    verify = await asyncio.to_thread(patent_forms.verify, dest)
+
+    meta = _load_meta(d)
+    forms = meta.setdefault("forms", [])
+    base = next((f for f in forms if f["name"] == name), {})
+    entry = {k: base.get(k) for k in ("label", "note") if base.get(k)}
+    entry.update({"name": out_name, "path": str(dest), "verify": verify,
+                  "label": (base.get("label") or name) + " (signed on screen)",
+                  "note": "Filled and signed in the panel. Nothing was emailed.",
+                  "presigned": True, "signed_by": body.get("signed_by") or ""})
+    forms[:] = [f for f in forms if f["name"] != out_name] + [entry]
+    # The signed copy supersedes the draft in the handoff, same as an emailed one.
+    meta.setdefault("signatures", {})[name] = {
+        "document_id": "", "title": entry["label"], "signer_name": body.get("signed_by") or "",
+        "signer_email": "", "sign_url": "", "view_url": "", "emailed": False,
+        "status": "completed", "signed_file": out_name, "on_screen": True,
+        "sent_at": time.time(), "signed": 1, "total": 1}
+    _save_meta(d, meta)
+    return JSONResponse({"ok": True, "form": entry, "placed": res["placed"],
+                         "forms": forms, "signatures": meta["signatures"]})
+
+
+@router.post("/api/signature/{person_id}/draw")
+async def api_signature_draw(person_id: str, request: Request):
+    """Save a signature drawn in the browser (a data: URL from a canvas)."""
+    body = await request.json()
+    raw = (body.get("data_url") or "").strip()
+    if not raw.startswith("data:image/png;base64,"):
+        return _err("expected a PNG data URL")
+    import base64
+    try:
+        blob = base64.b64decode(raw.split(",", 1)[1])
+    except Exception:
+        return _err("could not decode the drawing")
+    if len(blob) > 4 * 1024 * 1024:
+        return _err("drawing too large", 413)
+    store.SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in person_id if c.isalnum() or c in "-_") or "person"
+    dest = store.SIGNATURES_DIR / (safe + ".png")
+    for old in store.SIGNATURES_DIR.glob(safe + ".*"):
+        if old != dest:
+            old.unlink(missing_ok=True)
+    dest.write_bytes(blob)
+    for coll in ("inventors", "practitioners"):
+        for row in store.load().get(coll) or []:
+            if row.get("id") == person_id:
+                store.upsert(coll, {"id": person_id, "signature_file": dest.name})
+    return JSONResponse({"ok": True, "file": dest.name})
+
+
+# ==========================================================================
+# demo run
+# ==========================================================================
+@router.post("/api/demo")
+async def api_demo(request: Request):
+    """Build a packet from the bundled sample application, ready to push through.
+
+    It is a real Patent Center run: real login, real web ADS, real uploads, real
+    fee calculation. The only thing it does not do is press Submit or pay, and the
+    brief makes that a hard stop rather than a hope.
+    """
+    samples = sorted(store.SAMPLES_DIR.glob("*")) if store.SAMPLES_DIR.exists() else []
+    if not samples:
+        return _err("no sample application installed in %s" % store.SAMPLES_DIR, 404)
+    title = ("DEMO - VIBRATION DEVICE FOR BEDDING COVERING ELEMENTS USING A SUSTAINED "
+             "PRESSURE DIFFERENTIAL ACROSS A RIGID SLIDING PERIMETER")
+    packet_id = "%s-demo" % int(time.time())
+    d = _packet_dir(packet_id)
+    (d / "in").mkdir(parents=True, exist_ok=True)
+    (d / "forms").mkdir(parents=True, exist_ok=True)
+    for sample in samples:
+        shutil.copy2(sample, d / "in" / sample.name)
+    data = store.load()
+    defaults = data.get("defaults") or {}
+    meta = {"id": packet_id, "created": time.time(), "files": [], "demo": True,
+            "title": title, "docket": "DEMO-001",
+            "inventor_ids": ["inv_nimrod"],
+            "applicant_id": defaults.get("applicant_id") or "app_inventors",
+            "correspondence_id": defaults.get("correspondence_id") or "corr_nimo",
+            "entity_status": defaults.get("entity_status") or "small",
+            "publication": "normal"}
+    _save_meta(d, meta)
+    files_dir = d / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    expanded = await asyncio.to_thread(pkt.expand, d / "in", files_dir)
+    entries = [{"path": str(p), "name": p.name,
+                "role": await asyncio.to_thread(pkt.guess_role, p)} for p in expanded]
+    report = await asyncio.to_thread(pkt.review_packet, entries)
+    meta["files"] = entries
+    meta["report"] = report
+    _save_meta(d, meta)
+    return JSONResponse({"ok": True, "packet": meta, "files": entries, "report": report})
+
+
 # ==========================================================================
 # send for signature (GRABO Sign)
 # ==========================================================================
@@ -607,11 +762,34 @@ async def api_packet_sign_refresh(packet_id: str):
 # ==========================================================================
 # hand off to an agent
 # ==========================================================================
+
+DEMO_STOP = """
+## THIS IS A DEMO RUN. DO NOT FILE.
+
+Everything below is real: the real Patent Center, the real login, the real forms.
+The one thing that must not happen is the filing.
+
+Go all the way to the **Review & submit** screen and then STOP:
+  1. Log in to Patent Center.
+  2. Start a Utility Nonprovisional, choose the Web ADS, and fill it in from the
+     party data in filing.json.
+  3. Upload the documents and give each one its description.
+  4. Run Calculate fees and let it price the filing.
+  5. Reach Review & submit, screenshot it, and read the totals back here.
+  6. **Do not click Submit. Do not open the payment page. Do not enter a card.**
+  7. Leave the draft in place, or use Cancel submission, whichever Nimo asks for.
+     A draft that is never submitted costs nothing and files nothing.
+
+Report what each step looked like, anything that would have gone wrong on a real
+run, and the fee total Patent Center calculated. If you find yourself about to
+press Submit, you have misread this brief.
+"""
+
 BRIEF = """# USPTO filing brief
 
 You are finishing a US patent filing end to end. Everything below was prepared and
 checked by the patent panel; your job is to verify it yourself, fix anything still
-wrong, drive Patent Center, pay, and report back.
+wrong, {mission}
 
 ## What is being filed
 - Title: {title}
@@ -659,14 +837,11 @@ Generated forms: `{packet_dir}/forms`
 5. Use the Patent Center **web ADS**, not an uploaded ADS PDF. Upload the
    specification as **DOCX** to avoid the 37 CFR 1.16(u) surcharge. Give every file
    a document description or the submit button silently refuses.
-6. Pay with the Ramp card: `get_payment_method` for `{payment_key}`. Never write the
-   number to disk or into a screenshot you keep.
-7. When the receipt appears, capture the application number, confirmation number and
-   the payment transaction id, then close the browser you opened
-   (`browser_live.shutdown(port, profile)`), and report back here.
+6. {pay_step}
+7. {finish_step}
 
 ## Non-negotiable
-- Do not file if the gate above says a registered practitioner is required.
+{stop_rule}- Do not file if the gate above says a registered practitioner is required.
 - Do not check the nonpublication request box unless explicitly told to; it forfeits
   foreign filing rights.
 - Read the whole packet before submitting. You are signing a declaration under
@@ -704,10 +879,12 @@ async def api_packet_submit(packet_id: str, request: Request):
     entity = body.get("entity_status") or meta.get("entity_status") or "small"
     publication = body.get("publication") or meta.get("publication") or "normal"
 
+    demo = bool(meta.get("demo") or body.get("demo"))
     snap = store.snapshot_for_agent(data, inv_ids, applicant_id, corr_id, entity,
                                     publication, docket, title)
     gate = snap["gate"]
-    if gate["practitioner_required"] and not body.get("force"):
+    if gate["practitioner_required"] and not body.get("force") and not (
+            meta.get("demo") or body.get("demo")):
         return _err("A registered practitioner is required for this combination: "
                     + "; ".join(gate["reasons"]) + ". Fix the parties, or resubmit "
                     "with force to prepare the packet for the firm anyway.", 409)
@@ -717,7 +894,7 @@ async def api_packet_submit(packet_id: str, request: Request):
                                total_claims=int(counts.get("total") or 20),
                                independent_claims=int(counts.get("independent") or 3))
     slug = store.slugify(title, "filing")
-    session_name = ("uspto %s" % slug)[:60]
+    session_name = (("uspto demo %s" if demo else "uspto %s") % slug)[:60]
 
     parties = []
     for inv in snap["inventors"]:
@@ -776,7 +953,28 @@ async def api_packet_submit(packet_id: str, request: Request):
                             "($68 small entity) and a Notice to File Missing Parts.")
 
     base = str(request.base_url).rstrip("/")
+    pay_key = (snap.get("payment") or {}).get("advisor_key", "ramp-uspto-filing-fees")
+    if demo:
+        mission = ("drive Patent Center as far as the Review and submit screen, and report "
+                   "back. You are NOT filing and you are NOT paying.")
+        pay_step = ("DEMO: do NOT pay and do NOT open the payment page. Stop at Review and "
+                    "submit.")
+        finish_step = ("Screenshot Review and submit, read back the fee total Patent Center "
+                       "calculated, close the browser you opened "
+                       "(`browser_live.shutdown(port, profile)`), and report here. Leave the "
+                       "draft unsubmitted.")
+        stop_rule = ("- THIS IS A DEMO. Do not press Submit and do not pay, whatever else "
+                     "this brief says.\n")
+    else:
+        mission = "drive Patent Center, pay, and report back."
+        pay_step = ("Pay with the Ramp card: `get_payment_method` for `%s`. Never write the "
+                    "number to disk or into a screenshot you keep." % pay_key)
+        finish_step = ("When the receipt appears, capture the application number, confirmation "
+                       "number and the payment transaction id, then close the browser you "
+                       "opened (`browser_live.shutdown(port, profile)`), and report back here.")
+        stop_rule = ""
     brief = BRIEF.format(
+        mission=mission, pay_step=pay_step, finish_step=finish_step, stop_rule=stop_rule,
         title=title, docket=docket or "(none)", entity_status=entity,
         publication=publication, parties="\n".join(parties), gate=gate_text,
         fees="\n".join("- %s (%s): $%d" % (l["label"], l["code"], l["amount"])
@@ -788,6 +986,8 @@ async def api_packet_submit(packet_id: str, request: Request):
         slug=slug, live_url=base + "/patents#live",
         payment_key=(snap.get("payment") or {}).get("advisor_key", "ramp-uspto-filing-fees"))
 
+    if meta.get("demo") or body.get("demo"):
+        brief = DEMO_STOP + "\n" + brief
     brief_path = d / "BRIEF.md"
     brief_path.write_text(brief, encoding="utf8")
     if body.get("dry_run"):
@@ -823,19 +1023,23 @@ async def api_packet_submit(packet_id: str, request: Request):
                 files = {"file": (path.name, path.read_bytes(), "application/octet-stream")}
                 await client.post("/api/sessions/%s/upload" % created, files=files)
 
-            msg = ("Please file this US patent application. The full brief is in "
+            msg = (("DEMO RUN, do not file. " if demo else "")
+                   + "Please file this US patent application. The full brief is in "
                    "BRIEF.md, which I have just uploaded along with the packet, the "
                    "generated forms and filing.json (the resolved party data). Read "
                    "BRIEF.md first, verify the packet yourself, then complete the "
                    "Patent Center submission and payment and report the application "
-                   "number, confirmation number and payment transaction id.")
+                   "number, confirmation number and payment transaction id."
+                   + (" For this demo, stop at Review & submit and do not press "
+                      "Submit or pay." if demo else ""))
             await client.post("/api/sessions/%s/send" % created, json={"command": msg})
     except Exception as exc:
         return _err("handoff failed: %s" % exc, 500)
 
     entry = store.record_filing({
         "packet_id": packet_id, "title": title, "docket": docket,
-        "session": created, "entity_status": entity, "status": "handed off",
+        "session": created, "entity_status": entity,
+        "status": "demo, stops before filing" if demo else "handed off", "demo": demo,
         "gate": gate, "fee_estimate": fees["total"],
     })
     meta["session"] = created
@@ -1004,6 +1208,17 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);
 padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-space:pre-wrap}
 .hint{font-size:11px;color:var(--mut);margin-top:3px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:80;display:none;overflow:auto;padding:18px}
+.modal.on{display:block}
+.sheet{max-width:1000px;margin:0 auto;background:var(--panel);border:1px solid var(--line);
+border-radius:var(--rad);padding:14px}
+#pagewrap{position:relative;display:inline-block;background:#fff;border-radius:6px;line-height:0}
+#pageimg{max-width:100%;display:block}
+.mark{position:absolute;border:1px dashed var(--acc);background:rgba(75,159,255,.10);
+cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidden;white-space:nowrap}
+.mark img{width:100%;height:100%;object-fit:contain;display:block}
+#drawpad{background:#fff;border-radius:8px;border:1px solid var(--line);touch-action:none;cursor:crosshair}
+.tool.on{background:var(--acc);color:#06121f;border-color:var(--acc)}
 </style></head><body>
 <header>
   <h1>Patent filing</h1>
@@ -1018,6 +1233,16 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
 <main>
 
 <section id="s-new" class="on">
+  <div class="card" style="margin-bottom:14px">
+    <div class="row">
+      <div><b>Try it end to end.</b>
+        <div class="hint">Loads the bundled sample application, runs the checks, and hands it to a
+        session that logs in to the real Patent Center, fills the web ADS, uploads, prices the
+        filing and stops at Review &amp; submit. It never presses Submit and never pays.</div></div>
+      <button class="g fix" id="demorun">Load the demo application</button>
+      <span class="fix" id="demostat"></span>
+    </div>
+  </div>
   <div id="gate"></div>
   <div class="split">
     <div>
@@ -1159,6 +1384,41 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
     </div>
   </div>
 </section>
+
+<div class="modal" id="signmodal"><div class="sheet">
+  <div class="row">
+    <b class="fix mono" id="sm-name"></b>
+    <span class="fix" style="flex:1"></span>
+    <button class="g fix" id="sm-prev">Prev</button>
+    <span class="fix muted" id="sm-page"></span>
+    <button class="g fix" id="sm-next">Next</button>
+    <button class="d fix" id="sm-close">Close</button>
+  </div>
+  <div class="banner warn" id="sm-warn" style="display:none;margin:8px 0"></div>
+  <p class="muted" style="margin:8px 0">Pick a tool, then click where it goes on the page.
+    Click a placed item to remove it. Nothing is emailed and nothing leaves this box.</p>
+  <div class="row" style="margin-bottom:10px">
+    <button class="g tool fix" data-tool="text">Text</button>
+    <button class="g tool fix" data-tool="date">Date</button>
+    <button class="g tool fix" data-tool="signature">Signature</button>
+    <select class="fix" id="sm-who" style="max-width:230px"></select>
+    <button class="g fix" id="sm-draw">Draw one</button>
+    <span class="fix" style="flex:1"></span>
+    <button class="g fix" id="sm-undo">Undo</button>
+    <button class="b fix" id="sm-apply">Apply and save</button>
+    <span class="fix" id="sm-stat"></span>
+  </div>
+  <div id="pagewrap"><img id="pageimg" alt="page"></div>
+  <div id="sm-drawbox" style="display:none;margin-top:12px">
+    <p class="muted">Draw the signature, then save it against the person selected above. It is
+      stored once and reused on every form.</p>
+    <canvas id="drawpad" width="640" height="180"></canvas>
+    <div class="row" style="margin-top:8px">
+      <button class="g fix" id="sm-drawclear">Clear</button>
+      <button class="b fix" id="sm-drawsave">Save signature</button>
+    </div>
+  </div>
+</div></div>
 
 <section id="s-history"><div class="card"><h3>Filings</h3><div id="hist"></div></div></section>
 </main>
@@ -1326,13 +1586,14 @@ function drawForms(){
         <div><b class="mono" style="font-size:12px">${esc(f.name)}</b>
           <div class="hint">${esc(f.label)}</div>
           ${f.note?`<div class="hint">${esc(f.note)}</div>`:''}</div>
-        <span class="pill fix ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span>
+        <span class="fix">${f.presigned?'<span class="pill ok">signed</span> ':''}<span class="pill ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span></span>
       </div>
       <a href="${base}${encodeURIComponent(f.name)}" target="_blank" title="open the PDF">
         <img src="${base}${encodeURIComponent(f.name)}/thumb?t=${Date.now()}"
              style="width:100%;margin-top:10px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>
       <div class="row" style="margin-top:8px">
         <a class="g fix" target="_blank" href="${base}${encodeURIComponent(f.name)}">Open PDF</a>
+        <button class="g fix" onclick="openSigner('${esc(f.name)}')">Sign on screen</button>
         <span class="fix muted">${f.verify.pages||''} page(s)</span>
       </div>
       ${bad.length?`<div class="hint" style="color:var(--bad)">${bad.map(c=>esc(c.label+' '+(c.detail||''))).join('<br>')}</div>`:''}
@@ -1365,8 +1626,10 @@ function signerFor(formName){
 }
 function drawSignRows(){
   const fs=(packet&&packet.forms)||[];
-  const unsigned=fs.filter(f=>!f.name.startsWith('SIGNED_'));
-  if(!unsigned.length){$('signrows').innerHTML='<span class="muted">Generate the forms first.</span>';return;}
+  // A form that already carries a signature does not need an email round trip.
+  const unsigned=fs.filter(f=>!f.name.startsWith('SIGNED_')&&!f.presigned);
+  if(!unsigned.length){$('signrows').innerHTML='<span class="muted">'+
+    (fs.length?'Every form is signed already. Nothing to send.':'Generate the forms first.')+'</span>';return;}
   const sigs=(packet&&packet.signatures)||{};
   $('signrows').innerHTML=`<table><tr><th></th><th>Form</th><th>Signer</th><th>Email</th><th>State</th></tr>`+
     unsigned.map(f=>{
@@ -1431,6 +1694,134 @@ $('refreshsign').onclick=async()=>{
     toast(done?(done+' signed and pulled back into the packet.'):'Nothing signed yet.');
   }catch(e){$('signstat').textContent='';toast(e.message);}
 };
+
+// ---- demo ----
+$('demorun').onclick=async()=>{
+  $('demostat').textContent='building...';
+  try{
+    const j=await api('/api/demo',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    packet=j.packet; packet.files=j.files; packet.report=j.report;
+    $('title').value=packet.title; $('docket').value=packet.docket;
+    $('entity').value=packet.entity_status; $('publication').value=packet.publication||'normal';
+    document.querySelectorAll('.inv').forEach(c=>c.checked=(packet.inventor_ids||[]).includes(c.value));
+    drawFiles(); drawReport(); recompute(); drawForms(); drawSignRows();
+    $('demostat').textContent='';
+    toast('Demo application loaded. Generate the forms, then Submit: the session will stop at Review and submit.');
+  }catch(e){$('demostat').textContent='';toast('Demo failed: '+e.message);}
+};
+
+// ---- sign on screen ----
+let SM={name:'',page:0,pages:[],items:[],tool:null,sigs:[]};
+window.openSigner=async(name)=>{
+  if(!packet)return;
+  SM={name,page:0,pages:[],items:[],tool:null,sigs:[]};
+  const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(name)+'/layout');
+  SM.pages=j.pages; SM.sigs=j.signatures||[];
+  $('sm-name').textContent=name;
+  // A form generated for someone whose signature is already on file comes out
+  // signed. Stamping another one lands on top of it, which is what a second
+  // signature looked like in testing, so say so rather than let it happen.
+  const f=((packet&&packet.forms)||[]).find(x=>x.name===name);
+  $('sm-warn').style.display = (f&&f.presigned) ? 'block' : 'none';
+  if(f&&f.presigned) $('sm-warn').textContent =
+    'This form already carries '+(f.signed_by||'a')+' signature from the stored image. '
+    +'Use this to add a date or a missing field; placing another signature will overlap the one there.';
+  $('sm-who').innerHTML=(S.inventors||[]).concat(S.practitioners||[]).map(r=>{
+    const nm=r.given?`${r.given} ${r.family}`:(r.name||r.id);
+    const has=SM.sigs.some(x=>x.id===r.id);
+    return `<option value="${r.id}">${esc(nm)}${has?'':' (no signature yet)'}</option>`;}).join('');
+  $('signmodal').classList.add('on'); $('sm-drawbox').style.display='none';
+  showPage(0);
+};
+function showPage(n){
+  SM.page=Math.max(0,Math.min(n,SM.pages.length-1));
+  $('sm-page').textContent=`Page ${SM.page+1} of ${SM.pages.length}`;
+  $('pageimg').src=`${B}/patents/api/packet/${packet.id}/form/${encodeURIComponent(SM.name)}/thumb?page=${SM.page}&t=${Date.now()}`;
+  drawMarks();
+}
+$('sm-prev').onclick=()=>showPage(SM.page-1);
+$('sm-next').onclick=()=>showPage(SM.page+1);
+$('sm-close').onclick=()=>{$('signmodal').classList.remove('on');};
+document.querySelectorAll('.tool').forEach(b=>b.onclick=()=>{
+  SM.tool = SM.tool===b.dataset.tool ? null : b.dataset.tool;
+  document.querySelectorAll('.tool').forEach(x=>x.classList.toggle('on',x.dataset.tool===SM.tool));
+});
+$('pageimg').onclick=e=>{
+  if(!SM.tool)return toast('Pick a tool first.');
+  const r=e.target.getBoundingClientRect();
+  const x=(e.clientX-r.left)/r.width, y=(e.clientY-r.top)/r.height;
+  if(SM.tool==='signature'){
+    const who=$('sm-who').value;
+    if(!SM.sigs.some(s=>s.id===who))return toast('That person has no signature yet. Use "Draw one", or upload it on Settings.');
+    SM.items.push({page:SM.page,x,y,w:0.22,h:0.045,kind:'signature',image:who,label:'signature'});
+  }else{
+    const now=new Date().toISOString().slice(0,10);
+    const v=prompt(SM.tool==='date'?'Date':'Text', SM.tool==='date'?now:'');
+    if(v===null)return;
+    SM.items.push({page:SM.page,x,y,w:0.25,h:0.028,kind:'text',value:v,size:11,label:v});
+  }
+  drawMarks();
+};
+function drawMarks(){
+  const wrap=$('pagewrap');
+  [...wrap.querySelectorAll('.mark')].forEach(m=>m.remove());
+  const img=$('pageimg'); const W=img.clientWidth, H=img.clientHeight;
+  SM.items.forEach((it,i)=>{
+    if(it.page!==SM.page)return;
+    const d=document.createElement('div'); d.className='mark';
+    d.style.left=(it.x*W)+'px'; d.style.top=(it.y*H)+'px';
+    d.style.width=(it.w*W)+'px'; d.style.height=(it.h*H)+'px';
+    if(it.kind==='signature'){
+      d.innerHTML=`<img src="${B}/patents/api/signature/${it.image}?t=${Date.now()}">`;
+    } else { d.textContent=it.value; }
+    d.title='click to remove';
+    d.onclick=ev=>{ev.stopPropagation();SM.items.splice(i,1);drawMarks();};
+    wrap.appendChild(d);
+  });
+}
+$('pageimg').onload=drawMarks;
+$('sm-undo').onclick=()=>{SM.items.pop();drawMarks();};
+$('sm-apply').onclick=async()=>{
+  if(!SM.items.length)return toast('Nothing placed yet.');
+  $('sm-stat').textContent='saving...';
+  try{
+    const who=$('sm-who').selectedOptions[0];
+    const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(SM.name)+'/stamp',
+      {method:'POST',headers:{'Content-Type':'application/json'},
+       body:JSON.stringify({items:SM.items,signed_by:who?who.textContent.replace(' (no signature yet)',''):''})});
+    packet.forms=j.forms; packet.signatures=j.signatures;
+    $('sm-stat').textContent=''; $('signmodal').classList.remove('on');
+    drawForms(); drawSignRows(); drawSignState();
+    toast('Saved as '+j.form.name+'. That is the copy that gets filed.');
+  }catch(e){$('sm-stat').textContent='';toast('Could not save: '+e.message);}
+};
+// draw a signature
+$('sm-draw').onclick=()=>{const b=$('sm-drawbox');b.style.display=b.style.display==='none'?'block':'none';};
+(function(){
+  const c=$('drawpad'); if(!c)return; const ctx=c.getContext('2d');
+  ctx.lineWidth=2.4; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='#101040';
+  let drawing=false;
+  const pos=e=>{const r=c.getBoundingClientRect();const t=e.touches?e.touches[0]:e;
+    return [(t.clientX-r.left)*c.width/r.width,(t.clientY-r.top)*c.height/r.height];};
+  const down=e=>{drawing=true;ctx.beginPath();ctx.moveTo(...pos(e));e.preventDefault();};
+  const move=e=>{if(!drawing)return;ctx.lineTo(...pos(e));ctx.stroke();e.preventDefault();};
+  const up=()=>{drawing=false;};
+  c.addEventListener('mousedown',down);c.addEventListener('mousemove',move);
+  window.addEventListener('mouseup',up);
+  c.addEventListener('touchstart',down);c.addEventListener('touchmove',move);
+  window.addEventListener('touchend',up);
+  $('sm-drawclear').onclick=()=>ctx.clearRect(0,0,c.width,c.height);
+  $('sm-drawsave').onclick=async()=>{
+    const who=$('sm-who').value; if(!who)return toast('Pick who this signature belongs to.');
+    try{
+      await api('/api/signature/'+who+'/draw',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({data_url:c.toDataURL('image/png')})});
+      const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(SM.name)+'/layout');
+      SM.sigs=j.signatures||[]; await refresh();
+      toast('Signature saved. Pick the Signature tool and click where it goes.');
+    }catch(e){toast(e.message);}
+  };
+})();
 $('submit').onclick=async()=>{
   if(!$('title').value.trim())return toast('Give the invention a title first.');
   await ensurePacket(); $('substat').textContent='opening session...';
