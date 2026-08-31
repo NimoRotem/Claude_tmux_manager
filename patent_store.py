@@ -33,6 +33,9 @@ PACKETS_DIR = DATA_DIR / "packets"
 SIGNATURES_DIR = DATA_DIR / "signatures"
 SAMPLES_DIR = DATA_DIR / "samples"
 OBSERVATIONS_DIR = DATA_DIR / "observations"
+# Its own tree: SAMPLES_DIR is walked flat by the filing demo, so a subdirectory
+# in there is copied as if it were a file and the filing demo 500s.
+OBS_SAMPLES_DIR = DATA_DIR / "samples_observations"
 AUTH_DIR = DATA_DIR / "auth"
 
 _LOCK = threading.RLock()
@@ -573,3 +576,27 @@ def snapshot_for_agent(data: dict, inventor_ids, applicant_id: str,
         "gate": representation_gate(data, inventor_ids, applicant_id),
         "fee_schedule_verified": FEE_SCHEDULE_VERIFIED,
     }
+
+
+async def create_session(client, base_name: str, cwd: str, tries: int = 25):
+    """Open a tmux session, working around a name that is already taken.
+
+    The name is derived from the application or the title, so running the same
+    demo twice, or filing twice against one application, collided and the dashboard
+    answered "Session already exists". From the panel that looked like the button
+    doing nothing at all. Retrying with a suffix also covers the race between two
+    people pressing Submit at once.
+    """
+    last = ""
+    for n in range(1, tries + 1):
+        name = base_name if n == 1 else ("%s %d" % (base_name, n))[:60]
+        resp = await client.post("/api/sessions/create", json={"name": name, "cwd": cwd})
+        if resp.status_code < 400:
+            created = (resp.json() or {}).get("name") or ""
+            if created:
+                return created, ""
+            return "", "session create returned no name"
+        last = resp.text[:300]
+        if "already exists" not in last:
+            return "", last
+    return "", "could not find a free session name after %d tries: %s" % (tries, last)

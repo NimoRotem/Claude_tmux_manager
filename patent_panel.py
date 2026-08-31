@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -128,6 +129,24 @@ async def api_defaults(request: Request):
         {k: v for k, v in patch.items() if isinstance(k, str)})
     store.save(data)
     return JSONResponse({"ok": True, "defaults": data["defaults"]})
+
+
+@router.get("/api/live-sessions")
+async def api_live_sessions():
+    """Which tmux sessions actually exist, straight from tmux.
+
+    The dashboard's own /api/sessions kept listing sessions minutes after they were
+    killed, so the Live run picker offered dead runs that looked identical to the
+    live one and silently attached to a shell. tmux is the only thing that knows.
+    """
+    def names():
+        try:
+            out = subprocess.run(["tmux", "ls", "-F", "#{session_name}"],
+                                 capture_output=True, text=True, timeout=8)
+            return [n for n in (out.stdout or "").split("\n") if n.strip()]
+        except Exception:
+            return []
+    return JSONResponse({"sessions": await asyncio.to_thread(names)})
 
 
 @router.post("/api/gate")
@@ -606,7 +625,8 @@ async def api_demo(request: Request):
     fee calculation. The only thing it does not do is press Submit or pay, and the
     brief makes that a hard stop rather than a hope.
     """
-    samples = sorted(store.SAMPLES_DIR.glob("*")) if store.SAMPLES_DIR.exists() else []
+    samples = ([p for p in sorted(store.SAMPLES_DIR.glob("*")) if p.is_file()]
+               if store.SAMPLES_DIR.exists() else [])
     if not samples:
         return _err("no sample application installed in %s" % store.SAMPLES_DIR, 404)
     title = ("DEMO - VIBRATION DEVICE FOR BEDDING COVERING ELEMENTS USING A SUSTAINED "
@@ -831,13 +851,10 @@ Generated forms: `{packet_dir}/forms`
    login is in the advisor as secret `uspto-account`. Inject the cookies plus a
    fresh password-only Okta session id as the `sid` cookie on auth.uspto.gov and
    USPTO skips MFA.
-4. Drive a DEDICATED Chrome, not the shared one:
-   `python3 -c "import browser_live; print(browser_live.launch('{slug}'))"` from
-   `{dash}`. It starts with --no-proxy-server, which is required: the shared browser
-   sits behind a residential proxy that 407s captcha-sdk.awswaf.com, and
-   fees.uspto.gov wraps its payment POST in that script. The failure is silent, a
-   "Processing..." spinner for ever and no HTTP request at all.
-   Nimo can watch you live at {live_url} .
+4. {browser_line}Never use the shared browser: it sits behind a residential proxy
+   that 407s captcha-sdk.awswaf.com, and fees.uspto.gov wraps its payment POST in
+   that script. The failure is silent, a "Processing..." spinner for ever and no
+   HTTP request at all. Nimo watches you live at {live_url} .
 5. Use the Patent Center **web ADS**, not an uploaded ADS PDF. Upload the
    specification as **DOCX** to avoid the 37 CFR 1.16(u) surcharge. Give every file
    a document description or the submit button silently refuses.
@@ -977,7 +994,28 @@ async def api_packet_submit(packet_id: str, request: Request):
                        "number and the payment transaction id, then close the browser you "
                        "opened (`browser_live.shutdown(port, profile)`), and report back here.")
         stop_rule = ""
+    browser_line = ("Drive a DEDICATED Chrome, not the shared one: "
+                    "`python3 -c \"import browser_live; print(browser_live.launch('%s'))\"`. "
+                    % slug)
+    dry = bool(body.get("dry_run"))
+    try:
+        if dry:
+            raise RuntimeError("preview: no browser started")
+        binfo = await launch_for_run("filing-%s" % slug)
+        meta["browser_port"] = binfo["port"]
+        browser_line = (
+            "**A browser is already running for this filing and the panel is streaming "
+            "it: CDP on 127.0.0.1:%d (Chrome 149 on instance-3, device-trust cookies "
+            "available there). Drive THAT browser and do not start another**, or nobody "
+            "can watch you. `browser_live.targets(%d)` lists its tabs. "
+            % (binfo["port"], binfo["port"]))
+    except Exception as exc:                                      # noqa: BLE001
+        if dry:
+            browser_line = ("A dedicated browser is started for the run and the panel streams it; the port is filled in when you actually submit. ")
+        else:
+            meta["browser_error"] = str(exc)[:200]
     brief = BRIEF.format(
+        browser_line=browser_line,
         mission=mission, pay_step=pay_step, finish_step=finish_step, stop_rule=stop_rule,
         title=title, docket=docket or "(none)", entity_status=entity,
         publication=publication, parties="\n".join(parties), gate=gate_text,
@@ -1007,14 +1045,10 @@ async def api_packet_submit(packet_id: str, request: Request):
     created = ""
     try:
         async with httpx.AsyncClient(base_url=base, timeout=120, headers=headers) as client:
-            resp = await client.post("/api/sessions/create",
-                                     json={"name": session_name,
-                                           "cwd": str(Path(__file__).parent)})
-            if resp.status_code >= 400:
-                return _err("could not open a session: %s" % resp.text[:300], resp.status_code)
-            created = (resp.json() or {}).get("name") or ""
+            created, why = await store.create_session(
+                client, session_name, str(Path(__file__).parent))
             if not created:
-                return _err("session create returned no name", 500)
+                return _err("could not open a session: %s" % why, 502)
 
             uploads = [brief_path, d / "filing.json"]
             uploads += [Path(f["path"]) for f in (meta.get("files") or [])
@@ -1102,6 +1136,21 @@ async def api_browser_launch(request: Request):
         return _err(str(exc), 500)
     _BROWSERS[info["port"]] = info
     return JSONResponse({"ok": True, "browser": info})
+
+
+async def launch_for_run(label: str):
+    """Start the browser the agent is told to use, and remember it.
+
+    Without this the agent opens a browser with whatever tooling it likes, on a
+    port the panel never learns, and the Live run browser pane stays empty while
+    the agent is visibly driving Patent Center. Starting it here means the panel
+    knows the port before the session exists, so the stream is attachable from the
+    first frame and what you watch is definitely what the agent is driving.
+    """
+    info = await asyncio.to_thread(browser_live.launch_remote,
+                                   store.slugify(label, "filing"), True)
+    _BROWSERS[info["port"]] = info
+    return info
 
 
 @router.delete("/api/browsers/{port}")
@@ -1524,6 +1573,7 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
         <button class="g fix" id="bnew">New</button>
         <button class="d fix" id="bkill">Close</button>
       </div>
+      <div class="banner warn" id="sharedwarn" style="display:none;margin:0 0 8px"></div>
       <img id="screen" alt="browser">
       <div id="screenempty" style="display:none;background:#05070c;border:1px solid var(--line);
         border-radius:8px;padding:26px;text-align:center;color:var(--mut);font-size:13px"></div>
@@ -1600,7 +1650,13 @@ window.openRun=async(session)=>{
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==='s-live'));
   try{const j=await api('/api/store');S=j.store;}catch(e){}
   try{const o=await oapi('');OBS_SESSIONS=(o.submissions||[]).filter(x=>x.session);}catch(e){}
+  try{const l=await api('/api/live-sessions');LIVE_NAMES=l.sessions||[];}catch(e){LIVE_NAMES=null;}
   drawRunSessions(session);
+  // Prefer a live run over a dead one when nothing specific was asked for.
+  if(!session&&LIVE_NAMES){
+    const alive=[...$('rsel').options].find(o=>o.value&&LIVE_NAMES.includes(o.value));
+    if(alive)$('rsel').value=alive.value;
+  }
   const n=$('rsel').value;
   if(n&&n!==T.name)attachTerm(n);
   loadBrowsers();
@@ -2356,13 +2412,20 @@ function runSessions(){
   OBS_SESSIONS.forEach(o=>{
     if(o.session&&!seen.has(o.session)){seen.add(o.session);
       out.push({name:o.session,label:'1.290 observation, '+(o.application_number||o.title||o.session),
-                demo:!!o.demo,when:o.created});}});
+                demo:!!o.demo,when:o.created,port:o.browser_port});}});
   return out;
 }
+let LIVE_NAMES=null;                       // null = not asked yet
 function drawRunSessions(keep){
   const list=runSessions(), cur=keep||$('rsel').value;
+  // Two runs against the same application produce the same label, so the session
+  // name goes in the option too; without it the picker offered several identical
+  // rows and you could not tell the live one from a dead one.
   $('rsel').innerHTML=list.length
-    ? list.map(s=>`<option value="${esc(s.name)}">${esc(s.label)}${s.demo?' (demo)':''}</option>`).join('')
+    ? list.map(s=>{
+        const dead=LIVE_NAMES&&!LIVE_NAMES.includes(s.name);
+        return `<option value="${esc(s.name)}"${dead?' data-dead="1"':''}>${esc(s.label)}${
+          s.demo?' (demo)':''} - ${esc(s.name)}${dead?' [ended]':''}</option>`;}).join('')
     : '<option value="">no filing session yet</option>';
   if(cur&&list.some(s=>s.name===cur))$('rsel').value=cur;
   const n=$('rsel').value;
@@ -2416,7 +2479,10 @@ function attachTerm(name){
     if($('s-live').classList.contains('on'))termPoll();
   },1500);
 }
-$('rsel').onchange=()=>{drawRunSessions($('rsel').value);attachTerm($('rsel').value);};
+$('rsel').onchange=()=>{drawRunSessions($('rsel').value);attachTerm($('rsel').value);
+  // The browser belongs to the run, so changing the run must move the picture too.
+  if(live){LIVE_STOP=true;live.close();live=null;}
+  LIVE_STOP=false; LIVE_RETRIES=0; loadBrowsers().catch(()=>{});};
 $('rrefresh').onclick=async()=>{const j=await api('/api/store');S=j.store;
   drawRunSessions($('rsel').value); if(T.name){T.known=0;termPoll();} loadBrowsers();};
 async function sendToAgent(text){
@@ -2443,7 +2509,7 @@ document.querySelectorAll('#rkeys .key').forEach(b=>b.onclick=async()=>{
 });
 
 // ---- live browser ----
-let live=null;
+let live=null, LIVE_RETRIES=0, LIVE_STOP=false;
 async function loadBrowsers(){
   const j=await api('/api/browsers');
   $('bsel').innerHTML=j.browsers.map(b=>`<option value="${b.port}">${b.port}${b.remote?' instance-3':b.shared?' (shared)':' local'}${b.headless===false?' headed':''} - ${b.targets.length} tab(s)</option>`).join('')
@@ -2453,9 +2519,17 @@ async function loadBrowsers(){
   // shared browser on 9222 belongs to whatever else is using this box, and
   // attaching to it shows the wrong screen convincingly, which is worse than
   // showing none: you would be watching someone else's tab believing it is ours.
-  const own=j.browsers.filter(b=>!b.shared);
-  if(!live&&own.length){
-    $('bsel').value=String(own[0].port); drawTabs();
+  // Attach to something. Prefer a browser this panel started, but fall back to the
+  // shared one rather than showing nothing: an agent may well be driving it, and a
+  // labelled picture beats a paragraph explaining why there is no picture. The
+  // label is what keeps it honest, not the refusal.
+  // Exact match first: the handoff records the port it started for this run, so
+  // attach to THAT rather than to whatever else happens to be open on the box.
+  const want=(runSessions().find(r=>r.name===$('rsel').value)||{}).port;
+  const pick=j.browsers.find(b=>want&&b.port===want)
+           ||j.browsers.filter(b=>!b.shared)[0]||j.browsers[0];
+  if(!live&&pick){
+    $('bsel').value=String(pick.port); drawTabs();
     if($('tsel').value)$('battach').onclick();
   }
   drawScreenState();
@@ -2464,23 +2538,28 @@ async function loadBrowsers(){
 // running the agent has not opened one yet, or it stopped before opening one, and
 // that is worth saying rather than leaving a blank box that reads as broken.
 function drawScreenState(){
-  const all=(window._browsers||[]), own=all.filter(b=>!b.shared), attached=!!live;
+  const all=(window._browsers||[]), attached=!!live;
   const painted=attached&&$('screen').src;
   $('screen').style.display=painted?'block':'none';
   const box=$('screenempty');
+  // Say plainly when what you are looking at is the shared browser rather than one
+  // this filing opened, because the picture itself gives no clue.
+  const cur=all.find(b=>String(b.port)===$('bsel').value);
+  const warn=$('sharedwarn');
+  if(warn){
+    warn.style.display=(painted&&cur&&cur.shared)?'block':'none';
+    warn.textContent='This is the shared browser on this box, not one this run started. '
+      +'It may be showing another session\'s work.';
+  }
   if(painted){box.style.display='none';return;}
   box.style.display='block';
   box.textContent=attached
     ? 'Attached, waiting for the first frame.'
-    : own.length
+    : all.length
       ? 'A browser is running but nothing is attached. Pick a tab and press Attach.'
-      : (all.length
-         ? 'No browser of ours is open. Only the shared browser on this box is running, and '
-           +'that one belongs to something else, so it is not shown here. The agent starts '
-           +'its own when it reaches Patent Center.'
-         : 'No browser open. The agent starts one when it reaches Patent Center, and this '
-           +'fills in by itself. If the session stopped before then, its reason is in the '
-           +'terminal on the left.');
+      : 'No browser open yet. The agent starts one when it reaches Patent Center and this '
+        +'fills in by itself. If the run stopped before then, the reason is in the terminal '
+        +'on the left.';
 }
 $('bsel').onchange=drawTabs;
 function drawTabs(){
@@ -2492,9 +2571,10 @@ $('bnew').onclick=async()=>{$('bstat').textContent='starting...';
     body:JSON.stringify({label:($('title').value||'filing').slice(0,30),headless:true,remote:$('bremote').checked})});
   $('bstat').textContent=(j.browser.remote?'instance-3 ':'local ')+'browser on port '+j.browser.port; await loadBrowsers();}
   catch(e){$('bstat').textContent='';toast(e.message);}};
-$('bkill').onclick=async()=>{const p=$('bsel').value;if(!p)return;
+$('bkill').onclick=async()=>{const p=$('bsel').value;if(!p)return;LIVE_STOP=true;
   await api('/api/browsers/'+p,{method:'DELETE'});await loadBrowsers();};
 $('battach').onclick=()=>{
+  LIVE_STOP=false;
   if(live){live.close();live=null;}
   const port=$('bsel').value,target=$('tsel').value; if(!port)return;
   const ro=$('binteract').checked?'0':'1';
@@ -2505,9 +2585,21 @@ $('battach').onclick=()=>{
       $('livestat').textContent=`${n} frames, ${kb.toFixed(0)} KB, ${(kb/Math.max(1,(Date.now()-t0)/1000)).toFixed(1)} KB/s`;}
     else if(m.t==='nav'){$('navurl').value=m.url;}
     else if(m.t==='error'){toast(m.m);}
-    else if(m.t==='hello'){$('navurl').value=m.url;$('bstat').textContent='attached: '+(m.title||m.url);}
+    else if(m.t==='hello'){$('navurl').value=m.url;$('bstat').textContent='attached: '+(m.title||m.url);
+      LIVE_RETRIES=0;}
     drawScreenState();};
-  live.onclose=()=>{$('bstat').textContent='detached';live=null;drawScreenState();};
+  // A cross-process navigation destroys the CDP target and takes the socket with
+  // it, which is normal in the middle of a filing and used to leave the pane dead
+  // for the rest of the run. Re-resolve the tab list and reattach.
+  live.onclose=()=>{
+    live=null; drawScreenState();
+    const onTab=$('s-live').classList.contains('on');
+    if(!onTab||LIVE_STOP){$('bstat').textContent='detached';return;}
+    if(LIVE_RETRIES>=8){$('bstat').textContent='detached (gave up reattaching)';return;}
+    LIVE_RETRIES++;
+    $('bstat').textContent='reattaching ('+LIVE_RETRIES+')...';
+    setTimeout(()=>{loadBrowsers().catch(()=>{});},1800);
+  };
 };
 $('screen').onclick=e=>{ if(!live||!$('binteract').checked)return;
   const r=e.target.getBoundingClientRect();

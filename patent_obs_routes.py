@@ -88,7 +88,8 @@ async def api_obs_list():
             rows.append({"id": m.get("id"), "title": m.get("title") or "",
                          "application_number": m.get("application_number") or "",
                          "created": m.get("created"), "session": m.get("session") or "",
-                         "demo": bool(m.get("demo")), "items": len(m.get("items") or [])})
+                         "demo": bool(m.get("demo")), "items": len(m.get("items") or []),
+                         "browser_port": m.get("browser_port")})
     return JSONResponse({"submissions": rows[:60]})
 
 
@@ -317,9 +318,8 @@ package; verify it yourself, then {mission}
 {files_block}
 
 ## What Patent Center needs
-1. Log in at https://patentcenter.uspto.gov/ as the registered account
-   (`get_secret uspto-account`). If the device-trust cookie is needed, the browser
-   for this runs on instance-3; see `browser_live.launch_remote`.
+1. {browser_line}Log in at https://patentcenter.uspto.gov/ as the registered
+   account (`get_secret uspto-account`).
 {training_step}2. **Confirm the target is the application this brief describes, before you type
    anything into Patent Center.** Pull its file wrapper from the USPTO ODP API
    (`GET https://api.uspto.gov/api/v1/patent/applications/<8 digits>` with
@@ -420,6 +420,7 @@ async def api_obs_submit(sub_id: str, request: Request):
         bad = [c["label"] for c in review["checks"] if c["blocker"]]
         return _err("not ready to file: %s" % "; ".join(bad), 409)
 
+    slug_for_browser = store.slugify(meta.get("application_number") or "obs", "obs")
     fee = review["fee"]
     fee_text = ("no fee, 37 CFR 1.290(g)" if fee["exempt"]
                 else "$%d (%s, fee code %s)" % (fee["total"], fee["entity"], fee["code"]))
@@ -459,6 +460,31 @@ async def api_obs_submit(sub_id: str, request: Request):
         training_step = ""
         stop_bullet = ""
 
+    # Start the browser here rather than leaving the agent to open its own. The
+    # panel then knows the port before the session exists, so the Live run pane
+    # streams what the agent is actually driving instead of sitting empty.
+    browser_line = ("If the device-trust cookie is needed the browser runs on "
+                    "instance-3; see `browser_live.launch_remote`. ")
+    dry = bool(body.get("dry_run"))
+    try:
+        if dry:
+            raise RuntimeError("preview: no browser started")
+        import patent_panel
+        binfo = await patent_panel.launch_for_run("obs-%s" % slug_for_browser)
+        meta["browser_port"] = binfo["port"]
+        meta["browser_profile"] = binfo.get("profile", "")
+        browser_line = (
+            "**A browser is already running for this run and the panel is streaming it: "
+            "CDP on 127.0.0.1:%d (Chrome 149 on instance-3, device-trust cookies "
+            "available there). Drive THAT browser and do not start another**, or nobody "
+            "can watch you. `browser_live.targets(%d)` lists its tabs. "
+            % (binfo["port"], binfo["port"]))
+    except Exception as exc:                                      # noqa: BLE001
+        if dry:
+            browser_line = ("A dedicated browser is started for the run and the panel streams it; the port is filled in when you actually submit. ")
+        else:
+            meta["browser_error"] = str(exc)[:200]
+
     files = [f for f in (meta.get("files") or [])]
     # Always rebuild rather than trusting what is recorded: the list may have been
     # edited since Build was last pressed, and a stale concise-description document
@@ -470,6 +496,7 @@ async def api_obs_submit(sub_id: str, request: Request):
     brief = BRIEF.format(
         stop_rule=stop_rule, mission=mission, fee_step=fee_step, finish_step=finish_step,
         stop_bullet=stop_bullet, training_step=training_step,
+        browser_line=browser_line,
         appno=obs.format_application_number(meta.get("application_number") or ""),
         title_line=("\n- Title: %s" % meta["title"]) if meta.get("title") else "",
         deadline=review["timing"].get("deadline") or "unknown",
@@ -487,21 +514,17 @@ async def api_obs_submit(sub_id: str, request: Request):
                              "review": review, "session": ""})
 
     base = body.get("base") or os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
-    slug = store.slugify(meta.get("application_number") or "obs", "obs")
+    slug = slug_for_browser
     session_name = (("obs demo %s" if demo else "obs %s") % slug)[:60]
     cookies = request.headers.get("cookie", "")
     headers = {"cookie": cookies} if cookies else {}
     created = ""
     try:
         async with httpx.AsyncClient(base_url=base, timeout=120, headers=headers) as client:
-            resp = await client.post("/api/sessions/create",
-                                     json={"name": session_name,
-                                           "cwd": str(Path(__file__).parent)})
-            if resp.status_code >= 400:
-                return _err("could not open a session: %s" % resp.text[:300], resp.status_code)
-            created = (resp.json() or {}).get("name") or ""
+            created, why = await store.create_session(
+                client, session_name, str(Path(__file__).parent))
             if not created:
-                return _err("session create returned no name", 500)
+                return _err("could not open a session: %s" % why, 502)
 
             uploads = [brief_path, d / "submission.json"]
             uploads += [Path(f["path"]) for f in files]
@@ -590,7 +613,7 @@ async def api_obs_demo():
     for part in ("in", "files", "forms"):
         (d / part).mkdir(parents=True, exist_ok=True)
 
-    samples = store.SAMPLES_DIR / "observations"
+    samples = store.OBS_SAMPLES_DIR
     copied = []
     if samples.exists():
         for p in sorted(samples.glob("*")):
