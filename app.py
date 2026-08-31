@@ -1248,6 +1248,35 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 
+# The USPTO filing panel is its own module rather than another 1.5k lines in here:
+# it is a self-contained surface (party data and the 37 CFR 1.31 gate, packet
+# checks, USPTO form generation, a CDP screencast viewer) with its own page. It is
+# mounted here, above the /{username} catch-all, and an import failure must never
+# take the dashboard down with it.
+try:
+    import patent_panel
+
+    def _patent_panel_allowed(cookies: dict) -> bool:
+        """Signed-in, and on a shared dashboard an admin.
+
+        The HTTP middleware below already gates ordinary requests, but it does not
+        run for websockets, and the panel's live browser view streams a logged-in
+        USPTO session. Members must not reach it either: it holds Nimo's personal
+        addresses and spends on a company card.
+        """
+        if AUTH_PASS and not _check_token(cookies.get(AUTH_COOKIE)):
+            return False
+        if TEAM_MODE:
+            return _is_admin(_user_from_token(cookies.get(AUTH_COOKIE)))
+        return True
+
+    patent_panel.set_auth_guard(_patent_panel_allowed)
+    app.include_router(patent_panel.router)
+    app.include_router(patent_panel.ws_router)
+    logger.info("patent panel mounted at /patents")
+except Exception:
+    logger.exception("patent panel unavailable; the rest of the dashboard is unaffected")
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(_request: Request, exc: RequestValidationError):
@@ -1271,6 +1300,22 @@ AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 # own TMUX_DASH_SECRET and can't verify the other's token.
 AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
 
+# --- Cross-host SSO cookie (optional) --------------------------------------
+# A SECOND cookie, scoped to a parent domain (e.g. .rotem.ai), so that signing
+# in to any builder dashboard (builder3.rotem.ai, builder4.rotem.ai, ...) also
+# unlocks the private apps served straight off rotem.ai (rotem.ai/cameras, the
+# rotem.ai/apps portal), which gate on it via nginx auth_request.
+#
+# It is deliberately NOT the main auth cookie: that one is per-host and signed
+# with each box's own TMUX_DASH_SECRET, so two dashboards on the same parent
+# domain would clobber each other and neither could verify the other's token.
+# This cookie is signed with a secret SHARED across the boxes, so any of them
+# can issue it and one verify endpoint (rotem.ai -> builder3 loopback) accepts
+# it whichever box you logged in on. Unset SSO_SECRET => feature off, no cookie.
+SSO_SECRET = os.environ.get("TMUX_DASH_SSO_SECRET", "")
+SSO_COOKIE = os.environ.get("TMUX_DASH_SSO_COOKIE", "rotem_sso")
+SSO_COOKIE_DOMAIN = os.environ.get("TMUX_DASH_SSO_COOKIE_DOMAIN", "")  # e.g. ".rotem.ai"
+
 
 def _make_token(user_id: str) -> str:
     sig = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
@@ -1283,6 +1328,39 @@ def _check_token(token: str) -> bool:
     user_id, sig = token.split(":", 1)
     expected = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
     return hmac.compare_digest(sig, expected)
+
+
+def _make_sso_token(user_id: str) -> str:
+    sig = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{user_id}:{sig}"
+
+
+def _check_sso_token(token: str) -> bool:
+    if not (SSO_SECRET and token and ":" in token):
+        return False
+    user_id, sig = token.split(":", 1)
+    expected = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(sig, expected)
+
+
+def _set_sso_cookie(resp, request: "Request", user_id: str) -> None:
+    """Attach the shared cross-host SSO cookie, if the feature is configured."""
+    if not SSO_SECRET:
+        return
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    kw = dict(max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    if SSO_COOKIE_DOMAIN:
+        kw["domain"] = SSO_COOKIE_DOMAIN
+    resp.set_cookie(SSO_COOKIE, _make_sso_token(user_id), **kw)
+
+
+def _clear_sso_cookie(resp) -> None:
+    if not SSO_SECRET:
+        return
+    if SSO_COOKIE_DOMAIN:
+        resp.delete_cookie(SSO_COOKIE, domain=SSO_COOKIE_DOMAIN)
+    else:
+        resp.delete_cookie(SSO_COOKIE)
 
 
 # --- Multi-user store ---
@@ -1904,7 +1982,7 @@ async def auth_middleware(request: Request, call_next):
     # SSO verify endpoint for nginx auth_request from sibling knowva.ai apps:
     # it must return its own 200/401 based on the cookie, NOT the login-page
     # fallback (auth_request only treats a real 2xx as authenticated).
-    if path.endswith("/api/auth/verify"):
+    if path.endswith("/api/auth/verify") or path.endswith("/api/sso/verify"):
         return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
@@ -1947,7 +2025,18 @@ async def auth_middleware(request: Request, call_next):
     # The route's own _current_user() call may return early from cache, so
     # presence is recorded here too or it never fires.
     _touch_user_presence(user)
-    return await call_next(request)
+    resp = await call_next(request)
+    # Backfill the cross-host SSO cookie for sessions that logged in BEFORE the
+    # feature existed: they hold a valid per-host cookie but no rotem_sso, so the
+    # private apps on the parent domain still prompt. Set it on the next
+    # authenticated page load so re-login is not required. No-op if the feature
+    # is off or the cookie is already present and valid.
+    if SSO_SECRET and not _check_sso_token(request.cookies.get(SSO_COOKIE, "")):
+        try:
+            _set_sso_cookie(resp, request, user["id"])
+        except Exception:
+            logger.debug("failed to backfill SSO cookie", exc_info=True)
+    return resp
 
 
 @app.middleware("http")
@@ -1983,6 +2072,27 @@ async def api_auth_verify(request: Request):
         # ignore it. ASCII-safe: header values must not carry raw unicode.
         uname = str(u.get("username") or u.get("email") or "").encode("ascii", "ignore").decode()
         return JSONResponse({"ok": True}, headers={"X-Sso-User": uname})
+    return JSONResponse({"ok": False}, status_code=401)
+
+
+@app.get("/api/sso/verify")
+async def api_sso_verify(request: Request):
+    """Cross-host SSO check for nginx ``auth_request`` from the private apps on
+    the parent domain (rotem.ai/cameras, the rotem.ai/apps portal).
+
+    Validates the shared ``rotem_sso`` cookie, which any builder dashboard sets
+    (scoped to .rotem.ai) on login. 200 = a valid login on some builder box,
+    401 = none. The user id is exposed as X-Sso-User for apps that log it.
+
+    This is intentionally lighter than /api/auth/verify: the cookie proves a
+    valid dashboard login on the shared domain, and these apps do not need this
+    box's own per-user record (which would not exist for a user who logged in on
+    a different box). Requires TMUX_DASH_SSO_SECRET; 401s if the feature is off.
+    """
+    token = request.cookies.get(SSO_COOKIE, "")
+    if _check_sso_token(token):
+        uid = token.split(":", 1)[0].encode("ascii", "ignore").decode()
+        return JSONResponse({"ok": True}, headers={"X-Sso-User": uid})
     return JSONResponse({"ok": False}, status_code=401)
 
 
@@ -2108,6 +2218,7 @@ async def do_login(request: Request):
     resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    _set_sso_cookie(resp, request, target_user["id"])
     return resp
 
 
@@ -2115,6 +2226,7 @@ async def do_login(request: Request):
 async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
     resp.delete_cookie(AUTH_COOKIE)
+    _clear_sso_cookie(resp)
     return resp
 
 
@@ -2628,6 +2740,8 @@ def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
+    # token is "<user_id>:<sig>"; the SSO cookie is keyed by the same user id
+    _set_sso_cookie(resp, request, token.split(":", 1)[0])
     return resp
 
 
@@ -11421,8 +11535,12 @@ _BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
 # core per attached viewer, continuously, and nothing at all with none. Chrome,
 # the profile and any agent driving it over CDP are untouched either way.
 set -uo pipefail
-export HOME=/home/nimrod_rotem
-# shellcheck source=/home/nimrod_rotem/.claude-browser/bin/chrome-common.sh
+# Keep the HOME we were started with and only fall back to the usual one. It is
+# not the same on every box: builder4 is a tenant on the patents VM and its HOME
+# is /home/nimrod_rotem/builder4-home, so hardcoding sent every profile, log and
+# proxy config to the neighbour's directory.
+export HOME="${HOME:-/home/nimrod_rotem}"
+# shellcheck source=chrome-common.sh
 source "$HOME/.claude-browser/bin/chrome-common.sh"
 ACTION="${1:-}"; ID="${2:-}"
 [ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop|vnc-start|vnc-stop <id> ..."; exit 2; }
