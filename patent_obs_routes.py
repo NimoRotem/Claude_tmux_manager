@@ -203,12 +203,15 @@ async def api_obs_check(sub_id: str):
 # ==========================================================================
 # forms
 # ==========================================================================
-@router.post("/api/obs/{sub_id}/forms")
-async def api_obs_forms(sub_id: str):
-    d = _dir(sub_id)
-    if not d.exists():
-        return _err("unknown submission", 404)
-    meta = _load(d)
+async def _build_forms(d: Path, meta: dict) -> list:
+    """Render both documents and record them on the submission.
+
+    Callable from the Build button AND from the handoff, because the handoff used
+    to ship `meta["forms"]` verbatim: if nobody had pressed Build, the session went
+    out with a brief telling it to upload CONCISE_DESCRIPTIONS.pdf and no such file,
+    and that document is the 1.290(d)(2) requirement submissions are most often
+    refused on. Building is cheap and idempotent, so it is no longer optional.
+    """
     forms_dir = d / "forms"
     forms_dir.mkdir(parents=True, exist_ok=True)
     data = store.load()
@@ -221,25 +224,36 @@ async def api_obs_forms(sub_id: str):
             f = person.get("signature_file") or ""
             if f and (store.SIGNATURES_DIR / f).exists():
                 sig = str(store.SIGNATURES_DIR / f)
+
     out = []
-    try:
-        a = await asyncio.to_thread(obs.build_sb429, forms_dir / "SB429_WORKSHEET.pdf", meta, sig)
-        out.append({"name": "SB429_WORKSHEET.pdf", "path": a["path"], "verify": a["verify"],
-                    "upload": False, "overflow": a.get("overflow") or {},
-                    "label": "PTO/SB/429 worksheet, 37 CFR 1.290",
-                    "note": ("Do NOT upload this. The form itself says not to file it through the "
-                             "electronic system; Patent Center builds the list from its own "
-                             "screens. Use this to check what you typed there.")})
-        b = await asyncio.to_thread(obs.build_concise_descriptions,
-                                    forms_dir / "CONCISE_DESCRIPTIONS.pdf", meta)
-        out.append({"name": "CONCISE_DESCRIPTIONS.pdf", "path": b["path"], "verify": b["verify"],
-                    "upload": True, "overflow": {},
-                    "label": "Concise description of relevance, 37 CFR 1.290(d)(2)",
-                    "note": "This one IS filed. It is the part the examiner reads."})
-    except Exception as exc:                                      # noqa: BLE001
-        return _err("could not build the forms: %s" % exc, 500)
+    a = await asyncio.to_thread(obs.build_sb429, forms_dir / "SB429_WORKSHEET.pdf", meta, sig)
+    out.append({"name": "SB429_WORKSHEET.pdf", "path": a["path"], "verify": a["verify"],
+                "upload": False, "overflow": a.get("overflow") or {},
+                "label": "PTO/SB/429 worksheet, 37 CFR 1.290",
+                "note": ("Do NOT upload this. The form itself says not to file it through the "
+                         "electronic system; Patent Center builds the list from its own "
+                         "screens. Use this to check what you typed there.")})
+    b = await asyncio.to_thread(obs.build_concise_descriptions,
+                                forms_dir / "CONCISE_DESCRIPTIONS.pdf", meta)
+    out.append({"name": "CONCISE_DESCRIPTIONS.pdf", "path": b["path"], "verify": b["verify"],
+                "upload": True, "overflow": {},
+                "label": "Concise description of relevance, 37 CFR 1.290(d)(2)",
+                "note": "This one IS filed. It is the part the examiner reads."})
     meta["forms"] = out
     _save(d, meta)
+    return out
+
+
+@router.post("/api/obs/{sub_id}/forms")
+async def api_obs_forms(sub_id: str):
+    d = _dir(sub_id)
+    if not d.exists():
+        return _err("unknown submission", 404)
+    meta = _load(d)
+    try:
+        out = await _build_forms(d, meta)
+    except Exception as exc:                                      # noqa: BLE001
+        return _err("could not build the forms: %s" % exc, 500)
     return JSONResponse({"ok": True, "forms": out,
                          "review": obs.check(meta, meta.get("files") or [])})
 
@@ -306,7 +320,7 @@ package; verify it yourself, then {mission}
 1. Log in at https://patentcenter.uspto.gov/ as the registered account
    (`get_secret uspto-account`). If the device-trust cookie is needed, the browser
    for this runs on instance-3; see `browser_live.launch_remote`.
-2. **Confirm the target is the application this brief describes, before you type
+{training_step}2. **Confirm the target is the application this brief describes, before you type
    anything into Patent Center.** Pull its file wrapper from the USPTO ODP API
    (`GET https://api.uspto.gov/api/v1/patent/applications/<8 digits>` with
    `X-API-KEY`, key in `~/.patent-api/CREDS.md`) and check three things: it is
@@ -342,10 +356,31 @@ package; verify it yourself, then {mission}
   that will be thrown out.
 """
 
-DEMO_STOP = """## THIS IS A DEMO RUN. DO NOT FILE AND DO NOT PAY.
-Go through the whole workflow so it can be watched, and stop at the payment screen.
-Do not press the final submit and do not enter a card.
+DEMO_STOP = """## THIS IS A DEMO RUN, AND IT RUNS IN PATENT CENTER TRAINING MODE.
+Patent Center's Training Mode is an interactive simulation: the screens, the
+document list, the uploads and the fee calculation are the real ones, and nothing
+reaches a real application. Switch into it BEFORE you touch anything, confirm you
+are in it, and go through the whole workflow to the payment screen so it can be
+watched. Do not press the final submit and do not enter a card.
 
+If you cannot get into Training Mode, STOP and report. Do not run this package in
+live Patent Center: it carries sample documents and a placeholder application
+number, and putting either into the live system is the thing this demo exists to
+avoid.
+
+"""
+
+# Reaching a fee screen means the application number and every document are already
+# in. In LIVE Patent Center that lands sample PDFs and invented statements of
+# relevance in a stranger's file, which "stop before paying" does nothing to
+# prevent. Training Mode is the only place a payment stop is rehearsable, so the
+# demo goes there and refuses to run anywhere else.
+TRAINING_STEP = """1a. **Switch Patent Center into Training Mode and confirm you are in it.**
+   It is reached from the signed-in interface and the page marks itself as
+   training; uspto.gov describes it as "an interactive simulation where you can
+   safely practice filing DOCX and PDF documents". Screenshot the indicator. If you
+   cannot confirm you are in Training Mode, STOP and report, and do not continue in
+   live Patent Center.
 """
 
 
@@ -389,16 +424,26 @@ async def api_obs_submit(sub_id: str, request: Request):
     fee_text = ("no fee, 37 CFR 1.290(g)" if fee["exempt"]
                 else "$%d (%s, fee code %s)" % (fee["total"], fee["entity"], fee["code"]))
     if demo:
-        mission = ("drive Patent Center as far as the payment screen and stop there. "
-                   "You are NOT filing and you are NOT paying.")
-        fee_step = "DEMO: do NOT pay. Stop when the fee or payment screen appears."
-        finish_step = ("Screenshot the payment screen, read back the fee Patent Center "
-                       "calculated, close the browser you opened "
+        mission = ("in TRAINING MODE, drive Patent Center as far as the payment screen and "
+                   "stop there. You are NOT filing and you are NOT paying.")
+        fee_step = ("DEMO: do NOT pay. Stop when the fee or payment screen appears. In "
+                    "Training Mode the fee is calculated but nothing is charged, and you "
+                    "still do not enter a card.")
+        finish_step = ("Screenshot the payment screen and the Training Mode indicator, read "
+                       "back the fee Patent Center calculated, close the browser you opened "
                        "(`browser_live.shutdown(port, profile)`) and report here. Leave it "
                        "unsubmitted.")
         stop_rule = DEMO_STOP
-        stop_bullet = ("- THIS IS A DEMO. Do not submit and do not pay, whatever else this "
-                       "brief says.\n")
+        training_step = TRAINING_STEP
+        stop_bullet = (
+            "- THIS IS A DEMO. Do not submit and do not pay, whatever else this brief says.\n"
+            "- Training Mode is not optional and not a formality. Reaching a fee screen means "
+            "the application number and every document are already entered, so in LIVE Patent "
+            "Center this package would put sample PDFs and invented statements of relevance "
+            "into a real file. Stopping before payment does not prevent that. If you are not "
+            "in Training Mode, stop.\n"
+            "- The target number and the attached documents are placeholders. The PDFs say so "
+            "on their face. They are not to be filed anywhere, in any mode.\n")
     else:
         mission = "complete the submission, pay if a fee is due, and report back."
         fee_step = (("No fee is due: the 1.290(g) statement applies, three or fewer items on "
@@ -411,13 +456,20 @@ async def api_obs_submit(sub_id: str, request: Request):
                        "transaction id, close the browser you opened "
                        "(`browser_live.shutdown(port, profile)`) and report back here.")
         stop_rule = ""
+        training_step = ""
         stop_bullet = ""
 
     files = [f for f in (meta.get("files") or [])]
-    forms = [f for f in (meta.get("forms") or [])]
+    # Always rebuild rather than trusting what is recorded: the list may have been
+    # edited since Build was last pressed, and a stale concise-description document
+    # is worse than none, because the brief says to file it.
+    try:
+        forms = await _build_forms(d, meta)
+    except Exception as exc:                                      # noqa: BLE001
+        return _err("could not build the documents to file: %s" % exc, 500)
     brief = BRIEF.format(
         stop_rule=stop_rule, mission=mission, fee_step=fee_step, finish_step=finish_step,
-        stop_bullet=stop_bullet,
+        stop_bullet=stop_bullet, training_step=training_step,
         appno=obs.format_application_number(meta.get("application_number") or ""),
         title_line=("\n- Title: %s" % meta["title"]) if meta.get("title") else "",
         deadline=review["timing"].get("deadline") or "unknown",

@@ -1525,6 +1525,8 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
         <button class="d fix" id="bkill">Close</button>
       </div>
       <img id="screen" alt="browser">
+      <div id="screenempty" style="display:none;background:#05070c;border:1px solid var(--line);
+        border-radius:8px;padding:26px;text-align:center;color:var(--mut);font-size:13px"></div>
       <div class="row" style="margin-top:8px">
         <input id="navurl" placeholder="https://patentcenter.uspto.gov/">
         <button class="g fix" id="navgo">Go</button>
@@ -2447,9 +2449,38 @@ async function loadBrowsers(){
   $('bsel').innerHTML=j.browsers.map(b=>`<option value="${b.port}">${b.port}${b.remote?' instance-3':b.shared?' (shared)':' local'}${b.headless===false?' headed':''} - ${b.targets.length} tab(s)</option>`).join('')
     ||'<option value="">none running</option>';
   window._browsers=j.browsers; drawTabs();
-  // The agent opens its own browser. Attach to it without being asked, otherwise
-  // the pane sits black next to a session that is plainly doing something.
-  if(!live&&j.browsers.length&&$('bsel').value&&$('tsel').value)$('battach').onclick();
+  // Attach without being asked, but only to a browser this panel started. The
+  // shared browser on 9222 belongs to whatever else is using this box, and
+  // attaching to it shows the wrong screen convincingly, which is worse than
+  // showing none: you would be watching someone else's tab believing it is ours.
+  const own=j.browsers.filter(b=>!b.shared);
+  if(!live&&own.length){
+    $('bsel').value=String(own[0].port); drawTabs();
+    if($('tsel').value)$('battach').onclick();
+  }
+  drawScreenState();
+}
+// A black rectangle is the one thing this pane must never be. If no browser is
+// running the agent has not opened one yet, or it stopped before opening one, and
+// that is worth saying rather than leaving a blank box that reads as broken.
+function drawScreenState(){
+  const all=(window._browsers||[]), own=all.filter(b=>!b.shared), attached=!!live;
+  const painted=attached&&$('screen').src;
+  $('screen').style.display=painted?'block':'none';
+  const box=$('screenempty');
+  if(painted){box.style.display='none';return;}
+  box.style.display='block';
+  box.textContent=attached
+    ? 'Attached, waiting for the first frame.'
+    : own.length
+      ? 'A browser is running but nothing is attached. Pick a tab and press Attach.'
+      : (all.length
+         ? 'No browser of ours is open. Only the shared browser on this box is running, and '
+           +'that one belongs to something else, so it is not shown here. The agent starts '
+           +'its own when it reaches Patent Center.'
+         : 'No browser open. The agent starts one when it reaches Patent Center, and this '
+           +'fills in by itself. If the session stopped before then, its reason is in the '
+           +'terminal on the left.');
 }
 $('bsel').onchange=drawTabs;
 function drawTabs(){
@@ -2474,8 +2505,9 @@ $('battach').onclick=()=>{
       $('livestat').textContent=`${n} frames, ${kb.toFixed(0)} KB, ${(kb/Math.max(1,(Date.now()-t0)/1000)).toFixed(1)} KB/s`;}
     else if(m.t==='nav'){$('navurl').value=m.url;}
     else if(m.t==='error'){toast(m.m);}
-    else if(m.t==='hello'){$('navurl').value=m.url;$('bstat').textContent='attached: '+(m.title||m.url);}};
-  live.onclose=()=>{$('bstat').textContent='detached';};
+    else if(m.t==='hello'){$('navurl').value=m.url;$('bstat').textContent='attached: '+(m.title||m.url);}
+    drawScreenState();};
+  live.onclose=()=>{$('bstat').textContent='detached';live=null;drawScreenState();};
 };
 $('screen').onclick=e=>{ if(!live||!$('binteract').checked)return;
   const r=e.target.getBoundingClientRect();
