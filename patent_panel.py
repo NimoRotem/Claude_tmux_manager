@@ -29,11 +29,12 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 import browser_live
 import docsign
 import patent_forms
+import patent_intake as intake
 import patent_obs_routes
 import patent_packet as pkt
 import patent_store as store
@@ -344,6 +345,203 @@ async def api_packet_scan(packet_id: str):
     meta["scanned"] = time.time()
     _save_meta(d, meta)
     return JSONResponse({"ok": True, "files": entries, "report": report})
+
+
+
+def _build_forms_for(d, meta: dict, data: dict, wanted) -> list:
+    """Build exactly the forms this filing needs. Synchronous, called off-thread.
+
+    The panel used to present four checkboxes and ask which to generate. Nobody
+    filing a patent knows the answer, and getting it wrong is silent: the wrong set
+    is either a missing required form or a form the Office does not want. It falls
+    out of the parties instead, in patent_intake.forms_needed.
+    """
+    title = (meta.get("title") or "").strip()
+    docket = (meta.get("docket") or "").strip()
+    inv_ids = meta.get("inventor_ids") or []
+    forms_dir = Path(d) / "forms"
+    forms_dir.mkdir(parents=True, exist_ok=True)
+    wanted = set(wanted or [])
+    made = []
+
+    def add(path, label, note="", signed_by="", presigned=False, needs_signature=True):
+        made.append({"path": str(path), "name": Path(path).name, "label": label,
+                     "note": note, "verify": patent_forms.verify(path),
+                     "signed_by": signed_by, "presigned": bool(presigned),
+                     "needs_signature": bool(needs_signature)})
+
+    invs = [i for i in (store.find(data, "inventors", x) for x in inv_ids) if i]
+    if "declaration" in wanted:
+        for inv in invs:
+            name = store.full_name(inv)
+            sig = _signature_path(inv)
+            out = forms_dir / ("DECLARATION_%s.pdf" % store.slugify(name, "inventor"))
+            patent_forms.build_declaration(out, name, title, "", "", sig)
+            add(out, "Declaration 37 CFR 1.63 (PTO/AIA/01), %s" % name,
+                "Carries the 1.63(a)(4) statement that hand-built packets usually miss.",
+                signed_by=name, presigned=bool(sig))
+    if "age_petition" in wanted:
+        for inv in invs:
+            if not inv.get("age_65_plus"):
+                continue
+            name = store.full_name(inv)
+            sig = _signature_path(inv)
+            out = forms_dir / ("PETITION_AGE_%s.pdf" % store.slugify(name, "inventor"))
+            patent_forms.build_age_petition(
+                out, inv, title, application_number="", confirmation_number="",
+                filing_date="", docket=docket,
+                first_named_inventor=store.full_name(invs[0]) if invs else name,
+                signature_image=sig)
+            add(out, "Petition to Make Special on Age (PTO/SB/130), %s" % name,
+                "No fee under 37 CFR 1.102(c)(1). Filed once the application number exists.",
+                signed_by=name, presigned=bool(sig))
+    if "power_of_attorney" in wanted:
+        applicant = store.find(data, "applicants", meta.get("applicant_id") or "") or {}
+        prac = (data.get("practitioners") or [{}])[0]
+        signer = invs[0] if invs else {}
+        sig = _signature_path(signer)
+        out = forms_dir / "POWER_OF_ATTORNEY.pdf"
+        patent_forms.build_power_of_attorney(
+            out, applicant_name=applicant.get("name", ""),
+            signer_name=store.full_name(signer) if signer else "", signer_title="",
+            invention_title=title, docket=docket,
+            first_named_inventor=store.full_name(invs[0]) if invs else "",
+            customer_number=prac.get("customer_number", ""),
+            practitioners=[prac] if prac else [],
+            juristic_applicant=(applicant.get("kind") == "juristic"),
+            signer_is_inventor=(applicant.get("kind") != "juristic"),
+            signature_image=sig)
+        add(out, "Power of Attorney (PTO/AIA/82)",
+            "Representative details on an ADS are NOT a power of attorney (37 CFR 1.32).",
+            signed_by=store.full_name(signer) if signer else "", presigned=bool(sig))
+    if "statement_373" in wanted:
+        applicant = store.find(data, "applicants", meta.get("applicant_id") or "") or {}
+        signer = invs[0] if invs else {}
+        sig = _signature_path(signer)
+        out = forms_dir / "STATEMENT_3_73.pdf"
+        patent_forms.build_statement_373(
+            out, assignee_name=applicant.get("name", ""), assignee_kind="corporation",
+            invention_title=title,
+            first_named_inventor=store.full_name(invs[0]) if invs else "",
+            signer_name=store.full_name(signer) if signer else "", signer_title="",
+            signature_image=sig)
+        add(out, "Statement under 37 CFR 3.73(c) (PTO/AIA/96)",
+            "Needed when an assignee takes an action, including becoming the applicant.",
+            signed_by=store.full_name(signer) if signer else "", presigned=bool(sig))
+
+    # A copy signed on screen supersedes its draft.
+    signed = {n[len("SIGNED_"):] for n in
+              (f.name for f in forms_dir.glob("SIGNED_*.pdf"))}
+    for f in made:
+        if f["name"] in signed:
+            f["presigned"] = True
+            f["superseded_by"] = "SIGNED_" + f["name"]
+    return made
+
+
+@router.get("/api/packet/{packet_id}/file/{name}")
+async def api_packet_file(packet_id: str, name: str):
+    """Serve one file out of the uploaded package, so Preview can show it."""
+    d = _packet_dir(packet_id)
+    p = d / "files" / os.path.basename(name)
+    if not p.exists():
+        return _err("no such file", 404)
+    return FileResponse(str(p), filename=p.name)
+
+
+@router.post("/api/packet/{packet_id}/audit")
+async def api_packet_audit(packet_id: str, request: Request):
+    """Everything the old panel made you do by hand, in one call.
+
+    Expand, check every file, read the title and the inventors out of the package,
+    fall back to the store for what the files do not say, work out which forms this
+    filing actually needs, build them, and report what is still wrong with a remedy
+    against each item. The user's next action is either Submit or one named fix.
+    """
+    d = _packet_dir(packet_id)
+    if not d.exists():
+        return _err("unknown packet", 404)
+    body = await request.json() if request.headers.get("content-type", "").startswith(
+        "application/json") else {}
+    meta = _load_meta(d)
+    data = store.load()
+    defaults = data.get("defaults") or {}
+
+    # 1. expand and check the files
+    files_dir = d / "files"
+    shutil.rmtree(files_dir, ignore_errors=True)
+    files_dir.mkdir(parents=True, exist_ok=True)
+    expanded = await asyncio.to_thread(pkt.expand, d / "in", files_dir)
+    prior = {Path(f["path"]).name: f.get("role") for f in (meta.get("files") or [])}
+    entries = []
+    for p in expanded:
+        role = prior.get(p.name) or await asyncio.to_thread(pkt.guess_role, p)
+        entries.append({"path": str(p), "name": p.name, "role": role})
+    report = await asyncio.to_thread(pkt.review_packet, entries)
+    meta["files"] = entries
+    meta["report"] = report
+
+    # 2. read what the package itself says
+    facts = await asyncio.to_thread(intake.read_package, entries)
+
+    # 3. fill the gaps: explicit edits win, then the package, then the store
+    meta["title"] = (body.get("title") or meta.get("title") or facts.get("title") or "").strip()
+    meta.setdefault("docket", body.get("docket") or "")
+    if body.get("docket") is not None:
+        meta["docket"] = body.get("docket") or meta.get("docket", "")
+    meta["entity_status"] = (body.get("entity_status") or meta.get("entity_status")
+                             or defaults.get("entity_status") or "small")
+    meta["applicant_id"] = (body.get("applicant_id") or meta.get("applicant_id")
+                            or defaults.get("applicant_id") or "app_inventors")
+    meta["correspondence_id"] = (body.get("correspondence_id") or meta.get("correspondence_id")
+                                 or defaults.get("correspondence_id") or "")
+    meta["publication"] = body.get("publication") or meta.get("publication") or "normal"
+    if body.get("inventor_ids") is not None:
+        meta["inventor_ids"] = body.get("inventor_ids") or []
+    elif not meta.get("inventor_ids"):
+        matched = intake.match_inventors(facts.get("inventor_names") or [], data)
+        meta["inventor_ids"] = matched or ([defaults["inventor_id"]]
+                                           if defaults.get("inventor_id") else [])
+    meta["inventors_from_files"] = bool(facts.get("inventor_names"))
+
+    # 4. the representation gate and the fee estimate
+    gate = store.representation_gate(data, meta["inventor_ids"], meta["applicant_id"])
+    fees = store.estimate_fees(
+        entity_status=meta["entity_status"],
+        total_claims=facts.get("claims") or 20,
+        independent_claims=facts.get("independent") or 3,
+        sheets=facts.get("sheets") or 0,
+        docx_spec=bool(facts.get("spec_is_docx", True)),
+        oath_with_application=True)
+
+    # 5. build exactly the forms this filing needs
+    wanted = intake.forms_needed(meta["inventor_ids"], meta["applicant_id"], data)
+    meta["forms_needed"] = wanted
+    try:
+        forms = await asyncio.to_thread(_build_forms_for, d, meta, data, wanted)
+        meta["forms"] = forms
+    except Exception as exc:                                      # noqa: BLE001
+        meta["forms"] = []
+        meta["forms_error"] = str(exc)[:250]
+
+    # 6. what is still wrong, and what would fix it
+    audit = intake.audit(meta, data, facts, report, gate)
+    if meta.get("forms_error"):
+        audit["issues"].append({"id": "forms", "level": "block",
+                                "label": "The forms could not be built",
+                                "detail": meta["forms_error"], "rule": "",
+                                "fix": {"kind": "agent", "what": "build the forms"}})
+        audit["blocking"] += 1
+        audit["ready"] = False
+
+    meta["facts"] = facts
+    meta["audit"] = audit
+    meta["gate"] = gate
+    meta["fees"] = fees
+    _save_meta(d, meta)
+    return JSONResponse({"ok": True, "packet": meta, "facts": facts, "files": entries,
+                         "report": report, "audit": audit, "gate": gate, "fees": fees,
+                         "forms": meta.get("forms") or []})
 
 
 @router.post("/api/packet/{packet_id}/role")
@@ -1381,6 +1579,19 @@ border-radius:var(--rad);padding:14px;display:flex;flex-direction:column;max-hei
 border-radius:8px;padding:10px}
 #pagewrap{position:relative;display:inline-block;background:#fff;border-radius:6px;line-height:0}
 #pageimg{display:block;max-width:100%}
+/* One fact per line: label, leader dots, value. A form-shaped grid of boxes was
+   the wrong shape for something that is mostly read and occasionally corrected. */
+.frow{border-bottom:1px solid var(--line)}
+.frow:last-child{border-bottom:0}
+.rowline{display:flex;align-items:baseline;gap:8px;padding:9px 2px;cursor:default}
+.frow .rowline[onclick]{cursor:pointer}
+.frow .rowline[onclick]:hover{background:rgba(255,255,255,.03)}
+.rlabel{color:var(--mut);font-size:12.5px;white-space:nowrap}
+.rdots{flex:1;border-bottom:1px dotted var(--line);transform:translateY(-3px)}
+.rvalue{font-size:13px;text-align:right;max-width:62%}
+.redit{font-size:11px;color:var(--acc);white-space:nowrap}
+.reditor{padding:4px 2px 12px}
+#facts .frow:first-child .rowline{padding-top:2px}
 .runsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
 @media(max-width:1100px){.runsplit{grid-template-columns:1fr}}
 .runpane{min-width:0}
@@ -1409,108 +1620,57 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
 <main>
 
 <section id="s-new" class="on">
-  <div class="card" style="margin-bottom:14px">
+
+  <div class="card" id="dropcard">
+    <h3>Start with the package</h3>
+    <div class="hint">A zip, or the loose files. Everything else is read out of them:
+      the title, the claim count, the drawings, who the inventors are. You are asked
+      only for what the files do not say.</div>
+    <div class="row" style="margin-top:10px">
+      <input type="file" id="pkgfiles" multiple>
+      <button class="b fix" id="pkgup">Upload and check</button>
+      <span class="fix muted">or</span>
+      <button class="g fix" id="demorun">Load the demo</button>
+      <span class="fix muted" id="upstat"></span>
+    </div>
+  </div>
+
+  <div class="card" id="factscard" style="display:none">
+    <div class="row" style="margin-bottom:6px">
+      <h3 style="margin:0">The filing</h3>
+      <span class="fix" style="flex:1"></span>
+      <span class="pill fix" id="readypill"></span>
+    </div>
+    <div id="facts"></div>
+    <details id="advanced" style="margin-top:10px">
+      <summary class="muted" style="cursor:pointer;font-size:12px">Advanced</summary>
+      <div id="advbody" style="margin-top:10px"></div>
+    </details>
+  </div>
+
+  <div class="card" id="issuecard" style="display:none">
+    <h3>Before this can be filed</h3>
+    <div id="issues"></div>
+  </div>
+
+  <div class="card" id="gocard" style="display:none">
     <div class="row">
-      <div><b>Try it end to end.</b>
-        <div class="hint">Loads the bundled sample application, runs the checks, and hands it to a
-        session that logs in to the real Patent Center, fills the web ADS, uploads, prices the
-        filing and stops at Review &amp; submit. It never presses Submit and never pays.</div></div>
-      <button class="g fix" id="demorun">Load the demo application</button>
-      <span class="fix" id="demostat"></span>
+      <div><b id="gohead">Ready.</b><div class="hint" id="gohint"></div></div>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="preview">Preview</button>
+      <button class="b fix" id="go">Go</button>
+      <span class="fix" id="gostat"></span>
     </div>
   </div>
-  <div id="gate"></div>
-  <div class="split">
-    <div>
-      <div class="card">
-        <h3>Preset</h3>
-        <select id="preset"><option value="">Start from scratch</option></select>
-        <div class="hint" id="presetnote"></div>
-        <label>Title of invention</label><textarea id="title"></textarea>
-        <label>Attorney docket</label><input id="docket">
-        <div class="row">
-          <div><label>Entity status</label><select id="entity">
-            <option value="small">Small</option><option value="large">Regular undiscounted</option>
-            <option value="micro">Micro</option></select></div>
-          <div><label>Publication</label><select id="publication">
-            <option value="normal">Normal 18 month</option>
-            <option value="early">Request early</option>
-            <option value="nonpublication">Nonpublication request</option></select></div>
-        </div>
-        <div class="hint" id="pubwarn"></div>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Inventors</h3>
-        <div id="invpick"></div>
-        <label>Applicant</label><select id="applicant"></select>
-        <label>Correspondence</label><select id="corr"></select>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Fees</h3><div id="fees"></div>
-      </div>
-    </div>
-    <div>
-      <div class="card">
-        <h3>Draft</h3>
-        <div class="drop" id="drop">Drop the draft here, or click to choose.<br>
-          <span class="muted">Loose files or a zip. Notes and instructions are detected and left out of the submission.</span></div>
-        <input type="file" id="fileinput" multiple style="display:none">
-        <div id="filelist" style="margin-top:12px"></div>
-        <div class="row" style="margin-top:10px">
-          <button class="g fix" id="rescan">Re-check</button>
-          <button class="g fix" id="cleanbtn">Fix DOCX warnings</button>
-          <span class="fix" id="scanstat"></span>
-        </div>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Checks</h3><div id="report"><span class="muted">Upload a draft to see the checks.</span></div>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Forms to generate</h3>
-        <div class="chk"><input type="checkbox" id="f_decl" checked><label for="f_decl" style="margin:0">
-          Declaration per inventor (PTO/AIA/01)<div class="hint">Includes the 37 CFR 1.63(a)(4) statement most drafting tools omit.</div></label></div>
-        <div class="chk"><input type="checkbox" id="f_age"><label for="f_age" style="margin:0">
-          Petition to make special on age (PTO/SB/130)<div class="hint" id="agehint">No fee. Needs an inventor marked 65 or older.</div></label></div>
-        <div class="chk"><input type="checkbox" id="f_poa"><label for="f_poa" style="margin:0">
-          Power of attorney (PTO/AIA/82)</label></div>
-        <div class="chk"><input type="checkbox" id="f_373"><label for="f_373" style="margin:0">
-          Statement under 37 CFR 3.73(c) (PTO/AIA/96)</label></div>
-        <div class="row" style="margin-top:8px">
-          <button class="b fix" id="genall">Generate all four</button>
-          <button class="g fix" id="genforms">Generate ticked only</button>
-          <span class="fix" id="formstat"></span>
-        </div>
-        <div id="formlist" style="margin-top:10px"></div>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Send for signature</h3>
-        <p class="muted">Sends each form to its signer through <b>GRABO Sign</b>
-          (grabo.cc/data-dashboard/docsign). It detects the fields with AI, emails a private
-          link, and stamps a final PDF with an audit page. The signed copy comes back here and
-          is what gets filed. <span id="dshealth" class="pill"></span></p>
-        <div id="signrows"><span class="muted">Generate the forms first.</span></div>
-        <label>Message to the signers (optional)</label>
-        <input id="signmsg" placeholder="Please sign the inventor declaration for the vibration device application.">
-        <div class="row" style="margin-top:10px">
-          <button class="b fix" id="sendsign">Send selected</button>
-          <button class="g fix" id="refreshsign">Check signatures</button>
-          <span class="fix" id="signstat"></span>
-        </div>
-        <div id="signstate" style="margin-top:10px"></div>
-      </div>
-      <div class="card" style="margin-top:14px">
-        <h3>Submit</h3>
-        <p class="muted">Opens a Claude session in tmux with the packet, the resolved party
-        data and a written brief. It re-checks everything, drives Patent Center in a
-        dedicated proxy-free Chrome you can watch on the Live tab, pays, and reports back.</p>
-        <div class="row"><button class="b fix" id="submit">Open the filing session</button>
-        <button class="g fix" id="preview">Preview the brief</button>
-        <span class="fix" id="substat"></span></div>
-        <pre id="briefout" class="mono" style="display:none;white-space:pre-wrap;background:var(--panel2);
-          border:1px solid var(--line);border-radius:8px;padding:12px;margin-top:10px;max-height:420px;overflow:auto"></pre>
-      </div>
-    </div>
+
+  <div class="card" id="previewcard" style="display:none">
+    <div class="row"><h3 style="margin:0">What gets filed</h3>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="previewclose">Close</button></div>
+    <div id="previewblurb" class="hint" style="margin:8px 0"></div>
+    <div id="previewdocs"></div>
   </div>
+
 </section>
 
 <section id="s-obs">
@@ -1776,290 +1936,346 @@ window.openRun=async(session)=>{
 async function boot(){
   const j=await api('/api/store'); S=j.store; roles=j.roles;
   $('feestamp').textContent='fee schedule verified '+j.fees_verified;
-  const d=S.defaults||{};
-  $('entity').value=d.entity_status||'small';
-  fill('applicant',S.applicants,'name'); fill('corr',S.correspondence,'label');
-  $('applicant').value=d.applicant_id||''; $('corr').value=d.correspondence_id||'';
-  $('preset').innerHTML='<option value="">Start from scratch</option>'+
-    (S.presets||[]).map(p=>`<option value="${p.id}">${esc(p.label)}</option>`).join('');
-  drawInventors(); drawParties(); drawHistory(); recompute();
+  drawParties(); drawHistory();
 }
 function fill(id,rows,key){$(id).innerHTML=(rows||[]).map(r=>`<option value="${r.id}">${esc(r[key])}</option>`).join('');}
-function drawInventors(){
-  $('invpick').innerHTML=(S.inventors||[]).map(i=>{
-    const res=i.residence||{}, foreign=res.country && res.country!=='US';
-    return `<div class="chk"><input type="checkbox" class="inv" value="${i.id}" ${i.id==='inv_nimrod'?'checked':''}>
-    <label style="margin:0">${esc(i.given)} ${esc(i.family)}
-      <span class="pill ${foreign?'bad':'ok'}">${esc(res.city||'?')}, ${esc(res.country||'?')}</span>
-      ${i.age_65_plus?'<span class="pill ok">65+</span>':''}
-      ${foreign?'<div class="hint">Non-US domicile: naming this inventor forces a registered practitioner.</div>':''}
-    </label></div>`;}).join('');
-  document.querySelectorAll('.inv').forEach(c=>c.onchange=recompute);
-}
-const picked=()=>[...document.querySelectorAll('.inv:checked')].map(c=>c.value);
 
-let recTimer;
-function recompute(){clearTimeout(recTimer);recTimer=setTimeout(doRecompute,120);}
-async function doRecompute(){
-  const counts=(packet&&packet.report&&packet.report.counts)||{};
-  const j=await api('/api/gate',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({inventor_ids:picked(),applicant_id:$('applicant').value,
-      entity_status:$('entity').value,total_claims:counts.total||20,
-      independent_claims:counts.independent||3})});
-  const g=j.gate;
-  $('gate').innerHTML = g.practitioner_required
-    ? `<div class="banner bad"><b>A registered patent practitioner is required.</b><br>${g.reasons.map(esc).join('<br>')}
-       <div class="hint" style="color:inherit;opacity:.8">37 CFR 1.31(a), in force since 20 July 2026. A document signed by anyone else is not effective.</div></div>`
-    : `<div class="banner ok"><b>Pro se filing is permitted.</b> ${g.inventor_count} inventor(s), all US-domiciled, applicant is the inventor.
-       ${g.age_petition_available?'<br>Free age-based petition to make special available for '+g.age_petition_inventors.map(esc).join(', ')+'.':''}</div>`;
-  if(g.missing_inventor_data.length)
-    $('gate').innerHTML+=`<div class="banner warn"><b>Missing data the ADS needs:</b><br>${g.missing_inventor_data.map(esc).join('<br>')}</div>`;
-  $('agehint').textContent=g.age_petition_available
-    ? 'Available for '+g.age_petition_inventors.join(', ')+'. No fee, 37 CFR 1.102(c)(1).'
-    : 'No fee, but it needs an inventor marked 65 or older on the Settings tab.';
-  $('f_age').disabled=!g.age_petition_available;
-  const f=j.fees;
-  $('fees').innerHTML=`<table>${f.lines.map(l=>`<tr><td>${esc(l.label)}<div class="hint mono">${esc(l.code)}</div></td>
-    <td style="text-align:right">$${l.amount}</td></tr>`).join('')}
-    <tr><th>Total</th><th style="text-align:right">$${f.total}</th></tr></table>
-    <div class="hint">${esc(f.note)}</div>`;
-  $('pubwarn').textContent = $('publication').value==='nonpublication'
-    ? 'A nonpublication request forfeits the right to file abroad unless you notify the Office within 45 days. Only tick this if you will never file outside the US.' : '';
-}
-['applicant','entity','publication'].forEach(id=>$(id).onchange=recompute);
-$('preset').onchange=()=>{
-  const p=(S.presets||[]).find(x=>x.id===$('preset').value); if(!p)return;
-  $('presetnote').textContent=p.notes||'';
-  document.querySelectorAll('.inv').forEach(c=>c.checked=(p.inventor_ids||[]).includes(c.value));
-  if(p.applicant_id)$('applicant').value=p.applicant_id;
-  if(p.correspondence_id)$('corr').value=p.correspondence_id;
-  if(p.entity_status)$('entity').value=p.entity_status;
-  if(p.publication)$('publication').value=p.publication;
-  recompute();
+// ---- Settings tab (kept from the previous panel) ----
+const FIELDS={
+ inventors:[['given','Given name'],['middle','Middle'],['family','Family name'],['suffix','Suffix'],
+   ['residence.city','Residence city'],['residence.state','Residence state'],['residence.country','Residence country'],
+   ['mailing.line1','Mailing line 1'],['mailing.line2','Mailing line 2'],['mailing.city','Mailing city'],
+   ['mailing.state','State'],['mailing.postal','Postcode'],['mailing.country','Country'],
+   ['email','Email'],['phone','Phone'],['age_65_plus','65 or older','bool'],['notes','Notes','text']],
+ applicants:[['name','Name'],['kind','Kind (inventors|juristic|person)'],['address.line1','Line 1'],
+   ['address.city','City'],['address.state','State'],['address.postal','Postcode'],['address.country','Country'],['notes','Notes','text']],
+ correspondence:[['label','Label'],['customer_number','Customer number'],['name','Name'],['line1','Line 1'],
+   ['line2','Line 2'],['city','City'],['state','State'],['postal','Postcode'],['country','Country'],
+   ['email1','Email 1'],['email2','Email 2'],['phone','Phone'],['notes','Notes','text']],
+ practitioners:[['name','Name'],['registration','Registration number'],['category','Category'],
+   ['firm','Firm'],['customer_number','Customer number'],['notes','Notes','text']],
+ payment:[['label','Label'],['advisor_key','Advisor secret key'],['last_four','Last four'],
+   ['cap','Spend cap'],['notes','Notes','text']],
+ accounts:[['label','Label'],['username','Username'],['advisor_secret','Advisor secret key'],
+   ['customer_numbers','Customer numbers'],['notes','Notes','text']],
 };
+const COLL_NOTE={
+ inventors:'Residence decides the 37 CFR 1.31 gate. A non-US country here forces a registered practitioner on any filing this person is named in.',
+ applicants:'Leave the applicant as the inventors to keep the pro se route. Naming a company makes it a juristic applicant, and 1.31(a)(1) then requires a practitioner for everything.',
+ correspondence:'Where the Office sends the filing receipt and every notice. A customer number sends it to that firm instead of to you.',
+ practitioners:'Only needed when a practitioner is actually appointed. Listing one on an ADS is not a power of attorney (37 CFR 1.32); the PTO/AIA/82 form is.',
+ payment:'Card numbers are never stored here. Only the advisor key is, and the filing agent fetches the number with get_payment_method at payment time.',
+ accounts:'Passwords are never stored here either, only the name of the advisor secret that holds them.',
+};
+function renderColl(coll){
+  const host=$('grid-'+coll); if(!host)return;
+  host.innerHTML=(S[coll]||[]).map(r=>`<div class="card" style="background:var(--panel2)">
+    ${FIELDS[coll].map(([k,lab,t])=>{
+      const v=get(r,k);
+      if(t==='bool')return `<label class="chk"><input type="checkbox" data-c="${coll}" data-i="${r.id}" data-k="${k}" ${v?'checked':''}> ${esc(lab)}</label>`;
+      if(t==='text')return `<label>${esc(lab)}</label><textarea data-c="${coll}" data-i="${r.id}" data-k="${k}">${esc(v||'')}</textarea>`;
+      return `<label>${esc(lab)}</label><input data-c="${coll}" data-i="${r.id}" data-k="${k}" value="${esc(v||'')}">`;}).join('')}
+    <div class="row" style="margin-top:8px"><button class="g fix" onclick="saveRow('${coll}','${r.id}')">Save</button>
+    <button class="d fix" onclick="delRow('${coll}','${r.id}')">Delete</button></div></div>`).join('');
+}
+function drawParties(){
+  $('parties').innerHTML=Object.keys(FIELDS).map(coll=>`
+   <div class="card" style="margin-bottom:14px"><h3>${coll}</h3>
+    ${COLL_NOTE[coll]?`<p class="muted" style="margin:0 0 10px">${esc(COLL_NOTE[coll])}</p>`:''}
+    <div class="grid" id="grid-${coll}"></div>
+    <button class="g" style="margin-top:10px" onclick="addRow('${coll}')">Add</button></div>`).join('');
+  Object.keys(FIELDS).forEach(renderColl);
+  drawSignatures(); drawDefaults();
+}
 
-// ---- packet ----
-$('drop').onclick=()=>$('fileinput').click();
-$('drop').ondragover=e=>{e.preventDefault();$('drop').classList.add('hot');};
-$('drop').ondragleave=()=>$('drop').classList.remove('hot');
-$('drop').ondrop=e=>{e.preventDefault();$('drop').classList.remove('hot');send(e.dataTransfer.files);};
-$('fileinput').onchange=e=>send(e.target.files);
-async function ensurePacket(){
-  if(packet)return packet;
-  const j=await api('/api/packet',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({title:$('title').value,docket:$('docket').value})});
-  packet=j.packet; return packet;
+function drawDefaults(){
+  const d=S.defaults||{};
+  $('defaults').innerHTML=`<div class="card" style="background:var(--panel2)">`+
+    DEFAULT_FIELDS.map(([k,lab,t])=>t==='bool'
+      ? `<label class="chk"><input type="checkbox" data-def="${k}" ${d[k]?'checked':''}> ${esc(lab)}</label>`
+      : `<label>${esc(lab)}</label><input data-def="${k}" value="${esc(d[k]||'')}">`).join('')+
+    `<p class="hint">Leaving the PDX box ticked is the default and the right choice unless you will
+     never file abroad: it lets the EPO, JPO and KIPO pull the priority document automatically.</p></div>`;
 }
-async function send(files){
-  if(!files||!files.length)return;
-  await ensurePacket(); $('scanstat').textContent='uploading...';
-  for(const f of files){const fd=new FormData();fd.append('file',f);
-    await fetch(B+'/patents/api/packet/'+packet.id+'/upload',{method:'POST',body:fd});}
-  await scan();
-}
-async function scan(){
-  if(!packet)return; $('scanstat').textContent='checking...';
-  try{const j=await api('/api/packet/'+packet.id+'/scan',{method:'POST'});
-    packet.files=j.files; packet.report=j.report; drawFiles(); drawReport(); recompute();
-    $('scanstat').textContent='';}
-  catch(e){$('scanstat').textContent='';toast('Check failed: '+e.message);}
-}
-$('rescan').onclick=scan;
-$('cleanbtn').onclick=async()=>{
-  if(!packet)return toast('Upload a draft first.');
-  $('scanstat').textContent='fixing...';
-  const j=await api('/api/packet/'+packet.id+'/clean',{method:'POST'});
-  packet.report=j.report; drawReport(); $('scanstat').textContent='';
-  toast(j.fixed.length?('Fixed: '+j.fixed.map(f=>f.name+(f.quotes_replaced?` (${f.quotes_replaced} quotes)`:'')).join(', ')):'Nothing to fix.');
-};
-function drawFiles(){
-  $('filelist').innerHTML=`<table><tr><th>File</th><th>Role</th><th></th></tr>`+
-   (packet.files||[]).map(f=>`<tr><td class="mono">${esc(f.name)}</td>
-    <td><select data-n="${esc(f.name)}" class="rolesel">${Object.entries(roles).map(([k,v])=>
-      `<option value="${k}" ${f.role===k?'selected':''}>${esc(v)}</option>`).join('')}</select></td>
-    <td class="muted">${f.role==='exclude'?'not filed':''}</td></tr>`).join('')+`</table>`;
-  document.querySelectorAll('.rolesel').forEach(s=>s.onchange=async()=>{
-    const j=await api('/api/packet/'+packet.id+'/role',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:s.dataset.n,role:s.value})});
-    packet.report=j.report; packet.files=j.files; drawReport(); recompute();});
-}
-function drawReport(){
-  const r=packet.report; if(!r)return;
-  const badge=l=>`<span class="pill ${l==='fail'?'bad':l==='warn'?'warn':l==='pass'?'ok':''}">${l}</span>`;
-  $('report').innerHTML=`<div class="row" style="margin-bottom:8px">
-      <span class="fix">${badge('fail')} ${r.fail}</span><span class="fix">${badge('warn')} ${r.warn}</span>
-      <span class="fix">${badge('pass')} ${r.pass}</span><span class="fix muted">${(r.total_bytes/1e6).toFixed(1)} MB</span></div>`+
-    (r.sections||[]).map(s=>`<div style="margin-bottom:10px"><div class="muted" style="margin-bottom:4px">${esc(s.name)}</div>`+
-      s.findings.filter(f=>f.level!=='info'||s.name==='Required documents').map(f=>
-      `<div style="margin:3px 0">${badge(f.level)} ${esc(f.title)}
-        ${f.detail?`<div class="hint">${esc(f.detail)}</div>`:''}
-        ${f.rule?`<div class="hint mono">${esc(f.rule)}</div>`:''}</div>`).join('')+`</div>`).join('');
-}
-async function genForms(wanted){
-  await ensurePacket(); $('formstat').textContent='generating...';
-  try{
-    const j=await api('/api/packet/'+packet.id+'/forms',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({title:$('title').value,docket:$('docket').value,inventor_ids:picked(),
-        applicant_id:$('applicant').value,wanted})});
-    packet.forms=j.forms; $('formstat').textContent='';
-    drawForms(); drawSignRows();
-  }catch(e){$('formstat').textContent='';toast('Form generation failed: '+e.message);}
-}
-$('genforms').onclick=()=>{
-  const wanted=[]; if($('f_decl').checked)wanted.push('declaration');
-  if($('f_age').checked&&!$('f_age').disabled)wanted.push('age_petition');
-  if($('f_poa').checked)wanted.push('poa'); if($('f_373').checked)wanted.push('statement_373');
-  if(!wanted.length)return toast('Tick at least one form.');
-  genForms(wanted);
-};
-$('genall').onclick=()=>genForms(['all']);
-function drawForms(){
-  const fs=(packet&&packet.forms)||[];
-  if(!fs.length){$('formlist').innerHTML='';return;}
-  const base=B+'/patents/api/packet/'+packet.id+'/form/';
-  $('formlist').innerHTML=`<div class="grid" style="margin-top:6px">`+fs.map(f=>{
-    const bad=(f.verify.checks||[]).filter(c=>!c.ok);
+
+function drawSignatures(){
+  const people=[...(S.inventors||[]),...(S.practitioners||[])];
+  $('sigs').innerHTML=people.map(r=>{
+    const nm=r.given?`${esc(r.given)} ${esc(r.family)}`:esc(r.name||r.id);
+    const has=!!r.signature_file;
     return `<div class="card" style="background:var(--panel2)">
-      <div class="row" style="align-items:flex-start">
-        <div><b class="mono" style="font-size:12px">${esc(f.name)}</b>
-          <div class="hint">${esc(f.label)}</div>
-          ${f.note?`<div class="hint">${esc(f.note)}</div>`:''}</div>
-        <span class="fix">${f.presigned?'<span class="pill ok">signed</span> ':''}<span class="pill ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span></span>
+      <b>${nm}</b>
+      <div style="margin:8px 0;min-height:74px;display:flex;align-items:center;justify-content:center;
+        background:#fff;border-radius:8px;border:1px solid var(--line)">
+        ${has?`<img src="${B}/patents/api/signature/${r.id}?t=${Date.now()}" style="max-width:100%;max-height:70px">`
+             :`<span style="color:#888;font-size:12px">no signature on file</span>`}
       </div>
-      <a href="${base}${encodeURIComponent(f.name)}" target="_blank" title="open the PDF">
-        <img src="${base}${encodeURIComponent(f.name)}/thumb?t=${Date.now()}"
-             style="width:100%;margin-top:10px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>
-      <div class="row" style="margin-top:8px">
-        <a class="g fix" target="_blank" href="${base}${encodeURIComponent(f.name)}">Open PDF</a>
-        <button class="g fix" onclick="openSigner('${esc(f.name)}')">Sign on screen</button>
-        <span class="fix muted">${f.verify.pages||''} page(s)</span>
+      <div class="row">
+        <button class="g fix" onclick="document.getElementById('sigf-${r.id}').click()">${has?'Replace':'Upload'}</button>
+        ${has?`<button class="d fix" onclick="delSig('${r.id}')">Remove</button>`:''}
       </div>
-      ${bad.length?`<div class="hint" style="color:var(--bad)">${bad.map(c=>esc(c.label+' '+(c.detail||''))).join('<br>')}</div>`:''}
-    </div>`;}).join('')+`</div>`;
+      <input type="file" id="sigf-${r.id}" accept="image/png,image/jpeg,image/webp" style="display:none"
+        onchange="upSig('${r.id}',this)">
+    </div>`;}).join('');
 }
-$('preview').onclick=async()=>{
-  if(!$('title').value.trim())return toast('Give the invention a title first.');
-  await ensurePacket(); $('substat').textContent='building...';
-  const body={title:$('title').value,docket:$('docket').value,inventor_ids:picked(),
-    applicant_id:$('applicant').value,correspondence_id:$('corr').value,
-    entity_status:$('entity').value,publication:$('publication').value,dry_run:true,force:true};
-  try{const j=await api('/api/packet/'+packet.id+'/submit',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    $('briefout').style.display='block'; $('briefout').textContent=j.brief; $('substat').textContent='';}
-  catch(e){$('substat').textContent='';toast(e.message);}
-};
-// ---- signatures ----
-api('/api/docsign/health').then(h=>{
-  $('dshealth').textContent = h.ok ? ('connected as '+h.user+(h.ai_fields?', AI field detection on':'')) : 'not reachable';
-  $('dshealth').className = 'pill '+(h.ok?'ok':'bad');
-}).catch(()=>{$('dshealth').textContent='not reachable';$('dshealth').className='pill bad';});
 
-function signerFor(formName){
-  // A declaration or an age petition belongs to the inventor named in its filename.
-  for(const i of (S.inventors||[])){
-    const slug=(i.given+'-'+i.family).toLowerCase().replace(/[^a-z0-9]+/g,'-');
-    if(formName.toLowerCase().includes(slug)) return i;
+$('savedefaults').onclick=async()=>{
+  const d={}; document.querySelectorAll('[data-def]').forEach(el=>
+    d[el.dataset.def]=el.type==='checkbox'?el.checked:el.value);
+  await api('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(d)});
+  S.defaults=d; toast('Defaults saved.');
+};
+
+window.upSig=async(id,el)=>{
+  if(!el.files||!el.files[0])return;
+  const fd=new FormData(); fd.append('file',el.files[0]);
+  const r=await fetch(B+'/patents/api/signature/'+id,{method:'POST',body:fd});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)return toast(j.error||'upload failed');
+  await refresh(); toast('Signature saved. It will be stamped on every form for this person.');
+};
+
+window.delSig=async id=>{ if(!confirm('Remove this signature?'))return;
+  await api('/api/signature/'+id,{method:'DELETE'}); await refresh(); };
+const DEFAULT_FIELDS=[['entity_status','Entity status'],['docket_prefix','Docket prefix'],
+  ['publication','Publication'],['correspondence_id','Default correspondence id'],
+  ['applicant_id','Default applicant id'],['payment_id','Default payment id'],
+  ['spec_format','Specification format'],['authorize_pdx','Authorise foreign IP office access','bool']];
+function drawDefaults(){
+  const d=S.defaults||{};
+  $('defaults').innerHTML=`<div class="card" style="background:var(--panel2)">`+
+    DEFAULT_FIELDS.map(([k,lab,t])=>t==='bool'
+      ? `<label class="chk"><input type="checkbox" data-def="${k}" ${d[k]?'checked':''}> ${esc(lab)}</label>`
+      : `<label>${esc(lab)}</label><input data-def="${k}" value="${esc(d[k]||'')}">`).join('')+
+    `<p class="hint">Leaving the PDX box ticked is the default and the right choice unless you will
+     never file abroad: it lets the EPO, JPO and KIPO pull the priority document automatically.</p></div>`;
+}
+$('savedefaults').onclick=async()=>{
+  const d={}; document.querySelectorAll('[data-def]').forEach(el=>
+    d[el.dataset.def]=el.type==='checkbox'?el.checked:el.value);
+  await api('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(d)});
+  S.defaults=d; toast('Defaults saved.');
+};
+
+// ==========================================================================
+// New filing: upload, audit, fix, go.
+// One column, one line per fact, and nothing asked that the files already say.
+// ==========================================================================
+let PK=null, AUDIT=null, FACTS=null, OPEN_ROWS={};
+
+const KIND_LABEL={sign:'Sign it',edit:'Edit',upload:'Upload a file',agent:'Let the agent fix it'};
+
+function row(key,label,value,opts){
+  opts=opts||{};
+  const open=!!OPEN_ROWS[key], missing=!value&&opts.required;
+  const shown=missing?'<span style="color:var(--bad)">not found in the files</span>'
+                     :(value?esc(value):'<span class="muted">-</span>');
+  return `<div class="frow" data-k="${key}">
+    <div class="rowline" ${opts.editable?`onclick="toggleRow('${key}')"`:''}>
+      <span class="rlabel">${esc(label)}</span>
+      <span class="rdots"></span>
+      <span class="rvalue">${shown}</span>
+      ${opts.editable?`<span class="redit">${open?'close':'edit'}</span>`:''}
+    </div>
+    ${(open||missing)&&opts.editor?`<div class="reditor">${opts.editor}</div>`:''}
+  </div>`;
+}
+window.toggleRow=k=>{OPEN_ROWS[k]=!OPEN_ROWS[k];drawFacts();};
+
+function invEditor(){
+  return `<div class="hint" style="margin-bottom:6px">Who is named as an inventor. Each one gets
+    a declaration, and a non-US inventor changes what 37 CFR 1.31 allows.</div>`
+    +(S.inventors||[]).map(i=>{
+      const on=(PK.inventor_ids||[]).includes(i.id);
+      return `<label class="fix" style="display:block;margin:2px 0"><input type="checkbox" class="invx"
+        value="${i.id}" style="width:auto"${on?' checked':''}> ${esc(store_name(i))}${
+        i.country&&i.country!=='US'?` <span class="pill">${esc(i.country)}</span>`:''}</label>`;}).join('')
+    +`<button class="b fix" style="margin-top:8px" onclick="saveEdits()">Save</button>`;
+}
+function store_name(i){return ((i.given||'')+' '+(i.family||'')).trim()||i.name||i.id;}
+
+function drawFacts(){
+  if(!PK)return;
+  const f=FACTS||{}, fee=PK.fees||{};
+  const invNames=(PK.inventor_ids||[]).map(id=>{
+    const i=(S.inventors||[]).find(x=>x.id===id); return i?store_name(i):id;}).join(', ');
+  const applicant=(S.applicants||[]).find(a=>a.id===PK.applicant_id);
+  const files=(PK.files||[]).filter(x=>x.role!=='exclude').map(x=>x.name).join(', ');
+  const docs=(PK.forms||[]).map(x=>x.name).join(', ');
+  $('facts').innerHTML=[
+    row('title','Title',PK.title,{required:true,editable:true,
+      editor:`<input id="e-title" value="${esc(PK.title||'')}" placeholder="as it should read on the ADS">
+              <button class="b fix" style="margin-top:8px" onclick="saveEdits()">Save</button>`}),
+    row('inventors','Inventor'+((PK.inventor_ids||[]).length>1?'s':''),invNames,
+      {required:true,editable:true,editor:invEditor()}),
+    row('applicant','Applicant',applicant?applicant.name:'',{editable:true,
+      editor:`<select id="e-applicant">${(S.applicants||[]).map(a=>
+        `<option value="${a.id}"${a.id===PK.applicant_id?' selected':''}>${esc(a.name)}</option>`).join('')}</select>
+        <button class="b fix" style="margin-top:8px" onclick="saveEdits()">Save</button>`}),
+    row('entity','Entity status',(PK.entity_status||'').replace(/^./,c=>c.toUpperCase()),{editable:true,
+      editor:`<select id="e-entity">${['small','large','micro'].map(v=>
+        `<option value="${v}"${v===PK.entity_status?' selected':''}>${v}</option>`).join('')}</select>
+        <button class="b fix" style="margin-top:8px" onclick="saveEdits()">Save</button>`}),
+    row('claims','Claims',f.claims?`${f.claims}, ${f.independent} independent`:''),
+    row('drawings','Drawings',f.sheets?`${f.sheets} sheet${f.sheets===1?'':'s'}`:''),
+    row('spec','Specification',f.spec_name?`${f.spec_name}${f.spec_is_docx?'':' (not DOCX)'}`:''),
+    row('files','Files in the package',files),
+    row('docs','Documents generated for you',docs),
+    row('fee','Estimated fee',fee.total!=null?`$${fee.total}`:''),
+  ].join('');
+  $('advbody').innerHTML=`
+    <div class="row">
+      <div><label>Docket</label><input id="e-docket" value="${esc(PK.docket||'')}"></div>
+      <div><label>Publication</label><select id="e-publication">
+        <option value="normal"${PK.publication==='normal'?' selected':''}>Publish normally</option>
+        <option value="nonpub"${PK.publication==='nonpub'?' selected':''}>Non-publication request</option>
+      </select></div>
+      <div class="fix" style="padding-top:18px"><button class="b" onclick="saveEdits()">Save</button></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="g fix" onclick="runAudit()">Re-check the package</button>
+      <span class="fix hint">Re-reads every file and rebuilds the documents.</span>
+    </div>`;
+  const ok=AUDIT&&AUDIT.ready;
+  $('readypill').textContent=ok?'ready':(AUDIT?`${AUDIT.blocking} to fix`:'');
+  $('readypill').className='pill '+(ok?'ok':(AUDIT&&AUDIT.blocking?'bad':''));
+}
+
+function drawIssues(){
+  const list=(AUDIT&&AUDIT.issues)||[];
+  $('issuecard').style.display=list.length?'block':'none';
+  $('issues').innerHTML=list.map((i,n)=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+      <div class="row">
+        <span class="pill fix ${i.level==='block'?'bad':'warn'}">${i.level==='block'?'blocks filing':'worth a look'}</span>
+        <b class="fix">${esc(i.label)}</b>
+        <span class="fix" style="flex:1"></span>
+        ${i.fix&&i.fix.kind?`<button class="g fix" onclick="applyFix(${n})">${esc(KIND_LABEL[i.fix.kind]||'Fix')}</button>`:''}
+      </div>
+      ${i.detail?`<div class="hint">${esc(i.detail)}</div>`:''}
+      ${i.rule?`<div class="hint">${esc(i.rule)}</div>`:''}
+    </div>`).join('');
+  const ready=AUDIT&&AUDIT.ready;
+  $('gocard').style.display=PK?'block':'none';
+  $('gohead').textContent=ready?'Ready to file.':'Not ready yet.';
+  $('gohint').textContent=ready
+    ? 'Opens a session that files it in Patent Center. You watch it on Live run.'
+    : 'Clear what blocks filing above, or let the agent try.';
+  $('go').disabled=!ready;
+  $('go').style.opacity=ready?'1':'.5';
+}
+
+window.applyFix=async n=>{
+  const i=(AUDIT.issues||[])[n]; if(!i)return;
+  const k=i.fix.kind;
+  if(k==='sign'){ openSigner(i.fix.form); return; }
+  if(k==='edit'){ OPEN_ROWS[i.fix.field==='inventors'?'inventors':'title']=true;
+    drawFacts(); $('factscard').scrollIntoView({behavior:'smooth'}); return; }
+  if(k==='upload'){ $('dropcard').scrollIntoView({behavior:'smooth'});
+    toast('Add '+(i.fix.what||'the missing file')+' and upload again.'); return; }
+  if(k==='agent'){
+    $('gostat').textContent='fixing...';
+    try{ await api('/api/packet/'+PK.id+'/clean',{method:'POST'}); await runAudit(); }
+    catch(e){ toast(e.message); }
+    $('gostat').textContent='';
   }
-  return (S.inventors||[]).find(i=>picked().includes(i.id)) || null;
-}
-function drawSignRows(){
-  const fs=(packet&&packet.forms)||[];
-  // A form that already carries a signature does not need an email round trip.
-  const unsigned=fs.filter(f=>!f.name.startsWith('SIGNED_')&&!f.presigned);
-  if(!unsigned.length){$('signrows').innerHTML='<span class="muted">'+
-    (fs.length?'Every form is signed already. Nothing to send.':'Generate the forms first.')+'</span>';return;}
-  const sigs=(packet&&packet.signatures)||{};
-  $('signrows').innerHTML=`<table><tr><th></th><th>Form</th><th>Signer</th><th>Email</th><th>State</th></tr>`+
-    unsigned.map(f=>{
-      const inv=signerFor(f.name); const rec=sigs[f.name]||null;
-      const nm=inv?`${inv.given} ${inv.family}`:'';
-      const em=rec?rec.signer_email:(inv&&inv.email)||'';
-      return `<tr><td><input type="checkbox" class="signpick" data-f="${esc(f.name)}"
-                 data-inv="${inv?inv.id:''}" ${rec?'':'checked'} style="width:auto"></td>
-        <td class="mono" style="font-size:12px">${esc(f.name)}</td>
-        <td><input class="signname" data-f="${esc(f.name)}" value="${esc(nm)}"></td>
-        <td><input class="signemail" data-f="${esc(f.name)}" value="${esc(em)}" placeholder="name@example.com"></td>
-        <td>${rec?signBadge(rec):'<span class="muted">not sent</span>'}</td></tr>`;
-    }).join('')+`</table>`;
-}
-function signBadge(r){
-  if(r.error)return `<span class="pill bad">${esc(r.error.slice(0,60))}</span>`;
-  if(r.status==='completed')return `<span class="pill ok">signed</span>`;
-  const seen=r.viewed?' opened':'';
-  return `<span class="pill warn">sent${esc(seen)}</span>`;
-}
-function drawSignState(){
-  const sigs=(packet&&packet.signatures)||{};
-  const rows=Object.entries(sigs);
-  if(!rows.length){$('signstate').innerHTML='';return;}
-  $('signstate').innerHTML=`<table><tr><th>Document</th><th>Signer</th><th>State</th><th>Link</th></tr>`+
-    rows.map(([n,r])=>`<tr><td class="mono" style="font-size:12px">${esc(n)}</td>
-      <td>${esc(r.signer_name||'')}<div class="hint">${esc(r.signer_email||'')}</div></td>
-      <td>${signBadge(r)}${r.emailed===false?'<div class="hint">email failed, send the link yourself</div>':''}</td>
-      <td>${r.sign_url?`<a href="${esc(r.sign_url)}" target="_blank" style="color:var(--acc)">signing link</a><br>`:''}
-          ${r.view_url?`<a href="${esc(r.view_url)}" target="_blank" class="hint">in GRABO Sign</a>`:''}</td></tr>`).join('')+`</table>`;
-}
-$('sendsign').onclick=async()=>{
-  if(!packet||!(packet.forms||[]).length)return toast('Generate the forms first.');
-  const items=[...document.querySelectorAll('.signpick:checked')].map(c=>{
-    const f=c.dataset.f;
-    return {form_name:f, inventor_id:c.dataset.inv||'',
-      signer_name:(document.querySelector(`.signname[data-f="${CSS.escape(f)}"]`)||{}).value||'',
-      signer_email:(document.querySelector(`.signemail[data-f="${CSS.escape(f)}"]`)||{}).value||''};
-  });
-  if(!items.length)return toast('Tick at least one form.');
-  const noEmail=items.filter(i=>!i.signer_email.trim());
-  if(noEmail.length)return toast('Add an email address for: '+noEmail.map(i=>i.form_name).join(', '));
-  $('signstat').textContent='sending, this takes a moment per document...';
-  try{
-    const j=await api('/api/packet/'+packet.id+'/sign',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({items,message:$('signmsg').value})});
-    packet.signatures=j.signatures; $('signstat').textContent='';
-    drawSignRows(); drawSignState();
-    const bad=j.results.filter(r=>!r.ok);
-    toast(bad.length?('Some failed: '+bad.map(b=>b.form+': '+b.error).join('; '))
-                    :'Sent. Each signer has an email with a private link.');
-  }catch(e){$('signstat').textContent='';toast('Send failed: '+e.message);}
-};
-$('refreshsign').onclick=async()=>{
-  if(!packet)return; $('signstat').textContent='checking...';
-  try{
-    const j=await api('/api/packet/'+packet.id+'/sign/refresh',{method:'POST'});
-    packet.signatures=j.signatures; packet.forms=j.forms;
-    $('signstat').textContent=''; drawSignRows(); drawSignState(); drawForms();
-    const done=Object.values(j.signatures).filter(r=>r.status==='completed').length;
-    toast(done?(done+' signed and pulled back into the packet.'):'Nothing signed yet.');
-  }catch(e){$('signstat').textContent='';toast(e.message);}
 };
 
-// ---- demo ----
+window.saveEdits=async()=>{
+  const body={};
+  if($('e-title'))body.title=$('e-title').value;
+  if($('e-applicant'))body.applicant_id=$('e-applicant').value;
+  if($('e-entity'))body.entity_status=$('e-entity').value;
+  if($('e-docket'))body.docket=$('e-docket').value;
+  if($('e-publication'))body.publication=$('e-publication').value;
+  const boxes=[...document.querySelectorAll('.invx')];
+  if(boxes.length)body.inventor_ids=boxes.filter(b=>b.checked).map(b=>b.value);
+  OPEN_ROWS={};
+  await runAudit(body);
+};
+
+async function runAudit(body){
+  if(!PK)return;
+  $('upstat').textContent='checking...';
+  try{
+    const j=await api('/api/packet/'+PK.id+'/audit',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+    PK=j.packet; PK.fees=j.fees; FACTS=j.facts; AUDIT=j.audit;
+    $('factscard').style.display='block';
+    drawFacts(); drawIssues();
+  }catch(e){ toast('Could not check the package: '+e.message); }
+  $('upstat').textContent='';
+}
+
+$('pkgup').onclick=async()=>{
+  const inp=$('pkgfiles');
+  if(!inp.files.length)return toast('Pick a zip or some files first.');
+  $('upstat').textContent='uploading...';
+  try{
+    if(!PK){ const j=await api('/api/packet',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:'{}'}); PK=j.packet; }
+    for(const f of inp.files){
+      const fd=new FormData(); fd.append('file',f);
+      await fetch(`${B}/patents/api/packet/${PK.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
+    }
+    inp.value=''; await runAudit();
+  }catch(e){ $('upstat').textContent=''; toast('Upload failed: '+e.message); }
+};
+
 $('demorun').onclick=async()=>{
-  $('demostat').textContent='building...';
+  $('upstat').textContent='loading the demo...';
   try{
     const j=await api('/api/demo',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    packet=j.packet; packet.files=j.files; packet.report=j.report;
-    $('title').value=packet.title; $('docket').value=packet.docket;
-    $('entity').value=packet.entity_status; $('publication').value=packet.publication||'normal';
-    document.querySelectorAll('.inv').forEach(c=>c.checked=(packet.inventor_ids||[]).includes(c.value));
-    drawFiles(); drawReport(); recompute(); drawForms(); drawSignRows();
-    $('demostat').textContent='';
-    toast('Demo application loaded. Generate the forms, then Submit: the session will stop at Review and submit.');
-  }catch(e){$('demostat').textContent='';toast('Demo failed: '+e.message);}
+    PK=j.packet; OPEN_ROWS={}; await runAudit();
+    toast('Demo package loaded and checked.');
+  }catch(e){ $('upstat').textContent=''; toast('Demo failed: '+e.message); }
 };
+
+$('preview').onclick=async()=>{
+  if(!PK)return;
+  const base=`${B}/patents/api/packet/${PK.id}/`;
+  const f=FACTS||{}, fee=PK.fees||{};
+  const invNames=(PK.inventor_ids||[]).map(id=>{
+    const i=(S.inventors||[]).find(x=>x.id===id); return i?store_name(i):id;}).join(', ');
+  $('previewblurb').innerHTML=
+    `<b>${esc(PK.title||'(no title)')}</b><br>`
+    +`Filed for ${esc(invNames||'nobody yet')} as ${esc(PK.entity_status||'')} entity. `
+    +`${f.claims||0} claims (${f.independent||0} independent), ${f.sheets||0} drawing sheets. `
+    +`Estimated fee $${fee.total!=null?fee.total:'?'}. `
+    +`Patent Center calculates the figure that is actually charged.`;
+  const docs=[]
+    .concat((PK.files||[]).filter(x=>x.role!=='exclude').map(x=>({name:x.name,
+      url:base+'file/'+encodeURIComponent(x.name),what:'from your package'})))
+    .concat((PK.forms||[]).map(x=>({name:x.name,url:base+'form/'+encodeURIComponent(x.name),
+      thumb:base+'form/'+encodeURIComponent(x.name)+'/thumb',what:x.label})));
+  $('previewdocs').innerHTML=docs.map(d=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+      <div class="row"><b class="mono fix">${esc(d.name)}</b>
+        <span class="fix" style="flex:1"></span>
+        <a class="g fix" target="_blank" href="${d.url}">Open</a></div>
+      <div class="hint">${esc(d.what||'')}</div>
+      ${d.thumb?`<a href="${d.url}" target="_blank"><img src="${d.thumb}?t=${Date.now()}"
+        style="width:100%;max-width:380px;margin-top:8px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>`:''}
+    </div>`).join('')||'<span class="muted">Nothing to show yet.</span>';
+  $('previewcard').style.display='block';
+  $('previewcard').scrollIntoView({behavior:'smooth'});
+};
+$('previewclose').onclick=()=>{$('previewcard').style.display='none';};
 
 // ---- sign on screen ----
 let SM={name:'',page:0,pages:[],items:[],tool:null,sigs:[]};
 window.openSigner=async(name)=>{
-  if(!packet){toast('Load or create a packet first: the forms belong to one.');return;}
+  if(!PK){toast('Load or create a packet first: the forms belong to one.');return;}
   SM={name,page:0,pages:[],items:[],tool:null,sigs:[]};
-  const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(name)+'/layout');
+  const j=await api('/api/packet/'+PK.id+'/form/'+encodeURIComponent(name)+'/layout');
   SM.pages=j.pages; SM.sigs=j.signatures||[];
   $('sm-name').textContent=name;
   // A form generated for someone whose signature is already on file comes out
   // signed. Stamping another one lands on top of it, which is what a second
   // signature looked like in testing, so say so rather than let it happen.
-  const f=((packet&&packet.forms)||[]).find(x=>x.name===name);
+  const f=((PK&&PK.forms)||[]).find(x=>x.name===name);
   $('sm-warn').style.display = (f&&f.presigned) ? 'block' : 'none';
   if(f&&f.presigned) $('sm-warn').textContent =
     'This form already carries '+(f.signed_by||'a')+' signature from the stored image. '
@@ -2076,7 +2292,7 @@ window.openSigner=async(name)=>{
 function showPage(n){
   SM.page=Math.max(0,Math.min(n,SM.pages.length-1));
   $('sm-page').textContent=`Page ${SM.page+1} of ${SM.pages.length}`;
-  $('pageimg').src=`${B}/patents/api/packet/${packet.id}/form/${encodeURIComponent(SM.name)}/thumb?page=${SM.page}&t=${Date.now()}`;
+  $('pageimg').src=`${B}/patents/api/packet/${PK.id}/form/${encodeURIComponent(SM.name)}/thumb?page=${SM.page}&t=${Date.now()}`;
   drawMarks();
 }
 $('sm-prev').onclick=()=>showPage(SM.page-1);
@@ -2138,12 +2354,13 @@ $('sm-apply').onclick=async()=>{
   $('sm-stat').textContent='saving...';
   try{
     const who=$('sm-who').selectedOptions[0];
-    const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(SM.name)+'/stamp',
+    const j=await api('/api/packet/'+PK.id+'/form/'+encodeURIComponent(SM.name)+'/stamp',
       {method:'POST',headers:{'Content-Type':'application/json'},
        body:JSON.stringify({items:SM.items,signed_by:who?who.textContent.replace(' (no signature yet)',''):''})});
-    packet.forms=j.forms; packet.signatures=j.signatures;
     $('sm-stat').textContent=''; $('signmodal').classList.remove('on');
-    drawForms(); drawSignRows(); drawSignState();
+    // Re-audit rather than repaint: signing is exactly the thing that can turn
+    // "not ready" into "ready", and the Go button has to follow.
+    await runAudit();
     toast('Saved as '+j.form.name+'. That is the copy that gets filed.');
   }catch(e){$('sm-stat').textContent='';toast('Could not save: '+e.message);}
 };
@@ -2168,155 +2385,27 @@ $('sm-draw').onclick=()=>{const b=$('sm-drawbox');b.style.display=b.style.displa
     try{
       await api('/api/signature/'+who+'/draw',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({data_url:c.toDataURL('image/png')})});
-      const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(SM.name)+'/layout');
-      SM.sigs=j.signatures||[]; await refresh();
+      const j=await api('/api/packet/'+PK.id+'/form/'+encodeURIComponent(SM.name)+'/layout');
+      SM.sigs=j.signatures||[];
       toast('Signature saved. Pick the Signature tool and click where it goes.');
     }catch(e){toast(e.message);}
   };
 })();
-$('submit').onclick=async()=>{
-  if(!$('title').value.trim())return toast('Give the invention a title first.');
-  await ensurePacket(); $('substat').textContent='opening session...';
-  const body={title:$('title').value,docket:$('docket').value,inventor_ids:picked(),
-    applicant_id:$('applicant').value,correspondence_id:$('corr').value,
-    entity_status:$('entity').value,publication:$('publication').value};
-  try{
-    const j=await api('/api/packet/'+packet.id+'/submit',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    $('substat').innerHTML=`<a href="#" onclick="openRun('${esc(j.session)}');return false" style="color:var(--acc)">watch ${esc(j.session)}</a>`;
-    toast('Session '+j.session+' has the packet and the brief. Watching it on Live run.');
-    drawHistory();
-    // Straight to the terminal and the browser, on this page. Sending people off
-    // to the dashboard's raw view was the wrong hand-off: they lose the panel.
-    openRun(j.session);
-  }catch(e){
-    $('substat').textContent='';
-    if(String(e.message).includes('practitioner is required')){
-      if(confirm(e.message+'\n\nPrepare the packet for the firm anyway?')){
-        body.force=true;
-        const j=await api('/api/packet/'+packet.id+'/submit',{method:'POST',
-          headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-        $('substat').textContent='session '+j.session;
-      }
-    } else toast('Submit failed: '+e.message);
-  }
-};
 
-// ---- parties ----
-const FIELDS={
- inventors:[['given','Given name'],['middle','Middle'],['family','Family name'],['suffix','Suffix'],
-   ['residence.city','Residence city'],['residence.state','Residence state'],['residence.country','Residence country'],
-   ['mailing.line1','Mailing line 1'],['mailing.line2','Mailing line 2'],['mailing.city','Mailing city'],
-   ['mailing.state','State'],['mailing.postal','Postcode'],['mailing.country','Country'],
-   ['email','Email'],['phone','Phone'],['age_65_plus','65 or older','bool'],['notes','Notes','text']],
- applicants:[['name','Name'],['kind','Kind (inventors|juristic|person)'],['address.line1','Line 1'],
-   ['address.city','City'],['address.state','State'],['address.postal','Postcode'],['address.country','Country'],['notes','Notes','text']],
- correspondence:[['label','Label'],['customer_number','Customer number'],['name','Name'],['line1','Line 1'],
-   ['line2','Line 2'],['city','City'],['state','State'],['postal','Postcode'],['country','Country'],
-   ['email1','Email 1'],['email2','Email 2'],['phone','Phone'],['notes','Notes','text']],
- practitioners:[['name','Name'],['registration','Registration number'],['category','Category'],
-   ['firm','Firm'],['customer_number','Customer number'],['notes','Notes','text']],
- payment:[['label','Label'],['advisor_key','Advisor secret key'],['last_four','Last four'],
-   ['cap','Spend cap'],['notes','Notes','text']],
- accounts:[['label','Label'],['username','Username'],['advisor_secret','Advisor secret key'],
-   ['customer_numbers','Customer numbers'],['notes','Notes','text']],
+$('go').onclick=async()=>{
+  if(!PK||!(AUDIT&&AUDIT.ready))return;
+  $('gostat').textContent='opening session...';
+  try{
+    const j=await api('/api/packet/'+PK.id+'/submit',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({title:PK.title,docket:PK.docket,inventor_ids:PK.inventor_ids,
+        applicant_id:PK.applicant_id,correspondence_id:PK.correspondence_id,
+        entity_status:PK.entity_status,publication:PK.publication})});
+    $('gostat').textContent='';
+    toast('Session '+j.session+' has it. Watching on Live run.');
+    drawHistory(); openRun(j.session);
+  }catch(e){ $('gostat').textContent=''; toast(e.message); }
 };
-const COLL_NOTE={
- inventors:'Residence decides the 37 CFR 1.31 gate. A non-US country here forces a registered practitioner on any filing this person is named in.',
- applicants:'Leave the applicant as the inventors to keep the pro se route. Naming a company makes it a juristic applicant, and 1.31(a)(1) then requires a practitioner for everything.',
- correspondence:'Where the Office sends the filing receipt and every notice. A customer number sends it to that firm instead of to you.',
- practitioners:'Only needed when a practitioner is actually appointed. Listing one on an ADS is not a power of attorney (37 CFR 1.32); the PTO/AIA/82 form is.',
- payment:'Card numbers are never stored here. Only the advisor key is, and the filing agent fetches the number with get_payment_method at payment time.',
- accounts:'Passwords are never stored here either, only the name of the advisor secret that holds them.',
-};
-const get=(o,p)=>p.split('.').reduce((a,k)=>(a||{})[k],o);
-function setp(o,p,v){const ks=p.split('.');let c=o;ks.slice(0,-1).forEach(k=>{c[k]=c[k]||{};c=c[k];});c[ks.at(-1)]=v;}
-function drawParties(){
-  $('parties').innerHTML=Object.keys(FIELDS).map(coll=>`
-   <div class="card" style="margin-bottom:14px"><h3>${coll}</h3>
-    ${COLL_NOTE[coll]?`<p class="muted" style="margin:0 0 10px">${esc(COLL_NOTE[coll])}</p>`:''}
-    <div class="grid" id="grid-${coll}"></div>
-    <button class="g" style="margin-top:10px" onclick="addRow('${coll}')">Add</button></div>`).join('');
-  Object.keys(FIELDS).forEach(renderColl);
-  drawSignatures(); drawDefaults();
-}
-function drawSignatures(){
-  const people=[...(S.inventors||[]),...(S.practitioners||[])];
-  $('sigs').innerHTML=people.map(r=>{
-    const nm=r.given?`${esc(r.given)} ${esc(r.family)}`:esc(r.name||r.id);
-    const has=!!r.signature_file;
-    return `<div class="card" style="background:var(--panel2)">
-      <b>${nm}</b>
-      <div style="margin:8px 0;min-height:74px;display:flex;align-items:center;justify-content:center;
-        background:#fff;border-radius:8px;border:1px solid var(--line)">
-        ${has?`<img src="${B}/patents/api/signature/${r.id}?t=${Date.now()}" style="max-width:100%;max-height:70px">`
-             :`<span style="color:#888;font-size:12px">no signature on file</span>`}
-      </div>
-      <div class="row">
-        <button class="g fix" onclick="document.getElementById('sigf-${r.id}').click()">${has?'Replace':'Upload'}</button>
-        ${has?`<button class="d fix" onclick="delSig('${r.id}')">Remove</button>`:''}
-      </div>
-      <input type="file" id="sigf-${r.id}" accept="image/png,image/jpeg,image/webp" style="display:none"
-        onchange="upSig('${r.id}',this)">
-    </div>`;}).join('');
-}
-window.upSig=async(id,el)=>{
-  if(!el.files||!el.files[0])return;
-  const fd=new FormData(); fd.append('file',el.files[0]);
-  const r=await fetch(B+'/patents/api/signature/'+id,{method:'POST',body:fd});
-  const j=await r.json().catch(()=>({}));
-  if(!r.ok)return toast(j.error||'upload failed');
-  await refresh(); toast('Signature saved. It will be stamped on every form for this person.');
-};
-window.delSig=async id=>{ if(!confirm('Remove this signature?'))return;
-  await api('/api/signature/'+id,{method:'DELETE'}); await refresh(); };
-const DEFAULT_FIELDS=[['entity_status','Entity status'],['docket_prefix','Docket prefix'],
-  ['publication','Publication'],['correspondence_id','Default correspondence id'],
-  ['applicant_id','Default applicant id'],['payment_id','Default payment id'],
-  ['spec_format','Specification format'],['authorize_pdx','Authorise foreign IP office access','bool']];
-function drawDefaults(){
-  const d=S.defaults||{};
-  $('defaults').innerHTML=`<div class="card" style="background:var(--panel2)">`+
-    DEFAULT_FIELDS.map(([k,lab,t])=>t==='bool'
-      ? `<label class="chk"><input type="checkbox" data-def="${k}" ${d[k]?'checked':''}> ${esc(lab)}</label>`
-      : `<label>${esc(lab)}</label><input data-def="${k}" value="${esc(d[k]||'')}">`).join('')+
-    `<p class="hint">Leaving the PDX box ticked is the default and the right choice unless you will
-     never file abroad: it lets the EPO, JPO and KIPO pull the priority document automatically.</p></div>`;
-}
-$('savedefaults').onclick=async()=>{
-  const d={}; document.querySelectorAll('[data-def]').forEach(el=>
-    d[el.dataset.def]=el.type==='checkbox'?el.checked:el.value);
-  await api('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(d)});
-  S.defaults=d; toast('Defaults saved.');
-};
-async function refresh(){ const j=await api('/api/store'); S=j.store; drawInventors(); drawParties(); }
-function renderColl(coll){
-  const host=$('grid-'+coll); if(!host)return;
-  host.innerHTML=(S[coll]||[]).map(r=>`<div class="card" style="background:var(--panel2)">
-    ${FIELDS[coll].map(([k,lab,t])=>{
-      const v=get(r,k);
-      if(t==='bool')return `<label class="chk"><input type="checkbox" data-c="${coll}" data-i="${r.id}" data-k="${k}" ${v?'checked':''}> ${esc(lab)}</label>`;
-      if(t==='text')return `<label>${esc(lab)}</label><textarea data-c="${coll}" data-i="${r.id}" data-k="${k}">${esc(v||'')}</textarea>`;
-      return `<label>${esc(lab)}</label><input data-c="${coll}" data-i="${r.id}" data-k="${k}" value="${esc(v||'')}">`;}).join('')}
-    <div class="row" style="margin-top:8px"><button class="g fix" onclick="saveRow('${coll}','${r.id}')">Save</button>
-    <button class="d fix" onclick="delRow('${coll}','${r.id}')">Delete</button></div></div>`).join('');
-}
-window.addRow=async coll=>{const j=await api('/api/data/'+coll,{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-  S[coll]=S[coll]||[];S[coll].push(j.row);renderColl(coll);if(coll==='inventors')drawInventors();};
-window.saveRow=async(coll,id)=>{
-  const row={id};document.querySelectorAll(`[data-c="${coll}"][data-i="${id}"]`).forEach(el=>
-    setp(row,el.dataset.k,el.type==='checkbox'?el.checked:el.value));
-  const j=await api('/api/data/'+coll,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(row)});
-  const i=S[coll].findIndex(r=>r.id===id); if(i>=0)S[coll][i]=j.row;
-  if(coll==='inventors')drawInventors(); if(coll==='applicants')fill('applicant',S.applicants,'name');
-  if(coll==='correspondence')fill('corr',S.correspondence,'label');
-  recompute(); toast('Saved.');};
-window.delRow=async(coll,id)=>{if(!confirm('Delete this row?'))return;
-  await api('/api/data/'+coll+'/'+id,{method:'DELETE'});
-  S[coll]=S[coll].filter(r=>r.id!==id);renderColl(coll);
-  if(coll==='inventors')drawInventors();recompute();};
 
 function drawHistory(){
   api('/api/store').then(j=>{S=j.store;
