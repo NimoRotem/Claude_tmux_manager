@@ -1371,7 +1371,7 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
   <div class="card" style="margin-bottom:14px">
     <h3>The application you are observing on</h3>
     <div class="row">
-      <div><label>Application number</label><input id="o-appno" placeholder="18/402,517"></div>
+      <div><label>Application number</label><input id="o-appno" placeholder="18/000,000"></div>
       <div style="flex:2"><label>Title (optional, for your own records)</label><input id="o-title"></div>
       <div><label>Fee rate</label><select id="o-entity">
         <option value="undiscounted">Undiscounted</option>

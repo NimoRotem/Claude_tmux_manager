@@ -306,23 +306,35 @@ package; verify it yourself, then {mission}
 1. Log in at https://patentcenter.uspto.gov/ as the registered account
    (`get_secret uspto-account`). If the device-trust cookie is needed, the browser
    for this runs on instance-3; see `browser_live.launch_remote`.
-2. Choose the **third-party preissuance submission** workflow, not a normal
+2. **Confirm the target is the application this brief describes, before you type
+   anything into Patent Center.** Pull its file wrapper from the USPTO ODP API
+   (`GET https://api.uspto.gov/api/v1/patent/applications/<8 digits>` with
+   `X-API-KEY`, key in `~/.patent-api/CREDS.md`) and check three things: it is
+   still PENDING, its title and applicant are the ones named above, and its
+   publication and rejection dates are the ones the deadline was computed from.
+   The dates in this brief came from whoever typed them; the file wrapper is the
+   record. If any of the three disagrees, STOP and report rather than filing.
+3. Choose the **third-party preissuance submission** workflow, not a normal
    document upload, and enter the target application number above.
-3. Enter the document list on Patent Center's own screens. **Do not upload
+4. Enter the document list on Patent Center's own screens. **Do not upload
    SB429_WORKSHEET.pdf.** That form carries the instruction "Do not submit this
    form electronically via USPTO patent electronic filing system"; it exists so you
    can check the list you typed. Uploading it is a defect, not a belt and braces.
-4. Upload CONCISE_DESCRIPTIONS.pdf, plus every copy, translation and evidence of
+5. Upload CONCISE_DESCRIPTIONS.pdf, plus every copy, translation and evidence of
    publication listed above. A US patent or US publication needs no copy.
-5. Tick the two statements under 1.290(d)(5): the party has no 1.56 duty to
+6. Tick the two statements under 1.290(d)(5): the party has no 1.56 duty to
    disclose, and the submission complies with 122(e) and 1.290. Both are already
    true of us, which is why this route is open at all: we are a third party here.
-6. {fee_step}
-7. {finish_step}
+7. {fee_step}
+8. {finish_step}
 
 ## Non-negotiable
 {stop_bullet}- If the 1.290(b) window has closed, STOP and report. A late submission is
   refused as non-compliant and the fee is not returned.
+- A DEMO run is still a real login to a real Patent Center against a real
+  application. If the target is somebody else's live file, do not put sample or
+  placeholder documents into it, even in a workflow you intend to abandon before
+  submitting. Stop and report instead.
 - Do not add argument, opinion or claim charts beyond the concise descriptions
   already written. 1.290 allows a description of relevance and nothing more.
 - If anything in the package is wrong, fix it and say what you changed. If it
@@ -507,6 +519,18 @@ async def api_obs_demo():
     screen the demo can stop in front of. The target is a sample application number
     that is not ours: a third-party submission against your own application is a
     contradiction, because the 1.290(d)(5)(i) statement would be false.
+
+    The target must also not be ANYONE's. This demo shipped with 18/402,517, picked
+    because it looked invented; it is Halliburton's real application "Downhole
+    drilling sub with controllable stiffness", published US 2025/0215755 A1 and
+    abandoned 2025-08-23. A demo run against it would have logged into the real
+    Patent Center and started a real third-party submission on a stranger's file,
+    carrying four sample PDFs that say on their face that they are not real
+    documents. Every 8-digit number in an assigned series is somebody's application,
+    so the placeholder uses series 88, which the Office does not assign. The
+    consequence is deliberate: the demo cannot reach a payment screen, because a
+    real fee screen needs a real pending application, and that is a file we have no
+    business putting sample documents into.
     """
     from datetime import date, timedelta
     sub_id = "%s-demo" % int(time.time())
@@ -525,8 +549,8 @@ async def api_obs_demo():
     meta = dict(_blank())
     meta.update({
         "id": sub_id, "created": time.time(), "demo": True,
-        "application_number": "18/402,517",
-        "title": "DEMO - vibration device for bedding covering elements (not our application)",
+        "application_number": "88/888,888",
+        "title": "DEMO - vibration device for bedding covering elements (not a real application)",
         "publication_date": (date.today() - timedelta(days=40)).isoformat(),
         "entity": "undiscounted", "first_and_only": True,
         "stmt_not_1_56": True, "stmt_complies": True,
