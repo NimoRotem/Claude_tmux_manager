@@ -32,6 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import browser_live
 import docsign
 import patent_forms
+import patent_obs_routes
 import patent_packet as pkt
 import patent_store as store
 
@@ -72,6 +73,9 @@ async def _guard(request: Request):
 # cookie itself in the handler.
 router = APIRouter(prefix="/patents", tags=["patents"], dependencies=[Depends(_guard)])
 ws_router = APIRouter(prefix="/patents", tags=["patents"])
+# Third-party observations (37 CFR 1.290) are their own pipeline but the same
+# prefix and the same guard, so they share the page, the browser and the live view.
+router.include_router(patent_obs_routes.router)
 
 MAX_UPLOAD = 60 * 1024 * 1024
 _BROWSERS: dict = {}          # port -> launch info
@@ -1237,6 +1241,7 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
   <span class="pill" id="feestamp"></span>
   <nav>
     <button data-s="new" class="on">New filing</button>
+    <button data-s="obs">Observations</button>
     <button data-s="settings">Settings</button>
     <button data-s="live">Live run</button>
     <button data-s="history">History</button>
@@ -1346,6 +1351,105 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
           border:1px solid var(--line);border-radius:8px;padding:12px;margin-top:10px;max-height:420px;overflow:auto"></pre>
       </div>
     </div>
+  </div>
+</section>
+
+<section id="s-obs">
+  <div class="card" style="margin-bottom:14px">
+    <div class="row">
+      <div><b>Third-party observation, 37 CFR 1.290.</b>
+        <div class="hint">Prior art put in front of the examiner on someone else's pending
+          application, while it is still pending. Not an opposition: a document list, a concise
+          description of why each one matters, copies, and the fee. Miss any part of 1.290 and the
+          whole thing is refused rather than corrected, so the checks below are the point.</div></div>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="obsdemo">Load the demo</button>
+      <span class="fix muted" id="obsdemostat"></span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>The application you are observing on</h3>
+    <div class="row">
+      <div><label>Application number</label><input id="o-appno" placeholder="18/402,517"></div>
+      <div style="flex:2"><label>Title (optional, for your own records)</label><input id="o-title"></div>
+      <div><label>Fee rate</label><select id="o-entity">
+        <option value="undiscounted">Undiscounted</option>
+        <option value="small">Small entity</option></select>
+        <div class="hint">A third party cannot use the micro rate.</div></div>
+    </div>
+    <div class="row">
+      <div><label>First publication date</label><input id="o-pub" type="date"></div>
+      <div><label>First rejection of any claim</label><input id="o-rej" type="date"></div>
+      <div><label>Notice of allowance mailed</label><input id="o-noa" type="date"></div>
+    </div>
+    <div class="banner" id="o-timing" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>Documents <span class="muted" id="o-filecount"></span></h3>
+    <div class="hint">Drop a zip or any number of files. Copies, translations and evidence of
+      publication all go here; a US patent or US publication needs no copy, the Office has it.</div>
+    <div class="row" style="margin-top:8px">
+      <input type="file" id="o-files" multiple>
+      <button class="g fix" id="o-scan">Upload and check</button>
+      <span class="fix muted" id="o-scanstat"></span>
+    </div>
+    <div id="o-filelist" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="row"><h3 style="margin:0">The list</h3>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="o-additem">Add an item</button></div>
+    <div class="hint">Every item needs a concise description of its relevance under
+      1.290(d)(2). This is the requirement most submissions fail on, and the Office refuses the
+      submission rather than asking for it.</div>
+    <div id="o-items" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h3>Statements and fee</h3>
+    <label class="fix" style="display:block;margin:4px 0"><input type="checkbox" id="o-s1" style="width:auto" checked>
+      The party making the submission is not an individual with a duty to disclose under 37 CFR 1.56
+      <span class="hint">(1.290(d)(5)(i). An inventor, the applicant or their attorney cannot use
+      1.290 at all and files an IDS instead.)</span></label>
+    <label class="fix" style="display:block;margin:4px 0"><input type="checkbox" id="o-s2" style="width:auto" checked>
+      This submission complies with 35 U.S.C. 122(e) and 37 CFR 1.290 <span class="hint">(1.290(d)(5)(ii))</span></label>
+    <label class="fix" style="display:block;margin:4px 0"><input type="checkbox" id="o-first" style="width:auto" checked>
+      Claim the 1.290(g) fee exemption <span class="hint">(no fee for three or fewer items on your
+      first and only submission in this application, by you or anyone in privity with you)</span></label>
+    <label class="fix" style="display:block;margin:4px 0"><input type="checkbox" id="o-resub" style="width:auto">
+      This is a resubmission answering a notice of non-compliance <span class="hint">(corrections
+      limited to the non-compliance; the fee already paid is applied)</span></label>
+    <div class="row" style="margin-top:8px">
+      <div><label>Signed by</label><input id="o-signer"></div>
+      <div><label>Reg. no. (only if a practitioner)</label><input id="o-reg"></div>
+      <div class="fix" style="padding-top:18px"><span class="pill" id="o-fee">fee</span></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="row"><h3 style="margin:0">Is it ready?</h3>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="o-check">Re-check</button>
+      <button class="b fix" id="o-forms">Build the documents</button>
+      <span class="fix muted" id="o-formstat"></span></div>
+    <div id="o-review" style="margin-top:10px"><span class="muted">Fill the list, then check.</span></div>
+    <div id="o-forms-out" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><b>Hand it to an agent.</b>
+        <div class="hint">Opens a session that verifies the package itself, logs in to Patent
+          Center, drives the third-party preissuance submission and pays. Watch it on Live run.</div></div>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="o-dry">Preview the brief</button>
+      <button class="b fix" id="o-submit">Submit</button>
+      <span class="fix" id="o-substat"></span>
+    </div>
+    <pre id="o-brief" class="term" style="display:none;height:280px;margin-top:10px"></pre>
   </div>
 </section>
 
@@ -1493,6 +1597,7 @@ window.openRun=async(session)=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x.dataset.s==='live'));
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==='s-live'));
   try{const j=await api('/api/store');S=j.store;}catch(e){}
+  try{const o=await oapi('');OBS_SESSIONS=(o.submissions||[]).filter(x=>x.session);}catch(e){}
   drawRunSessions(session);
   const n=$('rsel').value;
   if(n&&n!==T.name)attachTerm(n);
@@ -2053,17 +2158,203 @@ function drawHistory(){
      :'<span class="muted">Nothing filed from here yet.</span>';});
 }
 
+// ---- third-party observations, 37 CFR 1.290 ----
+let OB=null;
+const OKINDS={us_patent:'US patent',us_pub:'US publication',foreign:'Foreign patent/publication',npl:'Non-patent publication'};
+const oapi=(p,o)=>api('/api/obs'+p,o);
+
+function obsRead(){
+  if(!OB)return null;
+  OB.application_number=$('o-appno').value; OB.title=$('o-title').value;
+  OB.entity=$('o-entity').value;
+  OB.publication_date=$('o-pub').value; OB.first_rejection_date=$('o-rej').value;
+  OB.notice_of_allowance_date=$('o-noa').value;
+  OB.stmt_not_1_56=$('o-s1').checked; OB.stmt_complies=$('o-s2').checked;
+  OB.first_and_only=$('o-first').checked; OB.resubmission=$('o-resub').checked;
+  OB.signer_name=$('o-signer').value; OB.registration_number=$('o-reg').value;
+  OB.items=[...document.querySelectorAll('#o-items .oitem')].map(el=>({
+    kind:el.querySelector('[data-k=kind]').value,
+    identifier:el.querySelector('[data-k=identifier]').value,
+    date:el.querySelector('[data-k=date]').value,
+    party:el.querySelector('[data-k=party]').value,
+    relevance:el.querySelector('[data-k=relevance]').value,
+    copy_file:el.querySelector('[data-k=copy_file]').value,
+    translation_file:el.querySelector('[data-k=translation_file]').value,
+    evidence_file:el.querySelector('[data-k=evidence_file]').value,
+    non_english:el.querySelector('[data-k=non_english]').checked}));
+  return OB;
+}
+function obsWrite(){
+  if(!OB)return;
+  $('o-appno').value=OB.application_number||''; $('o-title').value=OB.title||'';
+  $('o-entity').value=OB.entity||'undiscounted';
+  $('o-pub').value=OB.publication_date||''; $('o-rej').value=OB.first_rejection_date||'';
+  $('o-noa').value=OB.notice_of_allowance_date||'';
+  $('o-s1').checked=!!OB.stmt_not_1_56; $('o-s2').checked=!!OB.stmt_complies;
+  $('o-first').checked=!!OB.first_and_only; $('o-resub').checked=!!OB.resubmission;
+  $('o-signer').value=OB.signer_name||''; $('o-reg').value=OB.registration_number||'';
+  drawItems(); drawObsFiles();
+}
+function fileOptions(sel){
+  const names=((OB&&OB.files)||[]).map(f=>f.name);
+  return '<option value="">none</option>'+names.map(n=>
+    `<option value="${esc(n)}"${n===sel?' selected':''}>${esc(n)}</option>`).join('')
+    +((sel&&!names.includes(sel))?`<option value="${esc(sel)}" selected>${esc(sel)} (not uploaded)</option>`:'');
+}
+function drawItems(){
+  const items=(OB&&OB.items)||[];
+  $('o-items').innerHTML=items.length?items.map((it,i)=>`
+    <div class="oitem" style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px">
+      <div class="row">
+        <b class="fix">${i+1}</b>
+        <div><label>Kind</label><select data-k="kind">${Object.entries(OKINDS).map(([k,v])=>
+          `<option value="${k}"${(it.kind||'npl')===k?' selected':''}>${v}</option>`).join('')}</select></div>
+        <div style="flex:2"><label>Identifier or full citation</label>
+          <input data-k="identifier" value="${esc(it.identifier||'')}"></div>
+        <div><label>Date</label><input data-k="date" value="${esc(it.date||'')}" placeholder="MM/DD/YYYY"></div>
+        <div><label>Inventor / author</label><input data-k="party" value="${esc(it.party||'')}"></div>
+        <button class="d fix" style="margin-top:16px" onclick="delItem(${i})">Remove</button>
+      </div>
+      <label>Concise description of relevance (37 CFR 1.290(d)(2))</label>
+      <textarea data-k="relevance" rows="3" placeholder="What it discloses, and why that matters to this application.">${esc(it.relevance||'')}</textarea>
+      <div class="row" style="margin-top:6px">
+        <div><label>Copy</label><select data-k="copy_file">${fileOptions(it.copy_file)}</select></div>
+        <div><label>Translation</label><select data-k="translation_file">${fileOptions(it.translation_file)}</select></div>
+        <div><label>Evidence of publication</label><select data-k="evidence_file">${fileOptions(it.evidence_file)}</select></div>
+        <label class="fix" style="margin-top:18px"><input type="checkbox" data-k="non_english" style="width:auto"${it.non_english?' checked':''}> Not in English</label>
+      </div>
+    </div>`).join(''):'<span class="muted">Nothing listed. Add an item.</span>';
+}
+window.delItem=i=>{obsRead();OB.items.splice(i,1);drawItems();obsSave();};
+$('o-additem').onclick=()=>{if(!OB)return toast('Load or start a submission first.');
+  obsRead();OB.items.push({kind:'npl'});drawItems();};
+function drawObsFiles(){
+  const fs=(OB&&OB.files)||[];
+  $('o-filecount').textContent=fs.length?`(${fs.length})`:'';
+  $('o-filelist').innerHTML=fs.length?`<table><tr><th>File</th><th>Size</th><th>Checks</th></tr>`+
+    fs.map(f=>`<tr><td class="mono">${esc(f.name)}</td><td>${(f.bytes/1024).toFixed(0)} KB</td>
+      <td>${(f.checks||[]).filter(c=>!c.ok).map(c=>`<span class="pill bad">${esc(c.label)}</span>`).join(' ')
+        ||'<span class="pill ok">ok</span>'}</td></tr>`).join('')+`</table>`
+    :'<span class="muted">Nothing uploaded yet.</span>';
+}
+function drawReview(r){
+  if(!r)return;
+  const t=r.timing||{};
+  $('o-timing').className='banner '+(t.open===true?'ok':(t.open===false?'bad':'warn'));
+  $('o-timing').textContent=t.reason||'Give a publication date or a first rejection date.';
+  const f=r.fee||{};
+  $('o-fee').textContent=f.exempt?'no fee (1.290(g))':`$${f.total} ${f.entity} (code ${f.code})`;
+  $('o-fee').className='pill '+(f.exempt?'ok':'');
+  $('o-review').innerHTML=(r.checks||[]).map(c=>
+    `<div style="margin:3px 0"><span class="pill ${c.ok?'ok':(c.blocker?'bad':'')}">${
+      c.ok?'ok':(c.blocker?'blocker':'warn')}</span> ${esc(c.label)}${
+      c.detail?` <span class="muted">- ${esc(c.detail)}</span>`:''}${
+      (!c.ok&&c.fix)?`<div class="hint">${esc(c.fix)}</div>`:''}</div>`).join('')
+    +`<div style="margin-top:8px"><b>${r.ready?'Ready to file.':r.blockers+' blocker(s) to clear.'}</b></div>`;
+}
+async function obsSave(){
+  if(!OB)return; const body=obsRead();
+  try{const j=await oapi('/'+OB.id+'/save',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    OB=Object.assign(OB,j.submission); drawReview(j.review);}catch(e){}
+}
+['o-appno','o-title','o-entity','o-pub','o-rej','o-noa','o-signer','o-reg'].forEach(id=>
+  $(id).addEventListener('change',obsSave));
+['o-s1','o-s2','o-first','o-resub'].forEach(id=>$(id).addEventListener('change',obsSave));
+$('o-items').addEventListener('change',obsSave);
+
+async function ensureObs(){
+  if(OB)return OB;
+  const j=await oapi('',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({application_number:$('o-appno').value,title:$('o-title').value})});
+  OB=j.submission; return OB;
+}
+$('o-scan').onclick=async()=>{
+  await ensureObs();
+  const inp=$('o-files'); if(!inp.files.length)return toast('Pick some files first.');
+  $('o-scanstat').textContent='uploading...';
+  try{
+    for(const f of inp.files){
+      const fd=new FormData(); fd.append('file',f);
+      await fetch(`${B}/patents/api/obs/${OB.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
+    }
+    $('o-scanstat').textContent='checking...';
+    const j=await oapi('/'+OB.id+'/scan',{method:'POST'});
+    OB.files=j.files; drawObsFiles(); drawItems(); drawReview(j.review);
+    $('o-scanstat').textContent=''; inp.value='';
+    toast(j.files.length+' file(s) ready. Point each item at its copy.');
+  }catch(e){$('o-scanstat').textContent='';toast('Upload failed: '+e.message);}
+};
+$('o-check').onclick=async()=>{await obsSave();
+  const j=await oapi('/'+OB.id+'/check',{method:'POST'}); drawReview(j.review);};
+$('o-forms').onclick=async()=>{
+  if(!OB)return toast('Nothing to build yet.');
+  await obsSave(); $('o-formstat').textContent='building...';
+  try{
+    const j=await oapi('/'+OB.id+'/forms',{method:'POST'});
+    OB.forms=j.forms; drawReview(j.review); $('o-formstat').textContent='';
+    $('o-forms-out').innerHTML=j.forms.map(f=>{
+      const base=`${B}/patents/api/obs/${OB.id}/form/${encodeURIComponent(f.name)}`;
+      const ov=Object.entries(f.overflow||{}).map(([k,v])=>`${v} more ${k} than the form has rows`);
+      return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+        <div class="row"><b class="mono fix">${esc(f.name)}</b>
+          <span class="pill fix ${f.upload?'ok':''}">${f.upload?'gets filed':'worksheet, not filed'}</span>
+          <span class="pill fix ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span>
+          <span class="fix" style="flex:1"></span>
+          <a class="g fix" target="_blank" href="${base}">Open PDF</a></div>
+        <div class="hint">${esc(f.label)} - ${esc(f.note)}</div>
+        ${ov.length?`<div class="hint" style="color:var(--bad)">${esc(ov.join('; '))}. Patent Center's own screens take the full list; the worksheet cannot show it all.</div>`:''}
+        <a href="${base}" target="_blank"><img src="${base}/thumb?t=${Date.now()}"
+          style="width:100%;max-width:420px;margin-top:8px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>
+      </div>`;}).join('');
+    toast('Built. The worksheet is for checking; the concise descriptions get filed.');
+  }catch(e){$('o-formstat').textContent='';toast('Could not build: '+e.message);}
+};
+$('obsdemo').onclick=async()=>{
+  $('obsdemostat').textContent='building...';
+  try{
+    const j=await oapi('/demo',{method:'POST'});
+    OB=j.submission; obsWrite();
+    const s=await oapi('/'+OB.id+'/scan',{method:'POST'});
+    OB.files=s.files; drawObsFiles(); drawItems(); drawReview(s.review);
+    $('obsdemostat').textContent='';
+    toast('Demo loaded: four items, so a fee is due and the run has a payment screen to stop at.');
+  }catch(e){$('obsdemostat').textContent='';toast('Demo failed: '+e.message);}
+};
+async function obsSubmit(dry){
+  if(!OB)return toast('Nothing to submit.');
+  await obsSave(); $('o-substat').textContent=dry?'building...':'opening session...';
+  try{
+    const j=await oapi('/'+OB.id+'/submit',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dry_run:!!dry})});
+    $('o-substat').textContent='';
+    if(dry){$('o-brief').style.display='block';$('o-brief').textContent=j.brief;
+      toast('This is the brief the session gets.');return;}
+    toast('Session '+j.session+' has the submission. Watching it on Live run.');
+    openRun(j.session);
+  }catch(e){$('o-substat').textContent='';toast(e.message);}
+}
+$('o-dry').onclick=()=>obsSubmit(true);
+$('o-submit').onclick=()=>obsSubmit(false);
+
 // ---- the agent's terminal, embedded ----
 // Same tmux pane the dashboard renders, over the same /api/sessions/<n>/raw-tail
 // delta protocol: a full capture first, then only the new lines, with a visible-pane
 // hash so an in-place TUI redraw (which adds no scrollback) still refreshes.
 let T={name:'',text:'',known:0,hash:'',timer:null,gone:false};
 
+let OBS_SESSIONS=[];
 function runSessions(){
   const seen=new Set(), out=[];
   (S.filings||[]).slice().reverse().forEach(f=>{
     if(f.session&&!seen.has(f.session)){seen.add(f.session);
       out.push({name:f.session,label:f.title||f.session,demo:!!f.demo,when:f.created});}});
+  // An observation run is watched on the same tab as a filing run: same terminal,
+  // same browser, and you should not have to know which pipeline opened it.
+  OBS_SESSIONS.forEach(o=>{
+    if(o.session&&!seen.has(o.session)){seen.add(o.session);
+      out.push({name:o.session,label:'1.290 observation, '+(o.application_number||o.title||o.session),
+                demo:!!o.demo,when:o.created});}});
   return out;
 }
 function drawRunSessions(keep){

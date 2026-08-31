@@ -36,6 +36,7 @@ TEMPLATES = {
     "age_petition": "sb0130.pdf",      # PTO/SB/130, petition to make special on age
     "power_of_attorney": "aia0082.pdf",  # PTO/AIA/82A transmittal + 82B power
     "statement_373": "aia0096.pdf",    # PTO/AIA/96, 37 CFR 3.73(c) statement
+    "third_party_sub": "sb0429.pdf",   # PTO/SB/429, third-party submission, 37 CFR 1.290
 }
 
 
@@ -66,6 +67,45 @@ def _wrap(font: "pymupdf.Font", text: str, size: float, width: float) -> list:
     if cur:
         lines.append(cur)
     return lines or [""]
+
+
+def finalise(stage_path, out_path, title: str = "", author: str = "") -> Path:
+    """Re-distil, strip anything active, and stamp clean metadata.
+
+    Every PDF this panel produces goes out through here, because the two things
+    Patent Center rejects on are decided here: a BaseFont name containing a space
+    reads to its validator as a non-embedded font even when the font is embedded,
+    and `gs -dSubsetFonts=true` is what renames it to a clean subset; and an
+    AcroForm or an OpenAction counts as active content.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ptfinal_") as tmp:
+        distilled = Path(tmp) / "gs.pdf"
+        if shutil.which("gs"):
+            r = subprocess.run(
+                ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
+                 "-dPDFSETTINGS=/prepress", "-dEmbedAllFonts=true", "-dSubsetFonts=true",
+                 "-dCompatibilityLevel=1.5", "-dAutoRotatePages=/None",
+                 "-sOutputFile=" + str(distilled), str(stage_path)],
+                capture_output=True, text=True, timeout=180)
+            if r.returncode != 0 or not distilled.exists():
+                raise FormError("ghostscript failed: %s" % (r.stderr or "")[:300])
+        else:
+            distilled = Path(stage_path)
+        reader = PdfReader(str(distilled))
+        writer = PdfWriter()
+        for pg in reader.pages:
+            writer.add_page(pg)
+        root = writer._root_object
+        for key in ("/AcroForm", "/OpenAction", "/AA", "/Names", "/JavaScript"):
+            if key in root:
+                del root[key]
+        writer.add_metadata({"/Title": title or "", "/Author": author or "",
+                             "/Producer": "", "/Creator": ""})
+        with out_path.open("wb") as fh:
+            writer.write(fh)
+    return out_path
 
 
 def render(kind: str, out_path, text_values: dict, checks=(), font_size: float = 10.0,
@@ -176,30 +216,7 @@ def render(kind: str, out_path, text_values: dict, checks=(), font_size: float =
             stage = Path(tmp) / "stage.pdf"
             doc.save(str(stage), garbage=4, deflate=True, clean=True)
             doc.close()
-            distilled = Path(tmp) / "gs.pdf"
-            if shutil.which("gs"):
-                r = subprocess.run(
-                    ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
-                     "-dPDFSETTINGS=/prepress", "-dEmbedAllFonts=true", "-dSubsetFonts=true",
-                     "-dCompatibilityLevel=1.5", "-dAutoRotatePages=/None",
-                     "-sOutputFile=" + str(distilled), str(stage)],
-                    capture_output=True, text=True, timeout=180)
-                if r.returncode != 0 or not distilled.exists():
-                    raise FormError("ghostscript failed: %s" % (r.stderr or "")[:300])
-            else:
-                distilled = stage
-            reader = PdfReader(str(distilled))
-            writer = PdfWriter()
-            for pg in reader.pages:
-                writer.add_page(pg)
-            root = writer._root_object
-            for key in ("/AcroForm", "/OpenAction", "/AA", "/Names", "/JavaScript"):
-                if key in root:
-                    del root[key]
-            writer.add_metadata({"/Title": title or TEMPLATES[kind],
-                                 "/Author": author or "", "/Producer": "", "/Creator": ""})
-            with out_path.open("wb") as fh:
-                writer.write(fh)
+            finalise(stage, out_path, title=title or TEMPLATES[kind], author=author)
     finally:
         try:
             doc.close()

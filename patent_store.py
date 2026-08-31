@@ -32,6 +32,7 @@ FORMS_DIR = DATA_DIR / "forms"
 PACKETS_DIR = DATA_DIR / "packets"
 SIGNATURES_DIR = DATA_DIR / "signatures"
 SAMPLES_DIR = DATA_DIR / "samples"
+OBSERVATIONS_DIR = DATA_DIR / "observations"
 AUTH_DIR = DATA_DIR / "auth"
 
 _LOCK = threading.RLock()
@@ -303,6 +304,7 @@ def load() -> dict:
         FORMS_DIR.mkdir(parents=True, exist_ok=True)
         PACKETS_DIR.mkdir(parents=True, exist_ok=True)
         SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
+        OBSERVATIONS_DIR.mkdir(parents=True, exist_ok=True)
         if not STORE_PATH.exists():
             data = _seed()
             _write(data)
