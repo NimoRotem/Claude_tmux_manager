@@ -26,6 +26,7 @@ import socket
 import subprocess
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 try:                                             # websockets >= 14
@@ -203,7 +204,12 @@ def launch_remote(label: str, headless: bool = True, host: str = "", zone: str =
     """
     host = host or REMOTE_HOST
     zone = zone or REMOTE_ZONE
-    safe = "".join(c for c in label if c.isalnum() or c in "-_") or "filing"
+    # The profile path is the handle shutdown_remote kills by, so it MUST be unique
+    # per launch. It used to be /tmp/patent-browser-<label>, which meant two runs
+    # against the same application shared one path: closing the stale one killed
+    # the live one's browser out from under it, mid-filing, with no error anywhere.
+    safe = ("".join(c for c in label if c.isalnum() or c in "-_") or "filing")
+    safe = "%s-%s" % (safe[:40], uuid.uuid4().hex[:8])
     script = _REMOTE_LAUNCH % {"label": safe,
                                "headless": "--headless=new" if headless else ""}
     out = subprocess.run(

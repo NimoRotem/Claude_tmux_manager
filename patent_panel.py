@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -129,6 +130,115 @@ async def api_defaults(request: Request):
         {k: v for k, v in patch.items() if isinstance(k, str)})
     store.save(data)
     return JSONResponse({"ok": True, "defaults": data["defaults"]})
+
+
+PC_BASE = "https://patentcenter.uspto.gov/"
+
+
+@router.get("/api/uspto-health")
+async def api_uspto_health():
+    """Is Patent Center actually serving its own JavaScript right now?
+
+    Seen 2026-08-31: CloudFront in front of patentcenter.uspto.gov intermittently
+    answers asset requests with the SPA's own index.html, 200 and text/html, and
+    the response carries `x-cache: Error from cloudfront`. Chrome then refuses the
+    module for strict-MIME reasons, Angular never bootstraps, and the tab is a
+    white rectangle with the right title. The browser and the screencast are
+    healthy and there is nothing in them to see, which is the worst kind of
+    failure to look at, so name it rather than leaving a blank pane.
+    """
+    async def probe(client, url):
+        try:
+            r = await client.get(url, headers={
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"),
+                "Accept": "*/*", "Referer": PC_BASE,
+                "Sec-Fetch-Dest": "script", "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin"})
+            ctype = (r.headers.get("content-type") or "").split(";")[0]
+            return {"url": url, "status": r.status_code, "content_type": ctype,
+                    "bytes": len(r.content), "x_cache": r.headers.get("x-cache", ""),
+                    "ok": r.status_code == 200 and "html" not in ctype}
+        except Exception as exc:                                  # noqa: BLE001
+            return {"url": url, "status": 0, "content_type": "", "bytes": 0,
+                    "x_cache": "", "ok": False, "error": str(exc)[:120]}
+
+    assets = []
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        try:
+            index = await client.get(PC_BASE, headers={"User-Agent": "Mozilla/5.0 Chrome/152"})
+            html = index.text
+        except Exception as exc:                                  # noqa: BLE001
+            return JSONResponse({"ok": False, "reachable": False,
+                                 "detail": "could not load %s: %s" % (PC_BASE, str(exc)[:150])})
+        # Take the asset names straight out of the page, so this keeps working
+        # across their deploys instead of pinning today's bundle hashes.
+        names = re.findall(r'(?:src|href)="((?:main|chunk|polyfills|styles)-[A-Z0-9]+\.(?:js|css))"',
+                           html)
+        seen, picks = set(), []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                picks.append(n)
+            if len(picks) >= 3:
+                break
+        assets = [await probe(client, PC_BASE + n) for n in picks]
+
+    bad = [a for a in assets if not a["ok"]]
+    return JSONResponse({
+        "ok": not bad and bool(assets), "reachable": True, "assets": assets,
+        "note": ("These probes send a browser's own Referer and Sec-Fetch headers. The fault "
+                 "is intermittent, so a pass here does not prove the tab rendered; "
+                 "/api/page-health asks the browser itself, which is the only real answer."),
+        "detail": ("" if not bad else
+                   "Patent Center is serving %d of its %d JavaScript/CSS files as HTML "
+                   "(status 200, content-type text/html). That is a fault at USPTO's CDN, not "
+                   "here: Chrome refuses the module, their app never starts, and the page "
+                   "renders blank white. It is intermittent, so a hard reload often works. "
+                   "Nothing can be filed until it does."
+                   % (len(bad), len(assets)))})
+
+
+@router.get("/api/page-health")
+async def api_page_health(port: int, target: str = ""):
+    """Ask the browser whether the page it is on actually rendered anything.
+
+    A white pane has two very different causes that look identical: the stream is
+    broken, or the page really is blank. This settles it by reading the DOM the
+    viewer is looking at, so the panel can say which.
+    """
+    tabs = await asyncio.to_thread(browser_live.targets, port)
+    tab = next((t for t in tabs if t["id"] == target), tabs[0] if tabs else None)
+    if not tab:
+        return JSONResponse({"ok": False, "detail": "no page on port %d" % port})
+    expr = ("JSON.stringify({url:location.href,title:document.title,"
+            "ready:document.readyState,"
+            "text:document.documentElement.innerText.trim().length,"
+            "nodes:document.body?document.body.querySelectorAll('*').length:0})")
+    try:
+        async with browser_live.ws_connect(tab["ws"], max_size=None, open_timeout=12) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                      "params": {"expression": expr, "returnByValue": True}}))
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                msg = json.loads(await asyncio.wait_for(ws.recv(),
+                                                        timeout=max(1, deadline - time.time())))
+                if msg.get("id") == 1:
+                    val = ((msg.get("result") or {}).get("result") or {}).get("value")
+                    info = json.loads(val) if val else {}
+                    blank = info.get("text", 0) == 0
+                    return JSONResponse({
+                        "ok": not blank, "blank": blank, "page": info,
+                        "detail": ("" if not blank else
+                                   "The tab is on %s with the title %r and it rendered no text at "
+                                   "all. The stream is fine; the page itself is blank. On Patent "
+                                   "Center this is USPTO's CDN answering their own JavaScript with "
+                                   "HTML, which stops their app starting. A hard reload usually "
+                                   "clears it."
+                                   % (info.get("url", "?"), info.get("title", "")))})
+            return JSONResponse({"ok": False, "detail": "the page did not answer"})
+    except Exception as exc:                                      # noqa: BLE001
+        return JSONResponse({"ok": False, "detail": str(exc)[:200]})
 
 
 @router.get("/api/live-sessions")
@@ -1574,6 +1684,7 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
         <button class="d fix" id="bkill">Close</button>
       </div>
       <div class="banner warn" id="sharedwarn" style="display:none;margin:0 0 8px"></div>
+      <div class="banner bad" id="blankwarn" style="display:none;margin:0 0 8px"></div>
       <img id="screen" alt="browser">
       <div id="screenempty" style="display:none;background:#05070c;border:1px solid var(--line);
         border-radius:8px;padding:26px;text-align:center;color:var(--mut);font-size:13px"></div>
@@ -2532,11 +2643,30 @@ async function loadBrowsers(){
     $('bsel').value=String(pick.port); drawTabs();
     if($('tsel').value)$('battach').onclick();
   }
-  drawScreenState();
+  drawScreenState(); startBlankWatch();
 }
 // A black rectangle is the one thing this pane must never be. If no browser is
 // running the agent has not opened one yet, or it stopped before opening one, and
 // that is worth saying rather than leaving a blank box that reads as broken.
+// A white pane is ambiguous: broken stream, or a page that really is blank. Ask
+// the browser which, so the answer is on screen instead of in someone's head.
+let BLANK_TIMER=null;
+async function checkPageBlank(){
+  const port=$('bsel').value, tgt=$('tsel').value;
+  const box=$('blankwarn');
+  if(!live||!port){box.style.display='none';return;}
+  try{
+    const j=await api('/api/page-health?port='+encodeURIComponent(port)
+                      +(tgt?'&target='+encodeURIComponent(tgt):''));
+    if(j.blank){box.style.display='block';box.textContent=j.detail;}
+    else box.style.display='none';
+  }catch(e){box.style.display='none';}
+}
+function startBlankWatch(){
+  if(BLANK_TIMER)clearInterval(BLANK_TIMER);
+  BLANK_TIMER=setInterval(()=>{if($('s-live').classList.contains('on'))checkPageBlank();},15000);
+  setTimeout(checkPageBlank,3000);
+}
 function drawScreenState(){
   const all=(window._browsers||[]), attached=!!live;
   const painted=attached&&$('screen').src;
