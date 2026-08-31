@@ -30,6 +30,8 @@ DATA_DIR = Path(os.environ.get("PATENT_DATA_DIR",
 STORE_PATH = DATA_DIR / "store.json"
 FORMS_DIR = DATA_DIR / "forms"
 PACKETS_DIR = DATA_DIR / "packets"
+SIGNATURES_DIR = DATA_DIR / "signatures"
+AUTH_DIR = DATA_DIR / "auth"
 
 _LOCK = threading.RLock()
 
@@ -89,7 +91,7 @@ def _seed() -> dict:
                             "city": "Las Vegas", "state": "NV", "postal": "89119",
                             "country": "US"},
                 "email": "nimo@rotem.ai", "phone": "628-236-9320",
-                "age_65_plus": False, "date_of_birth": "1986-10-19",
+                "signature_file": "", "age_65_plus": False, "date_of_birth": "1986-10-19",
                 "notes": ("US domicile. Earlier applications filed by the firm record him at "
                           "Sheung Wan, Hong Kong; that address cannot be used on a pro se "
                           "filing because of 37 CFR 1.31(a)(2). Used on 19/791,470."),
@@ -99,34 +101,36 @@ def _seed() -> dict:
                 "id": "inv_efraim", "given": "Efraim", "middle": "", "family": "Rotem",
                 "suffix": "", "prefix": "",
                 "residence": {"city": "Santa Clara", "state": "CA", "country": "US"},
-                "mailing": {"line1": "", "line2": "", "city": "Santa Clara",
-                            "state": "CA", "postal": "", "country": "US"},
+                "mailing": {"line1": "291 Woodhams Dr.", "line2": "", "city": "Santa Clara",
+                            "state": "CA", "postal": "95051", "country": "US"},
                 "email": "", "phone": "",
-                "age_65_plus": True, "date_of_birth": "",
+                "signature_file": "", "age_65_plus": True, "date_of_birth": "",
                 "notes": ("65 or older: qualifies the application for a free Petition to Make "
                           "Special under 37 CFR 1.102(c)(1) whenever he is a named inventor. "
-                          "Street address and postcode still needed for the ADS."),
+                          "Mailing address read out of the ADS filed in US 19/428,078 on "
+                          "2025-12-19, so it matches what the Office already holds."),
                 "uspto_alt_addresses": [],
             },
             {
                 "id": "inv_ariel", "given": "Ariel", "middle": "", "family": "Rotem",
                 "suffix": "", "prefix": "",
                 "residence": {"city": "Hoboken", "state": "NJ", "country": "US"},
-                "mailing": {"line1": "", "line2": "", "city": "Hoboken",
-                            "state": "NJ", "postal": "", "country": "US"},
+                "mailing": {"line1": "333 River St.", "line2": "", "city": "Hoboken",
+                            "state": "NJ", "postal": "07030", "country": "US"},
                 "email": "", "phone": "",
-                "age_65_plus": False, "date_of_birth": "",
-                "notes": "Street address and postcode still needed for the ADS.",
+                "signature_file": "", "age_65_plus": False, "date_of_birth": "",
+                "notes": ("Mailing address read out of the ADS filed in US 19/428,078 on "
+                          "2025-12-19."),
                 "uspto_alt_addresses": [],
             },
             {
                 "id": "inv_oleg", "given": "Oleg", "middle": "", "family": "Joukov",
                 "suffix": "", "prefix": "",
                 "residence": {"city": "Shaar Efraim", "state": "", "country": "IL"},
-                "mailing": {"line1": "", "line2": "", "city": "Shaar Efraim",
-                            "state": "", "postal": "", "country": "IL"},
+                "mailing": {"line1": "Almog 118", "line2": "", "city": "Shaar Efraim",
+                            "state": "", "postal": "4283500", "country": "IL"},
                 "email": "", "phone": "",
-                "age_65_plus": False, "date_of_birth": "",
+                "signature_file": "", "age_65_plus": False, "date_of_birth": "",
                 "notes": ("NON-US DOMICILE. Naming him as a joint inventor makes him part of "
                           "the applicant under 37 CFR 1.42(a), which forces a registered "
                           "practitioner on the whole application under 1.31(a)(2). The USPTO "
@@ -138,11 +142,12 @@ def _seed() -> dict:
                 "id": "inv_eduard", "given": "Eduard", "middle": "", "family": "Tsfasman",
                 "suffix": "", "prefix": "",
                 "residence": {"city": "Shaar Efraim", "state": "", "country": "IL"},
-                "mailing": {"line1": "", "line2": "", "city": "Shaar Efraim",
-                            "state": "", "postal": "", "country": "IL"},
+                "mailing": {"line1": "Almog 118", "line2": "", "city": "Shaar Efraim",
+                            "state": "", "postal": "4283500", "country": "IL"},
                 "email": "", "phone": "",
-                "age_65_plus": False, "date_of_birth": "",
-                "notes": "NON-US DOMICILE, same practitioner consequence as Oleg Joukov.",
+                "signature_file": "", "age_65_plus": False, "date_of_birth": "",
+                "notes": ("NON-US DOMICILE, same practitioner consequence as Oleg Joukov. "
+                          "Address from the ADS filed in US 29/923,694."),
                 "uspto_alt_addresses": [],
             },
         ],
@@ -220,7 +225,34 @@ def _seed() -> dict:
                 "advisor_key": "ramp-uspto-filing-fees", "last_four": "0449",
                 "cap": "$2,500 / month",
                 "notes": ("Number and CVV live in the advisor, never here. The agent fetches "
-                          "them with get_payment_method at payment time."),
+                          "them with get_payment_method at payment time. Proven on 2026-08-30: "
+                          "paid the $730 on US 19/791,470."),
+            },
+            {
+                "id": "pay_ramp_ip", "label": "Ramp Visa 6021 (IP filing, patents and trademarks)",
+                "advisor_key": "", "last_four": "6021", "cap": "$10,000 / month",
+                "notes": ("Exists in Ramp (card id e85711ed-4295-45f5-b1b3-be13b0ea5603) but its "
+                          "number has never been read out, so it is not usable at a checkout yet. "
+                          "ramp_card_details can reveal it; then save_payment_method puts it in "
+                          "the advisor and this row gets an advisor key."),
+            },
+        ],
+        "accounts": [
+            {
+                "id": "acct_uspto", "label": "USPTO.gov (Patent Center, fees.uspto.gov)",
+                "username": "nimrod.rotem@gmail.com", "advisor_secret": "uspto-account",
+                "customer_numbers": "117228 (Intellent Patents LLC), 111739 (Ballard Spahr)",
+                "notes": ("Password lives in the advisor, never here: get_secret uspto-account. "
+                          "MFA is skipped by the Okta device-trust cookies in "
+                          "~/.tmux-dashboard/patents/auth/uspto_device.json, valid to Sep 2027, "
+                          "re-saved after every login so the year-long token keeps rolling."),
+            },
+            {
+                "id": "acct_odp", "label": "USPTO Open Data Portal API",
+                "username": "nimrod.rotem@gmail.com", "advisor_secret": "uspto-odp",
+                "customer_numbers": "",
+                "notes": ("Read-only. Used to pull the file wrapper for any published "
+                          "application, including the ADS an address can be read out of."),
             },
         ],
         "defaults": {
@@ -269,13 +301,32 @@ def load() -> dict:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FORMS_DIR.mkdir(parents=True, exist_ok=True)
         PACKETS_DIR.mkdir(parents=True, exist_ok=True)
+        SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
         if not STORE_PATH.exists():
             data = _seed()
             _write(data)
             return data
         try:
             with STORE_PATH.open(encoding="utf8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
+            # Forward-migrate: a store written before a section existed must gain it,
+            # or the panel renders an empty tab and the reason is invisible.
+            seed, changed = _seed(), False
+            for key, value in seed.items():
+                if key not in data:
+                    data[key] = value
+                    changed = True
+            for key, value in (seed.get("defaults") or {}).items():
+                if key not in (data.get("defaults") or {}):
+                    data.setdefault("defaults", {})[key] = value
+                    changed = True
+            for row in data.get("inventors") or []:
+                if "signature_file" not in row:
+                    row["signature_file"] = ""
+                    changed = True
+            if changed:
+                _write(data)
+            return data
         except Exception:
             # Never lose the file to a parse error: keep it and start clean beside it.
             backup = STORE_PATH.with_suffix(".corrupt-%d.json" % int(_now()))
@@ -304,9 +355,10 @@ def save(data: dict) -> dict:
 
 
 COLLECTIONS = ("inventors", "applicants", "correspondence", "practitioners",
-               "payment", "presets")
+               "payment", "presets", "accounts")
 _PREFIX = {"inventors": "inv", "applicants": "app", "correspondence": "corr",
-           "practitioners": "prac", "payment": "pay", "presets": "pre"}
+           "practitioners": "prac", "payment": "pay", "presets": "pre",
+           "accounts": "acct"}
 
 
 def upsert(collection: str, row: dict) -> dict:

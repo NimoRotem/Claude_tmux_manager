@@ -69,8 +69,16 @@ def _wrap(font: "pymupdf.Font", text: str, size: float, width: float) -> list:
 
 
 def render(kind: str, out_path, text_values: dict, checks=(), font_size: float = 10.0,
-           title: str = "", author: str = "") -> Path:
-    """Fill one template and write a flattened, validator-clean PDF."""
+           title: str = "", author: str = "", images: dict = None) -> Path:
+    """Fill one template and write a flattened, validator-clean PDF.
+
+    `images` maps a field name to an image file, for a scanned handwritten
+    signature. 37 CFR 1.4(d)(1) allows a handwritten signature, and MPEP 502.02
+    accepts a copy of one on an electronically filed document, so a stamped
+    signature graphic is as good as the /S-signature/ text and looks like a signed
+    paper. Where both are supplied the graphic wins and the typed name stays as the
+    printed name the rule also asks for.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     src = template_path(kind)
@@ -80,6 +88,7 @@ def render(kind: str, out_path, text_values: dict, checks=(), font_size: float =
     doc = pymupdf.open(src)
     font = pymupdf.Font(fontfile=FONT_FILE)
     checks = set(checks or ())
+    images = dict(images or {})
     seen, filled = set(), []
     try:
         for page in doc:
@@ -102,6 +111,30 @@ def render(kind: str, out_path, text_values: dict, checks=(), font_size: float =
                                    color=(0, 0, 0), width=1.1)
                     filled.append(name)
                     continue
+                if name in images:
+                    img = Path(images[name])
+                    if img.exists():
+                        # Anchor it at the LEFT of the box rather than letting
+                        # keep_proportion centre it, so it sits on the line the way
+                        # a pen would. Fit to whichever of height or width binds.
+                        avail_h = max(rect.height - 3.0, 4.0)
+                        avail_w = max(rect.width - 4.0, 8.0)
+                        try:
+                            with pymupdf.open(str(img)) as im:
+                                iw, ih = im[0].rect.width, im[0].rect.height
+                        except Exception:
+                            iw = ih = 0
+                        if iw > 0 and ih > 0:
+                            scale = min(avail_w / iw, avail_h / ih)
+                            w, h = iw * scale, ih * scale
+                        else:
+                            w, h = avail_w, avail_h
+                        top = rect.y0 + (rect.height - h) / 2.0
+                        box = pymupdf.Rect(rect.x0 + 2.0, top, rect.x0 + 2.0 + w, top + h)
+                        page.insert_image(box, filename=str(img), keep_proportion=True,
+                                          overlay=True)
+                        filled.append(name + " (signature image)")
+                        continue
                 value = text_values.get(name)
                 if value is None or str(value) == "":
                     continue
@@ -131,7 +164,7 @@ def render(kind: str, out_path, text_values: dict, checks=(), font_size: float =
             for w in list(page.widgets()):
                 page.delete_widget(w)
 
-        unknown = [k for k in text_values if k not in seen]
+        unknown = [k for k in list(text_values) + list(images) if k not in seen]
         if unknown:
             raise FormError("field(s) not on %s: %s" % (TEMPLATES[kind], ", ".join(sorted(unknown))))
         missing_checks = [c for c in checks if c not in seen]
@@ -238,7 +271,8 @@ def _sig(name: str) -> str:
 # the four documents
 # --------------------------------------------------------------------------
 def build_declaration(out_path, inventor_name: str, invention_title: str,
-                      date: str = "", signature_name: str = "") -> Path:
+                      date: str = "", signature_name: str = "",
+                      signature_image: str = "") -> Path:
     """PTO/AIA/01, one per inventor. Filed together with an ADS.
 
     The packet a drafting tool produces is often missing 37 CFR 1.63(a)(4), the
@@ -252,13 +286,15 @@ def build_declaration(out_path, inventor_name: str, invention_title: str,
          "Date Optional": date or _today(),
          "Text4": _sig(signature_name or inventor_name)},
         checks=["This declaration"],           # "The attached application"
+        images={"Text4": signature_image} if signature_image else None,
         title="Declaration (37 CFR 1.63) - PTO/AIA/01", author=inventor_name)
 
 
 def build_age_petition(out_path, inventor: dict, invention_title: str,
                        application_number: str = "", confirmation_number: str = "",
                        filing_date: str = "", docket: str = "",
-                       first_named_inventor: str = "", date: str = "") -> Path:
+                       first_named_inventor: str = "", date: str = "",
+                       signature_image: str = "") -> Path:
     """PTO/SB/130, 37 CFR 1.102(c)(1). No fee, and it can go in after filing.
 
     Option (1) is used deliberately: the inventor's own statement that he is 65 or
@@ -283,6 +319,7 @@ def build_age_petition(out_path, inventor: dict, invention_title: str,
          "Date YYYYMMDD": date or _today(),
          "Name": name},
         checks=["I am an inventor in this application and I am 65 years of age or more"],
+        images={"Signature": signature_image} if signature_image else None,
         title="Petition to Make Special Based on Age - PTO/SB/130", author=name)
 
 
@@ -293,7 +330,7 @@ def build_power_of_attorney(out_path, *, applicant_name: str, signer_name: str,
                             customer_number: str = "", practitioners=(),
                             signer_is_inventor: bool = True,
                             juristic_applicant: bool = False,
-                            date: str = "") -> Path:
+                            date: str = "", signature_image: str = "") -> Path:
     """PTO/AIA/82: the 82A transmittal plus the 82B power itself.
 
     Either appoint everyone behind a customer number, or list named practitioners.
@@ -334,7 +371,11 @@ def build_power_of_attorney(out_path, *, applicant_name: str, signer_name: str,
         checks.append("Assignee")
     elif signer_is_inventor:
         checks.append("Inventor or Joint inventor")
-    return render("power_of_attorney", out_path, values, checks=checks,
+    imgs = {}
+    if signature_image:
+        imgs = {"Signature": signature_image,
+                "Signature of the applicant for patent": signature_image}
+    return render("power_of_attorney", out_path, values, checks=checks, images=imgs,
                   title="Power of Attorney - PTO/AIA/82", author=signer_name)
 
 
@@ -343,7 +384,7 @@ def build_statement_373(out_path, *, assignee_name: str, assignee_kind: str,
                         invention_title: str = "", first_named_inventor: str = "",
                         reel: str = "", frame: str = "", ownership_percent: str = "",
                         signer_name: str = "", signer_title: str = "",
-                        date: str = "") -> Path:
+                        date: str = "", signature_image: str = "") -> Path:
     """PTO/AIA/96, the 37 CFR 3.73(c) statement of ownership.
 
     Needed whenever an assignee wants to take an action, including becoming the
@@ -373,4 +414,5 @@ def build_statement_373(out_path, *, assignee_name: str, assignee_kind: str,
     else:
         checks.append("Check Box10")             # copies attached
     return render("statement_373", out_path, values, checks=checks,
+                  images={"Text13": signature_image} if signature_image else None,
                   title="Statement under 37 CFR 3.73(c) - PTO/AIA/96", author=signer_name)

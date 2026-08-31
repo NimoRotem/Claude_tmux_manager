@@ -27,7 +27,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import browser_live
 import patent_forms
@@ -113,6 +113,16 @@ async def api_delete(collection: str, row_id: str):
     if collection not in store.COLLECTIONS:
         return _err("unknown collection %r" % collection, 404)
     return JSONResponse({"ok": store.delete(collection, row_id)})
+
+
+@router.post("/api/defaults")
+async def api_defaults(request: Request):
+    patch = await request.json()
+    data = store.load()
+    data.setdefault("defaults", {}).update(
+        {k: v for k, v in patch.items() if isinstance(k, str)})
+    store.save(data)
+    return JSONResponse({"ok": True, "defaults": data["defaults"]})
 
 
 @router.post("/api/gate")
@@ -255,6 +265,8 @@ async def api_packet_forms(packet_id: str, request: Request):
     docket = (body.get("docket") or meta.get("docket") or "").strip()
     inv_ids = body.get("inventor_ids") or meta.get("inventor_ids") or []
     wanted = set(body.get("wanted") or ["declaration"])
+    if "all" in wanted:
+        wanted = {"declaration", "age_petition", "poa", "statement_373"}
     forms_dir = d / "forms"
     forms_dir.mkdir(parents=True, exist_ok=True)
     made = []
@@ -267,11 +279,14 @@ async def api_packet_forms(packet_id: str, request: Request):
     try:
         invs = [store.find(data, "inventors", i) for i in inv_ids]
         invs = [i for i in invs if i]
+        if not invs and wanted & {"declaration", "age_petition"}:
+            return _err("pick at least one inventor before generating a declaration", 400)
         if "declaration" in wanted:
             for inv in invs:
                 name = store.full_name(inv)
                 out = forms_dir / ("DECLARATION_%s.pdf" % store.slugify(name, "inventor"))
-                await asyncio.to_thread(patent_forms.build_declaration, out, name, title)
+                await asyncio.to_thread(patent_forms.build_declaration, out, name, title,
+                                        "", "", _signature_path(inv))
                 _add(out, "Declaration 37 CFR 1.63 (PTO/AIA/01), %s" % name,
                      "Carries the 1.63(a)(4) statement that hand-built packets usually miss.")
         if "age_petition" in wanted:
@@ -285,14 +300,18 @@ async def api_packet_forms(packet_id: str, request: Request):
                     application_number=body.get("application_number", ""),
                     confirmation_number=body.get("confirmation_number", ""),
                     filing_date=body.get("filing_date", ""), docket=docket,
-                    first_named_inventor=store.full_name(invs[0]) if invs else name)
+                    first_named_inventor=store.full_name(invs[0]) if invs else name,
+                    signature_image=_signature_path(inv))
                 _add(out, "Petition to Make Special on Age (PTO/SB/130), %s" % name,
                      "No fee under 37 CFR 1.102(c)(1). File it after the application "
                      "number exists.")
         if "poa" in wanted:
             applicant = store.find(data, "applicants", body.get("applicant_id") or "")
             prac = store.find(data, "practitioners", body.get("practitioner_id") or "")
+            if not prac:
+                prac = (data.get("practitioners") or [{}])[0]
             juristic = (applicant.get("kind") == "juristic")
+            signer = invs[0] if invs else {}
             out = forms_dir / "POWER_OF_ATTORNEY.pdf"
             await asyncio.to_thread(
                 patent_forms.build_power_of_attorney, out,
@@ -303,8 +322,12 @@ async def api_packet_forms(packet_id: str, request: Request):
                 first_named_inventor=store.full_name(invs[0]) if invs else "",
                 customer_number=prac.get("customer_number", ""),
                 practitioners=[prac] if prac else [],
-                juristic_applicant=juristic, signer_is_inventor=not juristic)
-            _add(out, "Power of Attorney (PTO/AIA/82)")
+                juristic_applicant=juristic, signer_is_inventor=not juristic,
+                signature_image=_signature_path(signer))
+            _add(out, "Power of Attorney (PTO/AIA/82)",
+                 "Appoints %s. Providing representative details on an ADS is NOT a power "
+                 "of attorney (37 CFR 1.32), so this form is the thing that actually does it."
+                 % (prac.get("firm") or prac.get("name") or "the practitioner"))
         if "statement_373" in wanted:
             applicant = store.find(data, "applicants", body.get("applicant_id") or "")
             out = forms_dir / "STATEMENT_3_73.pdf"
@@ -315,8 +338,11 @@ async def api_packet_forms(packet_id: str, request: Request):
                 invention_title=title,
                 first_named_inventor=store.full_name(invs[0]) if invs else "",
                 signer_name=body.get("signer_name") or (store.full_name(invs[0]) if invs else ""),
-                signer_title=body.get("signer_title", ""))
-            _add(out, "Statement under 37 CFR 3.73(c) (PTO/AIA/96)")
+                signer_title=body.get("signer_title", ""),
+                signature_image=_signature_path(invs[0] if invs else {}))
+            _add(out, "Statement under 37 CFR 3.73(c) (PTO/AIA/96)",
+                 "Only needed when an assignee takes an action, including becoming the "
+                 "applicant under 37 CFR 1.46(c)(2).")
     except patent_forms.FormError as exc:
         return _err(str(exc), 500)
     except Exception as exc:
@@ -325,6 +351,131 @@ async def api_packet_forms(packet_id: str, request: Request):
     meta["forms"] = made
     _save_meta(d, meta)
     return JSONResponse({"ok": True, "forms": made})
+
+
+
+# ==========================================================================
+# signatures
+# ==========================================================================
+SIG_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+
+
+@router.post("/api/signature/{person_id}")
+async def api_signature_upload(person_id: str, file: UploadFile = File(...)):
+    """Store a scanned handwritten signature for one person.
+
+    37 CFR 1.4(d)(1) allows a handwritten signature and MPEP 502.02 accepts a copy
+    of one on an electronically filed document, so this is a real alternative to
+    the /S-signature/ text, not decoration. Trim it to the ink before uploading:
+    the image is fitted to the signature box, so a large white margin makes the
+    signature itself tiny.
+    """
+    data = await file.read()
+    if len(data) > 4 * 1024 * 1024:
+        return _err("signature image too large (max 4 MB)", 413)
+    ext = SIG_TYPES.get((file.content_type or "").lower())
+    if not ext:
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            return _err("use a PNG, JPEG or WebP image")
+    store.SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in person_id if c.isalnum() or c in "-_") or "person"
+    dest = store.SIGNATURES_DIR / (safe + ext)
+    for old in store.SIGNATURES_DIR.glob(safe + ".*"):
+        if old != dest:
+            old.unlink(missing_ok=True)
+    dest.write_bytes(data)
+    data_store = store.load()
+    for coll in ("inventors", "practitioners"):
+        for row in data_store.get(coll) or []:
+            if row.get("id") == person_id:
+                store.upsert(coll, {"id": person_id, "signature_file": dest.name})
+    return JSONResponse({"ok": True, "file": dest.name, "bytes": len(data)})
+
+
+@router.get("/api/signature/{person_id}")
+async def api_signature_get(person_id: str):
+    safe = "".join(c for c in person_id if c.isalnum() or c in "-_")
+    for path in sorted(store.SIGNATURES_DIR.glob(safe + ".*")):
+        media = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".webp": "image/webp"}.get(path.suffix.lower(), "application/octet-stream")
+        return Response(path.read_bytes(), media_type=media,
+                        headers={"Cache-Control": "no-store"})
+    return _err("no signature on file", 404)
+
+
+@router.delete("/api/signature/{person_id}")
+async def api_signature_delete(person_id: str):
+    safe = "".join(c for c in person_id if c.isalnum() or c in "-_")
+    gone = 0
+    for path in store.SIGNATURES_DIR.glob(safe + ".*"):
+        path.unlink(missing_ok=True)
+        gone += 1
+    data_store = store.load()
+    for coll in ("inventors", "practitioners"):
+        for row in data_store.get(coll) or []:
+            if row.get("id") == person_id:
+                store.upsert(coll, {"id": person_id, "signature_file": ""})
+    return JSONResponse({"ok": True, "removed": gone})
+
+
+def _signature_path(row: dict) -> str:
+    name = (row or {}).get("signature_file") or ""
+    if not name:
+        return ""
+    p = store.SIGNATURES_DIR / os.path.basename(name)
+    return str(p) if p.exists() else ""
+
+
+# ==========================================================================
+# reading a generated form back
+# ==========================================================================
+def _form_file(packet_id: str, name: str) -> Path:
+    d = _packet_dir(packet_id)
+    safe = os.path.basename(name)
+    path = (d / "forms" / safe).resolve()
+    if not str(path).startswith(str((d / "forms").resolve())) or not path.exists():
+        raise FileNotFoundError(name)
+    return path
+
+
+@router.get("/api/packet/{packet_id}/form/{name}")
+async def api_form_pdf(packet_id: str, name: str):
+    """The generated PDF itself, inline so the browser renders it."""
+    try:
+        path = _form_file(packet_id, name)
+    except (FileNotFoundError, ValueError):
+        return _err("no such form", 404)
+    return Response(path.read_bytes(), media_type="application/pdf",
+                    headers={"Content-Disposition": 'inline; filename="%s"' % path.name,
+                             "Cache-Control": "no-store"})
+
+
+@router.get("/api/packet/{packet_id}/form/{name}/thumb")
+async def api_form_thumb(packet_id: str, name: str, page: int = 0):
+    """A PNG of one page, so the panel can show the form without a PDF plugin."""
+    try:
+        path = _form_file(packet_id, name)
+    except (FileNotFoundError, ValueError):
+        return _err("no such form", 404)
+
+    def _render():
+        import pymupdf
+        with pymupdf.open(str(path)) as doc:
+            pno = max(0, min(int(page), doc.page_count - 1))
+            return doc[pno].get_pixmap(dpi=110).tobytes("png")
+
+    try:
+        png = await asyncio.to_thread(_render)
+    except Exception as exc:
+        return _err("could not render: %s" % exc, 500)
+    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/packet/{packet_id}/forms")
+async def api_forms_list(packet_id: str):
+    meta = _load_meta(_packet_dir(packet_id))
+    return JSONResponse({"forms": meta.get("forms") or []})
 
 
 # ==========================================================================
@@ -683,7 +834,7 @@ input,select,textarea{width:100%;background:var(--panel2);border:1px solid var(-
 padding:7px 9px;border-radius:8px;font:inherit;font-size:13px}
 textarea{min-height:60px;resize:vertical}
 button.b{background:var(--acc);border:none;color:#06121f;font-weight:600;padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px}
-button.g{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:7px 12px;border-radius:8px;cursor:pointer;font-size:13px}
+button.g,a.g{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:7px 12px;border-radius:8px;cursor:pointer;font-size:13px;text-decoration:none;display:inline-block;line-height:1.2}
 button.d{background:none;border:1px solid var(--line);color:var(--bad);padding:5px 9px;border-radius:8px;cursor:pointer;font-size:12px}
 button:disabled{opacity:.45;cursor:not-allowed}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -715,7 +866,7 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
   <span class="pill" id="feestamp"></span>
   <nav>
     <button data-s="new" class="on">New filing</button>
-    <button data-s="parties">Parties</button>
+    <button data-s="settings">Settings</button>
     <button data-s="live">Live browser</button>
     <button data-s="history">History</button>
   </nav>
@@ -780,7 +931,8 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
         <div class="chk"><input type="checkbox" id="f_373"><label for="f_373" style="margin:0">
           Statement under 37 CFR 3.73(c) (PTO/AIA/96)</label></div>
         <div class="row" style="margin-top:8px">
-          <button class="g fix" id="genforms">Generate forms</button>
+          <button class="b fix" id="genall">Generate all four</button>
+          <button class="g fix" id="genforms">Generate ticked only</button>
           <span class="fix" id="formstat"></span>
         </div>
         <div id="formlist" style="margin-top:10px"></div>
@@ -800,8 +952,23 @@ padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-spac
   </div>
 </section>
 
-<section id="s-parties">
+<section id="s-settings">
+  <div class="card" style="margin-bottom:14px">
+    <h3>Signatures</h3>
+    <p class="muted">A scanned handwritten signature is stamped onto every form generated for
+    that person, in place of the typed <span class="mono">/Name/</span>. 37 CFR 1.4(d)(1) allows a
+    handwritten signature and MPEP 502.02 accepts a copy of one on an electronically filed
+    document, so either is valid. <b>Crop to the ink</b>: the image is fitted to the signature
+    box, so a big white margin makes the signature tiny. PNG with a transparent background looks
+    best.</p>
+    <div class="grid" id="sigs"></div>
+  </div>
   <div id="parties"></div>
+  <div class="card" style="margin-top:14px">
+    <h3>Filing defaults</h3>
+    <div class="grid" id="defaults"></div>
+    <button class="g" style="margin-top:10px" id="savedefaults">Save defaults</button>
+  </div>
 </section>
 
 <section id="s-live">
@@ -891,7 +1058,7 @@ async function doRecompute(){
     $('gate').innerHTML+=`<div class="banner warn"><b>Missing data the ADS needs:</b><br>${g.missing_inventor_data.map(esc).join('<br>')}</div>`;
   $('agehint').textContent=g.age_petition_available
     ? 'Available for '+g.age_petition_inventors.join(', ')+'. No fee, 37 CFR 1.102(c)(1).'
-    : 'No fee, but it needs an inventor marked 65 or older on the Parties tab.';
+    : 'No fee, but it needs an inventor marked 65 or older on the Settings tab.';
   $('f_age').disabled=!g.age_petition_available;
   const f=j.fees;
   $('fees').innerHTML=`<table>${f.lines.map(l=>`<tr><td>${esc(l.label)}<div class="hint mono">${esc(l.code)}</div></td>
@@ -970,21 +1137,47 @@ function drawReport(){
         ${f.detail?`<div class="hint">${esc(f.detail)}</div>`:''}
         ${f.rule?`<div class="hint mono">${esc(f.rule)}</div>`:''}</div>`).join('')+`</div>`).join('');
 }
-$('genforms').onclick=async()=>{
+async function genForms(wanted){
   await ensurePacket(); $('formstat').textContent='generating...';
-  const wanted=[]; if($('f_decl').checked)wanted.push('declaration');
-  if($('f_age').checked&&!$('f_age').disabled)wanted.push('age_petition');
-  if($('f_poa').checked)wanted.push('poa'); if($('f_373').checked)wanted.push('statement_373');
   try{
     const j=await api('/api/packet/'+packet.id+'/forms',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({title:$('title').value,docket:$('docket').value,inventor_ids:picked(),
         applicant_id:$('applicant').value,wanted})});
     packet.forms=j.forms; $('formstat').textContent='';
-    $('formlist').innerHTML=`<table>${j.forms.map(f=>`<tr><td class="mono">${esc(f.name)}<div class="hint">${esc(f.label)}</div>
-      ${f.note?`<div class="hint">${esc(f.note)}</div>`:''}</td>
-      <td style="text-align:right"><span class="pill ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span></td></tr>`).join('')}</table>`;
+    drawForms();
   }catch(e){$('formstat').textContent='';toast('Form generation failed: '+e.message);}
+}
+$('genforms').onclick=()=>{
+  const wanted=[]; if($('f_decl').checked)wanted.push('declaration');
+  if($('f_age').checked&&!$('f_age').disabled)wanted.push('age_petition');
+  if($('f_poa').checked)wanted.push('poa'); if($('f_373').checked)wanted.push('statement_373');
+  if(!wanted.length)return toast('Tick at least one form.');
+  genForms(wanted);
 };
+$('genall').onclick=()=>genForms(['all']);
+function drawForms(){
+  const fs=(packet&&packet.forms)||[];
+  if(!fs.length){$('formlist').innerHTML='';return;}
+  const base=B+'/patents/api/packet/'+packet.id+'/form/';
+  $('formlist').innerHTML=`<div class="grid" style="margin-top:6px">`+fs.map(f=>{
+    const bad=(f.verify.checks||[]).filter(c=>!c.ok);
+    return `<div class="card" style="background:var(--panel2)">
+      <div class="row" style="align-items:flex-start">
+        <div><b class="mono" style="font-size:12px">${esc(f.name)}</b>
+          <div class="hint">${esc(f.label)}</div>
+          ${f.note?`<div class="hint">${esc(f.note)}</div>`:''}</div>
+        <span class="pill fix ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span>
+      </div>
+      <a href="${base}${encodeURIComponent(f.name)}" target="_blank" title="open the PDF">
+        <img src="${base}${encodeURIComponent(f.name)}/thumb?t=${Date.now()}"
+             style="width:100%;margin-top:10px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>
+      <div class="row" style="margin-top:8px">
+        <a class="g fix" target="_blank" href="${base}${encodeURIComponent(f.name)}">Open PDF</a>
+        <span class="fix muted">${f.verify.pages||''} page(s)</span>
+      </div>
+      ${bad.length?`<div class="hint" style="color:var(--bad)">${bad.map(c=>esc(c.label+' '+(c.detail||''))).join('<br>')}</div>`:''}
+    </div>`;}).join('')+`</div>`;
+}
 $('preview').onclick=async()=>{
   if(!$('title').value.trim())return toast('Give the invention a title first.');
   await ensurePacket(); $('substat').textContent='building...';
@@ -1035,16 +1228,81 @@ const FIELDS={
    ['email1','Email 1'],['email2','Email 2'],['phone','Phone'],['notes','Notes','text']],
  practitioners:[['name','Name'],['registration','Registration number'],['category','Category'],
    ['firm','Firm'],['customer_number','Customer number'],['notes','Notes','text']],
+ payment:[['label','Label'],['advisor_key','Advisor secret key'],['last_four','Last four'],
+   ['cap','Spend cap'],['notes','Notes','text']],
+ accounts:[['label','Label'],['username','Username'],['advisor_secret','Advisor secret key'],
+   ['customer_numbers','Customer numbers'],['notes','Notes','text']],
+};
+const COLL_NOTE={
+ inventors:'Residence decides the 37 CFR 1.31 gate. A non-US country here forces a registered practitioner on any filing this person is named in.',
+ applicants:'Leave the applicant as the inventors to keep the pro se route. Naming a company makes it a juristic applicant, and 1.31(a)(1) then requires a practitioner for everything.',
+ correspondence:'Where the Office sends the filing receipt and every notice. A customer number sends it to that firm instead of to you.',
+ practitioners:'Only needed when a practitioner is actually appointed. Listing one on an ADS is not a power of attorney (37 CFR 1.32); the PTO/AIA/82 form is.',
+ payment:'Card numbers are never stored here. Only the advisor key is, and the filing agent fetches the number with get_payment_method at payment time.',
+ accounts:'Passwords are never stored here either, only the name of the advisor secret that holds them.',
 };
 const get=(o,p)=>p.split('.').reduce((a,k)=>(a||{})[k],o);
 function setp(o,p,v){const ks=p.split('.');let c=o;ks.slice(0,-1).forEach(k=>{c[k]=c[k]||{};c=c[k];});c[ks.at(-1)]=v;}
 function drawParties(){
   $('parties').innerHTML=Object.keys(FIELDS).map(coll=>`
    <div class="card" style="margin-bottom:14px"><h3>${coll}</h3>
+    ${COLL_NOTE[coll]?`<p class="muted" style="margin:0 0 10px">${esc(COLL_NOTE[coll])}</p>`:''}
     <div class="grid" id="grid-${coll}"></div>
     <button class="g" style="margin-top:10px" onclick="addRow('${coll}')">Add</button></div>`).join('');
   Object.keys(FIELDS).forEach(renderColl);
+  drawSignatures(); drawDefaults();
 }
+function drawSignatures(){
+  const people=[...(S.inventors||[]),...(S.practitioners||[])];
+  $('sigs').innerHTML=people.map(r=>{
+    const nm=r.given?`${esc(r.given)} ${esc(r.family)}`:esc(r.name||r.id);
+    const has=!!r.signature_file;
+    return `<div class="card" style="background:var(--panel2)">
+      <b>${nm}</b>
+      <div style="margin:8px 0;min-height:74px;display:flex;align-items:center;justify-content:center;
+        background:#fff;border-radius:8px;border:1px solid var(--line)">
+        ${has?`<img src="${B}/patents/api/signature/${r.id}?t=${Date.now()}" style="max-width:100%;max-height:70px">`
+             :`<span style="color:#888;font-size:12px">no signature on file</span>`}
+      </div>
+      <div class="row">
+        <button class="g fix" onclick="document.getElementById('sigf-${r.id}').click()">${has?'Replace':'Upload'}</button>
+        ${has?`<button class="d fix" onclick="delSig('${r.id}')">Remove</button>`:''}
+      </div>
+      <input type="file" id="sigf-${r.id}" accept="image/png,image/jpeg,image/webp" style="display:none"
+        onchange="upSig('${r.id}',this)">
+    </div>`;}).join('');
+}
+window.upSig=async(id,el)=>{
+  if(!el.files||!el.files[0])return;
+  const fd=new FormData(); fd.append('file',el.files[0]);
+  const r=await fetch(B+'/patents/api/signature/'+id,{method:'POST',body:fd});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)return toast(j.error||'upload failed');
+  await refresh(); toast('Signature saved. It will be stamped on every form for this person.');
+};
+window.delSig=async id=>{ if(!confirm('Remove this signature?'))return;
+  await api('/api/signature/'+id,{method:'DELETE'}); await refresh(); };
+const DEFAULT_FIELDS=[['entity_status','Entity status'],['docket_prefix','Docket prefix'],
+  ['publication','Publication'],['correspondence_id','Default correspondence id'],
+  ['applicant_id','Default applicant id'],['payment_id','Default payment id'],
+  ['spec_format','Specification format'],['authorize_pdx','Authorise foreign IP office access','bool']];
+function drawDefaults(){
+  const d=S.defaults||{};
+  $('defaults').innerHTML=`<div class="card" style="background:var(--panel2)">`+
+    DEFAULT_FIELDS.map(([k,lab,t])=>t==='bool'
+      ? `<label class="chk"><input type="checkbox" data-def="${k}" ${d[k]?'checked':''}> ${esc(lab)}</label>`
+      : `<label>${esc(lab)}</label><input data-def="${k}" value="${esc(d[k]||'')}">`).join('')+
+    `<p class="hint">Leaving the PDX box ticked is the default and the right choice unless you will
+     never file abroad: it lets the EPO, JPO and KIPO pull the priority document automatically.</p></div>`;
+}
+$('savedefaults').onclick=async()=>{
+  const d={}; document.querySelectorAll('[data-def]').forEach(el=>
+    d[el.dataset.def]=el.type==='checkbox'?el.checked:el.value);
+  await api('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(d)});
+  S.defaults=d; toast('Defaults saved.');
+};
+async function refresh(){ const j=await api('/api/store'); S=j.store; drawInventors(); drawParties(); }
 function renderColl(coll){
   const host=$('grid-'+coll); if(!host)return;
   host.innerHTML=(S[coll]||[]).map(r=>`<div class="card" style="background:var(--panel2)">
