@@ -1208,12 +1208,24 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);
 padding:10px 14px;border-radius:var(--rad);max-width:460px;z-index:50;white-space:pre-wrap}
 .hint{font-size:11px;color:var(--mut);margin-top:3px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:80;display:none;overflow:auto;padding:18px}
-.modal.on{display:block}
-.sheet{max-width:1000px;margin:0 auto;background:var(--panel);border:1px solid var(--line);
-border-radius:var(--rad);padding:14px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:80;display:none;padding:18px}
+.modal.on{display:flex}
+.sheet{max-width:1040px;width:100%;margin:0 auto;background:var(--panel);border:1px solid var(--line);
+border-radius:var(--rad);padding:14px;display:flex;flex-direction:column;max-height:100%;min-height:0}
+/* Only the page scrolls. The toolbar has to stay put or you lose the tools the
+   moment you scroll down to the signature line. */
+#pagescroll{flex:1;min-height:0;overflow:auto;text-align:center;background:#0c0f16;
+border-radius:8px;padding:10px}
 #pagewrap{position:relative;display:inline-block;background:#fff;border-radius:6px;line-height:0}
-#pageimg{max-width:100%;display:block}
+#pageimg{display:block;max-width:100%}
+.runsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
+@media(max-width:1100px){.runsplit{grid-template-columns:1fr}}
+.runpane{min-width:0}
+.term{background:#05070c;border:1px solid var(--line);border-radius:8px;padding:10px;
+margin:0;height:52vh;min-height:300px;overflow:auto;white-space:pre;color:#cfe3ff;
+font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}
+#rcmd{flex:1;min-width:0;resize:vertical;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+#rkeys .key{padding:4px 9px;font-size:12px}
 .mark{position:absolute;border:1px dashed var(--acc);background:rgba(75,159,255,.10);
 cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidden;white-space:nowrap}
 .mark img{width:100%;height:100%;object-fit:contain;display:block}
@@ -1226,7 +1238,7 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
   <nav>
     <button data-s="new" class="on">New filing</button>
     <button data-s="settings">Settings</button>
-    <button data-s="live">Live browser</button>
+    <button data-s="live">Live run</button>
     <button data-s="history">History</button>
   </nav>
 </header>
@@ -1357,30 +1369,72 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
 </section>
 
 <section id="s-live">
-  <div class="card">
+  <div class="card" style="margin-bottom:14px">
     <div class="row">
-      <div><label>Browser</label><select id="bsel"></select></div>
-      <div><label>Tab</label><select id="tsel"></select></div>
+      <div style="min-width:260px"><label>Filing session</label><select id="rsel"></select></div>
       <div class="fix" style="padding-top:18px">
-        <button class="g" id="battach">Attach</button>
-        <button class="g" id="bnew">New browser</button>
-        <button class="d" id="bkill">Close</button>
+        <button class="g" id="rrefresh">Refresh</button>
+        <a class="g fix" id="ropen" target="_blank" href="#">Open in the dashboard</a>
+      </div>
+      <span class="fix" style="flex:1"></span>
+      <span class="muted fix" id="rstat"></span>
+    </div>
+    <div class="hint">The agent's screen and the browser it is driving, both on this page. The
+      terminal is the same tmux pane the dashboard shows, so you can answer it here.</div>
+  </div>
+
+  <div class="runsplit">
+    <div class="card runpane">
+      <div class="row" style="margin-bottom:8px">
+        <b class="fix">Agent</b>
+        <span class="pill" id="rlive">not attached</span>
+        <span class="fix" style="flex:1"></span>
+        <label class="fix" style="margin:0" title="Scroll with the pane instead of staying where you put it">
+          <input type="checkbox" id="rfollow" checked style="width:auto"> Follow</label>
+      </div>
+      <pre id="term" class="term">Pick a filing session above.</pre>
+      <div class="row" style="margin-top:8px;align-items:flex-end">
+        <textarea id="rcmd" rows="2" placeholder="Answer the agent. Enter sends, Shift+Enter for a new line."></textarea>
+        <button class="b fix" id="rsend">Send</button>
+      </div>
+      <div class="row" id="rkeys" style="margin-top:6px">
+        <button class="g fix key" data-k="Enter">Enter</button>
+        <button class="g fix key" data-k="Escape">Esc</button>
+        <button class="g fix key" data-k="Up">&#9650;</button>
+        <button class="g fix key" data-k="Down">&#9660;</button>
+        <button class="g fix key" data-k="1">1</button>
+        <button class="g fix key" data-k="2">2</button>
+        <button class="g fix key" data-k="3">3</button>
+        <button class="g fix key" data-k="y">y</button>
+        <button class="g fix key" data-k="n">n</button>
+        <button class="d fix key" data-k="C-c" title="interrupt what the agent is doing">Ctrl-C</button>
       </div>
     </div>
-    <div class="row" style="margin-top:6px">
-      <span class="muted fix" id="bstat">CDP screencast, not VNC: a JPEG only when the page changes.</span>
-      <span class="fix" style="flex:1"></span>
-      <label class="fix" style="margin:0" title="Chrome 152 on this box cannot inject cookies over CDP, so a browser that has to be logged in runs on instance-3.">
-        <input type="checkbox" id="bremote" checked style="width:auto"> Run on instance-3</label>
-      <label class="fix" style="margin:0"><input type="checkbox" id="binteract" style="width:auto"> Let me click and type</label>
-    </div>
-  </div>
-  <div class="card" style="margin-top:14px">
-    <img id="screen" alt="browser">
-    <div class="row" style="margin-top:8px">
-      <input id="navurl" placeholder="https://patentcenter.uspto.gov/">
-      <button class="g fix" id="navgo">Go</button>
-      <span class="muted fix" id="livestat"></span>
+
+    <div class="card runpane">
+      <div class="row" style="margin-bottom:8px">
+        <b class="fix">Browser</b>
+        <select id="bsel" style="max-width:190px"></select>
+        <select id="tsel" style="max-width:190px"></select>
+        <button class="g fix" id="battach">Attach</button>
+        <button class="g fix" id="bnew">New</button>
+        <button class="d fix" id="bkill">Close</button>
+      </div>
+      <img id="screen" alt="browser">
+      <div class="row" style="margin-top:8px">
+        <input id="navurl" placeholder="https://patentcenter.uspto.gov/">
+        <button class="g fix" id="navgo">Go</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="muted fix" id="bstat">CDP screencast, not VNC: a JPEG only when the page changes.</span>
+        <span class="fix" style="flex:1"></span>
+        <span class="muted fix" id="livestat"></span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label class="fix" style="margin:0" title="Chrome 152 on this box cannot inject cookies over CDP, so a browser that has to be logged in runs on instance-3.">
+          <input type="checkbox" id="bremote" checked style="width:auto"> Run on instance-3</label>
+        <label class="fix" style="margin:0"><input type="checkbox" id="binteract" style="width:auto"> Let me click and type</label>
+      </div>
     </div>
   </div>
 </section>
@@ -1395,20 +1449,21 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
     <button class="d fix" id="sm-close">Close</button>
   </div>
   <div class="banner warn" id="sm-warn" style="display:none;margin:8px 0"></div>
-  <p class="muted" style="margin:8px 0">Pick a tool, then click where it goes on the page.
-    Click a placed item to remove it. Nothing is emailed and nothing leaves this box.</p>
-  <div class="row" style="margin-bottom:10px">
+  <div class="row" style="margin-bottom:8px">
     <button class="g tool fix" data-tool="text">Text</button>
     <button class="g tool fix" data-tool="date">Date</button>
     <button class="g tool fix" data-tool="signature">Signature</button>
-    <select class="fix" id="sm-who" style="max-width:230px"></select>
+    <input id="sm-val" placeholder="what to type" style="max-width:210px" title="the text or date the next click drops on the page">
+    <select class="fix" id="sm-who" style="max-width:210px"></select>
     <button class="g fix" id="sm-draw">Draw one</button>
     <span class="fix" style="flex:1"></span>
     <button class="g fix" id="sm-undo">Undo</button>
     <button class="b fix" id="sm-apply">Apply and save</button>
     <span class="fix" id="sm-stat"></span>
   </div>
-  <div id="pagewrap"><img id="pageimg" alt="page"></div>
+  <div class="hint" id="sm-hint" style="margin-bottom:8px">Pick a tool, then click where it goes on
+    the page. Click a placed item to remove it. Nothing is emailed and nothing leaves this box.</div>
+  <div id="pagescroll"><div id="pagewrap"><img id="pageimg" alt="page"></div></div>
   <div id="sm-drawbox" style="display:none;margin-top:12px">
     <p class="muted">Draw the signature, then save it against the person selected above. It is
       stored once and reused on every form.</p>
@@ -1432,8 +1487,17 @@ function toast(m,ms=5200){const d=document.createElement('div');d.className='toa
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==='s-'+b.dataset.s));
-  if(b.dataset.s==='live') loadBrowsers();
+  if(b.dataset.s==='live') openRun();
 });
+window.openRun=async(session)=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x.dataset.s==='live'));
+  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==='s-live'));
+  try{const j=await api('/api/store');S=j.store;}catch(e){}
+  drawRunSessions(session);
+  const n=$('rsel').value;
+  if(n&&n!==T.name)attachTerm(n);
+  loadBrowsers();
+};
 
 async function boot(){
   const j=await api('/api/store'); S=j.store; roles=j.roles;
@@ -1713,7 +1777,7 @@ $('demorun').onclick=async()=>{
 // ---- sign on screen ----
 let SM={name:'',page:0,pages:[],items:[],tool:null,sigs:[]};
 window.openSigner=async(name)=>{
-  if(!packet)return;
+  if(!packet){toast('Load or create a packet first: the forms belong to one.');return;}
   SM={name,page:0,pages:[],items:[],tool:null,sigs:[]};
   const j=await api('/api/packet/'+packet.id+'/form/'+encodeURIComponent(name)+'/layout');
   SM.pages=j.pages; SM.sigs=j.signatures||[];
@@ -1731,6 +1795,8 @@ window.openSigner=async(name)=>{
     const has=SM.sigs.some(x=>x.id===r.id);
     return `<option value="${r.id}">${esc(nm)}${has?'':' (no signature yet)'}</option>`;}).join('');
   $('signmodal').classList.add('on'); $('sm-drawbox').style.display='none';
+  document.querySelectorAll('.tool').forEach(x=>x.classList.remove('on'));
+  $('sm-val').style.display='none'; $('sm-val').value='';
   showPage(0);
 };
 function showPage(n){
@@ -1742,22 +1808,34 @@ function showPage(n){
 $('sm-prev').onclick=()=>showPage(SM.page-1);
 $('sm-next').onclick=()=>showPage(SM.page+1);
 $('sm-close').onclick=()=>{$('signmodal').classList.remove('on');};
+// A window.prompt() here was the wrong shape: it blocks the page, some browsers
+// suppress it, and you cannot see the form while you type. The value lives in a
+// field on the toolbar instead, so what the next click drops is always visible.
 document.querySelectorAll('.tool').forEach(b=>b.onclick=()=>{
   SM.tool = SM.tool===b.dataset.tool ? null : b.dataset.tool;
   document.querySelectorAll('.tool').forEach(x=>x.classList.toggle('on',x.dataset.tool===SM.tool));
+  const v=$('sm-val');
+  if(SM.tool==='date'){v.style.display='';v.placeholder='date';
+    if(!v.value.trim())v.value=new Date().toISOString().slice(0,10);v.focus();}
+  else if(SM.tool==='text'){v.style.display='';v.placeholder='what to type';v.focus();}
+  else {v.style.display='none';}
+  $('sm-hint').textContent = SM.tool==='signature'
+    ? 'Click the signature line. The signature of the person picked above is placed there.'
+    : SM.tool ? 'Type the value, then click where it goes on the page.'
+    : 'Pick a tool, then click where it goes on the page. Click a placed item to remove it.';
 });
 $('pageimg').onclick=e=>{
-  if(!SM.tool)return toast('Pick a tool first.');
+  if(!SM.tool)return toast('Pick a tool first: Text, Date or Signature.');
   const r=e.target.getBoundingClientRect();
   const x=(e.clientX-r.left)/r.width, y=(e.clientY-r.top)/r.height;
   if(SM.tool==='signature'){
     const who=$('sm-who').value;
+    if(!who)return toast('Pick whose signature this is.');
     if(!SM.sigs.some(s=>s.id===who))return toast('That person has no signature yet. Use "Draw one", or upload it on Settings.');
     SM.items.push({page:SM.page,x,y,w:0.22,h:0.045,kind:'signature',image:who,label:'signature'});
   }else{
-    const now=new Date().toISOString().slice(0,10);
-    const v=prompt(SM.tool==='date'?'Date':'Text', SM.tool==='date'?now:'');
-    if(v===null)return;
+    const v=$('sm-val').value.trim();
+    if(!v)return toast('Type the '+(SM.tool==='date'?'date':'text')+' in the box first.');
     SM.items.push({page:SM.page,x,y,w:0.25,h:0.028,kind:'text',value:v,size:11,label:v});
   }
   drawMarks();
@@ -1831,9 +1909,12 @@ $('submit').onclick=async()=>{
   try{
     const j=await api('/api/packet/'+packet.id+'/submit',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    $('substat').innerHTML=`<a href="${B}/#${encodeURIComponent(j.session)}" style="color:var(--acc)">open session ${esc(j.session)}</a>`;
-    toast('Session '+j.session+' has the packet and the brief.');
+    $('substat').innerHTML=`<a href="#" onclick="openRun('${esc(j.session)}');return false" style="color:var(--acc)">watch ${esc(j.session)}</a>`;
+    toast('Session '+j.session+' has the packet and the brief. Watching it on Live run.');
     drawHistory();
+    // Straight to the terminal and the browser, on this page. Sending people off
+    // to the dashboard's raw view was the wrong hand-off: they lose the panel.
+    openRun(j.session);
   }catch(e){
     $('substat').textContent='';
     if(String(e.message).includes('practitioner is required')){
@@ -1967,10 +2048,106 @@ function drawHistory(){
   api('/api/store').then(j=>{S=j.store;
     $('hist').innerHTML=(S.filings||[]).length?`<table><tr><th>When</th><th>Title</th><th>Docket</th><th>Session</th><th>Status</th></tr>`+
      S.filings.map(f=>`<tr><td>${new Date(f.created*1000).toLocaleString()}</td><td>${esc(f.title)}</td>
-      <td class="mono">${esc(f.docket||'')}</td><td><a style="color:var(--acc)" href="${B}/#${encodeURIComponent(f.session||'')}">${esc(f.session||'')}</a></td>
+      <td class="mono">${esc(f.docket||'')}</td><td>${f.session?`<a style="color:var(--acc)" href="#" onclick="openRun('${esc(f.session)}');return false">${esc(f.session)}</a>`:''}</td>
       <td>${esc(f.status||'')}${f.application_number?' - '+esc(f.application_number):''}</td></tr>`).join('')+`</table>`
      :'<span class="muted">Nothing filed from here yet.</span>';});
 }
+
+// ---- the agent's terminal, embedded ----
+// Same tmux pane the dashboard renders, over the same /api/sessions/<n>/raw-tail
+// delta protocol: a full capture first, then only the new lines, with a visible-pane
+// hash so an in-place TUI redraw (which adds no scrollback) still refreshes.
+let T={name:'',text:'',known:0,hash:'',timer:null,gone:false};
+
+function runSessions(){
+  const seen=new Set(), out=[];
+  (S.filings||[]).slice().reverse().forEach(f=>{
+    if(f.session&&!seen.has(f.session)){seen.add(f.session);
+      out.push({name:f.session,label:f.title||f.session,demo:!!f.demo,when:f.created});}});
+  return out;
+}
+function drawRunSessions(keep){
+  const list=runSessions(), cur=keep||$('rsel').value;
+  $('rsel').innerHTML=list.length
+    ? list.map(s=>`<option value="${esc(s.name)}">${esc(s.label)}${s.demo?' (demo)':''}</option>`).join('')
+    : '<option value="">no filing session yet</option>';
+  if(cur&&list.some(s=>s.name===cur))$('rsel').value=cur;
+  const n=$('rsel').value;
+  $('ropen').href=n?`${B}/#/session/${encodeURIComponent(n)}/raw`:'#';
+}
+function termEl(){return $('term');}
+function renderTerm(){
+  const el=termEl(), follow=$('rfollow').checked;
+  const atEnd=el.scrollHeight-el.scrollTop-el.clientHeight<30;
+  el.textContent=T.text||'(nothing on the pane yet)';
+  if(follow||atEnd)el.scrollTop=el.scrollHeight;
+}
+async function termPoll(){
+  const name=T.name; if(!name)return;
+  try{
+    const q=`?known_lines=${T.known}&last_hash=${encodeURIComponent(T.hash||'')}`;
+    const r=await fetch(`${B}/api/sessions/${encodeURIComponent(name)}/raw-tail`+q,{credentials:'same-origin'});
+    if(r.status===404){
+      if(!T.gone){T.gone=true;$('rlive').textContent='session ended';$('rlive').className='pill bad';
+        if(!T.text)termEl().textContent='That tmux session is gone. The filing it belongs to is in '
+          +'History; open a new one from New filing.';}
+      return;
+    }
+    const j=await r.json();
+    if(T.name!==name)return;                    // the picker moved while we waited
+    T.gone=false;
+    if(typeof j.visible_hash==='string')T.hash=j.visible_hash;
+    if(j.mode==='full'){T.text=j.raw||'';T.known=j.pane_total;renderTerm();}
+    else if(j.mode==='delta'&&j.raw){
+      const incoming=j.raw.split('\n'), have=(T.text||'').split('\n');
+      const ov=j.overlap||0; let ok=false;
+      if(ov&&have.length>=ov&&have.slice(-ov).join('\n')===incoming.slice(0,ov).join('\n'))ok=true;
+      if(ok){
+        const add=incoming.slice(ov).join('\n');
+        if(add)T.text=(T.text?T.text+'\n':'')+add;
+        T.known=j.pane_total; renderTerm();
+      }else{                                     // drifted: resync from a full capture
+        T.known=0; return termPoll();
+      }
+    }
+    $('rlive').textContent='live'; $('rlive').className='pill ok';
+    $('rstat').textContent=(T.text||'').split('\n').length+' lines';
+  }catch(e){ $('rlive').textContent='no answer'; $('rlive').className='pill'; }
+}
+function attachTerm(name){
+  if(T.timer){clearInterval(T.timer);T.timer=null;}
+  T={name:name||'',text:'',known:0,hash:'',timer:null,gone:false};
+  termEl().textContent=name?'attaching...':'Pick a filing session above.';
+  if(!name){$('rlive').textContent='not attached';$('rlive').className='pill';return;}
+  termPoll(); T.timer=setInterval(()=>{
+    if($('s-live').classList.contains('on'))termPoll();
+  },1500);
+}
+$('rsel').onchange=()=>{drawRunSessions($('rsel').value);attachTerm($('rsel').value);};
+$('rrefresh').onclick=async()=>{const j=await api('/api/store');S=j.store;
+  drawRunSessions($('rsel').value); if(T.name){T.known=0;termPoll();} loadBrowsers();};
+async function sendToAgent(text){
+  if(!T.name)return toast('No session attached.');
+  if(!text.trim())return;
+  try{
+    await fetch(`${B}/api/sessions/${encodeURIComponent(T.name)}/send`,
+      {method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
+       body:JSON.stringify({command:text})});
+    $('rcmd').value=''; setTimeout(termPoll,400);
+  }catch(e){toast('Could not send: '+e.message);}
+}
+$('rsend').onclick=()=>sendToAgent($('rcmd').value);
+$('rcmd').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendToAgent($('rcmd').value);}});
+document.querySelectorAll('#rkeys .key').forEach(b=>b.onclick=async()=>{
+  if(!T.name)return toast('No session attached.');
+  try{
+    await fetch(`${B}/api/sessions/${encodeURIComponent(T.name)}/send-keys`,
+      {method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
+       body:JSON.stringify({keys:[b.dataset.k]})});
+    setTimeout(termPoll,300);
+  }catch(e){toast('Could not send: '+e.message);}
+});
 
 // ---- live browser ----
 let live=null;
@@ -1979,6 +2156,9 @@ async function loadBrowsers(){
   $('bsel').innerHTML=j.browsers.map(b=>`<option value="${b.port}">${b.port}${b.remote?' instance-3':b.shared?' (shared)':' local'}${b.headless===false?' headed':''} - ${b.targets.length} tab(s)</option>`).join('')
     ||'<option value="">none running</option>';
   window._browsers=j.browsers; drawTabs();
+  // The agent opens its own browser. Attach to it without being asked, otherwise
+  // the pane sits black next to a session that is plainly doing something.
+  if(!live&&j.browsers.length&&$('bsel').value&&$('tsel').value)$('battach').onclick();
 }
 $('bsel').onchange=drawTabs;
 function drawTabs(){

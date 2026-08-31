@@ -308,10 +308,25 @@ class Screencast:
         # an idle page and it looks like the bridge is broken. Marking the page
         # active first, and nudging it if the first frame does not arrive, is what
         # makes the very first paint show up.
-        with contextlib.suppress(Exception):
-            await self._send("Page.setWebLifecycleState", {"state": "active"})
+        await self._make_visible()
         await self._start()
         return self
+
+    async def _make_visible(self):
+        """Convince a headless tab it is on screen, or it never paints.
+
+        Measured on instance-3, Chrome 149, one tab, nothing else open: with none
+        of this, Page.screencastVisibilityChanged reports visible=false and the
+        tab emits ZERO frames, for ever, however many times you restart the
+        screencast. Emulation.setFocusEmulationEnabled flips it to visible=true
+        and the frames start; Page.bringToFront does too. Both are sent because
+        a navigation can drop either one, and neither costs anything.
+        """
+        for method, params in (("Emulation.setFocusEmulationEnabled", {"enabled": True}),
+                               ("Page.bringToFront", None),
+                               ("Page.setWebLifecycleState", {"state": "active"})):
+            with contextlib.suppress(Exception):
+                await self._send(method, params)
 
     async def _start(self):
         await self._send("Page.startScreencast", {
@@ -319,12 +334,27 @@ class Screencast:
             "maxWidth": self.max_width, "maxHeight": self.max_height,
             "everyNthFrame": self.every_nth})
 
+    async def _renudge(self):
+        """After a navigation, provoke a paint if the new page is already static."""
+        before = self._frames
+        for delay in (0.6, 1.2, 2.5):
+            await asyncio.sleep(delay)
+            if self._frames > before:
+                return
+            await self._make_visible()
+            with contextlib.suppress(Exception):
+                await self._send("Input.dispatchMouseEvent",
+                                 {"type": "mouseWheel", "x": 8, "y": 8,
+                                  "deltaX": 0, "deltaY": 0})
+                await self._start()
+
     async def _first_frame_watchdog(self):
         """Chrome only sends a frame when the page changes. Provoke the first one."""
         for delay in (1.2, 2.0, 3.0, 5.0):
             await asyncio.sleep(delay)
             if self._frames:
                 return
+            await self._make_visible()
             with contextlib.suppress(Exception):
                 await self._send("Input.dispatchMouseEvent",
                                  {"type": "mouseWheel", "x": 8, "y": 8,
@@ -391,8 +421,29 @@ class Screencast:
                 if (msg.get("params") or {}).get("visible"):
                     with contextlib.suppress(Exception):
                         await self._start()
-            elif method in ("Page.frameNavigated", "Page.loadEventFired") and on_event:
-                await on_event(method, msg.get("params") or {})
+                else:
+                    # Gone hidden: without this the stream is simply over.
+                    await self._make_visible()
+                    with contextlib.suppress(Exception):
+                        await self._start()
+            elif method in ("Page.frameNavigated", "Page.loadEventFired"):
+                # A cross-document navigation tears the screencast down with the
+                # old document, and Chrome does not tell you: the socket stays
+                # open, acks keep working, and not one further frame arrives. The
+                # viewer then sits frozen on the previous page for ever, which is
+                # exactly when you most want to see what the agent is doing.
+                # Measured: attach, navigate, 1 frame in 25 seconds. So restart it
+                # on every navigation, and clear the digest so the first frame of
+                # the new page is forwarded even if it happens to encode the same.
+                if method == "Page.loadEventFired" or not (
+                        msg.get("params") or {}).get("frame", {}).get("parentId"):
+                    self._shown_digest = ""
+                    await self._make_visible()
+                    with contextlib.suppress(Exception):
+                        await self._start()
+                    asyncio.create_task(self._renudge())
+                if on_event:
+                    await on_event(method, msg.get("params") or {})
 
     # ---- input passthrough -------------------------------------------------
     def _to_page(self, nx: float, ny: float):
