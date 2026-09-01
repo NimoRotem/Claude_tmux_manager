@@ -235,12 +235,18 @@ def audit(meta: dict, data: dict, facts: dict, report: dict, gate: dict) -> dict
         if form.get("name", "").startswith("SIGNED_"):
             continue
         if form.get("needs_signature") and not form.get("presigned"):
-            issues.append(_issue("sign_%s" % form["name"], "block",
-                                 "%s is not signed" % form["name"],
-                                 "Sign it on screen, or send it to the signer.",
-                                 {"kind": "sign", "form": form["name"],
-                                  "who": form.get("signer_name", "")},
-                                 "37 CFR 1.4(d)"))
+            # A demo never reaches Patent Center, so an unsigned form does not stop
+            # it. Fabricating a signature so the demo looks tidy would be worse:
+            # the whole point of the signing step is that a real one is required.
+            demo = bool(meta.get("demo"))
+            issues.append(_issue(
+                "sign_%s" % form["name"], "warn" if demo else "block",
+                "%s is not signed" % form["name"],
+                ("A real filing needs this signed; this demo stops before filing, so it "
+                 "does not block. Sign it anyway to try the signer."
+                 if demo else "Sign it on screen, or send it to the signer."),
+                {"kind": "sign", "form": form["name"], "who": form.get("signer_name", "")},
+                "37 CFR 1.4(d)"))
 
     blocking = [i for i in issues if i["level"] == "block"]
     return {"issues": issues, "blocking": len(blocking), "ready": not blocking}

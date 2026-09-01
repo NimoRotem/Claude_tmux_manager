@@ -130,7 +130,14 @@ async def api_obs_save(sub_id: str, request: Request):
         if key in body:
             meta[key] = body[key]
     _save(d, meta)
-    return JSONResponse({"ok": True, "submission": meta, "review": obs.check(meta, meta.get("files") or [])})
+    if meta.get("files"):
+        try:
+            await _build_forms(d, meta)
+        except Exception as exc:                                  # noqa: BLE001
+            meta["forms_error"] = str(exc)[:200]
+            _save(d, meta)
+    return JSONResponse({"ok": True, "submission": meta, "forms": meta.get("forms") or [],
+                         "review": obs.check(meta, meta.get("files") or [])})
 
 
 @router.delete("/api/obs/{sub_id}")
@@ -188,8 +195,16 @@ async def api_obs_scan(sub_id: str):
     meta["files"] = entries
     meta["scanned"] = time.time()
     _save(d, meta)
-    return JSONResponse({"ok": True, "files": entries,
-                         "review": obs.check(meta, entries)})
+    # Build the documents here rather than behind a button. Nobody can tell from
+    # the outside whether a rebuild is needed, so the answer is that it always is
+    # and it is never asked for.
+    try:
+        await _build_forms(d, meta)
+    except Exception as exc:                                      # noqa: BLE001
+        meta["forms_error"] = str(exc)[:200]
+        _save(d, meta)
+    return JSONResponse({"ok": True, "files": entries, "forms": meta.get("forms") or [],
+                         "review": obs.check(meta, meta.get("files") or [])})
 
 
 @router.post("/api/obs/{sub_id}/check")

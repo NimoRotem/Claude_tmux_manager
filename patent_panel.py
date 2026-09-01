@@ -1592,6 +1592,9 @@ border-radius:8px;padding:10px}
 .redit{font-size:11px;color:var(--acc);white-space:nowrap}
 .reditor{padding:4px 2px 12px}
 #facts .frow:first-child .rowline{padding-top:2px}
+.spin{display:inline-block;width:11px;height:11px;margin-right:8px;vertical-align:-1px;
+border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
 .runsplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
 @media(max-width:1100px){.runsplit{grid-template-columns:1fr}}
 .runpane{min-width:0}
@@ -1748,27 +1751,29 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
     </div>
   </div>
 
-  <div class="card" style="margin-bottom:14px">
-    <div class="row"><h3 style="margin:0">Is it ready?</h3>
-      <span class="fix" style="flex:1"></span>
-      <button class="g fix" id="o-check">Re-check</button>
-      <button class="b fix" id="o-forms">Build the documents</button>
-      <span class="fix muted" id="o-formstat"></span></div>
-    <div id="o-review" style="margin-top:10px"><span class="muted">Fill the list, then check.</span></div>
-    <div id="o-forms-out" style="margin-top:12px"></div>
+  <div class="card" id="o-issuecard" style="margin-bottom:14px;display:none">
+    <h3 id="o-issuehead">Before this can be filed</h3>
+    <div id="o-review"></div>
   </div>
 
   <div class="card">
     <div class="row">
-      <div><b>Hand it to an agent.</b>
-        <div class="hint">Opens a session that verifies the package itself, logs in to Patent
-          Center, drives the third-party preissuance submission and pays. Watch it on Live run.</div></div>
+      <div><b id="o-gohead">Ready.</b>
+        <div class="hint" id="o-gohint">Opens a session that files the submission in Patent
+          Center and pays. You watch it on Live run.</div></div>
       <span class="fix" style="flex:1"></span>
-      <button class="g fix" id="o-dry">Preview the brief</button>
-      <button class="b fix" id="o-submit">Submit</button>
+      <button class="g fix" id="o-dry">Preview</button>
+      <button class="b fix" id="o-submit">Go</button>
       <span class="fix" id="o-substat"></span>
     </div>
-    <pre id="o-brief" class="term" style="display:none;height:280px;margin-top:10px"></pre>
+  </div>
+
+  <div class="card" id="o-previewcard" style="display:none;margin-top:14px">
+    <div class="row"><h3 style="margin:0">What gets filed</h3>
+      <span class="fix" style="flex:1"></span>
+      <button class="g fix" id="o-previewclose">Close</button></div>
+    <div id="o-previewblurb" class="hint" style="margin:8px 0"></div>
+    <div id="o-previewdocs"></div>
   </div>
 </section>
 
@@ -2249,11 +2254,17 @@ $('preview').onclick=async()=>{
     .concat((PK.files||[]).filter(x=>x.role!=='exclude').map(x=>({name:x.name,
       url:base+'file/'+encodeURIComponent(x.name),what:'from your package'})))
     .concat((PK.forms||[]).map(x=>({name:x.name,url:base+'form/'+encodeURIComponent(x.name),
-      thumb:base+'form/'+encodeURIComponent(x.name)+'/thumb',what:x.label})));
+      thumb:base+'form/'+encodeURIComponent(x.name)+'/thumb',what:x.label,
+      // Anything we generated can be signed, whether or not it is currently a
+      // problem. Reaching the signer only through an error message meant that the
+      // moment the package was healthy the tool became unreachable.
+      sign:true, signed:!!x.presigned})));
   $('previewdocs').innerHTML=docs.map(d=>`
     <div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
       <div class="row"><b class="mono fix">${esc(d.name)}</b>
+        ${d.sign?`<span class="pill fix ${d.signed?'ok':''}">${d.signed?'signed':'not signed'}</span>`:''}
         <span class="fix" style="flex:1"></span>
+        ${d.sign?`<button class="g fix" onclick="openSigner('${esc(d.name)}')">Sign on screen</button>`:''}
         <a class="g fix" target="_blank" href="${d.url}">Open</a></div>
       <div class="hint">${esc(d.what||'')}</div>
       ${d.thumb?`<a href="${d.url}" target="_blank"><img src="${d.thumb}?t=${Date.now()}"
@@ -2417,7 +2428,7 @@ function drawHistory(){
 }
 
 // ---- third-party observations, 37 CFR 1.290 ----
-let OB=null;
+let OB=null, OBR=null;
 const OKINDS={us_patent:'US patent',us_pub:'US publication',foreign:'Foreign patent/publication',npl:'Non-patent publication'};
 const oapi=(p,o)=>api('/api/obs'+p,o);
 
@@ -2503,18 +2514,34 @@ function drawReview(r){
   const f=r.fee||{};
   $('o-fee').textContent=f.exempt?'no fee (1.290(g))':`$${f.total} ${f.entity} (code ${f.code})`;
   $('o-fee').className='pill '+(f.exempt?'ok':'');
-  $('o-review').innerHTML=(r.checks||[]).map(c=>
-    `<div style="margin:3px 0"><span class="pill ${c.ok?'ok':(c.blocker?'bad':'')}">${
-      c.ok?'ok':(c.blocker?'blocker':'warn')}</span> ${esc(c.label)}${
-      c.detail?` <span class="muted">- ${esc(c.detail)}</span>`:''}${
-      (!c.ok&&c.fix)?`<div class="hint">${esc(c.fix)}</div>`:''}</div>`).join('')
-    +`<div style="margin-top:8px"><b>${r.ready?'Ready to file.':r.blockers+' blocker(s) to clear.'}</b></div>`;
+  // Only what is wrong, with the rule that says so. A wall of ticks next to a
+  // Submit button is noise; the failures are the whole message.
+  const bad=(r.checks||[]).filter(c=>!c.ok);
+  $('o-issuecard').style.display=bad.length?'block':'none';
+  $('o-issuehead').textContent=bad.some(c=>c.blocker)
+    ? 'Before this can be filed' : 'Worth a look before you file';
+  $('o-review').innerHTML=bad.map(c=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+      <div class="row">
+        <span class="pill fix ${c.blocker?'bad':'warn'}">${c.blocker?'blocks filing':'worth a look'}</span>
+        <b class="fix">${esc(c.label)}</b>
+      </div>
+      ${c.detail?`<div class="hint">${esc(c.detail)}</div>`:''}
+      ${c.fix?`<div class="hint">${esc(c.fix)}</div>`:''}
+    </div>`).join('');
+  $('o-gohead').textContent=r.ready?'Ready to file.':'Not ready yet.';
+  $('o-gohint').textContent=r.ready
+    ? 'Opens a session that files the submission in Patent Center and pays. Watch it on Live run.'
+    : 'Clear what blocks filing above.';
+  $('o-submit').disabled=!r.ready;
+  $('o-submit').style.opacity=r.ready?'1':'.5';
+  OBR=r;
 }
 async function obsSave(){
   if(!OB)return; const body=obsRead();
   try{const j=await oapi('/'+OB.id+'/save',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    OB=Object.assign(OB,j.submission); drawReview(j.review);}catch(e){}
+    OB=Object.assign(OB,j.submission); OB.forms=j.forms||OB.forms; drawReview(j.review);}catch(e){}
 }
 ['o-appno','o-title','o-entity','o-pub','o-rej','o-noa','o-signer','o-reg'].forEach(id=>
   $(id).addEventListener('change',obsSave));
@@ -2538,35 +2565,10 @@ $('o-scan').onclick=async()=>{
     }
     $('o-scanstat').textContent='checking...';
     const j=await oapi('/'+OB.id+'/scan',{method:'POST'});
-    OB.files=j.files; drawObsFiles(); drawItems(); drawReview(j.review);
+    OB.files=j.files; OB.forms=j.forms||OB.forms; drawObsFiles(); drawItems(); drawReview(j.review);
     $('o-scanstat').textContent=''; inp.value='';
     toast(j.files.length+' file(s) ready. Point each item at its copy.');
   }catch(e){$('o-scanstat').textContent='';toast('Upload failed: '+e.message);}
-};
-$('o-check').onclick=async()=>{await obsSave();
-  const j=await oapi('/'+OB.id+'/check',{method:'POST'}); drawReview(j.review);};
-$('o-forms').onclick=async()=>{
-  if(!OB)return toast('Nothing to build yet.');
-  await obsSave(); $('o-formstat').textContent='building...';
-  try{
-    const j=await oapi('/'+OB.id+'/forms',{method:'POST'});
-    OB.forms=j.forms; drawReview(j.review); $('o-formstat').textContent='';
-    $('o-forms-out').innerHTML=j.forms.map(f=>{
-      const base=`${B}/patents/api/obs/${OB.id}/form/${encodeURIComponent(f.name)}`;
-      const ov=Object.entries(f.overflow||{}).map(([k,v])=>`${v} more ${k} than the form has rows`);
-      return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
-        <div class="row"><b class="mono fix">${esc(f.name)}</b>
-          <span class="pill fix ${f.upload?'ok':''}">${f.upload?'gets filed':'worksheet, not filed'}</span>
-          <span class="pill fix ${f.verify.ok?'ok':'bad'}">${f.verify.ok?'valid':'check'}</span>
-          <span class="fix" style="flex:1"></span>
-          <a class="g fix" target="_blank" href="${base}">Open PDF</a></div>
-        <div class="hint">${esc(f.label)} - ${esc(f.note)}</div>
-        ${ov.length?`<div class="hint" style="color:var(--bad)">${esc(ov.join('; '))}. Patent Center's own screens take the full list; the worksheet cannot show it all.</div>`:''}
-        <a href="${base}" target="_blank"><img src="${base}/thumb?t=${Date.now()}"
-          style="width:100%;max-width:420px;margin-top:8px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>
-      </div>`;}).join('');
-    toast('Built. The worksheet is for checking; the concise descriptions get filed.');
-  }catch(e){$('o-formstat').textContent='';toast('Could not build: '+e.message);}
 };
 $('obsdemo').onclick=async()=>{
   $('obsdemostat').textContent='building...';
@@ -2574,26 +2576,53 @@ $('obsdemo').onclick=async()=>{
     const j=await oapi('/demo',{method:'POST'});
     OB=j.submission; obsWrite();
     const s=await oapi('/'+OB.id+'/scan',{method:'POST'});
-    OB.files=s.files; drawObsFiles(); drawItems(); drawReview(s.review);
+    OB.files=s.files; OB.forms=s.forms||[]; drawObsFiles(); drawItems(); drawReview(s.review);
     $('obsdemostat').textContent='';
     toast('Demo loaded: four items, so a fee is due and the run has a payment screen to stop at.');
   }catch(e){$('obsdemostat').textContent='';toast('Demo failed: '+e.message);}
 };
-async function obsSubmit(dry){
+function obsPreview(){
+  if(!OB)return toast('Nothing to preview yet.');
+  const base=`${B}/patents/api/obs/${OB.id}/`;
+  const r=OBR||{}, f=r.fee||{}, t=r.timing||{};
+  $('o-previewblurb').innerHTML=
+    `<b>Third-party observation on ${esc(OB.application_number||'(no application number)')}</b><br>`
+    +`${(OB.items||[]).length} listed item${(OB.items||[]).length===1?'':'s'}, `
+    +`${f.exempt?'no fee under 1.290(g)':'$'+(f.total||0)+' under 1.290(f)'}. `
+    +`The 1.290(b) window ${t.open===true?'closes '+esc(t.deadline||''):'is '+(t.open===false?'CLOSED':'unknown')}. `
+    +`Signed by ${esc(OB.signer_name||'(nobody yet)')}.`;
+  const docs=[]
+    .concat((OB.forms||[]).map(x=>({name:x.name,url:base+'form/'+encodeURIComponent(x.name),
+      thumb:base+'form/'+encodeURIComponent(x.name)+'/thumb',
+      what:x.label+(x.upload?'':' - checked here, NOT uploaded')})))
+    .concat((OB.files||[]).map(x=>({name:x.name,url:base+'file/'+encodeURIComponent(x.name),
+      what:'from your package'})));
+  $('o-previewdocs').innerHTML=docs.map(d=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+      <div class="row"><b class="mono fix">${esc(d.name)}</b>
+        <span class="fix" style="flex:1"></span>
+        <a class="g fix" target="_blank" href="${d.url}">Open</a></div>
+      <div class="hint">${esc(d.what||'')}</div>
+      ${d.thumb?`<a href="${d.url}" target="_blank"><img src="${d.thumb}?t=${Date.now()}"
+        style="width:100%;max-width:380px;margin-top:8px;border-radius:8px;border:1px solid var(--line);background:#fff"></a>`:''}
+    </div>`).join('')||'<span class="muted">Nothing to show yet.</span>';
+  $('o-previewcard').style.display='block';
+  $('o-previewcard').scrollIntoView({behavior:'smooth'});
+}
+async function obsSubmit(){
   if(!OB)return toast('Nothing to submit.');
-  await obsSave(); $('o-substat').textContent=dry?'building...':'opening session...';
+  await obsSave(); $('o-substat').textContent='opening session...';
   try{
     const j=await oapi('/'+OB.id+'/submit',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({dry_run:!!dry})});
+      body:JSON.stringify({})});
     $('o-substat').textContent='';
-    if(dry){$('o-brief').style.display='block';$('o-brief').textContent=j.brief;
-      toast('This is the brief the session gets.');return;}
-    toast('Session '+j.session+' has the submission. Watching it on Live run.');
+    toast('Session '+j.session+' has the submission. Watching on Live run.');
     openRun(j.session);
   }catch(e){$('o-substat').textContent='';toast(e.message);}
 }
-$('o-dry').onclick=()=>obsSubmit(true);
-$('o-submit').onclick=()=>obsSubmit(false);
+$('o-dry').onclick=obsPreview;
+$('o-previewclose').onclick=()=>{$('o-previewcard').style.display='none';};
+$('o-submit').onclick=obsSubmit;
 
 // ---- the agent's terminal, embedded ----
 // Same tmux pane the dashboard renders, over the same /api/sessions/<n>/raw-tail
@@ -2747,7 +2776,20 @@ async function checkPageBlank(){
   try{
     const j=await api('/api/page-health?port='+encodeURIComponent(port)
                       +(tgt?'&target='+encodeURIComponent(tgt):''));
-    if(j.blank){box.style.display='block';box.textContent=j.detail;}
+    const url=(j.page&&j.page.url)||'', ready=(j.page&&j.page.ready)||'';
+    // A tab nobody has navigated yet, or one still loading, is not a fault. Only a
+    // page that finished and rendered nothing is. Saying "something is wrong" while
+    // the agent is still opening the browser is worse than saying nothing.
+    const idle=!url||url==='about:blank';
+    const loading=ready&&ready!=='complete';
+    if(idle||loading){
+      box.className='banner'; box.style.display='block';
+      box.innerHTML='<span class="spin"></span>'+(idle
+        ? 'Waiting for the agent to open a page.'
+        : 'Loading '+esc(url.slice(0,70))+' ...');
+      return;
+    }
+    if(j.blank){box.className='banner bad';box.style.display='block';box.textContent=j.detail;}
     else box.style.display='none';
   }catch(e){box.style.display='none';}
 }
