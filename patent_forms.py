@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -92,6 +93,13 @@ def finalise(stage_path, out_path, title: str = "", author: str = "") -> Path:
             if r.returncode != 0 or not distilled.exists():
                 raise FormError("ghostscript failed: %s" % (r.stderr or "")[:300])
         else:
+            # No ghostscript on this box. Historically this fell through and
+            # emitted the staged file, which is exactly the PDF this function
+            # exists to prevent: PyMuPDF names the face "Liberation Sans Regular"
+            # and a BaseFont name with spaces reads to the validators as a
+            # non-embedded font. Silently shipping it means the defect is only
+            # discovered by the office rejecting the filing. Caught on builder2
+            # on 2026-09-01, where the dashboard runs and gs was not installed.
             distilled = Path(stage_path)
         reader = PdfReader(str(distilled))
         writer = PdfWriter()
@@ -105,7 +113,122 @@ def finalise(stage_path, out_path, title: str = "", author: str = "") -> Path:
                              "/Producer": "", "/Creator": ""})
         with out_path.open("wb") as fh:
             writer.write(fh)
+    repair_text_layer(out_path)
+    _assert_fonts_clean(out_path)
     return out_path
+
+
+# Liberation Sans maps several codepoints onto one glyph, and PyMuPDF builds the
+# ToUnicode map by reversing the font cmap, so it picks the wrong member of each
+# pair. The page LOOKS right and the text layer is wrong, which is the worst
+# possible failure: found 2026-09-01, a document reading "B-184" on the page
+# extracted as "B\xad184", so a search for the number in the filed PDF misses.
+# Each pair below is (what PyMuPDF wrote, what was actually typed).
+_TOUNICODE_FIXES = {
+    "00AD": "002D",   # soft hyphen        -> hyphen-minus
+    "00A0": "0020",   # no-break space     -> space
+    "037E": "003B",   # Greek question mark-> semicolon
+}
+_HEXGRP = re.compile(rb"<([0-9A-Fa-f]+)>")
+
+
+def _fix_cmap_line(line: bytes) -> bytes:
+    """Rewrite the destination of one bfchar or bfrange entry.
+
+    Ghostscript writes the map as bfRANGE triples, `<src><src><dst>`, not as
+    bfchar pairs, which is why an earlier pair-only regex silently changed
+    nothing. Working a line at a time makes the destination unambiguous: it is
+    always the LAST bracket group, whether the line has two groups or three.
+    """
+    groups = _HEXGRP.findall(line)
+    if len(groups) not in (2, 3):
+        return line
+    dst = groups[-1].decode().upper()
+    if dst not in _TOUNICODE_FIXES:
+        return line
+    head, _, _tail = line.rpartition(b"<" + groups[-1] + b">")
+    return head + b"<" + _TOUNICODE_FIXES[dst].encode() + b">" + _tail
+
+
+def repair_text_layer(path) -> int:
+    """Rewrite ToUnicode CMaps so the extracted text matches the printed text.
+
+    Only the destination side of each bfchar pair is touched, never the source
+    glyph code, so a glyph that happens to be numbered 00AD is left alone.
+    Returns the number of substitutions made.
+    """
+    try:
+        import pymupdf
+    except Exception:
+        return 0
+    fixed = 0
+    try:
+        doc = pymupdf.open(str(path))
+    except Exception:
+        return 0
+    try:
+        for xref in range(1, doc.xref_length()):
+            try:
+                if not doc.xref_is_stream(xref):
+                    continue
+                raw = doc.xref_stream(xref)
+            except Exception:
+                continue
+            if not raw or (b"beginbfchar" not in raw and b"beginbfrange" not in raw):
+                continue
+            lines = raw.split(b"\n")
+            out = []
+            for line in lines:
+                new_line = _fix_cmap_line(line)
+                if new_line != line:
+                    fixed += 1
+                out.append(new_line)
+            new = b"\n".join(out)
+            if new != raw:
+                doc.update_stream(xref, new)
+        if fixed:
+            doc.saveIncr()
+    except Exception:
+        return fixed
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return fixed
+
+
+def _assert_fonts_clean(path):
+    """Refuse to hand back a PDF carrying the defect finalise exists to remove.
+
+    Checking the OUTPUT rather than checking whether ghostscript is installed:
+    that way this fires only when there is a real defect, so a box that produces
+    good PDFs by some other route is never broken by it, and a box that quietly
+    lost gs cannot ship a filing that the office will bounce.
+    """
+    try:
+        import pymupdf
+    except Exception:
+        return
+    bad = []
+    try:
+        with pymupdf.open(str(path)) as doc:
+            for pno in range(doc.page_count):
+                for font in doc.get_page_fonts(pno):
+                    xref, ext, basefont = font[0], font[1], font[3]
+                    if not xref or ext in ("n/a", ""):
+                        bad.append("%s (not embedded)" % basefont)
+                    elif " " in basefont or "#20" in basefont:
+                        bad.append("%s (space in the BaseFont name)" % basefont)
+    except Exception:
+        return
+    if bad:
+        raise FormError(
+            "%s would be rejected for its fonts: %s. %s"
+            % (Path(path).name, "; ".join(sorted(set(bad))),
+               "ghostscript is not installed, so the re-distil that fixes this was skipped: "
+               "apt install ghostscript" if not shutil.which("gs")
+               else "re-distil with gs -dSubsetFonts=true"))
 
 
 def render(kind: str, out_path, text_values: dict, checks=(), font_size: float = 10.0,

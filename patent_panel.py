@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 import browser_live
 import docsign
+import ep_obs_routes
 import patent_forms
 import patent_intake as intake
 import patent_obs_routes
@@ -79,6 +80,9 @@ ws_router = APIRouter(prefix="/patents", tags=["patents"])
 # Third-party observations (37 CFR 1.290) are their own pipeline but the same
 # prefix and the same guard, so they share the page, the browser and the live view.
 router.include_router(patent_obs_routes.router)
+# Art. 115 EPC observations at the EPO. Same page, same guard, same live view;
+# a different office, no fee, and its own form. See ep_obs_routes.
+router.include_router(ep_obs_routes.router)
 
 MAX_UPLOAD = 60 * 1024 * 1024
 _BROWSERS: dict = {}          # port -> launch info
