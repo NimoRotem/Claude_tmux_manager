@@ -13,6 +13,8 @@ import re
 import secrets
 import shlex
 import signal
+import socket
+import sqlite3
 import sys
 import shutil
 import subprocess
@@ -25365,6 +25367,7 @@ async function revealApiKey(id){
   }catch(e){ alert('Failed: '+e.message); }
 }
 function hideApiKey(id){ delete _apiRevealed[id]; renderApisAdmin(); }
+
 async function copyText(id){
   const t = _apiRevealed[id]; if(t===undefined) return;
   try{ await navigator.clipboard.writeText(t); }catch(e){
