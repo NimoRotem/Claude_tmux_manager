@@ -879,13 +879,19 @@ def _load_simple_watchdog_disabled():
 #   full  — everything in "basic" PLUS the autopilot watchdog that composes and
 #           types a "keep going" message when Claude pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
-# New sessions default to "full": a session that stops half-done and waits for a
-# user who is away is the failure this dashboard exists to prevent, and "basic"
-# left the composing watchdog dormant on every session nobody had toggled by
-# hand. The in-session Stop hook (~/.claude/hooks/keep_going.py) catches the
-# common case first; this catches what survives it. Persisted per session.
+# New sessions default to "basic", and that is deliberate. Do not flip it to
+# "full" to stop sessions handing back half-done: the Stop hook
+# (~/.claude/hooks/keep_going.py) already does that, deterministically, in
+# process, with the whole transcript, and with a fixed refusal text that cannot
+# invent a task. The autopilot instead composes a free-form instruction from a
+# screenshot of the pane, so it cannot tell a session stalling on an absent user
+# from one legitimately handing back a decision only a human can make. Flipping
+# the default was tried on 2026-09-01 and within the hour the autopilot read a
+# finished report that ended "the decision waiting for you is direction" and
+# typed a new task into that session. Overriding a legitimate hand-back is the
+# reason "full" is opt-in per session rather than the default.
 AUTOPUSH_MODES = ("off", "basic", "full")
-AUTOPUSH_DEFAULT = "full"
+AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
 

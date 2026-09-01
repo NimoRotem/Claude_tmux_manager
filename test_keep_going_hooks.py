@@ -169,6 +169,21 @@ def test_admin_config_dir_is_untouched_by_the_member_bootstrap(tmp_path, monkeyp
     assert not (home / ".claude" / "settings.json").exists()
 
 
+def test_autopush_default_stays_basic():
+    """Pins the decision, because the tempting change is to flip it.
+
+    "full" lets the autopilot compose a free-form instruction from a screenshot,
+    which cannot distinguish a session stalling on an absent user from one
+    legitimately handing back a human-only decision. The Stop hook covers the
+    stalling case deterministically, so "full" stays opt-in per session. If you
+    are here because this test failed, read the comment above AUTOPUSH_DEFAULT.
+    """
+    from app import AUTOPUSH_DEFAULT, AUTOPUSH_MODES
+
+    assert AUTOPUSH_DEFAULT == "basic"
+    assert set(AUTOPUSH_MODES) == {"off", "basic", "full"}
+
+
 def test_canonical_hook_paths_point_at_the_real_files():
     """Guards the deployed install: these are what member dirs are pointed at."""
     assert KEEP_GOING_HOOK.name == "keep_going.py"
