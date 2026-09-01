@@ -98,7 +98,7 @@ DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
 # Reasoning effort every new session launches on, exported as
 # CLAUDE_CODE_EFFORT_LEVEL by _claude_launch_env_prefix(). Sessions can still be
 # switched individually from the header dropdown, which runs /effort.
-DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "high")
+DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "xhigh")
 
 # --- Model catalog (session header dropdown) --------------------------------
 # The models offered in the per-session dropdown. Seeded with the current
@@ -114,6 +114,8 @@ _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
 _SEED_MODEL_CATALOG = [
     ["claude-opus-5[1m]", "Opus 5 · 1M"],
     ["claude-opus-5", "Opus 5"],
+    ["claude-fable-5-1[1m]", "Fable 5.1 · 1M"],
+    ["claude-fable-5-1", "Fable 5.1"],
     ["claude-sonnet-5[1m]", "Sonnet 5 · 1M"],
     ["claude-sonnet-5", "Sonnet 5"],
     ["claude-opus-4-8[1m]", "Opus 4.8 · 1M"],
@@ -195,6 +197,26 @@ def _merge_new_models(catalog: list, api_ids: list) -> list:
     return new_rows + catalog
 
 
+def _merge_seed_rows(rows: list) -> list:
+    """Fold any seed row the persisted catalog lacks into it, at the seed's
+    position relative to its neighbours. A deploy that adds a model to
+    _SEED_MODEL_CATALOG (Fable 5.1) must reach a box whose models.json was
+    written before that row existed; without this the persisted file wins and
+    the new model never shows in the dropdown."""
+    present = {r[0] for r in rows}
+    out = list(rows)
+    prev = None
+    for seed_id, label in _SEED_MODEL_CATALOG:
+        if seed_id not in present:
+            at = 0
+            if prev is not None:
+                at = next((i for i, r in enumerate(out) if r[0] == prev), -1) + 1
+            out.insert(at, [seed_id, label])
+            present.add(seed_id)
+        prev = seed_id
+    return out
+
+
 def _load_model_catalog() -> list:
     """Load the persisted catalog, or seed it. Always returns a non-empty list."""
     try:
@@ -203,7 +225,7 @@ def _load_model_catalog() -> list:
             rows = data.get("models") if isinstance(data, dict) else data
             rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
             if rows:
-                return rows
+                return _merge_seed_rows(rows)
     except Exception:
         logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
     return [list(r) for r in _SEED_MODEL_CATALOG]
@@ -22497,6 +22519,8 @@ function formatModelName(model){
 let MODEL_CHOICES=[
   ['claude-opus-5[1m]','Opus 5 · 1M'],
   ['claude-opus-5','Opus 5'],
+  ['claude-fable-5-1[1m]','Fable 5.1 · 1M'],
+  ['claude-fable-5-1','Fable 5.1'],
   ['claude-sonnet-5[1m]','Sonnet 5 · 1M'],
   ['claude-sonnet-5','Sonnet 5'],
   ['claude-opus-4-8[1m]','Opus 4.8 · 1M'],
