@@ -16654,17 +16654,33 @@ def _creds_plan(config_dir: str = "") -> str:
         return "Claude"
 
 
-def _session_claude_env(session_name: str) -> dict:
-    """Environment of the `claude` process running in a session's first pane."""
+_session_claude_proc_cache: Dict[str, dict] = {}
+_CLAUDE_PROC_TTL = 60
+
+
+def _session_claude_proc(session_name: str) -> dict:
+    """`{"cmdline": …, "env": {…}}` of the `claude` process in a session's first
+    pane. Cached — it costs two subprocess calls and only changes on a restart.
+
+    The command line is read as well as the environment because Claude Code's
+    1M-context tier is a `--model …[1m]` LAUNCH FLAG: the transcript records the
+    plain model id, so argv is the only place the wide window is written down."""
+    now = time.time()
+    cached = _session_claude_proc_cache.get(session_name)
+    if cached and now - cached["ts"] < _CLAUDE_PROC_TTL:
+        return cached["data"]
+    data = {"cmdline": "", "env": {}}
     try:
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
             capture_output=True, text=True, timeout=5).stdout.split()
     except Exception:
-        return {}
+        out = []
     pids = [p for p in out if p.isdigit()]
     # The pane's own pid is a shell; `claude` is a descendant of it.
     for pid in pids:
+        if data["env"]:
+            break
         try:
             kids = subprocess.run(["pgrep", "-P", pid], capture_output=True,
                                   text=True, timeout=5).stdout.split()
@@ -16672,8 +16688,9 @@ def _session_claude_env(session_name: str) -> dict:
             kids = []
         for cand in [*kids, pid]:
             try:
-                if "claude" not in Path(f"/proc/{cand}/cmdline").read_bytes().decode(
-                        "utf-8", "replace"):
+                cmdline = Path(f"/proc/{cand}/cmdline").read_bytes().decode(
+                    "utf-8", "replace")
+                if "claude" not in cmdline:
                     continue
                 raw = Path(f"/proc/{cand}/environ").read_bytes().decode("utf-8", "replace")
             except Exception:
@@ -16683,8 +16700,15 @@ def _session_claude_env(session_name: str) -> dict:
                 k, _, v = item.partition("=")
                 if k:
                     env[k] = v
-            return env
-    return {}
+            data = {"cmdline": " ".join(cmdline.split("\0")).strip(), "env": env}
+            break
+    _session_claude_proc_cache[session_name] = {"data": data, "ts": now}
+    return data
+
+
+def _session_claude_env(session_name: str) -> dict:
+    """Environment of the `claude` process running in a session's first pane."""
+    return _session_claude_proc(session_name)["env"]
 
 
 def _session_auth_fields(session_name: str) -> dict:
@@ -16719,16 +16743,24 @@ def _session_auth_fields(session_name: str) -> dict:
 
 
 def _session_model_fields(session_name: str) -> dict:
-    """`model`/`effort` plus their pending markers, for API payloads. A pending
-    marker clears once the transcript confirms the switch, or after 15 min
-    (request abandoned)."""
+    """`model`/`effort` plus their pending markers, the context the last turn
+    actually carried and when that turn ended — for API payloads.
+
+    A pending marker clears once the session confirms the switch, or after
+    15 min (request abandoned)."""
     detected = _detect_session_model_effort(session_name)
     model, effort = detected.get("model", ""), detected.get("effort", "")
+    # The reported id carries the `[1m]` suffix when the session was launched on
+    # the wide-context tier, so the badge reads "Opus 5 · 1M" and the dropdown
+    # ticks the row the session is actually on. Comparisons against a REQUESTED
+    # id therefore have to drop the suffix from both sides.
+    model_base = model.split("[", 1)[0]
 
     pend = _session_model_pending.get(session_name)
     if pend:
         base = pend.get("model", "").split("[", 1)[0]
-        confirmed = bool(model and base and (model == base or model.startswith(base + "-")))
+        confirmed = bool(model_base and base
+                         and (model_base == base or model_base.startswith(base + "-")))
         if confirmed or time.time() - pend.get("ts", 0) > 900:
             _session_model_pending.pop(session_name, None)
             pend = None
@@ -16749,7 +16781,18 @@ def _session_model_fields(session_name: str) -> dict:
         # the transcript to read, so fall back to what it was launched with.
         "effort": effort or DEFAULT_EFFORT,
         "effort_detected": bool(effort),
+        # Where the shown value came from: 'pane' (a /effort the session itself
+        # confirmed), 'transcript' (the level the last reply ran at), 'launch'
+        # (the --effort it started on) or 'default' (nothing to read — a guess).
+        "effort_source": detected.get("effort_source", ""),
         "effort_pending": (epend or {}).get("effort", ""),
+        # Prompt size of the last reply, its window, when it landed, and which
+        # cache TTL the session is buying. The bar under the terminal turns
+        # these into "ctx 47k · 5%" and "ended 4m ago".
+        "context_tokens": int(detected.get("context_tokens", 0) or 0),
+        "context_limit": int(detected.get("context_limit", 0) or 0),
+        "cache_ttl": int(detected.get("cache_ttl", 0) or 0),
+        "last_turn_end": float(detected.get("last_turn_end", 0) or 0),
     }
 
 
@@ -16814,7 +16857,16 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
             # Clear the floor AND beat the field. A score two transcripts both
             # reach says the fragments were not distinctive, and picking one of
             # them anyway is how a guess gets presented as a fact.
-            if best is not None and best_score >= 2 and best_score > runner_up:
+            #
+            # One match against a field of ZERO counts. Fragments are runs of at
+            # least five words and 24 characters; one of those landing in
+            # exactly one transcript out of a dozen and in none of the others is
+            # not a coincidence. Holding out for two was rejecting the correct
+            # file on a live session (measured: 1 against eleven 0s), which
+            # dropped it back to "newest in the directory" and let a neighbour's
+            # model, effort and token counts be shown as this session's.
+            decisive = best_score >= 2 or (best_score == 1 and runner_up == 0)
+            if best is not None and decisive and best_score > runner_up:
                 resolved, confident = best, True
     except Exception:
         logger.debug("Transcript disambiguation failed for '%s'", session_name,
@@ -16908,59 +16960,200 @@ def _transcript_match_text(path: str) -> str:
     return text
 
 
-def _detect_session_model_effort(session_name: str) -> dict:
-    """Read model + effort out of this session's transcript in one pass.
+# Context windows. The 1M tier is a launch flag, not something the transcript
+# records, so the wide window is read off argv and then self-heals: a prompt
+# measured above the standard window proves the session is on the wide one.
+_CTX_WINDOW_STD = 200_000
+_CTX_WINDOW_1M = 1_000_000
+# What a `/effort` or `/model` prints into the pane the moment it takes effect.
+# Anchored on the CLI's own result elbow: an agent that merely PRINTS the phrase
+# (grepping this very file will) must not be read as having switched.
+_PANE_EFFORT_RE = re.compile(r"⎿\s*Set effort level to ([a-z]+)", re.I)
+_PANE_MODEL_RE = re.compile(r"⎿\s*Set model to\s+([^\n]+)", re.I)
+_MODEL_1M_RE = re.compile(r"\[1m\]|\b1m context\b", re.I)
 
-    Both live on `type: "assistant"` entries: `model` inside the message (or at
-    the top level on older writes), `effort` at the top level. They are read
-    together so the tail is only decoded once."""
+
+def _iso_epoch(ts: str) -> float:
+    """Epoch seconds from a transcript's ISO-8601 `timestamp`, 0 if unreadable."""
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _scan_assistant_tail(lines: list) -> dict:
+    """Walk transcript lines newest-first and pull the facts off the most recent
+    MAIN-THREAD assistant entry.
+
+    Sub-agent turns (`isSidechain`) are written into the same file and run with
+    their own model, effort and context window, so "the last assistant entry"
+    was reporting a sub-agent's settings as the session's. They are skipped.
+
+    `ctx` is the whole prompt the reply carried — fresh input plus both cache
+    buckets — which is what "context used" means. `ttl` is which cache the
+    session is buying, read from the usage record rather than assumed: a 1h
+    entry means the transcript is still warm an hour later, a 5m one means it
+    is cold after five minutes."""
+    out = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0}
+    seen = 0
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        seen += 1
+        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+        if not isinstance(msg, dict):
+            msg = d
+        if not out["model"]:
+            out["model"] = msg.get("model") or d.get("model") or ""
+        if not out["effort"] and isinstance(d.get("effort"), str) and d["effort"]:
+            out["effort"] = d["effort"]
+        if not out["ts"]:
+            out["ts"] = _iso_epoch(d.get("timestamp"))
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        if usage:
+            if not out["ctx"]:
+                out["ctx"] = (int(usage.get("input_tokens") or 0)
+                              + int(usage.get("cache_read_input_tokens") or 0)
+                              + int(usage.get("cache_creation_input_tokens") or 0))
+            if not out["ttl"]:
+                # A turn that only READ from cache creates nothing, so the TTL
+                # is only stated on turns that wrote — keep looking back until
+                # one of the buckets is non-zero.
+                cc = usage.get("cache_creation") if isinstance(
+                    usage.get("cache_creation"), dict) else {}
+                h1 = int(cc.get("ephemeral_1h_input_tokens") or 0)
+                m5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
+                if h1 or m5:
+                    out["ttl"] = 3600 if h1 >= m5 else 300
+        if out["model"] and out["effort"] and out["ctx"] and out["ttl"]:
+            break
+        if seen >= 60:
+            break
+    out["n"] = seen
+    return out
+
+
+def _last_assistant_facts(path: str) -> dict:
+    """Model, effort, context size, cache TTL and end time of a transcript's
+    newest main-thread reply.
+
+    The window GROWS rather than sitting at a fixed 32KB. One tool result can be
+    hundreds of KB, so a fixed tail regularly held no complete assistant record
+    at all: the read came back empty, the caller substituted the configured
+    default, and a session running at one effort was labelled with another."""
+    empty = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0}
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return empty
+    out = empty
+    for budget in (65_536, 512_000, 4_000_000):
+        out = _scan_assistant_tail(_read_jsonl_tail(path, budget))
+        # Stop as soon as the answer is complete, the file is exhausted, or the
+        # window already held several replies — a field still missing after five
+        # of them (an older CLI that never wrote `effort`) is not going to turn
+        # up in an older one, and re-reading 4MB every 30s to find that out is
+        # how a detail nobody looks at becomes the most expensive poll on the box.
+        if (out["model"] and out["effort"] and out["ctx"]) or out["n"] >= 5 or budget >= size:
+            break
+    return out
+
+
+def _pane_model_effort(session_name: str) -> dict:
+    """Model and effort switches the SESSION ITSELF confirmed, read off its pane.
+
+    `/effort high` prints "Set effort level to high" the moment it takes, but
+    the transcript only records the new level on the NEXT reply. In the gap the
+    badge showed the previous turn's value — the "dropdown says max, the session
+    is on high" bug, and it lasts as long as the session is idle, which is
+    exactly when someone looks. The pane line is session-local and unambiguous,
+    so where it disagrees with the transcript it is the newer of the two."""
+    try:
+        pane = capture_pane_recent(session_name, 600)
+    except Exception:
+        return {}
+    out = {}
+    hits = _PANE_EFFORT_RE.findall(pane)
+    if hits:
+        level = hits[-1].strip().lower()
+        if level in ALLOWED_SESSION_EFFORTS:
+            out["effort"] = level
+    mhits = _PANE_MODEL_RE.findall(pane)
+    if mhits:
+        out["model_line"] = mhits[-1].strip()
+    return out
+
+
+def _detect_session_model_effort(session_name: str) -> dict:
+    """What this session is actually running: model, reasoning effort, the
+    context its last reply carried, and when that reply landed.
+
+    Read together so the transcript tail is only decoded once, then corrected
+    against the pane, which knows about a switch a turn earlier than the
+    transcript does."""
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
         return cached
-    blank = {"model": "", "effort": "", "ts": now}
     files = _find_session_jsonl_files(session_name)
-    if not files:
-        _session_model_cache[session_name] = blank
-        return blank
-    newest = _pick_session_transcript_file(session_name, files)
-    if not newest:
-        _session_model_cache[session_name] = blank
-        return blank
-    # Was the file actually identified as this session's, or is it just the
-    # most recent one in a shared project dir? The caller marks the badge so a
-    # guess is never shown as fact.
-    sure = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
-                or len(files) == 1)
-    model, effort = "", ""
-    try:
-        with open(newest, "rb") as f:
-            # Read last ~32KB to find recent model entries
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 32768))
-            tail = f.read().decode("utf-8", errors="replace")
-        for line in reversed(tail.strip().split("\n")):
-            try:
-                d = json.loads(line)
-                if d.get("type") != "assistant":
-                    continue
-                if not effort:
-                    e = d.get("effort", "")
-                    if isinstance(e, str) and e:
-                        effort = e
-                if not model:
-                    msg = d if "model" in d else d.get("message", {})
-                    m = msg.get("model", "")
-                    if m:
-                        model = m
-                if model and effort:
-                    break
-            except (json.JSONDecodeError, KeyError):
-                continue
-    except Exception:
-        logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
-    out = {"model": model, "effort": effort, "ts": now, "sure": sure}
+    newest = _pick_session_transcript_file(session_name, files) if files else None
+    # No transcript yet is not an ambiguous read — it is nothing to read yet, and
+    # argv still says what the session was launched on. `sure` stays true so a
+    # brand-new session is not badged as a guess.
+    sure = True
+    facts = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0}
+    if newest:
+        # Was the file actually identified as this session's, or is it just the
+        # most recent one in a shared project dir? The caller marks the badge so
+        # a guess is never shown as fact.
+        sure = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
+                    or len([f for f in files
+                            if not os.path.basename(f).startswith("agent-")]) == 1)
+        try:
+            facts = _last_assistant_facts(newest)
+        except Exception:
+            logger.debug("Failed to read transcript facts for '%s'", session_name,
+                         exc_info=True)
+    model, effort = facts["model"], facts["effort"]
+    source = "transcript" if effort else ""
+
+    proc = _session_claude_proc(session_name)
+    argv = proc.get("cmdline", "")
+    pane = _pane_model_effort(session_name)
+    # A pane-confirmed /effort outranks the transcript: it happened after the
+    # reply the transcript's level belongs to.
+    if pane.get("effort") and pane["effort"] != effort:
+        effort, source = pane["effort"], "pane"
+    if not effort:
+        launched = _flag_value(argv, "effort")
+        if launched and launched.lower() in ALLOWED_SESSION_EFFORTS:
+            effort, source = launched.lower(), "launch"
+    if not effort:
+        source = "default"
+
+    # The wide-context tier. argv is where it is written down, but a /model
+    # since launch overrides it in BOTH directions, so a pane line wins outright
+    # when there is one. A prompt measured past the standard window settles it
+    # either way.
+    model_line = pane.get("model_line") or ""
+    wide = bool(_MODEL_1M_RE.search(model_line) if model_line
+                else "[1m]" in argv.lower())
+    wide = wide or facts["ctx"] > _CTX_WINDOW_STD
+    if model and wide and not model.endswith("[1m]"):
+        model += "[1m]"
+    limit = (_CTX_WINDOW_1M if wide else _CTX_WINDOW_STD) if model else 0
+
+    out = {"model": model, "effort": effort, "ts": now, "sure": sure,
+           "effort_source": source,
+           "context_tokens": facts["ctx"], "context_limit": limit,
+           "cache_ttl": facts["ttl"], "last_turn_end": facts["ts"]}
     _session_model_cache[session_name] = out
     return out
 
@@ -19101,6 +19294,10 @@ body.member-admin .more-member-only{display:none}
 .raw-frozen-pill:hover{background:#4d3806;border-color:#d29922}
 .raw-output.frozen{border-color:#d2992255}
 .key-btn.key-freeze.active{background:#3d2c05;border-color:#d2992288;color:#e3b341}
+/* Navigation, not a keystroke sent to the agent — tinted to match the highlight
+   on your own messages so the pair reads as one idea. */
+.key-btn.key-jump{color:#79c0ff;border-color:#1f6feb55}
+.key-btn.key-jump:hover{background:#1f6feb22;border-color:#1f6feb99;color:#a5d6ff}
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
@@ -19129,6 +19326,20 @@ body.member-admin .more-member-only{display:none}
    reflows to whatever width there is, with a hanging indent so nesting reads. */
 .raw-output.flow{font-size:13.5px}
 .raw-output.flow .tl{padding-left:2.2em;text-indent:-2.2em}
+/* Your own words. The pane echoes what you send back at the agent's own indent
+   and in the agent's own colour, so on a long scrollback the one thing you are
+   hunting for is the one thing you cannot see. A tinted block with a rule down
+   its left edge; the rule sits in the terminal's own padding so no character
+   moves sideways. */
+.raw-output .tl-you{display:block;margin-left:-7px;padding-left:5px;border-left:2px solid #58a6ff;background:#1f6feb1f;color:#d8e8ff;border-radius:0 2px 2px 0}
+/* Flow mode hangs every line on a -2.2em indent. The block box would take the
+   parent's padding a second time, so it is pulled back out and the hanging
+   indent re-applied here — otherwise your own words sit two columns further in
+   than the agent's and the two stop lining up. */
+.raw-output.flow .tl-you{margin-left:-2.3em;padding-left:2.4em;text-indent:-2.2em}
+/* Where a jump landed. Fades on its own so nothing is left highlighted. */
+.raw-output .tl-you.jumped{background:#1f6feb4d;border-left-color:#79c0ff;animation:tl-you-flash 1.6s ease-out}
+@keyframes tl-you-flash{0%,20%{background:#1f6feb80}100%{background:#1f6feb1f}}
 .raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#484f58;border-radius:6px;border:2px solid #0d1117}
@@ -19167,6 +19378,21 @@ body.member-admin .more-member-only{display:none}
 .tl-sep{color:#30363d}
 .tl-spacer{flex:1}
 .tl-note{color:#6e7681;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Silence between turns, and how much of the window the last one filled. Both
+   are facts about what the NEXT message will cost: while the prompt cache is
+   still warm the whole transcript is re-read at a fraction of the price, and a
+   context near the top of the window is about to be compacted. Each carries its
+   own separator so an empty one leaves no orphaned dot. */
+.tl-since,.tl-ctx{white-space:nowrap;font-variant-numeric:tabular-nums;color:#6e7681}
+.term-live .tl-tok:not(:empty)::before,
+.term-live .tl-since:not(:empty)::before,
+.term-live .tl-ctx:not(:empty)::before{content:'· ';color:#30363d}
+.tl-since.warm{color:#3fb950}
+.tl-since.cooling{color:#d29922}
+.tl-since.cold{color:#8b949e}
+.tl-ctx.high{color:#d29922}
+.tl-ctx.crit{color:#f85149;font-weight:600}
+.tl-ctx.unsure,.tl-since.unsure{opacity:.55;font-style:italic}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -21091,6 +21317,41 @@ function _setRawScroll(el,target){
 // crawl forward a line at a time (which would repaint everything, every poll).
 const RAW_MAX_LINES=5000;
 
+// ── Telling your own words apart from the agent's ───────────────────────────
+// Claude Code echoes every message you send straight back into the pane behind a
+// `❯`, with its continuation rows indented two columns, and from there on it
+// looks exactly like everything else on screen. Scrolling back through an hour
+// of tool output, those echoes are the only landmarks anyone is actually looking
+// for. Marking them buys two things: a colour, and something for "jump to my
+// last message" to aim at.
+const _USER_ECHO_RE=/^ {0,3}[❯›»]\s*\S/;
+// An indented row opening with one of these is the CLI answering, not the tail
+// of what you typed. It matters most for a slash command, whose `⎿` result is
+// drawn at the same indent as a continuation row would be.
+const _NOT_USER_CONT_RE=/^\s*[⎿└●⏺•✻✽✢✳✴✱✲✵✶✷✸✹✺◐◓◑◒│┃╭╰╮╯├┤─━═]/;
+// 0 = not yours, 1 = a continuation row, 2 = the `❯` row the block opens with.
+function _markUserRows(rows){
+  const flags=new Array(rows.length).fill(0);
+  let inUser=false;
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    if(_USER_ECHO_RE.test(row)){flags[i]=2;inUser=true;continue;}
+    if(!inUser)continue;
+    if(row.trim()===''){
+      // A blank row belongs to the message only if the message carries on under
+      // it — a paragraph break inside what you typed. Otherwise it is the gap
+      // before the reply starts.
+      let j=i+1;
+      while(j<rows.length&&rows[j].trim()==='')j++;
+      if(j<rows.length&&/^ {2,}\S/.test(rows[j])&&!_NOT_USER_CONT_RE.test(rows[j])){flags[i]=1;continue;}
+      inUser=false;continue;
+    }
+    if(/^ {2,}\S/.test(row)&&!_NOT_USER_CONT_RE.test(row)){flags[i]=1;continue;}
+    inUser=false;
+  }
+  return flags;
+}
+
 function renderRawText(name,force){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
@@ -21129,6 +21390,8 @@ function renderRawText(name,force){
   }
   if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
   let htmlLines;
+  const prevUserCount=(st.userRows||[]).length;
+  st.userRows=[];
   if(!rows.length||!rows.join('').trim()){
     htmlLines=(st.fullText||'').trim()
       ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
@@ -21138,7 +21401,19 @@ function renderRawText(name,force){
     // split across rows still works; neither renderer ever emits a tag that
     // straddles a newline, so splitting the result back per line is safe.
     htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+    // Your own words, wrapped so they can be coloured and jumped to. The flags
+    // are computed on the FINAL rows, after filtering and unwrapping, so the
+    // indices line up with the divs that get painted.
+    const mine=_markUserRows(rows);
+    for(let i=0;i<htmlLines.length;i++){
+      if(!mine[i])continue;
+      if(mine[i]===2)st.userRows.push(i);   // the ❯ row: where a jump lands
+      htmlLines[i]='<span class="tl-you">'+htmlLines[i]+'</span>';
+    }
   }
+  // A new message of yours (or the scrollback cap dropping an old one) moves
+  // every position in that list, so the walk starts again from the newest.
+  if(st.userRows.length!==prevUserCount)st._jumpAt=undefined;
 
   const prev=st.painted||[];
   const d=_lineDiff(prev,htmlLines);
@@ -21227,12 +21502,89 @@ function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
     if(!selectedSession)return;
+    // The silence counter has to keep running while the session is IDLE — being
+    // idle is the whole point of it — so it is updated on every tick regardless
+    // of the busy state. It only rewrites the span when the rendered text
+    // actually changes, which past a minute is once a minute.
+    _paintIdleSince(selectedSession);
     const st=rawState[selectedSession];
     if(!st||!st.live||!st.live.seen||!_sessionBusy(selectedSession))return;
     const e=document.getElementById('tl-time-'+selectedSession);
     const secs=_liveSeconds(st,true);
     if(e&&secs!==null)e.textContent=_fmtElapsed(secs);
   },1000);
+}
+// Coarse elapsed time, for a counter that is read rather than watched: seconds
+// under a minute, then whole minutes, then hours. Deliberately not _fmtElapsed —
+// a ticking "4m 07s" of silence redraws sixty times a minute to say nothing.
+function _fmtAgo(sec){
+  sec=Math.max(0,Math.floor(sec||0));
+  if(sec<60)return sec+'s';
+  if(sec<3600)return Math.floor(sec/60)+'m';
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);
+  return m?h+'h '+m+'m':h+'h';
+}
+function _fmtTokens(n){
+  n=Math.max(0,Math.round(n||0));
+  if(n>=1000000)return (n/1000000).toFixed(n>=10000000?0:1).replace(/\.0$/,'')+'M';
+  if(n>=1000)return (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k';
+  return String(n);
+}
+// How long the session has been quiet, and what that costs. The prompt cache is
+// what makes a long transcript cheap to carry into the next message: while it is
+// warm the whole thing is re-read at a fraction of the price, and once it lapses
+// the next message pays to write it all again. The TTL is not assumed — it is
+// read off the last reply's own usage record (see _scan_assistant_tail).
+function _paintIdleSince(name){
+  const el=document.getElementById('tl-since-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const end=s.last_turn_end||0;
+  if(!end||_sessionBusy(name)){
+    if(el.textContent!==''){el.textContent='';el.className='tl-since';el.title='';}
+    return;
+  }
+  const ago=Date.now()/1000-end;
+  const ttl=s.cache_ttl||0;
+  let cls='tl-since',hint='Silence since the last reply landed.';
+  if(ttl){
+    const warm=ago<ttl*0.8, cooling=ago<ttl;
+    cls+=warm?' warm':(cooling?' cooling':' cold');
+    const ttlTxt=ttl>=3600?'1h':Math.round(ttl/60)+'m';
+    hint='Silence since the last reply landed. This session buys a '+ttlTxt+
+         ' prompt cache, so the transcript is '+
+         (cooling?'still warm, so the next message re-reads it at cache-read price.'
+                 :'cold, so the next message pays to write the whole prompt again.');
+  }
+  if(s.detect_sure===false)cls+=' unsure';
+  const txt='idle '+_fmtAgo(ago)+(ttl&&ago>=ttl?' · cache cold':'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+// Context the last reply carried, against the window it has. Both numbers come
+// off that reply's usage record: fresh input plus both cache buckets is the
+// whole prompt the model read.
+function _paintContext(name){
+  const el=document.getElementById('tl-ctx-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const tok=s.context_tokens||0,lim=s.context_limit||0;
+  if(!tok){
+    if(el.textContent!==''){el.textContent='';el.className='tl-ctx';el.title='';}
+    return;
+  }
+  const pct=lim?Math.round(tok/lim*100):0;
+  const txt='ctx '+_fmtTokens(tok)+(lim?' · '+pct+'%':'');
+  let cls='tl-ctx';
+  if(lim&&pct>=90)cls+=' crit';else if(lim&&pct>=75)cls+=' high';
+  if(s.detect_sure===false)cls+=' unsure';
+  const hint=tok.toLocaleString()+' tokens of prompt on the last reply'+
+    (lim?' out of a '+_fmtTokens(lim)+' window ('+pct+'%).':'.')+
+    (s.detect_sure===false?' Best guess: this session shares a working directory with others.':'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
 }
 function updateLiveBar(name){
   const bar=document.getElementById('term-live-'+name);
@@ -21241,7 +21593,12 @@ function updateLiveBar(name){
   const st=getRawState(name);
   const live=st.live||{};
   const busy=_sessionBusy(name);
-  const show=busy||!!live.seen;
+  // A session that has been idle since before the page loaded has no spinner
+  // row left in its pane, so `live.seen` is false — and that is exactly when the
+  // silence counter and the context reading are worth having. The bar also
+  // shows on the strength of what the server measured off the transcript.
+  const sess=sessions.find(x=>x.name===name)||{};
+  const show=busy||!!live.seen||!!(sess.context_tokens||sess.last_turn_end);
   bar.classList.toggle('on',show);
   if(!show)return;
   bar.classList.toggle('idle',!busy);
@@ -21257,11 +21614,58 @@ function updateLiveBar(name){
   const secs=_liveSeconds(st,busy);
   set('tl-time-',secs===null?'':(busy?'':'last turn ')+_fmtElapsed(secs));
   set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
+  _paintIdleSince(name);
+  _paintContext(name);
   const note=document.getElementById('tl-note-'+name);
   if(note){
     const txt=busy&&live.esc?'Stop to interrupt':'';
     if(note.textContent!==txt)note.textContent=txt;
   }
+}
+
+// ── Jumping back to what you said ───────────────────────────────────────────
+// The instruction you gave is the thing you scroll back for, and on a long run
+// it is thousands of rows up. renderRawText already knows which lines are yours
+// (see _markUserRows) and records the index of each `❯` row, so this is a walk
+// backwards through that list rather than a search. The scroll listener sets
+// userScrolledUp off the resulting position by itself, so the next poll leaves
+// the view where it was put.
+function jumpToLastUserMessage(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  const rows=(st&&st.userRows)||[];
+  if(!rawEl||!rows.length){
+    if(statusInfoEl)statusInfoEl.textContent='Nothing of yours in this scrollback yet';
+    return;
+  }
+  // Repeat clicks step further back; from the oldest, round to the newest.
+  let at=(typeof st._jumpAt==='number')?st._jumpAt:rows.length;
+  at=at-1;
+  if(at<0)at=rows.length-1;
+  st._jumpAt=at;
+  const idx=rows[at];
+  const el=rawEl.children[idx];
+  if(!el)return;
+  _setRawScroll(rawEl,Math.max(0,el.offsetTop-10));
+  const mark=el.querySelector('.tl-you')||el;
+  mark.classList.remove('jumped');
+  void mark.offsetWidth;              // restart the flash on a repeat click
+  mark.classList.add('jumped');
+  setTimeout(()=>mark.classList.remove('jumped'),1700);
+  if(statusInfoEl){
+    statusInfoEl.textContent=rows.length>1
+      ? 'Your message '+(at+1)+' of '+rows.length+', click again to step back'
+      : 'Your last message';
+  }
+}
+function jumpToLive(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  st._jumpAt=undefined;
+  st.userScrolledUp=false;
+  _setRawScroll(rawEl,rawEl.scrollHeight);
+  if(statusInfoEl)statusInfoEl.textContent='Following the output again';
 }
 
 // ── Freeze ──────────────────────────────────────────────────────────────────
@@ -21665,12 +22069,26 @@ function openEffortMenu(name,anchor,ev){
   _effortMenuEl=menu;
   setTimeout(()=>document.addEventListener('click',_effortMenuDocClose,true),0);
 }
+// Where the level shown came from, said plainly. 'default' means nothing could
+// be read and the dashboard's own default is standing in — the one case where
+// the badge used to state a level the session was demonstrably not running at.
+function effortTip(s){
+  const src=(s&&s.effort_source)||'';
+  if(src==='default')return 'Reasoning effort. GUESS: nothing readable in this session yet, so this is the dashboard default. Click to set it.';
+  if(s&&s.detect_sure===false)return 'Reasoning effort, best guess: this session shares a working directory with others, so its transcript could not be told apart. Click to switch.';
+  if(src==='pane')return 'Reasoning effort, confirmed by this session\'s own /effort. Click to switch.';
+  if(src==='launch')return 'Reasoning effort: what this session was launched with, no reply to read yet. Click to switch.';
+  return 'Reasoning effort: the level the last reply ran at. Click to switch (runs /effort in this session).';
+}
 function _paintEffortBadge(name){
   const s=sessions.find(x=>x.name===name);
   const lbl=effortBadgeLabel(s);
+  const unsure=!!(s&&(s.detect_sure===false||s.effort_source==='default'));
   const eb=document.getElementById('effort-badge-'+name);
   if(eb){
     eb.classList.toggle('pending',!!(s&&s.effort_pending));
+    eb.classList.toggle('unsure',unsure);
+    eb.title=effortTip(s);
     eb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
   }
   const me=document.getElementById('more-effort-'+name);
@@ -21733,12 +22151,21 @@ function openModelMenu(name,anchor,ev){
   _modelMenuEl=menu;
   setTimeout(()=>document.addEventListener('click',_modelMenuDocClose,true),0);
 }
+// The unsure marker is repainted here as well as in the template. It was only
+// ever set at render time, so a badge that started out as a guess kept looking
+// like one after the session was identified — and, worse, one that turned into
+// a guess went on reading as fact.
+const UNSURE_MODEL_TIP='Claude model, best guess: this session shares a working directory with others, so its transcript could not be told apart. Click to switch.';
+const SURE_MODEL_TIP='Claude model. Click to switch (runs /model in this session).';
 function _paintModelBadge(name){
   const s=sessions.find(x=>x.name===name);
   const lbl=modelBadgeLabel(s);
+  const unsure=!!(s&&s.detect_sure===false);
   const mb=document.getElementById('model-badge-'+name);
   if(mb){
     mb.classList.toggle('pending',!!(s&&s.model_pending));
+    mb.classList.toggle('unsure',unsure);
+    mb.title=unsure?UNSURE_MODEL_TIP:SURE_MODEL_TIP;
     mb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
   }
   const mm=document.getElementById('more-model-'+name);
@@ -22225,8 +22652,8 @@ function renderDetail(){
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
-        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="model-badge-${s.name}" title="${s.detect_sure===false?'Claude model (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Claude model — click to switch (runs /model in this session)'}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
-        <span class="badge model-badge${s.effort_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="effort-badge-${s.name}" title="${s.detect_sure===false?'Reasoning effort (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Reasoning effort — click to switch (runs /effort in this session)'}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="model-badge-${s.name}" title="${esc(s.detect_sure===false?UNSURE_MODEL_TIP:SURE_MODEL_TIP)}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.effort_pending?' pending':''}${(s.detect_sure===false||s.effort_source==='default')?' unsure':''}" id="effort-badge-${s.name}" title="${esc(effortTip(s))}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <!-- The terminal line count lived here. It is a number nobody acts on, sitting
@@ -22273,7 +22700,9 @@ function renderDetail(){
         <span class="tl-dots"><i></i><i></i><i></i></span>
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
+        <span class="tl-since" id="tl-since-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
+        <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
       </div>
@@ -23519,7 +23948,22 @@ async function pollStatus(){
         const epend=st.effort_pending||'';
         if((sessions[si].effort_pending||'')!==epend){sessions[si].effort_pending=epend;effortChanged=true;}
         if(st.effort&&sessions[si].effort!==st.effort){sessions[si].effort=st.effort;effortChanged=true;}
+        if((sessions[si].effort_source||'')!==(st.effort_source||'')){
+          sessions[si].effort_source=st.effort_source||'';effortChanged=true;
+        }
+        if(sessions[si].detect_sure!==st.detect_sure){
+          sessions[si].detect_sure=st.detect_sure;effortChanged=true;
+          _paintModelBadge(st.name);
+        }
         if(effortChanged)_paintEffortBadge(st.name);
+        // Context size, the last turn's end and which cache the session buys —
+        // measured server-side off the transcript, painted into the bar under
+        // the terminal.
+        sessions[si].context_tokens=st.context_tokens||0;
+        sessions[si].context_limit=st.context_limit||0;
+        sessions[si].cache_ttl=st.cache_ttl||0;
+        sessions[si].last_turn_end=st.last_turn_end||0;
+        if(st.name===selectedSession){_paintContext(st.name);_paintIdleSince(st.name);}
         if(navChanged)renderNav();
       }
     }
@@ -24388,7 +24832,9 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
     ${tab==='raw'?`<span class="key-bar-sep"></span>
-    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
+    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>
+    <button class="key-btn key-jump" id="jump-btn-${name}" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to the last thing YOU wrote. Click again to step back through earlier messages; from the oldest it returns to the newest.">&#8613; My last message</button>
+    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>

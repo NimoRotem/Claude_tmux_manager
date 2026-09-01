@@ -639,3 +639,125 @@ def test_nav_status_includes_memory_and_admin_recovery_control():
     assert "onclick=\"recoverSessions();closeToolsMenu()\"" in html
     assert "async function recoverSessions()" in html
     assert "BASE+'/api/admin/sessions/recover'" in html
+
+
+def _assistant(effort, model, ts, ctx=(10, 20, 30), ttl_1h=0, ttl_5m=0, sidechain=False):
+    import json
+
+    return json.dumps({
+        "type": "assistant",
+        "effort": effort,
+        "isSidechain": sidechain,
+        "timestamp": ts,
+        "message": {
+            "model": model,
+            "usage": {
+                "input_tokens": ctx[0],
+                "cache_read_input_tokens": ctx[1],
+                "cache_creation_input_tokens": ctx[2],
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": ttl_1h,
+                    "ephemeral_5m_input_tokens": ttl_5m,
+                },
+            },
+        },
+    })
+
+
+def test_a_subagents_effort_is_never_read_as_the_sessions_own():
+    import app
+
+    lines = [
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ttl_1h=99),
+        # A sub-agent turn lands in the SAME transcript and runs with its own
+        # model, effort and context. Reading "the last assistant entry" made it
+        # the session's.
+        _assistant("low", "claude-haiku-4-5", "2026-09-01T00:01:00.000Z",
+                   ctx=(1, 2, 3), sidechain=True),
+    ]
+    facts = app._scan_assistant_tail(lines)
+
+    assert facts["effort"] == "high"
+    assert facts["model"] == "claude-opus-5"
+    assert facts["ctx"] == 60
+    assert facts["ttl"] == 3600
+
+
+def test_context_and_end_time_come_off_the_newest_reply():
+    import app
+
+    lines = [
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ctx=(1, 1, 1)),
+        _assistant("max", "claude-opus-5", "2026-09-01T00:05:00.000Z",
+                   ctx=(100, 200, 300), ttl_5m=7),
+    ]
+    facts = app._scan_assistant_tail(lines)
+
+    assert facts["effort"] == "max"
+    assert facts["ctx"] == 600
+    assert facts["ttl"] == 300           # a 5m cache, read rather than assumed
+    assert facts["ts"] == app._iso_epoch("2026-09-01T00:05:00.000Z")
+
+
+def test_a_transcript_tail_grows_until_it_holds_a_reply(tmp_path):
+    import app
+
+    # One enormous tool result between the newest reply and the end of the file:
+    # the old fixed 32KB window held none of the reply, so the caller fell back
+    # to the configured default and mislabelled the session.
+    p = tmp_path / "t.jsonl"
+    filler = '{"type":"user","content":"' + ("x" * 200_000) + '"}'
+    p.write_text("\n".join([
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ttl_1h=5),
+        filler,
+    ]))
+
+    facts = app._last_assistant_facts(str(p))
+
+    assert facts["effort"] == "high"
+    assert facts["model"] == "claude-opus-5"
+
+
+def test_a_printed_effort_line_is_not_a_switch(monkeypatch):
+    import app
+
+    # An agent that merely PRINTS the phrase (grepping app.py does) must not be
+    # read as having run /effort. Only the CLI's own result elbow counts.
+    monkeypatch.setattr(app, "capture_pane_recent",
+                        lambda name, lines=80: 'grep -n "set effort level to low" app.py\n')
+    assert app._pane_model_effort("s") == {}
+
+    monkeypatch.setattr(app, "capture_pane_recent", lambda name, lines=80: (
+        "  ⎿  Set effort level to high (this session only)\n"
+        "  ⎿  Set effort level to max (this session only): Maximum capability\n"))
+    # The LAST confirmation wins: it is the one that is still in force.
+    assert app._pane_model_effort("s")["effort"] == "max"
+
+
+def test_the_live_bar_carries_silence_and_context():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert 'class="tl-since" id="tl-since-${s.name}"' in html
+    assert 'class="tl-ctx" id="tl-ctx-${s.name}"' in html
+    assert "function _paintIdleSince(name)" in html
+    assert "function _paintContext(name)" in html
+    # The silence counter has to keep ticking while the session is idle.
+    assert "_paintIdleSince(selectedSession);" in html
+    # And the bar shows on server-measured facts alone, for a session that was
+    # already idle before the page loaded and has no spinner row left.
+    assert "!!(sess.context_tokens||sess.last_turn_end)" in html
+
+
+def test_your_own_words_are_marked_and_jumpable():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "function _markUserRows(rows)" in html
+    assert "function jumpToLastUserMessage(name)" in html
+    assert "function jumpToLive(name)" in html
+    assert '<span class="tl-you">' in html
+    assert ".raw-output .tl-you{" in html
+    assert 'onclick="jumpToLastUserMessage(' in html
