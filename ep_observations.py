@@ -243,6 +243,15 @@ def check(sub: dict, files=()) -> dict:
         checks.append(_c("anonymity", "Filer identified", bool(who),
                          who or "Give a name, or tick anonymous deliberately.",
                          True, "Guidelines E-VI, 3"))
+        # Found by running the real form on 2026-09-01: e-mail is REQUIRED on the
+        # EPO's Personal Details step and the send button stays dead without it.
+        # It is also the address the EPO uses to invite correction of a formal
+        # deficiency, which is the stated reason for identifying yourself at all.
+        mail = (sub.get("filer_email") or "").strip()
+        checks.append(_c("filer_email", "Filer e-mail", "@" in mail,
+                         mail or "The EPO form requires it and will not send without one. "
+                                 "It is also how they invite us to correct a formal "
+                                 "deficiency.", True, "Guidelines E-VI, 3"))
 
     # --- cited documents ---------------------------------------------------
     for n, it in enumerate(items, 1):
@@ -322,6 +331,8 @@ def build_observations(out_path, sub: dict) -> dict:
         line("Filed anonymously.", 11, gap=6)
     else:
         line("Filed by: %s" % (sub.get("filer_name") or ""), 11, gap=1)
+        if sub.get("filer_email"):
+            line(sub["filer_email"], 11, gap=1)
         if sub.get("filer_address"):
             line(sub["filer_address"], 11, gap=6)
         else:

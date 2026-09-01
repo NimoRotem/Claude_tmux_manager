@@ -78,7 +78,7 @@ def _blank() -> dict:
     return {"id": "", "created": time.time(), "number": "", "number_kind": "application",
             "title": "", "proprietor": "", "language": "en", "stage": "examination",
             "published": True, "r71_3_sent": False, "anonymous": False,
-            "filer_name": "", "filer_address": "", "grounds": [], "reasoning": "",
+            "filer_name": "", "filer_email": "", "filer_address": "", "grounds": [], "reasoning": "",
             "items": [], "files": [], "forms": [], "status": "draft"}
 
 
@@ -252,6 +252,15 @@ works while OLF 2.0 does not. Do not go to filing.epo.org for this.
    does**, and the copies are in the uploaded files.
 5. **Summary** - review, then **Preview and send**.
 
+**E-mail is a REQUIRED field** on the Personal Details step. Ours is {filer_email}.
+Without it the send button stays dead, which reads like a bug and is not one.
+
+**Uploading a file when the browser is on another host.** If the CDP port is an
+SSH tunnel to a different machine, `DOM.setFileInputFiles` with a local path
+attaches a ZERO-BYTE file and the confirm fails silently, so the observation goes
+up empty. Copy the PDF to the machine the browser is on FIRST, then point the
+input at the path THERE. Check the size the form reports back before moving on.
+
 There is a **FriendlyCaptcha** on the form. It ignores a synthetic
 `element.click()`: drive it with a trusted `Input.dispatchMouseEvent` over CDP,
 scoped to the tab. Do not use xdotool, the browser is shared and another session
@@ -381,6 +390,7 @@ async def api_epobs_submit(sub_id: str, request: Request):
         browser_line=browser_line, tpo_url=TPO_URL, anon_step=anon_step,
         number=epobs.format_number(meta.get("number") or ""),
         number_kind=meta.get("number_kind") or "application",
+        filer_email=meta.get("filer_email") or "(NOT SET, the form will not send)",
         title=meta.get("title") or "(title not recorded)",
         title_line=("\n- Title: %s" % meta["title"]) if meta.get("title") else "",
         language=epobs.LANGUAGES.get((meta.get("language") or "en").lower(), "English"),
