@@ -1279,6 +1279,12 @@ try:
     app.include_router(patent_panel.router)
     app.include_router(patent_panel.ws_router)
     logger.info("patent panel mounted at /patents")
+except ModuleNotFoundError as exc:
+    # Not installed on this host is not a fault. The panel needs pymupdf and it
+    # is only wanted on the box that actually files; the whole fleet runs one
+    # build, so every other box would otherwise log an ERROR and a traceback on
+    # every boot for a feature it was never meant to serve.
+    logger.info("patent panel not available on this host (%s); nothing else is affected", exc)
 except Exception:
     logger.exception("patent panel unavailable; the rest of the dashboard is unaffected")
 
