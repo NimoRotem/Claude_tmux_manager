@@ -282,12 +282,15 @@ async def _model_refresh_loop():
         await asyncio.sleep(3600)
 
 
-def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
-    """Build the pane launch line: force plan auth via ~/.claude/.credentials.json
+def _claude_cmd_with_flags(cmd: str, pin_model: bool = True):
+    """(command, model, effort): the pane's claude command with --model/--effort
+    added, plus whichever values ended up in play (ours or the caller's own) so
+    the launch banner can name them. The auth half of the preamble is separate,
+    in _claude_launch_env_prefix: force plan auth via ~/.claude/.credentials.json
     (a stray ANTHROPIC_API_KEY would bill the metered API; a CLAUDE_CODE_OAUTH_TOKEN
-    env var makes claude brand itself "Claude API" even on the plan token) and pin
-    an explicit --model unless the command already carries one or the caller opts
-    out (profiles that pin their own model via settings.json)."""
+    env var makes claude brand itself "Claude API" even on the plan token). The
+    model is pinned unless the command already carries one or the caller opts out
+    (profiles that pin their own model via settings.json)."""
     out = cmd
     if pin_model and DEFAULT_MODEL and "claude" in cmd and "--model" not in cmd:
         out = f"{cmd} --model {shlex.quote(DEFAULT_MODEL)}"
@@ -295,7 +298,13 @@ def _launch_claude_cmd(cmd: str, pin_model: bool = True) -> str:
     # without pinning it, so the header dropdown (/effort) can still change it.
     if DEFAULT_EFFORT and "claude" in cmd and "--effort" not in out:
         out = f"{out} --effort {shlex.quote(DEFAULT_EFFORT)}"
-    return _claude_launch_env_prefix() + out
+    return out, _flag_value(out, "model"), _flag_value(out, "effort")
+
+
+def _flag_value(cmd: str, flag: str) -> str:
+    """The value of `--flag x` / `--flag='x'` in a shell command line, or ''."""
+    m = re.search(r"--%s[= ]\s*['\"]?([^\s'\"]+)" % re.escape(flag), cmd)
+    return m.group(1) if m else ""
 
 
 def _restore_default_model_setting():
@@ -314,63 +323,6 @@ def _restore_default_model_setting():
             logger.info("Restored default model in %s -> %s", sp, DEFAULT_MODEL)
     except Exception:
         logger.debug("Failed to restore default model in %s", sp, exc_info=True)
-
-
-def _effort_settings_slice(effort: str) -> dict:
-    """The settings.json keys that make `effort` the default for NEW sessions
-    without pinning it.
-
-    Never `env.CLAUDE_CODE_EFFORT_LEVEL`. The CLI injects settings `env` into its
-    own process, sees the variable, and then refuses /effort with
-    "CLAUDE_CODE_EFFORT_LEVEL=... overrides this session" — which is exactly the
-    header dropdown going dead. `effortLevel` is the non-pinning equivalent.
-
-    It only accepts low/medium/high/xhigh: "max" is a session-only level the CLI
-    refuses to persist ("max is session-only, nothing saved"), so it is carried by
-    the `--effort` launch flag alone and nothing goes into settings for it."""
-    e = (effort or "").strip().lower()
-    if e in ("low", "medium", "high", "xhigh"):
-        return {"effortLevel": e}
-    return {}
-
-
-def _apply_effort_to_settings(s: dict, effort: str) -> bool:
-    """Point a settings dict at `effort` and strip the env pin. True if changed."""
-    changed = False
-    env = s.get("env")
-    if isinstance(env, dict) and env.pop("CLAUDE_CODE_EFFORT_LEVEL", None) is not None:
-        s["env"] = env
-        changed = True
-    keys = _effort_settings_slice(effort)
-    for k, v in keys.items():
-        if s.get(k) != v:
-            s[k] = v
-            changed = True
-    if keys and s.get("ultracode"):
-        s["ultracode"] = False  # ultracode:true forces xhigh and outranks effortLevel
-        changed = True
-    return changed
-
-
-def _restore_default_effort_setting():
-    """Keep ~/.claude/settings.json on DEFAULT_EFFORT, and free of the env pin.
-
-    Two drifts to heal. `env.CLAUDE_CODE_EFFORT_LEVEL` pins the effort for a whole
-    session and kills the dropdown (see _effort_settings_slice) — strip it wherever
-    it comes from. And /effort persists its choice as the global default, the same
-    drift _restore_default_model_setting() undoes for the model."""
-    sp = Path.home() / ".claude" / "settings.json"
-    try:
-        s = json.loads(sp.read_text()) if sp.exists() else {}
-        if not isinstance(s, dict):
-            return
-        if _apply_effort_to_settings(s, DEFAULT_EFFORT):
-            _backup_before_dashboard_write(sp)
-            sp.write_text(json.dumps(s, indent=2))
-            logger.info("Restored default effort in %s -> %s", sp,
-                        DEFAULT_EFFORT or "(unset)")
-    except Exception:
-        logger.debug("Failed to restore default effort in %s", sp, exc_info=True)
 
 
 def _model_flag_for_relaunch(session_name: str) -> str:
@@ -410,6 +362,37 @@ TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", DEFAULT_EFFORT)
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
 GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "dianaotech.com")
+# ...but only for MEMBERS. On a single-admin box every session is the owner's
+# own, so synthesising <user>@<team domain> put the wrong address on real
+# commits (Nimo@dianaotech.com on the rotem.ai box). Explicit env wins, then the
+# box's own git config, then the old synthesised form as a last resort.
+GIT_OWNER_NAME = os.environ.get("TMUX_DASH_GIT_NAME", "")
+GIT_OWNER_EMAIL = os.environ.get("TMUX_DASH_GIT_EMAIL", "")
+_git_config_cache: Dict[str, str] = {}
+
+
+def _git_config_value(key: str) -> str:
+    """`git config --global --get <key>`, cached (it can't change under us
+    without a restart, and this runs on every session create)."""
+    if key not in _git_config_cache:
+        try:
+            r = subprocess.run(["git", "config", "--global", "--get", key],
+                               capture_output=True, text=True, timeout=5)
+            _git_config_cache[key] = r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            _git_config_cache[key] = ""
+    return _git_config_cache[key]
+
+
+def _git_identity_for(user, owner_name: str):
+    """(name, email) for a session's commits. Team members share one OS user, so
+    they keep a per-user synthesised address to stay individually attributed;
+    the owner/admin gets the box's real identity."""
+    if TEAM_MODE and user and not _is_admin(user):
+        return owner_name, "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN)
+    return (GIT_OWNER_NAME or _git_config_value("user.name") or owner_name,
+            GIT_OWNER_EMAIL or _git_config_value("user.email")
+            or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
 
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -515,17 +498,96 @@ def _claude_launch_env_prefix() -> str:
     treats the effort as pinned for the whole session and refuses /effort with
     "CLAUDE_CODE_EFFORT_LEVEL=... overrides this session", which would break the
     effort dropdown. The default is passed as `--effort` instead, which sets the
-    starting level and still allows switching.
-
-    Unsetting it here is necessary but NOT sufficient: the CLI also injects
-    settings.json `env` into its own process, so a pin written there survives
-    this prefix. _restore_default_effort_setting() strips that one."""
+    starting level and still allows switching."""
     tok = _load_longlived_token()
     if tok:
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
                 + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
     return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
             "CLAUDE_CODE_EFFORT_LEVEL; ")
+
+
+# --- Pane launch script ------------------------------------------------------
+# The launch preamble is long: DASH_* exports, a git identity, an auth unset or
+# a CLAUDE_CODE_OAUTH_TOKEN export, NODE_OPTIONS, --model, --effort. And
+# send-keys types it straight into the pane, so it was the first thing in every
+# session's scrollback (and, on the token branch, a long-lived credential in
+# clear on screen). Write it to a per-session 0600 script the shell sources
+# instead, and have that script print one banner line:
+#     [Nimo/box3] Clean · Opus 5 1M · High
+LAUNCH_SCRIPT_DIR = MESSAGES_DIR / "launch"
+
+
+def _auth_mode_label() -> str:
+    """One word for how a pane authenticates, for the launch banner."""
+    return "Token" if _load_longlived_token() else "Clean"
+
+
+def _launch_banner(session: str, owner: str = "", model: str = "", effort: str = "") -> str:
+    """`[Nimo/box3] Clean · Opus 5 1M · High`, what a pane shows instead of the
+    launch command."""
+    bits = [_auth_mode_label()]
+    if model:
+        base = _model_base_id(model)
+        bits.append(_model_label(base) + (" 1M" if model != base else ""))
+    if effort:
+        bits.append(effort.strip().capitalize())
+    head = "[%s/%s]" % (owner, session) if owner else "[%s]" % session
+    return head + " " + " · ".join(bits)
+
+
+def _launch_script_line(session: str, lines, banner: str = "") -> str:
+    """Write a pane's boot script and return the one short line to type into it.
+
+    Falls back to the old `;`-joined command if the file can't be written, so a
+    full disk degrades to a noisy launch rather than a session that never
+    starts."""
+    body = [l for l in lines if l and l.strip()]
+    if not body:
+        return ""
+    if banner:
+        body.insert(0, "printf '%s\\n' " + shlex.quote(banner))
+    try:
+        LAUNCH_SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        LAUNCH_SCRIPT_DIR.chmod(0o700)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", session) or "session"
+        path = LAUNCH_SCRIPT_DIR / (safe + ".sh")
+        path.write_text("# tmux-dashboard pane launch, rewritten on every start.\n"
+                        + "\n".join(body) + "\n")
+        path.chmod(0o600)
+    except Exception:
+        logger.debug("Could not write launch script for '%s'", session, exc_info=True)
+        return "; ".join(body)
+    home = str(Path.home())
+    shown = str(path)
+    if shown.startswith(home + "/"):
+        shown = "~" + shown[len(home):]
+    return "source " + shown
+
+
+def _session_owner_name(session_name: str) -> str:
+    """Dashboard username that owns a session, for the launch banner."""
+    try:
+        u = _find_user_by_id(_session_owner_id(session_name))
+        if u and u.get("username"):
+            return u["username"]
+    except Exception:
+        logger.debug("owner lookup failed for '%s'", session_name, exc_info=True)
+    return AUTH_USER or ""
+
+
+def _relaunch_line(session_name: str, claude_cmd: str) -> str:
+    """The one line to type to relaunch a session's claude. Same boot-script
+    treatment as a fresh session, which also keeps a long-lived
+    CLAUDE_CODE_OAUTH_TOKEN out of the pane, and out of the transcript on the
+    known failure where /exit didn't take and send-keys lands in Claude's input
+    box instead of a shell prompt. Flags are taken as given: unlike a fresh
+    session this must not add its own --model/--effort."""
+    lines = [_claude_launch_env_prefix().strip().rstrip(";"), claude_cmd]
+    banner = _launch_banner(session_name, _session_owner_name(session_name),
+                            _flag_value(claude_cmd, "model"),
+                            _flag_value(claude_cmd, "effort"))
+    return _launch_script_line(session_name, lines, banner)
 
 
 def _load_anthropic_key() -> str:
@@ -718,10 +780,11 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
         # Relaunch Claude on the bare shell, resuming the prior conversation.
         resume_flag = f"--resume {resume_uuid}" if resume_uuid else "--continue"
-        launch = (_claude_launch_env_prefix() +
-                  "NODE_OPTIONS=--max-old-space-size=8192 "
-                  f"claude --dangerously-skip-permissions {resume_flag}"
-                  f"{_model_flag_for_relaunch(session_name)}")
+        launch = _relaunch_line(
+            session_name,
+            "NODE_OPTIONS=--max-old-space-size=8192 "
+            f"claude --dangerously-skip-permissions {resume_flag}"
+            f"{_model_flag_for_relaunch(session_name)}")
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -794,7 +857,12 @@ async def lifespan(_app: FastAPI):
     _load_simple_watchdog_disabled()
     _load_autopush_mode()
     _restore_default_model_setting()
-    _restore_default_effort_setting()
+    try:
+        # Publish our browser slots to the ledger shared with any sibling
+        # dashboard on this box, and move ours off a slot somebody else owns.
+        await asyncio.to_thread(_save_browser_sessions, _load_browser_sessions())
+    except Exception:
+        logger.debug("Browser slot reconcile failed", exc_info=True)
     try:
         migrated_prompts = await asyncio.to_thread(_backfill_prompt_audit, _load_users())
         if migrated_prompts:
@@ -885,6 +953,27 @@ async def request_validation_error_handler(_request: Request, exc: RequestValida
 AUTH_USER = os.environ.get("TMUX_DASH_USER", "admin")
 AUTH_PASS = os.environ.get("TMUX_DASH_PASS", "")
 AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
+# Cookie name. Per-deployment, because two dashboards on the SAME domain (e.g.
+# knowva.ai/tmux and knowva.ai/tmux2) both set it at path "/": sharing one name
+# means logging into the second signs you out of the first, since each has its
+# own TMUX_DASH_SECRET and can't verify the other's token.
+AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
+
+# --- Cross-host SSO cookie (optional) --------------------------------------
+# A SECOND cookie, scoped to a parent domain (e.g. .rotem.ai), so that signing
+# in to any builder dashboard (builder3.rotem.ai, builder4.rotem.ai, ...) also
+# unlocks the private apps served straight off rotem.ai (rotem.ai/cameras, the
+# rotem.ai/apps portal), which gate on it via nginx auth_request.
+#
+# It is deliberately NOT the main auth cookie: that one is per-host and signed
+# with each box's own TMUX_DASH_SECRET, so two dashboards on the same parent
+# domain would clobber each other and neither could verify the other's token.
+# This cookie is signed with a secret SHARED across the boxes, so any of them
+# can issue it and one verify endpoint (rotem.ai -> builder3 loopback) accepts
+# it whichever box you logged in on. Unset SSO_SECRET => feature off, no cookie.
+SSO_SECRET = os.environ.get("TMUX_DASH_SSO_SECRET", "")
+SSO_COOKIE = os.environ.get("TMUX_DASH_SSO_COOKIE", "rotem_sso")
+SSO_COOKIE_DOMAIN = os.environ.get("TMUX_DASH_SSO_COOKIE_DOMAIN", "")  # e.g. ".rotem.ai"
 
 
 def _make_token(user_id: str) -> str:
@@ -898,6 +987,39 @@ def _check_token(token: str) -> bool:
     user_id, sig = token.split(":", 1)
     expected = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
     return hmac.compare_digest(sig, expected)
+
+
+def _make_sso_token(user_id: str) -> str:
+    sig = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{user_id}:{sig}"
+
+
+def _check_sso_token(token: str) -> bool:
+    if not (SSO_SECRET and token and ":" in token):
+        return False
+    user_id, sig = token.split(":", 1)
+    expected = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(sig, expected)
+
+
+def _set_sso_cookie(resp, request: "Request", user_id: str) -> None:
+    """Attach the shared cross-host SSO cookie, if the feature is configured."""
+    if not SSO_SECRET:
+        return
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    kw = dict(max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    if SSO_COOKIE_DOMAIN:
+        kw["domain"] = SSO_COOKIE_DOMAIN
+    resp.set_cookie(SSO_COOKIE, _make_sso_token(user_id), **kw)
+
+
+def _clear_sso_cookie(resp) -> None:
+    if not SSO_SECRET:
+        return
+    if SSO_COOKIE_DOMAIN:
+        resp.delete_cookie(SSO_COOKIE, domain=SSO_COOKIE_DOMAIN)
+    else:
+        resp.delete_cookie(SSO_COOKIE)
 
 
 # --- Multi-user store ---
@@ -1027,7 +1149,7 @@ def _current_user(request: Request) -> Optional[dict]:
     base_user = getattr(request.state, "_authenticated_user", None)
     if base_user is None:
         base_user = (cached or None) if cached is not None else _user_from_token(
-            request.cookies.get("tmux_auth"))
+            request.cookies.get(AUTH_COOKIE))
     user = base_user
     # Tab-scoped impersonation: the cookie still identifies the admin; the
     # header says which account this tab is acting as.
@@ -1300,18 +1422,56 @@ _GOOGLE_BTN_HTML = """  <a class="gbtn" id="gbtn" href="__ROOT_PATH__/auth/googl
   <div class="sep">or sign in with a password</div>"""
 
 
-def _login_page() -> str:
+# --- Two front doors for one process ---------------------------------------
+# Each box is reachable both under a path on a shared domain (knowva.ai/tmux,
+# rotem.ai/build) and, since the builder1/2/3.rotem.ai move, at the root of its
+# own hostname. The path front door cannot simply be dropped: knowva.ai/tmux is
+# the login that nginx's auth_request hands to /sales-update, /crm, /tester32,
+# /ctx-audit and /matcher, and a cookie set on builder1.rotem.ai would never be
+# sent to knowva.ai.
+#
+# So the prefix is per request, not per process. nginx states it with
+# X-Forwarded-Prefix ("/" meaning the root, since nginx drops a header whose
+# value is empty); with no header we fall back to the TMUX_DASH_ROOT_PATH the
+# process was started with, which is what every other caller still sends.
+def _req_prefix(request: Request) -> str:
+    hdr = request.headers.get("x-forwarded-prefix")
+    if hdr is None:
+        return ROOT_PATH
+    hdr = hdr.strip().rstrip("/")
+    return hdr if hdr.startswith("/") else ""
+
+
+_page_cache: Dict[tuple, str] = {}
+
+
+def _render_page(kind: str, prefix: str) -> str:
+    """A page template with this request's prefix baked in. Cached per prefix:
+    the dashboard HTML is ~500KB and only a couple of prefixes ever exist."""
+    key = (kind, prefix)
+    hit = _page_cache.get(key)
+    if hit is not None:
+        return hit
+    out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
+    _page_cache[key] = out
+    return out
+
+
+def _login_page(request: Optional[Request] = None) -> str:
     """The login page, with the Google button rendered only when configured.
 
     Resolved per request rather than at import so dropping in
     ~/.tmux-dashboard/google_oauth_client.json takes effect on the next page
     load instead of needing the app restarted.
     """
+    prefix = _req_prefix(request) if request is not None else ROOT_PATH
+    page = _render_page("login", prefix)
     if not _google_login_enabled():
-        return LOGIN_PAGE.replace("__GOOGLE_BTN__", "")
+        return page.replace("__GOOGLE_BTN__", "")
     domains = ", ".join("@" + d for d in GOOGLE_LOGIN_DOMAINS)
     hint = ("Company accounts only (" + domains + ")") if domains else "Company accounts only"
-    return LOGIN_PAGE.replace("__GOOGLE_BTN__", _GOOGLE_BTN_HTML.replace("__GOOGLE_HINT__", hint))
+    btn = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", prefix)
+    return page.replace("__GOOGLE_BTN__", btn.replace("__GOOGLE_HINT__", hint))
 
 
 @app.middleware("http")
@@ -1417,7 +1577,7 @@ async def auth_middleware(request: Request, call_next):
     # SSO verify endpoint for nginx auth_request from sibling knowva.ai apps:
     # it must return its own 200/401 based on the cookie, NOT the login-page
     # fallback (auth_request only treats a real 2xx as authenticated).
-    if path.endswith("/api/auth/verify"):
+    if path.endswith("/api/auth/verify") or path.endswith("/api/sso/verify"):
         return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
@@ -1440,9 +1600,9 @@ async def auth_middleware(request: Request, call_next):
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
     if _is_public_project_request(rel_path):
         return await call_next(request)
-    token = request.cookies.get("tmux_auth")
+    token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
-        resp = HTMLResponse(_login_page())
+        resp = HTMLResponse(_login_page(request))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
@@ -1451,8 +1611,8 @@ async def auth_middleware(request: Request, call_next):
     # the login screen.
     user = _user_from_token(token)
     if not user:
-        resp = HTMLResponse(_login_page())
-        resp.delete_cookie("tmux_auth")
+        resp = HTMLResponse(_login_page(request))
+        resp.delete_cookie(AUTH_COOKIE)
         return resp
     # Hand the resolved cookie identity to _current_user() as the *base* user;
     # it still has to inspect X-Tmux-Impersonate, so don't mark it resolved.
@@ -1460,6 +1620,31 @@ async def auth_middleware(request: Request, call_next):
     # The route's own _current_user() call may return early from cache, so
     # presence is recorded here too or it never fires.
     _touch_user_presence(user)
+    resp = await call_next(request)
+    # Backfill the cross-host SSO cookie for sessions that logged in BEFORE the
+    # feature existed: they hold a valid per-host cookie but no rotem_sso, so the
+    # private apps on the parent domain still prompt. Set it on the next
+    # authenticated page load so re-login is not required. No-op if the feature
+    # is off or the cookie is already present and valid.
+    if SSO_SECRET and not _check_sso_token(request.cookies.get(SSO_COOKIE, "")):
+        try:
+            _set_sso_cookie(resp, request, user["id"])
+        except Exception:
+            logger.debug("failed to backfill SSO cookie", exc_info=True)
+    return resp
+
+
+@app.middleware("http")
+async def forwarded_prefix_middleware(request: Request, call_next):
+    """Make this request's front door the one every redirect is built from.
+
+    Registered last, so it is the OUTERMOST middleware and runs before the auth
+    and ownership layers, both of which slice root_path off the path and build
+    login redirects from it. Routing is unaffected: nginx already strips the
+    prefix with a trailing-slash proxy_pass, so the ASGI path arrives relative
+    either way, and root_path is only ever used to build URLs.
+    """
+    request.scope["root_path"] = _req_prefix(request)
     return await call_next(request)
 
 
@@ -1475,13 +1660,34 @@ async def api_auth_verify(request: Request):
     here on purpose: letting anyone with a company address into the dashboard
     should not also hand them the crypto/sales/matcher apps.
     """
-    u = _user_from_token(request.cookies.get("tmux_auth"))
+    u = _user_from_token(request.cookies.get(AUTH_COOKIE))
     if u and u.get("sso", True) is not False:
         # Expose the signed-in user to SSO-gated siblings via auth_request_set
         # (e.g. tester32 records who authorized each scan). Harmless to apps that
         # ignore it. ASCII-safe: header values must not carry raw unicode.
         uname = str(u.get("username") or u.get("email") or "").encode("ascii", "ignore").decode()
         return JSONResponse({"ok": True}, headers={"X-Sso-User": uname})
+    return JSONResponse({"ok": False}, status_code=401)
+
+
+@app.get("/api/sso/verify")
+async def api_sso_verify(request: Request):
+    """Cross-host SSO check for nginx ``auth_request`` from the private apps on
+    the parent domain (rotem.ai/cameras, the rotem.ai/apps portal).
+
+    Validates the shared ``rotem_sso`` cookie, which any builder dashboard sets
+    (scoped to .rotem.ai) on login. 200 = a valid login on some builder box,
+    401 = none. The user id is exposed as X-Sso-User for apps that log it.
+
+    This is intentionally lighter than /api/auth/verify: the cookie proves a
+    valid dashboard login on the shared domain, and these apps do not need this
+    box's own per-user record (which would not exist for a user who logged in on
+    a different box). Requires TMUX_DASH_SSO_SECRET; 401s if the feature is off.
+    """
+    token = request.cookies.get(SSO_COOKIE, "")
+    if _check_sso_token(token):
+        uid = token.split(":", 1)[0].encode("ascii", "ignore").decode()
+        return JSONResponse({"ok": True}, headers={"X-Sso-User": uid})
     return JSONResponse({"ok": False}, status_code=401)
 
 
@@ -1522,9 +1728,9 @@ async def login_page(request: Request):
     nxt = (request.query_params.get("next") or "").strip()
     if not (nxt.startswith("/") and not nxt.startswith("//")) or "/login" in nxt.split("?")[0]:
         nxt = request.scope.get("root_path", "") + "/"
-    if _check_token(request.cookies.get("tmux_auth")):
+    if _check_token(request.cookies.get(AUTH_COOKIE)):
         return RedirectResponse(url=nxt, status_code=303)
-    resp = HTMLResponse(_login_page())
+    resp = HTMLResponse(_login_page(request))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
@@ -1606,14 +1812,16 @@ async def do_login(request: Request):
     token = _make_token(target_user["id"])
     resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    _set_sso_cookie(resp, request, target_user["id"])
     return resp
 
 
 @app.api_route("/logout", methods=["GET", "POST"])
 async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
-    resp.delete_cookie("tmux_auth")
+    resp.delete_cookie(AUTH_COOKIE)
+    _clear_sso_cookie(resp)
     return resp
 
 
@@ -2124,8 +2332,10 @@ async def api_admin_delete_user(request: Request, user_id: str):
 
 def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
-    resp.set_cookie("tmux_auth", token, max_age=86400 * 30,
+    resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
+    # token is "<user_id>:<sig>"; the SSO cookie is keyed by the same user id
+    _set_sso_cookie(resp, request, token.split(":", 1)[0])
     return resp
 
 
@@ -3472,13 +3682,10 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
 
 
 def _set_team_model_effort(cfg_dir: Path):
-    """Put the team default model + reasoning effort into a config dir's
-    settings.json so every session launches on them. Claude Code reads `model`
-    and `effortLevel` from settings. Defaults are TEAM_MODEL / TEAM_EFFORT.
-
-    Both are starting points, not pins: a member can still switch either from the
-    session header dropdown. That is why the effort goes to `effortLevel` and not
-    to env CLAUDE_CODE_EFFORT_LEVEL — see _effort_settings_slice()."""
+    """Pin the team default model + reasoning effort into a config dir's
+    settings.json so every session launches on it. Claude Code reads `model`
+    from settings and CLAUDE_CODE_EFFORT_LEVEL from settings `env`. Defaults are
+    TEAM_MODEL / TEAM_EFFORT (Opus 4.8 at high effort)."""
     sp = cfg_dir / "settings.json"
     try:
         s = json.loads(sp.read_text()) if sp.exists() else {}
@@ -3490,8 +3697,12 @@ def _set_team_model_effort(cfg_dir: Path):
     if TEAM_MODEL and s.get("model") != TEAM_MODEL:
         s["model"] = TEAM_MODEL
         changed = True
-    if _apply_effort_to_settings(s, TEAM_EFFORT):
-        changed = True
+    if TEAM_EFFORT:
+        env = s.get("env") if isinstance(s.get("env"), dict) else {}
+        if env.get("CLAUDE_CODE_EFFORT_LEVEL") != TEAM_EFFORT:
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = TEAM_EFFORT
+            s["env"] = env
+            changed = True
     if changed:
         try:
             sp.parent.mkdir(parents=True, exist_ok=True)
@@ -3512,8 +3723,11 @@ def _apply_member_auth(cfg_dir: Path) -> str:
 
 def _seed_trust(cfg_dir: Path, cwd: str):
     """Pre-accept Claude Code's per-folder trust dialog for `cwd` in this config
-    dir's .claude.json so it doesn't prompt (which would hang a detached session)."""
-    cj = cfg_dir / ".claude.json"
+    dir's .claude.json so it doesn't prompt (which would hang a detached session).
+
+    Via _profile_claude_json, so the default dir gets ~/.claude.json — the file
+    Claude Code actually reads — instead of a dead ~/.claude/.claude.json copy."""
+    cj = _profile_claude_json(cfg_dir)
     try:
         d = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(d, dict):
@@ -3820,7 +4034,7 @@ def _ensure_google_mcp(cfg_dir: Path, user: dict):
     cmd = os.environ.get("GOOGLE_MCP_COMMAND", "")
     if not cmd or not user or not user.get("id"):
         return
-    cj = cfg_dir / ".claude.json"
+    cj = _profile_claude_json(cfg_dir)
     try:
         data = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(data, dict):
@@ -6456,7 +6670,8 @@ async def index(request: Request):
     # Inject the per-user "simple" flag so the member UI is correct from the very
     # first line of JS (before any /api/me round-trip), avoiding admin-only fetches.
     simple = bool(TEAM_MODE and not _is_admin(_current_user(request)))
-    return HTMLResponse(HTML_PAGE.replace("__SIMPLE__", "true" if simple else "false"))
+    return HTMLResponse(_render_page("dash", _req_prefix(request))
+                        .replace("__SIMPLE__", "true" if simple else "false"))
 
 
 @app.get("/api/sessions")
@@ -6725,26 +6940,32 @@ async def api_create_session(request: Request, body: CreateSession):
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
-        # Export project-publishing convention env vars so Claude can publish to
-        # https://dianaotech.com/<username>/<session> reliably (see global context).
+        # Everything below is COLLECTED, not typed. It used to go into the pane as
+        # three or four send-keys lines, which is what made a fresh session open on
+        # a screenful of exports; it is written to a boot script and sourced in one
+        # short line at the end of this handler instead.
+        _boot: list = []
+        _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
+        # Project-publishing convention env vars (see global context). Only where a
+        # public base URL is actually configured: without one, PUB_URL falls back to
+        # another box's domain and DASH_PROJECT_URL is a link that 404s.
         try:
-            _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
-            _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
-            _pub_base = PUB_URL
-            # Per-user git identity: every member shares ONE OS user, so set the
-            # commit author/committer per session → commits are attributed to the
-            # right person. Push still uses the box's shared GitHub creds.
-            _git_email = "%s@%s" % (_owner_name, GIT_EMAIL_DOMAIN)
-            _exports = ("export DASH_USER=%s DASH_SESSION=%s DASH_PROJECT_DIR=%s DASH_PROJECT_URL=%s "
-                        "GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s" % (
-                shlex.quote(_owner_name), shlex.quote(created),
-                shlex.quote(_proj_dir), shlex.quote("%s/%s/%s" % (_pub_base, _owner_name, created)),
-                shlex.quote(_owner_name), shlex.quote(_git_email),
-                shlex.quote(_owner_name), shlex.quote(_git_email)))
-            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
+            if PUBLIC_BASE_URL or TEAM_MODE:
+                _boot.append("export DASH_PROJECT_DIR=%s DASH_PROJECT_URL=%s" % (
+                    shlex.quote(str(PROJECTS_ROOT / _owner_name / created)),
+                    shlex.quote("%s/%s/%s" % (PUB_URL, _owner_name, created))))
+            # Git identity: members share ONE OS user, so the commit author is set
+            # per session to keep them individually attributed; the owner gets the
+            # box's real identity. Push still uses the box's shared GitHub creds.
+            _git_name, _git_email = _git_identity_for(user, _owner_name)
+            _boot.append("export DASH_USER=%s DASH_SESSION=%s" % (
+                shlex.quote(_owner_name), shlex.quote(created)))
+            _boot.append("export GIT_AUTHOR_NAME=%s GIT_AUTHOR_EMAIL=%s "
+                         "GIT_COMMITTER_NAME=%s GIT_COMMITTER_EMAIL=%s" % (
+                shlex.quote(_git_name), shlex.quote(_git_email),
+                shlex.quote(_git_name), shlex.quote(_git_email)))
         except Exception:
-            logger.debug("Failed to export DASH_* project env for %s", created, exc_info=True)
+            logger.debug("Failed to build DASH_* project env for %s", created, exc_info=True)
         # Admins don't receive the member global block, so give them the projects
         # convention directly (members already have it in their global context).
         try:
@@ -6764,16 +6985,8 @@ async def api_create_session(request: Request, body: CreateSession):
         if user and not _is_admin(user):
             try:
                 _ensure_user_claude_config_dir(user)
-                user_cfg = _user_claude_config_dir(user)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", created, "-l",
-                     f"export CLAUDE_CONFIG_DIR={shlex.quote(str(user_cfg))}"],
-                    capture_output=True, text=True, timeout=5
-                )
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", created, "Enter"],
-                    capture_output=True, text=True, timeout=5
-                )
+                _boot.append("export CLAUDE_CONFIG_DIR=%s"
+                             % shlex.quote(str(_user_claude_config_dir(user))))
             except Exception:
                 logger.exception("Failed to set per-user CLAUDE_CONFIG_DIR for '%s'", created)
         # Authenticate the session. Prefer the subscription PLAN (symlink to the
@@ -6794,7 +7007,7 @@ async def api_create_session(request: Request, body: CreateSession):
             if _find_profile(requested_profile, roles):
                 roles["session_profiles"][created] = requested_profile
                 _save_roles(roles)
-                _send_profile_export(created, requested_profile)
+                _boot.append(_profile_export_line(requested_profile))
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
         # When authenticating via a shared API key, prime the config dir's one-time
@@ -6805,6 +7018,7 @@ async def api_create_session(request: Request, body: CreateSession):
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session. Pin the default model
         # unless the chosen profile pins its own via its settings.json.
+        _banner = ""
         if NEW_SESSION_CMD:
             _pin_model = True
             try:
@@ -6814,15 +7028,17 @@ async def api_create_session(request: Request, body: CreateSession):
                         _pin_model = False
             except Exception:
                 logger.debug("Profile model lookup failed on create", exc_info=True)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
-                 _launch_claude_cmd(NEW_SESSION_CMD, pin_model=_pin_model)],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
+            _cmd_line, _model, _effort = _claude_cmd_with_flags(NEW_SESSION_CMD, pin_model=_pin_model)
+            _banner = _launch_banner(created, _owner_name, _model, _effort)
+            _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
+            _boot.append(_cmd_line)
+        # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
+        _line = _launch_script_line(created, _boot, _banner)
+        if _line:
+            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _line],
+                           capture_output=True, text=True, timeout=5)
+            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"],
+                           capture_output=True, text=True, timeout=5)
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
         return JSONResponse({"ok": True, "name": created})
     except Exception as e:
@@ -6880,6 +7096,10 @@ async def api_delete_session(request: Request, session_name: str):
         _simple_watchdog_log.pop(session_name, None)
         _crash_recovery_state.pop(session_name, None)
         _seen_claude_running.discard(session_name)
+        try:
+            (LAUNCH_SCRIPT_DIR / (re.sub(r"[^A-Za-z0-9._-]", "_", session_name) + ".sh")).unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove launch script for '%s'", session_name, exc_info=True)
         if session_name in _simple_watchdog_disabled:
             _simple_watchdog_disabled.discard(session_name)
             _save_simple_watchdog_disabled()
@@ -8342,14 +8562,10 @@ def _materialize_profile(profile: dict):
     if profile.get("model"):
         managed["model"] = profile["model"]
     env = dict(profile.get("env") or {})
-    # The profile's effort is a starting level, never a pin: it goes to
-    # `effortLevel`, and an env pin typed into the profile's env editor is
-    # dropped, so the session header dropdown keeps working. See
-    # _effort_settings_slice().
-    env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    if profile.get("effort"):
+        env.setdefault("CLAUDE_CODE_EFFORT_LEVEL", profile["effort"])
     if env:
         managed["env"] = env
-    managed.update(_effort_settings_slice(profile.get("effort") or ""))
     if profile.get("permissions"):
         managed["permissions"] = profile["permissions"]
 
@@ -8373,7 +8589,7 @@ def _materialize_profile(profile: dict):
                     except Exception:
                         logger.debug("Failed to back up ~/.claude/settings.json", exc_info=True)
             merged = dict(existing)
-            for key in ("model", "env", "permissions", "effortLevel"):
+            for key in ("model", "env", "permissions"):
                 if key in managed:
                     merged[key] = managed[key]
                 # If user blanked the field via the editor, drop it from settings
@@ -9605,12 +9821,16 @@ async def api_project_scope_remove(request: Request, project: str, purge: int = 
     return JSONResponse({"ok": True, "path": str(target), **out})
 
 
+def _profile_export_line(profile_id: str) -> str:
+    """`export CLAUDE_CONFIG_DIR=...` (or the unset) for a profile."""
+    if profile_id == DEFAULT_PROFILE_ID:
+        return "unset CLAUDE_CONFIG_DIR"
+    return f"export CLAUDE_CONFIG_DIR={shlex.quote(str(_profile_dir(profile_id)))}"
+
+
 def _send_profile_export(session_name: str, profile_id: str):
     """Send `export CLAUDE_CONFIG_DIR=...` (or unset) to the tmux pane shell."""
-    if profile_id == DEFAULT_PROFILE_ID:
-        cmd = "unset CLAUDE_CONFIG_DIR"
-    else:
-        cmd = f"export CLAUDE_CONFIG_DIR={shlex.quote(str(_profile_dir(profile_id)))}"
+    cmd = _profile_export_line(profile_id)
     try:
         subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", cmd],
                        capture_output=True, text=True, timeout=5)
@@ -9706,6 +9926,55 @@ def _cpu_utilisation_pct() -> float:
         return _CPU_SAMPLE["pct"]
 
 
+_HOST_IDENTITY: Dict[str, str] = {}
+
+
+def _host_identity() -> Dict[str, str]:
+    """Which box am I? Name and addresses, resolved once.
+
+    Three dashboards now run the same app.py behind near-identical pages
+    (builder1/2/3.rotem.ai), so "which host is this" stopped being obvious from
+    the UI. Cached in a module global because none of it can change under a
+    running process, and /api/stats is polled by the nav bar for every signed-in
+    user — this must not cost a metadata round trip per poll.
+    """
+    if _HOST_IDENTITY:
+        return _HOST_IDENTITY
+    import socket
+    info = {"name": socket.gethostname(), "internal_ip": "", "external_ip": ""}
+
+    def _md(path: str) -> str:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/" + path,
+            headers={"Metadata-Flavor": "Google"})
+        return urllib.request.urlopen(req, timeout=1).read().decode().strip()
+
+    # GCE metadata is authoritative for the instance name and the external IP,
+    # neither of which the box can work out for itself. Off GCE this just fails
+    # and the hostname stands.
+    try:
+        info["name"] = _md("instance/name") or info["name"]
+        info["internal_ip"] = _md("instance/network-interfaces/0/ip")
+        info["external_ip"] = _md(
+            "instance/network-interfaces/0/access-configs/0/external-ip")
+    except Exception:
+        logger.debug("GCE metadata unavailable; falling back to hostname", exc_info=True)
+    if not info["internal_ip"]:
+        # No packet is sent; this just asks the kernel which source address it
+        # would route from, which beats gethostbyname on a multi-homed box.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                info["internal_ip"] = s.getsockname()[0]
+            finally:
+                s.close()
+        except Exception:
+            logger.debug("Could not resolve a local IP", exc_info=True)
+    _HOST_IDENTITY.update(info)
+    return _HOST_IDENTITY
+
+
 @app.get("/api/stats")
 async def api_stats(request: Request):
     """System stats: CPU, disk, memory, tmux sessions, Claude processes.
@@ -9719,6 +9988,8 @@ async def api_stats(request: Request):
     user = _current_user(request)
     is_admin = _is_admin(user)
     stats = {}
+    # Which box answered. Cached, so this is a dict lookup after the first call.
+    stats["host"] = await asyncio.to_thread(_host_identity)
     # CPU load
     try:
         with open('/proc/loadavg') as f:
@@ -9971,12 +10242,15 @@ def _account_identity(config_dir) -> dict:
     except Exception:
         pass
     # The big config (with oauthAccount.emailAddress) lives at <dir>/.claude.json,
-    # except the default ~/.claude whose config is the home-level ~/.claude.json.
-    cj = config_dir / ".claude.json"
+    # except the default ~/.claude, which runs with CLAUDE_CONFIG_DIR unset and so
+    # keeps its config at the home-level ~/.claude.json. Take that file
+    # unconditionally, never "only if the in-dir copy is missing": a home seeded by
+    # copying somebody else's ~/.claude (that is exactly how tmux2-home was built)
+    # carries a dead ~/.claude/.claude.json, and preferring it named the PREVIOUS
+    # account in the header for ever after the box had been signed in to another one.
+    cj = _profile_claude_json(config_dir)
     profile_fetched = 0.0
     try:
-        if not cj.exists() and config_dir == Path.home() / ".claude":
-            cj = Path.home() / ".claude.json"
         oa = json.loads(cj.read_text()).get("oauthAccount", {})
         email = oa.get("emailAddress", "") or ""
         org = oa.get("organizationUuid", "") or ""
@@ -9991,6 +10265,13 @@ def _account_identity(config_dir) -> dict:
         "email": email, "sub": sub, "tier": tier,
         "plan": _friendly_plan(sub, tier),
         "fp": org or (sub + "/" + tier),  # account fingerprint (changes per account)
+        # Whether that fingerprint is worth comparing. ~/.claude.json is large and
+        # every running claude rewrites it, so a read here lands on a truncated
+        # file often enough to matter: org comes back "" and the fingerprint
+        # silently degrades to sub/tier. Two of those in a row read as an account
+        # switch and flagged every older session as "on old login" while they were
+        # all on the same account. Only an org UUID we actually read is trusted.
+        "fp_ok": bool(org),
         "cred_mtime": cred_mtime,
         "profile_fetched": profile_fetched,
     }
@@ -10043,18 +10324,37 @@ def _login_switch_time(config_dir, ident: dict) -> float:
     # Best estimate of when a switch happened = the new account's profile fetch
     # time (≈ when it was logged in/switched to); fall back to creds mtime/now.
     anchor = ident.get("profile_fetched") or ident.get("cred_mtime") or now
+    if not ident.get("fp_ok"):
+        # We could not read a real account fingerprint this poll (see fp_ok in
+        # _account_identity). Compare nothing and write nothing: a degraded
+        # reading is not evidence of a switch, and treating it as one is what
+        # produced "N on old login" with every session on the same account.
+        return float((cur or {}).get("switched_at", 0) or 0)
     if not cur:
         # First sight of this dir: record the account but do NOT assume a switch
         # just happened — the account may have been active for a long time.
-        state[key] = {"fp": fp, "since": anchor, "switched_at": 0}
+        state[key] = {"fp": fp, "email": ident.get("email", ""),
+                      "since": anchor, "switched_at": 0}
         _save_login_state(state)
         return 0.0
     if cur.get("fp") != fp:
-        # A genuine account change observed between two polls -> record it.
-        state[key] = {"fp": fp, "since": anchor, "switched_at": anchor}
+        # A genuine account change observed between two polls -> record it. The
+        # email is the second opinion: same person, new org UUID (an org rename,
+        # a workspace being added) is not a login the sessions need to catch up
+        # with, so record the new fingerprint without raising the flag.
+        same_person = bool(ident.get("email")) and cur.get("email") == ident.get("email")
+        switched = 0.0 if same_person else anchor
+        state[key] = {"fp": fp, "email": ident.get("email", ""),
+                      "since": anchor, "switched_at": switched}
         _save_login_state(state)
-        return anchor
-    # Same account as last poll: keep the recorded switch time (0 if never).
+        return switched
+    # Same account as last poll: keep the recorded switch time (0 if never), and
+    # backfill the email so the same-person check above has something to compare
+    # on a state file written before it existed.
+    if ident.get("email") and not cur.get("email"):
+        cur["email"] = ident["email"]
+        state[key] = cur
+        _save_login_state(state)
     return float(cur.get("switched_at", 0) or 0)
 
 
@@ -10492,6 +10792,12 @@ def _load_browser_sessions() -> list:
 
 def _save_browser_sessions(sessions: list):
     try:
+        # Republish our slots to the shared ledger first: it can move one of ours
+        # off a slot a sibling dashboard owns, and that has to reach disk here.
+        _sync_slot_claims(sessions)
+    except Exception:
+        logger.debug("Failed to sync browser slot claims", exc_info=True)
+    try:
         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
         BROWSER_SESSIONS_FILE.write_text(json.dumps({"sessions": sessions}, indent=2))
     except Exception:
@@ -10539,18 +10845,161 @@ def _port_alive(host: str, port: int) -> bool:
         return False
 
 
-def _next_browser_slot(sessions: list) -> int:
-    used = {int(s.get("slot", 0)) for s in sessions}
-    k = 1
-    while k in used:
-        k += 1
-    return k
+# A slot IS a set of ports (display :99+n, rfb 5900+n, noVNC 6080+n, CDP 9222+n)
+# under one shared tree, and more than one dashboard runs out of that tree: the
+# knowva.ai/tmux and knowva.ai/tmux2 deployments have different HOMEs but the
+# same ~/.claude-browser (symlinked), so each numbering its own sessions from 1
+# meant "+ New browser session" on the second one handed out ports the first one
+# already owned — same display, same CDP port, same profile directory. This is
+# the shared ledger: a slot is free only if nobody has claimed it AND none of its
+# ports answers.
+BROWSER_SLOT_CLAIMS = Path.home() / ".claude-browser" / "slots.json"
+BROWSER_SLOT_MAX = 40
 
 
-def _browser_viewer_url(s: dict) -> str:
+def _slot_claims_read() -> dict:
+    try:
+        d = json.loads(BROWSER_SLOT_CLAIMS.read_text())
+        claims = d.get("claims") if isinstance(d, dict) else None
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def _slot_claims_lock():
+    try:
+        BROWSER_SLOT_CLAIMS.parent.mkdir(parents=True, exist_ok=True)
+        import fcntl
+        fh = open(str(BROWSER_SLOT_CLAIMS) + ".lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fh
+    except Exception:
+        logger.debug("Browser slot lock unavailable", exc_info=True)
+        return None
+
+
+def _slot_claims_unlock(fh):
+    if not fh:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+    except Exception:
+        pass
+
+
+def _slot_ports_free(slot: int) -> bool:
+    return not any(_browser_port_alive(p)
+                   for p in (5900 + slot, 6080 + slot, 9222 + slot))
+
+
+def _slot_claims_write(claims: dict) -> None:
+    try:
+        BROWSER_SLOT_CLAIMS.write_text(json.dumps({"claims": claims}, indent=2))
+    except Exception:
+        logger.debug("Failed to write browser slot claims", exc_info=True)
+
+
+def _apply_browser_slot(session: dict, slot: int) -> None:
+    session["slot"] = slot
+    session["display"] = 99 + slot
+    session["rfb_port"] = 5900 + slot
+    session["vnc_port"] = 6080 + slot
+    session["cdp_port"] = 9222 + slot
+
+
+def _free_slot(taken: set) -> int:
+    for k in range(1, BROWSER_SLOT_MAX):
+        if k not in taken and _slot_ports_free(k):
+            return k
+    return 0
+
+
+def _sync_slot_claims(sessions: list, want: str = "") -> int:
+    """Publish this dashboard's slots to the shared ledger, and take one if asked.
+
+    Slot 0 is deliberately absent: it is the systemd browser on :99/9222, which
+    every dashboard on the box shows on purpose. Everything above it is exclusive.
+
+    Mutates `sessions` in place when one of ours sits on a slot a sibling already
+    claimed — the duplicate is real (same display, same CDP port, same profile
+    directory), so ours moves. Returns the slot claimed for `want`, or 0."""
+    home = str(Path.home())
+    fh = _slot_claims_lock()
+    try:
+        others = {k: v for k, v in _slot_claims_read().items()
+                  if isinstance(v, dict) and v.get("home") != home}
+        taken = set()
+        for k in others:
+            try:
+                taken.add(int(k))
+            except Exception:
+                continue
+        mine = {}
+        for s in sessions:
+            try:
+                slot = int(s.get("slot", 0) or 0)
+            except Exception:
+                continue
+            if slot <= 0:
+                continue
+            if slot in taken:
+                moved = _free_slot(taken | set(mine))
+                if not moved:
+                    logger.error("No free browser slot to move '%s' onto", s.get("id"))
+                    continue
+                logger.warning("Browser '%s' moved from slot %d to %d: slot %d belongs to %s",
+                               s.get("id"), slot, moved, slot,
+                               (others.get(str(slot)) or {}).get("home"))
+                _apply_browser_slot(s, moved)
+                slot = moved
+            mine[slot] = {"sid": s.get("id"), "home": home}
+        got = 0
+        if want:
+            got = _free_slot(taken | set(mine))
+            if got:
+                mine[got] = {"sid": want, "home": home, "at": time.time()}
+        claims = dict(others)
+        claims.update({str(k): v for k, v in mine.items()})
+        _slot_claims_write(claims)
+        return got
+    finally:
+        _slot_claims_unlock(fh)
+
+
+def _claim_browser_slot(sessions: list, sid: str = "") -> int:
+    """Lowest slot free across every dashboard sharing ~/.claude-browser, claimed.
+
+    Returns 0 if there is none left, which the caller must treat as a failure
+    rather than silently launching on top of somebody else's browser."""
+    return _sync_slot_claims(sessions, want=sid or "?")
+
+
+def _release_browser_slot(sid: str) -> None:
+    home = str(Path.home())
+    fh = _slot_claims_lock()
+    try:
+        claims = {k: v for k, v in _slot_claims_read().items()
+                  if not (isinstance(v, dict) and v.get("home") == home
+                          and v.get("sid") == sid)}
+        BROWSER_SLOT_CLAIMS.write_text(json.dumps({"claims": claims}, indent=2))
+    except Exception:
+        logger.debug("Failed to release browser slot for %s", sid, exc_info=True)
+    finally:
+        _slot_claims_unlock(fh)
+
+
+def _browser_viewer_url(s: dict, prefix: Optional[str] = None) -> str:
     """Same-origin noVNC URL for a session, proxied by this dashboard. The `path`
-    param is host-absolute (incl. ROOT_PATH) so noVNC connects the websocket back
+    param is host-absolute (incl. the prefix) so noVNC connects the websocket back
     through the /browser/<id>/websockify proxy route.
+
+    `prefix` is THIS REQUEST's mount point, not the process-wide ROOT_PATH: one
+    process answers two front doors, so baking in ROOT_PATH sent every viewer on
+    the root door to /build/browser/... , which matches no route and fell through
+    to the project static handler ("Project not found.").
+    Callers that have a Request must pass _req_prefix(request).
 
     `reconnect` is forced ON: noVNC defaults it to false, so ANY transient drop
     (laptop sleep, wifi blip, proxy restart) left a dead "Disconnected" screen
@@ -10558,13 +11007,14 @@ def _browser_viewer_url(s: dict) -> str:
     `shared` keeps several viewers (inline preview + opened tab) on one session
     instead of the newcomer kicking the others off."""
     sid = s.get("id")
-    root = ROOT_PATH.strip("/")
+    base = ROOT_PATH if prefix is None else prefix
+    root = base.strip("/")
     wspath = (root + "/" if root else "") + f"browser/{sid}/websockify"
     # compression/quality: a watched stream is the one genuinely expensive thing
     # here, so cap it rather than letting noVNC negotiate a lossless 24-bit feed
     # of a 1920x1080 desktop. 2/5 is visually fine for reading a page and costs a
     # fraction of the default in both CPU and bandwidth.
-    return (f"{ROOT_PATH}/browser/{sid}/vnc.html?path={wspath}"
+    return (f"{base}/browser/{sid}/vnc.html?path={wspath}"
             "&autoconnect=true&resize=scale&shared=true"
             f"&compression={VNC_COMPRESSION}&quality={VNC_QUALITY}"
             "&reconnect=true&reconnect_delay=2000")
@@ -10577,6 +11027,12 @@ def _browser_viewer_url(s: dict) -> str:
 # frames, `input` for touch/keys) and serves a plain page. We proxy it here so
 # it inherits this dashboard's admin auth rather than being exposed on its own,
 # and so the Browser tab's iframe preview stays same-origin.
+#
+# The two redroid phones (wechat-vm-arm, wechat-vm-cn) that used to be here were
+# deleted along with their VMs, and their cards sat in the Browser tab forever
+# reading "stopped" with nothing that could remove them — which is why a viewer
+# can now be hidden from the UI (see _hidden_devices below) instead of only ever
+# being removable by editing this dict.
 ANDROID_VIEWERS = {
     # "host" defaults to builder itself; the desktop client lives on wechat-voice.
     "wechat-desktop": {
@@ -10587,32 +11043,44 @@ ANDROID_VIEWERS = {
                  "PulseAudio virtual devices so call audio can be bridged to a voice agent. "
                  "Sign in by scanning the on-screen QR from a phone already on that account.",
     },
-    "wechat": {
-        "name": "WeChat (Android)",
-        "port": 8713,
-        "notes": "redroid Android 13 on wechat-vm-arm, signed in as 夏天 "
-                 "(Weixin ID Zytoolsbag). Click to tap, drag to swipe.",
-    },
-    "wechat-cn": {
-        "name": "WeChat CN (Android)",
-        "port": 8715,
-        "notes": "redroid Android 13 on wechat-vm-cn, for +86 189 2605 5158. "
-                 "All of its traffic leaves through a Shenzhen residential IP, "
-                 "so WeChat sees a Guangdong consumer connection, not a datacenter. "
-                 "Click to tap, drag to swipe.",
-    },
 }
 
+# Device viewers hidden from this dashboard's Browser tab. Per-dashboard (it
+# lives under MESSAGES_DIR), because a device that matters on one box is noise
+# on another. Hiding is reversible from the UI — nothing is deleted.
+BROWSER_HIDDEN_DEVICES_FILE = MESSAGES_DIR / "browser_hidden_devices.json"
 
-def _android_viewer_url(key: str) -> str:
+
+def _hidden_devices() -> set:
+    try:
+        d = json.loads(BROWSER_HIDDEN_DEVICES_FILE.read_text())
+        return {str(k) for k in (d.get("hidden") or [])}
+    except Exception:
+        return set()
+
+
+def _set_hidden_devices(keys) -> None:
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        BROWSER_HIDDEN_DEVICES_FILE.write_text(
+            json.dumps({"hidden": sorted({str(k) for k in keys})}, indent=2))
+    except Exception:
+        logger.debug("Failed to save hidden device viewers", exc_info=True)
+
+
+def _android_viewer_url(key: str, prefix: Optional[str] = None) -> str:
     # Trailing slash matters: the viewer page uses relative URLs (frame.jpg,
     # tap, key), which resolve against the directory, not the parent.
-    return f"{ROOT_PATH}/android/{key}/"
+    # `prefix` is per request, for the same reason as _browser_viewer_url.
+    return f"{ROOT_PATH if prefix is None else prefix}/android/{key}/"
 
 
-async def _android_viewer_rows() -> list:
+async def _android_viewer_rows(prefix: Optional[str] = None) -> list:
     rows = []
+    hidden = _hidden_devices()
     for key, cfg in ANDROID_VIEWERS.items():
+        if key in hidden:
+            continue
         rows.append({
             "id": f"android-{key}",
             "kind": "android",
@@ -10620,8 +11088,8 @@ async def _android_viewer_rows() -> list:
             "running": await asyncio.to_thread(
                 _port_alive, cfg.get("host", "127.0.0.1"), cfg["port"]),
             "managed": False,
-            "viewer_url": _android_viewer_url(key),
-            "external_url": _android_viewer_url(key),
+            "viewer_url": _android_viewer_url(key, prefix),
+            "external_url": _android_viewer_url(key, prefix),
             "notes": cfg["notes"],
         })
     return rows
@@ -10631,7 +11099,8 @@ async def _android_viewer_rows() -> list:
 async def android_viewer_root(key: str, request: Request):
     if key not in ANDROID_VIEWERS:
         return JSONResponse({"error": "unknown device"}, status_code=404)
-    return RedirectResponse(url=_android_viewer_url(key), status_code=307)
+    return RedirectResponse(url=_android_viewer_url(key, _req_prefix(request)),
+                            status_code=307)
 
 
 @app.api_route("/android/{key}/{path:path}", methods=["GET", "POST"])
@@ -10712,6 +11181,7 @@ async def api_browser_sessions(request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     sessions = _load_browser_sessions()
+    prefix = _req_prefix(request)
     out = []
     for s in sessions:
         row = dict(s)
@@ -10722,17 +11192,29 @@ async def api_browser_sessions(request: Request):
         row["live_running"] = await asyncio.to_thread(_browser_port_alive, s.get("vnc_port", 0))
         row["live_autostop"] = _live_autostop_enabled(s)
         row["live_viewers"] = int(_live_viewers.get(str(s.get("id") or ""), 0))
-        row["viewer_url"] = _browser_viewer_url(s)
+        row["viewer_url"] = _browser_viewer_url(s, prefix)
         shot = await asyncio.to_thread(_latest_shot, str(s.get("id") or ""))
         row["shot_at"] = shot.stat().st_mtime if shot else 0
         st = _monitor_state.get(str(s.get("id") or "")) or {}
         row["last_url"] = str(st.get("url") or "")[:300]
         row["tabs"] = st.get("tabs")
         out.append(row)
-    out.extend(await _android_viewer_rows())
+    out.extend(await _android_viewer_rows(prefix))
     extra = sum(1 for s in sessions if s.get("managed"))
+    hidden = [{"key": k, "name": (ANDROID_VIEWERS.get(k) or {}).get("name", k)}
+              for k in sorted(_hidden_devices()) if k in ANDROID_VIEWERS]
     return JSONResponse({"sessions": out, "max_extra": BROWSER_MAX_EXTRA,
-                         "extra_count": extra, "root_path": ROOT_PATH})
+                         "extra_count": extra, "root_path": prefix,
+                         "hidden_devices": hidden})
+
+
+@app.post("/api/browser/devices/restore")
+async def api_browser_devices_restore(request: Request):
+    """Un-hide device viewers hidden from this dashboard's Browser tab."""
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    _set_hidden_devices([])
+    return JSONResponse({"ok": True})
 
 
 @app.get("/api/browser/workloads")
@@ -10785,7 +11267,8 @@ async def api_browser_activity(request: Request, sid: str = "", limit: int = 120
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     rows = await asyncio.to_thread(_activity_read, sid, max(1, min(int(limit), 500)))
-    return JSONResponse({"activity": rows, "shot_base": f"{ROOT_PATH}/api/browser/shot"})
+    return JSONResponse({"activity": rows,
+                         "shot_base": f"{_req_prefix(request)}/api/browser/shot"})
 
 
 @app.get("/api/browser/shot/{sid}/{name}")
@@ -10946,7 +11429,7 @@ async def api_ladder_run_get(run_id: str, request: Request):
     for s in rec.get("steps") or []:
         arts = s.get("artifacts") or {}
         s["artifact_urls"] = {
-            k: f"{ROOT_PATH}/api/browser/ladder/run/{rec['id']}/artifact/{v}"
+            k: f"{_req_prefix(request)}/api/browser/ladder/run/{rec['id']}/artifact/{v}"
             for k, v in arts.items() if v}
     return JSONResponse(rec)
 
@@ -11034,7 +11517,7 @@ def _configure_member_browser_mcp(cfg_dir: Path, user: dict, browser: dict) -> N
     Removed again if the browser stops belonging to them, so a recycled browser
     never leaves a stale binding behind.
     """
-    cj = cfg_dir / ".claude.json"
+    cj = _profile_claude_json(cfg_dir)
     try:
         data = json.loads(cj.read_text()) if cj.exists() else {}
         if not isinstance(data, dict):
@@ -11262,7 +11745,6 @@ def _ensure_user_browser_session(
             owned[0] if owned else None,
         )
         if session is None:
-            slot = _next_browser_slot(sessions)
             sid_base = "acct-" + hashlib.sha256(
                 user_id.encode("utf-8")
             ).hexdigest()[:16]
@@ -11272,6 +11754,10 @@ def _ensure_user_browser_session(
             while sid in existing_ids:
                 sid = f"{sid_base}-{suffix}"
                 suffix += 1
+            slot = _claim_browser_slot(sessions, sid)
+            if not slot:
+                logger.error("No free browser slot for account '%s'", user_id)
+                return {}
             session = {
                 "id": sid,
                 "name": f"{user.get('username') or 'User'} browser"[:80],
@@ -11905,7 +12391,7 @@ async def browser_monitor_watchdog():
         await asyncio.sleep(BROWSER_MONITOR_INTERVAL_S)
 
 
-async def _member_browser_status(user: dict) -> dict:
+async def _member_browser_status(user: dict, prefix: Optional[str] = None) -> dict:
     """Return the non-secret state shared by the member tab and header badge."""
     session = await asyncio.to_thread(_ensure_user_browser_session, user)
     if not session:
@@ -11938,7 +12424,7 @@ async def _member_browser_status(user: dict) -> dict:
             "id": sid,
             "name": session.get("name", "") or "Browser",
             "running": running,
-            "viewer_url": _browser_viewer_url(session),
+            "viewer_url": _browser_viewer_url(session, prefix),
         },
         "connected": connected,
         "signed_in": signed_in,
@@ -12034,7 +12520,7 @@ async def api_my_browser(request: Request):
     user = _current_user(request)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
-    return JSONResponse(await _member_browser_status(user))
+    return JSONResponse(await _member_browser_status(user, _req_prefix(request)))
 
 
 @app.get("/api/my/browser/proxy")
@@ -12088,7 +12574,13 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     sessions = _load_browser_sessions()
     if sum(1 for s in sessions if s.get("managed")) >= BROWSER_MAX_EXTRA:
         return JSONResponse({"error": f"Limit reached ({BROWSER_MAX_EXTRA} extra sessions)."}, status_code=400)
-    slot = _next_browser_slot(sessions)
+    slot = _claim_browser_slot(sessions)
+    if not slot:
+        return JSONResponse(
+            {"error": "No free browser slot: every display/CDP port in the shared "
+                      "~/.claude-browser range is already in use. Remove a browser "
+                      "(here or on the sibling dashboard) and try again."},
+            status_code=409)
     sid = "s%d" % slot
     disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
     name = (body.name or "").strip() or f"Browser {slot + 1}"
@@ -12113,7 +12605,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     _save_browser_sessions(sessions)
     row = dict(entry)
     row["running"] = ok
-    row["viewer_url"] = _browser_viewer_url(entry)
+    row["viewer_url"] = _browser_viewer_url(entry, _req_prefix(request))
     logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
                 sid, disp, vnc, cdp, ok)
     return JSONResponse({"ok": True, "session": row, "started": ok})
@@ -12123,6 +12615,15 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
 async def api_browser_delete(sid: str, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    # Device viewers are not sessions we own — there is no Chrome to stop and no
+    # entry in the store. Removing one means hiding its card, which is reversible.
+    if sid.startswith("android-"):
+        key = sid[len("android-"):]
+        if key not in ANDROID_VIEWERS:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        _set_hidden_devices(_hidden_devices() | {key})
+        logger.info("Device viewer '%s' hidden from the Browser tab", key)
+        return JSONResponse({"ok": True, "hidden": True})
     sessions = _load_browser_sessions()
     target = next((s for s in sessions if s.get("id") == sid), None)
     if not target:
@@ -12145,6 +12646,7 @@ async def api_browser_delete(sid: str, request: Request):
     _activity_append({"sid": sid, "event": "browser stopped and removed",
                       "url": "", "agents": []})
     _save_browser_sessions([s for s in sessions if s.get("id") != sid])
+    _release_browser_slot(sid)
     # Give its proxy port + sticky identity back, so a later browser reusing the
     # slot doesn't inherit a stranger's exit IP or its bandwidth counter.
     try:
@@ -12194,7 +12696,7 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     row["running"] = await asyncio.to_thread(_browser_alive, target)
     row["live_running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
     row["live_autostop"] = _live_autostop_enabled(target)
-    row["viewer_url"] = _browser_viewer_url(target)
+    row["viewer_url"] = _browser_viewer_url(target, _req_prefix(request))
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
@@ -13863,11 +14365,11 @@ async def _auto_fix_login(session_name: str) -> dict:
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "C-u"],
         capture_output=True, text=True, timeout=5)
-    await _send_line(session_name,
-                     _claude_launch_env_prefix() +
-                     "NODE_OPTIONS=--max-old-space-size=8192 "
-                     "claude --dangerously-skip-permissions --continue" +
-                     _model_flag_for_relaunch(session_name))
+    await _send_line(session_name, _relaunch_line(
+        session_name,
+        "NODE_OPTIONS=--max-old-space-size=8192 "
+        "claude --dangerously-skip-permissions --continue"
+        + _model_flag_for_relaunch(session_name)))
     # 4. Confirm it came back authenticated.
     for _ in range(20):
         await asyncio.sleep(2)
@@ -14006,7 +14508,7 @@ async def api_auto_auth(session_name: str, request: Request):
 async def browser_proxy_ws(ws: WebSocket, sid: str):
     """Reverse-proxy the noVNC WebSocket to the session's local websockify. The
     HTTP auth middleware doesn't run for websockets, so re-check the cookie here."""
-    if AUTH_PASS and not _check_token(ws.cookies.get("tmux_auth")):
+    if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
         await ws.close(code=1008)
         return
     s = _browser_session_by_id(sid)
@@ -14151,10 +14653,10 @@ async def api_session_relogin(session_name: str, request: Request):
         logger.debug("relogin: profile re-export failed", exc_info=True)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "-l",
-         _claude_launch_env_prefix() +
-         "NODE_OPTIONS=--max-old-space-size=8192 "
-         "claude --dangerously-skip-permissions --continue"
-         + _model_flag_for_relaunch(session_name)],
+         _relaunch_line(session_name,
+                        "NODE_OPTIONS=--max-old-space-size=8192 "
+                        "claude --dangerously-skip-permissions --continue"
+                        + _model_flag_for_relaunch(session_name))],
         capture_output=True, text=True, timeout=5)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -14637,6 +15139,26 @@ def _usage_access_token() -> tuple[str, str]:
         return "", "none"
 
 
+def _usage_account(token_source: str) -> dict:
+    """Whose usage the bars are showing: {email, plan}.
+
+    A bar sitting at 0% is only reassuring if you can see which account it was
+    read for. On a box that has just been signed in to a second account, "0%"
+    and "not connected" look identical, and the dedicated usage credential can
+    belong to a different account from the one the sessions actually run on.
+    """
+    if token_source == "dedicated":
+        try:
+            email = json.loads(_USAGE_OAUTH_FILE.read_text()).get("account") or ""
+        except Exception:
+            email = ""
+        if email:
+            return {"email": email, "plan": "", "source": token_source}
+    ident = _account_identity(Path.home() / ".claude")
+    return {"email": ident.get("email", ""), "plan": ident.get("plan", ""),
+            "source": token_source}
+
+
 def _load_anthropic_limits_cache():
     try:
         d = json.loads(_ANTHROPIC_LIMITS_CACHE_FILE.read_text())
@@ -14728,6 +15250,10 @@ async def api_anthropic_usage_limits():
     if not token:
         return JSONResponse({"error": "not_authenticated"}, status_code=401)
     fp = hashlib.sha1(token.encode()).hexdigest()[:16]
+    # Stamped on the way out, not only when a fetch happens, so a payload that
+    # was cached (or persisted across a restart) before this field existed still
+    # tells the UI whose numbers it is showing.
+    acct = _usage_account(token_source)
     # Serve cache only if fresh (<1h), same token, AND none of its windows have
     # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
     # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
@@ -14735,7 +15261,7 @@ async def api_anthropic_usage_limits():
             and _anthropic_limits_cache["data"]
             and _anthropic_limits_cache.get("fp") == fp
             and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
-        return JSONResponse(_anthropic_limits_cache["data"])
+        return JSONResponse({**_anthropic_limits_cache["data"], "account": acct})
 
     def _stale_or_error():
         """Serve the last good payload rather than an error whenever we have one.
@@ -14749,7 +15275,7 @@ async def api_anthropic_usage_limits():
             # maxed bar; the true value is unknown but a fresh window is ~0.
             out = _sanitize_expired_windows(_anthropic_limits_cache["data"], now_dt)
             if isinstance(out, dict):
-                out = {**out, "stale": True}
+                out = {**out, "stale": True, "account": acct}
             return JSONResponse(out)
         # Carry *why* forward. The reason is established once, on the call that
         # actually hit upstream; every later call inside the backoff window used
@@ -14832,7 +15358,9 @@ async def api_anthropic_usage_limits():
         shared = _shared_claude_token()
         hdr = await asyncio.to_thread(_usage_from_headers, shared or token)
         if hdr and (hdr.get("five_hour") or hdr.get("seven_day")):
-            payload = {"fetched_at": now, **hdr}
+            payload = {"fetched_at": now,
+                       "account": _usage_account("shared" if shared else token_source),
+                       **hdr}
             _anthropic_limits_cache.update({
                 "ts": now, "data": payload,
                 "fp": hashlib.sha1((shared or token).encode()).hexdigest()[:16],
@@ -14846,7 +15374,7 @@ async def api_anthropic_usage_limits():
             return JSONResponse(payload)
         return _stale_or_error()
 
-    payload = {"fetched_at": now, **data}
+    payload = {"fetched_at": now, "account": acct, **data}
     _anthropic_limits_cache["ts"] = now
     _anthropic_limits_cache["data"] = payload
     _anthropic_limits_cache["fp"] = fp
@@ -15363,7 +15891,7 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
     try:
         cand = _pane_match_fragments(session_name)
         if cand:
-            best, best_score = None, 0
+            best, best_score, runner_up = None, 0, 0
             # Newest first: on a tie the most recently written wins, which is
             # the old behaviour and the safer fallback.
             for f in sorted(files, key=lambda f: os.path.getmtime(f), reverse=True)[:12]:
@@ -15372,8 +15900,13 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
                     continue
                 score = sum(1 for c in cand if c in hay)
                 if score > best_score:
-                    best, best_score = f, score
-            if best is not None and best_score >= 2:
+                    best, best_score, runner_up = f, score, best_score
+                elif score > runner_up:
+                    runner_up = score
+            # Clear the floor AND beat the field. A score two transcripts both
+            # reach says the fragments were not distinctive, and picking one of
+            # them anyway is how a guess gets presented as a fact.
+            if best is not None and best_score >= 2 and best_score > runner_up:
                 resolved, confident = best, True
     except Exception:
         logger.debug("Transcript disambiguation failed for '%s'", session_name,
@@ -15428,7 +15961,11 @@ def _transcript_match_text(path: str) -> str:
     if c and c.get("mtime") == mtime:
         return c.get("text", "")
     parts = []
-    for ln in _read_jsonl_tail(path, 400_000):
+    # 1.5MB of tail, not 400KB: a single tool result can be hundreds of KB, so
+    # the old budget often decoded two or three records and yielded a few hundred
+    # characters to match against — which is why every session on this checkout
+    # fell back to "newest file" and showed its neighbour's model and tokens.
+    for ln in _read_jsonl_tail(path, 1_500_000):
         ln = ln.strip()
         if not ln:
             continue
@@ -15442,8 +15979,20 @@ def _transcript_match_text(path: str) -> str:
             parts.append(content)
         elif isinstance(content, list):
             for b in content:
-                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                if not isinstance(b, dict):
+                    continue
+                if isinstance(b.get("text"), str):
                     parts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    # The commands a session ran are all over its pane and are
+                    # most of what survives normalisation, so they are the
+                    # strongest fingerprint available. Tool RESULTS are excluded
+                    # on purpose: a session that captures another's pane (this
+                    # dashboard's own sessions do it constantly) would otherwise
+                    # absorb its fingerprint and be identified as it. Measured:
+                    # including results made one session match its neighbour's
+                    # transcript with a confident score.
+                    parts.append(json.dumps(b.get("input") or {})[:4000])
     text = _norm_text(re.sub(r"[^0-9A-Za-z ]+", " ", " ".join(parts)))
     if len(_transcript_text_cache) > 400:
         _transcript_text_cache.clear()
@@ -15553,6 +16102,21 @@ def _parse_session_stats(session_name: str) -> dict:
         result = {"available": False, "_ts": now}
         _session_stats_cache[session_name] = result
         return result
+
+    # The same trap the model badge fell into: transcripts are stored per working
+    # directory, so every tmux session open on one checkout shares a project dir.
+    # Summing all of them reported the neighbours' tokens as this session's, and
+    # measured the rate over minutes that belonged to whoever typed last — which
+    # is how a session that had been busy for an hour could read "0/min output,
+    # last activity 44m ago". Pin to this session's own transcript, and fall back
+    # to the whole directory (flagged, so the panel can say so) only when the
+    # session genuinely cannot be told apart from its siblings.
+    own = _pick_session_transcript_file(session_name, files)
+    session_scoped = bool(own) and bool(
+        (_session_transcript_cache.get(session_name) or {}).get("confident")
+        or len([f for f in files if not os.path.basename(f).startswith("agent-")]) == 1)
+    if session_scoped:
+        files = [own]
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now_epoch = now
@@ -15713,6 +16277,9 @@ def _parse_session_stats(session_name: str) -> dict:
         "sessionDurationMin": session_duration_min,
         "secsSinceLastActivity": secs_since_last,
         "modelsUsed": models_seen,
+        # False = these are every transcript in the working directory, not this
+        # session's own. Shown as such rather than passed off as a fact.
+        "sessionScoped": session_scoped,
         "_ts": now,
     }
     _session_stats_cache[session_name] = result
@@ -16129,16 +16696,14 @@ async def api_set_session_effort(session_name: str, body: EffortBody):
                 logger.debug("Pane check after /effort failed", exc_info=True)
                 break
             low = tail.lower()
-            # CLAUDE_CODE_EFFORT_LEVEL pins the session and the CLI refuses to
-            # switch. Launches unset it in the shell and the dashboard strips it
-            # from settings.json on startup, so this is a session that predates
-            # the strip, or one started by hand from a shell that exports it.
+            # An exported CLAUDE_CODE_EFFORT_LEVEL pins the session and the CLI
+            # refuses to switch. Dashboard launches unset it, but a session
+            # started by hand from a shell that exports it will land here.
             if "overrides this session" in low:
                 return JSONResponse(
                     {"error": "This session has CLAUDE_CODE_EFFORT_LEVEL set in its "
-                              "environment, which pins the effort level for its whole "
-                              "run. Restart the session from the dashboard and the "
-                              "dropdown will work."},
+                              "environment, which pins the effort level. Restart it "
+                              "from the dashboard to switch effort."},
                     status_code=409)
             if "unknown effort" in low or "invalid effort" in low:
                 return JSONResponse(
@@ -16154,11 +16719,6 @@ async def api_set_session_effort(session_name: str, body: EffortBody):
         _session_effort_pending[session_name] = {"effort": level,
                                                  "ts": time.time()}
         _session_model_cache.pop(session_name, None)
-        # /effort persists the choice as the default for NEW sessions, same as
-        # /model does. Undo that: the switch stays for THIS session, the global
-        # default stays DEFAULT_EFFORT.
-        await asyncio.sleep(0.8)
-        _restore_default_effort_setting()
         logger.info("Session '%s' effort switch requested -> %s%s",
                     session_name, level, "" if confirmed else " (unconfirmed)")
         return JSONResponse({"ok": True, "effort": level, "pending": True,
@@ -17764,6 +18324,7 @@ body.member-admin .more-member-only{display:none}
 .rate-badge.normal{background:rgba(63,185,80,.15);color:#3fb950}
 .rate-badge.limited{background:rgba(210,153,34,.15);color:#d29922}
 .rate-badge.severely_limited{background:rgba(248,81,73,.15);color:#f85149}
+.rate-badge.idle{background:rgba(139,148,158,.14);color:#8b949e}
 .stats-divider{grid-column:1/-1;border-top:1px solid #21262d;margin:4px 0}
 .stat-value .model-tag{font-size:.75rem;padding:1px 6px;background:#30363d;border-radius:4px;color:#c9d1d9}
 
@@ -18219,6 +18780,9 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-add{display:flex;gap:8px;align-items:center;margin-top:4px}
 .bs-add input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 10px;font-size:.85rem;outline:none}
 .bs-add input:focus{border-color:#58a6ff}
+.bs-hidden-note{margin-top:8px;font-size:.78rem;color:#8b949e}
+.bs-hidden-note a{color:#58a6ff;text-decoration:none}
+.bs-hidden-note a:hover{text-decoration:underline}
 .bs-proxy{border:1px solid #30363d;border-radius:8px;background:#0d1117;padding:10px 12px;margin-bottom:12px}
 .bs-proxy-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .bs-proxy-title{font-weight:600;color:#e6edf3;font-size:.85rem}
@@ -18956,7 +19520,7 @@ function splitLiveTail(lines){
 const _ENV_ASSIGN_RE=/^[A-Za-z_][A-Za-z0-9_]*=/;
 // The launch line itself, for the case where the prompt that carried it has
 // already scrolled out of tmux's history and only the command is left.
-const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex)\b|--dangerously-skip-permissions|CLAUDE_CODE_OAUTH_TOKEN=/;
+const _LAUNCH_CMD_RE=/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:claude|codex)\b|--dangerously-skip-permissions|CLAUDE_CODE_OAUTH_TOKEN=|^(?:source|\.)\s+\S*\/\.tmux-dashboard\/launch\//;
 function _stripStartupPreamble(lines){
   let i=0,sawShell=false;
   const limit=Math.min(lines.length,120);
@@ -21623,6 +22187,16 @@ async function refreshUsageLimits(){
       const el=document.getElementById(id); if(el)el.textContent=v+'%';
     });
     const staleNote=data.stale?' · last known value (upstream unreachable)':'';
+    // Which account, and when it was read. Without these a live 0% is
+    // indistinguishable from a dead widget — which is exactly how it reads
+    // after a box is signed in to a second, unused account.
+    const acct=data.account||{};
+    const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
+    let readNote='';
+    if(data.fetched_at){
+      const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
+      readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
+    }
     // Where the number came from, and whether spend has moved to overage credits
     // (the 7-day window being spent is exactly when that starts to cost money).
     const srcNote=data.source==='ratelimit_headers'
@@ -21632,8 +22206,8 @@ async function refreshUsageLimits(){
       ? ' · ⚠ plan window spent — running on overage credits'+
         (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
       : '';
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+staleNote+srcNote+ovNote;
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+staleNote+srcNote+ovNote;
+    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · resets '+_fmtResetTime(fh.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
+    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · resets '+_fmtResetTime(sd.resets_at)+acctNote+readNote+staleNote+srcNote+ovNote;
     const fhWrap=document.getElementById('nav-usage-5h-wrap');
     const sdWrap=document.getElementById('nav-usage-7d-wrap');
     if(fhWrap)fhWrap.title=fhTitle;
@@ -21657,8 +22231,11 @@ function _scheduleUsageRetry(){
 function startUsageLimitsPolling(){
   if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
   refreshUsageLimits();
-  // Poll every hour (3600s) while page is open — backend caches upstream calls
-  _usageLimitsTimer=setInterval(refreshUsageLimits,3600*1000);
+  // Poll every 10 min, not hourly. Upstream is still hit at most once an hour —
+  // the backend cache enforces that — but the cache is keyed on the token, so a
+  // login switch busts it, and an hourly page timer meant the bars kept showing
+  // the PREVIOUS account's numbers for up to an hour after the switch.
+  _usageLimitsTimer=setInterval(refreshUsageLimits,600*1000);
 }
 startUsageLimitsPolling();
 
@@ -22171,8 +22748,14 @@ async function loadSessionStats(name){
       panel.innerHTML='<span style="color:#6e7681">No token data yet — waiting for Claude Code activity.</span>';
       return;
     }
-    const rateCls=st.rateStatus;
-    const rateLabel=rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    // "Normal · 0/min output" is what an idle session used to read as, and it
+    // looks exactly like a broken meter. The backend only measures output over
+    // the last 10 minutes, so with nothing in that window there is no rate to
+    // report — say that, instead of reporting a zero that isn't a measurement.
+    const idle=!st.recentOutputRate&&!st.ratePct;
+    const rateCls=idle?'idle':st.rateStatus;
+    const rateLabel=idle?'Idle':rateCls==='severely_limited'?'Severely Limited':rateCls==='limited'?'Limited':'Normal';
+    const rateText=idle?'no output in the last 10 min':fmtRate(st.recentOutputRate)+' output';
     const barPct=Math.min(100,Math.max(2,st.ratePct));
     const sinceStr=st.secsSinceLastActivity<0?'—':st.secsSinceLastActivity<60?st.secsSinceLastActivity+'s ago':st.secsSinceLastActivity<3600?Math.floor(st.secsSinceLastActivity/60)+'m ago':Math.floor(st.secsSinceLastActivity/3600)+'h ago';
     panel.innerHTML=`
@@ -22192,13 +22775,14 @@ async function loadSessionStats(name){
       <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
         <span style="font-size:.75rem;color:#8b949e">Rate</span>
         <span class="rate-badge ${rateCls}">${rateLabel}</span>
-        <span style="font-size:.75rem;color:#6e7681">${fmtRate(st.recentOutputRate)} output</span>
+        <span style="font-size:.75rem;color:#6e7681">${rateText}</span>
         <span style="font-size:.65rem;color:#484f58">peak ${fmtRate(st.peakOutputRate)}</span>
       </div>
-      <div class="rate-bar">
+      ${st.sessionScoped===false?'<div style="font-size:.65rem;color:#6e7681;margin-top:6px" title="Transcripts are stored per working directory. This session could not be told apart from the others open on the same checkout, so these figures cover all of them.">every session in this working directory, not just this one</div>':''}
+      ${idle?'':`<div class="rate-bar">
         <div class="rate-bar-track"><div class="rate-bar-fill ${rateCls}" style="width:${barPct}%"></div></div>
         <span class="rate-label">${st.ratePct}%</span>
-      </div>`;
+      </div>`}`;
   }catch(e){
     panel.innerHTML='<span style="color:#6e7681">Stats unavailable</span>';
   }
@@ -23287,13 +23871,16 @@ function renderBrowserTab(data){
         : '<div class="bs-off">Viewer not running — <code>systemctl start android-view</code></div>';
       return '<div class="bs-card">'+
         '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
-          '<span class="bs-meta">'+status+' · adb · wechat-vm-arm</span></div>'+
+          '<span class="bs-meta">'+status+' · adb</span></div>'+
         '<div class="bs-preview">'+prev+'</div>'+
-        '<div class="bs-badges"><span class="bs-badge ok">📱 Android device</span>'+
+        '<div class="bs-badges"><span class="bs-badge ok">📱 device viewer</span>'+
           '<span class="bs-badge">click to tap · drag to swipe</span></div>'+
         '<div class="bs-notes">'+esc(s.notes||'')+'</div>'+
         '<div class="bs-actions">'+
           '<button class="btn" onclick="openBrowserSession(\''+id+'\')">Open&nbsp;↗</button>'+
+          ' <button class="btn btn-danger" onclick="hideBrowserDevice(\''+id+'\')"'+
+            ' title="Take this card off the Browser tab. The device itself is not'+
+            ' touched and hiding can be undone below.">Remove</button>'+
         '</div>'+
       '</div>';
     }
@@ -23446,6 +24033,14 @@ function renderBrowserTab(data){
   const addRow = atLimit
     ? '<div class="pf-banner">Reached the max of '+(data.max_extra||4)+' extra browser sessions. Remove one to add another.</div>'
     : '<div class="bs-add"><input id="bs-new-name" placeholder="New session name (optional)"><button class="btn btn-primary" onclick="createBrowserSession()">+ New browser session</button></div>';
+  // Hidden device viewers: hiding is the only way to remove a card for something
+  // this dashboard does not own, so it has to be visibly undoable.
+  const hid = data.hidden_devices||[];
+  const hiddenRow = hid.length
+    ? '<div class="bs-hidden-note">'+hid.length+' device viewer'+(hid.length===1?'':'s')+' hidden ('+
+        hid.map(h=>esc(h.name||h.key)).join(', ')+') · '+
+        '<a href="#" onclick="restoreBrowserDevices();return false;">restore</a></div>'
+    : '';
   document.getElementById('settings-content').innerHTML =
     '<div class="settings-section">'+
       '<div class="pf-banner">Independent browsers you (or Claude) can drive. Each card shows the '+
@@ -23453,11 +24048,14 @@ function renderBrowserTab(data){
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
         'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
         'once nobody is watching. <b>History</b> is the audit trail.</div>'+
-      '<div id="ladder-panel">'+renderLadderPanel()+'</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
+      hiddenRow+
       renderUnmanagedBrowsers()+
+      // The ladder is a diagnostic, not a browser: it lives under the browsers so
+      // the cards and the add/remove controls are what the tab opens on.
+      '<div id="ladder-panel">'+renderLadderPanel()+'</div>'+
     '</div>';
 }
 
@@ -24101,6 +24699,31 @@ async function createBrowserSession(){
     const r=await fetch(BASE+'/api/browser/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
     const d=await r.json();
     if(!r.ok) alert(d.error||'Failed to create');
+    // A session that was recorded but whose Chrome never came up is the failure
+    // that used to look like success: the card just sat there saying "stopped".
+    else if(d && d.started===false) alert('Created, but its Chrome did not come up within 25s. '+
+      'The card is there — try View live, or Remove it and add another.');
+  }catch(e){ alert('Failed: '+e.message); }
+  loadBrowserTab();
+}
+
+async function hideBrowserDevice(id){
+  const s=_bsFind(id);
+  if(!confirm('Remove "'+((s&&s.name)||id)+'" from this tab? The device itself is not touched, '+
+              'and you can restore it from the link under the browsers.')) return;
+  try{
+    const r=await fetch(BASE+'/api/browser/sessions/'+encodeURIComponent(id),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok) alert(d.error||'Failed to remove');
+  }catch(e){ alert('Failed: '+e.message); }
+  loadBrowserTab();
+}
+
+async function restoreBrowserDevices(){
+  try{
+    const r=await fetch(BASE+'/api/browser/devices/restore',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok) alert(d.error||'Failed to restore');
   }catch(e){ alert('Failed: '+e.message); }
   loadBrowserTab();
 }
@@ -26496,6 +27119,16 @@ function renderStats(s,usage){
   let html='';
   // Server
   html+='<div class="stats-section"><div class="stats-section-title">Server</div>';
+  // Three dashboards run the same page; say plainly which box this one is.
+  if(s.host&&s.host.name){
+    html+='<div class="stats-row"><span class="stats-row-label">Instance</span><span class="stats-row-value">'+esc(s.host.name)+'</span></div>';
+  }
+  if(s.host&&(s.host.external_ip||s.host.internal_ip)){
+    // External is what you SSH to or allowlist; internal is what the rest of the
+    // fleet reaches it on. Show both when both are known.
+    const ips=[s.host.external_ip,s.host.internal_ip].filter(Boolean);
+    html+='<div class="stats-row"><span class="stats-row-label">IP</span><span class="stats-row-value">'+esc(ips.join(' / '))+'</span></div>';
+  }
   html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
   if(s.cpu_load&&s.cpu_load['1m']){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Load</span><span class="stats-row-value">'+esc(s.cpu_load['1m'])+' / '+esc(s.cpu_load['5m'])+' / '+esc(s.cpu_load['15m'])+'</span></div>';
@@ -26642,12 +27275,11 @@ bootstrapDashboard();
 </body></html>
 """
 
-# Inject the actual ROOT_PATH into the JS BASE variable
-HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
+# __ROOT_PATH__ is deliberately NOT substituted here: it is baked in per request
+# by _render_page(), because one process now answers on both its path front door
+# and the root of its own builder<N>.rotem.ai hostname. Brand is process-wide.
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
-LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
-_GOOGLE_BTN_HTML = _GOOGLE_BTN_HTML.replace("__ROOT_PATH__", ROOT_PATH)
 
 
 # ===========================================================================
@@ -26702,7 +27334,7 @@ async def user_projects_page(request: Request, username: str):
         return HTMLResponse("Not found", status_code=404)
     viewer = _current_user(request)
     if not viewer:
-        return HTMLResponse(LOGIN_PAGE, status_code=401)
+        return HTMLResponse(_login_page(request), status_code=401)
     is_admin = _is_admin(viewer)
     if viewer.get("id") != target["id"] and not is_admin:
         return HTMLResponse("Forbidden — you can only view your own projects.", status_code=403)
