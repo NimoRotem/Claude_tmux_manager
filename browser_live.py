@@ -36,6 +36,17 @@ except Exception:                                # pragma: no cover
 
 CHROME = (shutil.which("google-chrome") or shutil.which("google-chrome-stable")
           or shutil.which("chromium") or shutil.which("chromium-browser"))
+
+# A headless Chrome advertises "HeadlessChrome/<v>" and the CDN in front of
+# patentcenter.uspto.gov answers EVERY asset request from such a UA with the SPA's
+# own index.html: 200, content-type text/html, x-cache "Error from cloudfront".
+# Chrome then refuses the module scripts under strict MIME checking, Angular never
+# bootstraps, and the tab is white with the correct title. Bisected 2026-09-01 on
+# instance-3: the UA is the only input that decides it. Referer and Sec-Fetch-* make
+# no difference, and a plain curl UA is refused the same way, so this is not the
+# intermittent CloudFront fault it was previously recorded as.
+HEADFUL_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/149.0.0.0 Safari/537.36")
 PROFILE_ROOT = Path(os.environ.get("PATENT_DATA_DIR",
                                    Path.home() / ".tmux-dashboard" / "patents")) / "browsers"
 PORT_RANGE = range(9400, 9450)
@@ -86,6 +97,7 @@ def launch(label: str, headless: bool = True, port: int = 0) -> dict:
             "--no-first-run", "--no-default-browser-check",
             "--disable-dev-shm-usage", "--disable-background-networking",
             "--disable-features=Translate,OptimizationHints",
+            "--user-agent=%s" % HEADFUL_UA,
             "--window-size=1440,960", "about:blank"]
     if headless:
         args.insert(1, "--headless=new")
@@ -182,7 +194,7 @@ if [ -z "%(headless)s" ]; then
   done
   [ -z "$DISPLAY" ] && { echo "NODISPLAY"; exit 1; }
 fi
-nohup google-chrome %(headless)s --no-proxy-server --user-data-dir="$prof"   --remote-debugging-port=$port --remote-allow-origins='*' --no-first-run   --no-default-browser-check --disable-dev-shm-usage --window-size=1440,960   about:blank >"$prof/chrome.log" 2>&1 &
+nohup google-chrome %(headless)s --no-proxy-server --user-data-dir="$prof"   --remote-debugging-port=$port --remote-allow-origins='*' --no-first-run   --no-default-browser-check --disable-dev-shm-usage --window-size=1440,960   --user-agent='%(ua)s'   about:blank >"$prof/chrome.log" 2>&1 &
 for i in $(seq 1 60); do
   if curl -s --max-time 2 "http://127.0.0.1:$port/json/version" >/dev/null; then
     echo "PORT=$port"; echo "PROFILE=$prof"; exit 0
@@ -211,7 +223,8 @@ def launch_remote(label: str, headless: bool = True, host: str = "", zone: str =
     safe = ("".join(c for c in label if c.isalnum() or c in "-_") or "filing")
     safe = "%s-%s" % (safe[:40], uuid.uuid4().hex[:8])
     script = _REMOTE_LAUNCH % {"label": safe,
-                               "headless": "--headless=new" if headless else ""}
+                               "headless": "--headless=new" if headless else "",
+                               "ua": HEADFUL_UA}
     out = subprocess.run(
         ["gcloud", "compute", "ssh", "%s@%s" % (REMOTE_USER, host), "--zone", zone,
          "--command", "sudo -u %s bash -s" % REMOTE_USER],
