@@ -844,3 +844,27 @@ def test_terminal_can_load_history_from_before_the_ring(monkeypatch):
     assert 'id="raw-older-${s.name}"' in html
     # The head trim must make room for history that was deliberately loaded.
     assert "const cap=RAW_MAX_LINES+olderRows;" in html
+
+
+def test_a_borrowed_transcript_never_outranks_the_launch_flags(tmp_path, monkeypatch):
+    import app
+
+    # A brand-new session has no transcript of its own yet, so the newest file in
+    # a shared project dir belongs to some OTHER session. Its level and model
+    # must not be shown as this session's: argv still says what it launched on.
+    other = tmp_path / "other.jsonl"
+    other.write_text(_assistant("high", "claude-fable-5-1", "2026-09-01T00:00:00.000Z"))
+    files = [str(other), str(tmp_path / "another.jsonl")]
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda name: files)
+    monkeypatch.setattr(app, "_pick_session_transcript_file", lambda name, fs: str(other))
+    monkeypatch.setattr(app, "_session_transcript_cache", {})
+    monkeypatch.setattr(app, "_session_model_cache", {})
+    monkeypatch.setattr(app, "_session_claude_proc", lambda name: {
+        "cmdline": "claude --dangerously-skip-permissions --model claude-opus-5[1m] --effort xhigh"})
+    monkeypatch.setattr(app, "capture_pane_recent", lambda name, lines=80: "")
+
+    out = app._detect_session_model_effort("fresh")
+
+    assert out["effort"] == "xhigh"
+    assert out["effort_source"] == "launch"
+    assert out["model"] == "claude-opus-5[1m]"

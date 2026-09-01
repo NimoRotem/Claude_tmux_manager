@@ -17479,6 +17479,18 @@ def _detect_session_model_effort(session_name: str) -> dict:
 
     proc = _session_claude_proc(session_name)
     argv = proc.get("cmdline", "")
+    # A transcript that was only GUESSED to be this session's (the newest file in
+    # a shared project dir, before the session has written its own) is some other
+    # session's history. argv is this session's own, so its launch flags outrank
+    # a borrowed transcript; the badge otherwise shows a neighbour's level and
+    # model until the first reply lands.
+    if not sure and argv:
+        launched_effort = (_flag_value(argv, "effort") or "").lower()
+        if launched_effort in ALLOWED_SESSION_EFFORTS:
+            effort, source = launched_effort, "launch"
+        launched_model = _flag_value(argv, "model")
+        if launched_model:
+            model = launched_model
     pane = _pane_model_effort(session_name)
     # A pane-confirmed /effort outranks the transcript: it happened after the
     # reply the transcript's level belongs to.
