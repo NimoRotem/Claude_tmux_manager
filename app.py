@@ -1165,6 +1165,11 @@ async def lifespan(_app: FastAPI):
     _load_autopush_mode()
     _restore_default_model_setting()
     _restore_default_effort_setting()
+    _enforce_tmux_history()
+    scrollback_task = asyncio.create_task(_scrollback_archive_loop())
+    _background_tasks.append(scrollback_task)
+    logger.info("Scrollback archive started (every %ds, tmux ring %d lines, log %s)",
+                SCROLLBACK_ARCHIVE_INTERVAL, TMUX_HISTORY_LIMIT, SCROLLBACK_DIR)
     try:
         # Publish our browser slots to the ledger shared with any sibling
         # dashboard on this box, and move ours off a slot somebody else owns.
@@ -5761,6 +5766,31 @@ def _find_session_for_user(session_name: str, user: Optional[dict]) -> tuple:
     return sessions, sess
 
 
+# How many lines of output tmux keeps per pane. The server default is 2000,
+# which on this box meant a session could only be scrolled back about half an
+# hour before its own history was gone. It is a per-SERVER option applied when a
+# pane is created (tmux 3.3 has no way to grow an existing pane's ring), so the
+# dashboard sets it at startup: every session it creates from then on gets the
+# larger ring, and panes that predate it keep whatever they were born with.
+TMUX_HISTORY_LIMIT = int(os.environ.get("TMUX_DASH_HISTORY_LIMIT", "50000"))
+
+
+def _enforce_tmux_history() -> None:
+    """Raise the tmux server's history-limit to TMUX_HISTORY_LIMIT."""
+    try:
+        cur = subprocess.run(["tmux", "show-options", "-gv", "history-limit"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if cur.isdigit() and int(cur) >= TMUX_HISTORY_LIMIT:
+            return
+        subprocess.run(["tmux", "set-option", "-g", "history-limit",
+                        str(TMUX_HISTORY_LIMIT)],
+                       capture_output=True, text=True, timeout=5)
+        logger.info("tmux history-limit %s -> %d (applies to new panes)",
+                    cur or "unset", TMUX_HISTORY_LIMIT)
+    except Exception:
+        logger.debug("Failed to set tmux history-limit", exc_info=True)
+
+
 def capture_pane_full(session_name: str) -> str:
     try:
         # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
@@ -5783,6 +5813,196 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+# ── Scrollback that outlives tmux ───────────────────────────────────────────
+# tmux keeps a session's output in a fixed ring (history-limit). Once it is full
+# the oldest line is dropped for every new one, silently — which is how a session
+# people had been reading all day could only be scrolled back half an hour. The
+# ring was 2000 lines here; it is 50000 now (see _enforce_tmux_history), but a
+# ring is still a ring and it is emptied outright when a pane restarts.
+#
+# So the dashboard keeps its own copy. Only SETTLED lines are archived: a line
+# that has scrolled off the visible area can never be rewritten, whereas the
+# bottom of the pane is redrawn several times a second and committing that would
+# write the composer and the spinner into the log over and over. `-E -1` ends the
+# capture one line above the visible top, which is exactly that boundary.
+SCROLLBACK_DIR = Path.home() / ".tmux-dashboard" / "scrollback"
+# How much of our own tail we look for in the pane to find where our copy ends.
+_SCROLLBACK_ANCHOR = 40
+# Windows tried when hunting for that anchor. A quiet session needs the first;
+# the last is for a session that produced tens of thousands of lines between two
+# archive passes.
+_SCROLLBACK_WINDOWS = (400, 4000, 50000)
+_SCROLLBACK_MAX_BYTES = 64 * 1024 * 1024
+_scrollback_state: Dict[str, dict] = {}   # {name: {"tail": [str], "lines": int}}
+_scrollback_lock = threading.Lock()
+
+
+def _scrollback_path(session_name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_name)[:120] or "_"
+    return SCROLLBACK_DIR / f"{safe}.log"
+
+
+def _settled_pane_lines(session_name: str, count: int) -> list:
+    """The last `count` lines of a pane's settled scrollback, oldest first."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-J",
+             "-S", f"-{max(1, int(count))}", "-E", "-1"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    lines = result.stdout.split("\n")
+    # capture-pane ends with a newline, so the split leaves one empty element.
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _scrollback_tail(session_name: str) -> dict:
+    """Our archive's line count and its last `_SCROLLBACK_ANCHOR` lines."""
+    st = _scrollback_state.get(session_name)
+    if st is not None:
+        return st
+    path = _scrollback_path(session_name)
+    tail, total = [], 0
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    total += 1
+                    tail.append(line.rstrip("\n"))
+                    if len(tail) > _SCROLLBACK_ANCHOR:
+                        tail.pop(0)
+        except Exception:
+            logger.debug("Failed to read scrollback for '%s'", session_name, exc_info=True)
+    st = {"tail": tail, "lines": total}
+    _scrollback_state[session_name] = st
+    return st
+
+
+def _find_anchor(window: list, anchor: list) -> int:
+    """Index in `window` just past the last occurrence of the `anchor` block,
+    or -1. Searched from the end: an agent that prints the same block twice must
+    resume after the newer copy, not the older one."""
+    n = len(anchor)
+    if not n or len(window) < n:
+        return -1
+    for i in range(len(window) - n, -1, -1):
+        if window[i:i + n] == anchor:
+            return i + n
+    return -1
+
+
+def archive_scrollback(session_name: str) -> int:
+    """Append this session's newly-settled pane lines to its own log. Returns
+    how many lines were added.
+
+    Finding where our copy ends is done by matching our own tail inside the
+    pane rather than by trusting a line count: tmux's `history_size` saturates
+    once the ring is full, so after that it stops growing while the content
+    underneath keeps moving, and any counter-based scheme silently stops
+    archiving exactly when the ring starts dropping lines."""
+    with _scrollback_lock:
+        state = _scrollback_tail(session_name)
+        anchor = state["tail"]
+        new: Optional[list] = None
+        resynced = False
+        # Nothing archived yet: take everything tmux still holds, in one go.
+        # Starting from the small window would throw away the history that is
+        # sitting right there, which is the whole point of the archive.
+        windows = _SCROLLBACK_WINDOWS if anchor else (_SCROLLBACK_WINDOWS[-1],)
+        for window in windows:
+            lines = _settled_pane_lines(session_name, window)
+            if not lines:
+                return 0
+            if not anchor:
+                new = lines
+                break
+            at = _find_anchor(lines, anchor)
+            if at >= 0:
+                new = lines[at:]
+                break
+            # Anchor not in this window. If the window already covers the whole
+            # scrollback there is nothing more to look at: the pane has been
+            # cleared or restarted under us, so keep the old log and start a new
+            # stretch after a marker rather than dropping either.
+            if len(lines) < window:
+                new, resynced = lines, True
+                break
+        if new is None:
+            new, resynced = _settled_pane_lines(session_name, _SCROLLBACK_WINDOWS[-1]), True
+        if not new:
+            return 0
+        try:
+            SCROLLBACK_DIR.mkdir(parents=True, exist_ok=True)
+            path = _scrollback_path(session_name)
+            with open(path, "a", encoding="utf-8") as f:
+                if resynced and state["lines"]:
+                    f.write("\n")
+                    state["lines"] += 1
+                for line in new:
+                    f.write(line + "\n")
+        except Exception:
+            logger.debug("Failed to append scrollback for '%s'", session_name, exc_info=True)
+            return 0
+        state["lines"] += len(new)
+        state["tail"] = (state["tail"] + new)[-_SCROLLBACK_ANCHOR:]
+        return len(new)
+
+
+def read_scrollback(session_name: str, start: int = 0, limit: int = 4000) -> dict:
+    """A slice of the archive, oldest first, plus how long the whole thing is."""
+    state = _scrollback_tail(session_name)
+    total = state["lines"]
+    start = max(0, min(int(start), total))
+    limit = max(1, min(int(limit), 20000))
+    out = []
+    path = _scrollback_path(session_name)
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i < start:
+                        continue
+                    if len(out) >= limit:
+                        break
+                    out.append(line.rstrip("\n"))
+        except Exception:
+            logger.debug("Failed to read scrollback slice for '%s'", session_name,
+                         exc_info=True)
+    return {"start": start, "lines": out, "total": total}
+
+
+def _trim_scrollback_files() -> None:
+    """Keep each log under _SCROLLBACK_MAX_BYTES by dropping its oldest half.
+    A log is the one copy of that history, so it is halved rather than deleted,
+    and only when it is genuinely large."""
+    try:
+        paths = list(SCROLLBACK_DIR.glob("*.log"))
+    except Exception:
+        return
+    for path in paths:
+        try:
+            if path.stat().st_size <= _SCROLLBACK_MAX_BYTES:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            keep = lines[len(lines) // 2:]
+            tmp = path.with_suffix(".log.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+            tmp.replace(path)
+            # The cache is keyed on the session name, not the file name, so the
+            # cheap and correct move is to drop all of it and re-read.
+            _scrollback_state.clear()
+            logger.info("Scrollback %s trimmed to %d lines", path.name, len(keep))
+        except Exception:
+            logger.debug("Failed to trim scrollback %s", path, exc_info=True)
 
 
 def get_pane_width(session_name: str) -> int:
@@ -7256,6 +7476,10 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     vis_hash = await asyncio.to_thread(_visible_pane_hash, session_name)
     pane_width = await asyncio.to_thread(get_pane_width, session_name)
 
+    # How much older history the archive holds beyond what tmux still has, so
+    # the terminal can offer to load it (see /history below).
+    archived = _scrollback_tail(session_name)["lines"]
+
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
         raw = await asyncio.to_thread(capture_pane_full, session_name)
@@ -7266,6 +7490,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
             "pane_total": current_total,
             "pane_width": pane_width,
             "visible_hash": vis_hash,
+            "archived_lines": archived,
         })
 
     # No scrollback growth, but visible content changed (TUI redraw) → full
@@ -7279,6 +7504,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
                 "pane_total": current_total,
                 "pane_width": pane_width,
                 "visible_hash": vis_hash,
+                "archived_lines": archived,
             })
         return JSONResponse({
             "mode": "none",
@@ -7286,6 +7512,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
             "pane_total": current_total,
             "pane_width": pane_width,
             "visible_hash": vis_hash,
+            "archived_lines": archived,
         })
 
     # Delta: capture only the new lines + small overlap for dedup
@@ -7300,6 +7527,33 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
         "pane_width": pane_width,
         "overlap": overlap,
         "visible_hash": vis_hash,
+        "archived_lines": archived,
+    })
+
+
+@app.get("/api/sessions/{session_name}/history")
+async def api_session_history(session_name: str, before: int = -1, limit: int = 3000):
+    """Older output from this session's own archive, for scrolling back past
+    what tmux still holds.
+
+    `before` is a line index into the archive: the response is the `limit` lines
+    that come before it, so the terminal can walk backwards a chunk at a time.
+    Pass -1 (the default) to start from the end of the archive."""
+    _, found = _find_session(session_name)
+    if not found:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    total = _scrollback_tail(session_name)["lines"]
+    limit = max(1, min(int(limit), 20000))
+    end = total if before is None or before < 0 else min(int(before), total)
+    start = max(0, end - limit)
+    chunk = await asyncio.to_thread(read_scrollback, session_name, start, end - start)
+    return JSONResponse({
+        "start": start,
+        "end": end,
+        "total": total,
+        "raw": "\n".join(chunk["lines"]),
+        "lines": len(chunk["lines"]),
+        "more": start > 0,
     })
 
 
@@ -18247,6 +18501,39 @@ async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
         return False
 
 
+SCROLLBACK_ARCHIVE_INTERVAL = int(os.environ.get("TMUX_DASH_SCROLLBACK_INTERVAL", "20"))
+
+
+async def _scrollback_archive_loop():
+    """Background loop: copy each session's settled output into its own log.
+
+    This is what makes the terminal's history survive. tmux's ring drops the
+    oldest line once it is full and loses the lot when a pane restarts, so the
+    archive has to be taken continuously; there is no way to go back for it
+    afterwards. It only ever reads lines that have scrolled out of the visible
+    area, so it never races the TUI's redraw."""
+    log = logging.getLogger("scrollback")
+    await asyncio.sleep(5)
+    passes = 0
+    while True:
+        try:
+            await asyncio.sleep(SCROLLBACK_ARCHIVE_INTERVAL)
+            for sess in await asyncio.to_thread(get_tmux_sessions):
+                try:
+                    added = await asyncio.to_thread(archive_scrollback, sess["name"])
+                    if added:
+                        log.debug("archived %d lines for %s", added, sess["name"])
+                except Exception:
+                    log.debug("archive failed for %s", sess["name"], exc_info=True)
+            passes += 1
+            if passes % 180 == 0:            # roughly hourly
+                await asyncio.to_thread(_trim_scrollback_files)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("scrollback loop iteration failed", exc_info=True)
+
+
 async def _simple_watchdog_loop():
     """Background loop: nudge sessions that are paused waiting for 'continue'."""
     slog = logging.getLogger("simple-watchdog")
@@ -19340,6 +19627,12 @@ body.member-admin .more-member-only{display:none}
 /* Where a jump landed. Fades on its own so nothing is left highlighted. */
 .raw-output .tl-you.jumped{background:#1f6feb4d;border-left-color:#79c0ff;animation:tl-you-flash 1.6s ease-out}
 @keyframes tl-you-flash{0%,20%{background:#1f6feb80}100%{background:#1f6feb1f}}
+/* The way back to output tmux has already dropped. Hidden entirely when the
+   archive holds nothing older than what is on screen, so it costs no height on
+   a fresh session. */
+.raw-older{display:none;padding:5px 10px;margin-bottom:6px;border:1px dashed #30363d;border-radius:6px;background:#0d1117;color:#79c0ff;font-size:.72rem;text-align:center;cursor:pointer;user-select:none;flex-shrink:0}
+.raw-older.on{display:block}
+.raw-older:hover{border-color:#1f6feb99;background:#1f6feb14;color:#a5d6ff}
 .raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#484f58;border-radius:6px;border:2px solid #0d1117}
@@ -20490,7 +20783,17 @@ const rawState={};
 // against it and rewrites only what moved. `_bodyText` is the transcript with
 // the live counter already stripped, so a repaint of the counter alone is a
 // no-op. `live` is what that counter said, redrawn by us in the status strip.
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+// olderText / olderFrom / archived: history pulled back out of the server's own
+// scrollback archive, which reaches further back than tmux's ring. It is kept
+// separate from fullText because fullText is replaced wholesale on every resync.
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',olderText:'',olderFrom:-1,archived:0,loadingOlder:false,paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+// Everything the terminal should show: the history someone asked for, then the
+// live pane.
+function _rawSource(st){
+  const older=st.olderText||'';
+  const live=st.fullText||'';
+  return older?(live?older+'\n'+live:older):live;
+}
 
 // --- "Clean view" terminal filter ---
 // One switch. On, the terminal shows only what the agent SAID to you and drops
@@ -21358,7 +21661,7 @@ function renderRawText(name,force){
   if(!rawEl)return;
   // The live counter comes off FIRST, in both views. It changes every second,
   // and everything below this line would otherwise re-run every second.
-  const split=splitLiveTail((st.fullText||'').split('\n'));
+  const split=splitLiveTail(_rawSource(st).split('\n'));
   if(split.live.seen){
     split.live.at=_nowMs();
     st.live=split.live;
@@ -21388,12 +21691,17 @@ function renderRawText(name,force){
     // otherwise fits exactly.
     rows=rows.map(l=>l.replace(/\s+$/,''));
   }
-  if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
+  // The cap trims from the HEAD, so it has to make room for history that was
+  // deliberately loaded — otherwise "load earlier" would delete what it just
+  // fetched. Nothing is trimmed off the front of an explicit request.
+  const olderRows=st.olderText?st.olderText.split('\n').length:0;
+  const cap=RAW_MAX_LINES+olderRows;
+  if(rows.length>cap+400)rows=rows.slice(rows.length-cap);
   let htmlLines;
   const prevUserCount=(st.userRows||[]).length;
   st.userRows=[];
   if(!rows.length||!rows.join('').trim()){
-    htmlLines=(st.fullText||'').trim()
+    htmlLines=_rawSource(st).trim()
       ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
       : [];
   }else{
@@ -21620,6 +21928,107 @@ function updateLiveBar(name){
   if(note){
     const txt=busy&&live.esc?'Stop to interrupt':'';
     if(note.textContent!==txt)note.textContent=txt;
+  }
+}
+
+// ── History from before tmux forgot it ──────────────────────────────────────
+// tmux keeps a pane's output in a ring and drops the oldest line once it is
+// full, so scrolling up in a long-running session used to stop dead somewhere in
+// the middle of the day. The server keeps its own archive of the settled lines
+// (see archive_scrollback); this pulls it back a chunk at a time and prepends it.
+//
+// The archive OVERLAPS what is already on screen, because it holds the same
+// settled lines tmux still has. Rather than trying to compute where the seam is
+// from two line counts that are only approximately comparable, the overlap is
+// measured directly: the longest tail of the fetched chunk that equals the head
+// of what is displayed is dropped.
+const OLDER_CHUNK=3000;
+const OLDER_MATCH_RUN=40;
+// Find where the displayed text starts inside the fetched chunk and cut there.
+// Deliberately NOT "the longest tail of the chunk that equals the head of the
+// screen": the archive is written a few seconds behind the pane and routinely
+// runs a little PAST the seam, so an exact-suffix test finds no overlap at all
+// and the whole chunk gets prepended on top of itself. Measured on a live
+// session: 1848 lines agreed, then the archive carried 70 more, and the suffix
+// test duplicated all 1918.
+function _trimOverlap(older,current){
+  if(!older.length||!current.length)return older;
+  const first=current[0];
+  // Only positions where the first displayed line actually occurs can begin the
+  // overlap, so the run comparison happens a handful of times, not thousands.
+  for(let i=older.length-1;i>=0;i--){
+    if(older[i]!==first)continue;
+    const run=Math.min(OLDER_MATCH_RUN,current.length,older.length-i);
+    // Ten identical lines in a row is evidence; one is a coincidence. A
+    // terminal showing fewer than ten lines has nothing worth overlapping, so
+    // the chunk goes in whole.
+    if(run<10)continue;
+    let ok=true;
+    for(let j=0;j<run;j++){if(older[i+j]!==current[j]){ok=false;break}}
+    if(ok)return older.slice(0,i);
+  }
+  return older;
+}
+function updateOlderBar(name){
+  const el=document.getElementById('raw-older-'+name);
+  if(!el)return;
+  const st=getRawState(name);
+  // Before any load: the archive counts SETTLED lines and fullText counts
+  // settled plus the visible area, so an archive longer than what is on screen
+  // is the tell that tmux has already dropped something. After a load,
+  // olderFrom is simply how far back the walk has got.
+  const shown=(st.fullText||'').split('\n').length;
+  const more=st.olderFrom<0?(st.archived>shown):(st.olderFrom>0);
+  el.classList.toggle('on',!!more);
+  if(!more)return;
+  el.textContent=st.loadingOlder
+    ? 'Loading earlier history…'
+    : '⤒ Load earlier history'+(st.olderFrom>0?' · '+st.olderFrom+' more lines':'');
+}
+async function loadEarlierHistory(name){
+  const st=getRawState(name);
+  if(st.loadingOlder)return;
+  const rawEl=document.getElementById('raw-'+name);
+  st.loadingOlder=true;updateOlderBar(name);
+  try{
+    const shown=_rawSource(st).split('\n');
+    const before=st.olderFrom<0?-1:st.olderFrom;
+    // The first pull has to clear whatever the live pane is already showing
+    // before it reaches anything new, so it asks for that much extra.
+    const want=Math.min(20000,OLDER_CHUNK+(st.olderFrom<0?shown.length:0));
+    const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)
+      +'/history?before='+before+'&limit='+want);
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    st.archived=d.total||st.archived;
+    let chunk=(d.raw||'').split('\n');
+    if(chunk.length===1&&chunk[0]==='')chunk=[];
+    // Trimmed on EVERY pull, not just the first. A chunk that does not reach
+    // past the seam is entirely overlap, and the walk still has to advance
+    // past it, so the next pull can land on the seam again.
+    chunk=_trimOverlap(chunk,shown);
+    st.olderFrom=d.start||0;
+    if(chunk.length){
+      st.olderText=chunk.join('\n')+(st.olderText?'\n'+st.olderText:'');
+      // Hold the reader's place: everything they were looking at moves down by
+      // however tall the new block turns out to be.
+      const beforeH=rawEl?rawEl.scrollHeight:0,beforeTop=rawEl?rawEl.scrollTop:0;
+      st.userScrolledUp=true;
+      renderRawText(name,true);
+      if(rawEl){
+        const delta=rawEl.scrollHeight-beforeH;
+        if(delta>0)_setRawScroll(rawEl,beforeTop+delta);
+      }
+    }
+    if(statusInfoEl){
+      statusInfoEl.textContent=st.olderFrom>0
+        ? 'Loaded earlier history · '+st.olderFrom+' older lines still available'
+        : 'Loaded the whole archived history';
+    }
+  }catch(e){
+    if(statusInfoEl)statusInfoEl.textContent='Could not load earlier history: '+(e&&e.message?e.message:e);
+  }finally{
+    st.loadingOlder=false;updateOlderBar(name);
   }
 }
 
@@ -22692,6 +23101,9 @@ function renderDetail(){
       <!-- No control row here on purpose: Stop / Reload / the line count and the
            pane title all live in the header line next to Delete, which buys the
            terminal ~34px of height on every screen. -->
+      <!-- Only on screen when the server's archive reaches further back than
+           tmux's ring still does. Clicking prepends a chunk of it. -->
+      <div class="raw-older" id="raw-older-${s.name}" onclick="loadEarlierHistory('${esc(s.name)}')"></div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
       <!-- The spinner, the seconds counter and the token tally the CLI paints
            into the pane are cut out of the transcript and redrawn here, outside
@@ -23717,6 +24129,7 @@ async function pollRawDelta(name){
     const data=await resp.json();
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
+    if(typeof data.archived_lines==='number'){st.archived=data.archived_lines;updateOlderBar(name);}
     if(data.mode==='full'){
       st.fullText=data.raw||'';
       st.knownLines=data.pane_total;
@@ -23773,6 +24186,7 @@ async function loadRaw(name){
   st.visibleHash='';
   st.firstLoad=true;
   st.fullText='';
+  st.olderText='';st.olderFrom=-1;st.loadingOlder=false;
   st.painted=null;st._bodyText=null;st.live=null;
   // Reload is an explicit "show me the terminal as it is now", which is the
   // opposite of a freeze — so it lifts one.
@@ -24834,7 +25248,8 @@ function buildKeyBar(name,tab){
     ${tab==='raw'?`<span class="key-bar-sep"></span>
     <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>
     <button class="key-btn key-jump" id="jump-btn-${name}" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to the last thing YOU wrote. Click again to step back through earlier messages; from the oldest it returns to the newest.">&#8613; My last message</button>
-    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>`:''}
+    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>
+    <button class="key-btn key-jump" onclick="loadEarlierHistory('${esc(name)}')" title="Pull back output older than tmux still holds, from the dashboard's own archive of this session. Click again for another chunk.">&#8676; Earlier history</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>

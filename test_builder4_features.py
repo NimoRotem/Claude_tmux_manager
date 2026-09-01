@@ -761,3 +761,86 @@ def test_your_own_words_are_marked_and_jumpable():
     assert '<span class="tl-you">' in html
     assert ".raw-output .tl-you{" in html
     assert 'onclick="jumpToLastUserMessage(' in html
+
+
+def test_settled_scrollback_is_archived_without_duplicating(monkeypatch, tmp_path):
+    import app
+
+    # A pane whose settled region grows, exactly as tmux reports it.
+    pane = {"lines": [f"line {i}" for i in range(120)]}
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    monkeypatch.setattr(app, "_settled_pane_lines",
+                        lambda name, count: pane["lines"][-count:])
+    app._scrollback_state.clear()
+
+    assert app.archive_scrollback("s") == 120
+    # Nothing new: a second pass must add nothing, or the log doubles every poll.
+    assert app.archive_scrollback("s") == 0
+
+    pane["lines"] += [f"line {i}" for i in range(120, 150)]
+    assert app.archive_scrollback("s") == 30
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert stored == [f"line {i}" for i in range(150)]
+
+
+def test_the_archive_keeps_what_the_tmux_ring_has_already_dropped(monkeypatch, tmp_path):
+    import app
+
+    # tmux keeps a fixed ring: here the last 100 lines. The archive has to hold
+    # everything the ring has already thrown away, which is the whole point of
+    # it. It can, as long as it is read again before its anchor scrolls out.
+    all_lines = [f"line {i}" for i in range(300)]
+    ring, seen = 100, {"upto": 120}
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    monkeypatch.setattr(
+        app, "_settled_pane_lines",
+        lambda name, count: all_lines[max(0, seen["upto"] - ring):seen["upto"]][-count:])
+    app._scrollback_state.clear()
+
+    app.archive_scrollback("s")
+    for upto in (180, 240, 300):     # the ring drops 60 lines between passes
+        seen["upto"] = upto
+        app.archive_scrollback("s")
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert stored == all_lines[20:]          # 0..19 predate the first read
+    assert app.read_scrollback("s", 0, 5)["lines"] == all_lines[20:25]
+    assert app.read_scrollback("s", 0, 5)["total"] == 280
+
+
+def test_a_pane_that_moved_past_the_anchor_resyncs_instead_of_duplicating(monkeypatch, tmp_path):
+    import app
+
+    # Poll too slowly and the ring drops the anchor. Nothing can bring those
+    # lines back, but the archive must not silently glue unrelated stretches
+    # together either: it marks the break and carries on.
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    pane = {"lines": [f"old {i}" for i in range(60)]}
+    monkeypatch.setattr(app, "_settled_pane_lines",
+                        lambda name, count: pane["lines"][-count:])
+    app._scrollback_state.clear()
+    app.archive_scrollback("s")
+
+    pane["lines"] = [f"new {i}" for i in range(60)]      # nothing in common
+    added = app.archive_scrollback("s")
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert added == 60
+    assert stored[:60] == [f"old {i}" for i in range(60)]
+    assert stored[60] == ""                              # the break marker
+    assert stored[61:] == [f"new {i}" for i in range(60)]
+
+
+def test_terminal_can_load_history_from_before_the_ring(monkeypatch):
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "async function loadEarlierHistory(name)" in html
+    assert "function _trimOverlap(older,current)" in html
+    assert "function updateOlderBar(name)" in html
+    assert "/history?before=" in html
+    assert 'id="raw-older-${s.name}"' in html
+    # The head trim must make room for history that was deliberately loaded.
+    assert "const cap=RAW_MAX_LINES+olderRows;" in html
