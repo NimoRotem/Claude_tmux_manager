@@ -242,6 +242,47 @@ async def api_page_health(port: int, target: str = ""):
         return JSONResponse({"ok": False, "detail": str(exc)[:200]})
 
 
+DASH_LOCAL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
+
+
+async def _dash(method: str, path: str, request: Request, **kw):
+    """Call the dashboard's own API on this box, on the page's behalf.
+
+    The Live run terminal needs the dashboard's session endpoints. Those live at
+    the dashboard root, which exists on builder4 but not under a prefix on another
+    host, so a page served at rotem.ai/patents/filing could not reach them. Routing
+    them through the panel keeps everything the page needs under one public prefix,
+    and the panel is already behind the same guard.
+    """
+    cookies = request.headers.get("cookie", "")
+    headers = {"cookie": cookies} if cookies else {}
+    async with httpx.AsyncClient(base_url=DASH_LOCAL, timeout=45, headers=headers) as c:
+        return await c.request(method, path, **kw)
+
+
+@router.get("/api/session/{name}/tail")
+async def api_session_tail(name: str, request: Request, known_lines: int = 0,
+                           last_hash: str = ""):
+    r = await _dash("GET", "/api/sessions/%s/raw-tail" % name, request,
+                    params={"known_lines": known_lines, "last_hash": last_hash})
+    return JSONResponse(r.json() if r.headers.get("content-type", "").startswith(
+        "application/json") else {"error": r.text[:200]}, status_code=r.status_code)
+
+
+@router.post("/api/session/{name}/send")
+async def api_session_send(name: str, request: Request):
+    body = await request.json()
+    r = await _dash("POST", "/api/sessions/%s/send" % name, request, json=body)
+    return JSONResponse(r.json() if r.content else {}, status_code=r.status_code)
+
+
+@router.post("/api/session/{name}/keys")
+async def api_session_keys(name: str, request: Request):
+    body = await request.json()
+    r = await _dash("POST", "/api/sessions/%s/send-keys" % name, request, json=body)
+    return JSONResponse(r.json() if r.content else {}, status_code=r.status_code)
+
+
 @router.get("/api/live-sessions")
 async def api_live_sessions():
     """Which tmux sessions actually exist, straight from tmux.
@@ -1513,10 +1554,31 @@ async def ws_live(sock: WebSocket):
 # ==========================================================================
 # page
 # ==========================================================================
+def public_base(request: Request) -> str:
+    """Where this panel lives as the browser sees it.
+
+    Served directly that is https://builder4.rotem.ai/patents. Behind the rotem.ai
+    proxy the path is rewritten, so nginx tells us what the public prefix was with
+    X-Forwarded-Prefix and we trust that over what we can see. Getting this wrong
+    is not subtle: every fetch and the live-view websocket hang off it.
+    """
+    fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    prefix = (request.headers.get("x-forwarded-prefix") or "").rstrip("/")
+    if fwd_host and prefix:
+        return "%s://%s%s" % (proto, fwd_host.split(",")[0].strip(), prefix)
+    return str(request.base_url).rstrip("/") + "/patents"
+
+
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def page(request: Request):
-    return HTMLResponse(PAGE.replace("__BASE__", str(request.base_url).rstrip("/")))
+    # The dashboard itself is only ever reached on its own host: sessions, uploads
+    # and the terminal live there, not under a prefix on another domain.
+    dash = os.environ.get("TMUX_DASH_PUBLIC_URL", "").rstrip("/") or \
+        str(request.base_url).rstrip("/")
+    return HTMLResponse(PAGE.replace("__PANEL__", public_base(request))
+                            .replace("__DASH__", dash))
 
 
 PAGE = r"""<!doctype html>
@@ -1910,7 +1972,11 @@ cursor:pointer;font:12px/1.2 sans-serif;color:#000;padding:1px 2px;overflow:hidd
 <section id="s-history"><div class="card"><h3>Filings</h3><div id="hist"></div></div></section>
 </main>
 <script>
-const B="__BASE__", api=(p,o)=>fetch(B+"/patents"+p,o).then(async r=>{const j=await r.json().catch(()=>({}));
+// PB is where this panel lives as the browser sees it. Behind a proxy that is a
+// prefix on another host (rotem.ai/patents/filing); direct it is builder4/patents.
+// Everything the page fetches hangs off PB, so the panel moves without edits.
+const PB="__PANEL__", DASH="__DASH__";
+const B=PB, api=(p,o)=>fetch(PB+p,o).then(async r=>{const j=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(j.error||r.statusText); return j;});
 let S={}, packet=null, roles={};
 const $=id=>document.getElementById(id), esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -2012,7 +2078,7 @@ function drawSignatures(){
       <b>${nm}</b>
       <div style="margin:8px 0;min-height:74px;display:flex;align-items:center;justify-content:center;
         background:#fff;border-radius:8px;border:1px solid var(--line)">
-        ${has?`<img src="${B}/patents/api/signature/${r.id}?t=${Date.now()}" style="max-width:100%;max-height:70px">`
+        ${has?`<img src="${PB}/api/signature/${r.id}?t=${Date.now()}" style="max-width:100%;max-height:70px">`
              :`<span style="color:#888;font-size:12px">no signature on file</span>`}
       </div>
       <div class="row">
@@ -2223,7 +2289,7 @@ $('pkgup').onclick=async()=>{
         headers:{'Content-Type':'application/json'},body:'{}'}); PK=j.packet; }
     for(const f of inp.files){
       const fd=new FormData(); fd.append('file',f);
-      await fetch(`${B}/patents/api/packet/${PK.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
+      await fetch(`${PB}/api/packet/${PK.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
     }
     inp.value=''; await runAudit();
   }catch(e){ $('upstat').textContent=''; toast('Upload failed: '+e.message); }
@@ -2240,7 +2306,7 @@ $('demorun').onclick=async()=>{
 
 $('preview').onclick=async()=>{
   if(!PK)return;
-  const base=`${B}/patents/api/packet/${PK.id}/`;
+  const base=`${PB}/api/packet/${PK.id}/`;
   const f=FACTS||{}, fee=PK.fees||{};
   const invNames=(PK.inventor_ids||[]).map(id=>{
     const i=(S.inventors||[]).find(x=>x.id===id); return i?store_name(i):id;}).join(', ');
@@ -2303,7 +2369,7 @@ window.openSigner=async(name)=>{
 function showPage(n){
   SM.page=Math.max(0,Math.min(n,SM.pages.length-1));
   $('sm-page').textContent=`Page ${SM.page+1} of ${SM.pages.length}`;
-  $('pageimg').src=`${B}/patents/api/packet/${PK.id}/form/${encodeURIComponent(SM.name)}/thumb?page=${SM.page}&t=${Date.now()}`;
+  $('pageimg').src=`${PB}/api/packet/${PK.id}/form/${encodeURIComponent(SM.name)}/thumb?page=${SM.page}&t=${Date.now()}`;
   drawMarks();
 }
 $('sm-prev').onclick=()=>showPage(SM.page-1);
@@ -2351,7 +2417,7 @@ function drawMarks(){
     d.style.left=(it.x*W)+'px'; d.style.top=(it.y*H)+'px';
     d.style.width=(it.w*W)+'px'; d.style.height=(it.h*H)+'px';
     if(it.kind==='signature'){
-      d.innerHTML=`<img src="${B}/patents/api/signature/${it.image}?t=${Date.now()}">`;
+      d.innerHTML=`<img src="${PB}/api/signature/${it.image}?t=${Date.now()}">`;
     } else { d.textContent=it.value; }
     d.title='click to remove';
     d.onclick=ev=>{ev.stopPropagation();SM.items.splice(i,1);drawMarks();};
@@ -2561,7 +2627,7 @@ $('o-scan').onclick=async()=>{
   try{
     for(const f of inp.files){
       const fd=new FormData(); fd.append('file',f);
-      await fetch(`${B}/patents/api/obs/${OB.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
+      await fetch(`${PB}/api/obs/${OB.id}/upload`,{method:'POST',body:fd,credentials:'same-origin'});
     }
     $('o-scanstat').textContent='checking...';
     const j=await oapi('/'+OB.id+'/scan',{method:'POST'});
@@ -2583,7 +2649,7 @@ $('obsdemo').onclick=async()=>{
 };
 function obsPreview(){
   if(!OB)return toast('Nothing to preview yet.');
-  const base=`${B}/patents/api/obs/${OB.id}/`;
+  const base=`${PB}/api/obs/${OB.id}/`;
   const r=OBR||{}, f=r.fee||{}, t=r.timing||{};
   $('o-previewblurb').innerHTML=
     `<b>Third-party observation on ${esc(OB.application_number||'(no application number)')}</b><br>`
@@ -2658,7 +2724,7 @@ function drawRunSessions(keep){
     : '<option value="">no filing session yet</option>';
   if(cur&&list.some(s=>s.name===cur))$('rsel').value=cur;
   const n=$('rsel').value;
-  $('ropen').href=n?`${B}/#/session/${encodeURIComponent(n)}/raw`:'#';
+  $('ropen').href=n?`${DASH}/#/session/${encodeURIComponent(n)}/raw`:'#';
 }
 function termEl(){return $('term');}
 function renderTerm(){
@@ -2671,7 +2737,7 @@ async function termPoll(){
   const name=T.name; if(!name)return;
   try{
     const q=`?known_lines=${T.known}&last_hash=${encodeURIComponent(T.hash||'')}`;
-    const r=await fetch(`${B}/api/sessions/${encodeURIComponent(name)}/raw-tail`+q,{credentials:'same-origin'});
+    const r=await fetch(`${PB}/api/session/${encodeURIComponent(name)}/tail`+q,{credentials:'same-origin'});
     if(r.status===404){
       if(!T.gone){T.gone=true;$('rlive').textContent='session ended';$('rlive').className='pill bad';
         if(!T.text)termEl().textContent='That tmux session is gone. The filing it belongs to is in '
@@ -2718,7 +2784,7 @@ async function sendToAgent(text){
   if(!T.name)return toast('No session attached.');
   if(!text.trim())return;
   try{
-    await fetch(`${B}/api/sessions/${encodeURIComponent(T.name)}/send`,
+    await fetch(`${PB}/api/session/${encodeURIComponent(T.name)}/send`,
       {method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
        body:JSON.stringify({command:text})});
     $('rcmd').value=''; setTimeout(termPoll,400);
@@ -2730,7 +2796,7 @@ $('rcmd').addEventListener('keydown',e=>{
 document.querySelectorAll('#rkeys .key').forEach(b=>b.onclick=async()=>{
   if(!T.name)return toast('No session attached.');
   try{
-    await fetch(`${B}/api/sessions/${encodeURIComponent(T.name)}/send-keys`,
+    await fetch(`${PB}/api/session/${encodeURIComponent(T.name)}/keys`,
       {method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
        body:JSON.stringify({keys:[b.dataset.k]})});
     setTimeout(termPoll,300);
@@ -2839,7 +2905,7 @@ $('battach').onclick=()=>{
   if(live){live.close();live=null;}
   const port=$('bsel').value,target=$('tsel').value; if(!port)return;
   const ro=$('binteract').checked?'0':'1';
-  const url=B.replace(/^http/,'ws')+`/patents/ws/live?port=${port}&target=${encodeURIComponent(target)}&ro=${ro}`;
+  const url=PB.replace(/^http/,'ws')+`/ws/live?port=${port}&target=${encodeURIComponent(target)}&ro=${ro}`;
   live=new WebSocket(url); let n=0,t0=Date.now(),kb=0;
   live.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.t==='frame'){n++;kb+=e.data.length*0.75/1024;$('screen').src='data:image/jpeg;base64,'+m.d;

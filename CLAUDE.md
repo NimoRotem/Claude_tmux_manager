@@ -4,7 +4,9 @@ Global rules (how to work, git, where things are) are in `~/CLAUDE.md` — don't
 
 - If you think you're done, you're not: re-check the scope of the task, then do some QA.
 - This app is a single 17k-line `app.py` (FastAPI + inline HTML/CSS/JS). Backend routes, styles and frontend JS all live in it; there is no `static/` or `templates/`.
-- The exception is the USPTO filing panel at `/patents`: `patent_panel.py` (router + page),
+- The exception is the USPTO filing panel, served at **https://rotem.ai/patents/filing/**
+  (nginx on the `builder` VM proxies it to this box's :8501 `/patents` with
+  `X-Forwarded-Prefix`; https://builder4.rotem.ai/patents still works and is the direct route): `patent_panel.py` (router + page),
   `patent_store.py` (parties, presets, the 37 CFR 1.31 gate, fees), `patent_packet.py` (packet
   intake and checks), `patent_forms.py` (fills the official USPTO PDFs), `browser_live.py`
   (CDP screencast viewer). app.py only mounts them. Data lives in `~/.tmux-dashboard/patents/`.
