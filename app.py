@@ -879,9 +879,13 @@ def _load_simple_watchdog_disabled():
 #   full  — everything in "basic" PLUS the autopilot watchdog that composes and
 #           types a "keep going" message when Claude pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
-# New sessions default to "basic". Persisted per session to disk.
+# New sessions default to "full": a session that stops half-done and waits for a
+# user who is away is the failure this dashboard exists to prevent, and "basic"
+# left the composing watchdog dormant on every session nobody had toggled by
+# hand. The in-session Stop hook (~/.claude/hooks/keep_going.py) catches the
+# common case first; this catches what survives it. Persisted per session.
 AUTOPUSH_MODES = ("off", "basic", "full")
-AUTOPUSH_DEFAULT = "basic"
+AUTOPUSH_DEFAULT = "full"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
 
