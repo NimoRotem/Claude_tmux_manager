@@ -1606,6 +1606,11 @@ def _ensure_user_claude_config_dir(user: dict):
     # update fails. Must run after the stub exists so the merge keeps
     # hasCompletedOnboarding. See _seed_profile_update_config.
     _seed_profile_update_config(d)
+    # Finish the work instead of handing it back. NOT gated on TEAM_MODE: this dir
+    # is created for every non-admin user whether team mode is on or not, and the
+    # boxes that actually have members run with TEAM_MODE unset, so gating this
+    # would leave it inert in exactly the place the gap is real.
+    _install_keep_going_hooks(d)
     # Team mode: shared Claude auth token, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
@@ -1618,7 +1623,6 @@ def _ensure_user_claude_config_dir(user: dict):
             _sync_group_context_into(claude_md, user.get("group", ""))
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
-            _install_keep_going_hooks(d)
             _ensure_google_mcp(d, user)
             _disable_claude_ai_connectors(d)
             _set_team_model_effort(d)

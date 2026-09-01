@@ -121,6 +121,54 @@ def test_does_nothing_when_the_scripts_are_missing(cfg, monkeypatch, tmp_path):
     assert not (cfg / "settings.json").exists()
 
 
+def test_installed_for_a_member_even_with_team_mode_off(tmp_path, monkeypatch):
+    """The regression this exists for.
+
+    The per-user config dir is created for every non-admin user regardless of
+    TEAM_MODE, and the boxes that actually have members run with TEAM_MODE unset.
+    Gating the install on team mode leaves it inert exactly where the gap is real,
+    so drive the real bootstrap with team mode OFF and require the hook anyway.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    stop = hooks / "keep_going.py"
+    reset = hooks / "keep_going_reset.py"
+    stop.write_text("#!/usr/bin/env python3\n")
+    reset.write_text("#!/usr/bin/env python3\n")
+    monkeypatch.setattr("app.KEEP_GOING_HOOK", stop)
+    monkeypatch.setattr("app.KEEP_GOING_RESET_HOOK", reset)
+    monkeypatch.setattr(
+        "app._KEEP_GOING_EVENTS",
+        (("Stop", stop), ("SubagentStop", stop), ("UserPromptSubmit", reset)),
+    )
+    monkeypatch.setattr("app.TEAM_MODE", False)
+
+    from app import _ensure_user_claude_config_dir, _user_claude_config_dir
+
+    user = {"id": "u_test123", "username": "member", "role": "user"}
+    _ensure_user_claude_config_dir(user)
+
+    s = json.loads((_user_claude_config_dir(user) / "settings.json").read_text())
+    assert "keep_going.py" in _commands(s, "Stop")[0]
+    assert "keep_going.py" in _commands(s, "SubagentStop")[0]
+    assert "keep_going_reset.py" in _commands(s, "UserPromptSubmit")[0]
+    assert "AskUserQuestion" in s["permissions"]["deny"]
+
+
+def test_admin_config_dir_is_untouched_by_the_member_bootstrap(tmp_path, monkeypatch):
+    """Admin uses ~/.claude directly; the bootstrap must not rewrite it."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    from app import _ensure_user_claude_config_dir
+
+    _ensure_user_claude_config_dir({"id": "admin", "username": "Nimo", "role": "admin"})
+    assert not (home / ".claude" / "settings.json").exists()
+
+
 def test_canonical_hook_paths_point_at_the_real_files():
     """Guards the deployed install: these are what member dirs are pointed at."""
     assert KEEP_GOING_HOOK.name == "keep_going.py"
