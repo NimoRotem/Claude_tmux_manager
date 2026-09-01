@@ -1285,40 +1285,24 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 
-# The USPTO filing panel is its own module rather than another 1.5k lines in here:
-# it is a self-contained surface (party data and the 37 CFR 1.31 gate, packet
-# checks, USPTO form generation, a CDP screencast viewer) with its own page. It is
-# mounted here, above the /{username} catch-all, and an import failure must never
-# take the dashboard down with it.
-try:
-    import patent_panel
+# The USPTO filing panel MOVED OUT on 2026-09-01. It is its own service now
+# (supervisor `patent-filing`, its own sessions, browser, login and data) served at
+# https://rotem.ai/patents/filing/ . Two copies of an app that spends money and
+# drives a logged-in Patent Center session is one copy too many, so this host keeps
+# only a redirect: anyone with the old URL, or an old bookmark, lands on the real
+# one instead of quietly using a stale build.
+FILING_APP_URL = os.environ.get("PATENT_FILING_URL", "https://rotem.ai/patents/filing/")
 
-    def _patent_panel_allowed(cookies: dict) -> bool:
-        """Signed-in, and on a shared dashboard an admin.
 
-        The HTTP middleware below already gates ordinary requests, but it does not
-        run for websockets, and the panel's live browser view streams a logged-in
-        USPTO session. Members must not reach it either: it holds Nimo's personal
-        addresses and spends on a company card.
-        """
-        if AUTH_PASS and not _check_token(cookies.get(AUTH_COOKIE)):
-            return False
-        if TEAM_MODE:
-            return _is_admin(_user_from_token(cookies.get(AUTH_COOKIE)))
-        return True
+@app.get("/patents")
+@app.get("/patents/")
+async def patents_moved():
+    return RedirectResponse(FILING_APP_URL, status_code=308)
 
-    patent_panel.set_auth_guard(_patent_panel_allowed)
-    app.include_router(patent_panel.router)
-    app.include_router(patent_panel.ws_router)
-    logger.info("patent panel mounted at /patents")
-except ModuleNotFoundError as exc:
-    # Not installed on this host is not a fault. The panel needs pymupdf and it
-    # is only wanted on the box that actually files; the whole fleet runs one
-    # build, so every other box would otherwise log an ERROR and a traceback on
-    # every boot for a feature it was never meant to serve.
-    logger.info("patent panel not available on this host (%s); nothing else is affected", exc)
-except Exception:
-    logger.exception("patent panel unavailable; the rest of the dashboard is unaffected")
+
+@app.get("/patents/{rest:path}")
+async def patents_moved_deep(rest: str):
+    return RedirectResponse(FILING_APP_URL, status_code=308)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2026,6 +2010,11 @@ async def auth_middleware(request: Request, call_next):
     if path in ("/login", "/login/", rp + "/login", rp + "/login/"):
         return await call_next(request)
     if path in ("/logout", "/logout/", rp + "/logout", rp + "/logout/"):
+        return await call_next(request)
+    # The filing app moved to its own service. Send an old bookmark straight there
+    # rather than through a login for an app that no longer lives here.
+    if path == "/patents" or path.startswith("/patents/") or \
+            path == rp + "/patents" or path.startswith(rp + "/patents/"):
         return await call_next(request)
     # SSO verify endpoint for nginx auth_request from sibling knowva.ai apps:
     # it must return its own 200/401 based on the cookie, NOT the login-page
