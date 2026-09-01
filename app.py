@@ -1618,6 +1618,7 @@ def _ensure_user_claude_config_dir(user: dict):
             _sync_group_context_into(claude_md, user.get("group", ""))
             _sync_group_skills_into(d, user.get("group", ""))
             _install_sandbox_hook(d, user)
+            _install_keep_going_hooks(d)
             _ensure_google_mcp(d, user)
             _disable_claude_ai_connectors(d)
             _set_team_model_effort(d)
@@ -4343,6 +4344,73 @@ def _install_sandbox_hook(cfg_dir: Path, user: dict):
         settings_path.write_text(json.dumps(settings, indent=2))
     except Exception:
         logger.debug("Failed to install sandbox hook into %s", settings_path, exc_info=True)
+
+
+# --- keep-going hooks ------------------------------------------------------
+# A member session runs with its own CLAUDE_CONFIG_DIR, so it never reads the
+# owner's ~/.claude/settings.json and none of the fleet-wide autonomy settings
+# reach it. Register the same Stop hooks and the same AskUserQuestion denial in
+# every member config dir, or members are the one class of session that can
+# still stop half-done and ask a question nobody is there to answer.
+#
+# The scripts are NOT copied per user: every config dir points at the single
+# canonical pair under ~/.claude/hooks so there is nothing to drift. They are
+# readable by every session because all sessions run as the same OS user.
+KEEP_GOING_HOOK = Path.home() / ".claude" / "hooks" / "keep_going.py"
+KEEP_GOING_RESET_HOOK = Path.home() / ".claude" / "hooks" / "keep_going_reset.py"
+_KEEP_GOING_EVENTS = (
+    ("Stop", KEEP_GOING_HOOK),
+    ("SubagentStop", KEEP_GOING_HOOK),
+    ("UserPromptSubmit", KEEP_GOING_RESET_HOOK),
+)
+
+
+def _install_keep_going_hooks(cfg_dir: Path):
+    """Make a member session finish its work instead of handing it back."""
+    if not KEEP_GOING_HOOK.exists() or not KEEP_GOING_RESET_HOOK.exists():
+        # Registering a command that isn't there would log a hook error on every
+        # single stop. The hooks fail open anyway, so skipping is the quiet path.
+        logger.debug("keep-going hooks missing at %s; not registering", KEEP_GOING_HOOK.parent)
+        return
+    settings_path = cfg_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        if not isinstance(settings, dict):
+            settings = {}
+    except Exception:
+        settings = {}
+
+    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    for event, script in _KEEP_GOING_EVENTS:
+        cmd = "python3 " + shlex.quote(str(script))
+        existing = hooks.get(event)
+        if not isinstance(existing, list):
+            existing = []
+        # Drop our own previous entry (by script name) so re-applying this on
+        # every member setup call self-heals instead of stacking duplicates.
+        existing = [h for h in existing if script.name not in json.dumps(h)]
+        existing.append({"hooks": [{"type": "command", "command": cmd}]})
+        hooks[event] = existing
+    settings["hooks"] = hooks
+
+    # A blocking multiple-choice prompt is the other way a session stalls on an
+    # absent user. Denying the tool removes it from the model's tool list.
+    perms = settings.get("permissions")
+    if not isinstance(perms, dict):
+        perms = {}
+    deny = perms.get("deny")
+    if not isinstance(deny, list):
+        deny = []
+    if "AskUserQuestion" not in deny:
+        deny.append("AskUserQuestion")
+    perms["deny"] = deny
+    settings["permissions"] = perms
+
+    try:
+        _backup_before_dashboard_write(settings_path)
+        settings_path.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        logger.debug("Failed to install keep-going hooks into %s", settings_path, exc_info=True)
 
 
 # --- email (Resend) --------------------------------------------------------
