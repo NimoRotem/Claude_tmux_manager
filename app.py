@@ -467,6 +467,13 @@ def _model_flag_for_relaunch(session_name: str) -> str:
     # running on. If the shortage is still there the CLI will fall back again and
     # say so in the badge, which is the honest outcome either way.
     fb = _session_fallback.get(session_name) or {}
+    if not fb:
+        # This process may have started after the switch happened, so fall back to
+        # what the session was recorded as being put on. Only when it disagrees
+        # with what is running: agreeing means there is nothing to undo.
+        chosen = _session_model_choice(session_name)
+        if chosen and last and chosen.split("[", 1)[0] != last.split("[", 1)[0]:
+            fb = {"from": chosen, "to": last.split("[", 1)[0]}
     if fb.get("from") and fb.get("to") and last.split("[", 1)[0] == fb["to"]:
         wide = last.endswith("[1m]")
         last = fb["from"]
@@ -1810,6 +1817,61 @@ def _clear_session_convo(session_name: str):
             SESSION_CONVOS_FILE.write_text(json.dumps(convos, indent=2))
         except Exception:
             logger.debug("Failed to save session conversations", exc_info=True)
+
+
+# WHAT THIS SESSION WAS ASKED TO RUN, which is not always what it is running.
+# Claude Code substitutes a model of its own when the chosen one is short of
+# capacity, and it does so silently. Reading the switch out of the transcript
+# catches it only while the record is still inside the tail window and only for
+# as long as this process lives, so the intent is written down instead: set when
+# somebody chooses a model, compared against reality on every poll. That comparison
+# survives a dashboard restart and a transcript that has moved on by megabytes.
+SESSION_MODEL_CHOICE_FILE = MESSAGES_DIR / "session_model_choice.json"
+_session_model_choice_cache: Optional[Dict[str, str]] = None
+
+
+def _load_session_model_choices() -> Dict[str, str]:
+    global _session_model_choice_cache
+    if _session_model_choice_cache is not None:
+        return _session_model_choice_cache
+    try:
+        if SESSION_MODEL_CHOICE_FILE.exists():
+            data = json.loads(SESSION_MODEL_CHOICE_FILE.read_text())
+            if isinstance(data, dict):
+                _session_model_choice_cache = {str(k): str(v) for k, v in data.items()}
+                return _session_model_choice_cache
+    except Exception:
+        logger.debug("Failed to load session model choices", exc_info=True)
+    _session_model_choice_cache = {}
+    return _session_model_choice_cache
+
+
+def _set_session_model_choice(session_name: str, model_id: str):
+    """Remember the model this session was deliberately put on."""
+    if not session_name or not model_id:
+        return
+    choices = _load_session_model_choices()
+    if choices.get(session_name) == model_id:
+        return
+    choices[session_name] = model_id
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_MODEL_CHOICE_FILE.write_text(json.dumps(choices, indent=2))
+    except Exception:
+        logger.debug("Failed to save session model choices", exc_info=True)
+
+
+def _session_model_choice(session_name: str) -> str:
+    return _load_session_model_choices().get(session_name, "")
+
+
+def _clear_session_model_choice(session_name: str):
+    choices = _load_session_model_choices()
+    if choices.pop(session_name, None) is not None:
+        try:
+            SESSION_MODEL_CHOICE_FILE.write_text(json.dumps(choices, indent=2))
+        except Exception:
+            logger.debug("Failed to save session model choices", exc_info=True)
 
 
 def _user_for_session(session_name: str) -> Optional[dict]:
@@ -8187,6 +8249,8 @@ async def api_create_session(request: Request, body: CreateSession):
                 _cmd_line = f"{_cmd_line} --session-id {_convo}"
                 _set_session_convo(created, _convo)
             _banner = _launch_banner(created, _owner_name, _model, _effort)
+            if _model:
+                _set_session_model_choice(created, _model)
             _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
             _boot.append(_managed_agent_command(created, _cmd_line))
         # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
@@ -8357,6 +8421,11 @@ async def api_delete_session(request: Request, session_name: str):
         # A new session that reuses this name must not inherit the dead one's
         # conversation — that is the same mix-up by another route.
         _clear_session_convo(session_name)
+        # Same reasoning for the model it was put on: a reused name must not
+        # inherit a dead session's choice and get relaunched on it.
+        _clear_session_model_choice(session_name)
+        _session_fallback.pop(session_name, None)
+        _session_fb_scan.pop(session_name, None)
         _remove_session_display_name(session_name)
         SESSION_LIFECYCLE.remove(
             session_name,
@@ -17414,6 +17483,66 @@ _MODEL_1M_RE = re.compile(r"\[1m\]|\b1m context\b", re.I)
 # seen at least once while it is fresh and can be remembered), narrow enough that
 # the extra work is parsing a handful of lines already in memory.
 _FALLBACK_LOOKBACK = 20
+# Where the forward scan for fallback records has read up to, per session.
+_session_fb_scan: Dict[str, dict] = {}   # {name: {"path": str, "off": int}}
+_FB_FIRST_LOOK = 1_000_000    # history to check the first time a file is seen
+_FB_MAX_CATCHUP = 8_000_000   # never read more than this in one pass
+
+
+def _fallback_since_last_look(session_name: str, path: str) -> dict:
+    """The newest fallback record written since the last time we looked.
+
+    The tail read that yields model and effort deliberately keeps a small window,
+    and ONE tool result is regularly bigger than the whole window, so a fallback
+    two turns back can already be out of reach: that is how a switch that plainly
+    happened still showed nothing. Following the file forward instead means the
+    cost is the bytes the session has actually written since the last poll, and no
+    record is missed however large a turn was. Returns {"from":…, "to":…} or {}.
+    """
+    state = _session_fb_scan.get(session_name) or {}
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    off = state.get("off", 0) if state.get("path") == path else None
+    if off is None:                      # first sight of this file
+        off = max(0, size - _FB_FIRST_LOOK)
+    elif off > size:                     # truncated or replaced under us
+        off = 0
+    if size - off > _FB_MAX_CATCHUP:     # been away a long time: skip the middle
+        off = size - _FB_MAX_CATCHUP
+    if size <= off:
+        _session_fb_scan[session_name] = {"path": path, "off": off}
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            chunk = fh.read(size - off)
+    except OSError:
+        return {}
+    # Stop at the last complete line so a half-written record is read next time,
+    # not skipped.
+    cut = chunk.rfind(b"\n") + 1
+    _session_fb_scan[session_name] = {"path": path, "off": off + (cut or 0)}
+    found = {}
+    for raw in chunk[:cut].split(b"\n"):
+        if b'"fallback"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        for part in (msg.get("content") or []):
+            if isinstance(part, dict) and part.get("type") == "fallback":
+                src = (part.get("from") or {}).get("model") or ""
+                dst = (part.get("to") or {}).get("model") or ""
+                if src and dst:
+                    found = {"from": src, "to": dst}
+                break
+    return found
 
 
 def _iso_epoch(ts: str) -> float:
@@ -17622,6 +17751,12 @@ def _detect_session_model_effort(session_name: str) -> dict:
     # transcript that grows past 4 MB, and re-scanning for it every 30s is how a
     # detail nobody looks at becomes the most expensive poll on the box.
     fb = facts.get("fell_back_from") or ""
+    if not fb and newest:
+        # Nothing in the window this time. Follow the file forward from where we
+        # last looked, which catches a record a huge turn has already pushed out.
+        seen_fb = _fallback_since_last_look(session_name, newest)
+        if seen_fb:
+            _session_fallback[session_name] = seen_fb
     if fb and model:
         _session_fallback[session_name] = {"from": fb, "to": model}
     kept = _session_fallback.get(session_name)
@@ -18255,6 +18390,9 @@ async def api_set_session_model(session_name: str, body: ModelBody):
             await asyncio.sleep(0.8)
         if confirmed:
             _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
+            # On disk, so a restart still knows what this session was put on even
+            # if the CLI has substituted a model of its own since.
+            _set_session_model_choice(session_name, mid)
         _session_model_cache.pop(session_name, None)
         # /model persists the choice into settings.json as the default for NEW
         # sessions ("saved as your default") — the exact drift that turned the
