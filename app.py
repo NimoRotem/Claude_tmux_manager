@@ -19893,6 +19893,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
 .model-menu .mm-item:hover{background:#21262d}
 .model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
+/* Undo the CLI's own substitution. Amber, like the badge that reports it. */
+.model-menu .mm-item.mm-restore{color:#e3b341;border-bottom:1px solid #30363d;border-radius:6px 6px 0 0;margin-bottom:2px}
+.model-menu .mm-item.mm-restore:hover{background:#d2992222}
 .tab-more-model-value{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
 .badge.unsure{opacity:.55;font-style:italic}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
@@ -22966,6 +22969,15 @@ async function setSessionEffort(name,effort){
     alert('Effort switch failed: '+(e&&e.message?e.message:e));
   }
 }
+// The id that would put a substituted session back on what it was set to. The
+// transcript records a bare id, so re-apply the wide-context tier when the
+// session was on it and the family offers one.
+function _restoreModelId(s){
+  const base=s&&s.fell_back_from;
+  if(!base)return '';
+  if((s.model||'').endsWith('[1m]')&&MODEL_CHOICES.some(c=>c[0]===base+'[1m]'))return base+'[1m]';
+  return MODEL_CHOICES.some(c=>c[0]===base)?base:'';
+}
 function modelBadgeLabel(s){
   if(s&&s.model_pending)return modelChoiceLabel(s.model_pending)+'…';
   // A model the CLI moved to ON ITS OWN is named as such. Without this the badge
@@ -22994,6 +23006,14 @@ function openModelMenu(name,anchor,ev){
   const menu=document.createElement('div');
   menu.className='model-menu';
   let html='<div class="mm-title">Model · applies from next reply</div>';
+  // Undoing the CLI's own substitution is the reason this menu is being opened
+  // at all, so it goes at the top rather than leaving somebody to remember which
+  // of thirteen rows they had picked.
+  const back=_restoreModelId(s);
+  if(back){
+    html+='<div class="mm-item mm-restore" onclick="setSessionModel(\''+esc(name)+'\',\''+esc(back)+'\')">'
+      +'<span>&#8617; Back to '+esc(modelChoiceLabel(back))+'</span></div>';
+  }
   MODEL_CHOICES.forEach(([id,label])=>{
     // Transcript-detected models carry no [1m]; treat the base-id match as
     // current only when no exact [1m] choice matches.
