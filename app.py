@@ -465,6 +465,25 @@ def _model_flag_for_relaunch(session_name: str) -> str:
         return f" --model {shlex.quote(DEFAULT_MODEL)}"
     return f" --model {shlex.quote(last)}"
 
+
+def _effort_flag_for_relaunch(session_name: str) -> str:
+    """` --effort <level>` for a crash/relogin relaunch: preserve the level the
+    session was actually running at.
+
+    Without it the relaunched CLI starts on settings.json's `effortLevel`, which
+    this dashboard deliberately keeps pinned at DEFAULT_EFFORT, so a session
+    someone had put on `max` came back at xhigh and nothing anywhere said so.
+    `max` is the case that matters and the case that breaks: the CLI refuses to
+    persist it ("session-only"), so the launch flag is the ONLY thing that can
+    carry it across a restart."""
+    try:
+        last = (_get_session_effort(session_name) or "").strip().lower()
+    except Exception:
+        last = ""
+    if last not in ALLOWED_SESSION_EFFORTS:
+        last = DEFAULT_EFFORT
+    return f" --effort {shlex.quote(last)}" if last else ""
+
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
 # simplified UI, a shared Claude auth token, per-user context, OAuth connections,
@@ -1113,7 +1132,8 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             session_name,
             "NODE_OPTIONS=--max-old-space-size=8192 "
             f"claude --dangerously-skip-permissions {resume_flag}"
-            f"{_model_flag_for_relaunch(session_name)}")
+            f"{_model_flag_for_relaunch(session_name)}"
+            f"{_effort_flag_for_relaunch(session_name)}")
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -7715,16 +7735,28 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     """Build a managed Claude command bound to one exact conversation."""
     if not _UUID_RE.fullmatch(str(resume_uuid or "")):
         raise ValueError("invalid Claude resume UUID")
+    # RESUMING A CONVERSATION IS NOT STARTING ONE. The launch defaults belong to a
+    # new session; applying them here silently moved a restored session back onto
+    # DEFAULT_MODEL and DEFAULT_EFFORT, so a session deliberately put on Fable at
+    # max came back as Opus at xhigh with the same history and no notice. Carry
+    # the session's own model and effort across instead, exactly as the crash and
+    # relogin relaunches do. Both helpers fall back to the defaults on their own
+    # when there is nothing to read, which is the right answer for a fresh restore.
     command, _model, _effort = _claude_cmd_with_flags(
         NEW_SESSION_CMD or "claude --dangerously-skip-permissions",
+        pin_model=False,
     )
     command = re.sub(
         r"\s+--(?:session-id|resume)\s+(?:'[^']*'|\"[^\"]*\"|\S+)",
         "",
         command,
     )
+    command = re.sub(r"\s+--effort(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)", "", command)
     command = re.sub(r"\s+--continue\b", "", command)
-    command = command.strip() + " --resume " + resume_uuid
+    command = (command.strip()
+               + _model_flag_for_relaunch(session_name)
+               + _effort_flag_for_relaunch(session_name)
+               + " --resume " + resume_uuid)
     return _managed_agent_command(session_name, command)
 
 
@@ -7809,11 +7841,16 @@ def _restore_durable_session(candidate: dict) -> dict:
         elif (profile_id := _get_session_profile_id(name)) != DEFAULT_PROFILE_ID:
             boot.append(_profile_export_line(profile_id))
         boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
-        boot.append(_claude_recovery_command(name, resume_uuid))
+        recovery = _claude_recovery_command(name, resume_uuid)
+        boot.append(recovery)
+        # Name what this restore is ACTUALLY starting on, not the box defaults:
+        # the recovery command now carries the session's own model and effort.
         launch = _launch_script_line(
             name,
             boot,
-            _launch_banner(name, owner_name, DEFAULT_MODEL, DEFAULT_EFFORT),
+            _launch_banner(name, owner_name,
+                           _flag_value(recovery, "model") or DEFAULT_MODEL,
+                           _flag_value(recovery, "effort") or DEFAULT_EFFORT),
         )
         for command in (
             ["tmux", "send-keys", "-t", created_id, "-l", launch],
@@ -15629,7 +15666,8 @@ async def _auto_fix_login(session_name: str) -> dict:
         "NODE_OPTIONS=--max-old-space-size=8192 "
         "claude --dangerously-skip-permissions "
         + await _async_resume_flag(session_name)
-        + _model_flag_for_relaunch(session_name)))
+        + _model_flag_for_relaunch(session_name)
+        + _effort_flag_for_relaunch(session_name)))
     # 4. Confirm it came back authenticated.
     for _ in range(20):
         await asyncio.sleep(2)
@@ -15917,7 +15955,8 @@ async def api_session_relogin(session_name: str, request: Request):
                         "NODE_OPTIONS=--max-old-space-size=8192 "
                         "claude --dangerously-skip-permissions "
                         + await _async_resume_flag(session_name)
-                        + _model_flag_for_relaunch(session_name))],
+                        + _model_flag_for_relaunch(session_name)
+                        + _effort_flag_for_relaunch(session_name))],
         capture_output=True, text=True, timeout=5)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -16964,6 +17003,8 @@ _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
 _session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 _session_effort_pending: Dict[str, dict] = {}  # {session_name: {"effort": str, "ts": float}}
+# Model changes the CLI made for ITSELF (capacity fallback), while they still hold.
+_session_fallback: Dict[str, dict] = {}  # {session_name: {"from": str, "to": str}}
 
 
 # --- How is each session actually signed in? --------------------------------
@@ -17127,6 +17168,9 @@ def _session_model_fields(session_name: str) -> dict:
 
     return {
         "model": model, "model_pending": (pend or {}).get("model", ""),
+        # The model the CLI moved OFF on its own, while that move still holds.
+        # Empty for the normal case: somebody chose this model.
+        "fell_back_from": detected.get("fell_back_from", ""),
         # False when several sessions share a working directory and this one's
         # transcript could not be told apart from its siblings.
         "detect_sure": bool(detected.get("sure", True)),
@@ -17324,6 +17368,11 @@ _CTX_WINDOW_1M = 1_000_000
 _PANE_EFFORT_RE = re.compile(r"⎿\s*Set effort level to ([a-z]+)", re.I)
 _PANE_MODEL_RE = re.compile(r"⎿\s*Set model to\s+([^\n]+)", re.I)
 _MODEL_1M_RE = re.compile(r"\[1m\]|\b1m context\b", re.I)
+# How many assistant entries to keep reading past a complete answer, looking for
+# a fallback record. Wide enough to cover the 30s detection cache (so a switch is
+# seen at least once while it is fresh and can be remembered), narrow enough that
+# the extra work is parsing a handful of lines already in memory.
+_FALLBACK_LOOKBACK = 20
 
 
 def _iso_epoch(ts: str) -> float:
@@ -17347,7 +17396,8 @@ def _scan_assistant_tail(lines: list) -> dict:
     session is buying, read from the usage record rather than assumed: a 1h
     entry means the transcript is still warm an hour later, a 5m one means it
     is cold after five minutes."""
-    out = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0}
+    out = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
+           "fell_back_from": ""}
     seen = 0
     for line in reversed(lines):
         line = line.strip()
@@ -17365,6 +17415,22 @@ def _scan_assistant_tail(lines: list) -> dict:
             msg = d
         if not out["model"]:
             out["model"] = msg.get("model") or d.get("model") or ""
+        # THE CLI CAN CHANGE THE MODEL ON ITS OWN. When the chosen model is out of
+        # capacity Claude Code falls back, writes the switch as a first-class
+        # assistant entry, and prints NOTHING in the pane: a session started on
+        # Fable 5.1 quietly finishes on Opus 5, and the badge that reports it looks
+        # like it is lying. Read the record so the badge can name who switched.
+        if not out["fell_back_from"] and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if not isinstance(part, dict) or part.get("type") != "fallback":
+                    continue
+                src = ((part.get("from") or {}) or {}).get("model") or ""
+                dst = ((part.get("to") or {}) or {}).get("model") or ""
+                # Only while it is still in force: a later switch back to the
+                # original leaves the newest turns on that model instead.
+                if src and dst and dst == (out["model"] or dst):
+                    out["fell_back_from"] = src
+                break
         if not out["effort"] and isinstance(d.get("effort"), str) and d["effort"]:
             out["effort"] = d["effort"]
         if not out["ts"]:
@@ -17385,7 +17451,12 @@ def _scan_assistant_tail(lines: list) -> dict:
                 m5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
                 if h1 or m5:
                     out["ttl"] = 3600 if h1 >= m5 else 300
-        if out["model"] and out["effort"] and out["ctx"] and out["ttl"]:
+        # The four facts are usually complete on the first entry, but a fallback
+        # is a single record a few turns back and stopping there would miss it
+        # for the whole rest of the run. Keep parsing a short way past the answer,
+        # far enough to cover the gap between two polls, never past the old cap.
+        if (out["model"] and out["effort"] and out["ctx"] and out["ttl"]
+                and (out["fell_back_from"] or seen >= _FALLBACK_LOOKBACK)):
             break
         if seen >= 60:
             break
@@ -17401,7 +17472,8 @@ def _last_assistant_facts(path: str) -> dict:
     hundreds of KB, so a fixed tail regularly held no complete assistant record
     at all: the read came back empty, the caller substituted the configured
     default, and a session running at one effort was labelled with another."""
-    empty = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0}
+    empty = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
+             "fell_back_from": ""}
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -17503,6 +17575,20 @@ def _detect_session_model_effort(session_name: str) -> dict:
     if not effort:
         source = "default"
 
+    # A fallback the CLI made for itself stays worth showing for as long as the
+    # session is still on the model it was moved to, which is usually the rest of
+    # the run. Remembered rather than re-read: the record is one line in a
+    # transcript that grows past 4 MB, and re-scanning for it every 30s is how a
+    # detail nobody looks at becomes the most expensive poll on the box.
+    fb = facts.get("fell_back_from") or ""
+    if fb and model:
+        _session_fallback[session_name] = {"from": fb, "to": model}
+    kept = _session_fallback.get(session_name)
+    if kept and model and kept.get("to") != model:
+        _session_fallback.pop(session_name, None)  # switched again since
+        kept = None
+    fell_back_from = (kept or {}).get("from", "")
+
     # The wide-context tier. argv is where it is written down, but a /model
     # since launch overrides it in BOTH directions, so a pane line wins outright
     # when there is one. A prompt measured past the standard window settles it
@@ -17516,7 +17602,7 @@ def _detect_session_model_effort(session_name: str) -> dict:
     limit = (_CTX_WINDOW_1M if wide else _CTX_WINDOW_STD) if model else 0
 
     out = {"model": model, "effort": effort, "ts": now, "sure": sure,
-           "effort_source": source,
+           "effort_source": source, "fell_back_from": fell_back_from,
            "context_tokens": facts["ctx"], "context_limit": limit,
            "cache_ttl": facts["ttl"], "last_turn_end": facts["ts"]}
     _session_model_cache[session_name] = out
@@ -18106,7 +18192,26 @@ async def api_set_session_model(session_name: str, body: ModelBody):
                 downgraded = True
         except Exception:
             logger.debug("Pane check after /model failed", exc_info=True)
-        _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
+        # DID IT ACTUALLY LAND? A pane that is mid-turn swallows the keystrokes:
+        # the text goes into the composer, no /model runs, and this endpoint used
+        # to answer 200 anyway. The badge then showed a pending model for 15
+        # minutes and fell back to the one the session was really on, which reads
+        # as the dashboard switching the model back on its own. /effort has always
+        # watched for its confirmation line; do the same here and say so when it
+        # never comes, rather than showing a switch that did not happen.
+        confirmed = False
+        for _ in range(6):
+            try:
+                tail = await asyncio.to_thread(capture_pane_recent, session_name, 12)
+            except Exception:
+                logger.debug("Pane confirm check after /model failed", exc_info=True)
+                break
+            if "set model to" in tail.lower():
+                confirmed = True
+                break
+            await asyncio.sleep(0.8)
+        if confirmed:
+            _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
         _session_model_cache.pop(session_name, None)
         # /model persists the choice into settings.json as the default for NEW
         # sessions ("saved as your default") — the exact drift that turned the
@@ -18115,10 +18220,11 @@ async def api_set_session_model(session_name: str, body: ModelBody):
         # explicitly anyway; this guards manual `claude` runs).
         await asyncio.sleep(0.8)
         _restore_default_model_setting()
-        logger.info("Session '%s' model switch requested -> %s%s",
-                    session_name, mid, " (downgraded from 1M)" if downgraded else "")
-        return JSONResponse({"ok": True, "model": mid, "pending": True,
-                             "downgraded": downgraded})
+        logger.info("Session '%s' model switch requested -> %s%s%s",
+                    session_name, mid, " (downgraded from 1M)" if downgraded else "",
+                    "" if confirmed else " (UNCONFIRMED: the pane never echoed it)")
+        return JSONResponse({"ok": True, "model": mid, "pending": confirmed,
+                             "confirmed": confirmed, "downgraded": downgraded})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -19568,6 +19674,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .badge.model-badge:hover{background:#3c444d;color:#e6edf3}
 .badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
 .badge.model-badge.pending{opacity:.75;font-style:italic}
+/* The CLI moved this session off the model it was put on, by itself and
+   silently. Amber, like the metered-key badge: not an error, but not what
+   anyone asked for either. */
+.badge.model-badge.fellback{background:#d2992222;color:#e3b341;border:1px solid #d2992255}
 .model-menu{position:fixed;z-index:3000;background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.55);padding:4px;min-width:172px}
 .model-menu .mm-title{padding:4px 10px 3px;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:#6e7681}
 .model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
@@ -22637,6 +22747,11 @@ async function setSessionEffort(name,effort){
 }
 function modelBadgeLabel(s){
   if(s&&s.model_pending)return modelChoiceLabel(s.model_pending)+'…';
+  // A model the CLI moved to ON ITS OWN is named as such. Without this the badge
+  // reads exactly like a model somebody chose, and the honest answer to "why does
+  // it say Opus when I started on Fable" is invisible.
+  if(s&&s.model&&s.fell_back_from)
+    return formatModelName(s.model)+' ← '+formatModelName(s.fell_back_from);
   if(s&&s.model)return formatModelName(s.model);
   return'model';
 }
@@ -22679,6 +22794,14 @@ function openModelMenu(name,anchor,ev){
 // a guess went on reading as fact.
 const UNSURE_MODEL_TIP='Claude model, best guess: this session shares a working directory with others, so its transcript could not be told apart. Click to switch.';
 const SURE_MODEL_TIP='Claude model. Click to switch (runs /model in this session).';
+function modelTip(s){
+  if(s&&s.fell_back_from)
+    return 'Claude Code switched this session from '+formatModelName(s.fell_back_from)
+      +' to '+formatModelName(s.model)+' by itself, which it does when the chosen model'
+      +' is out of capacity. It prints nothing in the terminal when it happens.'
+      +' Click to switch back.';
+  return (s&&s.detect_sure===false)?UNSURE_MODEL_TIP:SURE_MODEL_TIP;
+}
 function _paintModelBadge(name){
   const s=sessions.find(x=>x.name===name);
   const lbl=modelBadgeLabel(s);
@@ -22687,7 +22810,8 @@ function _paintModelBadge(name){
   if(mb){
     mb.classList.toggle('pending',!!(s&&s.model_pending));
     mb.classList.toggle('unsure',unsure);
-    mb.title=unsure?UNSURE_MODEL_TIP:SURE_MODEL_TIP;
+    mb.classList.toggle('fellback',!!(s&&s.fell_back_from));
+    mb.title=modelTip(s);
     mb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
   }
   const mm=document.getElementById('more-model-'+name);
@@ -22705,6 +22829,16 @@ async function setSessionModel(name,model){
       body:JSON.stringify({model})});
     const d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    // The backend watches the pane for the CLI's own confirmation. No echo means
+    // the session was mid-turn and swallowed the keystrokes, so the switch never
+    // ran: drop the pending badge and say so instead of showing a model change
+    // that is not going to happen.
+    if(d.confirmed===false){
+      if(si>=0)sessions[si].model_pending='';
+      _paintModelBadge(name);
+      if(statusInfoEl)statusInfoEl.textContent='Model switch did not land — the session was busy. Try again when it is idle.';
+      return;
+    }
     if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+' (applies from the next reply)';
   }catch(e){
     if(si>=0)sessions[si].model_pending=prev;
@@ -23174,7 +23308,7 @@ function renderDetail(){
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
-        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="model-badge-${s.name}" title="${esc(s.detect_sure===false?UNSURE_MODEL_TIP:SURE_MODEL_TIP)}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         <span class="badge model-badge${s.effort_pending?' pending':''}${(s.detect_sure===false||s.effort_source==='default')?' unsure':''}" id="effort-badge-${s.name}" title="${esc(effortTip(s))}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
@@ -24470,6 +24604,11 @@ async function pollStatus(){
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
         if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
+        // A fallback appears WITHOUT anyone touching the dropdown, so it has to
+        // repaint off the poll or the badge keeps the label it was rendered with.
+        if((sessions[si].fell_back_from||'')!==(st.fell_back_from||'')){
+          sessions[si].fell_back_from=st.fell_back_from||'';badgeChanged=true;
+        }
         if(badgeChanged)_paintModelBadge(st.name);
         let effortChanged=false;
         const epend=st.effort_pending||'';
