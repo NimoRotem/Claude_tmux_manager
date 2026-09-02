@@ -6367,6 +6367,22 @@ def _detect_activity_raw(session_name: str) -> dict:
         # Auto-approve disabled: never type/select on the user's behalf.
         # _check_auto_approve(session_name, visible)
 
+        return _classify_pane(session_name, visible, cmd)
+    except Exception:
+        logger.debug("Activity detection failed for session '%s'", session_name, exc_info=True)
+    return info
+
+
+def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
+    """Decide busy vs idle from the pane text alone.
+
+    Split out of _detect_activity_raw so the rules can be tested against captured
+    panes instead of a live tmux server: the two bugs this has had, prose matching
+    a status phrase and a leftover spinner outliving its turn, were both only
+    reproducible from real pane text.
+    """
+    info = {"status": "unknown", "command": cmd, "detail": ""}
+    try:
         all_lines = visible.split("\n")
         # Strip trailing empty lines to find the real bottom
         while all_lines and not all_lines[-1].strip():
@@ -6399,6 +6415,30 @@ def _detect_activity_raw(session_name: str) -> dict:
             if has_idle_prompt:
                 break
 
+        # --- Stability, measured BEFORE the spinner scan ---
+        # A spinner is evidence of work only while it is animating. Claude Code
+        # leaves its last spinner line on screen when a turn ends, so a pane can sit
+        # for ever on "Churned… (8m 05s)" with the work long finished. Step 3 used
+        # to return busy on sight of that and never reach the stability check below,
+        # which made the false positive PERMANENT rather than transient: the session
+        # showed working until it was touched again.
+        content_hash = hashlib.md5(visible.encode()).hexdigest()
+        now = time.time()
+        prev = _pane_stability.get(session_name)
+        if prev and prev[0] == content_hash:
+            stable_since = prev[1]
+            stable_seconds = now - stable_since
+            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
+        else:
+            stable_seconds = 0
+            _pane_stability[session_name] = (content_hash, now, 1)
+
+        content_is_static = stable_seconds >= 20
+        # A live spinner repaints every frame, so an unchanged pane means it is a
+        # leftover. "esc to interrupt" is the footer Claude shows only while a turn
+        # is actually running, so it still overrides staleness on its own.
+        spinner_is_live = has_esc_to_interrupt or not content_is_static
+
         # --- Step 3: Check for active spinners/progress ---
         # Scan a wider window (bottom 25 lines) because Claude Code's
         # spinners and task indicators appear in the content area
@@ -6417,12 +6457,12 @@ def _detect_activity_raw(session_name: str) -> dict:
             if _RE_COMPLETION.match(stripped):
                 continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
-            if _RE_RUNNING_TASK.match(stripped):
+            if _RE_RUNNING_TASK.match(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 info["detail"] = "Running task"
                 return info
             # Spinner icon + verb… at START of line
-            if _RE_SPINNER_START.match(stripped):
+            if _RE_SPINNER_START.match(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
@@ -6430,7 +6470,7 @@ def _detect_activity_raw(session_name: str) -> dict:
                     info["detail"] = "Working"
                 return info
             # Spinner icon + verb… anywhere in line (catches inline spinners)
-            if _RE_SPINNER_INLINE.search(stripped):
+            if _RE_SPINNER_INLINE.search(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
@@ -6438,7 +6478,8 @@ def _detect_activity_raw(session_name: str) -> dict:
                     info["detail"] = "Working"
                 return info
             # "(thought for Xs)" or "(thinking)" near end of line — strong busy signal
-            if _RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)'):
+            if (_RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)')) \
+                    and spinner_is_live:
                 info["status"] = "busy"
                 info["detail"] = "Thinking"
                 return info
@@ -6449,25 +6490,7 @@ def _detect_activity_raw(session_name: str) -> dict:
                 info["detail"] = "Agents running"
                 return info
 
-        # --- Step 4: Content stability check ---
-        # If the terminal content hasn't changed for 20+ seconds and there's no
-        # "esc to interrupt", the session is idle — real work produces output,
-        # real spinners animate.  This catches cases text patterns miss.
-        content_hash = hashlib.md5(visible.encode()).hexdigest()
-        now = time.time()
-        prev = _pane_stability.get(session_name)
-        if prev and prev[0] == content_hash:
-            # Content unchanged since last check
-            stable_since = prev[1]
-            stable_seconds = now - stable_since
-            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
-        else:
-            # Content changed — reset
-            stable_seconds = 0
-            _pane_stability[session_name] = (content_hash, now, 1)
-
-        content_is_static = stable_seconds >= 20
-
+        # --- Step 4: (stability was measured above, before the spinner scan) ---
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
