@@ -6198,6 +6198,16 @@ _RE_COMPLETION = re.compile(
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
+# "3 local agents still running", "Waiting for completion of 2 agents": these are
+# Claude Code's own status lines and they always carry a COUNT. Matching the bare
+# words instead meant an agent that merely WROTE "Still running: the redraft turn"
+# in its last reply pinned its session on "working" for ever, because step 3
+# returns before the content-stability check that would have caught it.
+_AGENTS_RUNNING_RE = re.compile(
+    r'(?:^|[\s⎿│>])\d+\s+(?:local\s+|background\s+)?(?:agents?|tasks?|tools?)\b[^.]{0,40}?'
+    r'\b(?:still\s+running|running|in\s+progress)\b'
+    r'|waiting\s+for\s+completion\s+of\s+\d+',
+    re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
@@ -6373,21 +6383,17 @@ def _detect_activity_raw(session_name: str) -> dict:
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
         # Lines containing these phrases override idle — session is still working
-        busy_overrides = [
-            "still running",
-            "agents running",
-            "waiting for completion",
-            "in progress",
-        ]
+        # Only a counted status line overrides an idle prompt. The bare phrases used
+        # to live here and any of them in ordinary prose cancelled a real idle.
+        busy_overrides = []
         has_idle_prompt = False
         for pattern in idle_prompt_patterns:
             for line in bottom:
                 stripped = line.strip()
                 if pattern.search(stripped):
                     # Check if the same line has a busy override
-                    lower = stripped.lower()
-                    if any(phrase in lower for phrase in busy_overrides):
-                        continue  # not truly idle
+                    if _AGENTS_RUNNING_RE.search(stripped):
+                        continue  # a counted status line: not truly idle
                     has_idle_prompt = True
                     break
             if has_idle_prompt:
@@ -6436,9 +6442,9 @@ def _detect_activity_raw(session_name: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = "Thinking"
                 return info
-            # "N local agents still running" or "Waiting for completion" = busy
-            lower = stripped.lower()
-            if "still running" in lower or "waiting for completion" in lower:
+            # "N local agents still running" / "Waiting for completion of N" = busy.
+            # The COUNT is what makes it a status line rather than a sentence.
+            if _AGENTS_RUNNING_RE.search(stripped):
                 info["status"] = "busy"
                 info["detail"] = "Agents running"
                 return info
