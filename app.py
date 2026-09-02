@@ -8003,6 +8003,14 @@ class CreateSession(BaseModel):
     name: str = ""
     profile_id: str = ""
     cwd: str = ""       # start the session in this project directory
+    # What to LAUNCH on. Empty means the box defaults. Until these existed the
+    # only way to a non-default model was to start the session on the default and
+    # then switch it, which is a switch that has to survive a busy pane, shows the
+    # default in the header until the first reply lands, and cannot reach `max` at
+    # all before the session has begun. Choosing at launch makes the header right
+    # from the first turn because the flags themselves say so.
+    model: str = ""
+    effort: str = ""
 
 
 @app.post("/api/sessions/create")
@@ -8019,6 +8027,14 @@ async def api_create_session(request: Request, body: CreateSession):
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
             return JSONResponse({"error": f"Session '{display_name}' already exists."}, status_code=409)
+    # What to launch on, if the dialog said. Validated against the same allowlists
+    # the header dropdowns use; empty means the box defaults.
+    _want_model = (body.model or "").strip()
+    if _want_model and _want_model not in ALLOWED_SESSION_MODELS:
+        return JSONResponse({"error": f"Unknown model: {_want_model}"}, status_code=400)
+    _want_effort = (body.effort or "").strip().lower()
+    if _want_effort and _want_effort not in ALLOWED_SESSION_EFFORTS:
+        return JSONResponse({"error": f"Unknown effort level: {_want_effort}"}, status_code=400)
     # The project the session belongs to. A session's cwd is what decides which
     # CLAUDE.md, .mcp.json and auto-memories Claude Code loads, so "open a session
     # in project B" has to mean starting tmux there — everything else follows.
@@ -8150,7 +8166,18 @@ async def api_create_session(request: Request, body: CreateSession):
                         _pin_model = False
             except Exception:
                 logger.debug("Profile model lookup failed on create", exc_info=True)
-            _cmd_line, _model, _effort = _claude_cmd_with_flags(NEW_SESSION_CMD, pin_model=_pin_model)
+            # An explicit choice from the New-session dialog goes on the command
+            # line itself, which _claude_cmd_with_flags then leaves alone. Both are
+            # validated against the same allowlists the dropdowns use, so an
+            # unknown id cannot reach a shell.
+            _base_cmd = NEW_SESSION_CMD
+            if _want_model:
+                # Already on the command line, so the pin below leaves it alone:
+                # a stated choice outranks both the box default and a profile's.
+                _base_cmd = f"{_base_cmd} --model {shlex.quote(_want_model)}"
+            if _want_effort:
+                _base_cmd = f"{_base_cmd} --effort {shlex.quote(_want_effort)}"
+            _cmd_line, _model, _effort = _claude_cmd_with_flags(_base_cmd, pin_model=_pin_model)
             # Name the conversation ourselves. Every session on this box starts in
             # the same cwd, so a later `--continue` would otherwise resume whichever
             # neighbour spoke last; with an id on record every relaunch is --resume.
@@ -18124,10 +18151,12 @@ class EffortBody(BaseModel):
 
 @app.get("/api/models")
 async def api_models():
-    """The model dropdown catalog ([id, label] rows) + the launch default. Kept
+    """The model dropdown catalog ([id, label] rows) + the launch defaults. Kept
     current by the 24h auto-detect; the frontend fetches this on load so newly
-    released models appear without a redeploy."""
-    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL})
+    released models appear without a redeploy. The defaults come with it so the
+    New-session dialog can preselect what the box would have launched anyway."""
+    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL,
+                         "efforts": EFFORT_CATALOG, "default_effort": DEFAULT_EFFORT})
 
 
 @app.post("/api/models/refresh")
@@ -20066,6 +20095,10 @@ body.member-admin .more-member-only{display:none}
 .modal h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem}
 .modal p{color:#8b949e;font-size:.9rem;margin-bottom:16px;line-height:1.5}
 .modal-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 12px;font-size:.9rem;margin-bottom:16px;outline:none}
+/* Model and effort, side by side, on the New-session dialog. */
+.new-session-launch{display:flex;gap:10px}
+.new-session-launch label{flex:1;font-size:.7rem;color:#8b949e;display:block}
+.new-session-launch select.modal-input{margin-top:4px;margin-bottom:6px;cursor:pointer}
 .modal-input:focus{border-color:#58a6ff}
 .modal-input::placeholder{color:#484f58}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end}
@@ -22656,12 +22689,19 @@ let MODEL_CHOICES=[
   ['claude-sonnet-4-6','Sonnet 4.6'],
   ['claude-haiku-4-5','Haiku 4.5'],
 ];
+// What this box launches a new session on, so the New-session dialog can open on
+// it. Filled by the fetch below; until it lands the dialog just shows the first
+// row, which is the same model the box would have used anyway.
+let DEFAULT_MODEL_ID='';
+let DEFAULT_EFFORT_ID='';
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
       if(d&&Array.isArray(d.models)&&d.models.length){
         MODEL_CHOICES=d.models.filter(m=>Array.isArray(m)&&m.length===2);
       }
+      if(d&&d.default)DEFAULT_MODEL_ID=d.default;
+      if(d&&d.default_effort)DEFAULT_EFFORT_ID=d.default_effort;
     }).catch(()=>{});
   }catch(e){}
 })();
@@ -24887,6 +24927,20 @@ function showCreateModal(){
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
       placeholder="e.g. my project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
+    ${MEMBER_SIMPLE?'':`<div class="new-session-launch">
+      <label>Model
+        <select class="modal-input" id="new-session-model">
+          ${MODEL_CHOICES.map(([id,label])=>'<option value="'+esc(id)+'"'+(id===DEFAULT_MODEL_ID?' selected':'')+'>'+esc(label)+'</option>').join('')}
+        </select>
+      </label>
+      <label>Effort
+        <select class="modal-input" id="new-session-effort">
+          ${EFFORT_CHOICES.map(([v,label])=>'<option value="'+esc(v)+'"'+(v===DEFAULT_EFFORT_ID?' selected':'')+'>'+esc(label)+'</option>').join('')}
+        </select>
+      </label>
+    </div>
+    <p class="conn-note">It launches on these, so the header is right from the first
+      reply. max cannot be set any other way before a session starts.</p>`}
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
@@ -24898,6 +24952,10 @@ function showCreateModal(){
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
+  const mSel=document.getElementById('new-session-model');
+  const eSel=document.getElementById('new-session-effort');
+  const model=mSel?mSel.value:'';
+  const effort=eSel?eSel.value:'';
   const modal=document.getElementById('modal-content');
   // Immediately show a loading state so it never looks frozen (the first session
   // for a member can take a few seconds to provision).
@@ -24909,7 +24967,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name, cwd: projectCwd()})
+      body:JSON.stringify({name, cwd: projectCwd(), model, effort})
     });
     const data=await resp.json();
     if(!resp.ok){
