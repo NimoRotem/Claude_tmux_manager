@@ -8102,6 +8102,12 @@ class CreateSession(BaseModel):
     # from the first turn because the flags themselves say so.
     model: str = ""
     effort: str = ""
+    # Forbid the CLI's silent model substitution for this session
+    # (CLAUDE_CODE_NO_MODEL_FALLBACK). Off by default on purpose: with it set the
+    # session REFUSES rather than quietly continuing on another model, and that
+    # includes refusing to compact, which would wedge a long run. It is the right
+    # answer when the whole point of the session is which model it runs on.
+    no_fallback: bool = False
 
 
 @app.post("/api/sessions/create")
@@ -8281,6 +8287,11 @@ async def api_create_session(request: Request, body: CreateSession):
             if _model:
                 _set_session_model_choice(created, _model)
             _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
+            if body.no_fallback:
+                # The CLI's own guard: it refuses the swap and says so, instead of
+                # switching models without a word. Exported for the pane, so it
+                # survives every relaunch this session goes through.
+                _boot.append("export CLAUDE_CODE_NO_MODEL_FALLBACK=1")
             _boot.append(_managed_agent_command(created, _cmd_line))
         # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
         _line = _launch_script_line(created, _boot, _banner)
@@ -20269,6 +20280,8 @@ body.member-admin .more-member-only{display:none}
 .new-session-launch{display:flex;gap:10px}
 .new-session-launch label{flex:1;font-size:.7rem;color:#8b949e;display:block}
 .new-session-launch select.modal-input{margin-top:4px;margin-bottom:6px;cursor:pointer}
+.new-session-nofb{display:flex;gap:8px;align-items:flex-start;font-size:.72rem;color:#8b949e;margin:2px 0 14px;cursor:pointer;line-height:1.35}
+.new-session-nofb input{margin-top:2px;flex:none;cursor:pointer}
 .modal-input:focus{border-color:#58a6ff}
 .modal-input::placeholder{color:#484f58}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end}
@@ -25127,7 +25140,11 @@ function showCreateModal(){
       </label>
     </div>
     <p class="conn-note">It launches on these, so the header is right from the first
-      reply. max cannot be set any other way before a session starts.</p>`}
+      reply. max cannot be set any other way before a session starts.</p>
+    <label class="new-session-nofb"><input type="checkbox" id="new-session-nofb">
+      Refuse a model swap: Claude Code substitutes another model when this one is
+      short of capacity, silently. Ticked, the session says so and stops instead,
+      including refusing to compact.</label>`}
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
@@ -25141,8 +25158,10 @@ async function createSession(){
   const name=input?input.value.trim():'';
   const mSel=document.getElementById('new-session-model');
   const eSel=document.getElementById('new-session-effort');
+  const nfSel=document.getElementById('new-session-nofb');
   const model=mSel?mSel.value:'';
   const effort=eSel?eSel.value:'';
+  const no_fallback=!!(nfSel&&nfSel.checked);
   const modal=document.getElementById('modal-content');
   // Immediately show a loading state so it never looks frozen (the first session
   // for a member can take a few seconds to provision).
@@ -25154,7 +25173,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name, cwd: projectCwd(), model, effort})
+      body:JSON.stringify({name, cwd: projectCwd(), model, effort, no_fallback})
     });
     const data=await resp.json();
     if(!resp.ok){
