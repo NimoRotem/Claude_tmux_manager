@@ -458,6 +458,20 @@ def _model_flag_for_relaunch(session_name: str) -> str:
         last = ""
     if last.startswith("<"):  # "<synthetic>" transcript entries
         last = ""
+    # A model the CLI FELL BACK to is not this session's model: it is what it was
+    # handed when the chosen one ran out of capacity, and it never returns on its
+    # own. Preserving it across a restart would make a temporary shortage
+    # permanent, one relaunch at a time. A restart is also the only moment the
+    # choice can be put back without typing into a live turn, so take it: restore
+    # what the session was actually set to, keeping the wide-context tier it was
+    # running on. If the shortage is still there the CLI will fall back again and
+    # say so in the badge, which is the honest outcome either way.
+    fb = _session_fallback.get(session_name) or {}
+    if fb.get("from") and fb.get("to") and last.split("[", 1)[0] == fb["to"]:
+        wide = last.endswith("[1m]")
+        last = fb["from"]
+        if wide and not last.endswith("[1m]") and any(f in last for f in _ONE_M_FAMILIES):
+            last += "[1m]"
     if not last:
         return f" --model {shlex.quote(DEFAULT_MODEL)}" if DEFAULT_MODEL else ""
     base = DEFAULT_MODEL.split("[", 1)[0]
