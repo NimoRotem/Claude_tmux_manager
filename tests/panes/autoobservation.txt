@@ -1,0 +1,24 @@
+  and made blank signatures impossible). 37 CFR 1.4(d) requires the signer to
+  insert the signature personally, and that applies to a typed /S-signature/ as
+  much as to a drawn one, so there is no version of this I can do on your
+  behalf. This is the legal boundary, not a step I left for later.
+
+  Not filed. A preissuance submission against Schmalz's application is
+  irreversible and public, and you asked for the tool to be fixed, not for the
+  filing to go. Go stays yours.
+
+  State of the record: 20 items, $156 small entity, window open to 2026-09-12,
+  signer Nimrod Rotem, one blocker, no warnings. Prepare, open it, Sign it,
+  draw, Add, drag onto the line, Save, Go.
+
+  PRs 18 to 20 merged, 68 tests, master deployed.
+
+✻ Baked for 35m 45s · done 11:08 PM
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · ← for agents
+                                        ✔ Update installed · Restart to update
+                                        new task? /clear to save 675.1k tokens
+

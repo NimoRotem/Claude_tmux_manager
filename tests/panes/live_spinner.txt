@@ -1,0 +1,10 @@
+● Working through the packet now.
+
+  Bash(ls -la)
+
+✻ Churned… (8m 05s · ↓ 29.6k tokens)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents
