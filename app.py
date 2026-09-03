@@ -1865,6 +1865,56 @@ def _session_model_choice(session_name: str) -> str:
     return _load_session_model_choices().get(session_name, "")
 
 
+# A substitution the CLI made, kept on disk. Holding it in memory alone meant it
+# vanished on every dashboard restart, and re-finding it in the transcript is not
+# guaranteed: the record was 1.04 MB back on a busy session, just past the window
+# a cold start is willing to read. A fact this hard to recover is written down
+# once, and cleared when the session is no longer on the model it was moved to.
+SESSION_FALLBACK_FILE = MESSAGES_DIR / "session_fallback.json"
+_session_fallback_disk: Optional[Dict[str, dict]] = None
+
+
+def _load_session_fallbacks() -> Dict[str, dict]:
+    global _session_fallback_disk
+    if _session_fallback_disk is not None:
+        return _session_fallback_disk
+    try:
+        if SESSION_FALLBACK_FILE.exists():
+            data = json.loads(SESSION_FALLBACK_FILE.read_text())
+            if isinstance(data, dict):
+                _session_fallback_disk = {
+                    str(k): v for k, v in data.items()
+                    if isinstance(v, dict) and v.get("from") and v.get("to")}
+                return _session_fallback_disk
+    except Exception:
+        logger.debug("Failed to load session fallbacks", exc_info=True)
+    _session_fallback_disk = {}
+    return _session_fallback_disk
+
+
+def _save_session_fallbacks():
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_FALLBACK_FILE.write_text(
+            json.dumps(_load_session_fallbacks(), indent=2))
+    except Exception:
+        logger.debug("Failed to save session fallbacks", exc_info=True)
+
+
+def _set_session_fallback(session_name: str, src: str, dst: str):
+    store = _load_session_fallbacks()
+    if store.get(session_name) == {"from": src, "to": dst}:
+        return
+    store[session_name] = {"from": src, "to": dst}
+    _save_session_fallbacks()
+
+
+def _clear_session_fallback(session_name: str):
+    store = _load_session_fallbacks()
+    if store.pop(session_name, None) is not None:
+        _save_session_fallbacks()
+
+
 def _clear_session_model_choice(session_name: str):
     choices = _load_session_model_choices()
     if choices.pop(session_name, None) is not None:
@@ -2169,6 +2219,32 @@ async def auth_middleware(request: Request, call_next):
             _set_sso_cookie(resp, request, user["id"])
         except Exception:
             logger.debug("failed to backfill SSO cookie", exc_info=True)
+    return resp
+
+
+# WHICH BUILD THIS PAGE CAME FROM. The whole UI is one long-lived tab: the poll
+# keeps the data fresh but the JAVASCRIPT is whatever was served when the tab was
+# opened, so a fix deployed hours ago is simply not running for anyone who never
+# reloaded, and it looks like the fix does not work. Stamped on every response and
+# compared by the frontend against the build it loaded with.
+def _build_id() -> str:
+    try:
+        st = os.stat(__file__)
+        return hashlib.sha1(f"{int(st.st_mtime)}:{st.st_size}".encode()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+BUILD_ID = _build_id()
+
+
+@app.middleware("http")
+async def build_stamp_middleware(request: Request, call_next):
+    resp = await call_next(request)
+    try:
+        resp.headers["X-Dash-Build"] = BUILD_ID
+    except Exception:
+        pass
     return resp
 
 
@@ -8465,6 +8541,7 @@ async def api_delete_session(request: Request, session_name: str):
         # inherit a dead session's choice and get relaunched on it.
         _clear_session_model_choice(session_name)
         _session_fallback.pop(session_name, None)
+        _clear_session_fallback(session_name)
         _session_fb_scan.pop(session_name, None)
         _remove_session_display_name(session_name)
         SESSION_LIFECYCLE.remove(
@@ -17797,12 +17874,20 @@ def _detect_session_model_effort(session_name: str) -> dict:
         seen_fb = _fallback_since_last_look(session_name, newest)
         if seen_fb:
             _session_fallback[session_name] = seen_fb
+            _set_session_fallback(session_name, seen_fb["from"], seen_fb["to"])
     if fb and model:
         _session_fallback[session_name] = {"from": fb, "to": model}
-    kept = _session_fallback.get(session_name)
+        _set_session_fallback(session_name, fb, model)
+    # Disk first on a cold start: this process may have begun long after the
+    # switch, and the record itself can be further back in the transcript than a
+    # cold scan is willing to read.
+    kept = _session_fallback.get(session_name) or _load_session_fallbacks().get(session_name)
     if kept and model and kept.get("to") != model:
         _session_fallback.pop(session_name, None)  # switched again since
+        _clear_session_fallback(session_name)
         kept = None
+    elif kept:
+        _session_fallback[session_name] = kept
     fell_back_from = (kept or {}).get("from", "")
 
     # The wide-context tier. argv is where it is written down, but a /model
@@ -18433,6 +18518,11 @@ async def api_set_session_model(session_name: str, body: ModelBody):
             # On disk, so a restart still knows what this session was put on even
             # if the CLI has substituted a model of its own since.
             _set_session_model_choice(session_name, mid)
+            # A deliberate switch ends any substitution that was in force: the
+            # session is on what somebody asked for again, whatever it answers on
+            # next. Leaving the old record would keep the badge accusing the CLI.
+            _session_fallback.pop(session_name, None)
+            _clear_session_fallback(session_name)
         _session_model_cache.pop(session_name, None)
         # /model persists the choice into settings.json as the default for NEW
         # sessions ("saved as your default") — the exact drift that turned the
@@ -19904,6 +19994,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
 .model-menu .mm-item:hover{background:#21262d}
 .model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
+/* A tab left open across a deploy. Sits out of the way, bottom right. */
+.build-pill{position:fixed;right:14px;bottom:14px;z-index:4000;background:#d2992222;color:#e3b341;border:1px solid #d2992255;border-radius:999px;padding:7px 14px;font-size:.75rem;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.build-pill:hover{background:#d2992244}
+.build-pill b{text-decoration:underline}
 /* Undo the CLI's own substitution. Amber, like the badge that reports it. */
 .model-menu .mm-item.mm-restore{color:#e3b341;border-bottom:1px solid #30363d;border-radius:6px 6px 0 0;margin-bottom:2px}
 .model-menu .mm-item.mm-restore:hover{background:#d2992222}
@@ -24832,9 +24926,29 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// The build this tab is RUNNING, learned from the first poll, versus the build
+// the server is serving now. A dashboard left open across a deploy keeps polling
+// fresh data through stale JavaScript, so a change to the UI is invisible and
+// looks like it was never shipped. Say so instead, and offer the reload.
+let _loadedBuild='';
+function _checkBuild(resp){
+  try{
+    const b=resp&&resp.headers?resp.headers.get('X-Dash-Build'):'';
+    if(!b)return;
+    if(!_loadedBuild){_loadedBuild=b;return;}
+    if(b===_loadedBuild||document.getElementById('build-pill'))return;
+    const pill=document.createElement('div');
+    pill.id='build-pill';
+    pill.className='build-pill';
+    pill.innerHTML='This page is running an older build. <b>Reload</b>';
+    pill.onclick=()=>location.reload();
+    document.body.appendChild(pill);
+  }catch(e){}
+}
 async function pollStatus(){
   try{
     const resp=await fetch(BASE+'/api/status');
+    _checkBuild(resp);
     const statuses=await resp.json();
     let changed=false;
     for(const st of statuses){
