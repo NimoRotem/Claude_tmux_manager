@@ -1892,27 +1892,37 @@ def _load_session_fallbacks() -> Dict[str, dict]:
     return _session_fallback_disk
 
 
-def _save_session_fallbacks():
+def _write_session_fallbacks(mutate) -> Dict[str, dict]:
+    """Read the file, apply `mutate` to it, write it back.
+
+    Never write the in-memory copy over the file: it was read once at startup and
+    anything else that has touched the file since (another process, a repair,
+    the tool that seeded it) would be silently erased. That is not theoretical, it
+    is how a correct record disappeared between two restarts.
+    """
+    global _session_fallback_disk
+    _session_fallback_disk = None            # force a re-read
+    store = _load_session_fallbacks()
+    mutate(store)
     try:
         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        SESSION_FALLBACK_FILE.write_text(
-            json.dumps(_load_session_fallbacks(), indent=2))
+        SESSION_FALLBACK_FILE.write_text(json.dumps(store, indent=2))
     except Exception:
         logger.debug("Failed to save session fallbacks", exc_info=True)
+    return store
 
 
 def _set_session_fallback(session_name: str, src: str, dst: str):
-    store = _load_session_fallbacks()
-    if store.get(session_name) == {"from": src, "to": dst}:
+    if _load_session_fallbacks().get(session_name) == {"from": src, "to": dst}:
         return
-    store[session_name] = {"from": src, "to": dst}
-    _save_session_fallbacks()
+    _write_session_fallbacks(
+        lambda s: s.__setitem__(session_name, {"from": src, "to": dst}))
 
 
 def _clear_session_fallback(session_name: str):
-    store = _load_session_fallbacks()
-    if store.pop(session_name, None) is not None:
-        _save_session_fallbacks()
+    if session_name not in _load_session_fallbacks():
+        return
+    _write_session_fallbacks(lambda s: s.pop(session_name, None))
 
 
 def _clear_session_model_choice(session_name: str):
@@ -17882,7 +17892,11 @@ def _detect_session_model_effort(session_name: str) -> dict:
     # switch, and the record itself can be further back in the transcript than a
     # cold scan is willing to read.
     kept = _session_fallback.get(session_name) or _load_session_fallbacks().get(session_name)
-    if kept and model and kept.get("to") != model:
+    # Forget it only on EVIDENCE that the session has moved on: a model read off a
+    # transcript we could not prove belongs to this session is not evidence, and
+    # deleting a true record on the strength of a neighbour's transcript is a fact
+    # that cannot be recovered afterwards.
+    if kept and model and sure and kept.get("to") != model:
         _session_fallback.pop(session_name, None)  # switched again since
         _clear_session_fallback(session_name)
         kept = None
@@ -24931,12 +24945,31 @@ function startStatusPolling(){
 // fresh data through stale JavaScript, so a change to the UI is invisible and
 // looks like it was never shipped. Say so instead, and offer the reload.
 let _loadedBuild='';
+// Reloading is only safe when there is nothing of the user's to lose. A draft in
+// a composer, an open dialog or menu, a switch still settling: any of those and
+// the pill waits, and the next poll tries again. Nothing here is state the server
+// does not already hold, so an idle page can just take the new build.
+function _safeToReload(){
+  try{
+    if(document.querySelector('#modal-overlay.active'))return false;
+    if(document.querySelector('.model-menu, .effort-menu'))return false;
+    for(const t of document.querySelectorAll('textarea.cmd-input, input.modal-input'))
+      if((t.value||'').trim())return false;
+    if(sessions.some(s=>s.model_pending||s.effort_pending))return false;
+    // _recording is a per-session map, not a flag: it is always truthy, so ask
+    // whether any session is actually recording.
+    if(typeof _recording==='object'&&_recording&&Object.values(_recording).some(Boolean))return false;
+  }catch(e){return false}
+  return true;
+}
 function _checkBuild(resp){
   try{
     const b=resp&&resp.headers?resp.headers.get('X-Dash-Build'):'';
     if(!b)return;
     if(!_loadedBuild){_loadedBuild=b;return;}
-    if(b===_loadedBuild||document.getElementById('build-pill'))return;
+    if(b===_loadedBuild)return;
+    if(_safeToReload()){location.reload();return;}
+    if(document.getElementById('build-pill'))return;
     const pill=document.createElement('div');
     pill.id='build-pill';
     pill.className='build-pill';
