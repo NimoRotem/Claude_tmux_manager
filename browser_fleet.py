@@ -71,7 +71,8 @@ RESIDENT_PROFILE_RE = re.compile(
 #  or anything under /tmp, which does not survive a reboot in the first place.
 #  A live console holds a claim on its own, so an unclaimed one is finished.
 DISPOSABLE_PROFILE_RE = re.compile(
-    r"^/tmp/|/\.tmux-dashboard/patents/browsers/")
+    r"^/tmp/|/\.tmux-dashboard/patents/browsers/|/\.patent-filing/browsers/"
+    r"|/\.trademark-filing/browsers/")
 
 #  -L <local>:<host>:<remote>. Written by launch_remote as -L <local>:127.0.0.1:<remote>.
 FORWARD_RE = re.compile(r"-L\s*(\d+):([\w.\-]+):(\d+)")
@@ -215,8 +216,10 @@ def owner_of(profile: str) -> str:
         return "the resident dashboard browser"
     if "/.ramp-browser/" in profile:
         return "the Ramp web session"
-    if "/.tmux-dashboard/patents/browsers/" in profile:
-        return "a patents filing browser (%s)" % Path(profile).name
+    if ("/.tmux-dashboard/patents/browsers/" in profile
+            or "/.patent-filing/browsers/" in profile
+            or "/.trademark-filing/browsers/" in profile):
+        return "a filing browser (%s)" % Path(profile).name
     return ""
 
 

@@ -473,3 +473,13 @@ class LiveAppClaimTests(unittest.TestCase):
                     mock.patch.object(fleet, "CB_ROOT", home / ".claude-browser"):
                 claims = fleet.read_claims()
         self.assertIn("patent filing app", claims[9402])
+
+
+class LocalFilingProfileTests(unittest.TestCase):
+    def test_a_local_filing_browser_is_disposable_not_unknown(self):
+        """The apps launch here now, into their own data directories. Unknown means
+        the reaper cannot reason about it and the wall cannot label it."""
+        for profile in ("/home/x/.patent-filing/browsers/warm-uspto",
+                        "/home/x/.trademark-filing/browsers/tmagent"):
+            self.assertEqual(fleet.classify_profile(profile), "disposable", profile)
+            self.assertIn("filing browser", fleet.owner_of(profile))
