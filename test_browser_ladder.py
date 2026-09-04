@@ -170,7 +170,12 @@ def test_a_proxy_pass_with_a_path_strips_the_location_prefix():
     for r in bl.nginx_routes():
         if r["upstream_path"] and r["prefix"] != "/" and not r["modifier"].startswith("~"):
             hit = bl.local_route(r["names"][0], r["prefix"] + "some/page")
-            assert hit and not hit["path"].startswith(r["prefix"])
+            #  The rule is that the LOCATION prefix is replaced by the upstream path,
+            #  not that the result cannot look like the prefix: builder4 serves
+            #  `location /api/ { proxy_pass http://127.0.0.1:8501/api/; }`, where the
+            #  two are the same string and a "does not start with the prefix" test
+            #  goes red on a route that is behaving exactly as nginx says it should.
+            assert hit and hit["path"] == r["upstream_path"].rstrip("/") + "/some/page"
             return
 
 
@@ -179,3 +184,49 @@ def test_artifact_paths_cannot_walk_out_of_the_run_directory():
     assert bl.run_artifact("../../etc", "passwd") is None
     assert bl.run_artifact("abc", "../../../.claude-browser/proxy.json") is None
     assert bl.run_artifact("", "x.html") is None
+
+
+# --- stopping the L3 egress must not depend on one tool being installed ------
+def test_pids_on_port_falls_back_when_lsof_is_missing(monkeypatch):
+    """lsof is not on every box. The version that shelled straight to it raised
+    FileNotFoundError, swallowed it, and reported 'could not stop' for ever, so
+    WARP was never reaped on any box without lsof."""
+    calls = []
+
+    class _Out:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd[0])
+        if cmd[0] == "lsof":
+            raise FileNotFoundError("no lsof here")
+        if cmd[0] == "ss":
+            return _Out('LISTEN 0 128 127.0.0.1:25344 0.0.0.0:* users:(("wireproxy",pid=4242,fd=7))\n')
+        return _Out("")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    assert bl.pids_on_port(25344) == [4242]
+    assert calls[:2] == ["lsof", "ss"]
+
+
+def test_pids_on_port_tries_fuser_last(monkeypatch):
+    class _Out:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "fuser":
+            return _Out(" 9191\n")
+        return _Out("")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    assert bl.pids_on_port(25344) == [9191]
+
+
+def test_warp_stop_says_no_when_nothing_holds_the_port(monkeypatch):
+    """A stop that reports success having killed nothing is how a reaper that
+    never worked looked healthy."""
+    monkeypatch.setattr(bl, "_port_alive", lambda *_a, **_k: True)
+    monkeypatch.setattr(bl, "pids_on_port", lambda *_a, **_k: [])
+    assert bl.warp_stop() is False
