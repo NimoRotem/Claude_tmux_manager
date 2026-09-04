@@ -234,12 +234,20 @@ def read_claims() -> Dict[int, str]:
         if b.get("port"):
             claims[int(b["port"])] = "trademark agent console (%s)" % (
                 b.get("profile") or "no profile recorded")
-    reg = HOME / ".tmux-dashboard" / "patents" / "browsers.json"
-    with contextlib.suppress(Exception):
-        for key, info in (json.loads(reg.read_text("utf-8")) or {}).items():
-            port = int((info or {}).get("port") or key or 0)
-            if port:
-                claims[port] = "patents filing panel (%s)" % key
+    #  BOTH filing registries. The live app moved out of the dashboard repo and
+    #  keeps its browsers in ~/.patent-filing; reading only the old path reported
+    #  every browser the running app owns as unclaimed, which is the one verdict
+    #  that must never be wrong, because unclaimed is what the reaper acts on.
+    for reg, label in ((HOME / ".patent-filing" / "browsers.json", "patent filing app"),
+                       (HOME / ".tmux-dashboard" / "patents" / "browsers.json",
+                        "patents panel (dashboard copy)")):
+        with contextlib.suppress(Exception):
+            for key, info in (json.loads(reg.read_text("utf-8")) or {}).items():
+                info = info or {}
+                port = int(info.get("port") or key or 0)
+                if port and port not in claims:
+                    claims[port] = "%s (%s)" % (
+                        label, Path(info.get("profile") or "").name or key)
     with contextlib.suppress(Exception):
         slots = (json.loads((CB_ROOT / "slots.json").read_text("utf-8")) or {}).get("claims") or {}
         for slot, info in slots.items():

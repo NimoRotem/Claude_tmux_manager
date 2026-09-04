@@ -440,3 +440,36 @@ class MemoryPressureTests(unittest.TestCase):
         html = fleet.wall_html([{"host": "instance-3", "browsers": [], "forwards": [],
                                  "memory_mb": {"available": 1800, "total": 16000}}])
         self.assertIn("close a browser here", html)
+
+
+class LiveAppClaimTests(unittest.TestCase):
+    def test_the_live_filing_app_registry_is_read_too(self):
+        """The app moved out of the dashboard repo. Reading only the old path
+        reported every browser it owns as unclaimed, and unclaimed is the verdict
+        the reaper acts on."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".patent-filing").mkdir(parents=True)
+            (home / ".patent-filing" / "browsers.json").write_text(json.dumps(
+                {"9402": {"port": 9402, "profile": "/tmp/patent-browser-warm-console-ec6"}}))
+            with mock.patch.object(fleet, "HOME", home), \
+                    mock.patch.object(fleet, "CB_ROOT", home / ".claude-browser"):
+                claims = fleet.read_claims()
+        self.assertIn(9402, claims)
+        self.assertIn("patent filing app", claims[9402])
+
+    def test_the_older_registry_does_not_override_the_live_one(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".patent-filing").mkdir(parents=True)
+            (home / ".tmux-dashboard" / "patents").mkdir(parents=True)
+            (home / ".patent-filing" / "browsers.json").write_text(json.dumps(
+                {"9402": {"port": 9402, "profile": "/tmp/live"}}))
+            (home / ".tmux-dashboard" / "patents" / "browsers.json").write_text(json.dumps(
+                {"9402": {"port": 9402, "profile": "/tmp/stale"}}))
+            with mock.patch.object(fleet, "HOME", home), \
+                    mock.patch.object(fleet, "CB_ROOT", home / ".claude-browser"):
+                claims = fleet.read_claims()
+        self.assertIn("patent filing app", claims[9402])
