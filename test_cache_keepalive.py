@@ -345,3 +345,17 @@ def test_the_keepalive_refuses_a_transcript_it_cannot_prove_is_ours():
     body = src[start:end]
     assert 'fields.get("detect_sure", True)' in body, (
         "the keep-alive must skip a session whose transcript is a guess")
+
+
+def test_the_two_states_do_not_share_a_colour():
+    """Green blinking means "come and type"; amber steady means "it is handling
+    it". One colour for both would defeat the point of having two states."""
+    src = APP.read_text()
+    expiring = src[src.index(".status-pill.idle.expiring{"):]
+    expiring = expiring[:expiring.index(".tl-since.expiring")]
+    keep = src[src.index(".status-pill.busy.keepcache{"):]
+    keep = keep[:keep.index("\n\n")] if "\n\n" in keep[:400] else keep[:400]
+    assert "#3fb950" in expiring or "#56d364" in expiring, "the pre-cold blink must stay green"
+    assert "#d29922" in keep or "#e3b341" in keep, "the keep-alive state must be amber"
+    assert "#d29922" not in expiring and "#e3b341" not in expiring, \
+        "the blink must not borrow the keep-alive's amber"

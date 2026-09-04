@@ -20615,15 +20615,17 @@ body.member-admin .more-member-only{display:none}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
 .autopush-seg button.ap-basicplus.active{background:#9e6a03}
 .autopush-seg button.ap-full.active{background:#238636}
-/* Approaching cold. The point of the blink is to be caught out of the corner of
-   an eye from across the room, so it is fast and it moves both the pill and the
-   dot; the amber below is the calmer "it is only holding the cache" state. */
+/* Approaching cold: the GREEN idle state, blinking fast, so it is caught out of
+   the corner of an eye from across the room. Deliberately still green. Amber is
+   reserved for the keep-alive below, and one colour meaning two different things
+   is exactly the confusion this is supposed to prevent: green blinking means
+   "come and type", amber steady means "it is handling it". */
 @keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
-.status-pill.idle.expiring{background:#d2992233;color:#e3b341;border-color:#d29922aa;
+.status-pill.idle.expiring{background:#3fb95033;color:#56d364;border-color:#3fb950aa;
   animation:cache-expiring .7s steps(1,end) infinite}
-.status-pill.idle.expiring .status-dot{background:#e3b341;
+.status-pill.idle.expiring .status-dot{background:#56d364;
   animation:cache-expiring .7s steps(1,end) infinite}
-.tl-since.expiring{color:#e3b341;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
+.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
 /* Working, but only to hold the cache. Amber, and NOT blinking: it wants to be
    distinguishable from a session someone actually asked for something. */
 .status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
