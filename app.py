@@ -1289,6 +1289,12 @@ async def lifespan(_app: FastAPI):
     logger.info("Unmanaged-browser resource guard started (shared CPU cap %.2f cores)",
                 browser_resource_guard.cpu_quota_percent() / 100.0)
 
+    #  Push the launcher to disk at boot, not only when somebody creates a browser.
+    #  It was written on the create/start paths alone, so a box that had not made a
+    #  new browser since the last deploy kept running whatever flags and guards the
+    #  script had months ago, and nobody could tell by looking at the code.
+    await asyncio.to_thread(_ensure_browser_launcher)
+
     autopark_task = asyncio.create_task(browser_autopark_watchdog())
     _background_tasks.append(autopark_task)
     logger.info("Browser CPU guard started (nice %d always, freeze >%.0fs idle, "
@@ -12223,6 +12229,18 @@ if [ "$ACTION" = "stop" ]; then
 fi
 
 DISP="${3:?display}"; RFB="${4:?rfbport}"; VNC="${5:?vncport}"; CDP="${6:?cdpport}"
+
+# A CDP PORT THAT ALREADY ANSWERS IS SOMEBODY'S BROWSER. Starting a second Chrome
+# on it does not fail loudly: one keeps 127.0.0.1, the other quietly takes ::1,
+# and every client afterwards reaches whichever its resolver happens to prefer.
+# Found on instance-3 2026-09-04 with the resident profile and a session called
+# "default" both on 9222, one of them holding a half-finished payroll login that
+# nothing could address. Refuse instead, and say which port.
+if curl -s --max-time 2 "http://127.0.0.1:$CDP/json/version" >/dev/null 2>&1 \
+   || curl -s --max-time 2 -g "http://[::1]:$CDP/json/version" >/dev/null 2>&1; then
+  echo "refusing to start session $ID: a browser already answers CDP on $CDP"
+  exit 3
+fi
 mkdir -p "$LOGS" "$PROFILE"
 export DISPLAY=":$DISP"
 : > "$PIDS"
