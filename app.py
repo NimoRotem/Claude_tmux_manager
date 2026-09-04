@@ -21539,14 +21539,29 @@ const _NOISE_RES=[
   /^context (left|remaining|window):/i,
   /^esc to interrupt\b/i,
   /^shell cwd was reset\b/i,
-  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,
+  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,   // but see _HOOK_HEADER_RE
   /^made \d+\s+\S+.*\b(edit|change)/i,
   /^⏵/,
   /\bnew task\?\s*\/clear to save\b/i,
   /^shift\+tab to cycle\b/i,
 ];
+// A hook that blocked or spoke: "Ran 2 stop hooks (ctrl+o to expand)" and the
+// `⎿` block under it. The CLI hands that text back to the model in the USER
+// role, so it is an instruction the session is acting on, not chatter, and it
+// is the one thing that explains why a turn carried on after it looked done.
+// Clean view used to swallow it twice over: the header matched the
+// "(ctrl+o to expand)" noise rule, and the body matched the tool-output rule.
+// The echo markers are in the optional group so one regex matches the row both
+// before the rewrite (`● Ran 2 stop hooks …`) and after it (`❯ Ran 2 stop hooks …`).
+const _HOOK_HEADER_RE=/^\s*(?:[●⏺•·❯›»]\s*)?Ran \d+ [A-Za-z]+ hooks?\b/;
+// The pane's own marker for a turn you typed. `>` is not usable here: at column
+// 0 it is already _PANE_STRUCTURE_RE furniture and _USER_ECHO_RE does not
+// accept it, so a literal `>` would render as chrome instead of as your words.
+const _HOOK_ECHO_PREFIX='❯ ';
+function _isHookHeader(line){return !!line&&_HOOK_HEADER_RE.test(line)}
 function _isNoise(line){
   if(!line)return false;
+  if(_isHookHeader(line))return false;
   const s=line.replace(/^[\s⎿●⏺•·│└├>*\-]+/,'').trim();
   if(!s)return false;
   for(let i=0;i<_NOISE_RES.length;i++){if(_NOISE_RES[i].test(s))return true;}
@@ -21742,7 +21757,25 @@ function applyRawFilter(text){
     // blocks still win: a `⎿`/`└` result (a table printed BY a command is tool
     // output, and breaking out would leak the rest of the block) and the
     // launch-command block (whose tail is Claude Code's own `╭…│…╰` banner).
-    if(mode!=='output'&&mode!=='shell'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    if(mode!=='output'&&mode!=='shell'&&mode!=='hook'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    // 'hook' is the one mode that EMITS. A hook that blocked is an instruction
+    // the session then obeyed, so hiding it leaves the next few minutes of work
+    // looking unprompted. The header is re-stamped with the pane's own user
+    // marker so it reads, highlights and jumps like the turn it actually is.
+    if(_isHookHeader(line)){
+      mode='hook';
+      out.push(_HOOK_ECHO_PREFIX+line.replace(_ANY_DECORATION_RE,'').trim());
+      continue;
+    }
+    if(mode==='hook'){
+      // Ends on what this row IS: a bullet, or anything at column 0. A blank
+      // row does NOT end it, because the hook's own text has paragraph breaks
+      // in it and stopping at the first one truncates the instruction. Decided
+      // from the row alone, which keeps this filter backwards-only in a
+      // renderer that is append-only.
+      if(!(_LEADING_BULLET_RE.test(line)||/^\S/.test(line))){out.push(line);continue;}
+      mode='';   // and fall through, so this row is judged on its own merits
+    }
     if(_isNoise(line)){mode='noise';continue;}
     if(_CALL_CONT_RE.test(line)){mode='call';continue;}
     if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
@@ -22261,9 +22294,18 @@ const _NOT_USER_CONT_RE=/^\s*[⎿└●⏺•✻✽✢✳✴✱✲✵✶✷✸�
 function _markUserRows(rows){
   const flags=new Array(rows.length).fill(0);
   let inUser=false;
+  // A hook block reaches the model in the user role, so it is marked like one.
+  // Its body is a `⎿` result, which _NOT_USER_CONT_RE would otherwise read as
+  // the CLI answering; inside a hook block that row IS the message.
+  let inHook=false;
+  const isCont=row=>/^ {2,}\S/.test(row)&&(inHook||!_NOT_USER_CONT_RE.test(row));
   for(let i=0;i<rows.length;i++){
     const row=rows[i];
-    if(_USER_ECHO_RE.test(row)){flags[i]=2;inUser=true;continue;}
+    // Matched in both views: clean view restamps the header with `❯`, exact
+    // view leaves the CLI's own bullet on it, and either way it is your turn.
+    if(_USER_ECHO_RE.test(row)||_isHookHeader(row)){
+      flags[i]=2;inUser=true;inHook=_isHookHeader(row);continue;
+    }
     if(!inUser)continue;
     if(row.trim()===''){
       // A blank row belongs to the message only if the message carries on under
@@ -22271,11 +22313,11 @@ function _markUserRows(rows){
       // before the reply starts.
       let j=i+1;
       while(j<rows.length&&rows[j].trim()==='')j++;
-      if(j<rows.length&&/^ {2,}\S/.test(rows[j])&&!_NOT_USER_CONT_RE.test(rows[j])){flags[i]=1;continue;}
-      inUser=false;continue;
+      if(j<rows.length&&isCont(rows[j])){flags[i]=1;continue;}
+      inUser=false;inHook=false;continue;
     }
-    if(/^ {2,}\S/.test(row)&&!_NOT_USER_CONT_RE.test(row)){flags[i]=1;continue;}
-    inUser=false;
+    if(isCont(row)){flags[i]=1;continue;}
+    inUser=false;inHook=false;
   }
   return flags;
 }
