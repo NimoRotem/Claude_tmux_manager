@@ -32,6 +32,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
+import browser_fleet
 import browser_live
 import docsign
 import patent_forms
@@ -1508,17 +1509,29 @@ async def api_browsers():
 async def api_browser_launch(request: Request):
     """Start a browser for a filing.
 
-    Remote is the default and it is not a preference. Chrome 152 on this box never
-    answers Network.setCookie or Storage.setCookies over CDP, headless or headed,
-    so the USPTO device-trust cookies cannot be injected here at all. instance-3
-    runs Chrome 149, where it works, and holds the device-trust file already, so
-    the browser lives there behind an ssh port-forward and everything else stays
-    local. Local is kept for anything that does not need a logged-in session.
+    Remote is the default because instance-3 holds the USPTO device-trust file and
+    the session built from it, so the browser lives there behind an ssh port-forward
+    and everything else stays local. Local is right for anything that does not need
+    that session.
+
+    It is NOT that cookies cannot be injected here, which is what this used to say.
+    Chrome 149 and 152 both accept Network.setCookie and Storage.setCookies on this
+    box when launched with --password-store=basic, and both wedge without it
+    (measured 2026-09-04). browser_live.launch passes it now.
     """
     body = await request.json()
     label = store.slugify(body.get("label") or "filing", "filing")
     headless = bool(body.get("headless", True))
     remote = bool(body.get("remote", True))
+    #  ADMISSION, NOT A PORT MAP. A free port number says nothing about whether the
+    #  box can afford the Chrome behind it, and these boxes livelock rather than
+    #  OOM-kill, so the refusal has to come before the launch and has to say why.
+    #  A remote browser costs instance-3's memory, not ours, so only local launches
+    #  are judged here.
+    if not remote:
+        affordable, why = browser_fleet.afford_browser()
+        if not affordable:
+            return _err(why, 503)
     try:
         if remote:
             info = await asyncio.to_thread(browser_live.launch_remote, label, headless)

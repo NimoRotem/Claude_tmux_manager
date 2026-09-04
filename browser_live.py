@@ -109,6 +109,17 @@ def launch(label: str, headless: bool = True, port: int = 0) -> dict:
     profile.mkdir(parents=True, exist_ok=True)
     args = [CHROME,
             "--no-proxy-server",
+            #  WITHOUT THIS FLAG THE BROWSER LOOKS BROKEN OVER CDP. Chrome tries to
+            #  put cookies in an OS keyring it reaches over dbus; there is none on
+            #  these boxes, so the first call that touches a cookie (Network.setCookie,
+            #  Storage.setCookies, and any navigation that sets one) never answers, and
+            #  every later call on that connection times out behind it. That is the
+            #  whole of the "Chrome 152 cannot set cookies here, so the signed-in
+            #  browser must live on instance-3" story: measured 2026-09-04, Chrome 149
+            #  AND 152 on builder4 both answer fine with this flag and both wedge
+            #  without it. browser-session.sh has always passed it, which is why the
+            #  resident browsers never showed the fault.
+            "--password-store=basic",
             "--user-data-dir=%s" % profile,
             "--remote-debugging-port=%d" % port,
             "--remote-allow-origins=*",
@@ -212,7 +223,7 @@ if [ -z "%(headless)s" ]; then
   done
   [ -z "$DISPLAY" ] && { echo "NODISPLAY"; exit 1; }
 fi
-nohup google-chrome %(headless)s --no-proxy-server --user-data-dir="$prof"   --remote-debugging-port=$port --remote-allow-origins='*' --no-first-run   --no-default-browser-check --disable-dev-shm-usage --window-size=1440,960   --user-agent='%(ua)s'   about:blank >"$prof/chrome.log" 2>&1 &
+nohup google-chrome %(headless)s --no-proxy-server --password-store=basic --user-data-dir="$prof"   --remote-debugging-port=$port --remote-allow-origins='*' --no-first-run   --no-default-browser-check --disable-dev-shm-usage --window-size=1440,960   --user-agent='%(ua)s'   about:blank >"$prof/chrome.log" 2>&1 &
 for i in $(seq 1 60); do
   if curl -s --max-time 2 "http://127.0.0.1:$port/json/version" >/dev/null; then
     echo "PORT=$port"; echo "PROFILE=$prof"; exit 0
@@ -226,11 +237,18 @@ echo "TIMEOUT"; exit 1
 def launch_remote(label: str, headless: bool = True, host: str = "", zone: str = "") -> dict:
     """Start Chrome on another box and tunnel its CDP port to this one.
 
-    Why this exists: Chrome 152 on the patents box never answers Network.setCookie
-    or Storage.setCookies over CDP, headless or headed, so the USPTO device-trust
-    cookies cannot be injected locally. instance-3 runs Chrome 149, where it works,
-    and it already holds the device-trust file. So the agent and the panel stay
-    here and only the browser lives there, behind a plain ssh port-forward.
+    Why this exists: instance-3 holds the USPTO device-trust file and the session
+    built from it, so the agent and the panel stay here and only the browser lives
+    there, behind a plain ssh port-forward.
+
+    It is NOT the Chrome version, which is what this used to say. Measured
+    2026-09-04 on builder4: Chrome 149 and 152 BOTH answer Network.setCookie and
+    Storage.setCookies here, and both wedge on them, headless or headed, when the
+    browser is launched without --password-store=basic. Chrome then blocks on an OS
+    keyring it reaches over dbus, there is none on these boxes, and every later call
+    on that connection times out behind the one that hung. launch() passes the flag
+    now, so a signed-in browser CAN run locally; moving the device trust is a
+    deliberate job, not a side effect of this note.
     """
     host = host or REMOTE_HOST
     zone = zone or REMOTE_ZONE
@@ -279,7 +297,6 @@ def launch_remote(label: str, headless: bool = True, host: str = "", zone: str =
             #  Recorded so a later caller can prove this port still reaches THIS
             #  browser and not one that inherited the number. See browser_id.
             "browser_id": browser_id(local_port)}
-
 
 def shutdown_remote(info: dict) -> dict:
     """Close the remote Chrome and drop the tunnel."""

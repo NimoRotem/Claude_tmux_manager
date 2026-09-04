@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -561,6 +562,172 @@ def probe_all(inv: dict, wait_s: float = 20.0) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# one identity, one holder at a time
+# ---------------------------------------------------------------------------
+#  A LEASE IS TAKEN ON AN IDENTITY, NOT ON A BROWSER. Two agents driving one
+#  signed-in profile is how a site sees two sessions from one account, logs one of
+#  them out and asks the other for a code. The identity is the scarce thing: the
+#  google account, the USPTO account, the Ramp session. A browser is just the
+#  process that happens to be holding it.
+#
+#  The file is shared by every dashboard on the box, like slots.json, because that
+#  is the level the collision happens at.
+LEASES_FILE = CB_ROOT / "leases.json"
+DEFAULT_LEASE_S = 3600.0
+#  Enough room for one more Chrome, judged the way browser_ladder judges it: these
+#  boxes livelock rather than OOM-kill, so the refusal has to come before the launch.
+MIN_FREE_MB = 900.0
+MIN_FREE_PCT = 8.0
+MAX_BROWSERS = int(os.environ.get("CB_MAX_BROWSERS", "6"))
+
+
+def _mem() -> Tuple[float, float]:
+    try:
+        info = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            info[k.strip()] = float(v.strip().split()[0]) / 1024.0
+        free = info.get("MemAvailable", 0.0)
+        total = info.get("MemTotal", 1.0)
+        return free, (free / total * 100.0 if total else 0.0)
+    except Exception:                                             # noqa: BLE001
+        return 0.0, 0.0
+
+
+def afford_browser(running: int = -1) -> Tuple[bool, str]:
+    """Can this box open one more browser right now?
+
+    Admission control, rather than the 39-slot port map, which only ever said
+    whether a NUMBER was free. A slot map cannot refuse anything, and the ladder's
+    own guard covers only ladder runs, so the live consoles were launching into
+    whatever was left.
+    """
+    mb, pct = _mem()
+    if mb < MIN_FREE_MB or pct < MIN_FREE_PCT:
+        return False, ("only %.0f MB (%.1f%%) of memory left: a Chrome here is how "
+                       "this box livelocks, so the launch is refused, not risked"
+                       % (mb, pct))
+    if running < 0:
+        try:
+            running = len([b for b in guard.browser_roots() if b.cdp_port])
+        except Exception:                                         # noqa: BLE001
+            running = 0
+    if running >= MAX_BROWSERS:
+        return False, ("%d browsers are already open and the ceiling is %d "
+                       "(CB_MAX_BROWSERS); close one or wait" % (running, MAX_BROWSERS))
+    return True, ""
+
+
+def egress_id(identity: str) -> str:
+    """The proxy session an identity always uses.
+
+    Derived from the identity and nothing else, so the same account is seen from the
+    same exit every time. Rotating the exit under a live session is what triggers the
+    re-auth and the 2FA storm; a per-slot or per-launch session id does exactly that
+    by accident.
+    """
+    return "id-" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
+
+
+def _leases_read() -> dict:
+    try:
+        data = json.loads(LEASES_FILE.read_text("utf-8"))
+        rows = data.get("leases") if isinstance(data, dict) else None
+        return rows if isinstance(rows, dict) else {}
+    except Exception:                                             # noqa: BLE001
+        return {}
+
+
+def _leases_write(rows: dict) -> None:
+    with contextlib.suppress(Exception):
+        LEASES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LEASES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"leases": rows}, indent=1), "utf-8")
+        tmp.replace(LEASES_FILE)
+
+
+@contextlib.contextmanager
+def _leases_lock():
+    """Exclusive across processes: two sessions asking at once is the whole point."""
+    fh = None
+    try:
+        LEASES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        import fcntl
+        fh = open(str(LEASES_FILE) + ".lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    except Exception:                                             # noqa: BLE001
+        yield
+    finally:
+        if fh:
+            with contextlib.suppress(Exception):
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+
+
+def _live(row: dict, now: float) -> bool:
+    return float(row.get("expires") or 0) > now
+
+
+def leases(now: Optional[float] = None) -> dict:
+    """Every lease that has not expired. Expiry is not tidiness: a session dies
+    without releasing anything, and an identity nobody can ever take again is worse
+    than one taken twice."""
+    now = time.time() if now is None else now
+    return {k: v for k, v in _leases_read().items() if _live(v, now)}
+
+
+def acquire(identity: str, holder: str, ttl_s: float = DEFAULT_LEASE_S,
+            check_capacity: bool = True, now: Optional[float] = None) -> dict:
+    """Take the lease on an identity, or say who has it and for how long."""
+    now = time.time() if now is None else now
+    if not identity or not holder:
+        return {"ok": False, "reason": "identity and holder are both required"}
+    with _leases_lock():
+        rows = _leases_read()
+        held = rows.get(identity)
+        if held and _live(held, now) and held.get("holder") != holder:
+            return {"ok": False, "reason": "held", "held_by": held.get("holder"),
+                    "expires_in": round(float(held["expires"]) - now),
+                    "detail": "%s is driving %s for another %d s. Wait or use another "
+                              "identity: two agents on one signed-in profile is what "
+                              "logs the account out."
+                              % (held.get("holder"), identity,
+                                 float(held["expires"]) - now)}
+        if check_capacity and not (held and _live(held, now)):
+            ok, why = afford_browser()
+            if not ok:
+                return {"ok": False, "reason": "capacity", "detail": why}
+        row = {"identity": identity, "holder": holder, "acquired": now,
+               "expires": now + float(ttl_s), "egress": egress_id(identity)}
+        rows[identity] = row
+        _leases_write(rows)
+        return {"ok": True, "lease": row}
+
+
+def renew(identity: str, holder: str, ttl_s: float = DEFAULT_LEASE_S,
+          now: Optional[float] = None) -> dict:
+    return acquire(identity, holder, ttl_s, check_capacity=False, now=now)
+
+
+def release(identity: str, holder: str) -> dict:
+    """Give it back. Only the holder may: a release by anyone else is how one agent
+    takes a profile out from under another that is mid-form."""
+    with _leases_lock():
+        rows = _leases_read()
+        held = rows.get(identity)
+        if not held:
+            return {"ok": True, "detail": "nothing held"}
+        if held.get("holder") != holder:
+            return {"ok": False, "reason": "not yours",
+                    "held_by": held.get("holder")}
+        rows.pop(identity, None)
+        _leases_write(rows)
+        return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # clearing up
 # ---------------------------------------------------------------------------
 def reap_plan(inv: dict, stale_h: float = DEFAULT_STALE_H) -> List[dict]:
@@ -726,9 +893,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--reap", action="store_true", help="kill orphaned forwards and browsers")
     ap.add_argument("--yes", action="store_true", help="with --reap, actually kill")
     ap.add_argument("--stale-hours", type=float, default=DEFAULT_STALE_H)
+    ap.add_argument("--lease", default="", metavar="IDENTITY",
+                    help="take the lease on an identity (needs --holder)")
+    ap.add_argument("--release", default="", metavar="IDENTITY",
+                    help="give an identity back (needs --holder)")
+    ap.add_argument("--holder", default="", help="who is asking: a session name or a job")
+    ap.add_argument("--ttl", type=float, default=DEFAULT_LEASE_S,
+                    help="lease length in seconds (default %d)" % DEFAULT_LEASE_S)
+    ap.add_argument("--leases", action="store_true", help="who holds what right now")
+    ap.add_argument("--egress", default="", metavar="IDENTITY",
+                    help="the proxy session this identity should always use")
+    ap.add_argument("--admit", action="store_true",
+                    help="can this box afford one more browser: exit 0 yes, 1 no")
+    ap.add_argument("--wall", default="", metavar="FILE",
+                    help="write an HTML page showing every browser on the fleet")
     ap.add_argument("--host", default="", help="inventory another box over ssh")
     ap.add_argument("--zone", default="us-central1-b")
     args = ap.parse_args(list(argv) if argv is not None else None)
+
+    if args.admit:
+        ok, why = afford_browser()
+        print("yes" if ok else "no: %s" % why)
+        return 0 if ok else 1
+    if args.lease or args.release:
+        if not args.holder:
+            print("--holder is required: a lease with no holder cannot be released")
+            return 2
+        res = (acquire(args.lease, args.holder, args.ttl) if args.lease
+               else release(args.release, args.holder))
+        print(json.dumps(res, indent=1) if args.json else _lease_line(res))
+        return 0 if res.get("ok") else 1
+    if args.egress:
+        sid = egress_id(args.egress)
+        print(sid if args.json else
+              ("%s\n  python3 ~/.claude-browser/bin/proxy-ctl.py session add %s --country us\n"
+               "  (pin the exit to the IDENTITY, never to the slot or the launch: a new "
+               "exit under a live session is what asks for a code)" % (sid, sid)))
+        return 0
+    if args.leases:
+        rows = leases()
+        if args.json:
+            print(json.dumps(rows, indent=1))
+        elif not rows:
+            print("no identity is leased")
+        else:
+            for ident, row in sorted(rows.items()):
+                print("  %-28s %-24s %5d s left  egress %s"
+                      % (ident, row.get("holder"), row["expires"] - time.time(),
+                         row.get("egress")))
+        return 0
+    if args.wall:
+        boxes = [inventory()]
+        if args.host:
+            boxes.append(remote_inventory(args.host, args.zone))
+        Path(args.wall).write_text(wall_html(boxes, probe_all(boxes[0]) if args.probe else []),
+                                   "utf-8")
+        print(args.wall)
+        return 0
 
     if args.host:
         inv = remote_inventory(args.host, args.zone)
@@ -752,6 +973,113 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.yes:
                 print("  (dry run: add --yes to act)")
     return 0
+
+
+def _esc(text) -> str:
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def wall_html(boxes: Sequence[dict], probes: Sequence[dict] = ()) -> str:
+    """One page showing every browser on the fleet, who owns it and what it is on.
+
+    Deliberately not a live stream: a stream costs a core per viewer, and the
+    question this answers is "who is driving what, and is anything stuck", which a
+    table answers better than a wall of video. Click through to the console that owns
+    a browser when you actually need to watch it.
+    """
+    now = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    held = leases()
+    out = ["<!doctype html><meta charset='utf-8'>",
+           "<title>Browsers on the fleet</title>",
+           "<style>",
+           ":root{color-scheme:light dark;--bg:#fbfbfa;--fg:#1a1a19;--muted:#6b6b66;",
+           "--line:#e3e3df;--card:#fff;--warn:#8a4b00;--warnbg:#fff4e5}",
+           "@media (prefers-color-scheme:dark){:root{--bg:#16161a;--fg:#eceCe8;",
+           "--muted:#9a9a94;--line:#2c2c31;--card:#1d1d22;--warn:#ffb870;--warnbg:#3a2a12}}",
+           "body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,",
+           "system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:28px}",
+           "h1{font-size:19px;margin:0 0 4px} h2{font-size:15px;margin:26px 0 8px}",
+           ".muted{color:var(--muted);font-size:12.5px}",
+           "table{border-collapse:collapse;width:100%;margin-top:8px;background:var(--card);",
+           "border:1px solid var(--line);border-radius:8px;overflow:hidden}",
+           "th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);",
+           "vertical-align:top;font-size:13px}",
+           "th{font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;",
+           "color:var(--muted)} tr:last-child td{border-bottom:0}",
+           "code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}",
+           ".warn{background:var(--warnbg);color:var(--warn);padding:8px 10px;border-radius:6px;",
+           "margin:6px 0;font-size:13px}",
+           ".wrap{max-width:1100px;margin:0 auto}.tabs{color:var(--muted);font-size:12px}",
+           "</style>",
+           "<div class=wrap><h1>Browsers on the fleet</h1>",
+           "<div class=muted>%s. Ownership comes from the profile path and the console "
+           "state files; identity is the browser's own CDP uuid, never the port.</div>" % _esc(now)]
+    for box in boxes:
+        mem = box.get("memory_mb") or {}
+        out.append("<h2>%s</h2>" % _esc(box.get("host", "?")))
+        if mem:
+            out.append("<div class=muted>%s MB free of %s</div>"
+                       % (_esc(mem.get("available")), _esc(mem.get("total"))))
+        for p in box.get("problems") or []:
+            out.append("<div class=warn><b>%s</b> %s</div>"
+                       % (_esc(p.get("kind")), _esc(p.get("detail"))))
+        rows = box.get("browsers") or []
+        if rows:
+            out.append("<table><tr><th>pid</th><th>port</th><th>kind</th><th>owner</th>"
+                       "<th>identity</th><th>open tabs</th></tr>")
+            for b in rows:
+                tabs = b.get("tabs") or []
+                tab_text = "<br>".join(_esc((t.get("url") or t.get("title"))[:90])
+                                       for t in tabs[:4]) or "<span class=muted>not asked</span>"
+                out.append("<tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td>"
+                           "<td>%s</td><td><code>%s</code></td><td class=tabs>%s</td></tr>"
+                           % (_esc(b.get("pid")), _esc(b.get("cdp_port")), _esc(b.get("kind")),
+                              _esc(b.get("claimed_by") or b.get("owner") or b.get("profile")),
+                              _esc((b.get("browser_id") or "")[:8] or "-"), tab_text))
+            out.append("</table>")
+        fwds = box.get("forwards") or []
+        if fwds:
+            out.append("<table><tr><th>tunnel pid</th><th>local</th><th>reaches</th>"
+                       "<th>state</th><th>claimed by</th></tr>")
+            for f in fwds:
+                out.append("<tr><td><code>%s</code></td><td><code>%s</code></td>"
+                           "<td><code>%s:%s</code></td><td>%s</td><td>%s</td></tr>"
+                           % (_esc(f.get("pid")), _esc(f.get("local_port")),
+                              _esc(f.get("remote_host")), _esc(f.get("remote_port")),
+                              "up" if f.get("up") else "dead",
+                              _esc(f.get("claimed_by") or "nobody")))
+            out.append("</table>")
+    if probes:
+        out.append("<h2>Sessions</h2><table><tr><th>identity</th><th>state</th>"
+                   "<th>evidence</th></tr>")
+        for r in probes:
+            out.append("<tr><td>%s</td><td>%s</td><td class=muted>%s</td></tr>"
+                       % (_esc(r.get("name")), _esc(r.get("state")), _esc(r.get("detail"))))
+        out.append("</table>")
+    out.append("<h2>Leases</h2>")
+    if held:
+        out.append("<table><tr><th>identity</th><th>holder</th><th>expires in</th>"
+                   "<th>egress</th></tr>")
+        for ident, row in sorted(held.items()):
+            out.append("<tr><td>%s</td><td>%s</td><td>%d s</td><td><code>%s</code></td></tr>"
+                       % (_esc(ident), _esc(row.get("holder")),
+                          row["expires"] - time.time(), _esc(row.get("egress"))))
+        out.append("</table>")
+    else:
+        out.append("<div class=muted>No identity is leased. One holder at a time per "
+                   "signed-in account: two agents on one profile is what logs it out.</div>")
+    out.append("</div>")
+    return "\n".join(out)
+
+
+def _lease_line(res: dict) -> str:
+    if res.get("ok"):
+        lease = res.get("lease")
+        return ("held by %s until %s (egress %s)"
+                % (lease["holder"], time.strftime("%H:%M:%S", time.localtime(lease["expires"])),
+                   lease["egress"])) if lease else "released"
+    return "refused: %s" % (res.get("detail") or res.get("reason") or "no reason given")
 
 
 def _print_remote(inv: dict) -> str:

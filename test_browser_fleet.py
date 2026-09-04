@@ -307,3 +307,114 @@ class RemoteParseTests(unittest.TestCase):
         """`echo #x` prints nothing, so a # sentinel merges every block into one."""
         self.assertFalse(fleet.REMOTE_SEP.startswith("#"))
         self.assertIn(fleet.REMOTE_SEP, fleet.REMOTE_SNIPPET)
+
+
+class LeaseTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.object(fleet, "LEASES_FILE",
+                                    Path(self.tmp.name) / "leases.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cap = mock.patch.object(fleet, "afford_browser", return_value=(True, ""))
+        cap.start()
+        self.addCleanup(cap.stop)
+
+    def test_one_holder_at_a_time(self):
+        self.assertTrue(fleet.acquire("uspto-nimo", "session-a")["ok"])
+        second = fleet.acquire("uspto-nimo", "session-b")
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["held_by"], "session-a")
+
+    def test_the_holder_can_take_it_again(self):
+        """Re-entrancy matters: a job that renews must not lock itself out."""
+        fleet.acquire("uspto-nimo", "session-a")
+        self.assertTrue(fleet.acquire("uspto-nimo", "session-a")["ok"])
+
+    def test_an_expired_lease_is_free(self):
+        """A session dies without releasing. An identity nobody can ever take again
+        is worse than one taken twice."""
+        fleet.acquire("uspto-nimo", "session-a", ttl_s=10, now=1000.0)
+        self.assertTrue(fleet.acquire("uspto-nimo", "session-b", now=1011.0)["ok"])
+
+    def test_a_live_lease_is_not_free_a_second_before_it_expires(self):
+        fleet.acquire("uspto-nimo", "session-a", ttl_s=10, now=1000.0)
+        self.assertFalse(fleet.acquire("uspto-nimo", "session-b", now=1009.0)["ok"])
+
+    def test_only_the_holder_releases(self):
+        fleet.acquire("uspto-nimo", "session-a")
+        self.assertFalse(fleet.release("uspto-nimo", "session-b")["ok"])
+        self.assertTrue(fleet.release("uspto-nimo", "session-a")["ok"])
+        self.assertTrue(fleet.acquire("uspto-nimo", "session-b")["ok"])
+
+    def test_leases_lists_only_the_live_ones(self):
+        fleet.acquire("a", "s", ttl_s=10, now=1000.0)
+        fleet.acquire("b", "s", ttl_s=10000, now=time.time())
+        self.assertEqual(sorted(fleet.leases()), ["b"])
+
+    def test_a_lease_needs_both_names(self):
+        self.assertFalse(fleet.acquire("", "s")["ok"])
+        self.assertFalse(fleet.acquire("a", "")["ok"])
+
+
+class AdmissionTests(unittest.TestCase):
+    def test_a_box_with_no_memory_refuses_a_browser(self):
+        with mock.patch.object(fleet, "_mem", return_value=(400.0, 3.0)):
+            ok, why = fleet.afford_browser(running=0)
+        self.assertFalse(ok)
+        self.assertIn("400 MB", why)
+
+    def test_the_ceiling_refuses_the_next_one(self):
+        with mock.patch.object(fleet, "_mem", return_value=(20000.0, 60.0)):
+            ok, why = fleet.afford_browser(running=fleet.MAX_BROWSERS)
+        self.assertFalse(ok)
+        self.assertIn("ceiling", why)
+
+    def test_a_healthy_box_admits(self):
+        with mock.patch.object(fleet, "_mem", return_value=(20000.0, 60.0)):
+            self.assertTrue(fleet.afford_browser(running=1)[0])
+
+    def test_capacity_refusal_blocks_a_new_lease_but_not_a_renewal(self):
+        """Refusing to renew would drop an identity somebody is mid-form with."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(fleet, "LEASES_FILE", Path(tmp) / "l.json"):
+                with mock.patch.object(fleet, "afford_browser", return_value=(True, "")):
+                    fleet.acquire("held", "s")
+                with mock.patch.object(fleet, "afford_browser",
+                                       return_value=(False, "no memory")):
+                    self.assertFalse(fleet.acquire("fresh", "s")["ok"])
+                    self.assertTrue(fleet.renew("held", "s")["ok"])
+
+
+class EgressTests(unittest.TestCase):
+    def test_the_exit_is_pinned_to_the_identity(self):
+        """Rotating the exit IP under a signed-in session is what triggers the
+        re-auth. Same identity, same session id, every launch."""
+        self.assertEqual(fleet.egress_id("uspto-nimo"), fleet.egress_id("uspto-nimo"))
+
+    def test_different_identities_get_different_exits(self):
+        self.assertNotEqual(fleet.egress_id("uspto-nimo"), fleet.egress_id("google-nimo"))
+
+
+class WallTests(unittest.TestCase):
+    def test_the_page_names_owners_and_problems(self):
+        box = {"host": "builder4", "browsers": [
+                   {"pid": 1, "cdp_port": 9222, "kind": "resident",
+                    "owner": "the resident dashboard browser", "browser_id": "abcdef1234",
+                    "tabs": [{"url": "https://uspto.gov/x", "title": "t"}]}],
+               "forwards": [{"pid": 2, "local_port": 9401, "remote_host": "127.0.0.1",
+                             "remote_port": 9401, "up": True, "claimed_by": ""}],
+               "problems": [{"kind": "port_collision", "detail": "two browsers on 9222"}]}
+        html = fleet.wall_html([box])
+        self.assertIn("the resident dashboard browser", html)
+        self.assertIn("port_collision", html)
+        self.assertIn("nobody", html)          # the unclaimed forward
+        self.assertIn("abcdef12", html)
+
+    def test_markup_in_a_tab_title_cannot_break_out(self):
+        box = {"host": "b", "browsers": [{"pid": 1, "cdp_port": 1, "kind": "x",
+               "owner": "<script>alert(1)</script>", "tabs": []}], "forwards": []}
+        self.assertNotIn("<script>alert", fleet.wall_html([box]))
