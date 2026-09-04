@@ -952,10 +952,57 @@ def _load_simple_watchdog_disabled():
 # finished report that ended "the decision waiting for you is direction" and
 # typed a new task into that session. Overriding a legitimate hand-back is the
 # reason "full" is opt-in per session rather than the default.
-AUTOPUSH_MODES = ("off", "basic", "full")
+#   basic+  : everything in "basic" PLUS a keep-alive that re-reads the prompt
+#           cache shortly before it would expire. See the cache block below.
+#           It never composes a task: it sends one fixed continue instruction,
+#           which is what makes it safe where "full" is not.
+AUTOPUSH_MODES = ("off", "basic", "basicplus", "full")
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
+
+# ── Prompt cache expiry ─────────────────────────────────────────────────────
+# Anthropic's prompt cache is ephemeral with one of two lifetimes: 5 minutes by
+# default, or 1 hour when the request asks for `ttl: "1h"`. Claude Code buys the
+# 1-hour cache, and _session_facts reads which one off the transcript rather than
+# assuming (usage.cache_creation splits the write into ephemeral_1h_input_tokens
+# and ephemeral_5m_input_tokens), so a session that drops to the 5-minute cache
+# is tracked correctly without a code change here.
+#
+# TWO PROPERTIES DECIDE THE WHOLE DESIGN:
+#   1. A cache READ refreshes the entry's timer, at no extra cost. So the clock
+#      restarts on every turn and the deadline is measured from the LAST turn,
+#      not from when the session began.
+#   2. The lifetime runs from the START of the request, and generation time
+#      counts against it. We only know when the reply LANDED, so a deadline of
+#      last_turn_end + ttl is optimistic by roughly one turn's duration. The
+#      warning lead below absorbs that: it is far larger than a turn.
+#
+# There is no API that answers "is this prefix still cached". What the transcript
+# does tell us, exactly, is whether the LAST turn read from cache
+# (usage.cache_read_input_tokens > 0), which is a measurement rather than a
+# prediction: non-zero means the cache was warm at that moment and its timer was
+# refreshed then. That is the honest signal, and it is what the UI reports.
+CACHE_WARN_LEAD = 600      # start warning 10 minutes before the cache goes cold
+CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
+                                # more or less continuous, so leave those alone.
+CACHE_KEEPALIVE_PROMPT = (
+    "Continue. re-verify your own work end to end, then finish whatever is still left."
+)
+
+
+def _cache_deadline(sess: dict) -> float:
+    """Epoch second at which this session's prompt cache goes cold, or 0.
+
+    0 means "not known": no turn recorded yet, or no cache write seen in the
+    transcript, and a guess would be worse than saying nothing.
+    """
+    try:
+        ttl = float(sess.get("cache_ttl") or 0)
+        end = float(sess.get("last_turn_end") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return end + ttl if ttl and end else 0.0
 
 
 def _get_autopush_mode(session_name: str) -> str:
@@ -1263,6 +1310,11 @@ async def lifespan(_app: FastAPI):
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
     logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
+
+    cache_keepalive_task = asyncio.create_task(_cache_keepalive_loop())
+    _background_tasks.append(cache_keepalive_task)
+    logger.info("Cache keep-alive started (Basic+ sessions, %ds before the cache goes cold)",
+                CACHE_WARN_LEAD)
 
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
@@ -2051,6 +2103,9 @@ def _render_page(kind: str, prefix: str) -> str:
     if hit is not None:
         return hit
     out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
+    # One definition of "approaching cold": the page blinks on the same number of
+    # seconds the keep-alive pushes on, so the warning and the action agree.
+    out = out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
     _page_cache[key] = out
     return out
 
@@ -7615,6 +7670,7 @@ def build_session_response(
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+        "cache_keepalive": _cache_keepalive_active(sess["name"]),
         **_session_model_fields(sess["name"]),
         **_session_auth_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
@@ -7694,6 +7750,7 @@ async def api_sessions_fast(request: Request):
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "cache_keepalive": _cache_keepalive_active(sess["name"]),
             **_session_model_fields(sess["name"]),
             **_session_auth_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
@@ -7741,6 +7798,7 @@ async def api_status(request: Request):
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "cache_keepalive": _cache_keepalive_active(sess["name"]),
             **_session_model_fields(sess["name"]),
             **_session_auth_fields(sess["name"]),
         })
@@ -17503,6 +17561,7 @@ def _session_model_fields(session_name: str) -> dict:
         "context_tokens": int(detected.get("context_tokens", 0) or 0),
         "context_limit": int(detected.get("context_limit", 0) or 0),
         "cache_ttl": int(detected.get("cache_ttl", 0) or 0),
+        "cache_read_tokens": int(detected.get("cache_read_tokens", 0) or 0),
         "last_turn_end": float(detected.get("last_turn_end", 0) or 0),
     }
 
@@ -17771,7 +17830,7 @@ def _scan_assistant_tail(lines: list) -> dict:
     entry means the transcript is still warm an hour later, a 5m one means it
     is cold after five minutes."""
     out = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
-           "fell_back_from": ""}
+           "fell_back_from": "", "cache_read": 0}
     seen = 0
     for line in reversed(lines):
         line = line.strip()
@@ -17815,6 +17874,13 @@ def _scan_assistant_tail(lines: list) -> dict:
                 out["ctx"] = (int(usage.get("input_tokens") or 0)
                               + int(usage.get("cache_read_input_tokens") or 0)
                               + int(usage.get("cache_creation_input_tokens") or 0))
+            # Whether the NEWEST turn read from cache. This is the one honest
+            # "was it still cached" measurement available: non-zero means the
+            # cache was warm for that request and its timer restarted then.
+            # Older turns say nothing about now, so only the first entry the
+            # reversed walk reaches (seen == 1) is recorded.
+            if seen == 1:
+                out["cache_read"] = int(usage.get("cache_read_input_tokens") or 0)
             if not out["ttl"]:
                 # A turn that only READ from cache creates nothing, so the TTL
                 # is only stated on turns that wrote — keep looking back until
@@ -17847,7 +17913,7 @@ def _last_assistant_facts(path: str) -> dict:
     at all: the read came back empty, the caller substituted the configured
     default, and a session running at one effort was labelled with another."""
     empty = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
-             "fell_back_from": ""}
+             "fell_back_from": "", "cache_read": 0}
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -17907,7 +17973,7 @@ def _detect_session_model_effort(session_name: str) -> dict:
     # argv still says what the session was launched on. `sure` stays true so a
     # brand-new session is not badged as a guess.
     sure = True
-    facts = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0}
+    facts = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "cache_read": 0}
     if newest:
         # Was the file actually identified as this session's, or is it just the
         # most recent one in a shared project dir? The caller marks the badge so
@@ -17996,7 +18062,8 @@ def _detect_session_model_effort(session_name: str) -> dict:
     out = {"model": model, "effort": effort, "ts": now, "sure": sure,
            "effort_source": source, "fell_back_from": fell_back_from,
            "context_tokens": facts["ctx"], "context_limit": limit,
-           "cache_ttl": facts["ttl"], "last_turn_end": facts["ts"]}
+           "cache_ttl": facts["ttl"], "last_turn_end": facts["ts"],
+           "cache_read_tokens": facts.get("cache_read", 0)}
     _session_model_cache[session_name] = out
     return out
 
@@ -19315,6 +19382,118 @@ _LOGIN_CODE_PROMPT_RE = re.compile(
     r"(?:paste|enter)\s+(?:the\s+)?(?:(?:authorization|oauth|login)\s+)?code\b",
     re.I,
 )
+# ── Basic+ : keep the prompt cache warm ─────────────────────────────────────
+# The cache is what makes a follow-up cheap, and it expires on a timer that
+# restarts on every turn (see CACHE_WARN_LEAD above). Basic+ spends one cheap
+# turn to restart that timer shortly before it would lapse, so a session left
+# alone over lunch is still warm when its owner comes back.
+#
+# Deliberately NOT the autopilot. That one screenshots the pane and lets a model
+# compose an instruction, which is why it stays opt-in and off by default: it
+# cannot tell a finished hand-back from a stall, and it has typed a new task
+# into a session that was legitimately done. This sends ONE fixed sentence and
+# never composes anything, so the worst case is a redundant verification pass on
+# work that was already finished.
+_CACHE_KEEPALIVE_INTERVAL = 30     # seconds between scans
+_cache_keepalive_state: Dict[str, dict] = {}
+
+
+def _cache_keepalive_active(session_name: str) -> bool:
+    """Is this session mid-run because the keep-alive pushed it?
+
+    True from the moment the nudge is sent until the turn it started finishes.
+    The UI colours the session on this, so it answers "it is working, but only
+    to hold the cache" rather than "someone asked it for something".
+    """
+    return bool((_cache_keepalive_state.get(session_name) or {}).get("fired_for"))
+
+
+async def _cache_keepalive_loop():
+    """Push one continue into an idle Basic+ session before its cache goes cold."""
+    log = logging.getLogger("cache-keepalive")
+    await asyncio.sleep(12)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_CACHE_KEEPALIVE_INTERVAL)
+            now = time.time()
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            for sess in sessions_list:
+                name = sess["name"]
+                if _get_autopush_mode(name) != "basicplus":
+                    _cache_keepalive_state.pop(name, None)
+                    continue
+                try:
+                    fields = await asyncio.to_thread(_session_model_fields, name)
+                except Exception:
+                    continue
+                ttl = int(fields.get("cache_ttl") or 0)
+                deadline = _cache_deadline(fields)
+                turn_end = float(fields.get("last_turn_end") or 0)
+                # No measured TTL means no transcript to read yet, or no cache
+                # write seen. Guessing a deadline would push on a made-up clock.
+                if not deadline or ttl < CACHE_KEEPALIVE_MIN_TTL:
+                    continue
+                # When several sessions share a working directory the transcript
+                # cannot be told apart, and detect_sure says so. Reporting a
+                # neighbour's countdown is a cosmetic error; TYPING on it is not,
+                # so the nudge only fires on a transcript we can prove is ours.
+                if not fields.get("detect_sure", True):
+                    continue
+                st = _cache_keepalive_state.setdefault(name, {})
+                # A turn landed after our nudge: the cache clock restarted, so
+                # drop the marker (the session stops showing as maintaining) and
+                # let the deadline test below decide afresh.
+                if st.get("fired_for") and turn_end > st["fired_for"] + 1:
+                    st.clear()
+                if now < deadline - CACHE_WARN_LEAD:
+                    continue
+                if st.get("fired_for"):
+                    continue          # already pushed for this turn
+                if not await _async_is_claude_running(name):
+                    continue
+                # Busy is the point of the exercise: a session that is working is
+                # issuing requests, and every one of them refreshes the cache.
+                try:
+                    activity = await async_detect_activity(name)
+                except Exception:
+                    continue
+                if activity.get("status") != "idle":
+                    continue
+                try:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if vis.returncode != 0:
+                        continue
+                    visible = vis.stdout
+                except Exception:
+                    continue
+                # The same three things that make any auto-typing unsafe: a menu
+                # the auto-responder owns, a shell where Claude used to be, and a
+                # half-typed message we would clobber. A fresh session has no
+                # conversation to keep warm, so it is skipped too.
+                if (_detect_interactive_prompt(visible)
+                        or _looks_like_bare_shell(visible)
+                        or _looks_like_fresh_claude_session(visible)
+                        or _has_pending_user_input(visible)):
+                    continue
+                ok = await _simple_watchdog_send_text(name, CACHE_KEEPALIVE_PROMPT)
+                if ok:
+                    st["fired_for"] = turn_end
+                    st["at"] = now
+                    left = int(deadline - now)
+                    _simple_watchdog_record(
+                        name, f"cache keep-alive ({left // 60}m before cold)")
+                    log.info("Cache keep-alive pushed to '%s' (%ds before cold)",
+                             name, left)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("cache keep-alive loop iteration failed", exc_info=True)
+
+
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
@@ -20434,7 +20613,21 @@ body.member-admin .more-member-only{display:none}
 .autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
+.autopush-seg button.ap-basicplus.active{background:#9e6a03}
 .autopush-seg button.ap-full.active{background:#238636}
+/* Approaching cold. The point of the blink is to be caught out of the corner of
+   an eye from across the room, so it is fast and it moves both the pill and the
+   dot; the amber below is the calmer "it is only holding the cache" state. */
+@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
+.status-pill.idle.expiring{background:#d2992233;color:#e3b341;border-color:#d29922aa;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.status-pill.idle.expiring .status-dot{background:#e3b341;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.tl-since.expiring{color:#e3b341;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
+/* Working, but only to hold the cache. Amber, and NOT blinking: it wants to be
+   distinguishable from a session someone actually asked for something. */
+.status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
+.status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
 .idle-nudge-seg button.in-off.active{background:#484f58}
 .idle-nudge-seg button.in-light.active{background:#1f6feb}
 .idle-nudge-seg button.in-adhd.active{background:#da3633}
@@ -21319,6 +21512,10 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+// Seconds before the prompt cache goes cold that the session starts
+// blinking, and that Basic+ pushes its keep-alive. Substituted from the
+// server's CACHE_WARN_LEAD so the two can never drift apart.
+const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
 
 // ── Tab-scoped impersonation ────────────────────────────────────────────────
 // The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
@@ -22495,6 +22692,11 @@ function startLiveTicker(){
     // of the busy state. It only rewrites the span when the rendered text
     // actually changes, which past a minute is once a minute.
     _paintIdleSince(selectedSession);
+    // The pill's cache state is a function of elapsed time, not of anything the
+    // server pushes, so it has to be re-evaluated on the tick as well. Without
+    // this a session that is already idle never starts blinking, because the
+    // pill is otherwise only repainted when its status CHANGES.
+    _paintPillCache(selectedSession);
     const st=rawState[selectedSession];
     if(!st||!st.live||!st.live.seen||!_sessionBusy(selectedSession))return;
     const e=document.getElementById('tl-time-'+selectedSession);
@@ -22535,17 +22737,30 @@ function _paintIdleSince(name){
   const ago=Date.now()/1000-end;
   const ttl=s.cache_ttl||0;
   let cls='tl-since',hint='Silence since the last reply landed.';
+  let left=0;
   if(ttl){
     const warm=ago<ttl*0.8, cooling=ago<ttl;
+    left=Math.max(0,ttl-ago);
     cls+=warm?' warm':(cooling?' cooling':' cold');
+    // Blink once inside the last CACHE_WARN_LEAD seconds, and only while there
+    // is still something to save: after it is cold there is nothing to hurry for.
+    if(cooling&&left<=CACHE_WARN_LEAD)cls+=' expiring';
     const ttlTxt=ttl>=3600?'1h':Math.round(ttl/60)+'m';
+    // What the last turn ACTUALLY did is a measurement; everything after it is a
+    // countdown. Report them as the different things they are.
+    const read=s.cache_read_tokens||0;
     hint='Silence since the last reply landed. This session buys a '+ttlTxt+
          ' prompt cache, so the transcript is '+
          (cooling?'still warm, so the next message re-reads it at cache-read price.'
-                 :'cold, so the next message pays to write the whole prompt again.');
+                 :'cold, so the next message pays to write the whole prompt again.')+
+         (cooling?' Goes cold in '+_fmtAgo(left)+'.':'')+
+         (read?' The last turn read '+read.toLocaleString()+' tokens from cache, '+
+               'which is what restarted this timer.'
+             :' The last turn read nothing from cache: it paid to write the prompt.');
   }
   if(s.detect_sure===false)cls+=' unsure';
-  const txt='idle '+_fmtAgo(ago)+(ttl&&ago>=ttl?' · cache cold':'');
+  const txt='idle '+_fmtAgo(ago)+
+    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_WARN_LEAD?' · cold in '+_fmtAgo(left):'')):'');
   if(el.textContent!==txt)el.textContent=txt;
   if(el.className!==cls)el.className=cls;
   if(el.title!==hint)el.title=hint;
@@ -24940,10 +25155,40 @@ function reloadActive(name){
   else refreshOne(name);
 }
 
+// Seconds until this session's prompt cache goes cold, or null when unknown.
+// Null and 0 mean different things and must not be conflated: null is "no
+// measured TTL, say nothing", 0 is "already cold".
+function _cacheSecondsLeft(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  if(!s.cache_ttl||!s.last_turn_end)return null;
+  return Math.max(0,s.cache_ttl-(Date.now()/1000-s.last_turn_end));
+}
+// The two cache states the pill can carry. Kept apart from updateStatusPill so
+// the per-second ticker can re-apply them without touching the label.
+function _pillCacheClasses(name,status){
+  const s=sessions.find(x=>x.name===name)||{};
+  let extra='';
+  if(status==='busy'&&s.cache_keepalive)extra+=' keepcache';
+  if(status==='idle'){
+    const left=_cacheSecondsLeft(name);
+    if(left!==null&&left>0&&left<=CACHE_WARN_LEAD)extra+=' expiring';
+  }
+  return extra;
+}
+function _paintPillCache(name){
+  const pill=document.getElementById('status-'+name);
+  if(!pill)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const base='status-pill '+(s.activity_status||'unknown');
+  const want=base+_pillCacheClasses(name,s.activity_status);
+  if(pill.className!==want)pill.className=want;
+}
 function updateStatusPill(name,status,detail){
   const pill=document.getElementById('status-'+name);
   if(pill){
-    pill.className='status-pill '+(status||'unknown');
+    // Amber steady = working only to hold the cache. Amber blinking = idle with
+    // the cache about to lapse, which is the one that wants you at the keyboard.
+    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status);
     pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
       +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
@@ -25920,11 +26165,16 @@ let _watchdogTimers={};
 const AUTOPUSH_TITLES={
   off:'Off — the dashboard never types into this terminal',
   basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
+  basicplus:'Basic +: Basic, plus one fixed "continue" '+
+            (CACHE_WARN_LEAD/60)+' minutes before the prompt cache goes cold, so the '+
+            'transcript stays warm and your next message is still cheap. Never composes '+
+            'a task; the session turns amber while it is running for this reason.',
   full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
 };
 function autopushDesc(mode){
   return ({off:'Off — no auto-typing',
            basic:'Basic — picks options + confirms prompts',
+           basicplus:'Basic +: Basic, plus keeps the prompt cache warm',
            full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
 }
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
@@ -25934,7 +26184,7 @@ function autopushSeg(name,mode,compact){
     esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
     esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
-    b('off','Off')+b('basic','Basic')+b('full','Full')+'</div>';
+    b('off','Off')+b('basic','Basic')+b('basicplus','Basic +')+b('full','Full')+'</div>';
 }
 // Reflect a mode across every rendered control for this session (More menu + Info tab).
 function syncAutopushUI(name,mode){

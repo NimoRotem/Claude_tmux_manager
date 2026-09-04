@@ -152,5 +152,5 @@ def test_the_canonical_paths_still_name_the_two_scripts():
 
 def test_autopush_is_the_remaining_control():
     from app import AUTOPUSH_MODES, AUTOPUSH_DEFAULT
-    assert set(AUTOPUSH_MODES) == {"off", "basic", "full"}
+    assert set(AUTOPUSH_MODES) == {"off", "basic", "basicplus", "full"}
     assert AUTOPUSH_DEFAULT in AUTOPUSH_MODES
