@@ -298,6 +298,7 @@ def launch_remote(label: str, headless: bool = True, host: str = "", zone: str =
             #  browser and not one that inherited the number. See browser_id.
             "browser_id": browser_id(local_port)}
 
+
 def shutdown_remote(info: dict) -> dict:
     """Close the remote Chrome and drop the tunnel."""
     host, zone = info.get("host") or REMOTE_HOST, info.get("zone") or REMOTE_ZONE
