@@ -747,11 +747,53 @@ def _save_longlived_token(token: str):
     LONGLIVED_TOKEN_FILE.chmod(0o600)
 
 
+def _plan_credential_is_static() -> bool:
+    """True when ~/.claude/.credentials.json cannot rotate under us.
+
+    `claude setup-token` mints an access token with an EMPTY refresh token and
+    about a year on the clock. Nothing ever refreshes it, so concurrent sessions
+    cannot race each other into "401 OAuth access token has been revoked", the
+    one failure CLAUDE_CODE_OAUTH_TOKEN was introduced to dodge. Once the shared
+    credential is itself a setup token, that export has nothing left to protect
+    and costs real accuracy: see _claude_launch_env_prefix.
+
+    A credential WITH a refresh token is the old rotating kind, and the export
+    still earns its place there, so this returns False and nothing changes.
+
+    (SHARED_CREDENTIALS is defined further down the file; this only ever runs
+    long after import, and naming the path twice is how the two copies drift.)
+    """
+    try:
+        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
+    except Exception:
+        return False
+    if not o or o.get("refreshToken"):
+        return False
+    return int(o.get("expiresAt") or 0) > int(time.time() * 1000)
+
+
 def _claude_launch_env_prefix() -> str:
     """Shell env prefix for launching `claude`. Exports a stored long-lived token
-    when present (so sessions stop rotating the shared credential and never get
-    revoked); otherwise falls back to unsetting both auth vars. ANTHROPIC_API_KEY
-    is always unset so inference stays on the plan, never the metered API.
+    ONLY when the shared plan credential could otherwise rotate; otherwise unsets
+    both auth vars and lets the CLI read ~/.claude/.credentials.json.
+    ANTHROPIC_API_KEY is always unset so inference stays on the plan, never the
+    metered API.
+
+    WHY THE EXPORT IS NOW CONDITIONAL. Measured on 2.1.257: the CLI decides the
+    name it prints beside the model from the subscriptionType on the credential
+    record, and it refuses to look at that record at all when
+    CLAUDE_CODE_OAUTH_TOKEN is set in the environment. A bare token string
+    carries no plan, so the switch falls through to its default and the session
+    announces itself as "Claude API". Same box, same token family, same plan,
+    one variable: with the export the banner read `Haiku 4.5 · Claude API`,
+    without it `Haiku 4.5 · Claude Max`.
+
+    Nothing about the BILLING ever differed: an sk-ant-oat01 token is answered
+    with anthropic-ratelimit-unified-5h/7d headers, which is the subscription's
+    own limiter, and the org has metered overage disabled outright. It was only
+    ever the label. But a label that says a session is spending metered money
+    when it is not is worth this much care, because the reasonable reaction to
+    it is to go looking for a bill that does not exist.
 
     CLAUDE_CODE_EFFORT_LEVEL is unset deliberately: when it is present the CLI
     treats the effort as pinned for the whole session and refuses /effort with
@@ -763,7 +805,7 @@ def _claude_launch_env_prefix() -> str:
     settings.json `env` into its own process, so a pin written there survives
     this prefix. _restore_default_effort_setting() strips that one."""
     tok = _load_longlived_token()
-    if tok:
+    if tok and not _plan_credential_is_static():
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
                 + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
     return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
@@ -782,8 +824,23 @@ LAUNCH_SCRIPT_DIR = MESSAGES_DIR / "launch"
 
 
 def _auth_mode_label() -> str:
-    """One word for how a pane authenticates, for the launch banner."""
-    return "Token" if _load_longlived_token() else "Clean"
+    """One word for what a pane will SPEND, for the launch banner.
+
+    It used to name the mechanism ("Token" / "Clean"), which answered a question
+    nobody was asking while leaving the one that matters, plan or metered API,
+    to be inferred from a line the CLI itself gets wrong. So it names the plan.
+    """
+    if _stored_anthropic_key:
+        return "API key"            # the metered path; the only one that bills
+    if _load_longlived_token() and not _plan_credential_is_static():
+        return "Token"              # plan-backed, but branded "Claude API" below
+    try:
+        sub = (json.loads(SHARED_CREDENTIALS.read_text())
+               .get("claudeAiOauth", {}).get("subscriptionType") or "")
+    except Exception:
+        sub = ""
+    return {"max": "Max plan", "pro": "Pro plan", "team": "Team plan",
+            "enterprise": "Enterprise"}.get(sub, "Clean")
 
 
 def _launch_banner(session: str, owner: str = "", model: str = "", effort: str = "") -> str:
@@ -984,6 +1041,13 @@ _autopush_mode: Dict[str, str] = {}
 # prediction: non-zero means the cache was warm at that moment and its timer was
 # refreshed then. That is the honest signal, and it is what the UI reports.
 CACHE_WARN_LEAD = 600      # start warning 10 minutes before the cache goes cold
+# And make a NOISE five minutes before, once. The blink above is for a screen
+# you are looking at; this is for one you are not. Two thresholds on purpose:
+# seeing it start to blink is a nudge you can ignore, hearing it is the last
+# call, and collapsing them into one number would mean either a chime ten
+# minutes out (too early to act on, so it becomes background noise) or no
+# visible warning until five (too late to notice across a room).
+CACHE_BEEP_LEAD = 300
 CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
                                 # more or less continuous, so leave those alone.
 CACHE_KEEPALIVE_PROMPT = (
@@ -2106,6 +2170,7 @@ def _render_page(kind: str, prefix: str) -> str:
     # One definition of "approaching cold": the page blinks on the same number of
     # seconds the keep-alive pushes on, so the warning and the action agree.
     out = out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
+    out = out.replace("__CACHE_BEEP_LEAD__", str(CACHE_BEEP_LEAD))
     _page_cache[key] = out
     return out
 
@@ -7201,7 +7266,7 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     # call relative to an OpenAI request.
     full_output = None
     sig = ""
-    might_need = AUTO_SUMMARIZER_ENABLED and (force_all or (
+    might_need = force_all or (AUTO_SUMMARIZER_ENABLED and (
         not has_description
         or not has_progress or progress_ttl_expired
         or not has_notes or notes_ttl_expired
@@ -7222,8 +7287,14 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         notes_ttl_expired and bool(sig) and entry.get("notes_sig") != sig
     )
 
-    # Auto-summarizer removed: never issue LLM title/description/progress/notes calls.
-    if not AUTO_SUMMARIZER_ENABLED:
+    # The AUTOMATIC summarizer is off unless TMUX_DASH_AUTO_SUMMARY is set: it
+    # fired an LLM call per session per poll forever, whether or not anyone was
+    # reading the result. `force_all` is the other thing entirely, someone
+    # pressed Full, and it stays live, because the Key Info notes are the ONLY
+    # source for the "Saved from this project" drawer, and with this gate also
+    # swallowing the button that drawer could never fill on any box where the
+    # env var was unset, which is all of them. Nothing here runs unasked.
+    if not AUTO_SUMMARIZER_ENABLED and not force_all:
         need_description = need_progress = need_notes = False
 
     tasks = {}
@@ -11576,6 +11647,39 @@ def _cpu_utilisation_pct() -> float:
         return _CPU_SAMPLE["pct"]
 
 
+def _billing_state() -> dict:
+    """What a session launched from this dashboard actually spends.
+
+    Exists because the CLI's own banner cannot be trusted to answer it: with
+    CLAUDE_CODE_OAUTH_TOKEN exported it prints "Claude API" on a Max plan (see
+    _claude_launch_env_prefix). This reports the launch path instead of the
+    label, so the answer comes from what the dashboard is about to do rather
+    than from what the session says about itself afterwards.
+
+    `metered` is the only field worth acting on: True means an Anthropic API key
+    is configured and inference is billed per token.
+    """
+    key = bool(_stored_anthropic_key)
+    plan, tier = "", ""
+    try:
+        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
+        if int(o.get("expiresAt") or 0) > int(time.time() * 1000):
+            plan = o.get("subscriptionType") or ""
+            tier = o.get("rateLimitTier") or ""
+    except Exception:
+        logger.debug("Could not read the plan credential for billing state", exc_info=True)
+    env_token = bool(_load_longlived_token()) and not _plan_credential_is_static()
+    return {
+        "metered": key,
+        "plan": plan,
+        "tier": tier,
+        "mode": _auth_mode_label(),
+        # True while the CLI will mislabel itself. Kept as its own field so the
+        # UI can explain the banner rather than contradict it.
+        "banner_says_api": env_token and not key,
+    }
+
+
 _HOST_IDENTITY: Dict[str, str] = {}
 
 
@@ -11640,6 +11744,7 @@ async def api_stats(request: Request):
     stats = {}
     # Which box answered. Cached, so this is a dict lookup after the first call.
     stats["host"] = await asyncio.to_thread(_host_identity)
+    stats["billing"] = _billing_state()
     # CPU load
     try:
         with open('/proc/loadavg') as f:
@@ -11723,6 +11828,233 @@ async def api_stats(request: Request):
     except Exception:
         stats["uptime"] = "unknown"
     return JSONResponse(stats)
+
+
+# --- Process table (the "what is actually running" half of the stats popup) ---
+#
+# `ps`'s %CPU is the average over the whole life of the process, so a session
+# that pinned a core for an hour this morning and has been idle since still
+# reads high, and the one eating the box right now reads low. top and htop do
+# not do that: they sample the counters twice and divide by the wall clock in
+# between. So does this. The sample costs a sleep, which is exactly why it is
+# NOT in /api/stats: the nav bar polls that for every signed-in user every 30
+# seconds, and a 0.6s sleep in there would be paid by all of them for a number
+# nobody is looking at.
+#
+# One second, not less. CPU is counted in kernel ticks (100/s here), so the
+# smallest non-zero reading is one tick over the window: at 0.6s that is 1.6%,
+# and a dozen daemons that merely woke up once all report it. At 1.0s the floor
+# is a round 1.0% and the table reads the way top does.
+_PROC_SAMPLE_SECS = 1.0
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_PAGE_KB = (os.sysconf("SC_PAGE_SIZE") // 1024) if hasattr(os, "sysconf") else 4
+
+
+def _proc_tick_table() -> Dict[int, tuple]:
+    """pid -> (ppid, cpu_ticks, rss_kb, comm). One pass over /proc.
+
+    Reads only `stat`, which is a single line and needs no parsing of the
+    /proc/<pid>/status key-value format. The comm field can itself contain
+    spaces and brackets, so it is cut out on the LAST ')' rather than split on
+    whitespace, the classic way this parser goes wrong.
+    """
+    out: Dict[int, tuple] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat") as fh:
+                line = fh.read()
+        except OSError:
+            continue            # exited between listdir and open; normal
+        try:
+            lp = line.rindex(")")
+            comm = line[line.index("(") + 1:lp]
+            f = line[lp + 2:].split()
+            # Fields after comm, 0-indexed: 0 state, 1 ppid, 11 utime, 12 stime,
+            # 21 rss (pages). See proc(5).
+            out[int(name)] = (int(f[1]), int(f[11]) + int(f[12]),
+                              int(f[21]) * _PAGE_KB, comm)
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _pid_to_session() -> Dict[int, str]:
+    """pid -> tmux session, for the pane process and everything under it.
+
+    A pane's own pid IS the agent process (tmux execs the launch script in the
+    pane), so every descendant of it (the MCP servers, a build, a stray
+    browser) is that session's work. Attributing them is the whole point of
+    the panel: "node is eating a core" is not actionable, "the node under
+    session `builder` is" is.
+    """
+    panes: Dict[int, str] = {}
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                            "#{session_name} #{pane_pid}"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            sess, _, pid = line.rpartition(" ")
+            if sess and pid.strip().isdigit():
+                panes[int(pid)] = sess
+    except Exception:
+        logger.debug("tmux pane listing failed for the process table", exc_info=True)
+    if not panes:
+        return {}
+    children: Dict[int, list] = {}
+    for pid, (ppid, _t, _r, _c) in _proc_tick_table().items():
+        children.setdefault(ppid, []).append(pid)
+    owner: Dict[int, str] = {}
+    for root, sess in panes.items():
+        stack = [root]
+        while stack:                       # BFS, not recursion: a deep pipeline
+            pid = stack.pop()              # of shells would blow the stack
+            if pid in owner:
+                continue
+            owner[pid] = sess
+            stack.extend(children.get(pid, ()))
+    return owner
+
+
+def _cmdline(pid: int, comm: str) -> str:
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read(4096)
+    except OSError:
+        return comm
+    txt = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    # A kernel thread has an empty cmdline; `ps` shows those in brackets.
+    return txt or "[" + comm + "]"
+
+
+_UID_NAMES: Dict[int, str] = {}
+
+
+def _uid_name(uid: int) -> str:
+    if uid not in _UID_NAMES:
+        try:
+            import pwd
+            _UID_NAMES[uid] = pwd.getpwuid(uid).pw_name
+        except Exception:
+            _UID_NAMES[uid] = str(uid)
+    return _UID_NAMES[uid]
+
+
+def _process_snapshot(limit: int = 24) -> dict:
+    """Two /proc samples, `_PROC_SAMPLE_SECS` apart, as a top-style table.
+
+    `cpu` is a share of ONE core, the way top and htop report it, so a process
+    using four cores reads 400%. Saying that in the UI matters: on an 8-vCPU
+    box "312%" is healthy and "98%" next to a stalled session is not, and the
+    two are indistinguishable if the number is silently normalised to the core
+    count.
+    """
+    first = _proc_tick_table()
+    t0 = time.monotonic()
+    time.sleep(_PROC_SAMPLE_SECS)
+    second = _proc_tick_table()
+    elapsed = max(time.monotonic() - t0, 0.05)
+    owner = _pid_to_session()
+    total_kb = 0
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+
+    rows = []
+    for pid, (ppid, ticks, rss_kb, comm) in second.items():
+        prev = first.get(pid)
+        # A process born inside the sample window has no baseline. Charging it
+        # its whole lifetime's ticks would spike it to a meaningless number, so
+        # it enters the table at 0 and is measured properly on the next poll.
+        used = (ticks - prev[1]) if prev else 0
+        cpu = round(100.0 * used / _CLK_TCK / elapsed, 1)
+        rows.append({
+            "pid": pid, "ppid": ppid, "comm": comm,
+            "cpu": max(cpu, 0.0),
+            "rss_mb": round(rss_kb / 1024.0, 1),
+            "mem": round(100.0 * rss_kb / total_kb, 1) if total_kb else 0.0,
+            "session": owner.get(pid, ""),
+        })
+
+    # Union of the two leaderboards. A 6 GB process at 0% CPU is exactly what
+    # you open this panel to find, and a pure CPU sort hides it completely.
+    by_cpu = sorted(rows, key=lambda r: -r["cpu"])[:limit]
+    by_mem = sorted(rows, key=lambda r: -r["rss_mb"])[:limit]
+    keep, seen = [], set()
+    for r in by_cpu + by_mem:
+        if r["pid"] in seen:
+            continue
+        seen.add(r["pid"])
+        keep.append(r)
+    for r in keep:
+        r["cmd"] = _cmdline(r["pid"], r["comm"])
+        try:
+            r["user"] = _uid_name(os.stat("/proc/%d" % r["pid"]).st_uid)
+        except OSError:
+            r["user"] = ""
+    return {
+        "processes": keep,
+        "total": len(rows),
+        "cpu_count": os.cpu_count() or 1,
+        "sample_secs": round(elapsed, 2),
+        # Across every process on the box, not just the rows above, so the panel
+        # can say what share of the machine the table actually accounts for.
+        # Deliberately no RSS total to go with it: summing RSS counts every
+        # shared page once per process and lands far above the RAM in the box,
+        # which would contradict the Memory section three rows higher up.
+        "cpu_sum": round(sum(r["cpu"] for r in rows), 1),
+    }
+
+
+# Its own single thread, never asyncio.to_thread. The default executor is where
+# every tmux capture and CDP probe already queues, and a 0.3s read has been
+# measured taking 12-21s behind them; a sampler that HOLDS a thread for a full
+# second would both wait in that queue and make it longer for everyone else.
+# One thread also serialises the sampler with itself, which is what makes the
+# cache below a real bound rather than a hope.
+_PROC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="proctop")
+_PROC_CACHE: dict = {"ts": 0.0, "snap": None}
+_PROC_CACHE_TTL = 2.5      # under the panel's 4s poll, so a single viewer always
+                           # gets a fresh sample and a second tab rides along
+
+
+def _process_snapshot_cached() -> dict:
+    now = time.monotonic()
+    snap = _PROC_CACHE["snap"]
+    if snap is not None and now - _PROC_CACHE["ts"] < _PROC_CACHE_TTL:
+        return snap
+    snap = _process_snapshot()
+    _PROC_CACHE["ts"] = time.monotonic()
+    _PROC_CACHE["snap"] = snap
+    return snap
+
+
+@app.get("/api/stats/processes")
+async def api_stats_processes(request: Request):
+    """top-style process table for the stats popup.
+
+    Command lines carry other people's cwd, model and prompts, so a member sees
+    only the processes under their OWN sessions. The host-level totals stay
+    whole for everyone: they are the same numbers the nav bar already shows.
+    """
+    user = _current_user(request)
+    snap = dict(await asyncio.get_running_loop().run_in_executor(
+        _PROC_POOL, _process_snapshot_cached))
+    if not _is_admin(user):
+        mine = {s["name"] for s in _filter_sessions_for_user(get_tmux_sessions(), user)}
+        snap["processes"] = [p for p in snap["processes"] if p.get("session") in mine]
+        snap["scoped"] = True
+    return JSONResponse(snap)
 
 
 @app.get("/api/health")
@@ -20525,6 +20857,11 @@ body.member-admin .more-member-only{display:none}
 .key-saved-body{display:none;flex-direction:column;gap:8px;margin-top:8px}
 .key-saved-body.open{display:flex}
 .key-saved-empty{font-size:.7rem;color:#6e7681}
+.key-saved-scan{margin-top:6px}
+.key-saved-scanbtn{font-size:.68rem;padding:3px 9px;border-radius:5px;cursor:pointer;
+  background:#21262d;border:1px solid #30363d;color:#c9d1d9}
+.key-saved-scanbtn:hover:not(:disabled){background:#30363d;color:#f0f6fc}
+.key-saved-scanbtn:disabled{opacity:.6;cursor:default}
 .key-saved-group{display:flex;flex-direction:column;gap:3px}
 .key-saved-title{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
 .key-saved-row{display:flex;align-items:center;gap:8px;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:0}
@@ -20783,6 +21120,30 @@ body.member-simple .hide-in-simple{display:none!important}
 .stats-usage-table tr.stats-totals-row{border-top:1px solid #30363d;font-weight:600}
 .stats-usage-table tr.stats-totals-row td{color:#f0f6fc;padding-top:6px}
 .stats-usage-table .model-tag{font-size:.65rem;padding:1px 5px;background:#30363d;border-radius:3px;color:#c9d1d9;display:inline-block}
+
+/* Process table (top/htop, inside the stats popup) */
+.proc-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.proc-head .proc-note{font-size:.7rem;color:#6e7681;margin-left:auto}
+.proc-sort{display:inline-flex;border:1px solid #30363d;border-radius:5px;overflow:hidden}
+.proc-sort button{background:#161b22;border:none;color:#8b949e;font-size:.68rem;padding:2px 8px;cursor:pointer}
+.proc-sort button+button{border-left:1px solid #30363d}
+.proc-sort button.active{background:#1f6feb;color:#fff;font-weight:600}
+.proc-table{width:100%;border-collapse:collapse;font-size:.72rem;table-layout:fixed}
+.proc-table th{color:#8b949e;font-weight:600;text-align:right;padding:3px 5px;border-bottom:1px solid #21262d;white-space:nowrap}
+.proc-table th.l,.proc-table td.l{text-align:left}
+.proc-table td{padding:2px 5px;color:#c9d1d9;text-align:right;white-space:nowrap;
+  font-family:'SF Mono','Fira Code',Consolas,monospace}
+/* The command is the only column allowed to be long, and it is the one worth
+   reading, so it takes whatever the fixed columns leave and clips with an
+   ellipsis. title= carries the whole line. */
+.proc-table td.proc-cmd{width:100%;overflow:hidden;text-overflow:ellipsis;color:#8b949e}
+.proc-table tr.mine td{background:#1f6feb14}
+.proc-table tr:hover td{background:#161b22}
+.proc-sess{display:inline-block;max-width:110px;overflow:hidden;text-overflow:ellipsis;
+  vertical-align:bottom;color:#58a6ff}
+.proc-hot{color:#f85149;font-weight:600}
+.proc-warm{color:#d29922}
+.proc-empty{font-size:.75rem;color:#6e7681;padding:6px 0}
 
 /* CLAUDE.md editor modal */
 /* Skills tab */
@@ -21518,6 +21879,8 @@ const BASE='__ROOT_PATH__';
 // blinking, and that Basic+ pushes its keep-alive. Substituted from the
 // server's CACHE_WARN_LEAD so the two can never drift apart.
 const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
+// And the seconds before it goes cold that the double beep sounds, once.
+const CACHE_BEEP_LEAD=__CACHE_BEEP_LEAD__;
 
 // ── Tab-scoped impersonation ────────────────────────────────────────────────
 // The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
@@ -22688,6 +23051,10 @@ let _liveTicker=null;
 function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
+    // Every session, not just the one on screen: a cache lapsing on a tab you
+    // are not looking at is precisely the one worth being told about. Cheap: a
+    // handful of arithmetic comparisons, and it fires at most once per turn.
+    _checkCacheExpiry();
     if(!selectedSession)return;
     // The silence counter has to keep running while the session is IDLE — being
     // idle is the whole point of it — so it is updated on every tick regardless
@@ -23203,6 +23570,66 @@ function playCompletionChime(){
   };
   if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
   else play();
+}
+
+// ── The cache-expiry double beep ────────────────────────────────────────────
+// One chime means a session finished. TWO, lower and falling, mean a session is
+// idle and about to lose its prompt cache: nothing is done, something is about
+// to be thrown away. Deliberately not a louder version of the completion chime,
+// because the two need to be told apart from the next room without looking.
+function playCacheExpiryChime(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const play=function(){
+    if(ctx.state!=='running')return;
+    const now=ctx.currentTime+0.015;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.72,now);
+    master.gain.exponentialRampToValueAtTime(0.0001,now+0.85);
+    master.connect(ctx.destination);
+    // E5 then B4, 190 ms apart: a falling pair, well below the completion
+    // chime's C6/E6, each with one quiet partial so it rings rather than beeps.
+    [[659.25,0,0.17,0.24],[1318.5,0.003,0.12,0.05],
+     [493.88,0.19,0.26,0.24],[987.77,0.193,0.16,0.05]]
+      .forEach(t=>_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3]));
+    setTimeout(function(){try{master.disconnect()}catch(e){}},1000);
+  };
+  if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
+  else play();
+}
+
+// Which turn each session has already been warned about. Keyed on the turn's
+// end time, not a boolean: a new reply restarts the cache clock, so it must also
+// re-arm the warning. Nothing is remembered across a reload, which is right:
+// the deadline is recomputed from the transcript either way.
+const _cacheBeeped={};
+function _checkCacheExpiry(){
+  const names=new Set();
+  let fired=false;
+  for(let i=0;i<sessions.length;i++){
+    const s=sessions[i];
+    names.add(s.name);
+    const end=s.last_turn_end||0, ttl=s.cache_ttl||0;
+    // No measured TTL means no cache write seen in the transcript. Warning on a
+    // guessed deadline would be worse than staying quiet.
+    if(!end||!ttl)continue;
+    if(_cacheBeeped[s.name]===end)continue;
+    // lastStatus, not s.activity_status: the poll updates the former every ten
+    // seconds and leaves the latter at whatever the last full load said.
+    if((lastStatus[s.name]||s.activity_status)!=='idle')continue;
+    const left=ttl-(Date.now()/1000-end);
+    // Inside the window, and only while there is still something to save. Once
+    // it is cold the money is spent and a chime is just noise.
+    if(left>CACHE_BEEP_LEAD||left<=0)continue;
+    _cacheBeeped[s.name]=end;
+    if(!fired){                 // one sound even if two sessions lapse together
+      playCacheExpiryChime();
+      showToast('“'+s.name+'” loses its prompt cache in '+_fmtAgo(left)+
+                '. Send it something now and the next message stays cheap.',12000);
+      fired=true;
+    }
+  }
+  for(const k in _cacheBeeped)if(!names.has(k))delete _cacheBeeped[k];
 }
 
 function trackSessionStatus(name,status,interrupted){
@@ -25180,9 +25607,12 @@ function _pillCacheClasses(name,status){
 function _paintPillCache(name){
   const pill=document.getElementById('status-'+name);
   if(!pill)return;
+  // lastStatus is what the 10-second poll writes; s.activity_status is only as
+  // fresh as the last full load. Rebuilding the class list off the stale one
+  // would drag the pill back to a status it left minutes ago, once a second.
   const s=sessions.find(x=>x.name===name)||{};
-  const base='status-pill '+(s.activity_status||'unknown');
-  const want=base+_pillCacheClasses(name,s.activity_status);
+  const status=lastStatus[name]||s.activity_status||'unknown';
+  const want='status-pill '+status+_pillCacheClasses(name,status);
   if(pill.className!==want)pill.className=want;
 }
 function updateStatusPill(name,status,detail){
@@ -25234,7 +25664,29 @@ function updateCard(s){
   }
 }
 
-async function loadAll(){
+// Bring `name` into view even if the project filter currently excludes it.
+// Returns false only when the session genuinely is not there yet.
+//
+// The filter can exclude a session you just made: with the "Other" workspace
+// selected, a new session starts in the DEFAULT directory, which is usually a
+// real project, so it is neither in "Other" nor in the filter you were looking
+// at. Widening to the one that contains it is what you meant by creating it.
+function _scopeToSession(name){
+  const s=sessions.find(x=>x.name===name);
+  if(!s)return false;
+  if(projectSessions().some(x=>x.name===name))return true;
+  const cwd=s.cwd||'';
+  CURRENT_PROJECT = projectList().some(p=>p.path===cwd) ? cwd
+                  : (orphanSessions().some(x=>x.name===name) ? '__other__' : '');
+  try{ localStorage.setItem('navProject',CURRENT_PROJECT); }catch(e){}
+  return true;
+}
+
+// `focus` names a session that must win the selection this time round: the one
+// just created by the + button. Without it the reload re-reads the URL hash,
+// which still names the session you were LOOKING at when you pressed +, and
+// puts you straight back on it.
+async function loadAll(focus){
   try{
     // Resolve simple-mode before the first render so member toggles don't flash.
     await loadCurrentUser();
@@ -25249,9 +25701,13 @@ async function loadAll(){
     });
     // Default the selection to the CURRENT project's sessions, not the global
     // first one, or switching workspaces would land you on a foreign session.
-    const _inScope=projectSessions();
+    const _focused=!!(focus&&_scopeToSession(focus));
+    const _inScope=projectSessions();      // after _scopeToSession may have widened it
     const _route=_sessionRoute();
-    if(_route&&_inScope.some(s=>s.name===_route.name)){
+    if(_focused){
+      selectedSession=focus;
+      activeTabs[focus]=_allowedSessionTab(activeTabs[focus]);
+    }else if(_route&&_inScope.some(s=>s.name===_route.name)){
       selectedSession=_route.name;
       activeTabs[_route.name]=_allowedSessionTab(_route.tab);
     }
@@ -25260,7 +25716,11 @@ async function loadAll(){
     }
     renderNav();
     renderDetail();
-    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),true);
+    // A create is a navigation, so it goes on the history stack and Back
+    // returns you to the session you were reading. Every other path through
+    // loadAll is a reload of where you already are: replace, or the stack fills
+    // with copies of one entry.
+    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),!_focused);
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
@@ -25700,7 +26160,10 @@ async function createSession(){
     }
     selectedSession=data.name;
     closeModal();
-    await loadAll();
+    await loadAll(data.name);
+    // Arm the completion chime straight away: you asked for this session, so
+    // the first thing it finishes is the thing you are waiting on.
+    armCompletionChime(data.name);
   }catch(e){
     if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
       <p class="conn-note">Network error — please try again.</p>
@@ -25717,7 +26180,7 @@ async function createSessionAuto(){
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({name, cwd: projectCwd()})});
       const data=await resp.json();
-      if(resp.ok){selectedSession=data.name;await loadAll();return}
+      if(resp.ok){selectedSession=data.name;await loadAll(data.name);armCompletionChime(data.name);return}
       if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
     }catch(e){alert('Failed to create session.');return}
   }
@@ -26506,8 +26969,25 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='Nothing captured yet. This is the quick-reference for THIS session: files it created, external URLs, and any logins or passwords it set up, so you do not have to scroll back through the terminal. Press "Full" on the Info tab to extract them.';
+      empty.textContent='Nothing captured yet. This is the quick-reference for THIS session: files it created, external URLs, and any logins or passwords it set up, so you do not have to scroll back through the terminal.';
       body.appendChild(empty);
+      // The extractor is one button away, so put the button here rather than
+      // naming a control on another tab. It reads the pane and fills the list.
+      const act=document.createElement('div');
+      act.className='key-saved-scan';
+      const btn=document.createElement('button');
+      btn.type='button';btn.className='key-saved-scanbtn';btn.textContent='Scan this session';
+      btn.title='Reads the terminal and pulls out the URLs, logins and files it produced. Takes a few seconds.';
+      btn.addEventListener('click',function(ev){
+        ev.preventDefault();ev.stopPropagation();
+        btn.disabled=true;btn.textContent='Scanning…';
+        // refreshFull repaints this drawer through updateCard when it lands.
+        Promise.resolve(refreshFull(name)).catch(function(){}).then(function(){
+          if(btn.isConnected){btn.disabled=false;btn.textContent='Scan again'}
+        });
+      });
+      act.appendChild(btn);
+      body.appendChild(act);
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('Links & URLs',info.urls.map(u=>_savedLinkRow(u,u))));
       if(info.creds.length)body.appendChild(_savedGroup('Logins & passwords',info.creds.map(_savedCredRow)));
@@ -30482,6 +30962,7 @@ async function openStats(){
     let usage=null;
     if(usageResp.ok) usage=await usageResp.json();
     renderStats(s,usage);
+    startProcPolling();
   }catch(e){
     document.getElementById('stats-content').innerHTML='<div style="color:#f85149">Failed to load stats.</div>';
   }
@@ -30502,6 +30983,34 @@ function renderStats(s,usage){
     html+='<div class="stats-row"><span class="stats-row-label">IP</span><span class="stats-row-value">'+esc(ips.join(' / '))+'</span></div>';
   }
   html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
+  // What sessions on this box SPEND. Here because the CLI's own banner prints
+  // "Claude API" on a plan-backed token whenever CLAUDE_CODE_OAUTH_TOKEN is
+  // exported, and the only sane place to settle that is somewhere that knows
+  // how the session was launched.
+  if(s.billing){
+    const b=s.billing;
+    const planName={max:'Claude Max',pro:'Claude Pro',team:'Claude Team',enterprise:'Claude Enterprise'}[b.plan]||'';
+    let txt,cls,hint;
+    if(b.metered){
+      txt='Metered API key';cls='#f85149';
+      hint='An Anthropic API key is configured, so inference on this box is billed per token.';
+    }else if(planName){
+      txt=planName+(b.tier?' · '+b.tier.replace(/_/g,' '):'');cls='#3fb950';
+      hint='Sessions authenticate with the subscription, not a metered API key. '+
+           'No ANTHROPIC_API_KEY is set for any pane.'+
+           (b.banner_says_api?' Claude Code still prints "Claude API" in its own '+
+             'welcome box: it reads the plan off the credentials file and ignores '+
+             'that file whenever CLAUDE_CODE_OAUTH_TOKEN is exported. Billing is '+
+             'unaffected.':'');
+    }else{
+      txt='No plan credential';cls='#d29922';
+      hint='No valid subscription token was found, and no API key is set. New sessions will ask you to log in.';
+    }
+    html+='<div class="stats-row" title="'+esc(hint)+'"><span class="stats-row-label">Billing</span>'+
+          '<span class="stats-row-value" style="color:'+cls+'">'+esc(txt)+
+          (b.banner_says_api?' <span style="color:#8b949e;font-weight:400">(banner says “Claude API”)</span>':'')+
+          '</span></div>';
+  }
   if(s.cpu_load&&s.cpu_load['1m']){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Load</span><span class="stats-row-value">'+esc(s.cpu_load['1m'])+' / '+esc(s.cpu_load['5m'])+' / '+esc(s.cpu_load['15m'])+'</span></div>';
   }
@@ -30575,11 +31084,117 @@ function renderStats(s,usage){
     html+='</tbody></table></div>';
   }
 
+  // Running processes. Its own section element, filled by its own poll, so a
+  // 1-second CPU sample never holds up everything above it.
+  html+='<div class="stats-section" id="stats-procs">'+
+        '<div class="stats-section-title">Running processes</div>'+
+        '<div class="proc-empty"><span class="spinner"></span> Sampling CPU…</div></div>';
+
   document.getElementById('stats-content').innerHTML=html;
+  renderProcesses();
 }
+
+// ── Running processes (top/htop, live while the popup is open) ──────────────
+// The server samples /proc twice a second apart, so `cpu` is what the process
+// is doing NOW, as a share of one core: 400% on this box means all four. That
+// is the number `ps` cannot give you and the reason this panel exists.
+let _procSort='cpu';
+let _procTimer=null;
+let _procRows=null;
+
+function setProcSort(mode){
+  _procSort=(mode==='mem'?'mem':'cpu');
+  document.querySelectorAll('.proc-sort button').forEach(b=>{
+    b.classList.toggle('active',b.dataset.sort===_procSort);
+  });
+  if(_procRows)_paintProcTable();
+}
+
+function _procCpuClass(cpu){return cpu>=90?'proc-hot':(cpu>=40?'proc-warm':'')}
+function _procMemClass(pct){return pct>=15?'proc-hot':(pct>=5?'proc-warm':'')}
+
+function _paintProcTable(){
+  const body=document.getElementById('proc-body');
+  if(!body||!_procRows)return;
+  const rows=_procRows.slice().sort((a,b)=>
+    _procSort==='mem'?(b.rss_mb-a.rss_mb):(b.cpu-a.cpu));
+  // Everything at a flat zero is padding: on a quiet box two thirds of the
+  // table is daemons that did not run at all during the sample. Drop those
+  // from the CPU view, but never from the memory view, where 0% CPU and 6 GB
+  // resident is exactly the row you came here for.
+  const shown=(_procSort==='cpu'?rows.filter(r=>r.cpu>0):rows).slice(0,20);
+  if(!shown.length){
+    body.innerHTML='<tr><td colspan="6" class="l proc-empty">Nothing measurable ran during the sample.</td></tr>';
+    return;
+  }
+  body.innerHTML=shown.map(r=>{
+    const sess=r.session
+      ? '<span class="proc-sess" title="tmux session '+esc(r.session)+'">'+esc(r.session)+'</span>'
+      : '<span style="color:#484f58">—</span>';
+    return '<tr'+(r.session===selectedSession?' class="mine"':'')+'>'+
+      '<td>'+r.pid+'</td>'+
+      '<td class="'+_procCpuClass(r.cpu)+'">'+r.cpu.toFixed(1)+'</td>'+
+      '<td class="'+_procMemClass(r.mem)+'">'+(r.rss_mb>=1024?(r.rss_mb/1024).toFixed(1)+'G':Math.round(r.rss_mb)+'M')+'</td>'+
+      '<td class="l">'+esc(r.user||'')+'</td>'+
+      '<td class="l">'+sess+'</td>'+
+      '<td class="l proc-cmd" title="'+esc(r.cmd||'')+'">'+esc(r.cmd||r.comm||'')+'</td></tr>';
+  }).join('');
+}
+
+async function renderProcesses(){
+  const host=document.getElementById('stats-procs');
+  if(!host)return;
+  let d;
+  try{
+    const r=await fetch(BASE+'/api/stats/processes');
+    if(!r.ok)throw new Error('http '+r.status);
+    d=await r.json();
+  }catch(e){
+    host.innerHTML='<div class="stats-section-title">Running processes</div>'+
+      '<div class="proc-empty">Could not read the process table on this box.</div>';
+    return;
+  }
+  _procRows=d.processes||[];
+  const cores=d.cpu_count||1;
+  // Say what the number means, in the panel, not just in the code: a reader who
+  // sees 312% next to a 4-core box has to be told that is three cores busy and
+  // not an error.
+  const note=(d.scoped?'Your sessions only. ':'')+
+    'CPU is a share of one core, so '+(cores*100)+'% is all '+cores+' of them. '+
+    'Everything on the box is using '+(d.cpu_sum||0)+'%. Sampled over '+
+    (d.sample_secs||1)+'s across '+(d.total||0)+' processes.';
+  host.innerHTML='<div class="stats-section-title">Running processes</div>'+
+    '<div class="proc-head">'+
+      '<div class="proc-sort" role="group" aria-label="Sort processes">'+
+        '<button type="button" data-sort="cpu" class="'+(_procSort==='cpu'?'active':'')+'" onclick="setProcSort(\'cpu\')">CPU</button>'+
+        '<button type="button" data-sort="mem" class="'+(_procSort==='mem'?'active':'')+'" onclick="setProcSort(\'mem\')">Memory</button>'+
+      '</div>'+
+      '<span class="proc-note">'+esc(note)+'</span>'+
+    '</div>'+
+    '<table class="proc-table"><thead><tr>'+
+      '<th style="width:62px">PID</th><th style="width:52px">CPU%</th><th style="width:56px">RES</th>'+
+      '<th class="l" style="width:92px">User</th><th class="l" style="width:118px">Session</th>'+
+      '<th class="l">Command</th>'+
+    '</tr></thead><tbody id="proc-body"></tbody></table>';
+  _paintProcTable();
+}
+
+function startProcPolling(){
+  stopProcPolling();
+  // 4 seconds: slower than top, because each poll costs the server a 1-second
+  // sleep and this is a glance, not a monitor.
+  _procTimer=setInterval(()=>{
+    if(!document.getElementById('stats-overlay').classList.contains('active')){
+      stopProcPolling();return;
+    }
+    renderProcesses();
+  },4000);
+}
+function stopProcPolling(){if(_procTimer){clearInterval(_procTimer);_procTimer=null}}
 
 function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
+  stopProcPolling();
 }
 
 // ── Phone layout: header status widgets move to the bottom ──────────────────
