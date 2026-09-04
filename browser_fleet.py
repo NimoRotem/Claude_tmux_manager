@@ -288,7 +288,10 @@ def inventory(check_cdp: bool = True, stale_h: float = DEFAULT_STALE_H) -> dict:
             f.up = bool(f.browser_id)
 
     problems = find_problems(browsers, forwards, snap, stale_h=stale_h)
+    free_mb, free_pct = _mem()
     return {"host": os.uname().nodename, "at": time.time(),
+            "memory_mb": {"available": round(free_mb), "total": round(free_mb / (free_pct / 100.0))
+                          if free_pct else 0},
             "browsers": [b.as_dict() for b in browsers],
             "forwards": [f.as_dict() for f in forwards],
             "problems": problems}
@@ -980,6 +983,28 @@ def _esc(text) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+#  Under this share of memory a box is close enough to trouble to say so on the
+#  page. The shed-early rule fires at 6%; a warning that first appears at 6% is a
+#  warning nobody can act on, because by then the box is already swapping.
+PRESSURE_PCT = 15.0
+
+
+def memory_pressure(mem: dict) -> str:
+    """A sentence when a box is short of room for its browsers, "" when it is not."""
+    try:
+        available, total = float(mem.get("available") or 0), float(mem.get("total") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not total or not available:
+        return ""
+    pct = available / total * 100.0
+    if pct >= PRESSURE_PCT:
+        return ""
+    return ("%.0f MB usable of %.0f, %.1f%%. These boxes livelock rather than "
+            "OOM-kill, so close a browser here before something else has to."
+            % (available, total, pct))
+
+
 def wall_html(boxes: Sequence[dict], probes: Sequence[dict] = ()) -> str:
     """One page showing every browser on the fleet, who owns it and what it is on.
 
@@ -1021,6 +1046,12 @@ def wall_html(boxes: Sequence[dict], probes: Sequence[dict] = ()) -> str:
         if mem:
             out.append("<div class=muted>%s MB free of %s</div>"
                        % (_esc(mem.get("available")), _esc(mem.get("total"))))
+            #  SAY IT WHERE SOMEBODY LOOKS. These boxes livelock rather than
+            #  OOM-kill, so the useful moment is while there is still room to close
+            #  something, not at 6% when the DHCP lease is already going.
+            pressure = memory_pressure(mem)
+            if pressure:
+                out.append("<div class=warn><b>memory</b> %s</div>" % _esc(pressure))
         for p in box.get("problems") or []:
             out.append("<div class=warn><b>%s</b> %s</div>"
                        % (_esc(p.get("kind")), _esc(p.get("detail"))))

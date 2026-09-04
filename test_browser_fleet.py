@@ -418,3 +418,25 @@ class WallTests(unittest.TestCase):
         box = {"host": "b", "browsers": [{"pid": 1, "cdp_port": 1, "kind": "x",
                "owner": "<script>alert(1)</script>", "tabs": []}], "forwards": []}
         self.assertNotIn("<script>alert", fleet.wall_html([box]))
+
+
+class MemoryPressureTests(unittest.TestCase):
+    def test_a_box_with_room_says_nothing(self):
+        self.assertEqual(fleet.memory_pressure({"available": 24000, "total": 32000}), "")
+
+    def test_a_tight_box_is_called_out_before_the_shed_threshold(self):
+        """The shed rule fires at 6%. A warning that first appears at 6% is one
+        nobody can act on, because the box is already swapping."""
+        said = fleet.memory_pressure({"available": 1800, "total": 16000})
+        self.assertIn("11.2%", said)
+        self.assertIn("livelock", said)
+
+    def test_a_box_that_did_not_answer_is_not_reported_as_starving(self):
+        self.assertEqual(fleet.memory_pressure({}), "")
+        self.assertEqual(fleet.memory_pressure({"available": 0, "total": 0}), "")
+        self.assertEqual(fleet.memory_pressure({"available": "?", "total": "?"}), "")
+
+    def test_the_wall_shows_the_warning(self):
+        html = fleet.wall_html([{"host": "instance-3", "browsers": [], "forwards": [],
+                                 "memory_mb": {"available": 1800, "total": 16000}}])
+        self.assertIn("close a browser here", html)
