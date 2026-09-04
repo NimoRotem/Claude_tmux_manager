@@ -1665,11 +1665,10 @@ def _ensure_user_claude_config_dir(user: dict):
     # update fails. Must run after the stub exists so the merge keeps
     # hasCompletedOnboarding. See _seed_profile_update_config.
     _seed_profile_update_config(d)
-    # Finish the work instead of handing it back. NOT gated on TEAM_MODE: this dir
-    # is created for every non-admin user whether team mode is on or not, and the
-    # boxes that actually have members run with TEAM_MODE unset, so gating this
-    # would leave it inert in exactly the place the gap is real.
-    _install_keep_going_hooks(d)
+    # Carrying on after a turn looks done is the Auto-push control's job alone.
+    # This strips the retired keep-going Stop hook from any config that still
+    # carries it, and keeps the AskUserQuestion denial, which is separate.
+    _remove_keep_going_hooks(d)
     # Team mode: shared Claude auth token, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
@@ -4574,13 +4573,19 @@ _KEEP_GOING_EVENTS = (
 )
 
 
-def _install_keep_going_hooks(cfg_dir: Path):
-    """Make a member session finish its work instead of handing it back."""
-    if not KEEP_GOING_HOOK.exists() or not KEEP_GOING_RESET_HOOK.exists():
-        # Registering a command that isn't there would log a hook error on every
-        # single stop. The hooks fail open anyway, so skipping is the quiet path.
-        logger.debug("keep-going hooks missing at %s; not registering", KEEP_GOING_HOOK.parent)
-        return
+def _remove_keep_going_hooks(cfg_dir: Path):
+    """Take the keep-going Stop hook back out, and keep it out.
+
+    Retired 2026-09-04: whether a session carries on after it looks done is the
+    Auto-push control's job (off / basic / full) and nothing else. A Stop hook
+    doing it as well meant two mechanisms with one steering wheel, and the hook
+    won every argument because it fires inside the session.
+
+    This STRIPS rather than merely stopping installation, so a member config
+    that already carries the registration is cleaned on the next setup call
+    instead of keeping it forever. Only entries naming our own two scripts go;
+    an unrelated Stop hook someone else registered is left alone.
+    """
     settings_path = cfg_dir / "settings.json"
     try:
         settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
@@ -4590,20 +4595,26 @@ def _install_keep_going_hooks(cfg_dir: Path):
         settings = {}
 
     hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
-    for event, script in _KEEP_GOING_EVENTS:
-        cmd = "python3 " + shlex.quote(str(script))
-        existing = hooks.get(event)
-        if not isinstance(existing, list):
-            existing = []
-        # Drop our own previous entry (by script name) so re-applying this on
-        # every member setup call self-heals instead of stacking duplicates.
-        existing = [h for h in existing if script.name not in json.dumps(h)]
-        existing.append({"hooks": [{"type": "command", "command": cmd}]})
-        hooks[event] = existing
-    settings["hooks"] = hooks
+    ours = {KEEP_GOING_HOOK.name, KEEP_GOING_RESET_HOOK.name}
+    for event in list(hooks):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        kept = [h for h in entries
+                if not any(name in json.dumps(h) for name in ours)]
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)      # no empty event lists left behind
+    if hooks:
+        settings["hooks"] = hooks
+    else:
+        settings.pop("hooks", None)
 
-    # A blocking multiple-choice prompt is the other way a session stalls on an
-    # absent user. Denying the tool removes it from the model's tool list.
+    # Kept deliberately. A blocking multiple-choice prompt is a separate way a
+    # session stalls on an absent user, it is a standing preference of its own,
+    # and Auto-push does not cover it. Denying the tool removes it from the
+    # model's tool list.
     perms = settings.get("permissions")
     if not isinstance(perms, dict):
         perms = {}
@@ -4619,7 +4630,7 @@ def _install_keep_going_hooks(cfg_dir: Path):
         _backup_before_dashboard_write(settings_path)
         settings_path.write_text(json.dumps(settings, indent=2))
     except Exception:
-        logger.debug("Failed to install keep-going hooks into %s", settings_path, exc_info=True)
+        logger.debug("Failed to strip keep-going hooks from %s", settings_path, exc_info=True)
 
 
 # --- email (Resend) --------------------------------------------------------
