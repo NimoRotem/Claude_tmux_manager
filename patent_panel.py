@@ -19,6 +19,7 @@ profile and environment setup keeps working and this module stays decoupled.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -82,6 +83,41 @@ router.include_router(patent_obs_routes.router)
 
 MAX_UPLOAD = 60 * 1024 * 1024
 _BROWSERS: dict = {}          # port -> launch info
+
+#  ...and the same thing on disk. A supervisor restart does not close the browsers
+#  this panel started, but it used to forget every one of them: the Chromes ran on,
+#  their ssh forwards ran on, and to anything else on the box they were ownerless.
+#  That is how a live console's forward reads as litter to a reaper, and how a port
+#  whose browser has died gets handed to the next launch while a viewer still points
+#  at it. The record is the claim, so it has to outlive the process holding it.
+_BROWSER_FILE = store.DATA_DIR / "browsers.json"
+
+
+def _browsers_load() -> None:
+    try:
+        data = json.loads(_BROWSER_FILE.read_text("utf-8"))
+    except Exception:                                             # noqa: BLE001
+        return
+    if not isinstance(data, dict):
+        return
+    for port, info in data.items():
+        with contextlib.suppress(Exception):
+            if isinstance(info, dict):
+                _BROWSERS[int(port)] = info
+
+
+def _browsers_save() -> None:
+    try:
+        _BROWSER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _BROWSER_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({str(k): v for k, v in _BROWSERS.items()}, indent=1),
+                       "utf-8")
+        tmp.replace(_BROWSER_FILE)
+    except Exception:                                             # noqa: BLE001
+        pass
+
+
+_browsers_load()
 
 
 def _packet_dir(packet_id: str) -> Path:
@@ -1443,9 +1479,16 @@ async def api_packet_submit(packet_id: str, request: Request):
 async def api_browsers():
     rows = []
     for port, info in list(_BROWSERS.items()):
-        up = browser_live.is_up(port)
+        #  IDENTITY, NOT THE PORT. A forward outlives its browser, the remote port
+        #  is handed to the next Chrome anybody launches on that host, and this
+        #  panel would then list, stream and drive a stranger's window under our own
+        #  label. The uuid recorded at launch is the only thing that survives that.
+        expected = info.get("browser_id") or ""
+        up = (browser_live.browser_id(port) == expected if expected
+              else browser_live.is_up(port))
         if not up:
             _BROWSERS.pop(port, None)
+            _browsers_save()
             continue
         rows.append({**info, "targets": browser_live.targets(port)})
     # Anything already listening that we did not start, so an agent's own browser
@@ -1484,6 +1527,7 @@ async def api_browser_launch(request: Request):
     except Exception as exc:
         return _err(str(exc), 500)
     _BROWSERS[info["port"]] = info
+    _browsers_save()
     return JSONResponse({"ok": True, "browser": info})
 
 
@@ -1499,12 +1543,14 @@ async def launch_for_run(label: str):
     info = await asyncio.to_thread(browser_live.launch_remote,
                                    store.slugify(label, "filing"), True)
     _BROWSERS[info["port"]] = info
+    _browsers_save()
     return info
 
 
 @router.delete("/api/browsers/{port}")
 async def api_browser_stop(port: int):
     info = _BROWSERS.pop(port, {})
+    _browsers_save()
     if info.get("remote"):
         res = await asyncio.to_thread(browser_live.shutdown_remote, info)
     else:

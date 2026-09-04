@@ -76,6 +76,24 @@ def is_up(port: int) -> bool:
         return False
 
 
+def browser_id(port: int) -> str:
+    """A value unique to ONE running Chrome, not to the port it answers on.
+
+    A PORT NUMBER IS NOT AN IDENTITY. An ssh forward can outlive the browser it was
+    opened for; the remote port is then handed to the next browser anybody launches
+    on that host, and this app's local port silently starts answering for a
+    STRANGER'S Chrome, which is_up() calls healthy. Chrome puts a fresh uuid in its
+    browser websocket path every time it starts, so this changes when the process
+    does and survives navigation, new tabs and whichever tab is being watched.
+    """
+    try:
+        url = (cdp_get(port, "/json/version", timeout=2.5) or {}).get(
+            "webSocketDebuggerUrl") or ""
+    except Exception:                                             # noqa: BLE001
+        return ""
+    return url.rsplit("/", 1)[-1] if "/devtools/browser/" in url else ""
+
+
 def launch(label: str, headless: bool = True, port: int = 0) -> dict:
     """Start a Chrome that belongs to this filing and nothing else.
 
@@ -257,7 +275,10 @@ def launch_remote(label: str, headless: bool = True, host: str = "", zone: str =
         raise RuntimeError("tunnel to %s:%s never came up" % (host, remote_port))
     return {"port": local_port, "remote_port": int(remote_port), "host": host,
             "zone": zone, "profile": remote_profile, "headless": headless,
-            "tunnel_pid": tunnel.pid, "remote": True}
+            "tunnel_pid": tunnel.pid, "remote": True,
+            #  Recorded so a later caller can prove this port still reaches THIS
+            #  browser and not one that inherited the number. See browser_id.
+            "browser_id": browser_id(local_port)}
 
 
 def shutdown_remote(info: dict) -> dict:

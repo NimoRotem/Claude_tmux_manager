@@ -170,7 +170,12 @@ def test_a_proxy_pass_with_a_path_strips_the_location_prefix():
     for r in bl.nginx_routes():
         if r["upstream_path"] and r["prefix"] != "/" and not r["modifier"].startswith("~"):
             hit = bl.local_route(r["names"][0], r["prefix"] + "some/page")
-            assert hit and not hit["path"].startswith(r["prefix"])
+            #  The rule is that the LOCATION prefix is replaced by the upstream path,
+            #  not that the result cannot look like the prefix: builder4 serves
+            #  `location /api/ { proxy_pass http://127.0.0.1:8501/api/; }`, where the
+            #  two are the same string and a "does not start with the prefix" test
+            #  goes red on a route that is behaving exactly as nginx says it should.
+            assert hit and hit["path"] == r["upstream_path"].rstrip("/") + "/some/page"
             return
 
 
