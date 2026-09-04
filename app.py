@@ -21552,12 +21552,14 @@ const _NOISE_RES=[
 // Clean view used to swallow it twice over: the header matched the
 // "(ctrl+o to expand)" noise rule, and the body matched the tool-output rule.
 // The echo markers are in the optional group so one regex matches the row both
-// before the rewrite (`● Ran 2 stop hooks …`) and after it (`❯ Ran 2 stop hooks …`).
-const _HOOK_HEADER_RE=/^\s*(?:[●⏺•·❯›»]\s*)?Ran \d+ [A-Za-z]+ hooks?\b/;
-// The pane's own marker for a turn you typed. `>` is not usable here: at column
-// 0 it is already _PANE_STRUCTURE_RE furniture and _USER_ECHO_RE does not
-// accept it, so a literal `>` would render as chrome instead of as your words.
-const _HOOK_ECHO_PREFIX='❯ ';
+// before the rewrite (`● Ran 2 stop hooks …`) and after it (`> Ran 2 stop hooks …`).
+const _HOOK_HEADER_RE=/^\s*(?:[●⏺•·❯›»>]\s*)?Ran \d+ [A-Za-z]+ hooks?\b/;
+// `>`, the way a message from you is written. The highlight does NOT come from
+// this character: _markUserRows keys the row off _isHookHeader, so the marker is
+// free to be whatever reads best. _PANE_STRUCTURE_RE also matches a leading `>`
+// but its one caller tests the INPUT row, never what we emit here, so nothing
+// downstream mistakes this for pane furniture.
+const _HOOK_ECHO_PREFIX='> ';
 function _isHookHeader(line){return !!line&&_HOOK_HEADER_RE.test(line)}
 function _isNoise(line){
   if(!line)return false;
@@ -22301,7 +22303,7 @@ function _markUserRows(rows){
   const isCont=row=>/^ {2,}\S/.test(row)&&(inHook||!_NOT_USER_CONT_RE.test(row));
   for(let i=0;i<rows.length;i++){
     const row=rows[i];
-    // Matched in both views: clean view restamps the header with `❯`, exact
+    // Matched in both views: clean view restamps the header with `>`, exact
     // view leaves the CLI's own bullet on it, and either way it is your turn.
     if(_USER_ECHO_RE.test(row)||_isHookHeader(row)){
       flags[i]=2;inUser=true;inHook=_isHookHeader(row);continue;

@@ -23,7 +23,8 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 # What we actually want to test. Everything these reach is pulled in with them,
 # so adding a helper in app.py does not mean editing a list here.
-_SEEDS = ["applyRawFilter", "_markUserRows", "_isHookHeader", "_HOOK_ECHO_PREFIX"]
+_SEEDS = ["applyRawFilter", "_markUserRows", "_isHookHeader", "_HOOK_ECHO_PREFIX",
+          "_USER_ECHO_RE"]
 
 
 # Sliced by LINE, never by brace depth: several of these regexes contain a
@@ -153,7 +154,7 @@ def test_a_real_captured_pane_renders_the_whole_block():
     rows = clean(REAL_PANE).split("\n")
     flags = marks(rows)
     hdr = next(i for i, l in enumerate(rows) if "Ran 2 stop hooks" in l)
-    assert rows[hdr].startswith("❯ ")
+    assert rows[hdr].startswith("> ")
     assert flags[hdr] == 2
     # Every row of the hook's text is present and marked as yours.
     for phrase in ("Stop hook error", "The user is away", "Re-read the original request",
@@ -182,8 +183,31 @@ def test_the_paragraph_after_a_blank_row_survives():
 def test_the_header_is_restamped_as_your_turn():
     out = clean(PANE)
     line = [l for l in out.split("\n") if "Ran 2 stop hooks" in l][0]
-    assert line.startswith("❯ "), f"expected the user marker, got {line!r}"
-    assert not line.lstrip("❯ ").startswith("●")
+    assert line.startswith("> "), f"expected the user marker, got {line!r}"
+    assert not line.lstrip("> ").startswith("●")
+
+
+def test_the_marker_is_a_literal_gt_and_the_highlight_does_not_depend_on_it():
+    """`>` is what was asked for, and it is safe because nothing keys on it.
+
+    The highlight comes from _isHookHeader, not from _USER_ECHO_RE (which does
+    not accept `>`), and _PANE_STRUCTURE_RE (which does) is only ever tested
+    against the input row, never against what the filter emits. Both halves are
+    pinned here, because either one changing silently turns the marker back into
+    plain chrome.
+    """
+    prefix = run_js("console.log(JSON.stringify(_HOOK_ECHO_PREFIX));")
+    assert prefix == "> ", f"the marker must be a literal '> ', got {prefix!r}"
+    # A `>` row is NOT a user echo, yet is still flagged 2 via the hook test.
+    checks = run_js(
+        "const row='> Ran 2 stop hooks (ctrl+o to expand)';"
+        "console.log(JSON.stringify({"
+        "echo:_USER_ECHO_RE.test(row),hook:_isHookHeader(row),"
+        "flag:_markUserRows([row])[0]}));"
+    )
+    assert checks["echo"] is False, "if `>` ever becomes a user echo, plain quoted text highlights too"
+    assert checks["hook"] is True
+    assert checks["flag"] == 2, "the highlight must survive without _USER_ECHO_RE"
 
 
 def test_the_block_is_highlighted_as_a_user_message():
