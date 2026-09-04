@@ -10064,6 +10064,50 @@ def _seed_profile_update_config(config_dir: Path):
         logger.debug("Failed to seed update config into %s", target, exc_info=True)
 
 
+_REPORT_STYLE_BEGIN = "<!-- REPORT STYLE (managed) -->"
+_REPORT_STYLE_END = "<!-- END REPORT STYLE -->"
+_REPORT_STYLE = """## How to write the summary at the end
+
+Write it for a busy reader who was not in the session.
+- Lead with the finding that changes what the reader believes, and let it hint at what the task was.
+- Say what happened and what the fix was, not how it was done.
+- No command flags, function names or file paths unless the reader has to type them. DO give the live URL of anything you built, with the login if it needs one.
+- Fragments fine. Clarity, not grammar. No fluff.
+- No em dash, no pipe character. It has to be copy-paste ready.
+- Close with what was left undone and why, if anything was.
+- No preamble, no "I've completed", no offer to do more, no menu of options, never "want me to".
+- Under 200 words for a whole session. Less if it holds."""
+
+
+def _strip_report_style(text: str) -> str:
+    """Remove every copy of the managed block, so it never accumulates.
+
+    The Profiles editor reads CLAUDE.md back off disk and saves the whole thing
+    into the stored record, so the block round-trips into `claude_md` unless it
+    is stripped on the way in.
+    """
+    body = text or ""
+    while _REPORT_STYLE_BEGIN in body:
+        pre, rest = body.split(_REPORT_STYLE_BEGIN, 1)
+        body = pre + (rest.split(_REPORT_STYLE_END, 1)[1] if _REPORT_STYLE_END in rest else "")
+    return body.rstrip("\n")
+
+
+def _with_report_style(text: str) -> str:
+    """Append the managed report-style block to a role profile's CLAUDE.md.
+
+    A role profile's CLAUDE.md is rewritten from the stored record on every
+    materialize, and that record is itself refreshed from `_PROFILE_PRESETS`
+    unless the profile is marked `edited`, so anything appended to the file by
+    hand is gone within minutes. Spelled out rather than pointed at: a pointer
+    would have to name `$HOME/CLAUDE.md`, which on a tenant box is readable by
+    every tenant session and is not always where the rules live.
+    """
+    body = _strip_report_style(text)
+    block = _REPORT_STYLE_BEGIN + "\n" + _REPORT_STYLE + "\n" + _REPORT_STYLE_END + "\n"
+    return (body + "\n\n" if body else "") + block
+
+
 def _materialize_profile(profile: dict):
     """Write settings.json, CLAUDE.md, and ensure skills/ exists.
 
@@ -10134,7 +10178,10 @@ def _materialize_profile(profile: dict):
             _backup_before_dashboard_write(settings_path)
             settings_path.write_text(json.dumps(managed, indent=2))
         _backup_before_dashboard_write(claudemd_path)
-        claudemd_path.write_text(profile.get("claude_md") or "")
+        # ~/.claude/CLAUDE.md is the account's own file and already carries the
+        # global rules; only the role dirs we own get the managed block.
+        claudemd_path.write_text(profile.get("claude_md") or "" if is_default
+                                 else _with_report_style(profile.get("claude_md")))
         _backup_before_dashboard_write(memorymd_path)
         memorymd_path.write_text(profile.get("memory_md") or "")
         # Seed initial skill files only when they are missing -- never overwrite,
@@ -10289,7 +10336,8 @@ async def api_update_profile(profile_id: str, body: UpdateProfileBody):
     if body.effort is not None:
         p["effort"] = body.effort
     if body.claude_md is not None:
-        p["claude_md"] = body.claude_md
+        # The editor sends back what it read off disk, managed block included.
+        p["claude_md"] = _strip_report_style(body.claude_md)
     if body.memory_md is not None:
         p["memory_md"] = body.memory_md
     if body.permissions is not None:
