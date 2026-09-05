@@ -4904,7 +4904,8 @@ _GROUP_CTX_BEGIN = "<!-- TEAM GROUP CONTEXT (managed — edits below are overwri
 _GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
 # Top-level path segments reserved for the app (never treated as usernames).
 _RESERVED_TOP = {"", "api", "login", "logout", "qa-output", "static", "favicon.ico",
-                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws"}
+                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws",
+                 "console"}
 
 
 def _load_groups() -> dict:
@@ -27047,6 +27048,18 @@ function renderBrowserTab(data){
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
         'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
         'once nobody is watching. <b>History</b> is the audit trail.</div>'+
+      // Signing in by hand is a different job from watching an agent work, and
+      // VNC is the wrong transport for it. The console browser streams one tab
+      // over CDP instead, goes out DIRECT rather than through the residential
+      // relay, and keeps its profile, so a login done there is still there
+      // tomorrow. Linked from here because this tab is where anyone looking for
+      // a browser looks first.
+      '<div class="pf-banner">Signing in to something yourself? Use the '+
+        '<a href="'+BASE+'/console" target="_blank" rel="noopener">'+
+        '<b>console browser ↗</b></a> instead of View live. It streams the page, '+
+        'not the desktop, so it is far quicker over a phone connection, and it '+
+        'shows you which exit it is on and whether that exit can reach the '+
+        'internet at all.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -30322,6 +30335,19 @@ async def vacuum_tool_sim():
         return HTMLResponse("vacuum_tool_sim.html is missing", status_code=404)
     return FileResponse(str(path), media_type="text/html",
                         headers={"Cache-Control": "no-store"})
+
+
+# The console browser: a headed Chrome a human can sign in to, streamed over CDP
+# instead of VNC. Its own module, mounted here, like the other panels. It has to be
+# registered ABOVE the /{username} catch-all or "console" is read as a member name.
+# The websocket carries a live, signed-in browser, so it re-checks the dashboard
+# cookie itself: HTTP middleware does not run for websockets.
+try:
+    import console_browser
+    console_browser.mount(
+        app, auth_ok=lambda ws: (not AUTH_PASS) or _check_token(ws.cookies.get(AUTH_COOKIE)))
+except Exception:
+    logger.exception("console browser not mounted")
 
 
 @app.get("/{username}", response_class=HTMLResponse)
