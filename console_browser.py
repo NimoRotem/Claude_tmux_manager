@@ -283,23 +283,36 @@ def park_if_idle(name: str = "default", viewers: int = 0) -> bool:
     return True
 
 
-def _park(port: int, name: str = "default") -> None:
-    """Leave exactly one blank tab. Cookies live in the profile on disk, not in
-    the tab, so nothing signed in is lost by doing this."""
+def _park(port: int, name: str = "default") -> int:
+    """Leave one blank tab and nothing else. Returns how many were closed.
+
+    Cookies live in the profile on disk, not in the tab, so nothing signed in is
+    lost. A blank tab is opened only if there is not one already: parking used to
+    open one unconditionally and so added a tab every time it ran.
+
+    /json/close answers "Target is closing" and returns before the tab is gone,
+    so a listing taken straight afterwards still shows it. Anything checking the
+    result has to wait, which is what the settle loop below is for.
+    """
     import urllib.request
-    with contextlib.suppress(Exception):
-        _cdp_new_tab(port, "about:blank")
     probe = (_load().get(name) or {}).get("probe_target")
-    keep = None
-    for tab in browser_live.targets(port):
-        if tab["id"] == probe:
-            continue
-        if tab["url"] == "about:blank" and keep is None:
-            keep = tab["id"]
-            continue
+    rows = [t for t in browser_live.targets(port) if t["id"] != probe]
+    keep = next((t["id"] for t in rows if t["url"] in ("about:blank", "")), None)
+    if keep is None:
         with contextlib.suppress(Exception):
-            urllib.request.urlopen("http://127.0.0.1:%d/json/close/%s" % (port, tab["id"]),
+            keep = _cdp_new_tab(port, "about:blank").get("id")
+    doomed = [t["id"] for t in rows if t["id"] != keep]
+    for ident in doomed:
+        with contextlib.suppress(Exception):
+            urllib.request.urlopen("http://127.0.0.1:%d/json/close/%s" % (port, ident),
                                    timeout=4).read()
+    deadline = time.time() + 5
+    while doomed and time.time() < deadline:
+        live = {t["id"] for t in browser_live.targets(port)}
+        if not (set(doomed) & live):
+            break
+        time.sleep(0.3)
+    return len(doomed)
 
 
 # ---------------------------------------------------------------------------

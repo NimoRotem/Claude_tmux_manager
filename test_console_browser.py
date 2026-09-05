@@ -72,7 +72,25 @@ def test_the_probe_tab_is_hidden_from_the_tab_list():
 def test_park_leaves_the_probe_tab_alone():
     src = open(cb.__file__, encoding="utf-8").read()
     fn = src.split("def _park(")[1].split("\n# ---")[0]
-    assert "probe" in fn and "continue" in fn
+    assert 't["id"] != probe' in fn
+
+
+def test_park_only_opens_a_blank_tab_when_there_is_not_one():
+    """It used to open one every time, so parking an already parked browser added
+    a tab. Nothing complains, the count just creeps up."""
+    src = open(cb.__file__, encoding="utf-8").read()
+    fn = src.split("def _park(")[1].split("\n# ---")[0]
+    assert "if keep is None:" in fn
+    assert fn.count("_cdp_new_tab") == 1
+
+
+def test_park_waits_for_the_tabs_to_actually_go():
+    """/json/close returns "Target is closing" before the tab is gone, so a
+    listing taken straight after still shows it and any caller that checks its
+    own work reads a stale answer."""
+    src = open(cb.__file__, encoding="utf-8").read()
+    fn = src.split("def _park(")[1].split("\n# ---")[0]
+    assert "deadline" in fn and "time.sleep" in fn
 
 
 # --- talking to Chrome -----------------------------------------------------
