@@ -338,6 +338,10 @@ def tabs(name: str = "default", include_probe: bool = False) -> list:
     st = _load().get(name) or {}
     if not st.get("port"):
         return []
+    # Asking what is open counts as using it. Without this only a live viewer
+    # refreshed the idle timer, so the reaper closed the tabs of an agent that was
+    # driving the browser over CDP: the work vanished mid-task with no error.
+    touch(name)
     rows = browser_live.targets(int(st["port"]))
     if include_probe:
         return rows
@@ -375,6 +379,7 @@ def _probe_tab(name: str = "default") -> dict:
 
 
 def new_tab(name: str = "default", url: str = "about:blank") -> dict:
+    touch(name)
     st = _load().get(name) or {}
     if not st.get("port"):
         raise RuntimeError("browser is not running")
