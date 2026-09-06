@@ -38,6 +38,9 @@ desktop.ini
 *.bak-*
 *.orig
 *.pre-skills-backup
+*.pre-*
+*.tested-*
+rollback-*/
 
 # Pidfiles, archives
 *.pid

@@ -17,12 +17,23 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+
+def _host_home() -> Path:
+    """The dashboard's home, not the session account's.
+
+    Sessions now run as their own UNIX user, so $HOME points at that account.
+    The controller socket, the browser profiles and the shared playwright CLI
+    all live in the dashboard owner's home and are reached explicitly.
+    """
+    import os
+    return Path(os.environ.get("TMUX_DASH_HOST_HOME") or Path.home())
 from typing import Any
 
 CONTROLLER_SOCKET = Path(
     os.environ.get(
         "TMUX_DASH_CONTROLLER_SOCKET",
-        str(Path.home() / ".tmux-dashboard" / "controller.sock"),
+        str(_host_home() / ".tmux-dashboard" / "controller.sock"),
     )
 )
 BROWSER_ID = os.environ.get("TMUX_DASH_BROWSER_ID", "default")
@@ -33,7 +44,7 @@ except ValueError:
 BROWSER_OUTPUT_DIR = Path(
     os.environ.get(
         "TMUX_DASH_BROWSER_OUTPUT_DIR",
-        str(Path.home() / ".playwright-mcp" / BROWSER_ID),
+        str(_host_home() / ".playwright-mcp" / BROWSER_ID),
     )
 )
 LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
@@ -135,7 +146,7 @@ class LeaseRegistry:
 def main() -> int:
     upstream_command = sys.argv[1:] or [
         "node",
-        str(Path.home() / ".claude-browser" / "node_modules" / "@playwright" / "mcp" / "cli.js"),
+        str(_host_home() / ".claude-browser" / "node_modules" / "@playwright" / "mcp" / "cli.js"),
         "--cdp-endpoint",
         f"http://127.0.0.1:{BROWSER_CDP_PORT}",
         "--output-dir",

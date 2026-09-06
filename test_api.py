@@ -1,8 +1,12 @@
 """Integration tests for tmux Dashboard API endpoints using FastAPI TestClient."""
+import asyncio
 import json
 import os
 import re
 import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,7 +19,8 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-not-real")
 
 from fastapi.testclient import TestClient
 
-from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, _make_token, app
+import app as app_module
+from app import AUTH_COOKIE, AUTH_PASS, AUTH_USER, BRAND_NAME, _make_token, app
 
 # Auth cookies carry the stable user id, not the configurable display/login name.
 AUTH_TOKEN = _make_token("admin")
@@ -45,6 +50,72 @@ def authed_client():
     return c
 
 
+@pytest.fixture(autouse=True)
+def isolated_session_tab_labels(tmp_path, monkeypatch):
+    """Never let frontend/API tests mutate the live dashboard's label store."""
+    store = app_module.LockedJsonStore(
+        tmp_path / "session-tab-labels.json",
+        lambda: {"version": 1, "sessions": {}},
+    )
+    monkeypatch.setattr(app_module, "_session_tab_labels", store)
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_tab_order(tmp_path, monkeypatch):
+    """Never let API tests mutate any live account's saved tab ordering."""
+    store = app_module.LockedJsonStore(
+        tmp_path / "session-tab-order.json",
+        lambda: {"version": 1, "owners": {}},
+    )
+    monkeypatch.setattr(app_module, "_session_tab_order_store", store)
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_lifecycle_and_owners(tmp_path, monkeypatch):
+    """API tests must never mutate live owner or reboot-recovery state."""
+    lifecycle = app_module.SessionLifecycleStore(tmp_path / "session-lifecycle.json")
+    monkeypatch.setattr(app_module, "_session_lifecycle", lifecycle)
+    monkeypatch.setattr(
+        app_module, "SESSION_OWNERS_FILE", tmp_path / "session_owners.json"
+    )
+    for session in MOCK_SESSIONS:
+        app_module._set_session_owner(session["name"], "admin")
+
+
+@pytest.fixture(autouse=True)
+def stable_test_terminal_identity(monkeypatch):
+    """Generic endpoint tests use one immutable, owner-bound tmux incarnation."""
+    def binding(name, owner_id):
+        if not owner_id:
+            return None
+        return {
+            "name": name,
+            "owner_id": owner_id,
+            "generation": "",
+            "session_id": "$99",
+            "session_created": "1700000000",
+            "managed": False,
+            "key": (name, owner_id, "", "$99@1700000000"),
+        }
+
+    monkeypatch.setattr(app_module, "_terminal_binding", binding)
+    monkeypatch.setattr(app_module, "_terminal_binding_state", lambda _binding: "current")
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_close_runtime():
+    app_module._session_close_jobs.clear()
+    app_module._session_close_tasks.clear()
+    app_module._session_close_barriers.clear()
+    yield
+    for task in app_module._session_close_tasks.values():
+        if not task.done():
+            task.cancel()
+    app_module._session_close_jobs.clear()
+    app_module._session_close_tasks.clear()
+    app_module._session_close_barriers.clear()
+
+
 # ─── Auth & Middleware Tests ───
 
 
@@ -52,7 +123,7 @@ class TestAuthMiddleware:
     def test_unauthenticated_returns_login_page(self, client):
         resp = client.get("/", follow_redirects=False)
         assert resp.status_code == 200
-        assert "tmux Dashboard" in resp.text
+        assert f"{BRAND_NAME} Dashboard" in resp.text
         assert "Log in" in resp.text
 
     def test_authenticated_returns_app(self, authed_client):
@@ -107,7 +178,256 @@ class TestSecurityHeaders:
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
 
 
+class TestAdminSessionRecovery:
+    def test_admin_starts_bodyless_controller_recovery(self, authed_client):
+        controller = AsyncMock(return_value={
+            "ok": True,
+            "accepted": True,
+            "job": {"id": "job_abcdefghijklmnop", "status": "queued"},
+            "_status": 202,
+        })
+        with patch("app._controller_call", controller):
+            resp = authed_client.post(
+                "/api/admin/sessions/recover",
+                headers={"X-Tmux-Recovery": "1"},
+            )
+
+        assert resp.status_code == 202
+        assert resp.json()["job"]["status"] == "queued"
+        controller.assert_awaited_once_with(
+            "durable_reconcile_start", owner_id="admin"
+        )
+
+    def test_recovery_requires_confirmation_header(self, authed_client):
+        controller = AsyncMock()
+        with patch("app._controller_call", controller):
+            resp = authed_client.post("/api/admin/sessions/recover")
+
+        assert resp.status_code == 400
+        controller.assert_not_awaited()
+
+    def test_non_admin_cannot_start_recovery(self, authed_client):
+        controller = AsyncMock()
+        member = {"id": "u_member", "username": "member", "role": "user"}
+        with (
+            patch("app._current_user", return_value=member),
+            patch("app._controller_call", controller),
+        ):
+            resp = authed_client.post(
+                "/api/admin/sessions/recover",
+                headers={"X-Tmux-Recovery": "1"},
+            )
+
+        assert resp.status_code == 403
+        controller.assert_not_awaited()
+
+    def test_admin_polls_only_own_recovery_job(self, authed_client):
+        controller = AsyncMock(return_value={
+            "ok": True,
+            "job": {
+                "id": "job_abcdefghijklmnop",
+                "status": "completed",
+                "ready": ["debug"],
+                "pending": [],
+            },
+            "_status": 200,
+        })
+        with patch("app._controller_call", controller):
+            resp = authed_client.get(
+                "/api/admin/sessions/recover/job_abcdefghijklmnop"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["job"]["ready"] == ["debug"]
+        controller.assert_awaited_once_with(
+            "durable_reconcile_status",
+            owner_id="admin",
+            job_id="job_abcdefghijklmnop",
+        )
+
+
 class TestDashboardFrontendRegressions:
+    def test_admin_tools_include_async_tab_recovery(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert "> Recover tabs</button>" in html
+        assert "async function recoverTabs()" in html
+        assert "'/api/admin/sessions/recover'" in html
+        assert "'X-Tmux-Recovery':'1'" in html
+        assert "function _recoveryModalOwns(run)" in html
+        assert "transientFailures>5" in html
+        assert "recovery will continue" in html
+
+    def test_delete_ui_saves_knowledge_before_close(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert "Summarize and close ${esc(name)}?" in html
+        assert "Summarize &amp; Close" in html
+        assert "Saving session knowledge…" in html
+        assert "/close/'+encodeURIComponent(job.id)" in html
+        assert "The tab remains open" in html
+        assert "transientFailures>5" in html
+
+    def test_session_tab_bar_stays_pinned_while_page_scrolls(self, authed_client):
+        html = authed_client.get("/").text
+        nav_rule = re.search(r"\.nav-wrapper\{([^}]*)\}", html)
+
+        assert nav_rule
+        declarations = nav_rule.group(1)
+        assert "position:sticky" in declarations
+        assert "top:0" in declarations
+        assert "z-index:1000" in declarations
+
+    def test_toolbar_keeps_only_compact_stats_and_settings_visible(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        nav_start = html.index('<div class="nav-right">')
+        status_menu_start = html.index(
+            '<div class="nav-status-menu"',
+            nav_start,
+        )
+        tools_start = html.index('<div class="nav-tools-wrap">', status_menu_start)
+        nav_before_menu = html[nav_start:status_menu_start]
+
+        assert 'id="nav-cpu-summary"' in nav_before_menu
+        assert 'id="nav-usage-cap-summary"' in nav_before_menu
+        assert '>Status <span class="nav-status-chevron">' in nav_before_menu
+        assert 'title="Settings"' in html[tools_start:]
+
+        for hidden_id in (
+            "nav-server-stats",
+            "nav-usage",
+            "nav-codex-alert",
+            "nav-browser-badge",
+            "codex-auth",
+            "nav-status-whoami",
+        ):
+            assert f'id="{hidden_id}"' not in nav_before_menu
+
+    def test_status_dropdown_owns_details_account_and_actions(self, authed_client):
+        html = authed_client.get("/").text
+        status_start = html.index('<div class="nav-status-menu"')
+        status_end = html.index('<div class="nav-tools-wrap">', status_start)
+        status = html[status_start:status_end]
+        tools_end = html.index(
+            "<!-- Member-only nav controls",
+            status_end,
+        )
+        tools = html[status_end:tools_end]
+
+        for moved_id in (
+            "nav-server-stats",
+            "nav-usage",
+            "nav-codex-alert",
+            "nav-browser-badge",
+            "codex-auth",
+            "nav-status-whoami",
+        ):
+            assert f'id="{moved_id}"' in status
+
+        assert "Full system stats" in status
+        assert "Log out" in status
+        assert "System Stats" not in tools
+        assert 'nav-tools-mobile" type="button" role="menuitem" onclick="doLogout()' in tools
+        assert "nav-tools-whoami" not in html
+        assert "mobile-bottom-bar" not in html
+        assert "syncMobileBottomBar" not in html
+
+    def test_mobile_toolbar_reserves_header_for_tabs_and_gear(self, authed_client):
+        html = authed_client.get("/").text
+        mobile_start = html.index("@media(max-width:768px){", html.index("/* Mobile */"))
+        mobile_end = html.index("</style>", mobile_start)
+        mobile = html[mobile_start:mobile_end]
+
+        assert ".top-nav{padding:0 0 0 8px}" in mobile
+        assert ".nav-new-btn,.nav-compact-status,.nav-status-toggle,.nav-status-text," in mobile
+        assert ".nav-right>.member-only{display:none!important}" in mobile
+        assert "body.member-simple .nav-tools-wrap{display:block}" in mobile
+        assert "body.member-simple .nav-status-wrap{display:block" not in mobile
+        assert ".nav-tools-mobile{display:flex}" in mobile
+        assert ".nav-tools-menu{position:fixed" in mobile
+
+        nav_start = html.index('<div class="nav-wrapper">')
+        nav_end = html.index('<div class="auth-dropdown"', nav_start)
+        nav = html[nav_start:nav_end]
+        assert 'id="top-nav"' in nav
+        assert 'id="nav-tools-toggle"' in nav
+        assert 'aria-label="Settings and tools"' in nav
+
+    def test_mobile_gear_preserves_displaced_toolbar_actions(self, authed_client):
+        html = authed_client.get("/").text
+        menu_start = html.index('<div class="nav-tools-menu" id="nav-tools-menu"')
+        menu_end = html.index("</div>\n  </div>", menu_start)
+        menu = html[menu_start:menu_end]
+
+        for label in (
+            "New session",
+            "Status &amp; usage",
+            "Settings",
+            "My private browser",
+            "Connections",
+            "Log out",
+        ):
+            assert label in menu
+        assert "createSessionAuto();closeToolsMenu()" in menu
+        assert "toggleStatusMenu(event)" in menu
+        assert "openSettings('browser');closeToolsMenu()" in menu
+        assert "openConnections();closeToolsMenu()" in menu
+        assert "doLogout();closeToolsMenu()" in menu
+        assert 'nav-tools-mobile nav-tools-admin" type="button" role="menuitem"' in menu
+        assert menu.count('role="menuitem"') == 9
+
+    def test_new_session_controls_auto_create_without_asking_for_a_name(
+        self, authed_client
+    ):
+        html = authed_client.get("/").text
+        nav_start = html.index('<div class="nav-wrapper">')
+        nav_end = html.index('<div class="auth-dropdown"', nav_start)
+        nav = html[nav_start:nav_end]
+        create_start = html.index("async function createSessionAuto()")
+        create_end = html.index("// ── Connections", create_start)
+        create = html[create_start:create_end]
+
+        assert 'class="nav-new-btn" onclick="createSessionAuto()"' in nav
+        assert "createSessionAuto();closeToolsMenu()" in nav
+        assert "new-session-name" not in html
+        assert "showCreateModal" not in html
+        assert "JSON.stringify({name:_autoSessionName()})" in create
+        assert "crypto.getRandomValues" in html
+        assert "for(let attempt=0;attempt<5;attempt++)" in create
+        assert "if(resp.status===409&&data.code==='name_conflict')continue" in create
+        assert "if(_sessionCreatePending)return" in create
+        assert "_sessionCreatePending=false" in create
+        assert "_sessionCreateModalOwns(run)" in create
+        assert "data.ok!==true||typeof data.name!=='string'||!data.name" in create
+        assert "await _waitForCreatedSession(created.name)" in create
+        assert "for(let attempt=0;attempt<30;attempt++)" in html
+        assert "encodeURIComponent(name)+'/uploads'" in html
+        assert "Session is still starting" in create
+        assert 'onclick="closeModal();loadAll()">Refresh tabs</button>' in create
+        assert "Creating session…" in create
+        assert "Couldn't create session" in create
+        assert 'onclick="createSessionAuto()">Try again</button>' in create
+
+    def test_tools_menu_tracks_accessible_expanded_state(self, authed_client):
+        html = authed_client.get("/").text
+        toggle_start = html.index("function toggleToolsMenu(e)")
+        toggle_end = html.index("// Close dropdowns on outside click", toggle_start)
+        controls = html[toggle_start:toggle_end]
+
+        assert "button.setAttribute('aria-expanded',open?'true':'false')" in controls
+        assert "button.setAttribute('aria-expanded','false')" in controls
+        assert "closeStatusMenu()" in controls
+
+    def test_key_bar_has_plan_mode_shortcut(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert "sendSlashCommand('${name}','/plan')" in html
+        assert 'title="Switch to Plan mode">/plan</button>' in html
+        assert "sendSlashCommand('${name}','/work')" not in html
+
     def test_voice_button_names_recording_and_transcribing_states(
         self,
         authed_client,
@@ -171,6 +491,158 @@ class TestDashboardFrontendRegressions:
 
         assert "updateComposerBtn(key)" in html[restore_start:restore_end]
 
+    def test_user_request_completion_plays_a_glass_chime(self, authed_client):
+        html = authed_client.get("/").text
+        chime_start = html.index("// ── Completion chime")
+        chime_end = html.index("// Local chat messages mirror", chime_start)
+        chime = html[chime_start:chime_end]
+        send_start = html.index("function setOptimisticBusy(name)")
+        send_end = html.index("function scheduleBusyVerification", send_start)
+
+        assert "window.AudioContext||window.webkitAudioContext" in chime
+        assert "master.gain.setValueAtTime(0.84,now)" in chime
+        assert "prev==='busy'&&status==='idle'&&_completionWatch[name]" in chime
+        assert "playCompletionChime()" in chime
+        assert "armCompletionChime(name)" in html[send_start:send_end]
+
+    def test_hidden_dashboard_keeps_lightweight_completion_polling(self, authed_client):
+        import shutil
+        import subprocess
+
+        html = authed_client.get("/").text
+        poll_start = html.index("async function pollStatus()")
+        poll_end = html.index("// --- Inline server stats", poll_start)
+        poll = html[poll_start:poll_end]
+
+        assert "Object.values(lastStatus).some(status=>status==='busy')" in poll
+        assert (
+            "const needsCacheStatus=sessions.some(s=>"
+            "['warm','warning'].includes(_cacheTelemetryState(s).phase))"
+        ) in poll
+        assert (
+            "if(document.hidden&&!Object.keys(_completionWatch).length"
+            "&&!hasBusySession&&!needsIdleNudgeStatus&&!needsCacheStatus)return"
+        ) in poll
+        assert "trackSessionStatus(st.name,st.activity_status)" in poll
+        assert "fetch(BASE+'/api/status')" in poll
+
+        node = shutil.which("node")
+        if node is None:
+            return
+        # Execute the actual early-return guard: hidden warm/warning sessions
+        # must refresh their status so work started elsewhere cancels an alert.
+        guard = poll[poll.index("const hasBusySession="):poll.index("  try{")]
+        driver = r"""
+const vm=require('vm');
+const cases=[
+  {phase:'warm',expected:true},
+  {phase:'warning',expected:true},
+  {phase:'cold',expected:false},
+  {phase:'unknown',expected:false},
+  {phase:'cold',busy:true,expected:true},
+  {phase:'cold',completion:true,expected:true},
+  {phase:'cold',nudge:true,expected:true},
+  {phase:'cold',hidden:false,expected:true},
+];
+for(const row of cases){
+  const context=vm.createContext({
+    document:{hidden:row.hidden!==false},
+    sessions:[{phase:row.phase}],
+    lastStatus:row.busy?{alpha:'busy'}:{},
+    _completionWatch:row.completion?{alpha:true}:{},
+    getIdleNudgeMode:()=>row.nudge?'adhd':'off',
+    _idleNudgeNames:()=>row.nudge?['alpha']:[],
+    _cacheTelemetryState:session=>session,
+  });
+  const actual=vm.runInContext('(function(){'+process.argv[1]+';return true})()',context);
+  if(Boolean(actual)!==row.expected)throw new Error(JSON.stringify(row));
+}
+"""
+        result = subprocess.run(
+            [node, "-e", driver, guard], capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_idle_nudge_has_off_light_and_adhd_modes(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert '>Idle nudge</div>' in html
+        assert 'aria-label="Idle nudge mode"' in html
+        assert "b('off','Off')+b('light','Light')+b('adhd','ADHD')" in html
+        assert "localStorage.getItem('idleNudgeMode')" in html
+        assert "localStorage.setItem('idleNudgeMode',mode)" in html
+        assert ".idle-nudge-seg button.in-light.active{background:#1f6feb}" in html
+        assert ".idle-nudge-seg button.in-adhd.active{background:#da3633}" in html
+
+    def test_idle_nudge_repeats_every_twenty_seconds_until_mode_condition(self, authed_client):
+        html = authed_client.get("/").text
+        nudge_start = html.index("const IDLE_NUDGE_INTERVAL_MS=20000")
+        nudge_end = html.index("function _navDotClass", nudge_start)
+        nudge = html[nudge_start:nudge_end]
+        tracker_start = html.index("function trackSessionStatus(name,status,interrupted)")
+        tracker_end = html.index("['pointerdown'", tracker_start)
+        tracker = html[tracker_start:tracker_end]
+        acknowledge_start = html.index("function _acknowledgeCompletion(name)")
+        acknowledge_end = html.index("// ── Completion chime", acknowledge_start)
+        acknowledge = html[acknowledge_start:acknowledge_end]
+
+        assert "},IDLE_NUDGE_INTERVAL_MS)" in nudge
+        assert "playCompletionChime()" in nudge
+        assert "const pending=mode==='adhd'?_idleNudgeAdhdPending:_completedUnread" in nudge
+        assert "_syncIdleNudgeTimer()" in acknowledge
+        assert "if(status==='busy'&&_idleNudgeAdhdPending[name])" in tracker
+        assert "delete _idleNudgeAdhdPending[name]" in tracker
+        assert "if(getIdleNudgeMode()==='adhd')" in tracker
+        assert "_idleNudgeAdhdPending[name]=true" in tracker
+
+    def test_successful_new_message_stops_only_that_tabs_idle_nudge(self, authed_client):
+        html = authed_client.get("/").text
+        clear_start = html.index("function _clearIdleNudgeForNewWork(name)")
+        clear_end = html.index("// ── Completion chime", clear_start)
+        clear = html[clear_start:clear_end]
+        busy_start = html.index("function setOptimisticBusy(name)")
+        busy_end = html.index("function scheduleBusyVerification", busy_start)
+        busy = html[busy_start:busy_end]
+
+        assert "delete _completedUnread[name]" in clear
+        assert "delete _idleNudgeAdhdPending[name]" in clear
+        assert "if(wasPending)_syncIdleNudgeTimer()" in clear
+        assert "_clearIdleNudgeForNewWork(name)" in busy
+
+    def test_completed_session_dot_pulses_green_until_the_session_is_viewed(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        pulse_rule = re.search(
+            r"\.nav-dot\.idle\.completed-unread\{([^}]*)\}",
+            html,
+        )
+        tracker_start = html.index("function trackSessionStatus(name,status,interrupted)")
+        tracker_end = html.index("['pointerdown'", tracker_start)
+        tracker = html[tracker_start:tracker_end]
+        select_start = html.index("function selectSession(name)")
+        select_end = html.index("function switchTab", select_start)
+        visibility_start = html.index("document.addEventListener('visibilitychange'")
+        visibility_end = html.index("function _ensureRawScrollTracking", visibility_start)
+        interrupt_start = html.index("async function interruptSession(name,source)")
+        interrupt_end = html.index("function toggleInterruptButtons", interrupt_start)
+
+        assert pulse_rule
+        assert "background:#3fb950" in html
+        assert "animation:pulse-glow 1.5s ease-in-out infinite" in pulse_rule.group(1)
+        assert "_markCompletionUnread(name)" in tracker
+        assert "if(completed&&!interrupted){" in tracker
+        assert "_navDotClass(s.name,lastStatus[s.name]||s.activity_status)" in html
+        assert "_acknowledgeCompletion(name)" in html[select_start:select_end]
+        assert "_acknowledgeCompletion(selectedSession)" in html[
+            visibility_start:visibility_end
+        ]
+        assert "_paintNavDot(name,status)" in html
+        assert "trackSessionStatus(name,'idle',true)" in html[
+            interrupt_start:interrupt_end
+        ]
+
     def test_composer_action_is_a_round_record_button(self, authed_client):
         html = authed_client.get("/").text
         action_rule = re.search(r"\.btn\.composer-action\{([^}]*)\}", html)
@@ -182,6 +654,188 @@ class TestDashboardFrontendRegressions:
             and "border-radius:50%" in action_rule.group(1)
         )
 
+
+class TestDynamicSessionTabLabels:
+    def test_tab_uses_dynamic_label_but_keeps_stable_session_routing(self, authed_client):
+        html = authed_client.get("/").text
+
+        assert "function sessionTabLabel(session)" in html
+        assert "${esc(sessionTabLabel(s))}" in html
+        assert (
+            "item.onclick=()=>{if(!_tabOrderSuppressClick)selectSession(s.name)}"
+            in html
+        )
+        assert "const nextTabLabel=st.tab_label||''" in html
+        assert "_paintSessionTabLabel(st.name)" in html
+        assert "max-width:148px" in html
+        assert "text-overflow:ellipsis" in html
+
+    def test_tab_labels_have_a_fast_in_place_poll(self, authed_client):
+        html = authed_client.get("/").text
+        poll_start = html.index("async function pollTabLabels()")
+        poll_end = html.index("async function pollStatus()", poll_start)
+        poll = html[poll_start:poll_end]
+
+        assert "setInterval(pollTabLabels,2000)" in html
+        assert "fetch(BASE+'/api/tab-labels',{cache:'no-store'})" in poll
+        assert "session.tab_label=next" in poll
+        assert "_paintSessionTabLabel(row.name)" in poll
+        assert "renderNav()" not in poll
+        visibility = html[
+            html.index("document.addEventListener('visibilitychange'"):
+            html.index("function _ensureRawScrollTracking")
+        ]
+        assert "pollTabLabels();" in visibility
+
+    def test_tab_label_poll_returns_current_account_sessions_only(
+        self,
+        authed_client,
+    ):
+        request_id = app_module._queue_session_tab_label(
+            "test-session", "admin", "Fix OAuth login", started_at=1_000
+        )
+        app_module._finish_session_tab_label(
+            "test-session", request_id, "OAuth Login", finished_at=1_120
+        )
+        with patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS):
+            resp = authed_client.get("/api/tab-labels")
+
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {"name": "test-session", "tab_label": "OAuth Login"},
+            {"name": "work-session", "tab_label": ""},
+        ]
+
+    def test_local_summary_is_always_two_words(self):
+        prompts = {
+            'add a toggle called "idle nudge" with three modes': "Idle Nudge",
+            "Fix the OAuth login timeout bug": "OAuth Login",
+            "count to 60": "Count 60",
+            (
+                "each tab has a fixed name; if work takes more than 2 minutes, "
+                "rename that tab by summarizing my ask in 2 words"
+            ): "Rename Tab",
+        }
+
+        for prompt, expected in prompts.items():
+            label = app_module._fallback_two_word_tab_label(prompt)
+            assert label == expected
+            assert len(label.split()) == 2
+
+    @pytest.mark.asyncio
+    async def test_busy_request_renames_at_two_minutes(self, monkeypatch):
+        monkeypatch.setattr(app_module, "TAB_RENAME_AFTER_SECONDS", 120)
+        monkeypatch.setattr(app_module, "client", None)
+        monkeypatch.setattr(
+            app_module,
+            "_detect_activity_raw",
+            lambda _name: {"status": "busy", "detail": "Working"},
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_latest_tab_label_prompt",
+            lambda _name, _owner, _source_ts: "Fix the OAuth login timeout bug",
+        )
+        request_id = app_module._queue_session_tab_label(
+            "test-session",
+            "admin",
+            "Fix the OAuth login timeout bug",
+            started_at=1_000,
+        )
+
+        assert await app_module._session_tab_label_pass(
+            now=1_119,
+            live_session_names={"test-session"},
+        ) == 0
+        assert app_module._session_tab_label_rows()["test-session"]["pending"]["id"] == request_id
+
+        assert await app_module._session_tab_label_pass(
+            now=1_120,
+            live_session_names={"test-session"},
+        ) == 1
+        row = app_module._session_tab_label_rows()["test-session"]
+        assert row["label"] == "OAuth Login"
+        assert "pending" not in row
+
+    @pytest.mark.asyncio
+    async def test_short_request_keeps_previous_label(self, monkeypatch):
+        monkeypatch.setattr(app_module, "TAB_RENAME_AFTER_SECONDS", 120)
+        monkeypatch.setattr(app_module, "client", None)
+        monkeypatch.setattr(
+            app_module,
+            "_detect_activity_raw",
+            lambda _name: {"status": "idle", "detail": ""},
+        )
+        first = app_module._queue_session_tab_label(
+            "test-session", "admin", "Existing tab label", started_at=500
+        )
+        app_module._finish_session_tab_label(
+            "test-session", first, "Existing Label", finished_at=620
+        )
+        app_module._queue_session_tab_label(
+            "test-session", "admin", "Say hello", started_at=1_000
+        )
+
+        assert await app_module._session_tab_label_pass(
+            now=1_120,
+            live_session_names={"test-session"},
+        ) == 0
+        row = app_module._session_tab_label_rows()["test-session"]
+        assert row["label"] == "Existing Label"
+        assert "pending" not in row
+
+    def test_new_requests_supersede_old_timers_and_duplicate_labels_are_distinct(self):
+        old_id = app_module._queue_session_tab_label(
+            "test-session", "admin", "Fix OAuth login", started_at=1_000
+        )
+        current_id = app_module._queue_session_tab_label(
+            "test-session", "admin", "Add idle nudge", started_at=1_010
+        )
+        assert not app_module._finish_session_tab_label(
+            "test-session", old_id, "OAuth Login"
+        )
+        assert (
+            app_module._session_tab_label_rows()["test-session"]["pending"]["id"]
+            == current_id
+        )
+
+        app_module._finish_session_tab_label(
+            "test-session", current_id, "OAuth Login"
+        )
+        other_id = app_module._queue_session_tab_label(
+            "work-session", "admin", "Fix OAuth login", started_at=1_020
+        )
+        other = app_module._finish_session_tab_label(
+            "work-session", other_id, "OAuth Login"
+        )
+        assert other["label"] == "OAuth Login-2"
+        assert app_module._session_tab_label("work-session") == "OAuth Login-2"
+        assert len(other["label"].split()) == 2
+
+    def test_short_approval_uses_the_previous_substantive_ask(self, monkeypatch):
+        substantive = (
+            "each tab has a fixed name; if work takes more than 2 minutes, "
+            "rename that tab by summarizing my ask in 2 words"
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_load_session_messages",
+            lambda _name: [
+                {"role": "user", "text": substantive, "ts": 900.0},
+                {"role": "assistant", "text": "Here is the plan", "ts": 950.0},
+                {"role": "user", "text": "ok", "ts": 1_000.0},
+            ],
+        )
+
+        app_module._queue_session_tab_label(
+            "test-session", "admin", "ok", started_at=1_000
+        )
+        pending = app_module._session_tab_label_rows()["test-session"]["pending"]
+        assert pending["candidate"] == "Rename Tab"
+        assert pending["source_ts"] == 900.0
+
+
+class TestDashboardFrontendRegressionsContinued:
     def test_composer_action_stays_green_when_hovered(self, authed_client):
         html = authed_client.get("/").text
         hover_rule = re.search(r"\.btn\.composer-action:hover\{([^}]*)\}", html)
@@ -201,6 +855,55 @@ class TestDashboardFrontendRegressions:
         html = authed_client.get("/").text
 
         assert html.count('oninput="autoGrow(this);updateComposerBtn(\'') == 2
+
+    def test_clipboard_images_become_sendable_composer_attachments(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        paste_start = html.index("function handleComposerPaste(event,name,tab)")
+        paste_end = html.index("function handleDrop(event,name,tab)", paste_start)
+        paste = html[paste_start:paste_end]
+
+        assert html.count('onpaste="handleComposerPaste(event,') == 2
+        assert html.count("or paste an image...") == 2
+        assert "item.kind==='file'" in html
+        assert ".startsWith('image/')" in html
+        assert "new File([blob],filename" in html
+        assert "await _uploadOneFile(name,tab,file)" in paste
+        assert "previewUrl:await _clipboardImagePreview(file)" in paste
+        assert "reader.readAsDataURL(file)" in html
+        assert paste.index("if(!blobs.length)return") < paste.index(
+            "event.preventDefault()"
+        ), "ordinary text paste must retain the browser's default behavior"
+
+        assert html.count(
+            "_commandWithComposerAttachments(typed,attachments)"
+        ) == 2
+        assert "_clearComposerAttachments(name,'chat')" in html
+        assert "_clearComposerAttachments(name,source)" in html
+
+    def test_stop_restores_the_last_submitted_draft_for_editing(
+        self,
+        authed_client,
+    ):
+        html = authed_client.get("/").text
+        restore_start = html.index("function _restoreSubmittedDraft(name,source)")
+        restore_end = html.index("function captureComposerFocus()", restore_start)
+        restore = html[restore_start:restore_end]
+        interrupt_start = html.index("async function interruptSession(name,source)")
+        interrupt_end = html.index("function toggleInterruptButtons", interrupt_start)
+        interrupt = html[interrupt_start:interrupt_end]
+
+        assert "interruptSession('${s.name}','chat')" in html
+        assert "interruptSession('${s.name}','raw')" in html
+        assert html.count("_rememberSubmittedDraft(name,typed,attachments)") == 2
+        assert "if(input.value.length||(_composerAttachments[key]||[]).length)" in restore
+        assert "input.value=submitted.text" in restore
+        assert "_composerAttachments[key]=attachments" in restore
+        assert "input.setSelectionRange(input.value.length,input.value.length)" in restore
+        assert "if(!resp.ok)" in interrupt
+        assert "_restoreSubmittedDraft(name,target)" in interrupt
 
     def test_empty_chat_and_terminal_composers_render_microphone_buttons(
         self,
@@ -250,6 +953,71 @@ class TestDashboardFrontendRegressions:
 # ─── Session List API Tests ───
 
 
+class TestTerminalRosterUiContracts:
+    def test_short_lived_websocket_open_does_not_reset_backoff(self, authed_client):
+        html = authed_client.get("/").text
+        start = html.index("function startRawPolling(name)")
+        end = html.index("function stopRawPolling(name)", start)
+        block = html[start:end]
+        assert "socket.onopen" not in block
+        assert "['full','delta','ping'].includes(data.mode)" in block
+        assert "st.backoff=500" in block
+
+    def test_nonretryable_terminal_error_stops_reconnects(self, authed_client):
+        html = authed_client.get("/").text
+        start = html.index("function applyRawPayload(name,data)")
+        end = html.index("async function loadRaw(name)", start)
+        block = html[start:end]
+        assert "data.retryable===false" in block
+        assert "st.polling=false" in block
+        assert "reconcileSessionRoster()" in block
+
+    def test_authoritative_roster_adds_removes_and_checks_incarnation(self, authed_client):
+        html = authed_client.get("/").text
+        start = html.index("function _applySessionRoster(envelope,force,autopushVersions)")
+        end = html.index("async function loadAll(", start)
+        block = html[start:end]
+        assert "envelope.authoritative!==true" in block
+        assert "nextByName.get(oldRow.name)" in block
+        assert "nextRow.incarnation" in block
+        assert "nextRow.logical_incarnation" in block
+        assert "const sameLogical=oldRow&&String(row.logical_incarnation" in block
+        assert "if(sameLogical&&(_autopushPending.has(row.name)" in block
+        assert "_discardSessionClientState(oldRow.name)" in block
+        assert "_resetSessionRuntimeState(oldRow.name)" in block
+        assert "if(discarded)mainEl.replaceChildren()" in block
+        assert "request!==_sessionRosterRequest" in block
+
+    def test_autopush_response_is_scoped_to_session_client_epoch(self, authed_client):
+        html = authed_client.get("/").text
+        start = html.index("async function setAutopush(name,mode)")
+        end = html.index("function renderWatchdogLog", start)
+        block = html[start:end]
+        assert "const clientEpoch=_sessionClientEpoch[name]||0" in block
+        assert "if((_sessionClientEpoch[name]||0)!==clientEpoch)return" in block
+        assert "if((_sessionClientEpoch[name]||0)===clientEpoch)" in block
+
+        status_start = html.index("async function loadWatchdogStatus(name)")
+        status_end = html.index("// ── Key Bar", status_start)
+        status_block = html[status_start:status_end]
+        assert "const clientEpoch=_sessionClientEpoch[name]||0" in status_block
+        assert "clientEpoch!==(_sessionClientEpoch[name]||0)" in status_block
+
+    def test_tab_strip_has_persistent_mouse_and_touch_drag_contract(self, authed_client):
+        html = authed_client.get("/").text
+        assert "item.draggable=true" in html
+        assert "_installTabTouchDrag(item,s.name)" in html
+        assert "X-Tmux-Tab-Order':'1'" in html
+        assert "&&_tabOrderDragging)return false" in html
+        assert "The tab order could not be saved" in html
+        render = html[html.index("function renderNav()") : html.index("/* ── Chat bubbles")]
+        assert "navEl.insertBefore(item,anchor||null)" in render
+        assert "items.reverse()" not in render
+
+
+# ─── Session List API Tests ───
+
+
 class TestSessionListEndpoints:
     @patch("app.get_tmux_sessions", return_value=[])
     def test_sessions_fast_empty(self, mock_sessions, authed_client):
@@ -267,6 +1035,147 @@ class TestSessionListEndpoints:
         assert data[0]["name"] == "test-session"
         assert data[1]["name"] == "work-session"
 
+    @patch("app.async_detect_activity", new_callable=AsyncMock)
+    @patch("app._tmux_inventory_snapshot")
+    def test_session_roster_is_authoritative_and_owner_scoped(
+        self, mock_inventory, mock_activity, authed_client
+    ):
+        mock_activity.return_value = {"status": "idle", "command": "", "detail": ""}
+        mock_inventory.return_value = {
+            "authoritative": True,
+            "state": "ok",
+            "observed_at": 123,
+            "owners": {"test-session": "admin"},
+            "sessions": [{**MOCK_SESSIONS[0], "runtime_state": "running", "incarnation": "inc-a"}],
+            "expected_rows": {},
+            "missing_expected": [],
+        }
+        resp = authed_client.get("/api/session-roster")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["authoritative"] is True
+        assert [(row["name"], row["incarnation"]) for row in data["sessions"]] == [
+            ("test-session", "inc-a")
+        ]
+
+    def test_tab_order_is_owner_scoped_and_appends_unknown_tabs(self):
+        app_module._save_session_tab_order("admin", ["work-session"])
+        app_module._save_session_tab_order("u_other", ["test-session"])
+        inventory = {
+            "owners": {"test-session": "admin", "work-session": "admin"},
+            "sessions": MOCK_SESSIONS,
+            "expected_rows": {},
+            "missing_expected": [],
+        }
+        rows = app_module._roster_sessions_for_user(inventory, {"id": "admin"})
+        assert [row["name"] for row in rows] == ["work-session", "test-session"]
+
+    def test_unsaved_order_preserves_the_legacy_visual_default(self):
+        inventory = {
+            "owners": {"test-session": "admin", "work-session": "admin"},
+            "sessions": MOCK_SESSIONS,
+            "expected_rows": {},
+            "missing_expected": [],
+        }
+        rows = app_module._roster_sessions_for_user(inventory, {"id": "admin"})
+        assert [row["name"] for row in rows] == ["work-session", "test-session"]
+
+    def test_save_tab_order_requires_confirmation_and_exact_owner(self, authed_client):
+        body = {"sessions": ["work-session", "test-session"]}
+        assert authed_client.post("/api/session-tab-order", json=body).status_code == 400
+        response = authed_client.post(
+            "/api/session-tab-order",
+            json=body,
+            headers={"X-Tmux-Tab-Order": "1"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "sessions": body["sessions"]}
+        assert app_module._session_tab_order("admin") == body["sessions"]
+
+        duplicate = authed_client.post(
+            "/api/session-tab-order",
+            json={"sessions": ["test-session", "test-session"]},
+            headers={"X-Tmux-Tab-Order": "1"},
+        )
+        assert duplicate.status_code == 422
+        app_module._set_session_owner("other-session", "u_other")
+        other = authed_client.post(
+            "/api/session-tab-order",
+            json={"sessions": ["other-session"]},
+            headers={"X-Tmux-Tab-Order": "1"},
+        )
+        assert other.status_code == 404
+        assert "other-session" not in other.text
+
+    def test_deleted_tab_is_removed_only_from_its_owners_order(self):
+        app_module._save_session_tab_order("admin", ["test-session", "work-session"])
+        app_module._save_session_tab_order("u_other", ["test-session", "elsewhere"])
+        app_module._remove_session_from_tab_order("test-session", "admin")
+        assert app_module._session_tab_order("admin") == ["work-session"]
+        assert app_module._session_tab_order("u_other") == ["test-session", "elsewhere"]
+
+    @patch("app._tmux_inventory_snapshot")
+    def test_session_roster_never_turns_inventory_failure_into_empty(self, mock_inventory, authed_client):
+        mock_inventory.return_value = {
+            "authoritative": False,
+            "state": "error",
+            "observed_at": 123,
+            "sessions": [],
+            "expected_rows": {},
+            "missing_expected": [],
+        }
+        resp = authed_client.get("/api/session-roster")
+        assert resp.status_code == 503
+        assert resp.json() == {
+            "authoritative": False,
+            "state": "error",
+            "observed_at": 123,
+            "sessions": [],
+        }
+
+    @patch("app._load_session_notes", return_value="new notes")
+    @patch("app._load_session_messages", return_value=[{"role": "user", "text": "new owner", "ts": 2}])
+    @patch("app.async_detect_activity", new_callable=AsyncMock)
+    @patch("app._tmux_inventory_snapshot")
+    def test_roster_discards_stale_other_owner_process_cache(
+        self,
+        mock_inventory,
+        mock_activity,
+        mock_messages,
+        mock_notes,
+        authed_client,
+    ):
+        mock_activity.return_value = {"status": "idle", "command": "", "detail": ""}
+        mock_inventory.return_value = {
+            "authoritative": True,
+            "state": "ok",
+            "observed_at": 123,
+            "owners": {"test-session": "admin"},
+            "sessions": [{
+                **MOCK_SESSIONS[0],
+                "runtime_state": "running",
+                "incarnation": "runtime-new",
+                "logical_incarnation": "logical-new",
+            }],
+            "expected_rows": {},
+            "missing_expected": [],
+        }
+        app_module.cache["test-session"] = {
+            "_owner_id": "u_old",
+            "_logical_incarnation": "logical-old",
+            "messages": [{"role": "user", "text": "old owner secret", "ts": 1}],
+            "notes": "old owner notes",
+        }
+        try:
+            resp = authed_client.get("/api/session-roster")
+            assert resp.status_code == 200
+            row = resp.json()["sessions"][0]
+            assert [message["text"] for message in row["messages"]] == ["new owner"]
+            assert row["notes"] == "new notes"
+            assert "old owner" not in json.dumps(row)
+        finally:
+            app_module.cache.pop("test-session", None)
+
     @patch("app.detect_activity", return_value={"status": "idle", "command": "", "detail": ""})
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_status_returns_activity(self, mock_sessions, mock_activity, authed_client):
@@ -275,6 +1184,31 @@ class TestSessionListEndpoints:
         data = resp.json()
         assert len(data) == 2
         assert all(s["activity_status"] == "idle" for s in data)
+
+    def test_status_discards_metadata_if_owner_changes_during_build(
+        self, authed_client
+    ):
+        async def swap_owner(_name):
+            app_module._set_session_owner("test-session", "u_replacement")
+            return {
+                "status": "busy",
+                "command": "replacement-secret-command",
+                "detail": "replacement-secret-detail",
+            }
+
+        def binding_state(binding):
+            owner = app_module._load_session_owners().get(binding["name"], "")
+            return "current" if owner == binding["owner_id"] else "replaced"
+
+        with (
+            patch("app.get_tmux_sessions", return_value=[MOCK_SESSIONS[0]]),
+            patch("app.async_detect_activity", side_effect=swap_owner),
+            patch("app._terminal_binding_state", side_effect=binding_state),
+        ):
+            resp = authed_client.get("/api/status")
+
+        assert resp.status_code == 503
+        assert "replacement-secret" not in resp.text
 
     def test_session_response_reads_real_apikey_auth_mode(self, tmp_path):
         import app as app_module
@@ -433,11 +1367,12 @@ class TestSessionCreateDelete:
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_create_session_duplicate_name(self, mock_sessions, authed_client):
-        resp = authed_client.post(
-            "/api/sessions/create",
-            json={"name": "test-session"},
+        with patch("app._exact_tmux_session_id", return_value="$1"):
+            resp = authed_client.post(
+                "/api/sessions/create",
+                json={"name": "test-session"},
 
-        )
+            )
         assert resp.status_code == 409
         assert "already exists" in resp.json()["error"]
 
@@ -471,8 +1406,22 @@ class TestStatsEndpoint:
         """Stats response must contain the documented top-level keys."""
         resp = authed_client.get("/api/stats")
         data = resp.json()
-        expected_keys = {"cpu_load", "memory", "disk", "tmux_sessions", "codex_processes"}
+        expected_keys = {
+            "cpu_load", "cpu_percent", "cpu_iowait_percent", "cpu_measurement",
+            "memory", "disk", "tmux_sessions", "codex_processes",
+        }
         assert expected_keys <= data.keys(), f"Missing keys: {expected_keys - data.keys()}"
+
+    @patch("app._sample_cpu_utilization", return_value=(37.5, 8.0))
+    def test_stats_uses_proc_delta_not_load_as_utilization(self, sample, authed_client):
+        resp = authed_client.get("/api/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cpu_percent"] == 37.5
+        assert data["cpu_iowait_percent"] == 8.0
+        assert data["cpu_measurement"] == "proc_stat_delta"
+        assert data["cpu_load"]  # load is preserved as its own metric
+        sample.assert_called_once()
 
     @patch("app.subprocess.run", side_effect=Exception("no pgrep"))
     @patch("app.shutil.disk_usage", side_effect=Exception("no disk"))
@@ -910,6 +1859,58 @@ class TestFindSessionJsonlFiles:
             result = app._find_session_jsonl_files("has-rollout-session")
         assert result == [str(rollout)]
 
+    def test_root_thread_validator_rejects_subagent_in_same_owner_home(
+        self, tmp_path
+    ):
+        import app
+
+        root_id = "01a035f8-3188-7c21-8cca-582b01ad3002"
+        child_id = "01a03616-3191-7b51-a79f-af48d2475db8"
+        sessions = tmp_path / ".codex" / "sessions"
+        sessions.mkdir(parents=True)
+        root = sessions / f"rollout-root-{root_id}.jsonl"
+        child = sessions / f"rollout-child-{child_id}.jsonl"
+        root.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": root_id,
+                "session_id": root_id,
+                "thread_source": "user",
+            },
+        }) + "\n")
+        child.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": child_id,
+                "session_id": root_id,
+                "thread_source": "subagent",
+            },
+        }) + "\n")
+
+        with patch("app._session_config_base", return_value=tmp_path / ".codex"):
+            assert app._validated_session_root_thread_id("debug", root_id) == root_id
+            assert app._validated_session_root_thread_id("debug", child_id) is None
+
+    def test_recorded_but_invalid_root_fails_closed(self):
+        import app
+
+        with (
+            patch.object(
+                app._session_lifecycle,
+                "get",
+                return_value={
+                    "resume_uuid": "01a035f8-3188-7c21-8cca-582b01ad3002"
+                },
+            ),
+            patch("app._validated_session_root_thread_id", return_value=None),
+            patch(
+                "app._strict_session_owner",
+                return_value=("u_michiel", {"id": "u_michiel"}),
+            ),
+        ):
+            with pytest.raises(ValueError, match="missing or invalid"):
+                app._find_session_transcript_uuid("debug")
+
     @patch("app.get_session_cwd", return_value="/home/user/myproject")
     def test_ignores_rollout_for_different_cwd(self, mock_cwd, tmp_path):
         """A rollout from another workspace must not leak into session stats."""
@@ -927,6 +1928,137 @@ class TestFindSessionJsonlFiles:
         with patch("app._session_config_base", return_value=tmp_path / ".codex"):
             result = app._find_session_jsonl_files("other-rollout-session")
         assert result == []
+
+    @patch("app.get_session_cwd", return_value="/home/user/new-project")
+    def test_recorded_resume_uuid_finds_rollout_after_project_move(
+        self, mock_cwd, tmp_path
+    ):
+        import app
+
+        thread_id = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+        sessions = tmp_path / ".codex" / "sessions"
+        sessions.mkdir(parents=True)
+        rollout = sessions / f"rollout-old-{thread_id}.jsonl"
+        rollout.write_text(
+            json.dumps({
+                "type": "session_meta",
+                "payload": {"id": thread_id, "cwd": "/home/user/old-project"},
+            }) + "\n"
+        )
+        with (
+            patch("app._session_config_base", return_value=tmp_path / ".codex"),
+            patch("app._find_session_transcript_uuid", return_value=thread_id),
+        ):
+            result = app._find_session_jsonl_files("moved-session")
+
+        assert result == [str(rollout)]
+
+
+def test_usage_aliases_migrated_root_without_relabeling_unrelated_rollout(
+    tmp_path,
+):
+    import app
+
+    mapped_id = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+    unrelated_id = "01a09999-1111-7222-8333-444455556666"
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    def write_rollout(path, thread_id, input_tokens):
+        path.write_text("\n".join([
+            json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "session_id": thread_id,
+                    "thread_source": "user",
+                    "cwd": "/home/nimrod_rotem/lisa-my",
+                },
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": 2,
+                            "cached_input_tokens": 0,
+                            "reasoning_output_tokens": 0,
+                        },
+                    },
+                },
+            }),
+        ]) + "\n")
+
+    mapped = tmp_path / f"rollout-mapped-{mapped_id}.jsonl"
+    unrelated = tmp_path / f"rollout-unrelated-{unrelated_id}.jsonl"
+    write_rollout(mapped, mapped_id, 10)
+    write_rollout(unrelated, unrelated_id, 20)
+    old_cache = dict(app._stats_usage_cache)
+    app._stats_usage_cache.update({"ts": 0, "data": {}})
+    try:
+        with (
+            patch("app._all_codex_rollouts", return_value=[mapped, unrelated]),
+            patch.object(
+                app._session_lifecycle,
+                "snapshot",
+                return_value={
+                    "sessions": {
+                        "logoutflow": {
+                            "resume_uuid": mapped_id,
+                            "cwd": "/home/nimrod_rotem/web-projects/Michiel/logoutflow",
+                        },
+                    },
+                },
+            ),
+            patch(
+                "app._validated_session_root_thread_id",
+                return_value=mapped_id,
+            ),
+            patch(
+                "app.get_tmux_sessions",
+                return_value=[{"name": "logoutflow"}],
+            ),
+            patch(
+                "app.get_session_cwd",
+                return_value="/home/nimrod_rotem/web-projects/Michiel/logoutflow",
+            ),
+        ):
+            response = asyncio.run(app.api_stats_usage())
+    finally:
+        app._stats_usage_cache.clear()
+        app._stats_usage_cache.update(old_cache)
+
+    payload = json.loads(response.body)
+    rows = {row["name"]: row for row in payload["sessions"]}
+    assert rows["logoutflow"]["thisWeek"]["totalTokens"] == 12
+    assert rows["lisa-my"]["thisWeek"]["totalTokens"] == 22
+    assert len(payload["sessions"]) == 2
+
+
+def test_session_model_falls_back_to_config_when_rollout_tail_has_no_context(
+    tmp_path,
+):
+    import app
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "01a035f8-3188-7c21-8cca-582b01ad3002"},
+    }) + "\n")
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+    app._session_model_cache.pop("restored", None)
+    try:
+        with (
+            patch("app._find_session_jsonl_files", return_value=[str(rollout)]),
+            patch("app._session_config_base", return_value=codex_home),
+        ):
+            assert app._get_session_model("restored") == "gpt-5.6-sol"
+    finally:
+        app._session_model_cache.pop("restored", None)
 
 
 # ─── Session Stats Endpoint ───
@@ -955,7 +2087,12 @@ class TestSessionStats:
 
         import app
         unique_session = "cache-hit-test-session"
-        cached_result = {"available": False, "_ts": time.time(), "_from_cache": True}
+        cached_result = {
+            "available": False,
+            "_ts": time.time(),
+            "_from_cache": True,
+            "_identity": app._session_derived_cache_identity(unique_session),
+        }
         app._session_stats_cache[unique_session] = cached_result
         try:
             resp = authed_client.get(f"/api/sessions/{unique_session}/stats")
@@ -981,21 +2118,29 @@ class TestHealthEndpoint:
 
     @patch("app.subprocess.run")
     def test_health_ok_when_tmux_running(self, mock_run, authed_client):
-        mock_run.return_value = MagicMock(returncode=0, stdout="session1\nsession2\n", stderr="")
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=(
+                "session1:1:1700000000:0:::::$1\n"
+                "session2:1:1700000001:0:::::$2\n"
+            ),
+            stderr="",
+        )
         resp = authed_client.get("/api/health")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["tmux"] is True
+        assert data["tmux"]["query_ok"] is True
+        assert data["tmux"]["server_running"] is True
 
     @patch("app.subprocess.run")
     def test_health_degraded_when_tmux_fails(self, mock_run, authed_client):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
         resp = authed_client.get("/api/health")
-        assert resp.status_code == 200
+        assert resp.status_code == 503
         data = resp.json()
         assert data["status"] == "degraded"
-        assert data["tmux"] is False
+        assert data["tmux"]["query_ok"] is False
 
     @patch("app.subprocess.run")
     def test_health_ok_when_no_tmux_server(self, mock_run, authed_client):
@@ -1003,7 +2148,21 @@ class TestHealthEndpoint:
         resp = authed_client.get("/api/health")
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["tmux"] is True
+        assert data["tmux"]["query_ok"] is True
+        assert data["tmux"]["server_running"] is False
+
+    @patch("app._tmux_inventory_snapshot")
+    def test_health_degraded_when_durable_session_is_missing(self, mock_inventory, authed_client):
+        mock_inventory.return_value = {
+            "authoritative": True,
+            "state": "no_server",
+            "expected": 1,
+            "ready_expected": 0,
+            "missing_expected": ["expected-tab"],
+        }
+        resp = authed_client.get("/api/health")
+        assert resp.status_code == 503
+        assert resp.json()["tmux"]["missing_durable"] == 1
 
     @patch("app.subprocess.run")
     def test_health_degraded_on_exception(self, mock_run, authed_client):
@@ -1011,7 +2170,21 @@ class TestHealthEndpoint:
         resp = authed_client.get("/api/health")
         data = resp.json()
         assert data["status"] == "degraded"
-        assert data["tmux"] is False
+        assert resp.status_code == 503
+        assert data["tmux"]["query_ok"] is False
+
+    @patch("app._health_report", new_callable=AsyncMock)
+    def test_public_health_routes_return_json_without_login_html(
+        self, mock_report, client
+    ):
+        mock_report.return_value = ({"status": "degraded"}, 503)
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+        detailed = client.get("/api/health")
+        assert live.status_code == 200 and live.json() == {"status": "ok"}
+        assert ready.status_code == 503 and ready.json() == {"status": "degraded"}
+        assert detailed.status_code == 401
+        assert detailed.json() == {"error": "Authentication required"}
 
     def test_health_reports_openai_status(self, authed_client):
         resp = authed_client.get("/api/health")
@@ -1070,8 +2243,11 @@ class TestUploadFileSizeLimit:
                 return b"x" * (51 * 1024 * 1024)
 
         with patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS), \
-             patch("app.get_session_cwd", return_value="/tmp"):
-            resp = await _app.api_upload_file("test-session", FakeLargeFile())
+             patch("app.get_session_cwd", return_value="/tmp"), \
+             patch("app._current_user", return_value={"id": "admin", "role": "admin"}):
+            resp = await _app.api_upload_file(
+                MagicMock(), "test-session", FakeLargeFile()
+            )
 
         assert resp.status_code == 413
         assert "too large" in resp.body.decode().lower()
@@ -1144,6 +2320,7 @@ class TestUploadFileSizeLimit:
         import app
         fresh_name = "fresh-upload-xxxx"
         fresh_sessions = [{"name": fresh_name, "windows": "1", "created": "0", "attached": False}]
+        app._set_session_owner(fresh_name, "admin")
         app.cache.pop(fresh_name, None)  # Ensure no cache entry
         from io import BytesIO
         with patch("app.get_tmux_sessions", return_value=fresh_sessions), \
@@ -1154,7 +2331,7 @@ class TestUploadFileSizeLimit:
                 files={"file": ("msg.txt", BytesIO(b"hi"), "text/plain")},
             )
         assert resp.status_code == 200
-        mock_load.assert_called_once_with(fresh_name)
+        mock_load.assert_called_once_with(fresh_name, "admin")
 
     @patch("app.get_session_cwd", return_value="/tmp/test-cwd")
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
@@ -1502,35 +2679,41 @@ class TestFullSessionsList:
 
 
 class TestAwayModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
+    @patch("app.get_tmux_sessions", return_value=[])
+    def test_rejects_unknown_session(self, mock_sessions, authed_client):
         resp = authed_client.get("/api/sessions/no-such-session/away-mode")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["enabled"] is False
-        assert "phase" in data
-        assert "log" in data
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Session not found"}
 
-    def test_returns_disabled_for_known_session_not_running(self, authed_client):
-        import app
-        app._away_mode_state.pop("test-clean-session", None)
-        resp = authed_client.get("/api/sessions/test-clean-session/away-mode")
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_returns_disabled_for_known_session_not_running(
+        self, mock_sessions, authed_client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "_away_mode_state", {})
+        resp = authed_client.get("/api/sessions/test-session/away-mode")
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
+        assert "phase" in resp.json()
+        assert "log" in resp.json()
 
 
 # ─── Go Nuts Mode Status Endpoint ───
 
 
 class TestGoNutsModeStatus:
-    def test_returns_disabled_for_unknown_session(self, authed_client):
+    @patch("app.get_tmux_sessions", return_value=[])
+    def test_rejects_unknown_session(self, mock_sessions, authed_client):
         resp = authed_client.get("/api/sessions/no-such-session/go-nuts-mode")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Session not found"}
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_status_schema_has_required_fields(self, mock_sessions, authed_client, monkeypatch):
+        monkeypatch.setattr(app_module, "_go_nuts_state", {})
+        resp = authed_client.get("/api/sessions/test-session/go-nuts-mode")
         assert resp.status_code == 200
         data = resp.json()
         assert data["enabled"] is False
-
-    def test_status_schema_has_required_fields(self, authed_client):
-        resp = authed_client.get("/api/sessions/any-session/go-nuts-mode")
-        data = resp.json()
         for field in ("enabled", "phase", "log"):
             assert field in data, f"Missing field: {field}"
 
@@ -1779,6 +2962,17 @@ class TestGoNutsModeToggle:
 
 class TestCreateSession:
     @pytest.fixture(autouse=True)
+    def _verified_model_catalog(self, tmp_path, monkeypatch):
+        """Model settings tests must not depend on the host's saved catalog."""
+        catalog = tmp_path / "verified-models.json"
+        catalog.write_text(json.dumps({
+            "models": app_module._SEED_MODEL_CATALOG,
+            "model_efforts": app_module._SEED_MODEL_EFFORTS,
+            "last_check": 1.0,
+        }))
+        monkeypatch.setattr(app_module, "MODELS_FILE", catalog)
+
+    @pytest.fixture(autouse=True)
     def _codex_cli_is_ready(self):
         with (
             patch(
@@ -1789,6 +2983,29 @@ class TestCreateSession:
                 "app._ensure_codex_auth_with_fallback",
                 return_value={"activeMode": "apikey", "loggedIn": True},
             ),
+            patch("app._set_session_owner"),
+            patch("app._clear_session_owner"),
+            patch("app._mark_tmux_session_managed", return_value=True),
+            patch("app._publish_tmux_session", return_value=True),
+            patch(
+                "app._session_launch_command",
+                side_effect=lambda *_args, **_kwargs: app_module.NEW_SESSION_CMD or "codex",
+            ),
+            patch.object(
+                app_module._session_lifecycle,
+                "register_active",
+                return_value={
+                    "desired_state": "running",
+                    "generation": "a" * 32,
+                    "owner_id": "admin",
+                },
+            ),
+            patch.object(app_module._session_lifecycle, "matches", return_value=True),
+            patch("app._checkpoint_active_session", return_value={}),
+            patch(
+                "app._controller_call",
+                new=AsyncMock(return_value={"ok": True, "mode": "basic"}),
+            ),
         ):
             yield
 
@@ -1796,24 +3013,51 @@ class TestCreateSession:
     @patch("app.subprocess.run")
     def test_create_session_with_valid_name(self, mock_run, mock_sessions, authed_client):
         """POST /api/sessions/create with a valid name should return ok=True."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.side_effect = [[], [{"name": "my-session", "windows": "1", "created": "0", "attached": False}]]
-        resp = authed_client.post("/api/sessions/create", json={"name": "my-session"})
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="$1\tmy-session\n", stderr=""
+        )
+        with (
+            patch("app._exact_tmux_session_id", side_effect=["", "$1", "$1"]),
+            patch("app._send_session_owner_environment", return_value=True),
+        ):
+            resp = authed_client.post("/api/sessions/create", json={"name": "my-session"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
         assert data["name"] == "my-session"
+        create_call = next(
+            call.args[0]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0][0:2] == ["tmux", "new-session"]
+        )
+        assert [";", "set-option", app_module._TMUX_QUARANTINED_OPTION, "1"] == (
+            create_call[create_call.index(";"):create_call.index(";") + 4]
+        )
+        token_index = create_call.index(app_module._TMUX_CREATE_TOKEN_OPTION)
+        assert re.fullmatch(r"[0-9a-f]{32}", create_call[token_index + 1])
 
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run")
     def test_create_session_auto_name(self, mock_run, mock_sessions, authed_client):
         """POST /api/sessions/create with empty name should auto-name the session."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        mock_sessions.return_value = [{"name": "auto-1", "windows": "1", "created": "0", "attached": False}]
-        resp = authed_client.post("/api/sessions/create", json={"name": ""})
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="$2\tauto-1\n", stderr=""
+        )
+        with (
+            patch("app._exact_tmux_session_id", return_value="$2"),
+            patch("app._send_session_owner_environment", return_value=True),
+        ):
+            resp = authed_client.post("/api/sessions/create", json={"name": ""})
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
+        assert data["name"] == "auto-1"
+        create_call = next(
+            call.args[0]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0][0:2] == ["tmux", "new-session"]
+        )
+        assert "-s" not in create_call
 
     @patch("app.get_tmux_sessions", return_value=[])
     def test_create_session_invalid_name_returns_400(self, mock_sessions, authed_client):
@@ -1826,9 +3070,11 @@ class TestCreateSession:
     def test_create_session_duplicate_name_returns_409(self, mock_sessions, authed_client):
         """Creating a session with an already-existing name should return 409."""
         mock_sessions.return_value = [{"name": "existing", "windows": "1", "created": "0", "attached": False}]
-        resp = authed_client.post("/api/sessions/create", json={"name": "existing"})
+        with patch("app._exact_tmux_session_id", return_value="$3"):
+            resp = authed_client.post("/api/sessions/create", json={"name": "existing"})
         assert resp.status_code == 409
         assert "error" in resp.json()
+        assert resp.json()["code"] == "name_conflict"
 
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run")
@@ -1844,8 +3090,14 @@ class TestCreateSession:
     def test_create_session_does_not_put_api_key_in_tmux_command(self, mock_run, authed_client):
         """Codex reads auth.json or the service env; tmux commands never expose the key."""
         sessions_before = [{"name": "keyed-session", "windows": "1", "created": "0", "attached": False}]
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        with patch("app.get_tmux_sessions", side_effect=[[], sessions_before]):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="$4\tkeyed-session\n", stderr=""
+        )
+        with (
+            patch("app.get_tmux_sessions", side_effect=[[], sessions_before]),
+            patch("app._exact_tmux_session_id", side_effect=["", "$4", "$4"]),
+            patch("app._send_session_owner_environment", return_value=True),
+        ):
             resp = authed_client.post("/api/sessions/create", json={"name": "keyed-session"})
         assert resp.status_code == 200
         calls_str = [str(c) for c in mock_run.call_args_list]
@@ -1856,8 +3108,14 @@ class TestCreateSession:
     def test_create_session_sends_new_session_cmd(self, mock_run, authed_client):
         """When NEW_SESSION_CMD is set, session creation should send it to the new pane."""
         sessions_before = [{"name": "cmd-session", "windows": "1", "created": "0", "attached": False}]
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        with patch("app.get_tmux_sessions", side_effect=[[], sessions_before]):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="$5\tcmd-session\n", stderr=""
+        )
+        with (
+            patch("app.get_tmux_sessions", side_effect=[[], sessions_before]),
+            patch("app._exact_tmux_session_id", side_effect=["", "$5", "$5"]),
+            patch("app._send_session_owner_environment", return_value=True),
+        ):
             resp = authed_client.post("/api/sessions/create", json={"name": "cmd-session"})
         assert resp.status_code == 200
         calls_str = [str(c) for c in mock_run.call_args_list]
@@ -1870,6 +3128,108 @@ class TestCreateSession:
         resp = authed_client.post("/api/sessions/create", json={"name": "crash-session"})
         assert resp.status_code == 500
         assert "error" in resp.json()
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_model_catalog_reports_model_specific_efforts(
+        self, mock_sessions, authed_client, tmp_path
+    ):
+        with (
+            patch("app.MODELS_FILE", tmp_path / "models.json"),
+            patch("app._refresh_model_catalog", new=AsyncMock(return_value=False)),
+        ):
+            resp = authed_client.get("/api/models")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model_efforts"]["gpt-6-astra"] == [
+            "low", "medium", "high", "xhigh", "max", "ultra",
+        ]
+        assert "none" not in data["model_efforts"]["gpt-6-astra"]
+
+        html = authed_client.get("/").text
+        assert "function catalogModelId(model)" in html
+        assert "MODEL_EFFORTS[effortModel]" in html
+        assert "sessions[si].effort=st.effort" in html
+        assert "Model saved, but restart failed" in html
+        assert "Effort saved, but restart failed" in html
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_model_change_rejects_unavailable_model(
+        self, mock_sessions, authed_client
+    ):
+        resp = authed_client.post(
+            "/api/sessions/test-session/model",
+            json={"model": "gpt-99-fake", "restart": False},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "Model is not available for this account."
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_model_change_rejects_unverified_seed_fallback(
+        self, mock_sessions, authed_client, tmp_path
+    ):
+        with patch("app.MODELS_FILE", tmp_path / "missing-models.json"):
+            resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-6-astra", "restart": False},
+            )
+
+        assert resp.status_code == 503
+        assert "catalog is unavailable" in resp.json()["error"]
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_astra_rejects_unsupported_none_effort(
+        self, mock_sessions, authed_client, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            'model = "gpt-6-astra"\nmodel_reasoning_effort = "max"\n'
+        )
+
+        with patch(
+            "app._verified_session_codex_config_path", return_value=config
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/effort",
+                json={"effort": "none", "restart": False},
+            )
+
+        assert resp.status_code == 400
+        assert "gpt-6-astra does not support none" in resp.json()["error"]
+        assert app_module.tomllib.loads(config.read_text())["model_reasoning_effort"] == "max"
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_model_change_atomically_downgrades_unsupported_effort(
+        self, mock_sessions, authed_client, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            'model = "gpt-6-astra"\nmodel_reasoning_effort = "max"\n'
+        )
+
+        with (
+            patch("app._verified_session_codex_config_path", return_value=config),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch(
+                "app._send_session_owner_environment_serialized",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-5.5", "restart": False},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["effort"] == "xhigh"
+        parsed = app_module.tomllib.loads(config.read_text())
+        assert parsed["model"] == "gpt-5.5"
+        assert parsed["model_reasoning_effort"] == "xhigh"
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     def test_model_change_preserves_the_accounts_agents_md(
@@ -1890,6 +3250,10 @@ class TestCreateSession:
 
         with (
             patch("app._session_config_base", return_value=codex_home),
+            patch(
+                "app._verified_session_codex_config_path",
+                return_value=codex_home / "config.toml",
+            ),
             patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
             patch("app._send_session_owner_environment", return_value=True),
         ):
@@ -1902,6 +3266,717 @@ class TestCreateSession:
         assert agents_path.read_bytes() == original
         # and the model really did land in that home's config
         assert 'model = "gpt-5.6-sol"' in (codex_home / "config.toml").read_text()
+
+    def test_model_and_effort_changes_reject_a_cross_owner_session(self, authed_client):
+        with (
+            patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS),
+            patch("app._session_owner_id", return_value="another-user"),
+        ):
+            model_resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-5.6-sol", "restart": False},
+            )
+            effort_resp = authed_client.post(
+                "/api/sessions/test-session/effort",
+                json={"effort": "high", "restart": False},
+            )
+
+        assert model_resp.status_code == 404
+        assert effort_resp.status_code == 404
+
+    def test_model_change_rejects_symlinked_config_without_touching_target(
+        self, authed_client, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        target = tmp_path / "outside.toml"
+        target.write_text('model = "do-not-change"\n')
+        (codex_home / "config.toml").symlink_to(target)
+
+        with (
+            patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS),
+            patch("app.CODEX_HOME", codex_home),
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-5.6-sol", "restart": False},
+            )
+
+        assert resp.status_code == 409
+        assert target.read_text() == 'model = "do-not-change"\n'
+        assert (codex_home / "config.toml").is_symlink()
+
+    def test_model_and_effort_writes_are_serialized_without_losing_fields(
+        self, tmp_path
+    ):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import app
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text('approval_policy = "never"\n')
+        original_merge = app._merge_top_level_toml_keys
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+
+        def slow_merge(existing, managed):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return original_merge(existing, managed)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        with (
+            patch("app._session_config_base", return_value=codex_home),
+            patch("app._merge_top_level_toml_keys", side_effect=slow_merge),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = (
+                pool.submit(
+                    app._write_session_codex_settings,
+                    "test-session",
+                    {"model": "gpt-5.6-sol"},
+                ),
+                pool.submit(
+                    app._write_session_codex_settings,
+                    "test-session",
+                    {"model_reasoning_effort": "high"},
+                ),
+            )
+            for future in futures:
+                future.result(timeout=2)
+
+        parsed = app.tomllib.loads(config.read_text())
+        assert parsed["model"] == "gpt-5.6-sol"
+        assert parsed["model_reasoning_effort"] == "high"
+        assert max_active == 1
+        assert not list(codex_home.glob("*.lock"))
+
+    def test_concurrent_model_and_effort_changes_leave_a_supported_pair(
+        self, tmp_path
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            'model = "gpt-6-astra"\nmodel_reasoning_effort = "max"\n'
+        )
+        efforts = {
+            "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "gpt-5.5": ["low", "medium", "high", "xhigh"],
+        }
+
+        with (
+            patch("app._verified_session_codex_config_path", return_value=config),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [
+                pool.submit(
+                    app_module._write_validated_session_codex_settings,
+                    "test-session",
+                    model_efforts=efforts,
+                    requested_model="gpt-5.5",
+                ),
+                pool.submit(
+                    app_module._write_validated_session_codex_settings,
+                    "test-session",
+                    model_efforts=efforts,
+                    requested_effort="ultra",
+                ),
+            ]
+            for future in futures:
+                try:
+                    future.result(timeout=2)
+                except app_module._UnsupportedModelEffortError:
+                    pass
+
+        parsed = app_module.tomllib.loads(config.read_text())
+        assert parsed["model"] == "gpt-5.5"
+        assert parsed["model_reasoning_effort"] == "xhigh"
+
+    def test_model_change_fails_closed_without_reasoning_metadata(self, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            'model = "gpt-6-astra"\nmodel_reasoning_effort = "max"\n'
+        )
+
+        with patch("app._verified_session_codex_config_path", return_value=config):
+            with pytest.raises(app_module._UnsupportedModelEffortError):
+                app_module._write_validated_session_codex_settings(
+                    "test-session",
+                    model_efforts={},
+                    requested_model="gpt-5.5",
+                )
+
+        assert app_module.tomllib.loads(config.read_text())["model"] == "gpt-6-astra"
+
+    def test_pending_model_is_derived_from_config_without_rollout_context(
+        self, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            'model = "gpt-6-astra"\nmodel_reasoning_effort = "ultra"\n'
+        )
+
+        with (
+            patch("app._session_config_base", return_value=codex_home),
+            patch("app._get_session_model", return_value=""),
+        ):
+            fields = app_module._session_model_fields("test-session")
+
+        assert fields == {
+            "model": "gpt-6-astra",
+            "model_pending": "gpt-6-astra",
+            "effort": "ultra",
+        }
+
+    def test_config_replace_fails_closed_across_filesystems(self, tmp_path):
+        import errno
+
+        config = tmp_path / "config.toml"
+        config.write_text('model = "gpt-5.6-luna"\n')
+        staging = tmp_path / "protected-staging"
+        staging.mkdir(mode=0o700)
+
+        with (
+            patch("app._protected_codex_config_io_dir", return_value=staging),
+            patch("app.os.replace", side_effect=OSError(errno.EXDEV, "cross-device")),
+            pytest.raises(app_module._UnsafeCodexConfigError, match="different filesystem"),
+        ):
+            app_module._atomic_write_codex_config(
+                config, 'model = "gpt-5.6-sol"\n', 0o600
+            )
+
+        assert config.read_text() == 'model = "gpt-5.6-luna"\n'
+        assert list(staging.iterdir()) == []
+
+    def test_atomic_config_replace_inherits_destination_parent_group(self, tmp_path):
+        import stat
+
+        alternate_groups = [gid for gid in os.getgroups() if gid != os.getegid()]
+        if not alternate_groups:
+            pytest.skip("requires a supplementary group distinct from the effective gid")
+
+        codex_home = tmp_path / "member-codex-home"
+        codex_home.mkdir()
+        try:
+            os.chown(codex_home, -1, alternate_groups[0])
+        except PermissionError:
+            pytest.skip("cannot assign a supplementary group to the test directory")
+        config = codex_home / "config.toml"
+        staging = tmp_path / "protected-staging"
+        staging.mkdir(mode=0o700)
+        assert staging.stat().st_gid != codex_home.stat().st_gid
+
+        with patch("app._protected_codex_config_io_dir", return_value=staging):
+            app_module._atomic_write_codex_config(
+                config, 'model = "gpt-5.6-sol"\n', 0o660
+            )
+
+        assert config.stat().st_gid == codex_home.stat().st_gid
+        assert stat.S_IMODE(config.stat().st_mode) == 0o660
+
+    def test_symlink_swap_after_a_write_cannot_modify_its_target(
+        self, authed_client, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text('model = "gpt-5.6-luna"\n')
+        target = tmp_path / "outside.toml"
+        target.write_text('model_reasoning_effort = "do-not-change"\n')
+
+        with patch("app._session_config_base", return_value=codex_home):
+            app_module._write_session_codex_settings(
+                "test-session", {"model": "gpt-5.6-sol"}
+            )
+            config.unlink()
+            config.symlink_to(target)
+            with patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS), \
+                 patch("app.CODEX_HOME", codex_home):
+                resp = authed_client.post(
+                    "/api/sessions/test-session/effort",
+                    json={"effort": "high", "restart": False},
+                )
+
+        assert resp.status_code == 409
+        assert target.read_text() == 'model_reasoning_effort = "do-not-change"\n'
+        assert config.is_symlink()
+
+    def test_member_config_rebuild_preserves_selected_model_and_effort(
+        self, tmp_path
+    ):
+        member = {
+            "id": "u_member",
+            "username": "member",
+            "role": "user",
+            "group": "",
+        }
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model = "gpt-5.6-luna"\n'
+            'model_reasoning_effort = "high"\n'
+            'approval_policy = "on-request"\n'
+        )
+
+        with (
+            patch("app.PROJECTS_ROOT", tmp_path / "projects"),
+            patch("app._load_session_owners", return_value={}),
+            patch("app._account_advisor_token_path", return_value=tmp_path / "missing"),
+        ):
+            assert app_module._configure_member_codex_isolation(tmp_path, member)
+
+        parsed = app_module.tomllib.loads(config.read_text())
+        assert parsed["model"] == "gpt-5.6-luna"
+        assert parsed["model_reasoning_effort"] == "high"
+
+    def test_owner_environment_aborts_on_symlinked_member_config(
+        self, tmp_path
+    ):
+        member = {
+            "id": "u_member",
+            "username": "member",
+            "role": "user",
+            "group": "",
+        }
+        codex_home = tmp_path / ".codex-user-u_member"
+        codex_home.mkdir()
+        target = tmp_path / "outside.toml"
+        target.write_text('model = "do-not-change"\n')
+        (codex_home / "config.toml").symlink_to(target)
+        run = MagicMock()
+
+        with (
+            patch("app._user_for_session", return_value=member),
+            patch("app._user_codex_config_dir", return_value=codex_home),
+            patch("app.subprocess.run", run),
+        ):
+            assert app_module._send_session_owner_environment("test-session") is False
+
+        assert target.read_text() == 'model = "do-not-change"\n'
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("unsafe_kind", ["symlink", "oversized"])
+    def test_saved_model_effort_rejects_unsafe_config(
+        self, tmp_path, unsafe_kind
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        if unsafe_kind == "symlink":
+            target = tmp_path / "outside.toml"
+            target.write_text('model = "gpt-5.6-luna"\n')
+            config.symlink_to(target)
+        else:
+            config.write_bytes(b"#" * (app_module._CODEX_CONFIG_MAX_BYTES + 1))
+
+        with (
+            patch("app._session_config_base", return_value=codex_home),
+            pytest.raises(app_module._UnsafeCodexConfigError),
+        ):
+            app_module._saved_session_model_effort("test-session")
+
+    def test_model_change_aborts_if_owner_changes_after_authorization(
+        self, authed_client, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        original = 'model = "gpt-5.6-luna"\n'
+        config.write_text(original)
+
+        with (
+            patch("app._find_session_for_user", return_value=(MOCK_SESSIONS, MOCK_SESSIONS[0])),
+            patch("app._session_config_base", return_value=codex_home),
+            patch("app._session_owner_id", side_effect=["admin", "another-user"]),
+            patch("app._async_is_codex_running", new=AsyncMock()) as running,
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/model",
+                json={"model": "gpt-5.6-sol", "restart": True},
+            )
+
+        assert resp.status_code == 409
+        assert config.read_text() == original
+        running.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restart_refuses_to_mutate_session_after_owner_changes(self):
+        import app
+
+        run = MagicMock()
+        with (
+            patch("app._strict_session_owner", return_value=None),
+            patch("app.subprocess.run", run),
+        ):
+            result = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert result == (False, False)
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restart_pins_saved_model_and_effort_over_resumed_thread(
+        self, tmp_path
+    ):
+        import app
+
+        events = []
+
+        def record_run(args, **_kwargs):
+            events.append(("run", tuple(args)))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        async def record_sleep(duration):
+            events.append(("sleep", duration))
+
+        run = MagicMock(side_effect=record_run)
+        thread_id = "01a035f8-3188-7c21-8cca-582b01ad3002"
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "resume_uuid": thread_id,
+            "cwd": str(tmp_path),
+        }
+        ensure = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch.object(app._session_lifecycle, "matches", return_value=True),
+            patch("app._active_session_root_thread_id", return_value=thread_id),
+            patch("app._validated_session_root_thread_id", return_value=thread_id),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app._tmux_session_matches_owner", return_value=True),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch("app._ensure_codex_running", ensure),
+            patch("app.subprocess.run", run),
+            patch("app.asyncio.sleep", side_effect=record_sleep),
+        ):
+            exported, restarted = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert (exported, restarted) == (True, True)
+        ensure.assert_awaited_once_with(
+            "test-session",
+            resume_uuid=thread_id,
+            resume_cwd=str(tmp_path),
+            expected_owner_id="admin",
+            expected_generation=generation,
+            expected_desired_states={"running"},
+            allow_fresh=False,
+            operation_locked=True,
+            tmux_locked=True,
+            autopush_guard=False,
+            expected_binding=None,
+        )
+        quit_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "run" and event[1][-2:] == ("-l", "/quit")
+        )
+        enter_index = next(
+            index
+            for index, event in enumerate(events[quit_index + 1 :], quit_index + 1)
+            if event[0] == "run" and event[1][-1] == "Enter"
+        )
+        assert ("sleep", 1.0) in events[quit_index + 1 : enter_index]
+
+    @pytest.mark.asyncio
+    async def test_restart_relaunches_provably_unused_session_fresh(self, tmp_path):
+        import app
+
+        run = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "cwd": str(tmp_path),
+            "had_conversation_input": False,
+        }
+        ensure = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch.object(app._session_lifecycle, "matches", return_value=True),
+            patch("app._active_session_root_thread_id", return_value=None),
+            patch("app._session_close_can_skip_archive", return_value=True),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app._tmux_session_matches_owner", return_value=True),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch("app._ensure_codex_running", ensure),
+            patch("app.subprocess.run", run),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            exported, restarted = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert (exported, restarted) == (True, True)
+        ensure.assert_awaited_once_with(
+            "test-session",
+            resume_uuid="",
+            resume_cwd=str(tmp_path),
+            expected_owner_id="admin",
+            expected_generation=generation,
+            expected_desired_states={"running"},
+            allow_fresh=True,
+            operation_locked=True,
+            tmux_locked=True,
+            autopush_guard=False,
+            expected_binding=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_restart_refuses_fresh_launch_when_input_may_exist(self, tmp_path):
+        import app
+
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "cwd": str(tmp_path),
+            "had_conversation_input": True,
+        }
+        ensure = AsyncMock()
+        run = MagicMock()
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch("app._active_session_root_thread_id", return_value=None),
+            patch("app._session_close_can_skip_archive", return_value=False),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._ensure_codex_running", ensure),
+            patch("app.subprocess.run", run),
+        ):
+            result = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert result == (False, False)
+        ensure.assert_not_awaited()
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restart_relaunches_unused_session_when_bootstrap_root_appears(
+        self, tmp_path
+    ):
+        import app
+
+        active_root = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "cwd": str(tmp_path),
+            "had_conversation_input": False,
+        }
+        ensure = AsyncMock(return_value=True)
+        run = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="", stderr="")
+        )
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch.object(app._session_lifecycle, "matches", return_value=True),
+            patch("app._active_session_root_thread_id", return_value=active_root),
+            patch("app._session_generation_is_unused", return_value=True),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app._tmux_session_matches_owner", return_value=True),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch("app._ensure_codex_running", ensure),
+            patch("app.subprocess.run", run),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert result == (True, True)
+        ensure.assert_awaited_once_with(
+            "test-session",
+            resume_uuid="",
+            resume_cwd=str(tmp_path),
+            expected_owner_id="admin",
+            expected_generation=generation,
+            expected_desired_states={"running"},
+            allow_fresh=True,
+            operation_locked=True,
+            tmux_locked=True,
+            autopush_guard=False,
+            expected_binding=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_restart_clears_unused_recorded_bootstrap_root(self, tmp_path):
+        import app
+
+        bootstrap_root = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "resume_uuid": bootstrap_root,
+            "cwd": str(tmp_path),
+            "had_conversation_input": False,
+        }
+        cleared_row = {key: value for key, value in row.items() if key != "resume_uuid"}
+        ensure = AsyncMock(return_value=True)
+        clear_root = MagicMock(return_value=cleared_row)
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch.object(app._session_lifecycle, "matches", return_value=True),
+            patch.object(app._session_lifecycle, "clear_resume_uuid", clear_root),
+            patch("app._active_session_root_thread_id", return_value=None),
+            patch(
+                "app._validated_session_root_thread_id",
+                return_value=bootstrap_root,
+            ),
+            patch("app._session_generation_is_unused", return_value=True),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app._tmux_session_matches_owner", return_value=True),
+            patch("app._async_is_codex_running", new=AsyncMock(return_value=False)),
+            patch("app._ensure_codex_running", ensure),
+            patch(
+                "app.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert result == (True, True)
+        clear_root.assert_called_once_with(
+            "test-session",
+            owner_id="admin",
+            expected_generation=generation,
+        )
+        ensure.assert_awaited_once_with(
+            "test-session",
+            resume_uuid="",
+            resume_cwd=str(tmp_path),
+            expected_owner_id="admin",
+            expected_generation=generation,
+            expected_desired_states={"running"},
+            allow_fresh=True,
+            operation_locked=True,
+            tmux_locked=True,
+            autopush_guard=False,
+            expected_binding=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_restart_refuses_stale_recorded_root(self, tmp_path):
+        import app
+
+        recorded_root = "01a035f8-3188-7c21-8cca-582b01ad3002"
+        active_root = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "resume_uuid": recorded_root,
+            "cwd": str(tmp_path),
+            "had_conversation_input": True,
+        }
+        ensure = AsyncMock()
+        run = MagicMock()
+
+        with (
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch("app._checkpoint_active_session", return_value=row),
+            patch.object(app._session_lifecycle, "get", return_value=row),
+            patch("app._active_session_root_thread_id", return_value=active_root),
+            patch(
+                "app._validated_session_root_thread_id",
+                return_value=recorded_root,
+            ),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app.get_session_cwd", return_value=str(tmp_path)),
+            patch("app._ensure_codex_running", ensure),
+            patch("app.subprocess.run", run),
+        ):
+            result = await app._restart_codex_for_session(
+                "test-session", expected_owner_id="admin"
+            )
+
+        assert result == (False, False)
+        ensure.assert_not_awaited()
+        run.assert_not_called()
 
 
 # ─── Delete Session Tests ───
@@ -1917,80 +3992,1781 @@ class TestDeleteSession:
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
     def test_delete_session_success(self, mock_run, mock_sessions, authed_client):
-        """Successful session deletion should return ok=True and session name."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        resp = authed_client.delete("/api/sessions/test-session")
-        assert resp.status_code == 200
+        """Interactive deletion starts a non-blocking knowledge-preserving job."""
+        with patch(
+            "app._controller_call",
+            new=AsyncMock(return_value={
+                "ok": True,
+                "accepted": True,
+                "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+                "_status": 202,
+            }),
+        ):
+            resp = authed_client.delete("/api/sessions/test-session")
+        assert resp.status_code == 202
         data = resp.json()
         assert data["ok"] is True
-        assert data["killed"] == "test-session"
+        assert data["job"]["status"] == "queued"
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
     def test_delete_session_kill_failure_returns_500(self, mock_run, mock_sessions, authed_client):
         """If tmux kill-session fails, return 500."""
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="can't kill session")
-        resp = authed_client.delete("/api/sessions/test-session")
+        with patch(
+            "app._controller_call",
+            new=AsyncMock(return_value={"error": "can't kill session", "_status": 500}),
+        ):
+            resp = authed_client.delete("/api/sessions/test-session")
         assert resp.status_code == 500
         assert "error" in resp.json()
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
     def test_delete_session_with_pane_pids(self, mock_run, mock_sessions, authed_client):
-        """Delete should TERM then KILL child processes when pane PIDs are found."""
-        # Calls: list-panes (returns 1 PID), pkill -TERM, pkill -KILL, kill-session
-        pids_result = MagicMock(returncode=0, stdout="99999\n", stderr="")
-        ok_result = MagicMock(returncode=0, stdout="", stderr="")
-        mock_run.side_effect = [pids_result, ok_result, ok_result, ok_result]
-        resp = authed_client.delete("/api/sessions/test-session")
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
-        # Verify pkill was called
-        calls_str = [str(c) for c in mock_run.call_args_list]
-        assert any("pkill" in c for c in calls_str)
-
-    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
-    @patch("app.subprocess.run")
-    def test_delete_session_cancels_active_go_nuts_task(self, mock_run, mock_sessions, authed_client):
-        """Delete should cancel any active go-nuts task for the session."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        import app
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        app._go_nuts_state["test-session"] = {"enabled": True, "task": mock_task}
-        try:
+        """The HTTP worker delegates process cleanup to the controller."""
+        call = AsyncMock(return_value={
+            "ok": True,
+            "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+            "_status": 202,
+        })
+        with patch("app._controller_call", new=call):
             resp = authed_client.delete("/api/sessions/test-session")
-            assert resp.status_code == 200
-            mock_task.cancel.assert_called_once()
+        assert resp.status_code == 202
+        assert resp.json()["ok"] is True
+        call.assert_awaited_once_with(
+            "session_close_start", session="test-session", owner_id="admin"
+        )
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_pauses_active_go_nuts_task(self, monkeypatch):
+        """Accepted close stops background prompts before transcript capture."""
+        gate = asyncio.Event()
+
+        async def worker():
+            await gate.wait()
+
+        task = asyncio.create_task(worker())
+        app_module._go_nuts_state["test-session"] = {
+            "enabled": True,
+            "task": task,
+        }
+        save = MagicMock()
+        monkeypatch.setattr(app_module, "_save_autonomous_state", save)
+        try:
+            await app_module._pause_autonomous_work_for_close("test-session")
+            assert task.cancelled()
+            assert app_module._go_nuts_state["test-session"]["enabled"] is False
+            save.assert_called_once()
         finally:
-            app._go_nuts_state.pop("test-session", None)
+            app_module._go_nuts_state.pop("test-session", None)
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run", side_effect=Exception("tmux daemon gone"))
     def test_delete_session_outer_exception_returns_500(self, mock_run, mock_sessions, authed_client):
         """An unexpected outer exception should return 500."""
-        resp = authed_client.delete("/api/sessions/test-session")
+        with patch(
+            "app._controller_call",
+            new=AsyncMock(return_value={"error": "tmux daemon gone", "_status": 500}),
+        ):
+            resp = authed_client.delete("/api/sessions/test-session")
         assert resp.status_code == 500
         assert "error" in resp.json()
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
     def test_delete_session_pkill_exception_still_succeeds(self, mock_run, mock_sessions, authed_client):
-        """pkill failures should be swallowed and kill-session should still run."""
-        pids_result = MagicMock(returncode=0, stdout="99999\n", stderr="")
-        kill_ok = MagicMock(returncode=0, stdout="", stderr="")
-
-        def run_side_effect(cmd, **kw):
-            if "pkill" in cmd:
-                raise OSError("no permission")
-            if "list-panes" in cmd:
-                return pids_result
-            return kill_ok
-
-        mock_run.side_effect = run_side_effect
-        resp = authed_client.delete("/api/sessions/test-session")
-        assert resp.status_code == 200
+        """Controller-reported successful cleanup is returned unchanged."""
+        with patch(
+            "app._controller_call",
+            new=AsyncMock(return_value={
+                "ok": True,
+                "job": {"id": "close_abcdefghijklmnop", "status": "queued"},
+                "_status": 202,
+            }),
+        ):
+            resp = authed_client.delete("/api/sessions/test-session")
+        assert resp.status_code == 202
         assert resp.json()["ok"] is True
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    def test_owner_polls_close_job(self, mock_sessions, authed_client):
+        call = AsyncMock(return_value={
+            "ok": True,
+            "job": {
+                "id": "close_abcdefghijklmnop",
+                "session": "test-session",
+                "status": "completed",
+                "phase": "complete",
+                "spec_file": "TECHNICAL_SPEC.md",
+            },
+            "_status": 200,
+        })
+        with patch("app._controller_call", new=call):
+            resp = authed_client.get(
+                "/api/sessions/test-session/close/close_abcdefghijklmnop"
+            )
+        assert resp.status_code == 200
+        assert resp.json()["job"]["spec_file"] == "TECHNICAL_SPEC.md"
+        call.assert_awaited_once_with(
+            "session_close_status",
+            session="test-session",
+            owner_id="admin",
+            job_id="close_abcdefghijklmnop",
+        )
+
+    def test_member_can_poll_completed_close_after_owner_cleanup(self, authed_client):
+        member = {"id": "u_member", "username": "member", "role": "user"}
+        call = AsyncMock(return_value={
+            "ok": True,
+            "job": {
+                "id": "close_abcdefghijklmnop",
+                "session": "gone-session",
+                "status": "completed",
+                "tab_state": "closed",
+            },
+            "_status": 200,
+        })
+        with (
+            patch("app._current_user", return_value=member),
+            patch("app._user_can_access_session", return_value=False),
+            patch("app._controller_call", new=call),
+        ):
+            resp = authed_client.get(
+                "/api/sessions/gone-session/close/close_abcdefghijklmnop"
+            )
+        assert resp.status_code == 200
+        call.assert_awaited_once_with(
+            "session_close_status",
+            session="gone-session",
+            owner_id="u_member",
+            job_id="close_abcdefghijklmnop",
+        )
+
+
+class TestKnowledgePreservingClose:
+    def _binding(self, project_root: Path):
+        return {
+            "owner": {"id": "admin", "username": "admin", "role": "admin"},
+            "owner_id": "admin",
+            "session_name": "test-session",
+            "generation": "a" * 32,
+            "resume_uuid": "01a035f8-3188-7c21-8cca-582b01ad3002",
+            "project_root": project_root,
+            "tmux_state": "present",
+            "session_id": "$1",
+            "tab_label": "Close Knowledge",
+        }
+
+    def _patch_close_binding_state(
+        self,
+        monkeypatch,
+        project_root: Path,
+        *,
+        recorded_root: str = "",
+        validated_recorded_root: str = "",
+        active_root: str | None = None,
+        last_source: str = "",
+        had_conversation_input: bool | None = None,
+    ):
+        owner = self._binding(project_root)["owner"]
+        lifecycle = {
+            "managed": True,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "generation": "a" * 32,
+            "resume_uuid": recorded_root,
+            "last_source": last_source,
+        }
+        if had_conversation_input is not None:
+            lifecycle["had_conversation_input"] = had_conversation_input
+        monkeypatch.setattr(
+            app_module,
+            "_strict_session_owner",
+            lambda *_args: ("admin", owner),
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "get",
+            lambda _name: lifecycle,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_durable_session_cwd",
+            lambda *_args: str(project_root),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_validated_session_root_thread_id",
+            lambda _name, value, _owner="": (
+                validated_recorded_root
+                if value == validated_recorded_root and validated_recorded_root
+                else None
+            ),
+        )
+        active = MagicMock(return_value=active_root)
+        monkeypatch.setattr(app_module, "_active_session_root_thread_id", active)
+        monkeypatch.setattr(
+            app_module,
+            "_exact_tmux_session_state",
+            lambda _name: ("present", "$1"),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_tmux_session_matches_owner",
+            lambda *_args: True,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "get_session_cwd",
+            lambda _name: str(project_root),
+        )
+        return active
+
+    def test_close_archive_precedes_idempotent_spec_write(self, tmp_path, monkeypatch):
+        state_root = tmp_path / "state"
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "TECHNICAL_SPEC.md").write_text(
+            "# Existing spec\n\nHuman-maintained architecture.\n"
+        )
+        monkeypatch.setattr(app_module, "MESSAGES_DIR", state_root)
+        binding = self._binding(project)
+        context = {
+            "messages": [{"role": "assistant", "text": "Implemented close."}],
+            "source_hash": "b" * 64,
+            "source_bytes": 123,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        original_write = app_module._atomic_write_spec_at
+        observed = []
+
+        def verify_archive_first(parent_fd, name, content, mode=0o644):
+            archive = state_root / "session-closures" / "test-session" / (
+                "a" * 32 + "-" + "b" * 16 + ".json"
+            )
+            assert archive.is_file()
+            observed.append(name)
+            return original_write(parent_fd, name, content, mode)
+
+        monkeypatch.setattr(app_module, "_atomic_write_spec_at", verify_archive_first)
+        app_module._persist_session_close_knowledge(
+            binding, context, "**Outcome**\n\nImplemented safe close."
+        )
+        app_module._persist_session_close_knowledge(
+            binding, context, "**Outcome**\n\nImplemented safe close."
+        )
+
+        spec = (project / "TECHNICAL_SPEC.md").read_text()
+        assert "Human-maintained architecture." in spec
+        assert spec.count("tmux-dashboard-session-close:") == 2
+        assert len(observed) == 2
+
+    def test_lisa_workspace_writes_canonical_repo_spec(self, tmp_path, monkeypatch):
+        state_root = tmp_path / "state"
+        project = tmp_path / "project"
+        canonical = project / "repo" / "lisa-app" / "docs" / "TECHNICAL_SPEC.md"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("# Canonical Lisa spec\n")
+        (project / "TECHNICAL_SPEC.md").write_text("# Workspace pointer\n")
+        monkeypatch.setattr(app_module, "MESSAGES_DIR", state_root)
+        binding = self._binding(project)
+
+        result = app_module._persist_session_close_knowledge(
+            binding,
+            {
+                "messages": [{"role": "assistant", "text": "Implemented safe close."}],
+                "source_hash": "c" * 64,
+                "source_bytes": 100,
+                "root_thread_id": binding["resume_uuid"],
+            },
+            "**Outcome**\n\nImplemented safe close.",
+        )
+
+        assert Path(result["spec_path"]) == canonical
+        assert "Implemented safe close." in canonical.read_text()
+        assert (project / "TECHNICAL_SPEC.md").read_text() == "# Workspace pointer\n"
+
+    def test_canonical_lisa_spec_symlink_parent_fails_closed(self, tmp_path):
+        project = tmp_path / "project"
+        victim = tmp_path / "victim"
+        (project / "repo" / "lisa-app").mkdir(parents=True)
+        victim.mkdir()
+        (project / "repo" / "lisa-app" / "docs").symlink_to(
+            victim, target_is_directory=True
+        )
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._technical_spec_path(project)
+        assert not list(victim.iterdir())
+
+    def test_existing_archive_tracks_canonical_spec_migration(self, tmp_path, monkeypatch):
+        state_root = tmp_path / "state"
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.setattr(app_module, "MESSAGES_DIR", state_root)
+        binding = self._binding(project)
+        context = {
+            "messages": [{"role": "assistant", "text": "Implemented safe close."}],
+            "source_hash": "d" * 64,
+            "source_bytes": 100,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        first = app_module._persist_session_close_knowledge(
+            binding, context, "**Outcome**\n\nOld handoff."
+        )
+        canonical = project / "repo" / "lisa-app" / "docs" / "TECHNICAL_SPEC.md"
+        canonical.parent.mkdir(parents=True)
+        second = app_module._persist_session_close_knowledge(
+            binding, context, "**Outcome**\n\nImproved technical handoff."
+        )
+
+        archived = json.loads(Path(second["archive_path"]).read_text())
+        assert Path(second["spec_path"]) == canonical
+        assert archived["technical_spec"] == str(canonical)
+        assert archived["summary"] == "**Outcome**\n\nImproved technical handoff."
+        assert archived["summary_history"][-1]["technical_spec"] == first["spec_path"]
+        assert "Improved technical handoff." in canonical.read_text()
+
+    def test_close_summary_redacts_secrets_and_private_paths(self, tmp_path):
+        text = (
+            "API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n"
+            "password: swordfish\n"
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n"
+            "github_pat_abcdefghijklmnopqrstuvwxyz123456\n"
+            "AKIAABCDEFGHIJKLMNOP\n"
+            "postgres://alice:hunter2@db.example/app\n"
+            "DATABASE_PASSWORD=swordfish2\n"
+            "TWILIO_AUTH_TOKEN=0123456789abcdef0123456789abcdef\n"
+            "Contact monica@example.com or +1 415-555-1212\n"
+            "/root/.ssh/id_ed25519\n"
+            f"Changed {tmp_path}/private/module.py"
+        )
+        clean = app_module._sanitize_session_spec_text(text, tmp_path)
+        assert "sk-abcdefghijklmnopqrstuvwxyz" not in clean
+        assert "swordfish" not in clean
+        assert "github_pat_" not in clean
+        assert "AKIAABCDEFGHIJKLMNOP" not in clean
+        assert "hunter2" not in clean
+        assert "swordfish2" not in clean
+        assert "0123456789abcdef0123456789abcdef" not in clean
+        assert "monica@example.com" not in clean
+        assert "415-555-1212" not in clean
+        assert "/root/" not in clean
+        assert "private/module.py" in clean
+        assert "[REDACTED]" in clean
+
+    def test_close_summary_removes_owner_name_and_optional_surname(self, tmp_path):
+        clean = app_module._sanitize_session_spec_text(
+            (
+                "Michiel Rauws requested a change. Michiel's account was checked. "
+                "Branch `Michiel/task-hold-ui` was validated."
+            ),
+            tmp_path,
+            private_terms=["Michiel"],
+        )
+        assert "Michiel" not in clean
+        assert "Rauws" not in clean
+        assert clean.count("the user") == 2
+        assert "`task-hold-ui`" in clean
+
+    def test_close_summary_drops_residual_case_narrative(self):
+        cleaned = app_module._remove_session_case_narrative(
+            "\n".join((
+                "## Outcome",
+                "- User account recovery was successfully completed.",
+                "- Task #691 was confirmed delivered.",
+                "- The maintenance request was paused.",
+                "- The booking authorization gate requires verified approval.",
+                "## Open Work",
+                "- Implement this in a dashboard-authorized session.",
+            ))
+        )
+        assert "account recovery" not in cleaned
+        assert "Task #691" not in cleaned
+        assert "maintenance request" not in cleaned
+        assert "dashboard-authorized" not in cleaned
+        assert "booking authorization gate" in cleaned
+
+    @pytest.mark.asyncio
+    async def test_final_handoff_edit_excludes_personal_case_narrative(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        async def llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return (
+                    "## Outcome\nMichiel Rauws cancelled an appointment with a vendor. "
+                    "The authorization gate was implemented."
+                )
+            return "## Outcome\nThe authorization gate was implemented and validated."
+
+        monkeypatch.setattr(app_module, "client", object())
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        result = await app_module._summarize_session_close(
+            {
+                "messages": [{
+                    "role": "assistant",
+                    "text": "Michiel Rauws cancelled an appointment after implementing the gate.",
+                }],
+                "private_terms": ["Michiel"],
+            },
+            tmp_path,
+        )
+
+        assert len(calls) == 3
+        assert "personal names" in calls[-2]["system_prompt"]
+        assert "appointments" in calls[-2]["system_prompt"]
+        assert "final privacy" in calls[-1]["system_prompt"]
+        assert "Michiel" not in result
+        assert "appointment" not in result
+        assert "authorization gate" in result
+
+    @pytest.mark.asyncio
+    async def test_no_llm_fails_closed_without_deleting_knowledge(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, "client", None)
+        llm = AsyncMock()
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        context = {
+            "messages": [
+                {"role": "user", "text": "Build safe close"},
+                {"role": "assistant", "text": "Implemented the archive and spec update."},
+            ]
+        }
+        with pytest.raises(app_module._SessionCloseError):
+            await app_module._summarize_session_close(context, tmp_path)
+        llm.assert_not_awaited()
+
+    def test_spec_symlink_is_rejected(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        victim = tmp_path / "victim.md"
+        victim.write_text("do not touch")
+        (project / "TECHNICAL_SPEC.md").symlink_to(victim)
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._technical_spec_path(project)
+        assert victim.read_text() == "do not touch"
+
+    def test_spec_hardlink_is_rejected(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        victim = tmp_path / "victim.md"
+        victim.write_text("do not disclose")
+        os.link(victim, project / "TECHNICAL_SPEC.md")
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._technical_spec_path(project)
+        assert victim.read_text() == "do not disclose"
+
+    def test_archive_generation_path_traversal_is_rejected(self, tmp_path):
+        binding = {**self._binding(tmp_path), "generation": "../../escape"}
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._persist_session_close_knowledge(
+                binding,
+                {"source_hash": "a" * 64, "messages": []},
+                "**Outcome**\n\nSafe summary",
+            )
+        assert not (tmp_path.parent / "escape.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_summary_includes_early_messages_not_only_tail(self, tmp_path, monkeypatch):
+        calls = []
+
+        async def llm(**kwargs):
+            calls.append(kwargs["user_content"])
+            return "**Outcome**\n\nComplete handoff from all supplied evidence."
+
+        monkeypatch.setattr(app_module, "client", object())
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        context = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "text": (
+                        "message-0 DATABASE_PASSWORD=never-send-this"
+                        if index == 0 else f"message-{index}"
+                    ),
+                }
+                for index in range(30)
+            ]
+        }
+        await app_module._summarize_session_close(context, tmp_path)
+        assert any("message-0" in call for call in calls)
+        assert any("message-29" in call for call in calls)
+        assert all("never-send-this" not in call for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_llm_input_sanitizing_does_not_truncate_chunk(self, tmp_path, monkeypatch):
+        calls = []
+
+        async def llm(**kwargs):
+            calls.append(kwargs["user_content"])
+            return "**Outcome**\n\nComplete handoff from every supplied conversation part."
+
+        monkeypatch.setattr(app_module, "client", object())
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        text = (
+            "START-KEEP "
+            + "a" * 9_000
+            + " MIDDLE-KEEP "
+            + "b" * 11_000
+            + " END-KEEP"
+        )
+        await app_module._summarize_session_close(
+            {"messages": [{"role": "assistant", "text": text}]},
+            tmp_path,
+        )
+        combined = "\n".join(calls)
+        assert "START-KEEP" in combined
+        assert "MIDDLE-KEEP" in combined
+        assert "END-KEEP" in combined
+
+    @pytest.mark.asyncio
+    async def test_empty_final_reduce_fails_closed(self, tmp_path, monkeypatch):
+        calls = 0
+
+        async def llm(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return "**Outcome**\n\nPartial handoff." if calls <= 2 else ""
+
+        monkeypatch.setattr(app_module, "client", object())
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        context = {
+            "messages": [{"role": "assistant", "text": "x" * 50_000}]
+        }
+        with pytest.raises(app_module._SessionCloseError):
+            await app_module._summarize_session_close(context, tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_oversized_summary_fails_closed_before_llm(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, "client", object())
+        llm = AsyncMock()
+        monkeypatch.setattr(app_module, "llm_call", llm)
+        context = {
+            "messages": [{
+                "role": "assistant",
+                "text": "x" * (app_module._SESSION_CLOSE_MAX_SUMMARY_CHARS + 1),
+            }]
+        }
+        with pytest.raises(app_module._SessionCloseError):
+            await app_module._summarize_session_close(context, tmp_path)
+        llm.assert_not_awaited()
+
+    def test_archive_symlink_parent_is_rejected(self, tmp_path, monkeypatch):
+        state = tmp_path / "state"
+        victim = tmp_path / "victim"
+        state.mkdir()
+        victim.mkdir()
+        (state / "session-closures").symlink_to(victim, target_is_directory=True)
+        monkeypatch.setattr(app_module, "MESSAGES_DIR", state)
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._persist_session_close_knowledge(
+                self._binding(tmp_path),
+                {"source_hash": "a" * 64, "messages": []},
+                "**Outcome**\n\nSafe summary",
+            )
+        assert not list(victim.iterdir())
+
+    def test_oversized_existing_spec_is_rejected_before_read(self, tmp_path, monkeypatch):
+        state = tmp_path / "state"
+        project = tmp_path / "project"
+        state.mkdir()
+        project.mkdir()
+        spec = project / "TECHNICAL_SPEC.md"
+        with spec.open("wb") as stream:
+            stream.seek(app_module._SESSION_CLOSE_MAX_SPEC_BYTES)
+            stream.write(b"x")
+        monkeypatch.setattr(app_module, "MESSAGES_DIR", state)
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._persist_session_close_knowledge(
+                self._binding(project),
+                {"source_hash": "a" * 64, "messages": []},
+                "**Outcome**\n\nSafe summary",
+            )
+
+    def test_held_rollout_fd_must_identify_exact_root(self, tmp_path, monkeypatch):
+        binding = self._binding(tmp_path)
+        sessions = tmp_path / "codex" / "sessions" / "2026" / "08" / "27"
+        sessions.mkdir(parents=True)
+        rollout = sessions / f"rollout-test-{binding['resume_uuid']}.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "session_id": "wrong-root",
+                "id": "wrong-root",
+                "thread_source": "user",
+                "cwd": str(tmp_path),
+            },
+        }) + "\n")
+        monkeypatch.setattr(
+            app_module,
+            "_user_codex_config_dir",
+            lambda _owner: tmp_path / "codex",
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_rollout_path",
+            lambda *_args: rollout,
+        )
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._capture_session_close_context(binding)
+
+    def test_capture_reads_current_response_item_message_format(self, tmp_path, monkeypatch):
+        binding = self._binding(tmp_path)
+        original_cwd = tmp_path / "original-cwd"
+        original_cwd.mkdir()
+        sessions = tmp_path / "codex" / "sessions" / "2026" / "08" / "27"
+        sessions.mkdir(parents=True)
+        rollout = sessions / f"rollout-test-{binding['resume_uuid']}.jsonl"
+        events = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "session_id": binding["resume_uuid"],
+                    "id": binding["resume_uuid"],
+                    "thread_source": "user",
+                    # Codex keeps this immutable origin when an exact root is
+                    # later resumed with `-C` into the tab's current project.
+                    "cwd": str(original_cwd),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            "# AGENTS.md instructions for /project\n\n<INSTRUCTIONS>\n"
+                            "managed context\n</INSTRUCTIONS>\n<environment_context>"
+                            "managed environment\n</environment_context>"
+                        ),
+                    }],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Build the close flow."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Implemented and tested it."}],
+                },
+            },
+        ]
+        rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+        monkeypatch.setattr(
+            app_module,
+            "_user_codex_config_dir",
+            lambda _owner: tmp_path / "codex",
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_rollout_path",
+            lambda *_args: rollout,
+        )
+
+        context = app_module._capture_session_close_context(binding)
+
+        assert context["messages"] == [
+            {"role": "user", "text": "Build the close flow."},
+            {"role": "assistant", "text": "Implemented and tested it."},
+        ]
+
+    def test_capture_verified_bootstrap_only_rollout_returns_empty_messages(
+        self, tmp_path, monkeypatch
+    ):
+        binding = self._binding(tmp_path)
+        sessions = tmp_path / "codex" / "sessions" / "2026" / "08" / "29"
+        sessions.mkdir(parents=True)
+        rollout = sessions / f"rollout-test-{binding['resume_uuid']}.jsonl"
+        events = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "session_id": binding["resume_uuid"],
+                    "id": binding["resume_uuid"],
+                    "thread_source": "user",
+                    "cwd": str(tmp_path),
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "bootstrap-turn"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            "# AGENTS.md instructions for /project\n\n<INSTRUCTIONS>\n"
+                            "managed context\n</INSTRUCTIONS>\n<environment_context>"
+                            "managed environment\n</environment_context>"
+                        ),
+                    }],
+                },
+            },
+        ]
+        rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+        monkeypatch.setattr(
+            app_module,
+            "_user_codex_config_dir",
+            lambda _owner: tmp_path / "codex",
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_rollout_path",
+            lambda *_args: rollout,
+        )
+
+        context = app_module._capture_session_close_context(binding)
+
+        assert context["messages"] == []
+        assert context["parse_errors"] == 0
+        assert context["source_bytes"] == rollout.stat().st_size
+        assert context["root_thread_id"] == binding["resume_uuid"]
+
+    def test_missing_lifecycle_root_adopts_validated_live_root(
+        self, tmp_path, monkeypatch
+    ):
+        live_root = "01a00000-0000-7000-8000-000000000001"
+        active = self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=live_root,
+        )
+
+        binding = app_module._session_close_binding("test-session", "admin")
+
+        assert binding["resume_uuid"] == live_root
+        assert active.call_count == 2
+
+    def test_nonempty_unverifiable_recorded_root_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="01a00000-0000-7000-8000-000000000002",
+            validated_recorded_root="",
+            active_root=None,
+        )
+
+        with pytest.raises(
+            app_module._SessionCloseError,
+            match="exact Codex conversation could not be verified",
+        ):
+            app_module._session_close_binding("test-session", "admin")
+
+    def test_unverifiable_recorded_root_adopts_exact_live_root(
+        self, tmp_path, monkeypatch
+    ):
+        live_root = "01a00000-0000-7000-8000-000000000003"
+        self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="01a00000-0000-7000-8000-000000000002",
+            validated_recorded_root="",
+            active_root=live_root,
+        )
+
+        binding = app_module._session_close_binding("test-session", "admin")
+
+        assert binding["resume_uuid"] == live_root
+
+    def test_missing_root_with_recorded_user_history_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=None,
+            last_source="terminal-stream",
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_load_session_messages",
+            lambda *_args: [{"role": "user", "text": "Please keep this work."}],
+        )
+
+        with pytest.raises(
+            app_module._SessionCloseError,
+            match="exact Codex conversation could not be verified",
+        ):
+            app_module._session_close_binding("test-session", "admin")
+
+    def test_positively_empty_passive_tab_can_bind_without_root(
+        self, tmp_path, monkeypatch
+    ):
+        active = self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=None,
+            last_source="terminal-stream",
+            had_conversation_input=False,
+        )
+        monkeypatch.setattr(app_module, "_load_session_messages", lambda *_args: [])
+        monkeypatch.setattr(app_module, "_iter_prompt_audit_reverse", lambda: [])
+        monkeypatch.setattr(app_module, "_session_tab_label_rows", lambda: {})
+        monkeypatch.setattr(app_module, "_away_mode_state", {})
+        monkeypatch.setattr(app_module, "_go_nuts_state", {})
+
+        binding = app_module._session_close_binding("test-session", "admin")
+
+        assert binding["resume_uuid"] == ""
+        assert active.call_count == 2
+
+    def test_new_empty_generation_ignores_stale_name_scoped_input_evidence(
+        self, tmp_path, monkeypatch
+    ):
+        active = self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=None,
+            last_source="send-command",
+            had_conversation_input=False,
+        )
+        old_messages = MagicMock(
+            return_value=[{"role": "user", "text": "Old generation work"}]
+        )
+        old_audit = MagicMock(return_value=[{
+            "session_name": "test-session",
+            "user_id": "admin",
+            "prompt": "Old generation prompt",
+        }])
+        monkeypatch.setattr(app_module, "_load_session_messages", old_messages)
+        monkeypatch.setattr(app_module, "_iter_prompt_audit_reverse", old_audit)
+        monkeypatch.setattr(
+            app_module,
+            "_session_tab_label_rows",
+            lambda: {
+                "test-session": {
+                    "owner_id": "admin",
+                    "generation": "b" * 32,
+                    "pending": False,
+                    "label": "Old Work",
+                }
+            },
+        )
+        monkeypatch.setattr(app_module, "_away_mode_state", {})
+        monkeypatch.setattr(app_module, "_go_nuts_state", {})
+
+        binding = app_module._session_close_binding("test-session", "admin")
+
+        assert binding["resume_uuid"] == ""
+        assert active.call_count == 2
+        old_messages.assert_not_called()
+        old_audit.assert_not_called()
+
+    def test_generation_with_conversation_input_cannot_skip_archive(
+        self, tmp_path, monkeypatch
+    ):
+        self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=None,
+            had_conversation_input=True,
+        )
+
+        with pytest.raises(
+            app_module._SessionCloseError,
+            match="exact Codex conversation could not be verified",
+        ):
+            app_module._session_close_binding("test-session", "admin")
+
+    def test_completed_label_for_current_generation_prevents_rootless_close(
+        self, tmp_path, monkeypatch
+    ):
+        self._patch_close_binding_state(
+            monkeypatch,
+            tmp_path,
+            recorded_root="",
+            active_root=None,
+            had_conversation_input=False,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_session_tab_label_rows",
+            lambda: {
+                "test-session": {
+                    "owner_id": "admin",
+                    "generation": "a" * 32,
+                    "pending": False,
+                    "label": "Current Work",
+                }
+            },
+        )
+        monkeypatch.setattr(app_module, "_away_mode_state", {})
+        monkeypatch.setattr(app_module, "_go_nuts_state", {})
+
+        with pytest.raises(
+            app_module._SessionCloseError,
+            match="exact Codex conversation could not be verified",
+        ):
+            app_module._session_close_binding("test-session", "admin")
+
+    def test_stale_checkpoint_root_cannot_be_closed(self, tmp_path, monkeypatch):
+        owner = self._binding(tmp_path)["owner"]
+        old_root = self._binding(tmp_path)["resume_uuid"]
+        monkeypatch.setattr(
+            app_module,
+            "_strict_session_owner",
+            lambda *_args: ("admin", owner),
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "get",
+            lambda _name: {
+                "managed": True,
+                "owner_id": "admin",
+                "desired_state": "running",
+                "generation": "a" * 32,
+                "resume_uuid": old_root,
+            },
+        )
+        monkeypatch.setattr(app_module, "_durable_session_cwd", lambda *_args: str(tmp_path))
+        monkeypatch.setattr(app_module, "_validated_session_root_thread_id", lambda *_args: old_root)
+        monkeypatch.setattr(app_module, "_exact_tmux_session_state", lambda _name: ("present", "$1"))
+        monkeypatch.setattr(app_module, "_tmux_session_matches_owner", lambda *_args: True)
+        monkeypatch.setattr(
+            app_module,
+            "_active_session_root_thread_id",
+            lambda *_args: "01a00000-0000-7000-8000-000000000001",
+        )
+        monkeypatch.setattr(app_module, "get_session_cwd", lambda _name: str(tmp_path))
+        with pytest.raises(app_module._SessionCloseError):
+            app_module._session_close_binding("test-session", "admin")
+
+    @pytest.mark.asyncio
+    async def test_simple_watchdog_records_input_before_sending_tmux_keys(
+        self, monkeypatch, owned_autopush_runtime
+    ):
+        events = []
+
+        class OperationFence:
+            def __enter__(self):
+                events.append(("lock", "enter"))
+
+            def __exit__(self, *_args):
+                events.append(("lock", "exit"))
+
+        def touch(*args, **kwargs):
+            events.append(("touch", args, kwargs))
+            return {"had_conversation_input": True}
+
+        def send_keys(command, **_kwargs):
+            events.append(("tmux", command))
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(
+            app_module,
+            "_session_operation_lock",
+            lambda _name: OperationFence(),
+        )
+        monkeypatch.setattr(app_module._session_lifecycle, "touch", touch)
+        monkeypatch.setattr(app_module.subprocess, "run", send_keys)
+        monkeypatch.setattr(app_module.asyncio, "sleep", AsyncMock())
+
+        sent = await app_module._simple_watchdog_send_text(
+            "test-session", "  keep   going  "
+        )
+
+        assert sent is True
+        assert events[0] == ("lock", "enter")
+        assert events[1] == (
+            "touch",
+            ("test-session",),
+            {"source": "autopilot-watchdog", "records_input": True},
+        )
+        assert events[2][0] == "tmux"
+        assert events[2][1] == [
+            "tmux", "send-keys", "-t", "test-session", "-l", "keep going",
+        ]
+        assert events[3][0] == "tmux"
+        assert events[3][1] == [
+            "tmux", "send-keys", "-t", "test-session", "Enter",
+        ]
+        assert events[4] == ("lock", "exit")
+
+    @pytest.mark.parametrize("replacement", ["owner", "generation"])
+    def test_close_barrier_install_rejects_replacement_under_operation_lock(
+        self, replacement, monkeypatch
+    ):
+        expected_generation = "a" * 32
+        state = {"owner_id": "admin", "generation": expected_generation}
+        owner = {"id": "admin", "username": "admin", "role": "admin"}
+
+        class ReplacingOperationFence:
+            def __enter__(self):
+                if replacement == "owner":
+                    state["owner_id"] = "u_replacement"
+                else:
+                    state["generation"] = "b" * 32
+
+            def __exit__(self, *_args):
+                return None
+
+        monkeypatch.setattr(
+            app_module,
+            "_session_operation_lock",
+            lambda _name: ReplacingOperationFence(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_strict_session_owner",
+            lambda _name, expected_owner="": (
+                ("admin", owner)
+                if state["owner_id"] == "admin"
+                and (not expected_owner or expected_owner == "admin")
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "matches",
+            lambda _name, *, generation, owner_id, desired_states: (
+                state["generation"] == generation
+                and state["owner_id"] == owner_id
+                and desired_states == {"running"}
+            ),
+        )
+        exact_tmux = MagicMock(return_value=("present", "$1"))
+        monkeypatch.setattr(app_module, "_exact_tmux_session_state", exact_tmux)
+
+        with pytest.raises(
+            app_module._SessionCloseError,
+            match=(
+                "Session ownership changed; retry close"
+                if replacement == "owner"
+                else "Session generation changed; retry close"
+            ),
+        ):
+            app_module._install_session_close_barrier(
+                "test-session",
+                "close_candidate_job",
+                "admin",
+                expected_generation,
+            )
+
+        assert "test-session" not in app_module._session_close_barriers
+        exact_tmux.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_close_start_cannot_overwrite_existing_barrier(
+        self, monkeypatch
+    ):
+        existing_job = "close_existing_job"
+        app_module._session_close_barriers["test-session"] = existing_job
+        owner = {"id": "admin", "username": "admin", "role": "admin"}
+        lifecycle = {
+            "managed": True,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "generation": "a" * 32,
+        }
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(app_module, "_find_user_by_id", lambda _owner: owner)
+        monkeypatch.setattr(
+            app_module,
+            "_strict_session_owner",
+            lambda *_args: ("admin", owner),
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "get",
+            lambda _name: lifecycle,
+        )
+
+        result = await app_module._start_session_close("admin", "test-session")
+
+        assert result["ok"] is False
+        assert result["_status"] == 409
+        assert app_module._session_close_barriers["test-session"] == existing_job
+        assert ("admin", "test-session") not in app_module._session_close_jobs
+        assert ("admin", "test-session") not in app_module._session_close_tasks
+
+    @pytest.mark.asyncio
+    async def test_close_job_finally_preserves_replacement_barrier(self, monkeypatch):
+        original_job = "close_original_job"
+        replacement_job = "close_replacement_job"
+        app_module._session_close_barriers["test-session"] = original_job
+
+        async def replace_barrier(_session_name):
+            app_module._session_close_barriers["test-session"] = replacement_job
+
+        monkeypatch.setattr(
+            app_module,
+            "_pause_autonomous_work_for_close",
+            replace_barrier,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={}),
+        )
+        owner = {"id": "admin", "username": "admin", "role": "admin"}
+        job = {"id": original_job, "session": "test-session"}
+
+        await app_module._run_session_close_job(owner, job)
+
+        assert job["status"] == "failed"
+        assert app_module._session_close_barriers["test-session"] == replacement_job
+
+    @pytest.mark.asyncio
+    async def test_close_barrier_rejects_new_session_resume(self, monkeypatch):
+        resume = AsyncMock()
+        monkeypatch.setattr(app_module, "_resume_parked_session", resume)
+        app_module._session_close_barriers["test-session"] = "job-id"
+        try:
+            result = await app_module._controller_dispatch({
+                "op": "session_resume",
+                "session": "test-session",
+                "source": "send-command",
+            })
+        finally:
+            app_module._session_close_barriers.pop("test-session", None)
+        assert result["_status"] == 409
+        resume.assert_not_awaited()
+
+    def test_inflight_send_cannot_cross_exclusive_close_fence(
+        self, authed_client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: MOCK_SESSIONS)
+        monkeypatch.setattr(
+            app_module,
+            "_controller_call",
+            AsyncMock(return_value={"ok": True}),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_wait_for_codex_input_ready",
+            AsyncMock(return_value=True),
+        )
+        send = MagicMock()
+        monkeypatch.setattr(app_module.subprocess, "run", send)
+        with app_module._session_operation_lock("test-session"):
+            response = authed_client.post(
+                "/api/sessions/test-session/send",
+                json={"command": "must not cross close"},
+            )
+        assert response.status_code == 409
+        send.assert_not_called()
+
+    def test_send_obeys_authoritative_input_check_under_operation_fence(
+        self, authed_client, monkeypatch
+    ):
+        lock_state = {"held": False}
+        operations = []
+
+        class TrackedOperationFence:
+            def __enter__(self):
+                assert lock_state["held"] is False
+                lock_state["held"] = True
+
+            def __exit__(self, *_args):
+                lock_state["held"] = False
+
+        async def controller_call(operation, **kwargs):
+            operations.append((operation, kwargs))
+            if operation == "session_resume":
+                assert lock_state["held"] is False
+                return {"ok": True}
+            assert operation == "session_input_check"
+            assert lock_state["held"] is True
+            return {
+                "ok": False,
+                "error": "Session is being summarized and closed",
+                "_status": 409,
+            }
+
+        send = MagicMock()
+        terminal_binding = MagicMock()
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: MOCK_SESSIONS)
+        monkeypatch.setattr(app_module, "_controller_call", controller_call)
+        monkeypatch.setattr(
+            app_module,
+            "_wait_for_codex_input_ready",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_session_operation_lock",
+            lambda _name: TrackedOperationFence(),
+        )
+        monkeypatch.setattr(app_module, "_terminal_binding", terminal_binding)
+        monkeypatch.setattr(app_module.subprocess, "run", send)
+
+        response = authed_client.post(
+            "/api/sessions/test-session/send",
+            json={"command": "must not cross authoritative close fence"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "Session is being summarized and closed"
+        assert [operation for operation, _kwargs in operations] == [
+            "session_resume",
+            "session_input_check",
+        ]
+        assert operations[1][1]["records_input"] is True
+        assert operations[1][1]["source"] == "send-command"
+        assert lock_state["held"] is False
+        terminal_binding.assert_not_called()
+        send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_spec_failure_leaves_tab_open(self, tmp_path, monkeypatch):
+        binding = self._binding(tmp_path)
+        context = {
+            "messages": [{"role": "assistant", "text": "Work result"}],
+            "source_hash": "c" * 64,
+            "source_bytes": 10,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", MagicMock(return_value={}))
+        monkeypatch.setattr(app_module, "_session_close_binding", lambda *_args: binding)
+        monkeypatch.setattr(app_module, "_capture_session_close_context", lambda _binding: context)
+        monkeypatch.setattr(app_module, "_session_close_source_unchanged", lambda *_args: True)
+        monkeypatch.setattr(app_module, "async_detect_activity", AsyncMock(return_value={"status": "idle"}))
+        monkeypatch.setattr(app_module, "_summarize_session_close", AsyncMock(return_value="summary"))
+        monkeypatch.setattr(
+            app_module,
+            "_persist_session_close_knowledge",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+        delete = AsyncMock()
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        assert job["status"] == "failed"
+        assert job["tab_state"] == "open"
+        delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rootless_close_publishes_unarchived_and_skips_archive_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        binding = {**self._binding(tmp_path), "resume_uuid": ""}
+        pause = AsyncMock()
+        capture = MagicMock()
+        summarize = AsyncMock()
+        persist = MagicMock()
+        source_unchanged = MagicMock()
+        delete = AsyncMock(
+            return_value=app_module.JSONResponse(
+                {"ok": True, "killed": "test-session"}
+            )
+        )
+
+        @asynccontextmanager
+        async def tmux_lock():
+            yield
+
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(app_module, "_pause_autonomous_work_for_close", pause)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        checkpoint = MagicMock(return_value={"managed": True})
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", checkpoint)
+        close_binding = MagicMock(return_value=binding)
+        monkeypatch.setattr(app_module, "_session_close_binding", close_binding)
+        monkeypatch.setattr(app_module, "async_detect_activity", AsyncMock(
+            return_value={"status": "idle"}
+        ))
+        monkeypatch.setattr(app_module, "_capture_session_close_context", capture)
+        monkeypatch.setattr(app_module, "_summarize_session_close", summarize)
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_source_unchanged",
+            source_unchanged,
+        )
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        monkeypatch.setattr(app_module, "_async_tmux_server_mutation_lock", tmux_lock)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        public_job = app_module._public_session_close_job(job)
+        assert job["status"] == "completed"
+        assert job["tab_state"] == "closed"
+        assert public_job["archived"] is False
+        assert public_job["spec_file"] is None
+        pause.assert_awaited_once_with("test-session")
+        capture.assert_not_called()
+        summarize.assert_not_awaited()
+        persist.assert_not_called()
+        source_unchanged.assert_not_called()
+        checkpoint.assert_called_once_with(
+            "test-session",
+            source="knowledge-close-final",
+            expected_owner_id="admin",
+        )
+        assert close_binding.call_count == 2
+        delete.assert_awaited_once_with(
+            None,
+            "test-session",
+            expected_user=binding["owner"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_verified_bootstrap_only_close_is_unarchived_and_deletes(
+        self, tmp_path, monkeypatch
+    ):
+        binding = {
+            **self._binding(tmp_path),
+            "conversation_input_known": True,
+            "had_conversation_input": False,
+        }
+        context = {
+            "messages": [],
+            "parse_errors": 0,
+            "source_hash": "e" * 64,
+            "source_bytes": 123,
+            "source_relative": (
+                f"2026/08/29/rollout-test-{binding['resume_uuid']}.jsonl"
+            ),
+            "source_fingerprint": (1, 2, 123, 4),
+            "root_thread_id": binding["resume_uuid"],
+        }
+        pause = AsyncMock()
+        capture = MagicMock(return_value=context)
+        summarize = AsyncMock()
+        persist = MagicMock()
+        source_unchanged = MagicMock(return_value=True)
+        delete = AsyncMock(
+            return_value=app_module.JSONResponse(
+                {"ok": True, "killed": "test-session"}
+            )
+        )
+
+        @asynccontextmanager
+        async def tmux_lock():
+            yield
+
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(app_module, "_pause_autonomous_work_for_close", pause)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        checkpoint = MagicMock(return_value={"managed": True})
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", checkpoint)
+        close_binding = MagicMock(return_value=binding)
+        monkeypatch.setattr(app_module, "_session_close_binding", close_binding)
+        monkeypatch.setattr(
+            app_module,
+            "async_detect_activity",
+            AsyncMock(return_value={"status": "idle"}),
+        )
+        monkeypatch.setattr(app_module, "_capture_session_close_context", capture)
+        monkeypatch.setattr(app_module, "_summarize_session_close", summarize)
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_source_unchanged",
+            source_unchanged,
+        )
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        monkeypatch.setattr(app_module, "_async_tmux_server_mutation_lock", tmux_lock)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        public_job = app_module._public_session_close_job(job)
+        assert job["status"] == "completed"
+        assert job["tab_state"] == "closed"
+        assert public_job["archived"] is False
+        assert public_job["spec_file"] is None
+        capture.assert_called_once_with(binding)
+        summarize.assert_not_awaited()
+        persist.assert_not_called()
+        source_unchanged.assert_called_once_with(binding, context)
+        checkpoint.assert_called_once_with(
+            "test-session",
+            source="knowledge-close-final",
+            expected_owner_id="admin",
+        )
+        assert close_binding.call_count == 2
+        delete.assert_awaited_once_with(
+            None,
+            "test-session",
+            expected_user=binding["owner"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_bootstrap_only_source_fails_before_delete(
+        self, tmp_path, monkeypatch
+    ):
+        binding = {
+            **self._binding(tmp_path),
+            "conversation_input_known": True,
+            "had_conversation_input": False,
+        }
+        context = {
+            "messages": [],
+            "parse_errors": 0,
+            "source_hash": "f" * 64,
+            "source_bytes": 123,
+            "source_relative": (
+                f"2026/08/29/rollout-test-{binding['resume_uuid']}.jsonl"
+            ),
+            "source_fingerprint": (1, 2, 123, 4),
+            "root_thread_id": binding["resume_uuid"],
+        }
+        capture = MagicMock(return_value=context)
+        summarize = AsyncMock()
+        persist = MagicMock()
+        source_unchanged = MagicMock(return_value=False)
+        delete = AsyncMock()
+
+        @asynccontextmanager
+        async def tmux_lock():
+            yield
+
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_pause_autonomous_work_for_close",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        checkpoint = MagicMock(return_value={"managed": True})
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", checkpoint)
+        close_binding = MagicMock(return_value=binding)
+        monkeypatch.setattr(app_module, "_session_close_binding", close_binding)
+        monkeypatch.setattr(
+            app_module,
+            "async_detect_activity",
+            AsyncMock(return_value={"status": "idle"}),
+        )
+        monkeypatch.setattr(app_module, "_capture_session_close_context", capture)
+        monkeypatch.setattr(app_module, "_summarize_session_close", summarize)
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_source_unchanged",
+            source_unchanged,
+        )
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        monkeypatch.setattr(app_module, "_async_tmux_server_mutation_lock", tmux_lock)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        assert job["status"] == "failed"
+        assert job["tab_state"] == "unknown"
+        assert job["archived"] is False
+        assert job["error"] == (
+            "New session activity arrived before close; retry to include it"
+        )
+        capture.assert_called_once_with(binding)
+        summarize.assert_not_awaited()
+        persist.assert_not_called()
+        source_unchanged.assert_called_once_with(binding, context)
+        checkpoint.assert_called_once_with(
+            "test-session",
+            source="knowledge-close-final",
+            expected_owner_id="admin",
+        )
+        assert close_binding.call_count == 2
+        delete.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("conversation_input_known", "had_conversation_input", "parse_errors"),
+        [
+            (False, False, 0),
+            (True, True, 0),
+            (True, False, 1),
+            (True, False, None),
+        ],
+        ids=(
+            "unknown-input-marker",
+            "known-user-input",
+            "parse-error",
+            "missing-parse-errors",
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_empty_rootful_context_fails_closed_without_positive_proof(
+        self,
+        conversation_input_known,
+        had_conversation_input,
+        parse_errors,
+        tmp_path,
+        monkeypatch,
+    ):
+        binding = {
+            **self._binding(tmp_path),
+            "conversation_input_known": conversation_input_known,
+            "had_conversation_input": had_conversation_input,
+        }
+        context = {
+            "messages": [],
+            "source_hash": "1" * 64,
+            "source_bytes": 123,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        if parse_errors is not None:
+            context["parse_errors"] = parse_errors
+        capture = MagicMock(return_value=context)
+        summarize = AsyncMock()
+        persist = MagicMock()
+        source_unchanged = MagicMock()
+        delete = AsyncMock()
+        checkpoint = MagicMock()
+        close_binding = MagicMock(return_value=binding)
+
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_pause_autonomous_work_for_close",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", checkpoint)
+        monkeypatch.setattr(app_module, "_session_close_binding", close_binding)
+        monkeypatch.setattr(
+            app_module,
+            "async_detect_activity",
+            AsyncMock(return_value={"status": "idle"}),
+        )
+        monkeypatch.setattr(app_module, "_capture_session_close_context", capture)
+        monkeypatch.setattr(app_module, "_summarize_session_close", summarize)
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(
+            app_module,
+            "_session_close_source_unchanged",
+            source_unchanged,
+        )
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        assert job["status"] == "failed"
+        assert job["tab_state"] == "open"
+        assert job["error"] == (
+            "No conversation could be recovered from the exact Codex transcript; "
+            "the tab was not closed"
+        )
+        capture.assert_called_once_with(binding)
+        summarize.assert_not_awaited()
+        persist.assert_not_called()
+        source_unchanged.assert_not_called()
+        checkpoint.assert_not_called()
+        close_binding.assert_called_once_with("test-session", "admin")
+        delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_spec_is_persisted_before_tmux_delete(self, tmp_path, monkeypatch):
+        binding = self._binding(tmp_path)
+        context = {
+            "messages": [{"role": "assistant", "text": "Work result"}],
+            "source_hash": "d" * 64,
+            "source_bytes": 10,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        state = {"persisted": False}
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", MagicMock(return_value={}))
+        monkeypatch.setattr(app_module, "_session_close_binding", lambda *_args: binding)
+        monkeypatch.setattr(app_module, "_capture_session_close_context", lambda _binding: context)
+        monkeypatch.setattr(app_module, "_session_close_source_unchanged", lambda *_args: True)
+        monkeypatch.setattr(app_module, "async_detect_activity", AsyncMock(return_value={"status": "idle"}))
+        monkeypatch.setattr(app_module, "_summarize_session_close", AsyncMock(return_value="summary"))
+
+        def persist(*_args):
+            state["persisted"] = True
+            return {"spec_path": str(tmp_path / "TECHNICAL_SPEC.md")}
+
+        async def delete(*_args, **_kwargs):
+            assert state["persisted"] is True
+            return app_module.JSONResponse({"ok": True, "killed": "test-session"})
+
+        @asynccontextmanager
+        async def tmux_lock():
+            yield
+
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        monkeypatch.setattr(app_module, "_async_tmux_server_mutation_lock", tmux_lock)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        assert job["status"] == "completed"
+        assert job["spec_file"] == "TECHNICAL_SPEC.md"
+
+    @pytest.mark.asyncio
+    async def test_generation_change_aborts_before_spec_or_delete(self, tmp_path, monkeypatch):
+        original = self._binding(tmp_path)
+        replaced = {**original, "generation": "e" * 32, "session_id": "$2"}
+        bindings = iter([original, replaced])
+        context = {
+            "messages": [{"role": "assistant", "text": "Work result"}],
+            "source_hash": "f" * 64,
+            "source_bytes": 10,
+            "root_thread_id": original["resume_uuid"],
+        }
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", MagicMock(return_value={}))
+        monkeypatch.setattr(app_module, "_session_close_binding", lambda *_args: next(bindings))
+        monkeypatch.setattr(app_module, "_capture_session_close_context", lambda _binding: context)
+        monkeypatch.setattr(app_module, "async_detect_activity", AsyncMock(return_value={"status": "idle"}))
+        monkeypatch.setattr(app_module, "_summarize_session_close", AsyncMock(return_value="summary"))
+        persist = MagicMock()
+        delete = AsyncMock()
+        monkeypatch.setattr(app_module, "_persist_session_close_knowledge", persist)
+        monkeypatch.setattr(app_module, "_api_delete_session_unlocked", delete)
+        job = {"session": "test-session"}
+
+        await app_module._run_session_close_job(original["owner"], job)
+
+        assert job["status"] == "failed"
+        persist.assert_not_called()
+        delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_is_uncertain_not_retryable_open(self, tmp_path, monkeypatch):
+        binding = self._binding(tmp_path)
+        context = {
+            "messages": [{"role": "assistant", "text": "Work result"}],
+            "source_hash": "9" * 64,
+            "source_bytes": 10,
+            "root_thread_id": binding["resume_uuid"],
+        }
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(
+            app_module,
+            "_checkpoint_active_session_serialized",
+            AsyncMock(return_value={"managed": True}),
+        )
+        monkeypatch.setattr(app_module, "_checkpoint_active_session", MagicMock(return_value={}))
+        monkeypatch.setattr(app_module, "_session_close_binding", lambda *_args: binding)
+        monkeypatch.setattr(app_module, "_capture_session_close_context", lambda _binding: context)
+        monkeypatch.setattr(app_module, "_session_close_source_unchanged", lambda *_args: True)
+        monkeypatch.setattr(app_module, "async_detect_activity", AsyncMock(return_value={"status": "idle"}))
+        monkeypatch.setattr(app_module, "_summarize_session_close", AsyncMock(return_value="summary"))
+        monkeypatch.setattr(
+            app_module,
+            "_persist_session_close_knowledge",
+            lambda *_args: {"spec_path": str(tmp_path / "TECHNICAL_SPEC.md")},
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_api_delete_session_unlocked",
+            AsyncMock(return_value=app_module.JSONResponse({"error": "kill failed"}, status_code=500)),
+        )
+        monkeypatch.setattr(app_module, "_exact_tmux_session_state", lambda _name: ("present", "$1"))
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "get",
+            lambda _name: {"desired_state": "deleting"},
+        )
+
+        job = {"session": "test-session"}
+        await app_module._run_session_close_job(binding["owner"], job)
+
+        assert job["status"] == "failed"
+        assert job["tab_state"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_close_start_reuses_running_job(self, monkeypatch):
+        gate = asyncio.Event()
+        owner = {"id": "admin", "username": "admin", "role": "admin"}
+        generation = "a" * 32
+        monkeypatch.setattr(app_module, "_shutting_down", False)
+        monkeypatch.setattr(app_module, "_find_user_by_id", lambda _owner: owner)
+        monkeypatch.setattr(app_module, "_strict_session_owner", lambda *_args: ("admin", owner))
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "get",
+            lambda _name: {
+                "managed": True,
+                "owner_id": "admin",
+                "desired_state": "running",
+                "generation": generation,
+            },
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle,
+            "matches",
+            lambda _name, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_exact_tmux_session_state",
+            lambda _name: ("present", "$1"),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "_tmux_session_matches_owner",
+            lambda *_args: True,
+        )
+
+        async def worker(_owner, job):
+            job["status"] = "running"
+            await gate.wait()
+            job["status"] = "completed"
+
+        monkeypatch.setattr(app_module, "_run_session_close_job", worker)
+        app_module._session_close_jobs.clear()
+        app_module._session_close_tasks.clear()
+        first = await app_module._start_session_close("admin", "test-session")
+        second = await app_module._start_session_close("admin", "test-session")
+        assert first["accepted"] is True
+        assert second["accepted"] is False
+        assert second["job"]["id"] == first["job"]["id"]
+        gate.set()
+        await app_module._session_close_tasks[("admin", "test-session")]
+        app_module._session_close_barriers.pop("test-session", None)
 
 
 # ─── Send Command Success Path Tests ───
@@ -2002,7 +5778,11 @@ class TestSendCommandEndpoint:
     def test_send_short_command_success(self, mock_run, mock_sessions, authed_client):
         """Short commands (<=200 chars) should be sent via send-keys and return ok=True."""
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        with patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with (
+            patch("app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("app._live_tmux_session_names", return_value={"test-session"}),
+            patch("app._checkpoint_active_session", return_value={}),
+        ):
             resp = authed_client.post(
                 "/api/sessions/test-session/send",
                 json={"command": "echo hello"},
@@ -2011,10 +5791,56 @@ class TestSendCommandEndpoint:
         data = resp.json()
         assert data["ok"] is True
         assert data["sent"] == "echo hello"
-        mock_sleep.assert_awaited_once_with(0.25)
+        mock_sleep.assert_any_await(0.25)
         # The send path scrolls the pane back into view first, and submits with
         # C-m rather than the "Enter" key name; both reach tmux identically.
-        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["-40", "echo hello", "C-m"]
+        # The final -8 is the post-submit pane check that confirms the prompt
+        # left the composer instead of becoming stranded there.
+        assert [call.args[0][-1] for call in mock_run.call_args_list] == ["-40", "echo hello", "C-m", "-8"]
+
+    @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
+    @patch("app.subprocess.run")
+    def test_send_slash_command_stays_literal_when_account_instructions_are_stale(
+        self, mock_run, mock_sessions, authed_client, tmp_path
+    ):
+        """A stale member thread must not turn a native Codex command into prose."""
+        import app
+
+        codex_home = tmp_path / ".codex-user-u_member"
+        codex_home.mkdir()
+        (codex_home / "AGENTS.md").write_text("Updated member instructions.\n")
+        member = {"id": "u_member", "username": "member", "role": "user"}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("app._user_for_session", return_value=member),
+            patch("app._user_codex_config_dir", return_value=codex_home),
+            patch("app._session_codex_process_id", return_value=321),
+            patch("app._process_environment", return_value={}),
+            patch("app._session_account_instruction_marker", return_value=("", "")),
+            patch("app._ensure_codex_submitted", new=AsyncMock(return_value="submitted")),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            resp = authed_client.post(
+                "/api/sessions/test-session/send",
+                json={"command": "/model gpt-5.6-sol"},
+            )
+            # The refresh stays pending and still wraps the next ordinary prompt.
+            wrapped, marker = app._account_instruction_refresh_for_prompt(
+                "test-session", "continue the task"
+            )
+
+        assert resp.status_code == 200
+        literal_inputs = [
+            call.args[0][-1]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0][:4] == ["tmux", "send-keys", "-t", "$99"]
+            and "-l" in call.args[0]
+        ]
+        assert literal_inputs == ["/model gpt-5.6-sol"]
+        assert all("[Read/apply " not in value for value in literal_inputs)
+        assert wrapped.endswith("ORIGINAL:\ncontinue the task")
+        assert marker is not None
 
     @patch("app.get_tmux_sessions", return_value=MOCK_SESSIONS)
     @patch("app.subprocess.run")
@@ -2306,7 +6132,12 @@ class TestParseSessionStats:
     def test_cache_hit_returns_immediately(self):
         import app as _app
         name = "stats-cache-immediate"
-        sentinel = {"available": True, "_ts": time.time(), "_sentinel": True}
+        sentinel = {
+            "available": True,
+            "_ts": time.time(),
+            "_sentinel": True,
+            "_identity": _app._session_derived_cache_identity(name),
+        }
         _app._session_stats_cache[name] = sentinel
         try:
             result = _app._parse_session_stats(name)
@@ -2757,6 +6588,11 @@ class TestAutonomousStatePersistence:
 
         try:
             with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
+                 patch.object(
+                     _app,
+                     "_autonomous_state_store",
+                     _app.LockedJsonStore(state_file, dict),
+                 ), \
                  patch("app.MESSAGES_DIR", tmp_path):
                 _app._save_autonomous_state()
                 loaded = _app._load_autonomous_state()
@@ -2772,7 +6608,12 @@ class TestAutonomousStatePersistence:
     def test_load_returns_empty_when_file_missing(self, tmp_path):
         import app as _app
         state_file = tmp_path / "autonomous-modes.json"
-        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file):
+        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
+             patch.object(
+                 _app,
+                 "_autonomous_state_store",
+                 _app.LockedJsonStore(state_file, dict),
+             ):
             result = _app._load_autonomous_state()
         assert result == {}
 
@@ -2780,7 +6621,12 @@ class TestAutonomousStatePersistence:
         import app as _app
         state_file = tmp_path / "autonomous-modes.json"
         state_file.write_text("{invalid json}")
-        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file):
+        with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
+             patch.object(
+                 _app,
+                 "_autonomous_state_store",
+                 _app.LockedJsonStore(state_file, dict),
+             ):
             result = _app._load_autonomous_state()
         assert result == {}
 
@@ -2801,6 +6647,11 @@ class TestAutonomousStatePersistence:
 
         try:
             with patch.object(_app, "AUTONOMOUS_STATE_FILE", state_file), \
+                 patch.object(
+                     _app,
+                     "_autonomous_state_store",
+                     _app.LockedJsonStore(state_file, dict),
+                 ), \
                  patch("app.MESSAGES_DIR", tmp_path):
                 _app._save_autonomous_state()
                 loaded = _app._load_autonomous_state()
@@ -2903,7 +6754,11 @@ class TestMiscUncoveredPaths:
         import app as _app
         notes_file = tmp_path / "notes.json"
         with patch("app.MESSAGES_DIR", tmp_path), \
-             patch.object(_app, "cache", {"sess1": {"notes": "my note"}}):
+             patch.object(_app, "cache", {"sess1": {
+                 "notes": "my note",
+                 "_owner_id": "admin",
+                 "_logical_incarnation": "legacy-test",
+             }}):
             _app._save_notes()
         assert notes_file.exists()
         data = json.loads(notes_file.read_text())
@@ -2954,7 +6809,10 @@ class TestLlmCall:
             coro.close()
             return mock_resp
 
-        with patch("app.asyncio.wait_for", fake_wait_for):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        with patch.object(_app, "client", mock_client), \
+             patch("app.asyncio.wait_for", fake_wait_for):
             result = await _app.llm_call("sys prompt", "user content", max_tokens=50)
 
         assert result == "hello world"
@@ -3185,6 +7043,28 @@ class TestEnsureCodexRunning:
         assert result is True
 
     @pytest.mark.asyncio
+    async def test_owner_environment_failure_aborts_before_relaunch(self):
+        import app as _app
+
+        async def run_inline(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        with (
+            patch(
+                "app._async_is_codex_running",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch("app._send_session_owner_environment", return_value=False),
+            patch("app.asyncio.to_thread", side_effect=run_inline),
+            patch("app._session_launch_command") as launch,
+        ):
+            result = await _app._ensure_codex_running("my-session")
+
+        assert result is False
+        launch.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_restarts_codex_and_returns_true(self):
         """Lines 189-213: not running → sends restart command → running after 1 poll."""
         import app as _app
@@ -3198,8 +7078,12 @@ class TestEnsureCodexRunning:
             return is_running_values.pop(0)
 
         with patch("app._async_is_codex_running", side_effect=fake_is_running), \
-             patch("app.asyncio.to_thread", new_callable=AsyncMock), \
-             patch("app.asyncio.sleep", new_callable=AsyncMock):
+             patch("app._send_session_owner_environment", return_value=True), \
+             patch("app._exact_tmux_session_id", return_value="$1"), \
+             patch("app.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("app._find_session_transcript_uuid", return_value=None), \
+             patch("app.asyncio.sleep", new_callable=AsyncMock), \
+             patch.object(_app._session_lifecycle, "get", return_value={}):
             result = await _app._ensure_codex_running(
                 "my-session",
                 log_fn=lambda s, msg: log_entries.append(msg),
@@ -3208,6 +7092,151 @@ class TestEnsureCodexRunning:
         assert result is True
         assert any("restarted" in e for e in log_entries)  # covers line 210
 
+    @pytest.mark.asyncio
+    async def test_recovery_relaunch_pins_saved_model_and_effort(self):
+        """Crash recovery must not let stale rollout settings win on resume."""
+        import app as _app
+
+        is_running_values = [False, True]
+
+        async def fake_is_running(session_name):
+            return is_running_values.pop(0)
+
+        with (
+            patch("app._async_is_codex_running", side_effect=fake_is_running),
+            patch("app._send_session_owner_environment", return_value=True),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app.subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("app._find_session_transcript_uuid", return_value=None),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+            patch.object(_app._session_lifecycle, "get", return_value={}),
+            patch("app._session_launch_base", return_value="codex --yolo"),
+            patch(
+                "app._saved_session_model_effort",
+                return_value=("gpt-5.6-sol", "high"),
+            ),
+            patch("app._session_launch_command", return_value="pinned-launch") as launch,
+        ):
+            result = await _app._ensure_codex_running("my-session")
+
+        assert result is True
+        launch.assert_called_once_with(
+            "my-session",
+            "codex --yolo",
+            expected_owner_id=None,
+            pin_model=False,
+            resume=True,
+            model="gpt-5.6-sol",
+            effort="high",
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_fresh_restart_launches_without_resume(self, tmp_path):
+        """A confirmed settings restart may relaunch a verified unused tab."""
+        import app as _app
+
+        generation = "a" * 32
+        row = {
+            "managed": True,
+            "generation": generation,
+            "owner_id": "admin",
+            "desired_state": "running",
+            "restore_on_startup": True,
+            "cwd": str(tmp_path),
+            "had_conversation_input": False,
+        }
+        is_running_values = [False, True]
+
+        async def fake_is_running(_session_name):
+            return is_running_values.pop(0)
+
+        with (
+            patch("app._async_is_codex_running", side_effect=fake_is_running),
+            patch(
+                "app._strict_session_owner",
+                return_value=("admin", {"id": "admin", "username": "admin"}),
+            ),
+            patch.object(_app._session_lifecycle, "get", return_value=row),
+            patch.object(_app._session_lifecycle, "matches", return_value=True),
+            patch("app._durable_session_cwd", return_value=str(tmp_path)),
+            patch("app._tmux_session_matches_owner", return_value=True),
+            patch("app._send_session_owner_environment", return_value=True),
+            patch("app._ensure_codex_auth_with_fallback"),
+            patch("app._uses_private_account_runtime", return_value=False),
+            patch(
+                "app._find_session_transcript_uuid",
+                return_value="01a035f8-3188-7c21-8cca-582b01ad3002",
+            ) as find_transcript,
+            patch("app._session_launch_base", return_value="codex --yolo"),
+            patch(
+                "app._saved_session_model_effort",
+                return_value=("gpt-6-astra", "xhigh"),
+            ),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app.subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+            patch("app._session_launch_command", return_value="fresh-launch") as launch,
+        ):
+            result = await _app._ensure_codex_running(
+                "my-session",
+                expected_owner_id="admin",
+                expected_generation=generation,
+                expected_desired_states={"running"},
+                allow_fresh=True,
+            )
+
+        assert result is True
+        find_transcript.assert_not_called()
+        launch.assert_called_once_with(
+            "my-session",
+            "codex --yolo",
+            expected_owner_id="admin",
+            pin_model=False,
+            resume=False,
+            model="gpt-6-astra",
+            effort="xhigh",
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_forwards_recorded_thread_id_and_cwd(self):
+        """Production recovery must use the root recorded for the dashboard tab."""
+        import app as _app
+
+        thread_id = "01a020d4-d4e0-75a3-b832-b830e6f4fd87"
+        is_running_values = [False, True]
+
+        async def fake_is_running(session_name):
+            return is_running_values.pop(0)
+
+        with (
+            patch("app._async_is_codex_running", side_effect=fake_is_running),
+            patch("app._send_session_owner_environment", return_value=True),
+            patch("app._exact_tmux_session_id", return_value="$1"),
+            patch("app.subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("app.asyncio.sleep", new_callable=AsyncMock),
+            patch("app._session_launch_base", return_value="codex --yolo"),
+            patch("app._find_session_transcript_uuid", return_value=thread_id),
+            patch(
+                "app._saved_session_model_effort",
+                return_value=("gpt-5.6-sol", "high"),
+            ),
+            patch("app.get_session_cwd", return_value="/workspace/recovered"),
+            patch("app._session_launch_command", return_value="pinned-launch") as launch,
+        ):
+            result = await _app._ensure_codex_running("my-session")
+
+        assert result is True
+        launch.assert_called_once_with(
+            "my-session",
+            "codex --yolo",
+            expected_owner_id=None,
+            pin_model=False,
+            resume=True,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_uuid=thread_id,
+            resume_cwd="/workspace/recovered",
+        )
     @pytest.mark.asyncio
     async def test_returns_false_after_timeout(self):
         """Lines 215-218: not running → sends restart command → never restarts."""
@@ -3251,9 +7280,198 @@ class TestEnsureCodexRunning:
         assert any("not running" in entry for entry in log_entries)
 
 
+def test_restore_virtual_session_uses_exact_tmux_targets(tmp_path):
+    """A missing `debug` session must not accidentally target `debugtmux`."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        result = MagicMock()
+        result.returncode = 1 if args[1] == "has-session" else 0
+        result.stderr = ""
+        if args[1] == "new-session":
+            result.stdout = "$9\tdebug\n"
+        elif args[1] == "display-message":
+            result.stdout = "$9\tdebug\n"
+        else:
+            result.stdout = ""
+        return result
+
+    with (
+        patch(
+            "app._user_for_session",
+            return_value={"id": "u_michiel", "username": "Michiel"},
+        ),
+        patch("app._uses_private_account_runtime", return_value=False),
+        patch("app.subprocess.run", side_effect=fake_run),
+    ):
+        restored = app_module._restore_parked_tmux_shell(
+            "debug", {"cwd": str(tmp_path), "virtual": True}
+        )
+
+    assert restored is True
+    assert ["tmux", "has-session", "-t", "=debug"] in calls
+    new_session = next(call for call in calls if call[1] == "new-session")
+    assert [";", "set-option", app_module._TMUX_QUARANTINED_OPTION, "1"] == (
+        new_session[new_session.index(";"):new_session.index(";") + 4]
+    )
+    assert any(
+        call[:5] == ["tmux", "set-option", "-pt", "$9:", "remain-on-exit"]
+        for call in calls
+    )
+    assert all(
+        call[3] == "$9:"
+        for call in calls
+        if len(call) > 3 and call[0:2] == ["tmux", "send-keys"]
+    )
+
+
+def test_restore_mapped_session_rejects_missing_cwd_before_tmux(tmp_path):
+    run = MagicMock()
+    with (
+        patch(
+            "app._user_for_session",
+            return_value={"id": "u_michiel", "username": "Michiel"},
+        ),
+        patch("app.subprocess.run", run),
+    ):
+        restored = app_module._restore_parked_tmux_shell(
+            "debug",
+            {
+                "cwd": str(tmp_path / "missing"),
+                "virtual": True,
+                "resume_uuid": "01a035f8-3188-7c21-8cca-582b01ad3002",
+            },
+        )
+
+    assert restored is False
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_park_session_uses_exact_pane_targets(tmp_path):
+    calls = []
+    events = []
+    lifecycle = {
+        "managed": True,
+        "generation": "a" * 32,
+        "owner_id": "u_michiel",
+        "desired_state": "running",
+        "resume_uuid": "01a035f8-3188-7c21-8cca-582b01ad3002",
+    }
+
+    def record_run(args, **kwargs):
+        calls.append(args)
+        events.append(("run", tuple(args)))
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    async def record_sleep(duration):
+        events.append(("sleep", duration))
+
+    with (
+        patch("app.async_detect_activity", new=AsyncMock(return_value={"status": "idle"})),
+        patch("app._session_has_autonomous_work", return_value=False),
+        patch(
+            "app._strict_session_owner",
+            return_value=("u_michiel", {"id": "u_michiel"}),
+        ),
+        patch("app._archive_tmux_scrollback", return_value=""),
+        patch("app.get_session_cwd", return_value=str(tmp_path)),
+        patch("app._checkpoint_active_session", return_value=lifecycle),
+        patch(
+            "app._validated_session_root_thread_id",
+            return_value=lifecycle["resume_uuid"],
+        ),
+        patch(
+            "app._active_session_root_thread_id",
+            return_value=lifecycle["resume_uuid"],
+        ),
+        patch("app._durable_session_cwd", return_value=str(tmp_path.resolve())),
+        patch("app._exact_tmux_session_id", return_value="$7"),
+        patch("app._tmux_session_matches_owner", return_value=True),
+        patch(
+            "app._async_is_codex_running",
+            new=AsyncMock(side_effect=[True, False, False, False]),
+        ),
+        patch("app.subprocess.run", side_effect=record_run),
+        patch("app.asyncio.sleep", side_effect=record_sleep),
+        patch.object(
+            app_module._session_lifecycle,
+            "get",
+            return_value=lifecycle,
+        ),
+        patch.object(
+            app_module._session_lifecycle,
+            "mark_parked",
+            return_value={"parked": True},
+        ),
+        patch.object(
+            app_module._session_lifecycle,
+            "begin_transition",
+            return_value={"desired_state": "parking"},
+        ),
+    ):
+        result = await app_module._park_session_local("debug", 123.0)
+
+    assert result["ok"] is True
+    targeted = [
+        call for call in calls
+        if call[:2] == ["tmux", "send-keys"]
+        or call[:2] == ["tmux", "set-option"]
+    ]
+    assert targeted
+    assert all(call[3] == "$7:" for call in targeted)
+    quit_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "run" and event[1][-2:] == ("-l", "/quit")
+    )
+    enter_index = next(
+        index
+        for index, event in enumerate(events[quit_index + 1 :], quit_index + 1)
+        if event[0] == "run" and event[1][-1] == "Enter"
+    )
+    assert ("sleep", 1.0) in events[quit_index + 1 : enter_index]
+
+
 # ─── Away Mode Toggle (enable/disable paths) ───
 
 
+@pytest.fixture
+def owned_autopush_runtime(tmp_path, monkeypatch):
+    """Autonomous behavior tests start with valid, isolated mode and owner state."""
+    path = tmp_path / "autopush-mode.json"
+    store = app_module.LockedJsonStore(path, lambda: {})
+    store.update(lambda data: data.clear())
+    monkeypatch.setattr(app_module, "AUTOPUSH_MODE_FILE", path)
+    monkeypatch.setattr(app_module, "_autopush_mode_store", store)
+    monkeypatch.setattr(app_module, "_autopush_mode", {})
+    monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+    monkeypatch.setattr(app_module, "_autopush_mode_file_stamp", app_module._autopush_file_stamp())
+    monkeypatch.setattr(app_module, "_autopush_action_locks", {})
+    monkeypatch.setattr(app_module, "_autonomous_toggle_revision", {})
+    monkeypatch.setattr(app_module, "_away_mode_state", {})
+    monkeypatch.setattr(app_module, "_go_nuts_state", {})
+
+    def register(name, state=None, mode="away"):
+        app_module._set_session_owner(name, "admin")
+        if state is not None:
+            state.update(owner_id="admin", generation="")
+            registry = app_module._away_mode_state if mode == "away" else app_module._go_nuts_state
+            registry[name] = state
+        return app_module._terminal_binding(name, "admin")
+
+    async def terminal_binding(name, expected_owner_id=""):
+        owner_id = app_module._session_owner_id(name)
+        if not owner_id or (expected_owner_id and expected_owner_id != owner_id):
+            return None
+        return app_module._terminal_binding(name, owner_id)
+
+    monkeypatch.setattr(app_module, "_autopush_terminal_binding", terminal_binding)
+    return register
+
+
+@pytest.mark.usefixtures("owned_autopush_runtime")
 class TestAwayModeToggleEnable:
     """Cover lines 3617-3649: api_away_mode_toggle enable/disable with valid session."""
 
@@ -3271,7 +7489,8 @@ class TestAwayModeToggleEnable:
             pass  # Completes immediately, no leaked coroutine
 
         try:
-            with patch("app._away_mode_worker", instant_worker):
+            with patch("app._away_mode_worker", instant_worker), \
+                 patch("app._resume_parked_session", new=AsyncMock(return_value={"ok": True})):
                 resp = authed_client.post(
                     "/api/sessions/test-session/away-mode", json={"enabled": True}
                 )
@@ -3350,6 +7569,7 @@ class TestAwayModeToggleEnable:
 # ─── Go Nuts Mode Toggle (enable/disable paths) ───
 
 
+@pytest.mark.usefixtures("owned_autopush_runtime")
 class TestGoNutsModeToggleEnable:
     """Cover lines 3966-3999: api_go_nuts_mode_toggle enable/disable with valid session."""
 
@@ -3368,7 +7588,8 @@ class TestGoNutsModeToggleEnable:
             pass  # Completes immediately, no leaked coroutine
 
         try:
-            with patch("app._go_nuts_mode_worker", instant_worker):
+            with patch("app._go_nuts_mode_worker", instant_worker), \
+                 patch("app._resume_parked_session", new=AsyncMock(return_value={"ok": True})):
                 resp = authed_client.post(
                     "/api/sessions/test-session/go-nuts-mode", json={"enabled": True}
                 )
@@ -3693,8 +7914,12 @@ class TestAwayWaitForIdle:
 class TestRestoreAutonomousMode:
     """Cover lines 2664-2723: _restore_autonomous_mode."""
 
+    @pytest.fixture(autouse=True)
+    def owned_restore_session(self, owned_autopush_runtime):
+        owned_autopush_runtime("my-sess")
+
     @pytest.mark.asyncio
-    async def test_restore_away_mode_success(self):
+    async def test_restore_away_mode_success(self, owned_autopush_runtime):
         """Normal restore: session exists, idle, sends prompt, enters continuous loop."""
         import app as _app
 
@@ -3706,16 +7931,18 @@ class TestRestoreAutonomousMode:
         async def mock_activity(session_name):
             return {"status": "idle"}
 
-        async def mock_ensure_codex(session_name, log_fn=None, state=None):
+        async def mock_ensure_codex(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return True
 
-        async def mock_send_prompt(session_name, prompt):
-            pass
+        async def mock_send_prompt(session_name, prompt, *, expected_binding=None):
+            assert expected_binding["owner_id"] == "admin"
 
         async def mock_continuous_loop(session_name):
             loop_called.append(session_name)
 
         state = {"enabled": True, "phase": 4, "step": 0, "log": []}
+        owned_autopush_runtime("my-sess", state)
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
              patch("app._ensure_codex_running", mock_ensure_codex), \
@@ -3767,7 +7994,7 @@ class TestRestoreAutonomousMode:
         assert state["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_restore_go_nuts_mode_uses_gonuts_loop(self):
+    async def test_restore_go_nuts_mode_uses_gonuts_loop(self, owned_autopush_runtime):
         """Restore for go-nuts mode enters _go_nuts_continuous_loop."""
         import app as _app
 
@@ -3779,16 +8006,18 @@ class TestRestoreAutonomousMode:
         async def mock_activity(session_name):
             return {"status": "idle"}
 
-        async def mock_ensure_codex(session_name, log_fn=None, state=None):
+        async def mock_ensure_codex(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return True
 
-        async def mock_send_prompt(session_name, prompt):
-            pass
+        async def mock_send_prompt(session_name, prompt, *, expected_binding=None):
+            assert expected_binding["owner_id"] == "admin"
 
         async def mock_gonuts_loop(session_name):
             loop_called.append(("gonuts", session_name))
 
         state = {"enabled": True, "phase": 2, "step": 0, "log": []}
+        owned_autopush_runtime("my-sess", state, mode="gonuts")
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
              patch("app._ensure_codex_running", mock_ensure_codex), \
@@ -3892,12 +8121,18 @@ class TestWatchdogLoop:
 class TestAwaySendPrompt:
     """Cover lines 3107-3201: _away_send_prompt."""
 
+    @pytest.fixture(autouse=True)
+    def owned_prompt_session(self, owned_autopush_runtime):
+        owned_autopush_runtime("test-sess")
+
     @pytest.mark.asyncio
     async def test_busy_detected_returns_early(self):
         """Lines 3160-3162: if session is busy after paste, returns immediately."""
         import app as _app
 
         async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
             if fn is _app.capture_pane_recent:
                 return "snapshot"
             return MagicMock(returncode=0, stdout="", stderr="")
@@ -3925,6 +8160,8 @@ class TestAwaySendPrompt:
         snapshot_count = [0]
 
         async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
             if fn is _app.capture_pane_recent:
                 snapshot_count[0] += 1
                 # pre-snapshot returns "before", post-snapshot returns "after"
@@ -3952,6 +8189,8 @@ class TestAwaySendPrompt:
         import app as _app
 
         async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
             if fn is _app.capture_pane_recent:
                 return "same content"  # Never changes
             return MagicMock(returncode=0, stdout="", stderr="")
@@ -3980,6 +8219,8 @@ class TestAwaySendPrompt:
         tmux_commands = []
 
         async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
             if fn is _app.capture_pane_recent:
                 call_count[0] += 1
                 # Pre-snapshot (call 1) and post-snapshot (calls 2,3,4) and recent check (call 5)
@@ -4011,6 +8252,8 @@ class TestAwaySendPrompt:
         import app as _app
 
         async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
             if fn is _app.capture_pane_recent:
                 return "snapshot"
             return MagicMock(returncode=0, stdout="", stderr="")
@@ -4058,8 +8301,13 @@ class TestAwaySendPrompt:
 class TestRestoreAutonomousModeExtra:
     """Cover lines 2686-2698, 2713-2720: busy-wait path and claude-dead path in restore."""
 
+    @pytest.fixture(autouse=True)
+    def owned_restore_sessions(self, owned_autopush_runtime):
+        owned_autopush_runtime("busy-sess")
+        owned_autopush_runtime("dead-sess")
+
     @pytest.mark.asyncio
-    async def test_restore_waits_when_busy(self):
+    async def test_restore_waits_when_busy(self, owned_autopush_runtime):
         """Lines 2686-2687: if session is busy on restore, wait for idle before sending."""
         import app as _app
 
@@ -4074,20 +8322,22 @@ class TestRestoreAutonomousModeExtra:
         async def mock_wait_idle(session_name, timeout=900):
             wait_called.append(session_name)
 
-        async def mock_ensure_claude(session_name, log_fn=None, state=None):
+        async def mock_ensure_claude(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return True
 
-        async def mock_send_prompt(session_name, prompt):
-            pass
+        async def mock_send_prompt(session_name, prompt, *, expected_binding=None):
+            assert expected_binding["owner_id"] == "admin"
 
         async def mock_loop(session_name):
             pass
 
         state = {"enabled": True, "phase": 4, "step": 0, "log": []}
+        owned_autopush_runtime("busy-sess", state)
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
              patch("app._away_wait_for_idle", mock_wait_idle), \
-             patch("app._ensure_claude_running", mock_ensure_claude), \
+             patch("app._ensure_codex_running", mock_ensure_claude), \
              patch("app._away_send_prompt", mock_send_prompt), \
              patch("app._away_mode_continuous_loop", mock_loop):
             await _app._restore_autonomous_mode("busy-sess", state, "away")
@@ -4106,7 +8356,8 @@ class TestRestoreAutonomousModeExtra:
         async def mock_activity(session_name):
             return {"status": "idle"}
 
-        async def mock_ensure_dead(session_name, log_fn=None, state=None):
+        async def mock_ensure_dead(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return False  # Codex couldn't restart
 
         async def mock_loop(session_name):
@@ -4115,7 +8366,7 @@ class TestRestoreAutonomousModeExtra:
         state = {"enabled": True, "phase": 4, "step": 0, "log": []}
         with patch("app.asyncio.sleep", noop_sleep), \
              patch("app.async_detect_activity", mock_activity), \
-             patch("app._ensure_claude_running", mock_ensure_dead), \
+             patch("app._ensure_codex_running", mock_ensure_dead), \
              patch("app._away_mode_continuous_loop", mock_loop), \
              patch("app._save_autonomous_state"):
             await _app._restore_autonomous_mode("dead-sess", state, "away")
@@ -4282,6 +8533,562 @@ class TestAwayModeWorkerPaths:
 # ---------------------------------------------------------------------------
 
 
+class TestCodexSubmitVerification:
+    @pytest.mark.asyncio
+    async def test_slash_command_never_retries_enter_into_its_picker(self, monkeypatch):
+        run = MagicMock()
+        capture = MagicMock(
+            return_value=(
+                "› /model\n\nSelect model and reasoning effort\n"
+                "❯ 1. gpt-5.6-sol xhigh\n  2. gpt-6-astra xhigh\n"
+            )
+        )
+        monkeypatch.setattr(app_module, "capture_pane_recent", capture)
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+        monkeypatch.setattr(app_module.asyncio, "sleep", AsyncMock())
+
+        result = await app_module._ensure_codex_submitted(
+            "off-session", "/model", "$99"
+        )
+
+        assert result == "submitted"
+        capture.assert_not_called()
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_echoed_prompt_above_picker_does_not_retry_enter(self, monkeypatch):
+        tail = (
+            "› deploy the change\n\n"
+            "Would you like to proceed?\n"
+            "❯ 1. Yes\n  2. No\n"
+        )
+        run = MagicMock()
+        monkeypatch.setattr(app_module, "capture_pane_recent", MagicMock(return_value=tail))
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+        monkeypatch.setattr(app_module.asyncio, "sleep", AsyncMock())
+
+        result = await app_module._ensure_codex_submitted(
+            "off-session", "deploy the change", "$99"
+        )
+
+        assert result == "submitted"
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_historical_picker_does_not_hide_a_pending_composer(self, monkeypatch):
+        tail = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes\n  2. No\n\n"
+            "› deploy the change\n\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+        run = MagicMock(return_value=MagicMock(returncode=0))
+        monkeypatch.setattr(app_module, "capture_pane_recent", MagicMock(return_value=tail))
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+        monkeypatch.setattr(app_module.asyncio, "sleep", AsyncMock())
+
+        result = await app_module._ensure_codex_submitted(
+            "off-session", "deploy the change", "$99"
+        )
+
+        assert result == "stranded"
+        assert [call.args[0][-1] for call in run.call_args_list] == ["C-m"] * 3
+
+    def test_only_footer_adjacent_prompt_is_the_active_composer(self):
+        pane = (
+            "› old echoed message\n\n• Done.\n\n"
+            "› new pending message\n\n  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+
+        assert app_module._active_codex_composer_text(pane) == "new pending message"
+
+    def test_wrapped_live_composer_is_joined(self):
+        pane = (
+            "• Earlier response.\n\n"
+            "› deploy the dashboard change and verify it\n"
+            "  against the live service\n\n"
+            "  gpt-5.6-sol xhigh · ~/lisa-my · Main [default]\n"
+        )
+
+        assert app_module._active_codex_composer_text(pane) == (
+            "deploy the dashboard change and verify it against the live service"
+        )
+
+    def test_live_cursor_variants_are_safe(self):
+        menu = "Select one\n› 2. Continue\n  3. Stop\n"
+        assert app_module._detect_interactive_prompt(menu) == "selection_prompt"
+        assert app_module._parse_menu_options(menu) == (
+            [(2, "Continue"), (3, "Stop")], 0
+        )
+        draft = "› do not submit this\n\n  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        assert app_module._has_pending_user_input(draft) is True
+
+        picker_after_old_footer = (
+            "› Ask Codex to do anything\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n\n"
+            "Select model\n› 1. gpt-5.6-sol\n  2. gpt-6-astra\n"
+        )
+        assert app_module._detect_interactive_prompt(
+            picker_after_old_footer
+        ) == "selection_prompt"
+
+    def test_historical_menu_cannot_submit_a_live_draft(self):
+        pane = (
+            "Select one\n› 2. Continue\n  3. Stop\n\n"
+            "› do not submit this\n\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+
+        assert app_module._detect_interactive_prompt(pane) is None
+
+    def test_menu_parser_ignores_historical_numbered_lists(self):
+        pane = (
+            "Earlier choices:\n  1. old one\n  2. old two\n  3. old three\n\n"
+            "Choose how to proceed:\n❯ 1. Continue\n  2. Stop\n"
+        )
+
+        assert app_module._parse_menu_options(pane) == (
+            [(1, "Continue"), (2, "Stop")], 0
+        )
+        assert app_module._detect_interactive_prompt(pane) == "selection_prompt"
+
+    def test_numbered_live_draft_is_not_a_menu(self):
+        pane = (
+            "Select one\n› 2. Continue\n  3. Stop\n\n"
+            "› 1. preserve this draft\n\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+
+        assert app_module._has_pending_user_input(pane) is True
+        assert app_module._detect_interactive_prompt(pane) is None
+
+        multiline = (
+            "› 1. keep this draft\n"
+            "  2. do not auto-submit it\n\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+        assert app_module._has_pending_user_input(multiline) is True
+        assert app_module._detect_interactive_prompt(multiline) is None
+
+        cwd_with_spaces = (
+            "› 1. keep this draft\n"
+            "  2. do not auto-submit it\n\n"
+            "  gpt-5.6-sol xhigh · ~/My Project · Main [default]\n"
+        )
+        assert app_module._has_pending_user_input(cwd_with_spaces) is True
+        assert app_module._detect_interactive_prompt(cwd_with_spaces) is None
+
+    def test_live_placeholder_is_an_empty_composer(self):
+        pane = (
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol xhigh · ~/project · Main [default]\n"
+        )
+
+        assert app_module._active_codex_composer_text(pane) == ""
+        assert app_module._has_pending_user_input(pane) is False
+
+
+class TestAutopushModeState:
+    def test_missing_mode_file_fails_closed_to_off(self, tmp_path, monkeypatch):
+        path = tmp_path / "missing-autopush-mode.json"
+        monkeypatch.setattr(app_module, "PROCESS_ROLE", "api")
+        monkeypatch.setattr(app_module, "AUTOPUSH_MODE_FILE", path)
+        monkeypatch.setattr(
+            app_module, "_autopush_mode_store",
+            app_module.LockedJsonStore(path, lambda: {}),
+        )
+        monkeypatch.setattr(
+            app_module, "_autopush_mode_file_stamp",
+            app_module._AUTOPUSH_UNCHECKED_STAMP,
+        )
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        monkeypatch.setattr(app_module, "_autopush_mode", {"session": "full"})
+
+        assert app_module._get_autopush_mode("session") == "off"
+        assert app_module._autopush_mode_state_valid is False
+
+    def test_api_worker_reads_controller_persisted_off_mode(self, tmp_path, monkeypatch):
+        path = tmp_path / "autopush-mode.json"
+        store = app_module.LockedJsonStore(path, lambda: {})
+        store.update(lambda data: data.update({"off-session": "off"}))
+        monkeypatch.setattr(app_module, "PROCESS_ROLE", "api")
+        monkeypatch.setattr(app_module, "AUTOPUSH_MODE_FILE", path)
+        monkeypatch.setattr(app_module, "_autopush_mode_store", store)
+        monkeypatch.setattr(app_module, "_autopush_mode_file_stamp", None)
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        monkeypatch.setattr(app_module, "_autopush_mode", {})
+
+        assert app_module._get_autopush_mode("off-session") == "off"
+        store.update(lambda data: data.update({"off-session": "basic"}))
+        assert app_module._get_autopush_mode("off-session") == "basic"
+
+    def test_corrupt_mode_file_fails_closed_to_off(self, tmp_path, monkeypatch):
+        path = tmp_path / "autopush-mode.json"
+        path.write_text("{not valid json")
+        monkeypatch.setattr(app_module, "PROCESS_ROLE", "api")
+        monkeypatch.setattr(app_module, "AUTOPUSH_MODE_FILE", path)
+        monkeypatch.setattr(
+            app_module, "_autopush_mode_store",
+            app_module.LockedJsonStore(path, lambda: {}),
+        )
+        monkeypatch.setattr(app_module, "_autopush_mode_file_stamp", None)
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        monkeypatch.setattr(app_module, "_autopush_mode", {"session": "full"})
+
+        assert app_module._get_autopush_mode("session") == "off"
+        assert app_module._autopush_mode_state_valid is False
+
+    def test_corrupt_recovery_publishes_fail_closed_snapshot_in_memory(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "autopush-mode.json"
+        path.write_text("{broken")
+        monkeypatch.setattr(app_module, "PROCESS_ROLE", "controller")
+        monkeypatch.setattr(app_module, "AUTOPUSH_MODE_FILE", path)
+        monkeypatch.setattr(
+            app_module, "_autopush_mode_store",
+            app_module.LockedJsonStore(path, lambda: {}),
+        )
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", False)
+        monkeypatch.setattr(app_module, "_autopush_mode", {"chosen": "full"})
+        monkeypatch.setattr(
+            app_module, "get_tmux_sessions",
+            lambda: [{"name": "chosen"}, {"name": "unrelated"}],
+        )
+
+        app_module._save_autopush_mode()
+
+        expected = {"chosen": "full", "unrelated": "off"}
+        assert app_module._autopush_mode == expected
+        assert json.loads(path.read_text()) == expected
+        assert app_module._get_autopush_mode("unrelated") == "off"
+
+    @pytest.mark.asyncio
+    async def test_queued_set_rejects_replaced_generation(self, monkeypatch):
+        name = "generation-race-session"
+        owner_id = "owner-1"
+        old_generation = "a" * 32
+        lifecycle = {
+            "owner_id": owner_id,
+            "generation": old_generation,
+            "desired_state": "running",
+        }
+        app_module._autopush_mode[name] = "basic"
+        app_module._autopush_action_locks.pop(name, None)
+        lock = app_module._autopush_action_lock(name)
+        await lock.acquire()
+        monkeypatch.setattr(
+            app_module, "_strict_session_owner",
+            lambda session, expected="": (owner_id, {})
+            if session == name and expected == owner_id else None,
+        )
+        monkeypatch.setattr(
+            app_module._session_lifecycle, "get", lambda session: dict(lifecycle)
+        )
+        monkeypatch.setattr(app_module, "_save_autopush_mode", MagicMock())
+
+        setting = asyncio.create_task(app_module._controller_dispatch({
+            "op": "autopush_set",
+            "session": name,
+            "mode": "off",
+            "owner_id": owner_id,
+            "generation": old_generation,
+        }))
+        await asyncio.sleep(0)
+        lifecycle["generation"] = "b" * 32
+        lock.release()
+        result = await setting
+
+        try:
+            assert result["_status"] == 404
+            assert app_module._autopush_mode[name] == "basic"
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+    @pytest.mark.asyncio
+    async def test_off_response_waits_for_inflight_auto_action(self, monkeypatch):
+        name = "off-barrier-session"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        app_module._autopush_mode[name] = "basic"
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_save_autopush_mode", MagicMock())
+
+        async def inflight_action():
+            async with app_module._autopush_action_lock(name):
+                entered.set()
+                await release.wait()
+
+        action = asyncio.create_task(inflight_action())
+        await entered.wait()
+        setting = asyncio.create_task(app_module._controller_dispatch({
+            "op": "autopush_set", "session": name, "mode": "off",
+        }))
+        await asyncio.sleep(0)
+        assert not setting.done()
+
+        release.set()
+        await action
+        result = await setting
+
+        try:
+            assert result["ok"] is True
+            assert result["mode"] == "off"
+            assert app_module._get_autopush_mode(name) == "off"
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+    @pytest.mark.asyncio
+    async def test_off_cancels_autonomous_modes_and_blocks_their_sender(self, monkeypatch):
+        name = "off-autonomous-session"
+        away_task = asyncio.create_task(asyncio.sleep(3600))
+        nuts_task = asyncio.create_task(asyncio.sleep(3600))
+        await asyncio.sleep(0)
+        app_module._autopush_mode[name] = "basic"
+        app_module._away_mode_state[name] = {"enabled": True, "task": away_task}
+        app_module._go_nuts_state[name] = {"enabled": True, "task": nuts_task}
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_save_autopush_mode", MagicMock())
+        monkeypatch.setattr(app_module, "_save_autonomous_state", MagicMock())
+
+        try:
+            result = await app_module._controller_dispatch({
+                "op": "autopush_set", "session": name, "mode": "off",
+            })
+            await asyncio.gather(away_task, nuts_task, return_exceptions=True)
+            sender = AsyncMock()
+            monkeypatch.setattr(app_module, "_away_send_prompt_unlocked", sender)
+            await app_module._away_send_prompt(name, "do not send")
+
+            assert result["ok"] is True
+            assert app_module._away_mode_state[name]["enabled"] is False
+            assert app_module._go_nuts_state[name]["enabled"] is False
+            assert away_task.cancelled()
+            assert nuts_task.cancelled()
+            sender.assert_not_awaited()
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._away_mode_state.pop(name, None)
+            app_module._go_nuts_state.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+
+    @pytest.mark.asyncio
+    async def test_off_is_not_acknowledged_without_durable_autonomous_stop(
+        self, monkeypatch
+    ):
+        name = "autonomous-save-failure"
+        app_module._autopush_mode[name] = "basic"
+        app_module._away_mode_state[name] = {"enabled": True, "task": None}
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        mode_save = MagicMock()
+        monkeypatch.setattr(app_module, "_save_autopush_mode", mode_save)
+        monkeypatch.setattr(app_module, "_save_autonomous_state", lambda *_args: False)
+
+        try:
+            result = await app_module._controller_dispatch({
+                "op": "autopush_set", "session": name, "mode": "off",
+            })
+
+            assert result["_status"] == 503
+            assert app_module._autopush_mode[name] == "basic"
+            assert app_module._away_mode_state[name]["enabled"] is False
+            mode_save.assert_not_called()
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._away_mode_state.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+
+class TestAutopushLoginBarrier:
+    @pytest.mark.asyncio
+    async def test_off_during_auth_validation_blocks_login_writes(self, monkeypatch):
+        name = "login-off-race"
+        validation_started = asyncio.Event()
+        release_validation = asyncio.Event()
+        sends = []
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            if fn is app_module._ensure_codex_auth_with_fallback:
+                validation_started.set()
+                await release_validation.wait()
+                return {
+                    "loggedIn": True, "fallbackActive": False,
+                    "activeMode": "chatgpt",
+                }
+            if fn is app_module.subprocess.run:
+                sends.append(args[0])
+                return MagicMock(returncode=0)
+            return fn(*args, **kwargs)
+
+        app_module._autopush_mode[name] = "basic"
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module.asyncio, "to_thread", fake_to_thread)
+        monkeypatch.setattr(app_module, "_save_autopush_mode", MagicMock())
+        monkeypatch.setattr(app_module, "_save_autonomous_state", MagicMock())
+        restart = AsyncMock(return_value=(True, True))
+        monkeypatch.setattr(app_module, "_restart_codex_for_session", restart)
+
+        recovery = asyncio.create_task(app_module._auto_fix_login(
+            name, respect_autopush=True
+        ))
+        await validation_started.wait()
+        setting = await app_module._controller_dispatch({
+            "op": "autopush_set", "session": name, "mode": "off",
+        })
+        release_validation.set()
+        result = await recovery
+
+        try:
+            assert setting["ok"] is True
+            assert result["error"] == "auto-push is Off"
+            assert sends == []
+            restart.assert_not_awaited()
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+
+class TestAutopushSessionBinding:
+    @pytest.mark.asyncio
+    async def test_full_writer_rejects_same_name_replacement(self, monkeypatch):
+        name = "full-replaced"
+        binding = {"session_id": "$old"}
+        run = MagicMock(return_value=MagicMock(returncode=0))
+        app_module._autopush_mode[name] = "full"
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        monkeypatch.setattr(
+            app_module, "_terminal_binding_state", lambda _binding: "replaced"
+        )
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+
+        try:
+            sent = await app_module._simple_watchdog_send_text(
+                name, "keep going", required_modes={"full"},
+                expected_binding=binding,
+            )
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+        assert sent is False
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_autonomous_batch_rejects_same_name_replacement(
+        self, monkeypatch
+    ):
+        name = "autonomous-replaced"
+        binding = {"session_id": "$old"}
+        run = MagicMock(return_value=MagicMock(returncode=0))
+        app_module._autopush_mode[name] = "basic"
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_autopush_mode_state_valid", True)
+        monkeypatch.setattr(
+            app_module, "_terminal_binding_state", lambda _binding: "replaced"
+        )
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+
+        try:
+            sent = await app_module._autopush_tmux_batch(
+                name,
+                [(["tmux", "send-keys", "-t", name, "Enter"], 3)],
+                expected_binding=binding,
+            )
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+
+        assert sent is False
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_autonomous_enable_superseded_by_disable(self, monkeypatch):
+        name = "away-enable-race"
+        resume_started = asyncio.Event()
+        release_resume = asyncio.Event()
+
+        async def delayed_resume(*_args, **_kwargs):
+            resume_started.set()
+            await release_resume.wait()
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            app_module, "_find_session", lambda _name: (0, {"name": name})
+        )
+        monkeypatch.setattr(
+            app_module, "_autopush_identity_matches", lambda *_args: True
+        )
+        monkeypatch.setattr(app_module, "_get_autopush_mode", lambda _name: "basic")
+        monkeypatch.setattr(app_module, "_resume_parked_session", delayed_resume)
+        monkeypatch.setattr(app_module, "_save_autonomous_state", lambda *_args: True)
+        app_module._away_mode_state.pop(name, None)
+        app_module._go_nuts_state.pop(name, None)
+        app_module._autopush_action_locks.pop(name, None)
+        app_module._autonomous_toggle_revision.pop(name, None)
+
+        enabling = asyncio.create_task(
+            app_module._away_toggle_local(name, True)
+        )
+        await resume_started.wait()
+        disabled = await app_module._away_toggle_local(name, False)
+        release_resume.set()
+        enabled = await enabling
+
+        try:
+            assert disabled["ok"] is True
+            assert enabled["_status"] == 409
+            assert not app_module._away_mode_state.get(name, {}).get("enabled")
+        finally:
+            app_module._away_mode_state.pop(name, None)
+            app_module._go_nuts_state.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)
+            app_module._autonomous_toggle_revision.pop(name, None)
+
+
+class TestCacheKeepaliveSafety:
+    @pytest.mark.asyncio
+    async def test_expired_cache_never_sends_a_keepalive(self, monkeypatch):
+        import asyncio as _asyncio
+
+        sleeps = 0
+
+        async def one_iteration(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps <= 2:
+                return
+            raise _asyncio.CancelledError()
+
+        monkeypatch.setattr(app_module.asyncio, "sleep", one_iteration)
+        monkeypatch.setattr(
+            app_module, "get_tmux_sessions", lambda: [{"name": "cache-session"}]
+        )
+        monkeypatch.setattr(
+            app_module, "_get_autopush_mode", lambda _name: "basicplus"
+        )
+        monkeypatch.setattr(
+            app_module, "_codex_session_facts",
+            lambda _name: {
+                "cache_ttl": 1800, "last_turn_end": 100,
+                "detect_sure": True,
+            },
+        )
+        monkeypatch.setattr(app_module.time, "time", lambda: 2000)
+        sender = AsyncMock(return_value=True)
+        monkeypatch.setattr(app_module, "_simple_watchdog_send_text", sender)
+
+        with pytest.raises(_asyncio.CancelledError):
+            await app_module._cache_keepalive_loop()
+
+        sender.assert_not_awaited()
+
+
+@pytest.mark.usefixtures("owned_autopush_runtime")
 class TestAutoResponderLoop:
     """Tests for _auto_responder_loop (lines 2571-2612)."""
 
@@ -4296,35 +9103,166 @@ class TestAutoResponderLoop:
 
         async def counting_sleep(secs):
             sleep_count[0] += 1
-            # Exit after the initial delay + one interval sleep
-            if sleep_count[0] >= 2:
+            # Exit after the initial delay + one complete polling iteration.
+            if sleep_count[0] >= 3:
                 raise _asyncio.CancelledError()
 
         mock_capture = MagicMock(returncode=0, stdout="❯ 1. Yes\n2. No\nWould you like to proceed")
         mock_enter = MagicMock(returncode=0, stdout="")
-
-        call_seq = [0]
+        sent = []
 
         async def mock_to_thread(fn, *args, **kwargs):
-            call_seq[0] += 1
-            # First call = capture-pane, second = send-keys Enter
-            if call_seq[0] == 1:
+            if fn is _app._terminal_binding:
+                return fn(*args, **kwargs)
+            if fn is _app._terminal_binding_state:
+                return "current"
+            if fn is _app.subprocess.run and args[0][1] == "capture-pane":
                 return mock_capture
+            if fn is _app.subprocess.run and args[0][1] == "send-keys":
+                sent.append(args[0])
             return mock_enter
 
         _app._auto_respond_cooldown.clear()
         _app._auto_respond_log.clear()
         try:
-            with patch("app.get_tmux_sessions", return_value=[{"name": "ar-sess"}]), \
+            with patch("app.get_tmux_sessions", return_value=[{
+                     "name": "ar-sess", "owner_id": "admin",
+                 }]), \
                  patch("app.asyncio.sleep", counting_sleep), \
                  patch("app.asyncio.to_thread", mock_to_thread), \
                  patch("app._detect_interactive_prompt", return_value="plan_approval"), \
+                 patch("app._llm_pick_menu_option", new=AsyncMock(return_value=None)), \
                  patch("app.time.time", return_value=1000.0):
                 with pytest.raises(_asyncio.CancelledError):
                     await _app._auto_responder_loop()
         finally:
             _app._auto_respond_cooldown.clear()
             _app._auto_respond_log.clear()
+
+        assert sent and sent[-1][-1] == "Enter"
+
+    @pytest.mark.asyncio
+    async def test_switching_off_while_picker_awaits_aborts_selection(
+        self, monkeypatch, owned_autopush_runtime
+    ):
+        import asyncio as _asyncio
+
+        name = "off-race-session"
+        owned_autopush_runtime(name)
+        sleep_count = 0
+        picker_calls = []
+
+        async def one_iteration_sleep(_secs):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count <= 2:
+                return
+            raise _asyncio.CancelledError()
+
+        async def switch_off_during_pick(*_args, **_kwargs):
+            picker_calls.append(name)
+            app_module._autopush_mode[name] = "off"
+            return 1
+
+        def tmux(command, **_kwargs):
+            if command[1] == "capture-pane":
+                return MagicMock(
+                    returncode=0,
+                    stdout="Would you like to proceed?\n❯ 1. Yes\n  2. No\n",
+                )
+            return MagicMock(returncode=0, stdout="")
+
+        app_module._autopush_mode[name] = "basic"
+        app_module._auto_respond_cooldown.pop(name, None)
+        app_module._auto_respond_log.clear()
+        app_module._autopush_action_locks.pop(name, None)
+        run = MagicMock(side_effect=tmux)
+        monkeypatch.setattr(app_module, "get_tmux_sessions", lambda: [{"name": name}])
+        monkeypatch.setattr(
+            app_module, "_terminal_binding",
+            lambda *_args: {"session_id": "$42"},
+        )
+        monkeypatch.setattr(
+            app_module, "_terminal_binding_state", lambda _binding: "current"
+        )
+        monkeypatch.setattr(app_module.asyncio, "sleep", one_iteration_sleep)
+        monkeypatch.setattr(app_module, "_llm_pick_menu_option", switch_off_during_pick)
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+        monkeypatch.setattr(app_module._session_lifecycle, "touch", MagicMock())
+
+        try:
+            with pytest.raises(_asyncio.CancelledError):
+                await app_module._auto_responder_loop()
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._auto_respond_cooldown.pop(name, None)
+            app_module._auto_respond_log.clear()
+            app_module._autopush_action_locks.pop(name, None)
+
+        assert not [
+            call for call in run.call_args_list
+            if call.args and call.args[0][1:3] == ["send-keys", "-t"]
+        ]
+        assert picker_calls == [name]
+
+    @pytest.mark.asyncio
+    async def test_replaced_same_name_session_aborts_selection(self, monkeypatch):
+        import asyncio as _asyncio
+
+        name = "replaced-session"
+        sleep_count = 0
+
+        async def one_iteration_sleep(_secs):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count <= 2:
+                return
+            raise _asyncio.CancelledError()
+
+        def tmux(command, **_kwargs):
+            if command[1] == "capture-pane":
+                return MagicMock(
+                    returncode=0,
+                    stdout="Would you like to proceed?\n❯ 1. Yes\n  2. No\n",
+                )
+            return MagicMock(returncode=0, stdout="")
+
+        app_module._autopush_mode[name] = "basic"
+        app_module._auto_respond_cooldown.pop(name, None)
+        app_module._auto_respond_log.clear()
+        app_module._autopush_action_locks.pop(name, None)
+        run = MagicMock(side_effect=tmux)
+        monkeypatch.setattr(
+            app_module, "get_tmux_sessions",
+            lambda: [{"name": name, "owner_id": "admin"}],
+        )
+        monkeypatch.setattr(
+            app_module, "_terminal_binding",
+            lambda *_args: {"session_id": "$old"},
+        )
+        monkeypatch.setattr(
+            app_module, "_terminal_binding_state", lambda _binding: "replaced"
+        )
+        monkeypatch.setattr(app_module.asyncio, "sleep", one_iteration_sleep)
+        monkeypatch.setattr(
+            app_module, "_llm_pick_menu_option", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(app_module.subprocess, "run", run)
+        monkeypatch.setattr(app_module._session_lifecycle, "touch", MagicMock())
+
+        try:
+            with pytest.raises(_asyncio.CancelledError):
+                await app_module._auto_responder_loop()
+        finally:
+            app_module._autopush_mode.pop(name, None)
+            app_module._auto_respond_cooldown.pop(name, None)
+            app_module._auto_respond_log.clear()
+            app_module._autopush_action_locks.pop(name, None)
+
+        assert not [
+            call for call in run.call_args_list
+            if call.args and call.args[0][1:3] == ["send-keys", "-t"]
+        ]
 
     @pytest.mark.asyncio
     async def test_cooldown_skips_session(self):
@@ -4527,7 +9465,7 @@ class TestAwayModeWorkerContinuousLoop:
     """Tests for the phase 4+ continuous loop in _away_mode_worker (lines 3538-3594)."""
 
     @pytest.mark.asyncio
-    async def test_one_cycle_then_disabled(self):
+    async def test_one_cycle_then_disabled(self, owned_autopush_runtime):
         """Lines 3538-3594: runs one full ping cycle then exits when disabled."""
         import app as _app
 
@@ -4537,6 +9475,8 @@ class TestAwayModeWorkerContinuousLoop:
 
         async def counting_sleep(secs):
             sleep_count[0] += 1
+            if sleep_count[0] > 20:
+                pytest.fail("Away worker exceeded one mocked cycle")
             if secs == 5:  # sleep after successful cycle → disable
                 state["enabled"] = False
 
@@ -4550,7 +9490,9 @@ class TestAwayModeWorkerContinuousLoop:
         async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
             send_calls[0] += 1
 
-        async def noop_ensure(session_name, log_fn=None, state=None):
+        async def noop_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
+            assert kwargs["autopush_guard"] is True
             return True
 
         async def mock_activity(session_name):
@@ -4564,7 +9506,7 @@ class TestAwayModeWorkerContinuousLoop:
             "step": 0, "step_name": "", "started_at": 0.0,
             "log": [], "report": "", "task": None,
         }
-        _app._away_mode_state["cont-away"] = state
+        owned_autopush_runtime("cont-away", state)
 
         try:
             with patch("app._away_phase_study", noop_phase), \
@@ -4577,7 +9519,7 @@ class TestAwayModeWorkerContinuousLoop:
                  patch("app._ensure_codex_running", noop_ensure), \
                  patch("app._away_send_and_wait", mock_send_wait), \
                  patch("app._save_autonomous_state"):
-                await _app._away_mode_worker("cont-away")
+                await asyncio.wait_for(_app._away_mode_worker("cont-away"), timeout=2)
         finally:
             _app._away_mode_state.pop("cont-away", None)
 
@@ -4587,12 +9529,16 @@ class TestAwayModeWorkerContinuousLoop:
         assert state["task"] is None
 
     @pytest.mark.asyncio
-    async def test_claude_dead_stops_loop(self):
+    async def test_claude_dead_stops_loop(self, owned_autopush_runtime):
         """Lines 3554-3559: Codex dead and can't restart → stop."""
         import app as _app
 
+        sleep_count = [0]
+
         async def counting_sleep(secs):
-            pass  # all sleeps are instant
+            sleep_count[0] += 1
+            if sleep_count[0] > 20:
+                pytest.fail("Away worker did not stop after failed Codex recovery")
 
         async def mock_activity(session_name):
             return {"status": "idle"}
@@ -4605,7 +9551,8 @@ class TestAwayModeWorkerContinuousLoop:
             time_idx[0] += 1
             return val
 
-        async def dead_ensure(session_name, log_fn=None, state=None):
+        async def dead_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return False  # Codex dead, can't restart
 
         async def noop_phase(session_name, state):
@@ -4616,7 +9563,7 @@ class TestAwayModeWorkerContinuousLoop:
             "step": 0, "step_name": "", "started_at": 0.0,
             "log": [], "report": "", "task": None,
         }
-        _app._away_mode_state["dead-away"] = state
+        owned_autopush_runtime("dead-away", state)
 
         try:
             with patch("app._away_phase_study", noop_phase), \
@@ -4628,7 +9575,7 @@ class TestAwayModeWorkerContinuousLoop:
                  patch("app.time.time", mock_time), \
                  patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
-                await _app._away_mode_worker("dead-away")
+                await asyncio.wait_for(_app._away_mode_worker("dead-away"), timeout=2)
         finally:
             _app._away_mode_state.pop("dead-away", None)
 
@@ -4640,14 +9587,18 @@ class TestGoNutsModeWorkerContinuousLoop:
     """Tests for the phase 4+ continuous loop in _go_nuts_mode_worker (lines 3883-3958)."""
 
     @pytest.mark.asyncio
-    async def test_one_cycle_then_disabled(self):
+    async def test_one_cycle_then_disabled(self, owned_autopush_runtime):
         """Lines 3883-3958: go-nuts runs one full build cycle then exits."""
         import app as _app
 
         time_values = [0.0, 91.0, 91.0]
         time_idx = [0]
+        sleep_count = [0]
 
         async def counting_sleep(secs):
+            sleep_count[0] += 1
+            if sleep_count[0] > 20:
+                pytest.fail("Go Nuts worker exceeded one mocked cycle")
             if secs == 5:
                 state["enabled"] = False
 
@@ -4661,7 +9612,9 @@ class TestGoNutsModeWorkerContinuousLoop:
         async def mock_send_wait(session_name, prompt, state, step_name, timeout=900):
             send_calls[0] += 1
 
-        async def noop_ensure(session_name, log_fn=None, state=None):
+        async def noop_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
+            assert kwargs["autopush_guard"] is True
             return True
 
         async def mock_activity(session_name):
@@ -4675,7 +9628,7 @@ class TestGoNutsModeWorkerContinuousLoop:
             "step": 0, "step_name": "", "started_at": 0.0,
             "log": [], "report": "", "task": None,
         }
-        _app._go_nuts_state["cont-gn"] = state
+        owned_autopush_runtime("cont-gn", state, mode="gonuts")
 
         try:
             with patch("app._go_nuts_phase_discover", noop_phase), \
@@ -4688,7 +9641,7 @@ class TestGoNutsModeWorkerContinuousLoop:
                  patch("app._ensure_codex_running", noop_ensure), \
                  patch("app._go_nuts_send_and_wait", mock_send_wait), \
                  patch("app._save_autonomous_state"):
-                await _app._go_nuts_mode_worker("cont-gn")
+                await asyncio.wait_for(_app._go_nuts_mode_worker("cont-gn"), timeout=2)
         finally:
             _app._go_nuts_state.pop("cont-gn", None)
 
@@ -4698,12 +9651,16 @@ class TestGoNutsModeWorkerContinuousLoop:
         assert state["task"] is None
 
     @pytest.mark.asyncio
-    async def test_claude_dead_stops_loop(self):
+    async def test_claude_dead_stops_loop(self, owned_autopush_runtime):
         """Go-nuts: Codex dead → stops loop."""
         import app as _app
 
+        sleep_count = [0]
+
         async def counting_sleep(secs):
-            pass
+            sleep_count[0] += 1
+            if sleep_count[0] > 20:
+                pytest.fail("Go Nuts worker did not stop after failed Codex recovery")
 
         time_idx = [0]
         time_vals = [0.0, 91.0]
@@ -4713,7 +9670,8 @@ class TestGoNutsModeWorkerContinuousLoop:
             time_idx[0] += 1
             return val
 
-        async def dead_ensure(session_name, log_fn=None, state=None):
+        async def dead_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_owner_id"] == "admin"
             return False
 
         async def mock_activity(session_name):
@@ -4727,7 +9685,7 @@ class TestGoNutsModeWorkerContinuousLoop:
             "step": 0, "step_name": "", "started_at": 0.0,
             "log": [], "report": "", "task": None,
         }
-        _app._go_nuts_state["dead-gn"] = state
+        owned_autopush_runtime("dead-gn", state, mode="gonuts")
 
         try:
             with patch("app._go_nuts_phase_discover", noop_phase), \
@@ -4739,7 +9697,7 @@ class TestGoNutsModeWorkerContinuousLoop:
                  patch("app.time.time", mock_time), \
                  patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
-                await _app._go_nuts_mode_worker("dead-gn")
+                await asyncio.wait_for(_app._go_nuts_mode_worker("dead-gn"), timeout=2)
         finally:
             _app._go_nuts_state.pop("dead-gn", None)
 
@@ -4750,7 +9708,7 @@ class TestWatchdogCheckSession:
     """Tests for _watchdog_check_session (lines 2774-2882)."""
 
     @pytest.mark.asyncio
-    async def test_empty_pane_returns_early(self):
+    async def test_empty_pane_returns_early(self, owned_autopush_runtime):
         """Lines 2775-2779: empty pane → return immediately."""
         import logging
 
@@ -4758,13 +9716,14 @@ class TestWatchdogCheckSession:
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
+        owned_autopush_runtime("empty-sess", state)
 
         with patch("app.asyncio.to_thread", return_value="   "):
             await _app._watchdog_check_session("empty-sess", state, "away", wlog)
         # No assertion needed — function returned without error
 
     @pytest.mark.asyncio
-    async def test_new_content_resets_snapshot(self):
+    async def test_new_content_resets_snapshot(self, owned_autopush_runtime):
         """Lines 2781-2790: new content hash → reset snapshot, return."""
         import logging
 
@@ -4772,6 +9731,7 @@ class TestWatchdogCheckSession:
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
+        owned_autopush_runtime("snap-sess", state)
 
         _app._watchdog_snapshots.pop("snap-sess", None)
         try:
@@ -4785,7 +9745,7 @@ class TestWatchdogCheckSession:
             _app._watchdog_snapshots.pop("snap-sess", None)
 
     @pytest.mark.asyncio
-    async def test_stall_below_threshold_returns_early(self):
+    async def test_stall_below_threshold_returns_early(self, owned_autopush_runtime):
         """Lines 2793-2795: stall detected but < _STALL_THRESHOLD → return."""
         import logging
 
@@ -4793,6 +9753,7 @@ class TestWatchdogCheckSession:
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
+        owned_autopush_runtime("thresh-sess", state)
 
         # Pre-seed a snapshot with same content hash
         import hashlib
@@ -4814,7 +9775,7 @@ class TestWatchdogCheckSession:
             _app._watchdog_snapshots.pop("thresh-sess", None)
 
     @pytest.mark.asyncio
-    async def test_stall_llm_says_stuck_triggers_nudge(self):
+    async def test_stall_llm_says_stuck_triggers_nudge(self, owned_autopush_runtime):
         """Lines 2801-2879: LLM says STUCK → nudge sent."""
         import hashlib
         import logging
@@ -4823,6 +9784,7 @@ class TestWatchdogCheckSession:
 
         wlog = logging.getLogger("watchdog-test")
         state = {"enabled": True, "log": []}
+        owned_autopush_runtime("nudge-sess", state)
 
         content = "stuck terminal output"
         content_hash = hashlib.md5(content.encode()).hexdigest()
@@ -4835,14 +9797,16 @@ class TestWatchdogCheckSession:
 
         nudge_called = [False]
 
-        async def mock_send_prompt(session_name, prompt):
+        async def mock_send_prompt(session_name, prompt, *, expected_binding=None):
+            assert expected_binding["owner_id"] == "admin"
+            assert expected_binding["session_id"] == "$99"
             nudge_called[0] = True
 
         try:
             with patch("app.asyncio.to_thread", return_value=content), \
                  patch("app.time.time", return_value=1000.0), \
                  patch("app._STALL_THRESHOLD", 10), \
-                 patch("app._async_is_claude_running", return_value=True), \
+                 patch("app._async_is_codex_running", return_value=True), \
                  patch("app.llm_call", return_value="STUCK"), \
                  patch("app.async_detect_activity",
                        return_value={"status": "idle"}), \
@@ -4860,7 +9824,7 @@ class TestWatchdogRestartMode:
     """Tests for _watchdog_restart_mode (lines 2887-2950)."""
 
     @pytest.mark.asyncio
-    async def test_away_mode_restart_launches_continuous_loop(self):
+    async def test_away_mode_restart_launches_continuous_loop(self, owned_autopush_runtime):
         """Lines 2887-2950: restart cancels old task, sends unstick, creates new task."""
         import asyncio as _asyncio
         import logging
@@ -4879,28 +9843,41 @@ class TestWatchdogRestartMode:
             "phase": 2, "phase_name": "Phase 2",
             "task": old_task,
         }
-        _app._away_mode_state["restart-test"] = state
+        binding = owned_autopush_runtime("restart-test", state)
 
         send_calls = [0]
 
-        async def mock_send_prompt(session_name, prompt):
+        async def mock_send_prompt(session_name, prompt, **kwargs):
+            assert kwargs["expected_binding"] == binding
             send_calls[0] += 1
 
-        async def mock_ensure(session_name, log_fn=None, state=None):
+        async def mock_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_binding"] == binding
+            assert kwargs["expected_owner_id"] == "admin"
+            assert kwargs["autopush_guard"] is True
             return True
 
         async def instant_continuous(session_name):
             pass
 
+        async def mock_to_thread(fn, *args, **kwargs):
+            if fn is _app._terminal_binding_state:
+                return fn(*args, **kwargs)
+            return MagicMock()
+
         try:
-            with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
+            with patch("app.asyncio.to_thread", mock_to_thread), \
                  patch("app.asyncio.sleep", return_value=None), \
+                 patch("app._get_autopush_mode", return_value="basic"), \
+                 patch("app._autopush_tmux_batch", new=AsyncMock(return_value=True)), \
                  patch("app._ensure_codex_running", mock_ensure), \
                  patch("app._away_send_prompt", mock_send_prompt), \
                  patch("app._away_mode_continuous_loop", instant_continuous), \
                  patch("app._save_autonomous_state"), \
                  patch("app.asyncio.wait_for", side_effect=_asyncio.TimeoutError()):
                 await _app._watchdog_restart_mode("restart-test", state, "away", wlog)
+            if state.get("task"):
+                await asyncio.wait_for(state["task"], timeout=2)
         finally:
             _app._away_mode_state.pop("restart-test", None)
 
@@ -4909,7 +9886,7 @@ class TestWatchdogRestartMode:
         assert state["enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_restart_codex_dead_sets_disabled(self):
+    async def test_restart_codex_dead_sets_disabled(self, owned_autopush_runtime):
         """If Codex cannot be restarted, the autonomous mode is disabled."""
         import logging
 
@@ -4922,14 +9899,17 @@ class TestWatchdogRestartMode:
             "started_at": 0.0, "step": 0,
             "task": None,
         }
-        _app._away_mode_state["restart-dead"] = state
+        binding = owned_autopush_runtime("restart-dead", state)
 
-        async def dead_ensure(session_name, log_fn=None, state=None):
+        async def dead_ensure(session_name, log_fn=None, state=None, **kwargs):
+            assert kwargs["expected_binding"] == binding
             return False
 
         try:
             with patch("app.asyncio.to_thread", new_callable=AsyncMock), \
                  patch("app.asyncio.sleep", return_value=None), \
+                 patch("app._get_autopush_mode", return_value="basic"), \
+                 patch("app._autopush_tmux_batch", new=AsyncMock(return_value=True)), \
                  patch("app._ensure_codex_running", dead_ensure), \
                  patch("app._save_autonomous_state"):
                 await _app._watchdog_restart_mode("restart-dead", state, "away", wlog)
@@ -4937,3 +9917,65 @@ class TestWatchdogRestartMode:
             _app._away_mode_state.pop("restart-dead", None)
 
         assert state["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_off_during_restart_blocks_later_keys_and_resurrection(
+        self, monkeypatch, owned_autopush_runtime
+    ):
+        import logging
+
+        name = "restart-off-race"
+        state = {
+            "enabled": True, "log": [], "started_at": 0.0,
+            "step": 0, "task": None,
+        }
+        binding = owned_autopush_runtime(name, state)
+        first_key_sent = asyncio.Event()
+        release_restart = asyncio.Event()
+        key_calls = []
+
+        async def fenced_batch(session_name, commands, *, expected_binding=None):
+            assert expected_binding == binding
+            async with app_module._autopush_action_lock(session_name):
+                if app_module._get_autopush_mode(session_name) == "off":
+                    return False
+                key_calls.extend(commands)
+                first_key_sent.set()
+                return True
+
+        async def controlled_sleep(seconds):
+            if seconds == 3:
+                await asyncio.wait_for(release_restart.wait(), timeout=2)
+
+        app_module._away_mode_state[name] = state
+        app_module._autopush_mode[name] = "basic"
+        app_module._autopush_action_locks.pop(name, None)
+        monkeypatch.setattr(app_module, "_autopush_tmux_batch", fenced_batch)
+        monkeypatch.setattr(app_module.asyncio, "sleep", controlled_sleep)
+        monkeypatch.setattr(app_module, "_save_autopush_mode", MagicMock())
+        monkeypatch.setattr(app_module, "_save_autonomous_state", MagicMock())
+        ensure = AsyncMock(return_value=True)
+        monkeypatch.setattr(app_module, "_ensure_codex_running", ensure)
+
+        restarting = asyncio.create_task(app_module._watchdog_restart_mode(
+            name, state, "away", logging.getLogger("watchdog-test")
+        ))
+        try:
+            await asyncio.wait_for(first_key_sent.wait(), timeout=2)
+            setting = await app_module._controller_dispatch({
+                "op": "autopush_set", "session": name, "mode": "off",
+            })
+            release_restart.set()
+            await asyncio.wait_for(restarting, timeout=2)
+            assert setting["ok"] is True
+            assert len(key_calls) == 1
+            assert state["enabled"] is False
+            ensure.assert_not_awaited()
+        finally:
+            release_restart.set()
+            if not restarting.done():
+                restarting.cancel()
+            await asyncio.gather(restarting, return_exceptions=True)
+            app_module._away_mode_state.pop(name, None)
+            app_module._autopush_mode.pop(name, None)
+            app_module._autopush_action_locks.pop(name, None)

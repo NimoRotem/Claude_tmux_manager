@@ -101,6 +101,15 @@ process.stdout.write(JSON.stringify({
   diff_append: ctx._lineDiff(['a','b','c'], ['a','b','c','d']),
   diff_same: ctx._lineDiff(['a','b'], ['a','b']),
   diff_middle: ctx._lineDiff(['a','b','c'], ['a','B','c']),
+  prompt_flags: ctx._userPromptLineFlags([
+    '› A submitted message that wraps',
+    '  onto another terminal row',
+    '',
+    '• The assistant reply stays white',
+    '› Use /skills to list available skills',
+    '',
+    '  gpt-5.6-sol max · /tmp/termqa',
+  ]),
 }));
 """
 
@@ -206,6 +215,51 @@ def test_raw_view_passes_the_pane_through_untouched():
     assert not any("esc to interrupt" in l for l in out["body"])
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 12])
+def test_clean_view_hides_usage_reset_notice_without_eating_following_prose(count):
+    noun = "reset" if count == 1 else "resets"
+    notice = f"• You have {count} usage limit {noun} available. Run /usage to use one."
+    before = "• The requested change is ready."
+    after = "  This explanation should stay visible."
+    out = _run(f"{before}\n{notice}\n{after}")
+    assert out["clean"] == [before, after]
+
+
+@pytest.mark.parametrize("notice", [
+    "• You have 2 usage limit resets available.\n  Run /usage to use one.",
+    "• You have 2 usage limit\n  resets available. Run /usage\n  to use one.",
+    "• You have 2 usage limit re\nsets available. Run /us\nage to use one.",
+    "\x1b[33m• You have 2 usage limit resets available.\x1b[0m\r\n"
+    "  Run \x1b]8;;https://example.test\x1b\\/usage\x1b]8;;\x1b\\ to use one.\r",
+])
+def test_clean_view_hides_wrapped_and_ansi_usage_reset_notices(notice):
+    out = _run(f"• A real reply\n{notice}\n• Another real reply")
+    assert out["clean"] == ["• A real reply", "• Another real reply"]
+
+
+def test_raw_view_keeps_the_usage_reset_notice():
+    notice = "\x1b[33m• You have 2 usage limit resets available.\r\n  Run /usage to use one.\x1b[0m"
+    out = _run(notice, clean_view=False)
+    assert "\n".join(out["clean"]) == notice
+
+
+def test_clean_view_keeps_usage_limit_discussion_and_quoted_notices():
+    notice = "You have 2 usage limit resets available. Run /usage to use one."
+    rows = [
+        f"› Please hide this notice: {notice}",
+        "• You have 2 usage limit resets available, so you can resume work.",
+        f"• You have 2 usage limit resets available. Run /usage to use one. This is an example.",
+        f"> • {notice}",
+        f"  {notice}",
+        "  ```text",
+        f"• {notice}",
+        "  ```",
+        "• That is the message to hide.",
+    ]
+    out = _run("\n".join(rows))
+    assert out["clean"] == rows
+
+
 def test_flow_mode_rejoins_a_url_cut_at_the_margin(rendered):
     joined = "\n".join(rendered["flow"])
     assert "edit?gid=1321488188" in joined
@@ -235,3 +289,10 @@ def test_the_paint_rewrites_only_what_moved(rendered):
     assert rendered["diff_append"] == {"from": 3, "remove": 0, "insert": 1}
     assert rendered["diff_same"] == {"from": 2, "remove": 0, "insert": 0}
     assert rendered["diff_middle"] == {"from": 1, "remove": 1, "insert": 1}
+
+
+def test_submitted_user_messages_get_the_green_terminal_style(rendered):
+    assert rendered["prompt_flags"] == [True, True, False, False, False, False, False]
+    source = APP.read_text()
+    assert ".raw-output .tl-user-prompt{color:#3fb950;font-weight:600}" in source
+    assert '<span class="tl-user-prompt">' in source
