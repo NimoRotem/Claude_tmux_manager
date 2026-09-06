@@ -35,6 +35,7 @@ from app import (
     _check_token,
     _detect_interactive_prompt,
     _find_session,
+    _fetch_codex_model_catalog,
     _is_valid_session_name,
     _login_attempts,
     _make_token,
@@ -45,6 +46,83 @@ from app import (
     get_session_cwd,
     get_tmux_sessions,
 )
+
+
+class TestCodexModelCatalog:
+    @patch("app.subprocess.run")
+    def test_prefers_account_catalog_and_filters_hidden_models(self, run):
+        run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"models": [
+                {
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "visibility": "list",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"}, {"effort": "max"}, {"effort": "ultra"},
+                    ],
+                },
+                {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide"},
+                {"slug": "gpt-5.3-codex-spark", "display_name": "GPT-5.3-Codex-Spark", "visibility": "list"},
+            ]}),
+        )
+
+        assert _fetch_codex_model_catalog() == (
+            [
+                ["gpt-6-astra", "GPT-6-Astra"],
+                ["gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"],
+            ],
+            {"gpt-6-astra": ["low", "max", "ultra"]},
+        )
+        run.assert_called_once_with(
+            ["codex", "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    @patch("app.subprocess.run")
+    def test_falls_back_to_bundled_catalog(self, run):
+        run.side_effect = [
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps({"models": [
+                    {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list"},
+                ]}),
+            ),
+        ]
+
+        assert _fetch_codex_model_catalog() == (
+            [["gpt-5.6-sol", "GPT-5.6-Sol"]],
+            {},
+        )
+        assert [call.args[0] for call in run.call_args_list] == [
+            ["codex", "debug", "models"],
+            ["codex", "debug", "models", "--bundled"],
+        ]
+
+    def test_startup_preserves_existing_codex_preferences(self, tmp_path):
+        import app
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            'model = "gpt-6-astra"\n'
+            'model_reasoning_effort = "ultra"\n'
+            'sandbox_mode = "workspace-write"\n'
+            'approval_policy = "on-request"\n'
+        )
+
+        with patch("app.CODEX_HOME", codex_home):
+            app._restore_default_model_setting()
+
+        parsed = app.tomllib.loads(config.read_text())
+        assert parsed["model"] == "gpt-6-astra"
+        assert parsed["model_reasoning_effort"] == "ultra"
+        assert parsed["sandbox_mode"] == "workspace-write"
+        assert parsed["approval_policy"] == "on-request"
 
 # ─── Auth Token Tests ───
 
@@ -488,7 +566,11 @@ class TestGetTmuxSessions:
     def test_parses_standard_output(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="main:3:1700000000:1\nwork:1:1700001000:0\n"
+            stdout=(
+                "main:3:1700000000:1:::::$1\n"
+                "work:1:1700001000:0:::::$2\n"
+            ),
+            stderr="",
         )
         sessions = get_tmux_sessions()
         assert len(sessions) == 2
@@ -519,24 +601,202 @@ class TestGetTmuxSessions:
 
     @patch("app.subprocess.run")
     def test_partial_fields(self, mock_run):
-        """Session line with fewer fields than expected."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="lonely\n")
+        """A truncated successful response is not an authoritative empty list."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="lonely\n", stderr="")
         sessions = get_tmux_sessions()
-        assert len(sessions) == 1
-        assert sessions[0]["name"] == "lonely"
-        assert sessions[0]["windows"] == "?"
-        assert sessions[0]["created"] == ""
-        assert sessions[0]["attached"] is False
+        assert sessions == []
 
     @patch("app.subprocess.run")
     def test_session_name_with_colons(self, mock_run):
         """Session name containing colons splits correctly (only first 4 parts used)."""
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="my:session:2:1700000000:0\n"
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="my:session:2:1700000000:0\n", stderr="")
         sessions = get_tmux_sessions()
-        # parts[0] = "my", parts[1] = "session", parts[2] = "2", parts[3] = "1700000000"
-        assert sessions[0]["name"] == "my"
+        assert sessions == []
+
+    @patch("app._load_session_owners", return_value={"managed": "u_test"})
+    @patch("app.subprocess.run")
+    def test_valid_managed_session_bypasses_process_visibility_cache(
+        self, mock_run, mock_owners
+    ):
+        import app as app_module
+
+        generation = "a" * 32
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=f"managed:1:1700000000:0:0:u_test:1:{generation}:$7\n",
+            stderr="",
+        )
+        lifecycle = {
+            "sessions": {
+                "managed": {
+                    "managed": True,
+                    "owner_id": "u_test",
+                    "generation": generation,
+                    "desired_state": "running",
+                    "restore_on_startup": True,
+                    "parked": False,
+                }
+            }
+        }
+        with patch.object(app_module._session_lifecycle, "snapshot", return_value=lifecycle), \
+             patch("app._session_is_codex", return_value=False) as classifier:
+            sessions = get_tmux_sessions()
+        assert [row["name"] for row in sessions] == ["managed"]
+        assert sessions[0]["incarnation"]
+        classifier.assert_not_called()
+
+    @patch("app._load_session_owners", return_value={"managed": "u_test"})
+    @patch("app.subprocess.run")
+    def test_quarantined_managed_session_stays_hidden(self, mock_run, mock_owners):
+        import app as app_module
+
+        generation = "b" * 32
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=f"managed:1:1700000000:0:1:u_test:1:{generation}:$8\n",
+            stderr="",
+        )
+        lifecycle = {
+            "sessions": {
+                "managed": {
+                    "managed": True,
+                    "owner_id": "u_test",
+                    "generation": generation,
+                    "desired_state": "running",
+                    "restore_on_startup": True,
+                    "parked": False,
+                }
+            }
+        }
+        with patch.object(app_module._session_lifecycle, "snapshot", return_value=lifecycle):
+            inventory = app_module._tmux_inventory_snapshot()
+        assert inventory["sessions"] == []
+        assert inventory["missing_expected"] == ["managed"]
+
+    @patch("app._load_session_owners", return_value={"managed": "u_test"})
+    @patch("app.subprocess.run")
+    def test_valid_live_parked_session_is_authoritative_virtual(
+        self, mock_run, mock_owners
+    ):
+        import app as app_module
+
+        generation = "e" * 32
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=f"managed:1:1700000000:0:0:u_test:1:{generation}:$9\n",
+            stderr="",
+        )
+        lifecycle = {
+            "sessions": {
+                "managed": {
+                    "managed": True,
+                    "owner_id": "u_test",
+                    "generation": generation,
+                    "desired_state": "parked",
+                    "restore_on_startup": True,
+                    "parked": True,
+                    "parked_at": 1700000001,
+                }
+            }
+        }
+        with patch.object(app_module._session_lifecycle, "snapshot", return_value=lifecycle):
+            inventory = app_module._tmux_inventory_snapshot()
+        assert inventory["authoritative"] is True
+        assert [(row["name"], row["runtime_state"]) for row in inventory["sessions"]] == [
+            ("managed", "parked")
+        ]
+
+    @patch("app.subprocess.run")
+    def test_inventory_reports_errors_as_non_authoritative(self, mock_run):
+        import app as app_module
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="permission denied")
+        inventory = app_module._tmux_inventory_snapshot()
+        assert inventory["state"] == "error"
+        assert inventory["authoritative"] is False
+
+    @patch("app.subprocess.run")
+    def test_no_server_is_authoritative_empty_inventory(self, mock_run):
+        import app as app_module
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="no server running")
+        inventory = app_module._tmux_inventory_snapshot()
+        assert inventory["state"] == "no_server"
+        assert inventory["authoritative"] is True
+
+
+class TestTerminalStreamIdentity:
+    def test_binding_contains_owner_generation_and_immutable_tmux_id(self):
+        import app as app_module
+
+        generation = "c" * 32
+        lifecycle = {
+            "managed": True,
+            "owner_id": "u_test",
+            "generation": generation,
+        }
+        marker = MagicMock(
+            returncode=0,
+            stdout=f"u_test\t1\t{generation}\t0\t1700000000\n",
+        )
+        with patch("app._strict_session_owner", return_value=("u_test", {"id": "u_test"})), \
+             patch("app._exact_tmux_session_id", return_value="$42"), \
+             patch.object(app_module._session_lifecycle, "get", return_value=lifecycle), \
+             patch("app.subprocess.run", return_value=marker):
+            binding = app_module._terminal_binding("managed", "u_test")
+        assert binding["key"] == (
+            "managed", "u_test", generation, "$42@1700000000"
+        )
+
+    def test_binding_revalidation_rejects_same_name_replacement(self):
+        import app as app_module
+
+        binding = {
+            "name": "managed",
+            "owner_id": "u_test",
+            "generation": "d" * 32,
+            "session_id": "$42",
+            "session_created": "1700000000",
+            "key": ("managed", "u_test", "d" * 32, "$42"),
+        }
+        probe = MagicMock(
+            returncode=0,
+            stdout=f"$43\tmanaged\tu_test\t1\t{'d' * 32}\t0\t1700000001\n",
+            stderr="",
+        )
+        with patch("app.subprocess.run", return_value=probe):
+            assert app_module._terminal_binding_state(binding) == "replaced"
+
+    def test_binding_probe_timeout_is_retryable_unknown(self):
+        import app as app_module
+
+        binding = {
+            "name": "managed",
+            "owner_id": "u_test",
+            "generation": "d" * 32,
+            "session_id": "$42",
+            "managed": True,
+        }
+        with patch("app.subprocess.run", side_effect=TimeoutError("tmux slow")):
+            assert app_module._terminal_binding_state(binding) == "unknown"
+
+    def test_confirmed_missing_legacy_session_is_nonretryable(self):
+        import app as app_module
+
+        with patch("app._exact_tmux_session_state", return_value=("absent", "")), \
+             patch("app._durable_running_intent_exists", return_value=False):
+            payload = app_module._terminal_unavailable_payload("gone")
+        assert payload["code"] == "session_not_found"
+        assert payload["retryable"] is False
+
+    def test_unknown_tmux_state_remains_retryable(self):
+        import app as app_module
+
+        with patch("app._exact_tmux_session_state", return_value=("unknown", "")), \
+             patch("app._durable_running_intent_exists", return_value=False):
+            payload = app_module._terminal_unavailable_payload("maybe")
+        assert payload["code"] == "session_unavailable"
+        assert payload["retryable"] is True
 
 
 # ─── get_pane_position Tests ───
@@ -682,9 +942,12 @@ class TestDetectActivityHysteresis:
 
 
 class TestBuildSessionResponse:
+    @patch("app._get_autopush_mode", return_value="basic")
     @patch("app._session_real_auth_mode", return_value="api")
     @patch("app.detect_activity")
-    def test_builds_complete_response(self, mock_activity, mock_auth_mode):
+    def test_builds_complete_response(self, mock_activity, mock_auth_mode, mock_mode):
+        # Response assembly has a known mode; mode-file fail-closed behavior is
+        # covered separately and must not depend on the host's saved state.
         mock_activity.return_value = {"status": "idle", "command": "codex", "detail": "Waiting"}
         sess = {"name": "test", "windows": "2", "attached": True}
         data = {
@@ -711,6 +974,7 @@ class TestBuildSessionResponse:
         assert result["auth_mode"] == "api"
         assert result["autopush_mode"] == "basic"
         assert result["simple_watchdog"] is False
+        mock_mode.assert_any_call("test")
 
     @patch("app.detect_activity")
     def test_missing_data_keys_use_defaults(self, mock_activity):
@@ -982,7 +1246,7 @@ class TestApiKeyShellQuoting:
         import inspect
 
         import app
-        source = inspect.getsource(app.api_create_session)
+        source = inspect.getsource(app._send_session_owner_environment)
         assert "shlex.quote" in source
 
     def test_set_auth_mode_never_sends_credentials_to_tmux(self):

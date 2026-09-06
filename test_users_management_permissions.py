@@ -1,7 +1,7 @@
 """Focused regression coverage for the dedicated Users workspace and fixed groups."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("TMUX_DASH_SECRET", "test-secret-key-for-testing")
 os.environ.setdefault("TMUX_DASH_PASS", "testpass")
@@ -240,10 +240,11 @@ def test_owner_environment_uses_private_codex_home_and_advisor_token(monkeypatch
     monkeypatch.setattr(app_module, "_user_codex_config_dir", lambda user: codex_home)
     monkeypatch.setattr(app_module, "_ensure_user_codex_config_dir", lambda user: None)
     monkeypatch.setattr(app_module, "_member_session_project_dir", lambda user, name: tmp_path / "project")
+    monkeypatch.setattr(app_module, "_exact_tmux_session_id", lambda _name: "$1")
     monkeypatch.setattr(
         app_module.subprocess,
         "run",
-        lambda args, **kwargs: calls.append(args),
+        lambda args, **kwargs: calls.append(args) or MagicMock(returncode=0),
     )
 
     assert app_module._send_session_owner_environment("work") is True
@@ -251,6 +252,24 @@ def test_owner_environment_uses_private_codex_home_and_advisor_token(monkeypatch
     assert f"export CODEX_HOME={codex_home}" in command
     assert str(codex_home / "advisor-token") in command
     assert "never-print-this-token" not in command
+
+
+def test_owner_environment_reports_tmux_send_failure(monkeypatch, tmp_path):
+    member = {"id": "u_member", "username": "member", "role": "user"}
+    codex_home = tmp_path / ".codex-user-u_member"
+    codex_home.mkdir()
+    (codex_home / "advisor-token").write_text("private-token")
+    monkeypatch.setattr(app_module, "_user_for_session", lambda name: member)
+    monkeypatch.setattr(app_module, "_user_codex_config_dir", lambda user: codex_home)
+    monkeypatch.setattr(app_module, "_ensure_user_codex_config_dir", lambda user: None)
+    monkeypatch.setattr(app_module, "_member_session_project_dir", lambda user, name: tmp_path / "project")
+    monkeypatch.setattr(
+        app_module.subprocess,
+        "run",
+        lambda *args, **kwargs: MagicMock(returncode=1),
+    )
+
+    assert app_module._send_session_owner_environment("work") is False
 
 
 def test_advisor_sync_applies_the_fixed_group_and_its_scopes(monkeypatch, tmp_path):
