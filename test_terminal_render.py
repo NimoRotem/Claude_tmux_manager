@@ -260,6 +260,172 @@ def test_clean_view_keeps_usage_limit_discussion_and_quoted_notices():
     assert out["clean"] == rows
 
 
+TRANSCRIPT_HINT = (
+    "Earlier messages are available — press ctrl + t to view the full transcript"
+)
+PYTEST_FRAGMENT = """\
+  >       assert send_calls[0] == 1
+  E       assert 0 == 1
+
+test_api.py:9275: AssertionError
+  ________ TestWatchdogRestartMode.test_restart_codex_dead_sets_disabled _________
+  self = <test_api.TestWatchdogRestartMode object at 0x1234>
+      @pytest.mark.asyncio
+      async def test_restart_codex_dead_sets_disabled(self):
+          import logging
+          import app as _app
+"""
+
+
+def test_clean_view_hides_history_clipped_pytest_output():
+    pane = (
+        TRANSCRIPT_HINT + "\n" + PYTEST_FRAGMENT
+        + "\n• The restart check failed; I am fixing it.\n› Keep going"
+    )
+    out = _run(pane)
+    assert out["clean"] == [
+        "• The restart check failed; I am fixing it.", "› Keep going",
+    ]
+
+
+@pytest.mark.parametrize("source_indent", ["", "  "])
+def test_tool_output_stays_hidden_across_blank_rows_and_pytest_source_markers(source_indent):
+    pane = (
+        "• I am checking the restart.\n• Ran pytest\n  └ tests failed\n\n"
+        + source_indent + ">       assert send_calls[0] == 1\n"
+        + "E       assert 0 == 1\n\ntest_api.py:9275: AssertionError\n"
+        + "• The restart check failed; I am fixing it.\n› Keep going"
+    )
+    text = "\n".join(_run(pane)["clean"])
+    assert "assert send_calls" not in text
+    assert "AssertionError" not in text
+    assert "I am checking the restart." in text
+    assert "The restart check failed; I am fixing it." in text
+    assert "Keep going" in text
+
+
+@pytest.mark.parametrize("header", [
+    "• Edit app.py (+2 -1)",
+    "• Add test_api.py (+4)",
+    "• Added test_api.py (+4)",
+    "• Edit app.py",
+    "• Edit README",
+    "• Added 1 file",
+    "• Edited ~/project/test_terminal_render.py (+105\n-0)",
+    "• Added ~/project/a_very_long_file\n_name.py (+4 -0)",
+])
+def test_clean_view_hides_file_actions_with_diff_evidence(header):
+    pane = header + "\n    12 + import app\n    13 - old_call()\n• The change is ready."
+    assert _run(pane)["clean"] == ["• The change is ready."]
+
+
+@pytest.mark.parametrize("hint", [
+    TRANSCRIPT_HINT,
+    "  " + TRANSCRIPT_HINT,
+    "Earlier messages are available — press ctrl + t\n  to view the full transcript",
+    "Earlier messages are available — press ctrl + t to view the full tran\nscript",
+    "\x1b[2m" + TRANSCRIPT_HINT + "\x1b[0m\r",
+])
+def test_transcript_hint_removal_keeps_following_prose(hint):
+    after = "  This explanation should remain visible."
+    assert _run("• A real reply\n" + hint + "\n" + after)["clean"] == [
+        "• A real reply", after,
+    ]
+
+
+def test_clean_view_preserves_quoted_errors_fenced_code_and_action_prose():
+    rows = [
+        "• Added monitoring and edited the final summary.",
+        "• Edit the example below when the requirement changes.",
+        "> " + TRANSCRIPT_HINT,
+        ">       assert send_calls[0] == 1",
+        "  ```text",
+        TRANSCRIPT_HINT,
+        *PYTEST_FRAGMENT.splitlines(),
+        "• Add test_api.py (+4)",
+        "  ```",
+        "• The example above is intentional.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_clean_view_preserves_a_users_pasted_error_report():
+    rows = [
+        "› Please explain this failure:",
+        TRANSCRIPT_HINT,
+        *PYTEST_FRAGMENT.splitlines(),
+        "• I will explain the failure.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_clean_view_keeps_an_ambiguous_error_fragment_without_tool_context():
+    assert _run(PYTEST_FRAGMENT)["clean"] == PYTEST_FRAGMENT.splitlines()
+
+
+def test_raw_view_keeps_history_hint_and_pytest_output():
+    pane = (TRANSCRIPT_HINT + "\n" + PYTEST_FRAGMENT).rstrip("\n")
+    assert "\n".join(_run(pane, clean_view=False)["clean"]) == pane
+
+
+def test_running_unbulleted_tool_after_a_user_message_is_hidden():
+    pane = "› Run tests\n\n  Bash(pytest)\n    ⎿ E assert 0 == 1\n      source\n● Done."
+    text = "\n".join(_run(pane)["clean"])
+    assert "Run tests" in text
+    assert "Done." in text
+    assert "Bash(pytest)" not in text
+    assert "E assert" not in text
+
+
+def test_user_fenced_tool_examples_remain_visible():
+    rows = [
+        "› Here is a quoted transcript",
+        "  ```text",
+        "• Add test_api.py (+4)",
+        "    12 + import app",
+        "  ```",
+        "• This is the real response.",
+    ]
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+@pytest.mark.parametrize("rows", [
+    ["• Added two regression tests.", "  Both passed (2)", "• The change is ready."],
+    ["• Added validation for the route.", "  The covered edge cases increased (+4)", "• Done."],
+    ["• Read this patch example:", "  ```text", "  Updated app.py (+2 -1)",
+     "    12 + import app", "  ```", "• This explains the notation."],
+    ["• Add the following code:", "  ```python", "  values = (+4)", "  ```", "• Done."],
+    ["• Added a note about the patch:", "  > Edited app.py (+2 -1)",
+     "  The quoted note should remain.", "• Done."],
+])
+def test_wrapped_file_actions_do_not_consume_prose_quotes_or_fences(rows):
+    assert _run("\n".join(rows))["clean"] == rows
+
+
+def test_history_hint_does_not_hide_an_introduced_pytest_example():
+    rows = [
+        "  This quoted example explains it:",
+        "  > assert send_calls[0] == 1",
+        "  E assert 0 == 1",
+        "• Done.",
+    ]
+    assert _run(TRANSCRIPT_HINT + "\n" + "\n".join(rows))["clean"] == rows
+
+
+@pytest.mark.parametrize("marker", ["●", ">"])
+def test_hook_instructions_remain_visible_including_literal_history_hint(marker):
+    rows = [
+        f"{marker} Ran 1 stop hook (ctrl+o to expand)",
+        "  ⎿ Please address the failed tests before stopping.",
+        "  " + TRANSCRIPT_HINT,
+        "",
+        "  Follow up with verification.",
+        "• Continuing now.",
+    ]
+    expected = ["> Ran 1 stop hook (ctrl+o to expand)", *rows[1:]]
+    assert _run("\n".join(rows))["clean"] == expected
+
+
 def test_flow_mode_rejoins_a_url_cut_at_the_margin(rendered):
     joined = "\n".join(rendered["flow"])
     assert "edit?gid=1321488188" in joined

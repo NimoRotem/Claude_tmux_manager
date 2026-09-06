@@ -28262,15 +28262,35 @@ const _TOOL_PAREN_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|
 const _CODEX_VERB_RE=/^(?:Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
 // Codex file ops carry a diff stat: "Edited app.py (+12 -3)", "Added x.md (+40)".
 // The stat is what tells them apart from prose ("Added swap and a monitor").
-const _CODEX_FILEOP_RE=/^(?:Edited|Added|Created|Wrote|Updated|Deleted|Removed|Renamed|Moved|Read|Patched)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
-function _isToolHeader(line,followerIsMarker){
+const _CODEX_FILEOP_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
+const _CODEX_FILEOP_TARGET_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+(?:\d+\s+files?|\S+)\s*$/;
+const _CODEX_DIFF_ROW_RE=/^\s+\d+(?:\s+[+-](?:\s|$)|[+-]\s|[ \t]{2,}\S)/;
+function _isToolHeader(line,followerIsMarker,followerIsDiff=false){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   if(_TOOL_PAREN_RE.test(stripped))return true;
   if(_CODEX_VERB_RE.test(stripped))return true;
   if(_CODEX_FILEOP_RE.test(stripped))return true;
+  if(followerIsDiff&&_CODEX_FILEOP_TARGET_RE.test(stripped))return true;
   // Structural fallback: a bullet whose next non-empty row is a `│`/`└`/`⎿`
   // marker is a tool block whatever the verb is. Prose bullets never are.
   return !!followerIsMarker;
+}
+function _wrappedFileOpHeader(lines,start){
+  let header=lines[start].replace(_ANY_DECORATION_RE,'');
+  const target=header.replace(/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+/,'');
+  // A wrapped file target or unfinished diff stat, never an action sentence.
+  if(target===header||! /^(?:\S*[^:\s]|\d+\s+files?)(?:\s+\([+-]?\d+(?:\s+[+-]?\d*)?)?\s*$/.test(target))return false;
+  for(let j=start+1;j<Math.min(lines.length,start+8);j++){
+    const row=lines[j];
+    if(!row.trim()||_LEADING_BULLET_RE.test(row)||/^\s*(?:[›❯»>]|`{3,}|~{3,})/.test(row)||_CODEX_DIFF_ROW_RE.test(row))break;
+    header+=' '+row.trim();
+    if(_CODEX_FILEOP_RE.test(header)){
+      let next=j+1;
+      while(next<lines.length&&!lines[next].trim())next++;
+      return next<lines.length&&_CODEX_DIFF_ROW_RE.test(lines[next]);
+    }
+  }
+  return false;
 }
 // Kept for compatibility with the old two-toggle helper name.
 function _isBashFetchHeader(line){return _isToolHeader(line,false)}
@@ -28608,6 +28628,44 @@ function _stripUsageResetNotices(lines){
   }
   return out;
 }
+function _plainTerminalRow(line){
+  return line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'').replace(/\r/g,'');
+}
+// This history hint can be inserted in front of a clipped tool result. Remove
+// only its exact rows, including terminal wraps, without hiding following prose.
+function _transcriptHintEnd(lines,start){
+  const first=_plainTerminalRow(lines[start]);
+  if(!/^\s*Earlier(?:\s|$)/.test(first))return -1;
+  let compact='';
+  for(let j=start;j<Math.min(lines.length,start+12);j++){
+    const part=_plainTerminalRow(lines[j]);
+    if(!part.trim()||(j>start&&/^\s*[•●⏺❯›»>`~]/.test(part)))break;
+    compact+=part.replace(/\s/g,'');
+    if(/^Earliermessagesareavailable[—–-]pressctrl\+ttoviewthefulltranscript[.!]?$/i.test(compact))return j;
+  }
+  return -1;
+}
+// Only a history-clipped block gets this recovery heuristic. Two independent
+// pytest markers are required; isolated code, error discussion and quotes are
+// otherwise content, even when they resemble terminal output.
+function _clippedPytestOutput(lines,start){
+  let source=false,error=false,location=false,separator=false;
+  for(let j=start;j>=0&&j<Math.min(lines.length,start+16);j++){
+    const line=_plainTerminalRow(lines[j]);
+    if(/^\s*[•●⏺❯›»]|^\s*(?:`{3,}|~{3,})/.test(line))break;
+    if(!line.trim())continue;
+    const isSource=/^\s*>\s+\S/.test(line);
+    const isError=/^\s*E\s+(?:assert\b|[\w.]+(?:Error|Exception)\b)/.test(line);
+    const isLocation=/^\s*\S+\.py:\d+:\s*\w+(?:Error|Exception)\b/.test(line);
+    const isSeparator=/^\s*_{3,}.*\btest_\w+/.test(line);
+    if(!isSource&&!isError&&!isLocation&&!isSeparator)return false;
+    source=source||isSource;error=error||isError;
+    location=location||isLocation;separator=separator||isSeparator;
+    if((source&&error)||(error&&location)||(location&&separator))return true;
+  }
+  return false;
+}
 function applyRawFilter(text){
   if(!getCleanViewPref())return text;
   if(!text)return text;
@@ -28633,12 +28691,36 @@ function applyRawFilter(text){
   //   'output' — a hidden ⎿/└ result block and its indented continuation rows.
   //   'noise'  — a hidden bookkeeping/update line and its wrapped rows.
   //   'shell'  — a hidden shell command and its wrapped rows.
-  // Suppression ends at a bullet, at pane structure, or at a blank row that is
-  // followed by something starting at column 0 — so the agent's spoken text and
-  // its paragraph breaks always survive.
-  let mode='';
+  // Tool suppression ends at a new conversation boundary. Blank rows and
+  // pytest's column-zero source markers still belong to the tool result.
+  let mode='',fence=null,inUserMessage=false;
   for(let i=0;i<lines.length;i++){
     const line=lines[i];
+    const plain=_plainTerminalRow(line);
+    const fenceMark=/^\s*(`{3,}|~{3,})/.exec(plain);
+    if(fence){
+      out.push(line);
+      if(fenceMark&&fenceMark[1][0]===fence[0]&&fenceMark[1].length>=fence.length)fence=null;
+      continue;
+    }
+    if(_USER_PROMPT_RE.test(plain)){
+      mode='';inUserMessage=true;out.push(line);continue;
+    }
+    if(!mode&&fenceMark){fence=fenceMark[1];out.push(line);continue;}
+    if(inUserMessage){
+      const startsTool=_TOOL_PAREN_RE.test(plain.replace(_ANY_DECORATION_RE,''))||
+        _OUTPUT_MARKER_RE.test(plain)||_CALL_CONT_RE.test(plain)||_isHookHeader(plain);
+      if(!_LEADING_BULLET_RE.test(plain)&&!startsTool){out.push(line);continue;}
+      inUserMessage=false;
+    }
+    const hintEnd=mode==='hook'?-1:_transcriptHintEnd(lines,i);
+    if(hintEnd>=i){
+      if(!mode&&_clippedPytestOutput(lines,nextNonEmpty[hintEnd]))mode='output';
+      i=hintEnd;continue;
+    }
+    // A quote in visible conversation stays visible. Inside established tool
+    // output, pytest's `> assert ...` source marker is part of that output.
+    if(!mode&&!_isHookHeader(line)&&/^\s*>/.test(plain)){out.push(line);continue;}
     // Table rows are content, and they end any block that was being hidden —
     // tested before the marker rules, which would otherwise claim them. Two
     // blocks still win: a `⎿`/`└` result (a table printed BY a command is tool
@@ -28674,7 +28756,8 @@ function applyRawFilter(text){
     if(_LEADING_BULLET_RE.test(line)){
       const nx=nextNonEmpty[i];
       const followerIsMarker=nx>=0&&(_OUTPUT_MARKER_RE.test(lines[nx])||_CALL_CONT_RE.test(lines[nx]));
-      if(_isToolHeader(line,followerIsMarker)){mode='call';continue;}
+      const followerIsDiff=nx>=0&&_CODEX_DIFF_ROW_RE.test(lines[nx]);
+      if(_isToolHeader(line,followerIsMarker,followerIsDiff)||_wrappedFileOpHeader(lines,i)){mode='call';continue;}
       mode='';out.push(line);continue;   // prose bullet
     }
     if(agentPane&&_SHELL_PROMPT_RE.test(line)){mode='shell';continue;}
@@ -28684,10 +28767,13 @@ function applyRawFilter(text){
       // ends when the block does — when the next real row is a bullet or
       // starts at column 0.
       const nx=nextNonEmpty[i];
+      if((mode==='call'||mode==='output')&&nx>=0&&
+         !_LEADING_BULLET_RE.test(lines[nx])&&!/^[›❯»](?:\s|$)/.test(lines[nx]))continue;
       if(mode&&nx>=0&&/^\s/.test(lines[nx])&&!_LEADING_BULLET_RE.test(lines[nx]))continue;
       mode='';out.push(line);continue;
     }
     if(/^\S/.test(line)){
+      if(mode==='call'||mode==='output')continue;
       // Column-0 non-space. Inside an agent pane every spoken word sits inside
       // a `•` bullet at an indent, so a column-0 row reached while a block is
       // being hidden is that block's wrapped tail, not prose — drop it. Pane
