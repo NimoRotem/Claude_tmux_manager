@@ -1,3 +1,5 @@
+import os
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -635,7 +637,12 @@ def test_nav_status_includes_memory_and_admin_recovery_control():
 
     html = app.HTML_PAGE
 
-    assert "RAM <span class=\"stat-val '+memClass+'\">'+memPct+'%</span>" in html
+    # CPU and RAM are two stacked rows, laid out like the 5h/7d usage pair they
+    # sit next to: a labelled track plus the percentage, not a run of prose.
+    assert "row('CPU',cpuPct,cpuClass," in html
+    assert "row('RAM',memPct,memClass,memTxt)" in html
+    assert '<span class="nav-stat-bar"><span class="nav-stat-fill ' in html
+    assert ".nav-server-stats{color:#8b949e;white-space:nowrap;display:flex;flex-direction:column" in html
     assert "onclick=\"recoverSessions();closeToolsMenu()\"" in html
     assert "async function recoverSessions()" in html
     assert "BASE+'/api/admin/sessions/recover'" in html
@@ -748,6 +755,264 @@ def test_the_live_bar_carries_silence_and_context():
     # And the bar shows on server-measured facts alone, for a session that was
     # already idle before the page loaded and has no spinner row left.
     assert "!!(sess.context_tokens||sess.last_turn_end)" in html
+
+
+def _stub_proc(monkeypatch, cmdline="", pid=0, fds=()):
+    """Pretend a session's `claude` runs with this argv and these open files."""
+    import app
+
+    monkeypatch.setattr(app, "_session_claude_proc",
+                        lambda name: {"pid": pid, "cmdline": cmdline, "env": {}})
+    if pid:
+        monkeypatch.setattr(app.os, "listdir",
+                            lambda p: [str(i) for i in range(len(fds))]
+                            if p == f"/proc/{pid}/fd" else os.listdir(p))
+        monkeypatch.setattr(app.os, "readlink",
+                            lambda p: fds[int(os.path.basename(p))]
+                            if p.startswith(f"/proc/{pid}/fd/") else os.readlink(p))
+
+
+def test_the_session_id_flag_names_the_transcript(monkeypatch):
+    import app
+
+    _stub_proc(monkeypatch, cmdline=(
+        "claude --dangerously-skip-permissions --model claude-opus-5[1m] "
+        "--effort xhigh --session-id 20d33bb7-bb5b-4770-9b67-e2b83b16a64c"))
+
+    assert app._session_transcript_uuid("s") == "20d33bb7-bb5b-4770-9b67-e2b83b16a64c"
+
+
+def test_the_open_scratch_dir_names_the_transcript(monkeypatch):
+    import app
+
+    # A session launched WITHOUT --session-id still holds its per-session scratch
+    # directory open, and that path carries the same uuid.
+    _stub_proc(monkeypatch, cmdline="claude --dangerously-skip-permissions", pid=4242,
+               fds=("/dev/pts/9", "socket:[123]",
+                    "/tmp/claude-1000/-home-nimo-proj/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/tasks"))
+
+    assert app._session_transcript_uuid("s") == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def test_the_named_transcript_wins_over_the_newest_one(tmp_path, monkeypatch):
+    import app
+
+    # A dozen sessions share one project directory. "Newest by mtime" hands each
+    # of them a sibling's file, which is how a three-minute-old session reported
+    # an 800k-token prompt as its own.
+    mine = tmp_path / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+    theirs = tmp_path / "ffffffff-1111-2222-3333-444444444444.jsonl"
+    mine.write_text("{}\n")
+    theirs.write_text("{}\n")
+    os.utime(mine, (1, 1))                       # mine is the OLDER file
+    _stub_proc(monkeypatch, cmdline=(
+        "claude --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+    app._session_transcript_cache.pop("s", None)
+
+    picked = app._pick_session_transcript_file("s", [str(mine), str(theirs)])
+
+    assert picked == str(mine)
+    assert app._session_transcript_cache["s"]["confident"] is True
+
+
+def test_an_unproven_transcript_reports_no_context(monkeypatch, tmp_path):
+    import app
+
+    # Model and effort survive an unproven read because argv carries this
+    # session's own launch flags. The prompt size, the cache TTL and the time of
+    # the last reply exist nowhere but the transcript, so an unproven read of
+    # them is a neighbour's figure wearing this session's name.
+    a = tmp_path / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    b = tmp_path / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    for p in (a, b):
+        p.write_text(_assistant("high", "claude-opus-5",
+                                "2026-09-01T00:00:00.000Z", ctx=(1, 800_000, 1)) + "\n")
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda n: [str(a), str(b)])
+    monkeypatch.setattr(app, "_pane_match_fragments", lambda n: [])
+    monkeypatch.setattr(app, "_pane_model_effort", lambda n: {})
+    _stub_proc(monkeypatch, cmdline="claude --effort high --model claude-opus-5")
+    app._session_model_cache.pop("s", None)
+    app._session_transcript_cache.pop("s", None)
+
+    out = app._detect_session_model_effort("s")
+
+    assert out["sure"] is False
+    assert out["effort"] == "high"           # from argv, which is this session's
+    assert out["context_tokens"] == 0        # never a neighbour's number
+    assert out["cache_ttl"] == 0
+    assert out["last_turn_end"] == 0
+
+
+def _tool_use(name, **inp):
+    import json
+
+    return json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": inp}]}})
+
+
+def _said(text):
+    import json
+
+    return json.dumps({"type": "assistant",
+                       "message": {"content": [{"type": "text", "text": text}]}})
+
+
+def test_saved_reference_is_read_off_the_transcript(tmp_path):
+    import app
+
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join([
+        _tool_use("Write", file_path="/home/n/proj/report.md", content="x"),
+        _tool_use("Edit", file_path="/home/n/.tmux-dashboard/uploads/s-1/DRAFT.md"),
+        _tool_use("Write", file_path="/home/n/.claude/settings.json"),
+        _tool_use("Bash", command="curl -s https://demo.rotem.ai/panel/ | head"),
+        _said("Live at https://demo.rotem.ai/panel/ with login user: nimo\n"
+              "Password: hunter2-correct-horse\n"
+              "max_tokens: 1024\n"
+              "See http://www.w3.org/2000/svg for the namespace."),
+    ]) + "\n")
+
+    got = app._saved_scan_transcript(str(p))
+
+    assert "/home/n/proj/report.md" in got["files"]
+    # The session's OWN output directory sits under a dot-dir; the rule that
+    # keeps ~/.claude out was throwing away every deliverable with it.
+    assert "/home/n/.tmux-dashboard/uploads/s-1/DRAFT.md" in got["files"]
+    assert "/home/n/.claude/settings.json" not in got["files"]
+    assert got["urls"] == ["https://demo.rotem.ai/panel/"]      # deduped, no w3.org
+    pairs = {(c["label"].lower(), c["value"]) for c in got["creds"]}
+    assert ("login user", "nimo") in pairs
+    assert ("password", "hunter2-correct-horse") in pairs
+    # A token COUNT is not a login. Matching `max_tokens` turned every usage line
+    # in an LLM session into a fake credential.
+    assert not [c for c in got["creds"] if "token" in c["label"].lower()]
+
+
+def test_saved_reference_scan_resumes_where_it_stopped(tmp_path):
+    import app
+
+    p = tmp_path / "t.jsonl"
+    p.write_text(_tool_use("Write", file_path="/home/n/one.md") + "\n")
+    first = app._saved_scan_transcript(str(p))
+    assert first["files"] == ["/home/n/one.md"]
+
+    with open(p, "a") as fh:
+        fh.write(_tool_use("Write", file_path="/home/n/two.md") + "\n")
+    second = app._saved_scan_transcript(str(p))
+
+    # The appended record is picked up WITHOUT re-reading the earlier bytes, and
+    # the earlier finding is still there.
+    assert set(second["files"]) == {"/home/n/one.md", "/home/n/two.md"}
+    assert app._saved_scan_state[str(p)]["offset"] == p.stat().st_size
+
+
+def test_saved_reference_is_empty_when_the_transcript_is_unproven(monkeypatch, tmp_path):
+    import app
+
+    a = tmp_path / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    b = tmp_path / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    for p in (a, b):
+        p.write_text(_tool_use("Write", file_path="/home/n/theirs.md") + "\n")
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda n: [str(a), str(b)])
+    monkeypatch.setattr(app, "_pane_match_fragments", lambda n: [])
+    _stub_proc(monkeypatch, cmdline="claude")
+    app._session_transcript_cache.pop("s", None)
+
+    got = app._session_saved_reference("s")
+
+    assert got == {"urls": [], "creds": [], "files": [], "identified": False}
+
+
+def test_the_saved_drawer_reads_the_server_not_a_dead_summariser():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "async function refreshSavedKeys(name,force)" in html
+    assert "'/api/sessions/'+encodeURIComponent(name)+'/saved'" in html
+    # The old empty state told the reader to press "Full" on the Info tab, which
+    # has not extracted anything since the auto-summariser was switched off.
+    assert 'Press "Full" on the Info tab' not in html
+
+
+def test_a_new_session_is_the_one_you_land_on():
+    import app
+
+    html = app.HTML_PAGE
+
+    # loadAll() re-reads the URL hash, so setting `selectedSession` alone was
+    # undone the moment it ran: the new session was created and you stayed on
+    # the old one. The route has to move.
+    assert "function _openNewSession(name)" in html
+    assert "location.hash=_sessionRouteHash(name,tab);" in html
+    assert "_openNewSession(data.name);" in html
+    assert "selectedSession=data.name;" not in html
+
+
+def test_the_key_bar_drops_the_retired_controls():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "sendSlashCommand('${name}','/plan')" not in html
+    assert ">Clear Input</button>" not in html
+    # The ones that earn their place are still there.
+    assert "sendSlashCommand('${name}','/context')" in html
+    assert "sendSlashCommand('${name}','/usage')" in html
+
+
+def test_the_live_bar_carries_the_account_caps():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert 'class="tl-cap" id="tl-cap-${s.name}"' in html
+    assert "function paintSessionUsageCaps()" in html
+    # Fed from the fetch the header already makes, not a second one.
+    assert "_usageCaps={has:true," in html
+
+
+def test_claude_processes_are_attributed_to_their_session(monkeypatch):
+    import app
+
+    # pid 100 tmux server on the dashboard's own socket; 200 its pane shell;
+    # 300 the agent. pid 400 is an agent under a tmux server on another socket,
+    # which is exactly the shape of an abandoned test fixture.
+    table = {
+        100: {"ppid": 1, "rss_mb": 3, "age_s": 900, "argv": "tmux new-session -d -s work"},
+        200: {"ppid": 100, "rss_mb": 4, "age_s": 900, "argv": "-bash"},
+        300: {"ppid": 200, "rss_mb": 500, "age_s": 900,
+              "argv": "claude --dangerously-skip-permissions"},
+        400: {"ppid": 500, "rss_mb": 220, "age_s": 160000,
+              "argv": "claude --dangerously-skip-permissions"},
+        500: {"ppid": 1, "rss_mb": 3, "age_s": 160000,
+              "argv": "tmux -L pffive new-session -d -s de-43"},
+    }
+    monkeypatch.setattr(app, "_read_proc_table", lambda: table)
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        stdout="200 work\n" if "-L" not in a[0] else "", returncode=0))
+    app._CLAUDE_INVENTORY_CACHE.update({"ts": 0.0, "data": None})
+
+    inv = app._claude_process_inventory()
+
+    assert inv["total"] == 2
+    assert inv["attached"] == 1
+    assert inv["orphaned"] == 1
+    # The number that answers "should these still be running".
+    assert inv["orphan_rss_mb"] == 220
+    by_pid = {p["pid"]: p for p in inv["processes"]}
+    assert by_pid[300]["session"] == "work" and by_pid[300]["attached"] is True
+    assert by_pid[400]["socket"] == "pffive" and by_pid[400]["attached"] is False
+
+
+def test_the_stats_panel_names_the_owner_of_every_agent():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "const inv=s.claude_inventory||null;" in html
+    assert "Claude Processes ('+inv.total+' running)</div>" in html
+    assert "Not attached to any session here" in html
 
 
 def test_your_own_words_are_marked_and_jumpable():

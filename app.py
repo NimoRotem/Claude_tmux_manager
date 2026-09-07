@@ -8840,6 +8840,24 @@ async def api_list_uploads(session_name: str):
     return JSONResponse({"files": files})
 
 
+@app.get("/api/sessions/{session_name}/saved")
+async def api_session_saved(session_name: str):
+    """Links, logins and files this session produced — the Saved-from-this-project
+    drawer under the terminal.
+
+    Read straight off the session's own transcript, so it is complete the moment
+    the session does something rather than whenever a summariser last ran."""
+    _, sess = _find_session(session_name)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        data = await asyncio.to_thread(_session_saved_reference, session_name)
+    except Exception:
+        logger.debug("saved-reference scan failed for '%s'", session_name, exc_info=True)
+        return JSONResponse({"urls": [], "creds": [], "files": [], "identified": False})
+    return JSONResponse(data)
+
+
 @app.delete("/api/sessions/{session_name}/uploads/{filename}")
 async def api_delete_upload(session_name: str, filename: str):
     """Remove a previously uploaded file from the session uploads dir."""
@@ -11625,6 +11643,142 @@ def _host_identity() -> Dict[str, str]:
     return _HOST_IDENTITY
 
 
+# ── Who owns each running `claude` ────────────────────────────────────────────
+#
+# The Stats panel used to print `pgrep -a claude` verbatim: fifty identical
+# "claude --dangerously-skip-permissions" lines, no owner, no size, no age. It
+# reads as leaked history, which is the one thing it is not — every line is a
+# live process holding 150-250MB. What is missing is the attribution, so this
+# supplies it: the tmux session each one belongs to, the socket that session
+# lives on, and how long it has been there. Anything whose tmux server is not
+# this dashboard's is flagged as unattached, because that is the whole answer to
+# "should these still be running".
+_CLAUDE_INVENTORY_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_CLAUDE_INVENTORY_TTL = 20
+
+
+def _read_proc_table() -> dict:
+    """`{pid: {"ppid", "rss_mb", "age_s", "argv"}}` for every visible process."""
+    try:
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        page = os.sysconf("SC_PAGE_SIZE") or 4096
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except Exception:
+        return {}
+    table = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                raw = f.read()
+            # comm sits in parentheses and may itself contain spaces and
+            # parentheses, so the fields after it start past the LAST ')'.
+            fields = raw[raw.rindex(")") + 2:].split()
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            table[pid] = {
+                "ppid": int(fields[1]),
+                "rss_mb": int(fields[21]) * page // (1024 * 1024),
+                "age_s": max(0, int(uptime - int(fields[19]) / hz)),
+                "argv": " ".join(a for a in argv.split("\0") if a),
+            }
+        except (IndexError, ValueError):
+            continue
+    return table
+
+
+def _tmux_socket_of(argv: str) -> str:
+    m = re.search(r"(?:^|\s)-L\s+(\S+)", argv)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:^|\s)-S\s+(\S+)", argv)
+    return os.path.basename(m.group(1)) if m else "default"
+
+
+def _claude_process_inventory() -> dict:
+    """Every live `claude`, with the tmux session and socket that owns it."""
+    now = time.time()
+    cached = _CLAUDE_INVENTORY_CACHE
+    if cached["data"] is not None and now - cached["ts"] < _CLAUDE_INVENTORY_TTL:
+        return cached["data"]
+
+    table = _read_proc_table()
+    # tmux SERVERS, by pid. A server's argv keeps the -L/-S it was started with,
+    # which is the only place the socket name is written down.
+    servers = {pid: _tmux_socket_of(p["argv"]) for pid, p in table.items()
+               if p["argv"].split(" ", 1)[0].rsplit("/", 1)[-1] == "tmux"}
+
+    def ancestry(pid):
+        chain, seen = [], set()
+        while pid and pid not in seen and pid != 1:
+            seen.add(pid)
+            chain.append(pid)
+            pid = table.get(pid, {}).get("ppid", 0)
+        return chain
+
+    claudes = [pid for pid, p in table.items()
+               if re.match(r"^(?:\S*/)?claude(?:\s|$)", p["argv"])]
+
+    # pane pid -> session name, per socket, asked only of sockets that actually
+    # have a claude under them.
+    panes: Dict[str, dict] = {}
+    for sock in {servers[a] for pid in claudes for a in ancestry(pid) if a in servers}:
+        cmd = ["tmux"] + ([] if sock == "default" else ["-L", sock])
+        try:
+            out = subprocess.run(cmd + ["list-panes", "-a", "-F",
+                                        "#{pane_pid} #{session_name}"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            out = ""
+        m = {}
+        for line in out.splitlines():
+            bits = line.split(None, 1)
+            if len(bits) == 2 and bits[0].isdigit():
+                m[int(bits[0])] = bits[1]
+        panes[sock] = m
+
+    procs = []
+    for pid in sorted(claudes):
+        p = table[pid]
+        chain = ancestry(pid)
+        sock, session = "", ""
+        for anc in chain:
+            if anc in servers:
+                sock = servers[anc]
+                break
+        if sock:
+            for anc in chain:
+                if anc in panes.get(sock, {}):
+                    session = panes[sock][anc]
+                    break
+        procs.append({
+            "pid": pid,
+            "session": session,
+            "socket": sock or "-",
+            "rss_mb": p["rss_mb"],
+            "age_s": p["age_s"],
+            # On this dashboard's own tmux socket, in a session that still
+            # exists. Anything else is running with nobody watching it.
+            "attached": bool(session) and sock == "default",
+            "argv": p["argv"],
+        })
+    procs.sort(key=lambda x: (x["attached"], -x["rss_mb"]))
+    data = {
+        "processes": procs,
+        "total": len(procs),
+        "attached": sum(1 for x in procs if x["attached"]),
+        "orphaned": sum(1 for x in procs if not x["attached"]),
+        "orphan_rss_mb": sum(x["rss_mb"] for x in procs if not x["attached"]),
+    }
+    _CLAUDE_INVENTORY_CACHE.update({"ts": now, "data": data})
+    return data
+
+
 @app.get("/api/stats")
 async def api_stats(request: Request):
     """System stats: CPU, disk, memory, tmux sessions, Claude processes.
@@ -11691,16 +11845,22 @@ async def api_stats(request: Request):
         stats["disk"] = {}
     # tmux sessions
     stats["tmux_sessions"] = _filter_sessions_for_user(get_tmux_sessions(), user)
-    # Claude processes. Command lines leak other members' cwd/model, so members
-    # get the count only.
+    # Claude processes, attributed to the tmux session that owns each one.
+    # Command lines leak other members' cwd/model, so members get counts only.
     try:
-        result = subprocess.run(
-            ["pgrep", "-a", "claude"],
-            capture_output=True, text=True, timeout=5
-        )
-        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-        stats["claude_processes"] = lines if is_admin else len(lines)
+        inv = await asyncio.to_thread(_claude_process_inventory)
+        stats["claude_inventory"] = {
+            "total": inv["total"], "attached": inv["attached"],
+            "orphaned": inv["orphaned"], "orphan_rss_mb": inv["orphan_rss_mb"],
+            "processes": inv["processes"] if is_admin else [],
+        }
+        # Kept for anything still reading the old shape.
+        stats["claude_processes"] = ([p["argv"] for p in inv["processes"]]
+                                     if is_admin else inv["total"])
     except Exception:
+        logger.debug("Claude process inventory failed", exc_info=True)
+        stats["claude_inventory"] = {"total": 0, "attached": 0, "orphaned": 0,
+                                     "orphan_rss_mb": 0, "processes": []}
         stats["claude_processes"] = [] if is_admin else 0
     # Node processes (Claude Code runs as node)
     try:
@@ -17425,17 +17585,20 @@ _CLAUDE_PROC_TTL = 60
 
 
 def _session_claude_proc(session_name: str) -> dict:
-    """`{"cmdline": …, "env": {…}}` of the `claude` process in a session's first
-    pane. Cached — it costs two subprocess calls and only changes on a restart.
+    """`{"pid": …, "cmdline": …, "env": {…}}` of the `claude` process in a
+    session's first pane. Cached — it costs two subprocess calls and only
+    changes on a restart.
 
     The command line is read as well as the environment because Claude Code's
     1M-context tier is a `--model …[1m]` LAUNCH FLAG: the transcript records the
-    plain model id, so argv is the only place the wide window is written down."""
+    plain model id, so argv is the only place the wide window is written down.
+    The pid is kept because it is the one hard link between a tmux session and
+    the transcript it is writing (see _session_transcript_uuid)."""
     now = time.time()
     cached = _session_claude_proc_cache.get(session_name)
     if cached and now - cached["ts"] < _CLAUDE_PROC_TTL:
         return cached["data"]
-    data = {"cmdline": "", "env": {}}
+    data = {"pid": 0, "cmdline": "", "env": {}}
     try:
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
@@ -17466,10 +17629,55 @@ def _session_claude_proc(session_name: str) -> dict:
                 k, _, v = item.partition("=")
                 if k:
                     env[k] = v
-            data = {"cmdline": " ".join(cmdline.split("\0")).strip(), "env": env}
+            data = {"pid": int(cand), "cmdline": " ".join(cmdline.split("\0")).strip(),
+                    "env": env}
             break
     _session_claude_proc_cache[session_name] = {"data": data, "ts": now}
     return data
+
+
+# `/tmp/claude-<uid>/<encoded-cwd>/<session-uuid>/…` — the per-session scratch
+# directory Claude Code opens and keeps open. The uuid in it is the transcript's
+# file name, which is what makes this a proof of ownership rather than a guess.
+_CLAUDE_SCRATCH_RE = re.compile(
+    r"/tmp/claude-\d+/[^/]+/([0-9a-fA-F-]{36})(?:/|$)")
+
+
+def _session_transcript_uuid(session_name: str) -> str:
+    """The transcript UUID this tmux session's `claude` process is writing, or ''.
+
+    SEVERAL SESSIONS SHARE ONE PROJECT DIRECTORY. Transcripts are filed per
+    working directory, so a dozen sessions opened on the same checkout all land
+    in one folder and "the newest file" hands every one of them whichever
+    sibling typed last — which is how a session three minutes old reported a
+    neighbour's 800k-token prompt as its own context.
+
+    Two facts settle it outright, both read off the session's own process:
+      * `--session-id <uuid>` in argv, which is how the dashboard launches a
+        session and names its transcript up front;
+      * an open descriptor on the per-session scratch directory, whose path
+        carries the same uuid. Present whatever the session was launched with.
+    Neither is a heuristic, so a hit here needs no corroboration."""
+    proc = _session_claude_proc(session_name)
+    sid = _flag_value(proc.get("cmdline", ""), "session-id")
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", sid or ""):
+        return sid.lower()
+    pid = proc.get("pid") or 0
+    if not pid:
+        return ""
+    try:
+        fd_dir = f"/proc/{pid}/fd"
+        for entry in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, entry))
+            except OSError:
+                continue
+            m = _CLAUDE_SCRATCH_RE.search(target)
+            if m:
+                return m.group(1).lower()
+    except OSError:
+        pass
+    return ""
 
 
 def _session_claude_env(session_name: str) -> dict:
@@ -17607,6 +17815,16 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
         p = cached.get("path")
         if p and os.path.exists(p):
             return p
+
+    # The process knows which file it is writing. Ask it before guessing.
+    uuid = _session_transcript_uuid(session_name)
+    if uuid:
+        by_uuid = {os.path.splitext(os.path.basename(f))[0].lower(): f for f in files}
+        hit = by_uuid.get(uuid)
+        if hit:
+            _session_transcript_cache[session_name] = {"path": hit, "ts": now,
+                                                       "confident": True}
+            return hit
 
     resolved, confident = newest, False
     try:
@@ -17931,6 +18149,261 @@ def _last_assistant_facts(path: str) -> dict:
     return out
 
 
+# ── "Saved from this project": links, logins and files, read off the transcript ──
+#
+# This drawer was fed by an LLM pass over the pane (get_notes) that has been off
+# by default for months, so it said "nothing saved yet" for every session on
+# every box — a permanently empty panel promising the one thing it never did.
+# The transcript already records all three facts exactly, so nothing has to be
+# inferred and nothing has to be paid for: files come from the write tools' own
+# arguments, links from what was said and fetched, logins from the lines that
+# state them. Scanning is INCREMENTAL — each pass reads only the bytes appended
+# since the last one — so a 20MB transcript costs one full read, once.
+
+_SAVED_URL_RE = re.compile(r"https?://[^\s,;'\"`)<>\]]+")
+# `label: value` where the label names a credential. The label is allowed a few
+# words of context ("dashboard login", "Basic auth user") so real lines survive,
+# but it is capped so a paragraph mentioning a password is not swallowed whole.
+_SAVED_CRED_RE = re.compile(
+    r"(?im)(?:^|[\s,;(\[|])"
+    r"([\w .\-/()]{0,28}?"
+    # `token` refuses its plural on purpose: `max_tokens`, `input_tokens` and
+    # `output tokens` are counts, and matching them turned every usage line in
+    # an LLM session into a fake login.
+    r"(?:user(?:name)?s?|logins?|e?mails?|passwords?|passwd|passphrases?|"
+    r"api[ _-]?keys?|secrets?|token(?!s)|pin(?![a-z])|otp|credentials?)"
+    r"[\w .\-/()]{0,16}?)"
+    r"\s*[:=]\s*"
+    r"([^\s,;'\"`]{2,120})")
+# Values that are code, prose or a placeholder rather than a credential.
+_SAVED_CRED_JUNK_RE = re.compile(
+    r"os\.getenv|getenv\(|process\.env|hashlib\.|secrets\.token|token_hex\(|"
+    r"^\s*(?:import|from|export|const|let|var|def|return|if|for)\b|"
+    r"[<>{}()\[\]]|\*\*|\*{3,}|x{6,}|"
+    r"^(?:str|int|float|bool|dict|list|none|null|nil|n/?a|tbd|todo|yes|no|true|false|"
+    r"the|an?|and|or|it|is|was)$",
+    re.I)
+# Labels that name a MEASUREMENT, not a credential. `max_tokens`, `output
+# tokens` and `input_tokens` are all over an LLM session's own prose, and each
+# one used to be filed under Logins with its number as the password.
+_SAVED_CRED_LABEL_JUNK_RE = re.compile(
+    r"(?:^|\s)(?:max|min|input|output|cache|total|count|used|usage|per|avg|num|"
+    r"limit|len|size|price|cost|budget|def|class|self|kwargs|args|return|"
+    r"remaining|reset|window)(?:\s|$)|[(){}\[\]]", re.I)
+
+
+def _saved_cred_ok(label: str, value: str) -> bool:
+    """Is this `label: value` pair a credential worth keeping?"""
+    if len(value) < 3 or value.isdigit():
+        return False
+    if not re.search(r"[A-Za-z0-9]", value):
+        return False
+    if _SAVED_CRED_JUNK_RE.search(value):
+        return False
+    # Separators are normalised to spaces so `max_tokens` reads as `max tokens`
+    # and the word-boundary rules above can see the `max`.
+    return not _SAVED_CRED_LABEL_JUNK_RE.search(re.sub(r"[_\-/.]+", " ", label).lower())
+_SAVED_PATH_DENY_RE = re.compile(
+    r"(^|/)\.[^/]+(/|$)|^/etc/|^/tmp/|^/proc/|^/var/(log|lib|cache)/|"
+    r"(^|/)(SKILL|CLAUDE|AGENTS|MEMORY)\.md$|"
+    r"(^|/)(claude-roles|session_owners|users)\.json$|"
+    r"\.(pyc|log|bak|lock)$", re.I)
+# The session's own output directory. It sits under a DOT-dir
+# (~/.tmux-dashboard/uploads/<session>/), and the blanket dot-dir rule above —
+# written to keep ~/.claude and ~/.codex out — was therefore throwing away the
+# deliverables themselves: every report, draft and figure a session produced.
+_SAVED_UPLOAD_DIR_RE = re.compile(r"/uploads?/", re.I)
+# A URL still carrying shell or template syntax was never a real address: it is
+# a `curl "$BASE/x"` line, or a format string, caught mid-substitution.
+_SAVED_URL_JUNK_RE = re.compile(r"[$`{}\\]|%[sd]\b|(^|\.)example\.(com|org|net)(/|$|:)", re.I)
+_SAVED_WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "create_file",
+                      "str_replace_editor"}
+_SAVED_CAPS = {"urls": 30, "creds": 25, "files": 60}
+# path -> {"key": (inode, offset), "urls": [...], "creds": [...], "files": [...]}
+_saved_scan_state: Dict[str, dict] = {}
+
+
+def _saved_url_useful(u: str) -> bool:
+    """Is this a link someone would click again, or plumbing?
+
+    Mirrors the filter the drawer already applied client-side so the two agree:
+    no loopback or private addresses, no `api.*`, no LLM-provider or Google
+    OAuth endpoints, no bare API/health/callback paths or data files."""
+    if _SAVED_URL_JUNK_RE.search(u):
+        return False
+    try:
+        p = urllib.parse.urlparse(u)
+    except Exception:
+        return False
+    host = (p.hostname or "").lower()
+    if not host or host in ("localhost", "0.0.0.0", "127.0.0.1", "::1"):
+        return False
+    if re.match(r"^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+        return False
+    if host.startswith("api."):
+        return False
+    if re.search(r"(^|\.)(anthropic|openai)\.com$", host):
+        return False
+    if host.endswith(".googleapis.com") or host in ("accounts.google.com",
+                                                    "oauth2.googleapis.com"):
+        return False
+    # XML/RDF namespace declarations. They appear in every SVG and XHTML file a
+    # session writes and are not addresses anybody visits.
+    if host in ("www.w3.org", "w3.org", "schemas.microsoft.com", "schema.org"):
+        return False
+    path = p.path or ""
+    if re.search(r"(^|/)(api|v1|v2|oauth|rest|graphql|health|callback|\.well-known)(/|$)"
+                 r"|\.(json|xml|txt|log|ico|png|jpe?g|svg|css|js)$", path, re.I):
+        return False
+    return True
+
+
+def _saved_path_useful(p: str) -> bool:
+    p = (p or "").strip()
+    if not p or "<" in p or ">" in p or not p.startswith(("/", "~/")):
+        return False
+    if not re.search(r"\.[A-Za-z0-9]{1,8}$", p.rstrip("/")):
+        return False
+    if _SAVED_UPLOAD_DIR_RE.search(p):
+        return True
+    return not _SAVED_PATH_DENY_RE.search(p)
+
+
+def _saved_harvest_text(text: str, urls: list, creds: list) -> None:
+    """Pull links and stated logins out of one block of prose."""
+    for m in _SAVED_URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;:)")
+        if _saved_url_useful(u):
+            urls.append(u)
+    for m in _SAVED_CRED_RE.finditer(text or ""):
+        label, value = m.group(1).strip(), m.group(2).strip().strip("`\"'")
+        # The match may have started mid-sentence, so the label can pick up the
+        # connective in front of it ("with Basic auth user").
+        label = re.sub(r"^(?:with|and|the|a|an|its|our|your|use|using|via|for|to|in)\s+",
+                       "", label, flags=re.I).strip()
+        # A URL is already reported as a link; "login page: https://…" is not a
+        # credential and putting it under Logins loses the distinction.
+        # A link is reported as a link. `//host/path` is what is left of one when
+        # the regex split "https://…" at its own colon, which is how the question
+        # "whats the password for https://gateway…" became a saved login.
+        if not label or not value or value.startswith(("http://", "https://", "//")):
+            continue
+        if not _saved_cred_ok(label, value):
+            continue
+        creds.append({"label": label, "value": value})
+
+
+def _saved_scan_transcript(path: str) -> dict:
+    """Links, logins and written files harvested from a transcript, incrementally.
+
+    The scan resumes at the byte offset it stopped at last time; a truncated or
+    replaced file (inode change, or a file shorter than the offset) restarts it."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"urls": [], "creds": [], "files": []}
+    state = _saved_scan_state.get(path)
+    if not state or state.get("inode") != st.st_ino or state.get("offset", 0) > st.st_size:
+        state = {"inode": st.st_ino, "offset": 0, "urls": [], "creds": [], "files": []}
+    if state["offset"] == st.st_size:
+        return state
+    urls, creds, files = state["urls"], state["creds"], state["files"]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(state["offset"])
+            for line in fh:
+                if not line.endswith("\n"):
+                    break            # a half-written record; pick it up next pass
+                state["offset"] += len(line.encode("utf-8", "replace"))
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") not in ("assistant", "user"):
+                    continue
+                msg = d.get("message") if isinstance(d.get("message"), dict) else d
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, str):
+                    _saved_harvest_text(content, urls, creds)
+                    continue
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if isinstance(b.get("text"), str):
+                        _saved_harvest_text(b["text"], urls, creds)
+                    elif b.get("type") == "tool_use":
+                        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                        tool = str(b.get("name") or "").lower()
+                        if tool in _SAVED_WRITE_TOOLS:
+                            fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+                            if isinstance(fp, str) and _saved_path_useful(fp):
+                                files.append(fp)
+                        elif tool in ("webfetch", "web_fetch"):
+                            u = inp.get("url")
+                            if isinstance(u, str) and _saved_url_useful(u):
+                                urls.append(u)
+                        elif tool == "bash":
+                            # Commands are where a deploy URL usually first
+                            # appears; the command text is not prose, so only
+                            # links are taken from it.
+                            cmd = inp.get("command")
+                            if isinstance(cmd, str):
+                                for m in _SAVED_URL_RE.finditer(cmd):
+                                    u = m.group(0).rstrip(".,;:)")
+                                    if _saved_url_useful(u):
+                                        urls.append(u)
+    except OSError:
+        return {"urls": [], "creds": [], "files": []}
+    # Newest first, deduped, capped. A later mention of the same thing is the
+    # current one, so the last occurrence wins its position.
+    state["urls"] = _saved_dedupe(urls, lambda u: u.rstrip("/").lower(),
+                                  _SAVED_CAPS["urls"])
+    state["creds"] = _saved_dedupe(
+        creds, lambda c: (c["label"].lower(), c["value"].lower()), _SAVED_CAPS["creds"])
+    state["files"] = _saved_dedupe(files, lambda f: f.rstrip("/"),
+                                   _SAVED_CAPS["files"])
+    _saved_scan_state[path] = state
+    return state
+
+
+def _saved_dedupe(items: list, key, cap: int) -> list:
+    seen, out = set(), []
+    for it in reversed(items):
+        k = key(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _session_saved_reference(session_name: str) -> dict:
+    """The Saved-from-this-project payload for one session, or empty when this
+    session's own transcript could not be identified. Never a neighbour's."""
+    empty = {"urls": [], "creds": [], "files": [], "identified": False}
+    files = _find_session_jsonl_files(session_name)
+    if not files:
+        return empty
+    path = _pick_session_transcript_file(session_name, files)
+    if not path:
+        return empty
+    confident = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
+                     or len([f for f in files
+                             if not os.path.basename(f).startswith("agent-")]) == 1)
+    if not confident:
+        return empty
+    got = _saved_scan_transcript(path)
+    return {"urls": got["urls"], "creds": got["creds"], "files": got["files"],
+            "identified": True}
+
+
 def _pane_model_effort(session_name: str) -> dict:
     """Model and effort switches the SESSION ITSELF confirmed, read off its pane.
 
@@ -18054,10 +18527,20 @@ def _detect_session_model_effort(session_name: str) -> dict:
     model_line = pane.get("model_line") or ""
     wide = bool(_MODEL_1M_RE.search(model_line) if model_line
                 else "[1m]" in argv.lower())
-    wide = wide or facts["ctx"] > _CTX_WINDOW_STD
+    wide = wide or (sure and facts["ctx"] > _CTX_WINDOW_STD)
     if model and wide and not model.endswith("[1m]"):
         model += "[1m]"
     limit = (_CTX_WINDOW_1M if wide else _CTX_WINDOW_STD) if model else 0
+
+    # A BORROWED TRANSCRIPT HAS NO FALLBACK, so its numbers must not be shown.
+    # Model and effort survive an unproven read because argv carries this
+    # session's own launch flags; the prompt size, the cache TTL and the time of
+    # the last reply exist nowhere else, so an unproven read of them is simply
+    # the neighbour's figure with this session's name on it. That is what put
+    # "ctx 804k · 80%" under a session three minutes old. Report nothing instead:
+    # the bar already hides a zero.
+    if not sure:
+        facts = dict(facts, ctx=0, ttl=0, ts=0.0, cache_read=0)
 
     out = {"model": model, "effort": effort, "ts": now, "sure": sure,
            "effort_source": source, "fell_back_from": fell_back_from,
@@ -20156,9 +20639,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
 .nav-spacer{flex:1}
-.nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;padding-right:10px;display:flex;align-items:center;gap:8px;border-right:1px solid #30363d;margin-right:10px;padding:4px 10px 4px 0;transition:color .15s}
+/* CPU and RAM stack into two rows, laid out exactly like the 5h/7d usage pair
+   next to them: same label column, same 82px track, same .6rem number. One row
+   each keeps the header the same height as the bars beside it instead of
+   stretching it. */
+.nav-server-stats{color:#8b949e;white-space:nowrap;display:flex;flex-direction:column;justify-content:center;gap:2px;border-right:1px solid #30363d;margin-right:10px;padding-right:12px;flex-shrink:0;transition:color .15s}
 .nav-server-stats:hover{color:#c9d1d9}
-.nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
+.nav-stat-item{display:flex;align-items:center;gap:5px;line-height:1}
+.nav-stat-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
+.nav-stat-bar{position:relative;width:82px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-stat-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
+.nav-stat-fill.warn{background:#d29922}
+.nav-stat-fill.crit{background:#f85149}
+.nav-server-stats .stat-val{color:#c9d1d9;font-weight:600;font-size:.6rem;width:26px;text-align:right;font-variant-numeric:tabular-nums}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
 /* Always laid out, never display:none on data loss. Hiding the whole block when
@@ -20495,6 +20988,18 @@ body.member-admin .more-member-only{display:none}
 .tl-ctx.high{color:#d29922}
 .tl-ctx.crit{color:#f85149;font-weight:600}
 .tl-ctx.unsure,.tl-since.unsure{opacity:.55;font-style:italic}
+/* Anthropic 5h / 7d caps, pinned to the right of the live bar. Sized to fit the
+   existing 16px row, so adding them costs no terminal height. */
+.tl-cap{display:flex;align-items:center;gap:10px;flex:none;margin-left:4px}
+.tl-cap.no-data{opacity:.45}
+.tl-cap-item{display:flex;align-items:center;gap:4px;cursor:help;line-height:1}
+.tl-cap-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
+.tl-cap-bar{position:relative;width:44px;height:3px;background:#21262d;border-radius:2px;overflow:hidden}
+.tl-cap-fill{position:absolute;top:0;left:0;bottom:0;width:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
+.tl-cap-fill.warn{background:#d29922}
+.tl-cap-fill.crit{background:#f85149}
+.tl-cap-pct{color:#8b949e;font-size:.6rem;font-weight:600;width:24px;text-align:right;font-variant-numeric:tabular-nums}
+body.member-simple .tl-cap{display:none}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -21294,7 +21799,7 @@ body.member-simple .hide-in-simple{display:none!important}
     display:flex;flex-direction:row;gap:16px;border:none;margin:0;padding:0}
   body:not(.member-simple) .mobile-bottom-bar .nav-server-stats{
     display:flex;border:none;margin:0;padding:0}
-  .mobile-bottom-bar .nav-usage-bar{width:96px;height:5px}
+  .mobile-bottom-bar .nav-usage-bar,.mobile-bottom-bar .nav-stat-bar{width:96px;height:5px}
   .mobile-bottom-bar .nav-browser-badge{padding:4px 9px}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
@@ -21323,6 +21828,8 @@ body.member-simple .hide-in-simple{display:none!important}
   .raw-output.flow .tl{padding-left:1.3em;text-indent:-1.3em}
   .term-live{font-size:.66rem;gap:6px;padding:5px 9px}
   .term-live .tl-note{display:none}
+  .term-live .tl-cap{gap:6px;margin-left:0}
+  .term-live .tl-cap-bar{width:30px}
   .modal{min-width:280px;margin:0 16px}
   .tab{padding:8px 12px;font-size:.8rem}
   .tab-more-menu{min-width:210px}
@@ -22821,6 +23328,10 @@ function updateLiveBar(name){
   set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
   _paintIdleSince(name);
   _paintContext(name);
+  // The bar is rebuilt whenever the detail pane re-renders, so the cap fills
+  // have to be re-applied from the last fetch rather than left at their markup
+  // defaults. Cheap: at most one session's worth of nodes.
+  paintSessionUsageCaps();
   const note=document.getElementById('tl-note-'+name);
   if(note){
     const txt=busy&&live.esc?'Stop to interrupt':'';
@@ -24064,6 +24575,22 @@ function renderDetail(){
         <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
+        <!-- The account's Anthropic caps, on the session that is spending them.
+             Same two windows and the same colours as the header pair; here so
+             the answer to "can I keep going" sits next to the terminal you would
+             keep going in. -->
+        <span class="tl-cap" id="tl-cap-${s.name}">
+          <span class="tl-cap-item" id="tl-cap-5h-wrap-${s.name}">
+            <span class="tl-cap-label">5h</span>
+            <span class="tl-cap-bar"><span class="tl-cap-fill" id="tl-cap-5h-fill-${s.name}"></span></span>
+            <span class="tl-cap-pct" id="tl-cap-5h-pct-${s.name}">&mdash;</span>
+          </span>
+          <span class="tl-cap-item" id="tl-cap-7d-wrap-${s.name}">
+            <span class="tl-cap-label">7d</span>
+            <span class="tl-cap-bar"><span class="tl-cap-fill" id="tl-cap-7d-fill-${s.name}"></span></span>
+            <span class="tl-cap-pct" id="tl-cap-7d-pct-${s.name}">&mdash;</span>
+          </span>
+        </span>
       </div>
       <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
            which is collapsed by default, so the frozen state needs to announce
@@ -24185,8 +24712,12 @@ function renderDetail(){
   renderComposerAttachments(s.name,'raw');
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
-  // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
+  // Populate the saved keys/URLs/files list inside the Keys & Commands drawer.
+  // Paint immediately from whatever is already cached, then re-read the
+  // transcript in the background so a session that has just written something
+  // shows it without a page reload.
   renderSavedKeys(s.name, s);
+  refreshSavedKeys(s.name);
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
@@ -25212,6 +25743,7 @@ function updateCard(s){
   const rawTitle=document.getElementById('raw-title-'+s.name);
   if(rawTitle&&s.title)rawTitle.textContent=s.title;
   renderSavedKeys(s.name, s);
+  refreshSavedKeys(s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
   updateStatusPill(s.name,s.activity_status,s.activity_detail);
@@ -25422,7 +25954,16 @@ async function refreshNavStats(){
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
     const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
     const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span><span>RAM <span class="stat-val '+memClass+'">'+memPct+'%</span></span>';
+    const row=(label,pct,cls,title)=>'<span class="nav-stat-item" title="'+esc(title)+'">'+
+      '<span class="nav-stat-label">'+label+'</span>'+
+      '<span class="nav-stat-bar"><span class="nav-stat-fill '+cls+'" style="width:'+Math.min(100,pct)+'%"></span></span>'+
+      '<span class="stat-val '+cls+'">'+pct+'%</span></span>';
+    const memTxt=s.memory&&s.memory.total_mb
+      ? Math.round(s.memory.used_mb/1024*10)/10+'G of '+Math.round(s.memory.total_mb/1024*10)/10+'G used'
+      : 'Memory';
+    navStatsEl.innerHTML=
+      row('CPU',cpuPct,cpuClass,cpuPct+'% across '+cpuCount+' vCPU · '+threads+' threads runnable')+
+      row('RAM',memPct,memClass,memTxt);
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
@@ -25553,9 +26094,40 @@ async function refreshUsageLimits(){
     const tsd=document.getElementById('tools-usage-7d-wrap');
     if(tfh)tfh.title=fhTitle;
     if(tsd)tsd.title=sdTitle;
+    _usageCaps={has:true,fh:Number(fh.utilization)||0,sd:Number(sd.utilization)||0,
+                fhTitle:fhTitle,sdTitle:sdTitle};
+    paintSessionUsageCaps();
   }catch(e){
     /* keep last known display */
   }
+}
+// The same two windows, repeated under every open terminal. The header pair is
+// off-screen on a phone and easy to miss on a laptop, and "how much of the cap
+// is left" is a question you ask WHILE a session is running, not while looking
+// at the header. One fetch feeds both: the last answer is kept here and the
+// session bars are repainted from it, so this adds no upstream traffic.
+let _usageCaps={has:false,fh:0,sd:0,fhTitle:'',sdTitle:''};
+function _applyCapStyle(fillEl,pctNum){
+  if(!fillEl)return;
+  fillEl.style.width=Math.min(100,Math.max(0,pctNum))+'%';
+  const cls=pctNum>=90?'crit':(pctNum>=70?'warn':'');
+  fillEl.className='tl-cap-fill'+(cls?' '+cls:'');
+}
+function paintSessionUsageCaps(){
+  document.querySelectorAll('.tl-cap').forEach(function(wrap){
+    const name=wrap.id.slice('tl-cap-'.length);
+    wrap.classList.toggle('no-data',!_usageCaps.has);
+    [['5h',_usageCaps.fh,_usageCaps.fhTitle],['7d',_usageCaps.sd,_usageCaps.sdTitle]]
+      .forEach(function(row){
+        const key=row[0],val=row[1],title=row[2];
+        _applyCapStyle(document.getElementById('tl-cap-'+key+'-fill-'+name),
+                       _usageCaps.has?val:0);
+        const pct=document.getElementById('tl-cap-'+key+'-pct-'+name);
+        if(pct)pct.textContent=_usageCaps.has?Math.round(val)+'%':'—';
+        const w=document.getElementById('tl-cap-'+key+'-wrap-'+name);
+        if(w)w.title=_usageCaps.has?title:'Anthropic usage unavailable.';
+      });
+  });
 }
 // When the backend has no fresh number (upstream down or rate-limited) retry in
 // 5 minutes instead of waiting out the full hourly tick, so the bars fill in as
@@ -25698,7 +26270,7 @@ async function createSession(){
         <button class="modal-confirm-create" onclick="showCreateModal()">Try again</button></div>`;}
       return;
     }
-    selectedSession=data.name;
+    _openNewSession(data.name);
     closeModal();
     await loadAll();
   }catch(e){
@@ -25708,6 +26280,18 @@ async function createSession(){
   }
 }
 
+// OPEN THE SESSION YOU JUST MADE. Setting `selectedSession` is not enough:
+// loadAll() re-reads the URL hash and, because the hash still names the session
+// you were looking at a moment ago and that session is still in scope, it puts
+// the selection straight back. The new session was created and you were left
+// staring at the old one. The route is the source of truth, so move the route.
+function _openNewSession(name){
+  if(!name)return;
+  selectedSession=name;
+  const tab=MEMBER_SIMPLE?'chat':'raw';
+  activeTabs[name]=tab;
+  location.hash=_sessionRouteHash(name,tab);
+}
 function _randName(n){const c='abcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;}
 async function createSessionAuto(){
   for(let attempt=0;attempt<5;attempt++){
@@ -25717,7 +26301,7 @@ async function createSessionAuto(){
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({name, cwd: projectCwd()})});
       const data=await resp.json();
-      if(resp.ok){selectedSession=data.name;await loadAll();return}
+      if(resp.ok){_openNewSession(data.name);await loadAll();return}
       if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
     }catch(e){alert('Failed to create session.');return}
   }
@@ -26287,7 +26871,6 @@ function buildKeyBar(name,tab){
     <span class="key-bar-label">Keys:</span>
     <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Claude Code's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
@@ -26307,7 +26890,6 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
     <span class="key-bar-sep"></span>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
@@ -26475,9 +27057,41 @@ function _savedFileRow(p,disambiguate){
   r.appendChild(_savedCopyBtn(p));
   return r;
 }
+// What the server read straight out of this session's transcript, per session.
+// The notes-derived list (parseKeyInfo above) is kept and merged rather than
+// replaced: on a box where the LLM summariser IS switched on it still has
+// things the transcript does not state outright.
+const savedRefCache={};
+const _savedRefAt={};
+async function refreshSavedKeys(name,force){
+  // The scan itself is incremental and costs almost nothing, but the poll that
+  // repaints the card runs every few seconds and there is no point re-reading
+  // that often. 30s is well under how long anyone spends reading the drawer.
+  const now=Date.now();
+  if(!force&&_savedRefAt[name]&&now-_savedRefAt[name]<30000)return;
+  _savedRefAt[name]=now;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/saved');
+    if(!resp.ok)return;
+    savedRefCache[name]=await resp.json();
+  }catch(e){return}
+  renderSavedKeys(name);
+}
+function _mergeSaved(a,b){
+  const seen=new Set(),out=[];
+  [...(a||[]),...(b||[])].forEach(function(it){
+    const k=(typeof it==='string'?it.replace(/\/+$/,''):it.label+'~'+it.value).toLowerCase();
+    if(seen.has(k))return; seen.add(k); out.push(it);
+  });
+  return out;
+}
 function renderSavedKeys(name,sessionObj){
   const s=sessionObj||sessions.find(x=>x.name===name);
-  const info=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  const notesInfo=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  const ref=savedRefCache[name]||{urls:[],creds:[],files:[]};
+  const info={urls:_mergeSaved(ref.urls,notesInfo.urls),
+              creds:_mergeSaved(ref.creds,notesInfo.creds),
+              files:_mergeSaved(ref.files,notesInfo.files)};
   // Basenames that collide across kept files → show the parent dir to tell apart.
   const baseCount={};
   info.files.forEach(p=>{const b=p.replace(/\/+$/,'').split('/').pop();baseCount[b]=(baseCount[b]||0)+1});
@@ -26506,7 +27120,9 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='Nothing captured yet. This is the quick-reference for THIS session: files it created, external URLs, and any logins or passwords it set up, so you do not have to scroll back through the terminal. Press "Full" on the Info tab to extract them.';
+      empty.textContent=(savedRefCache[name]&&savedRefCache[name].identified===false)
+        ? 'This session shares a working directory with others and its own transcript could not be told apart from theirs yet, so nothing is listed rather than a neighbour’s links. It fills in once the session has run a turn of its own.'
+        : 'Nothing to show yet. This is the quick-reference for THIS session: the files it wrote, the links it produced, and any logins it set up, so you do not have to scroll back through the terminal. It fills itself in as the session works.';
       body.appendChild(empty);
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('Links & URLs',info.urls.map(u=>_savedLinkRow(u,u))));
@@ -30543,18 +31159,49 @@ function renderStats(s,usage){
     });
     html+='</div>';
   }
-  // Claude Processes
-  html+='<div class="stats-section"><div class="stats-section-title">Claude Processes</div>';
-  if(s.claude_processes&&s.claude_processes.length){
-    s.claude_processes.forEach(p=>{
-      const short=p.length>80?p.substring(0,80)+'...':p;
-      html+='<div class="stats-row" style="word-break:break-all"><span class="stats-row-value" style="font-size:.7rem">'+esc(short)+'</span></div>';
+  // Claude Processes.
+  // Every row here is a LIVE process, not a log of past ones — a list of
+  // identical command lines read like leftover history, which is the single
+  // most misleading thing this panel could do while nine gigabytes sit in
+  // abandoned agents. So each one is named by the tmux session that owns it,
+  // sized, aged, and separated into "this dashboard's" and "nobody's".
+  const inv=s.claude_inventory||null;
+  const fmtAgeShort=sec=>{
+    if(sec==null)return'';
+    if(sec<3600)return Math.max(1,Math.round(sec/60))+'m';
+    if(sec<86400)return Math.round(sec/3600)+'h';
+    return (sec/86400).toFixed(1)+'d';
+  };
+  const fmtMb=mb=>mb>=1024?(mb/1024).toFixed(1)+'G':(mb||0)+'M';
+  if(inv){
+    html+='<div class="stats-section"><div class="stats-section-title">Claude Processes ('+inv.total+' running)</div>';
+    html+='<div class="stats-row"><span class="stats-row-label">In a session on this dashboard</span><span class="stats-row-value">'+inv.attached+'</span></div>';
+    const orphColor=inv.orphaned?(inv.orphan_rss_mb>=2048?'#f85149':'#d29922'):'#8b949e';
+    html+='<div class="stats-row"><span class="stats-row-label">Not attached to any session here</span>'+
+      '<span class="stats-row-value" style="color:'+orphColor+'">'+inv.orphaned+
+      (inv.orphaned?' &middot; '+fmtMb(inv.orphan_rss_mb)+' held':'')+'</span></div>';
+    if(inv.orphaned)
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#6e7681;font-size:.7rem">'+
+        'Agents on another tmux socket, or whose session is gone. They keep their memory until killed.</span></div>';
+    const rows=(inv.processes||[]);
+    const shown=rows.slice(0,30);
+    shown.forEach(p=>{
+      const who=p.session
+        ? (p.attached?esc(p.session):esc(p.socket)+' / '+esc(p.session))
+        : 'pid '+p.pid+' (no session)';
+      const dot=p.attached?'#3fb950':'#d29922';
+      html+='<div class="stats-row" title="pid '+p.pid+' &middot; '+esc(p.argv||'')+'">'+
+        '<span class="stats-row-label"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:'+dot+';margin-right:7px"></span>'+who+'</span>'+
+        '<span class="stats-row-value" style="font-size:.72rem">'+fmtMb(p.rss_mb)+' &middot; '+fmtAgeShort(p.age_s)+'</span></div>';
     });
-  }else{
-    html+='<div class="stats-row"><span class="stats-row-label">No Claude processes found</span></div>';
+    if(rows.length>shown.length)
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#6e7681">+'+(rows.length-shown.length)+' more</span></div>';
+    if(!rows.length&&inv.total)
+      html+='<div class="stats-row"><span class="stats-row-label">'+inv.total+' running (details are admin-only)</span></div>';
+    if(!inv.total)
+      html+='<div class="stats-row"><span class="stats-row-label">No Claude processes running</span></div>';
+    html+='</div>';
   }
-  if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
-  html+='</div>';
 
   // Claude Usage
   if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
