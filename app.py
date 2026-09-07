@@ -604,26 +604,45 @@ def _session_display_name_rows() -> dict[str, dict]:
     }
 
 
-def _session_display_name(session_name: str, rows: dict | None = None) -> str:
-    """What the user typed, or the tmux name when they typed no spaces."""
+def _session_display_name(session_name: str, rows: dict | None = None,
+                          created: str = "") -> str:
+    """The name to show for a session: what someone typed, else the tmux name.
+
+    TMUX NAMES GET RECYCLED. Kill `report` and make a new `report` and the old
+    row would label the new session with the dead one's name, which is worse
+    than showing the plain name. The original guard against that was to accept a
+    stored name only when it collapsed back to the tmux name with its spaces
+    removed, which also meant a rename could add and remove spaces and nothing
+    else. Sessions now record the tmux `session_created` stamp they were named
+    under, so a free-form name is safe: a recycled name has a different stamp and
+    the row is ignored. Rows written before this (no stamp) keep the old rule.
+    """
     rows = rows if rows is not None else _session_display_name_rows()
-    display = str((rows.get(session_name) or {}).get("display") or "")
-    # A stored name that no longer collapses to this session is not this
-    # session's name: fall back rather than mislabel a recycled tmux name.
-    if display and display.replace(" ", "") == session_name:
+    row = rows.get(session_name) or {}
+    display = str(row.get("display") or "")
+    if not display:
+        return session_name
+    stamp = str(row.get("created") or "")
+    if stamp:
+        return display if str(created or "") == stamp else session_name
+    if display.replace(" ", "") == session_name:
         return display
     return session_name
 
 
-def _set_session_display_name(session_name: str, display: str) -> None:
-    """Remember a spaced name. A name with no spaces needs no row."""
+def _set_session_display_name(session_name: str, display: str,
+                              created: str = "") -> None:
+    """Remember a name. A name equal to the tmux name needs no row."""
     def mutate(data: dict) -> None:
         data["version"] = 1
         rows = data.setdefault("sessions", {})
         if not display or display == session_name:
             rows.pop(session_name, None)
             return
-        rows[session_name] = {"display": display, "updated_at": time.time()}
+        row = {"display": display, "updated_at": time.time()}
+        if created:
+            row["created"] = str(created)
+        rows[session_name] = row
 
     SESSION_DISPLAY_NAMES.update(mutate)
 
@@ -7650,7 +7669,8 @@ def build_session_response(
         activity = detect_activity(sess["name"])
     return {
         "name": sess["name"],
-        "display_name": _session_display_name(sess["name"], display_names),
+        "display_name": _session_display_name(sess["name"], display_names,
+                                              sess.get("created", "")),
         "windows": sess["windows"],
         "attached": sess["attached"],
         "cwd": sess.get("cwd", ""),     # the project this session belongs to
@@ -7725,7 +7745,8 @@ async def api_sessions_fast(request: Request):
         cache[sess["name"]] = entry
         out.append({
             "name": sess["name"],
-            "display_name": _session_display_name(sess["name"], display_names),
+            "display_name": _session_display_name(sess["name"], display_names,
+                                                  sess.get("created", "")),
             "windows": sess["windows"],
             "attached": sess["attached"],
             # The working directory IS the project: it selects the CLAUDE.md,
@@ -7793,7 +7814,8 @@ async def api_status(request: Request):
     for sess, activity in zip(sessions, activities):
         out.append({
             "name": sess["name"],
-            "display_name": _session_display_name(sess["name"], display_names),
+            "display_name": _session_display_name(sess["name"], display_names,
+                                                  sess.get("created", "")),
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
@@ -8838,6 +8860,40 @@ async def api_list_uploads(session_name: str):
                 continue
     files.sort(key=lambda f: f["mtime"], reverse=True)
     return JSONResponse({"files": files})
+
+
+class SessionDisplayNameBody(BaseModel):
+    name: str = Field(default="", max_length=80)
+
+
+@app.patch("/api/sessions/{session_name}/display-name")
+async def api_set_session_display_name(request: Request, session_name: str,
+                                       body: SessionDisplayNameBody):
+    """Rename a session, for reading. The tmux name never changes.
+
+    THE TMUX NAME IS THE IDENTITY: it is a URL segment, a DOM id, a shell
+    argument, the key under which this session's owner, autopush mode, messages
+    and notes are filed, and what `tmux -t` is given. Renaming that would mean
+    renaming all of it, and would break any tab someone still has open. So the
+    name people read is a label stored beside it, and the two are kept from
+    drifting apart by recording the tmux creation stamp with the label: a
+    recycled tmux name has a different stamp and does not inherit the label.
+
+    An empty name clears the label and the tmux name shows through again.
+    """
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    display = " ".join(str(body.name or "").split())
+    if display and not _SESSION_NAME_RE.match(display):
+        return JSONResponse(
+            {"error": "Letters, numbers, spaces, dashes and underscores only."},
+            status_code=400)
+    created = str(sess.get("created", "") or "")
+    await asyncio.to_thread(_set_session_display_name, session_name, display, created)
+    return JSONResponse({"ok": True, "name": session_name,
+                         "display_name": display or session_name})
 
 
 @app.get("/api/sessions/{session_name}/saved")
@@ -20642,6 +20698,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
+.nav-session-rename{width:11ch;min-width:70px;max-width:22ch;background:#0d1117;border:1px solid #58a6ff;border-radius:4px;color:#e6edf3;font:inherit;font-size:inherit;padding:0 4px;outline:none}
+.nav-proj-more .npi-path{color:#6e7681;font-style:italic}
 .nav-spacer{flex:1}
 /* CPU and RAM stack into two rows, laid out exactly like the 5h/7d usage pair
    next to them: same label column, same 82px track, same .6rem number. One row
@@ -24068,7 +24126,57 @@ function sessionLabel(sessionOrName){
   return (s&&s.display_name)||sessionOrName||'';
 }
 
+// A rename puts an <input> inside the tab, and renderNav rebuilds every tab on
+// each poll, so a repaint mid-edit would take the box away under the cursor.
+let _renamingSession=null;
+
+// ── Rename a session ────────────────────────────────────────────────────────
+// The tmux name is the identity and never changes: it is a URL segment, a DOM
+// id, a shell argument and the key every per-session file is stored under. What
+// changes is the label shown on the tab, which the server keeps beside it.
+function startSessionRename(name,labelEl){
+  if(_renamingSession)return;
+  _renamingSession=name;
+  const before=sessionLabel(name);
+  const input=document.createElement('input');
+  input.type='text';input.className='nav-session-rename';input.value=before;
+  input.maxLength=80;
+  input.setAttribute('aria-label','Session name');
+  labelEl.replaceChildren(input);
+  input.focus();input.select();
+  let done=false;
+  const finish=async function(commit){
+    if(done)return;
+    done=true;
+    const typed=input.value.trim();
+    _renamingSession=null;
+    if(!commit||typed===before){renderNav();return}
+    try{
+      const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/display-name',{
+        method:'PATCH',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:typed})});
+      const data=await resp.json();
+      if(!resp.ok){showToast(data.error||'Could not rename the session.');renderNav();return}
+      const idx=sessions.findIndex(x=>x.name===name);
+      if(idx>=0)sessions[idx].display_name=data.display_name;
+      renderNav();
+      showToast(typed?('Renamed to "'+data.display_name+'".')
+                     :('Name cleared — showing '+name+'.'));
+    }catch(e){showToast('Could not reach the server to rename.');renderNav()}
+  };
+  input.addEventListener('keydown',function(ev){
+    ev.stopPropagation();
+    if(ev.key==='Enter'){ev.preventDefault();finish(true)}
+    else if(ev.key==='Escape'){ev.preventDefault();finish(false)}
+  });
+  // Clicking away keeps what you typed: losing an edit because the mouse moved
+  // is the more annoying of the two mistakes.
+  input.addEventListener('blur',function(){finish(true)});
+  input.addEventListener('click',function(ev){ev.stopPropagation()});
+}
+
 function renderNav(){
+  if(_renamingSession)return;            // finish the rename first
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   // Session tabs sit AFTER the project switcher, not between it and the brand.
   const anchor=navEl.querySelector('#nav-proj-wrap')||navEl.querySelector('.nav-brand');
@@ -24076,13 +24184,22 @@ function renderNav(){
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.title=sessionLabel(s);
+    item.title=sessionLabel(s)+(s.name===selectedSession?' — click the name to rename':'');
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
       <span class="nav-session-id">${esc(sessionLabel(s))}</span>
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
+    // On the tab you are already in, the name is the rename handle. On any
+    // other tab the first click still has to select it, or switching sessions
+    // would mean clicking the dot.
+    const label=item.querySelector('.nav-session-id');
+    if(label)label.addEventListener('click',function(ev){
+      if(s.name!==selectedSession)return;
+      ev.stopPropagation();
+      startSessionRename(s.name,label);
+    });
     anchor.after(item);
   });
   const items=Array.from(navEl.querySelectorAll('.nav-item'));
@@ -24115,7 +24232,31 @@ function projShort(p){
 }
 
 // Projects offered in the switcher.
-function projectList(){ return (PROJECTS||[]).filter(p => !projHidden(p.path)); }
+// EVERY DIRECTORY CLAUDE CODE HAS EVER RUN IN gets recorded in ~/.claude.json,
+// and this list was built straight off that, so the switcher filled up with the
+// throwaway run directories the filing apps make one of per submission: 23 of
+// the 25 entries here, none of them holding a CLAUDE.md, a .mcp.json or a
+// .claude/ anything, none with a session in it, none anybody chose. They are
+// history, not workspaces. A directory earns a place in the picker by having
+// something in it: a live session, a project-scope file, or being the one you
+// are in. `showAllProjects` puts the rest back, and Remove drops one for good.
+let PROJ_SHOW_ALL=false;
+let PROJ_HIDDEN=0;
+function projectList(){
+  const all=(PROJECTS||[]).filter(p => !projHidden(p.path));
+  if(PROJ_SHOW_ALL){PROJ_HIDDEN=0;return all}
+  const live=new Set((sessions||[]).map(s => s.cwd||''));
+  const kept=all.filter(p => live.has(p.path) || (p.present||0) > 0
+                             || p.path===CURRENT_PROJECT || PROJ_ALIAS[p.path]);
+  // Never hide everything: an empty picker is worse than a noisy one.
+  PROJ_HIDDEN=kept.length ? all.length-kept.length : 0;
+  return kept.length ? kept : all;
+}
+function toggleAllProjects(ev){
+  if(ev)ev.stopPropagation();
+  PROJ_SHOW_ALL=!PROJ_SHOW_ALL;
+  renderProjectNav();
+}
 
 // The real directory of the current selection, or '' for the pseudo-entries.
 // Anything that hands a path to the backend (new session cwd, profile scoping,
@@ -24207,6 +24348,17 @@ function renderProjectNav(){
       + ' title="Sessions whose directory is not a registered project">'
       + '<span class="npi-path">Other sessions</span>'
       + '<span class="npi-meta"><b>'+orphans.length+' live</b></span></div>';
+  }
+  // Say what is being kept out, and let it back in. Silently shortening a list
+  // is how a directory someone does want stops existing as far as they know.
+  if(PROJ_HIDDEN||PROJ_SHOW_ALL){
+    html += '<div class="nav-proj-sep"></div>'
+      + '<div class="nav-proj-item nav-proj-more" onclick="toggleAllProjects(event)"'
+      + ' title="Directories Claude Code recorded because it ran there once. No session, and no CLAUDE.md, .mcp.json or .claude/ files of their own.">'
+      + '<span class="npi-path">'
+      + (PROJ_SHOW_ALL ? 'Hide directories with nothing in them'
+                       : PROJ_HIDDEN+(PROJ_HIDDEN===1?' directory':' directories')+' with nothing in them')
+      + '</span><span class="npi-meta">'+(PROJ_SHOW_ALL?'hide':'show')+'</span></div>';
   }
   listEl.innerHTML = html;
 }

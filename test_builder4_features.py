@@ -1140,3 +1140,67 @@ def test_a_borrowed_transcript_never_outranks_the_launch_flags(tmp_path, monkeyp
     assert out["effort"] == "xhigh"
     assert out["effort_source"] == "launch"
     assert out["model"] == "claude-opus-5[1m]"
+
+
+# ── Renaming a session, and the tmux name that must not move ─────────────────
+
+def test_a_renamed_session_shows_the_new_name():
+    import app
+
+    rows = {"report": {"display": "Q3 revenue report", "created": "1788800000"}}
+
+    assert app._session_display_name("report", rows, "1788800000") == "Q3 revenue report"
+
+
+def test_a_recycled_tmux_name_does_not_inherit_the_old_label(tmp_path):
+    """Kill `report` and make a new `report`: the label belonged to the session
+    that is gone, and wearing it would be worse than showing the plain name. The
+    tmux creation stamp is what tells the two apart."""
+    import app
+
+    rows = {"report": {"display": "Q3 revenue report", "created": "1788800000"}}
+
+    assert app._session_display_name("report", rows, "1788899999") == "report"
+
+
+def test_a_label_written_before_the_stamp_existed_still_works():
+    """Rows predating the stamp were only ever allowed to re-space the tmux
+    name, and that rule still governs them, so nobody's existing name changes."""
+    import app
+
+    old = {"twoword": {"display": "two word"}}
+
+    assert app._session_display_name("twoword", old, "1788800000") == "two word"
+    # ...and the guard those rows relied on is still enforced for them.
+    wrong = {"twoword": {"display": "something else"}}
+    assert app._session_display_name("twoword", wrong, "1788800000") == "twoword"
+
+
+def test_the_rename_endpoint_is_wired_and_scoped():
+    import app
+
+    routes = {getattr(r, "path", "") : getattr(r, "methods", set()) for r in app.app.routes}
+    assert "PATCH" in routes.get("/api/sessions/{session_name}/display-name", set())
+    src = app.HTML_PAGE
+    # First click on another tab still SELECTS it; only the tab you are in renames.
+    assert "if(s.name!==selectedSession)return;" in src
+    assert "function startSessionRename(name,labelEl)" in src
+    assert "'/display-name'" in src or "/display-name'" in src
+    # A repaint mid-edit would take the input away under the cursor.
+    assert "if(_renamingSession)return;" in src
+
+
+def test_the_project_picker_hides_directories_with_nothing_in_them():
+    import app
+
+    src = app.HTML_PAGE
+
+    # A directory earns its place by having a session, a project-scope file, or
+    # being the current selection. Claude Code records every directory it has
+    # ever run in, so without this the picker fills with throwaway run dirs.
+    assert "live.has(p.path) || (p.present||0) > 0" in src
+    assert "p.path===CURRENT_PROJECT || PROJ_ALIAS[p.path]" in src
+    # Never hide everything, and always say what was hidden.
+    assert "return kept.length ? kept : all;" in src
+    assert "function toggleAllProjects(ev)" in src
+    assert "with nothing in them" in src
