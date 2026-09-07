@@ -8841,13 +8841,17 @@ async def api_list_uploads(session_name: str):
 
 
 @app.get("/api/sessions/{session_name}/saved")
-async def api_session_saved(session_name: str):
+async def api_session_saved(request: Request, session_name: str):
     """Links, logins and files this session produced — the Saved-from-this-project
     drawer under the terminal.
 
     Read straight off the session's own transcript, so it is complete the moment
-    the session does something rather than whenever a summariser last ran."""
-    _, sess = _find_session(session_name)
+    the session does something rather than whenever a summariser last ran.
+
+    OWNERSHIP-SCOPED, unlike its neighbours here: this is the one session endpoint
+    that hands back CREDENTIALS, so a member asking for a name that is not theirs
+    gets the same 404 as a name that does not exist."""
+    _, sess = _find_session_for_user(session_name, _current_user(request))
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
