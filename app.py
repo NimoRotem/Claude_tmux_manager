@@ -98,7 +98,7 @@ DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
 # Reasoning effort every new session launches on, exported as
 # CLAUDE_CODE_EFFORT_LEVEL by _claude_launch_env_prefix(). Sessions can still be
 # switched individually from the header dropdown, which runs /effort.
-DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "high")
+DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "xhigh")
 
 # --- Model catalog (session header dropdown) --------------------------------
 # The models offered in the per-session dropdown. Seeded with the current
@@ -114,6 +114,8 @@ _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
 _SEED_MODEL_CATALOG = [
     ["claude-opus-5[1m]", "Opus 5 · 1M"],
     ["claude-opus-5", "Opus 5"],
+    ["claude-fable-5-1[1m]", "Fable 5.1 · 1M"],
+    ["claude-fable-5-1", "Fable 5.1"],
     ["claude-sonnet-5[1m]", "Sonnet 5 · 1M"],
     ["claude-sonnet-5", "Sonnet 5"],
     ["claude-opus-4-8[1m]", "Opus 4.8 · 1M"],
@@ -195,6 +197,26 @@ def _merge_new_models(catalog: list, api_ids: list) -> list:
     return new_rows + catalog
 
 
+def _merge_seed_rows(rows: list) -> list:
+    """Fold any seed row the persisted catalog lacks into it, at the seed's
+    position relative to its neighbours. A deploy that adds a model to
+    _SEED_MODEL_CATALOG (Fable 5.1) must reach a box whose models.json was
+    written before that row existed; without this the persisted file wins and
+    the new model never shows in the dropdown."""
+    present = {r[0] for r in rows}
+    out = list(rows)
+    prev = None
+    for seed_id, label in _SEED_MODEL_CATALOG:
+        if seed_id not in present:
+            at = 0
+            if prev is not None:
+                at = next((i for i, r in enumerate(out) if r[0] == prev), -1) + 1
+            out.insert(at, [seed_id, label])
+            present.add(seed_id)
+        prev = seed_id
+    return out
+
+
 def _load_model_catalog() -> list:
     """Load the persisted catalog, or seed it. Always returns a non-empty list."""
     try:
@@ -203,7 +225,7 @@ def _load_model_catalog() -> list:
             rows = data.get("models") if isinstance(data, dict) else data
             rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
             if rows:
-                return rows
+                return _merge_seed_rows(rows)
     except Exception:
         logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
     return [list(r) for r in _SEED_MODEL_CATALOG]
@@ -436,12 +458,52 @@ def _model_flag_for_relaunch(session_name: str) -> str:
         last = ""
     if last.startswith("<"):  # "<synthetic>" transcript entries
         last = ""
+    # A model the CLI FELL BACK to is not this session's model: it is what it was
+    # handed when the chosen one ran out of capacity, and it never returns on its
+    # own. Preserving it across a restart would make a temporary shortage
+    # permanent, one relaunch at a time. A restart is also the only moment the
+    # choice can be put back without typing into a live turn, so take it: restore
+    # what the session was actually set to, keeping the wide-context tier it was
+    # running on. If the shortage is still there the CLI will fall back again and
+    # say so in the badge, which is the honest outcome either way.
+    fb = _session_fallback.get(session_name) or {}
+    if not fb:
+        # This process may have started after the switch happened, so fall back to
+        # what the session was recorded as being put on. Only when it disagrees
+        # with what is running: agreeing means there is nothing to undo.
+        chosen = _session_model_choice(session_name)
+        if chosen and last and chosen.split("[", 1)[0] != last.split("[", 1)[0]:
+            fb = {"from": chosen, "to": last.split("[", 1)[0]}
+    if fb.get("from") and fb.get("to") and last.split("[", 1)[0] == fb["to"]:
+        wide = last.endswith("[1m]")
+        last = fb["from"]
+        if wide and not last.endswith("[1m]") and any(f in last for f in _ONE_M_FAMILIES):
+            last += "[1m]"
     if not last:
         return f" --model {shlex.quote(DEFAULT_MODEL)}" if DEFAULT_MODEL else ""
     base = DEFAULT_MODEL.split("[", 1)[0]
     if base and (last == base or last.startswith(base + "-")):
         return f" --model {shlex.quote(DEFAULT_MODEL)}"
     return f" --model {shlex.quote(last)}"
+
+
+def _effort_flag_for_relaunch(session_name: str) -> str:
+    """` --effort <level>` for a crash/relogin relaunch: preserve the level the
+    session was actually running at.
+
+    Without it the relaunched CLI starts on settings.json's `effortLevel`, which
+    this dashboard deliberately keeps pinned at DEFAULT_EFFORT, so a session
+    someone had put on `max` came back at xhigh and nothing anywhere said so.
+    `max` is the case that matters and the case that breaks: the CLI refuses to
+    persist it ("session-only"), so the launch flag is the ONLY thing that can
+    carry it across a restart."""
+    try:
+        last = (_get_session_effort(session_name) or "").strip().lower()
+    except Exception:
+        last = ""
+    if last not in ALLOWED_SESSION_EFFORTS:
+        last = DEFAULT_EFFORT
+    return f" --effort {shlex.quote(last)}" if last else ""
 
 # --- Team mode ------------------------------------------------------------
 # When TMUX_DASH_TEAM_MODE=1, non-admin ("user" role) accounts get a heavily
@@ -517,84 +579,34 @@ AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() i
 MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 ANTHROPIC_API_KEY_FILE = MESSAGES_DIR / "anthropic_api_key"
 SESSION_LIFECYCLE = SessionLifecycleStore(MESSAGES_DIR / "session-lifecycle.json")
-SESSION_TAB_LABELS = LockedJsonStore(
-    MESSAGES_DIR / "session-tab-labels.json",
+# A session's tmux name has no spaces, because it is also a shell argument, a
+# URL segment and a DOM id all over this app. What the user typed is kept here
+# and shown in the tab instead, so "word1 word2" reads the way it was written.
+SESSION_DISPLAY_NAMES = LockedJsonStore(
+    MESSAGES_DIR / "session-display-names.json",
     lambda: {"version": 1, "sessions": {}},
 )
 TMUX_MUTATION_LOCK = MESSAGES_DIR / "tmux-mutation.lock"
 _stored_anthropic_key: str = ""
 
-_TAB_LABEL_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
-_TAB_LABEL_ACTIONS = frozenset(
-    {
-        "add", "build", "check", "create", "debug", "design", "diagnose",
-        "fix", "implement", "improve", "merge", "refactor", "remove",
-        "repair", "review", "test", "update", "write",
-    }
-)
-_TAB_LABEL_STOP_WORDS = frozenset(
-    {
-        "a", "about", "all", "an", "and", "at", "be", "by", "can", "code",
-        "do", "for", "from", "here", "how", "i", "in", "into", "is", "it",
-        "just", "me", "my", "new", "now", "of", "on", "or", "please", "the",
-        "this", "to", "up", "we", "what", "with", "you", "your",
-    }
-)
-_TAB_LABEL_CONTINUATIONS = frozenset(
-    {
-        "continue", "do it", "go ahead", "implement it", "ok", "okay",
-        "proceed", "sounds good", "start", "yes", "yep",
-    }
-)
-_TAB_LABEL_ACRONYMS = {
-    "ai": "AI", "api": "API", "css": "CSS", "dns": "DNS", "html": "HTML",
-    "js": "JS", "json": "JSON", "oauth": "OAuth", "ssh": "SSH",
-    "tmux": "tmux", "ui": "UI", "url": "URL", "ux": "UX",
-}
+
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9 _-]+$")
 
 
-def _tab_label_word(word: str) -> str:
-    normalized = str(word or "")[:24]
-    lower = normalized.lower()
-    if lower in _TAB_LABEL_ACRONYMS:
-        return _TAB_LABEL_ACRONYMS[lower]
-    if normalized.isupper() and len(normalized) <= 8:
-        return normalized
-    return normalized.capitalize()
+def _split_session_name(raw: str) -> tuple[str, str]:
+    """Split a typed name into the tmux name and the name to show.
+
+    'word1 word2' -> ('word1word2', 'word1 word2'). Returns ('', '') when the
+    input is not a usable name.
+    """
+    display = " ".join(str(raw or "").split())
+    if not display or not _SESSION_NAME_RE.match(display):
+        return "", ""
+    return display.replace(" ", ""), display
 
 
-def _normalize_two_word_tab_label(value: str, fallback: str = "Active Task") -> str:
-    words = _TAB_LABEL_WORD_RE.findall(str(value or ""))[:2]
-    if not words:
-        words = _TAB_LABEL_WORD_RE.findall(fallback)[:2] or ["Active", "Task"]
-    if len(words) == 1:
-        words.append("Task")
-    return " ".join(_tab_label_word(word) for word in words[:2])
-
-
-def _fallback_two_word_tab_label(prompt: str) -> str:
-    text = re.sub(r"https?://\S+", " ", str(prompt or ""))
-    tokens = _TAB_LABEL_WORD_RE.findall(text)
-    content = []
-    seen = set()
-    for token in tokens:
-        lower = token.lower()
-        if (
-            lower in _TAB_LABEL_STOP_WORDS
-            or lower in _TAB_LABEL_ACTIONS
-            or lower in seen
-            or (len(token) < 2 and not token.isupper())
-        ):
-            continue
-        seen.add(lower)
-        content.append(token)
-        if len(content) == 2:
-            break
-    return _normalize_two_word_tab_label(" ".join(content), "Active Task")
-
-
-def _session_tab_label_rows() -> dict[str, dict]:
-    rows = SESSION_TAB_LABELS.read().get("sessions", {})
+def _session_display_name_rows() -> dict[str, dict]:
+    rows = SESSION_DISPLAY_NAMES.read().get("sessions", {})
     return {
         str(name): dict(row)
         for name, row in rows.items()
@@ -602,57 +614,54 @@ def _session_tab_label_rows() -> dict[str, dict]:
     }
 
 
-def _session_tab_label(session_name: str, rows: dict | None = None) -> str:
-    rows = rows if rows is not None else _session_tab_label_rows()
-    label = str((rows.get(session_name) or {}).get("label") or "")
-    return _normalize_two_word_tab_label(label) if label else ""
+def _session_display_name(session_name: str, rows: dict | None = None,
+                          created: str = "") -> str:
+    """The name to show for a session: what someone typed, else the tmux name.
+
+    TMUX NAMES GET RECYCLED. Kill `report` and make a new `report` and the old
+    row would label the new session with the dead one's name, which is worse
+    than showing the plain name. The original guard against that was to accept a
+    stored name only when it collapsed back to the tmux name with its spaces
+    removed, which also meant a rename could add and remove spaces and nothing
+    else. Sessions now record the tmux `session_created` stamp they were named
+    under, so a free-form name is safe: a recycled name has a different stamp and
+    the row is ignored. Rows written before this (no stamp) keep the old rule.
+    """
+    rows = rows if rows is not None else _session_display_name_rows()
+    row = rows.get(session_name) or {}
+    display = str(row.get("display") or "")
+    if not display:
+        return session_name
+    stamp = str(row.get("created") or "")
+    if stamp:
+        return display if str(created or "") == stamp else session_name
+    if display.replace(" ", "") == session_name:
+        return display
+    return session_name
 
 
-def _set_session_tab_label(session_name: str, owner_id: str, prompt: str) -> str:
-    """Persist a free, deterministic two-word label for one session."""
-    normalized_prompt = " ".join(_TAB_LABEL_WORD_RE.findall(str(prompt or ""))).casefold()
-
-    def mutate(data: dict) -> str:
+def _set_session_display_name(session_name: str, display: str,
+                              created: str = "") -> None:
+    """Remember a name. A name equal to the tmux name needs no row."""
+    def mutate(data: dict) -> None:
         data["version"] = 1
         rows = data.setdefault("sessions", {})
-        previous = rows.get(session_name)
-        row = dict(previous) if isinstance(previous, dict) else {}
-        if normalized_prompt in _TAB_LABEL_CONTINUATIONS and row.get("label"):
-            return str(row["label"])
-        label = _fallback_two_word_tab_label(prompt)
-        used = {
-            str(other.get("label") or "").casefold()
-            for other_name, other in rows.items()
-            if other_name != session_name
-            and isinstance(other, dict)
-            and str(other.get("owner_id") or "") == owner_id
-        }
-        if label.casefold() in used:
-            first, second = label.split(" ", 1)
-            for suffix in range(2, 100):
-                candidate = f"{first} {second[:20]}-{suffix}"
-                if candidate.casefold() not in used:
-                    label = candidate
-                    break
-        row.update(
-            {
-                "owner_id": str(owner_id or "admin")[:256],
-                "label": label,
-                "updated_at": time.time(),
-            }
-        )
+        if not display or display == session_name:
+            rows.pop(session_name, None)
+            return
+        row = {"display": display, "updated_at": time.time()}
+        if created:
+            row["created"] = str(created)
         rows[session_name] = row
-        return label
 
-    _data, label = SESSION_TAB_LABELS.update(mutate)
-    return label
+    SESSION_DISPLAY_NAMES.update(mutate)
 
 
-def _remove_session_tab_label(session_name: str) -> None:
+def _remove_session_display_name(session_name: str) -> None:
     def mutate(data: dict) -> None:
         data.setdefault("sessions", {}).pop(session_name, None)
 
-    SESSION_TAB_LABELS.update(mutate)
+    SESSION_DISPLAY_NAMES.update(mutate)
 
 
 def _acquire_tmux_mutation_fd(timeout: float = 45.0) -> int:
@@ -767,11 +776,53 @@ def _save_longlived_token(token: str):
     LONGLIVED_TOKEN_FILE.chmod(0o600)
 
 
+def _plan_credential_is_static() -> bool:
+    """True when ~/.claude/.credentials.json cannot rotate under us.
+
+    `claude setup-token` mints an access token with an EMPTY refresh token and
+    about a year on the clock. Nothing ever refreshes it, so concurrent sessions
+    cannot race each other into "401 OAuth access token has been revoked", the
+    one failure CLAUDE_CODE_OAUTH_TOKEN was introduced to dodge. Once the shared
+    credential is itself a setup token, that export has nothing left to protect
+    and costs real accuracy: see _claude_launch_env_prefix.
+
+    A credential WITH a refresh token is the old rotating kind, and the export
+    still earns its place there, so this returns False and nothing changes.
+
+    (SHARED_CREDENTIALS is defined further down the file; this only ever runs
+    long after import, and naming the path twice is how the two copies drift.)
+    """
+    try:
+        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
+    except Exception:
+        return False
+    if not o or o.get("refreshToken"):
+        return False
+    return int(o.get("expiresAt") or 0) > int(time.time() * 1000)
+
+
 def _claude_launch_env_prefix() -> str:
     """Shell env prefix for launching `claude`. Exports a stored long-lived token
-    when present (so sessions stop rotating the shared credential and never get
-    revoked); otherwise falls back to unsetting both auth vars. ANTHROPIC_API_KEY
-    is always unset so inference stays on the plan, never the metered API.
+    ONLY when the shared plan credential could otherwise rotate; otherwise unsets
+    both auth vars and lets the CLI read ~/.claude/.credentials.json.
+    ANTHROPIC_API_KEY is always unset so inference stays on the plan, never the
+    metered API.
+
+    WHY THE EXPORT IS NOW CONDITIONAL. Measured on 2.1.257: the CLI decides the
+    name it prints beside the model from the subscriptionType on the credential
+    record, and it refuses to look at that record at all when
+    CLAUDE_CODE_OAUTH_TOKEN is set in the environment. A bare token string
+    carries no plan, so the switch falls through to its default and the session
+    announces itself as "Claude API". Same box, same token family, same plan,
+    one variable: with the export the banner read `Haiku 4.5 · Claude API`,
+    without it `Haiku 4.5 · Claude Max`.
+
+    Nothing about the BILLING ever differed: an sk-ant-oat01 token is answered
+    with anthropic-ratelimit-unified-5h/7d headers, which is the subscription's
+    own limiter, and the org has metered overage disabled outright. It was only
+    ever the label. But a label that says a session is spending metered money
+    when it is not is worth this much care, because the reasonable reaction to
+    it is to go looking for a bill that does not exist.
 
     CLAUDE_CODE_EFFORT_LEVEL is unset deliberately: when it is present the CLI
     treats the effort as pinned for the whole session and refuses /effort with
@@ -783,7 +834,7 @@ def _claude_launch_env_prefix() -> str:
     settings.json `env` into its own process, so a pin written there survives
     this prefix. _restore_default_effort_setting() strips that one."""
     tok = _load_longlived_token()
-    if tok:
+    if tok and not _plan_credential_is_static():
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
                 + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
     return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
@@ -802,8 +853,23 @@ LAUNCH_SCRIPT_DIR = MESSAGES_DIR / "launch"
 
 
 def _auth_mode_label() -> str:
-    """One word for how a pane authenticates, for the launch banner."""
-    return "Token" if _load_longlived_token() else "Clean"
+    """One word for what a pane will SPEND, for the launch banner.
+
+    It used to name the mechanism ("Token" / "Clean"), which answered a question
+    nobody was asking while leaving the one that matters, plan or metered API,
+    to be inferred from a line the CLI itself gets wrong. So it names the plan.
+    """
+    if _stored_anthropic_key:
+        return "API key"            # the metered path; the only one that bills
+    if _load_longlived_token() and not _plan_credential_is_static():
+        return "Token"              # plan-backed, but branded "Claude API" below
+    try:
+        sub = (json.loads(SHARED_CREDENTIALS.read_text())
+               .get("claudeAiOauth", {}).get("subscriptionType") or "")
+    except Exception:
+        sub = ""
+    return {"max": "Max plan", "pro": "Pro plan", "team": "Team plan",
+            "enterprise": "Enterprise"}.get(sub, "Clean")
 
 
 def _launch_banner(session: str, owner: str = "", model: str = "", effort: str = "") -> str:
@@ -961,11 +1027,75 @@ def _load_simple_watchdog_disabled():
 #   full  — everything in "basic" PLUS the autopilot watchdog that composes and
 #           types a "keep going" message when Claude pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
-# New sessions default to "basic". Persisted per session to disk.
-AUTOPUSH_MODES = ("off", "basic", "full")
+# New sessions default to "basic", and that is deliberate. Do not flip it to
+# "full" to stop sessions handing back half-done: the Stop hook
+# (~/.claude/hooks/keep_going.py) already does that, deterministically, in
+# process, with the whole transcript, and with a fixed refusal text that cannot
+# invent a task. The autopilot instead composes a free-form instruction from a
+# screenshot of the pane, so it cannot tell a session stalling on an absent user
+# from one legitimately handing back a decision only a human can make. Flipping
+# the default was tried on 2026-09-01 and within the hour the autopilot read a
+# finished report that ended "the decision waiting for you is direction" and
+# typed a new task into that session. Overriding a legitimate hand-back is the
+# reason "full" is opt-in per session rather than the default.
+#   basic+  : everything in "basic" PLUS a keep-alive that re-reads the prompt
+#           cache shortly before it would expire. See the cache block below.
+#           It never composes a task: it sends one fixed continue instruction,
+#           which is what makes it safe where "full" is not.
+AUTOPUSH_MODES = ("off", "basic", "basicplus", "full")
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
+
+# ── Prompt cache expiry ─────────────────────────────────────────────────────
+# Anthropic's prompt cache is ephemeral with one of two lifetimes: 5 minutes by
+# default, or 1 hour when the request asks for `ttl: "1h"`. Claude Code buys the
+# 1-hour cache, and _session_facts reads which one off the transcript rather than
+# assuming (usage.cache_creation splits the write into ephemeral_1h_input_tokens
+# and ephemeral_5m_input_tokens), so a session that drops to the 5-minute cache
+# is tracked correctly without a code change here.
+#
+# TWO PROPERTIES DECIDE THE WHOLE DESIGN:
+#   1. A cache READ refreshes the entry's timer, at no extra cost. So the clock
+#      restarts on every turn and the deadline is measured from the LAST turn,
+#      not from when the session began.
+#   2. The lifetime runs from the START of the request, and generation time
+#      counts against it. We only know when the reply LANDED, so a deadline of
+#      last_turn_end + ttl is optimistic by roughly one turn's duration. The
+#      warning lead below absorbs that: it is far larger than a turn.
+#
+# There is no API that answers "is this prefix still cached". What the transcript
+# does tell us, exactly, is whether the LAST turn read from cache
+# (usage.cache_read_input_tokens > 0), which is a measurement rather than a
+# prediction: non-zero means the cache was warm at that moment and its timer was
+# refreshed then. That is the honest signal, and it is what the UI reports.
+CACHE_WARN_LEAD = 600      # start warning 10 minutes before the cache goes cold
+# And make a NOISE five minutes before, once. The blink above is for a screen
+# you are looking at; this is for one you are not. Two thresholds on purpose:
+# seeing it start to blink is a nudge you can ignore, hearing it is the last
+# call, and collapsing them into one number would mean either a chime ten
+# minutes out (too early to act on, so it becomes background noise) or no
+# visible warning until five (too late to notice across a room).
+CACHE_BEEP_LEAD = 300
+CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
+                                # more or less continuous, so leave those alone.
+CACHE_KEEPALIVE_PROMPT = (
+    "Continue. re-verify your own work end to end, then finish whatever is still left."
+)
+
+
+def _cache_deadline(sess: dict) -> float:
+    """Epoch second at which this session's prompt cache goes cold, or 0.
+
+    0 means "not known": no turn recorded yet, or no cache write seen in the
+    transcript, and a guess would be worse than saying nothing.
+    """
+    try:
+        ttl = float(sess.get("cache_ttl") or 0)
+        end = float(sess.get("last_turn_end") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return end + ttl if ttl and end else 0.0
 
 
 def _get_autopush_mode(session_name: str) -> str:
@@ -1196,7 +1326,8 @@ async def _ensure_claude_running(session_name: str, log_fn=None, state: dict = N
             session_name,
             "NODE_OPTIONS=--max-old-space-size=8192 "
             f"claude --dangerously-skip-permissions {resume_flag}"
-            f"{_model_flag_for_relaunch(session_name)}")
+            f"{_model_flag_for_relaunch(session_name)}"
+            f"{_effort_flag_for_relaunch(session_name)}")
         # C-u first to discard any stray text left on the crashed shell's prompt
         # line (e.g. a "continue" a watchdog typed before this loop took over).
         await asyncio.to_thread(subprocess.run,
@@ -1280,6 +1411,11 @@ async def lifespan(_app: FastAPI):
     _load_autopush_mode()
     _restore_default_model_setting()
     _restore_default_effort_setting()
+    _enforce_tmux_history()
+    scrollback_task = asyncio.create_task(_scrollback_archive_loop())
+    _background_tasks.append(scrollback_task)
+    logger.info("Scrollback archive started (every %ds, tmux ring %d lines, log %s)",
+                SCROLLBACK_ARCHIVE_INTERVAL, TMUX_HISTORY_LIMIT, SCROLLBACK_DIR)
     try:
         # Publish our browser slots to the ledger shared with any sibling
         # dashboard on this box, and move ours off a slot somebody else owns.
@@ -1300,6 +1436,11 @@ async def lifespan(_app: FastAPI):
     simple_watchdog_task = asyncio.create_task(_simple_watchdog_loop())
     _background_tasks.append(simple_watchdog_task)
     logger.info("Simple watchdog started (auto-push overrides for %d sessions)", len(_autopush_mode))
+
+    cache_keepalive_task = asyncio.create_task(_cache_keepalive_loop())
+    _background_tasks.append(cache_keepalive_task)
+    logger.info("Cache keep-alive started (Basic+ sessions, %ds before the cache goes cold)",
+                CACHE_WARN_LEAD)
 
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
@@ -1325,6 +1466,12 @@ async def lifespan(_app: FastAPI):
     _background_tasks.append(resource_guard_task)
     logger.info("Unmanaged-browser resource guard started (shared CPU cap %.2f cores)",
                 browser_resource_guard.cpu_quota_percent() / 100.0)
+
+    #  Push the launcher to disk at boot, not only when somebody creates a browser.
+    #  It was written on the create/start paths alone, so a box that had not made a
+    #  new browser since the last deploy kept running whatever flags and guards the
+    #  script had months ago, and nobody could tell by looking at the code.
+    await asyncio.to_thread(_ensure_browser_launcher)
 
     autopark_task = asyncio.create_task(browser_autopark_watchdog())
     _background_tasks.append(autopark_task)
@@ -1363,6 +1510,25 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
 
+# The USPTO filing panel MOVED OUT on 2026-09-01. It is its own service now
+# (supervisor `patent-filing`, its own sessions, browser, login and data) served at
+# https://rotem.ai/patents/filing/ . Two copies of an app that spends money and
+# drives a logged-in Patent Center session is one copy too many, so this host keeps
+# only a redirect: anyone with the old URL, or an old bookmark, lands on the real
+# one instead of quietly using a stale build.
+FILING_APP_URL = os.environ.get("PATENT_FILING_URL", "https://rotem.ai/patents/filing/")
+
+
+@app.get("/patents")
+@app.get("/patents/")
+async def patents_moved():
+    return RedirectResponse(FILING_APP_URL, status_code=308)
+
+
+@app.get("/patents/{rest:path}")
+async def patents_moved_deep(rest: str):
+    return RedirectResponse(FILING_APP_URL, status_code=308)
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(_request: Request, exc: RequestValidationError):
@@ -1386,6 +1552,22 @@ AUTH_SECRET = os.environ.get("TMUX_DASH_SECRET", secrets.token_hex(32))
 # own TMUX_DASH_SECRET and can't verify the other's token.
 AUTH_COOKIE = os.environ.get("TMUX_DASH_COOKIE", "tmux_auth")
 
+# --- Cross-host SSO cookie (optional) --------------------------------------
+# A SECOND cookie, scoped to a parent domain (e.g. .rotem.ai), so that signing
+# in to any builder dashboard (builder3.rotem.ai, builder4.rotem.ai, ...) also
+# unlocks the private apps served straight off rotem.ai (rotem.ai/cameras, the
+# rotem.ai/apps portal), which gate on it via nginx auth_request.
+#
+# It is deliberately NOT the main auth cookie: that one is per-host and signed
+# with each box's own TMUX_DASH_SECRET, so two dashboards on the same parent
+# domain would clobber each other and neither could verify the other's token.
+# This cookie is signed with a secret SHARED across the boxes, so any of them
+# can issue it and one verify endpoint (rotem.ai -> builder3 loopback) accepts
+# it whichever box you logged in on. Unset SSO_SECRET => feature off, no cookie.
+SSO_SECRET = os.environ.get("TMUX_DASH_SSO_SECRET", "")
+SSO_COOKIE = os.environ.get("TMUX_DASH_SSO_COOKIE", "rotem_sso")
+SSO_COOKIE_DOMAIN = os.environ.get("TMUX_DASH_SSO_COOKIE_DOMAIN", "")  # e.g. ".rotem.ai"
+
 
 def _make_token(user_id: str) -> str:
     sig = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
@@ -1398,6 +1580,39 @@ def _check_token(token: str) -> bool:
     user_id, sig = token.split(":", 1)
     expected = hmac.new(AUTH_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
     return hmac.compare_digest(sig, expected)
+
+
+def _make_sso_token(user_id: str) -> str:
+    sig = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{user_id}:{sig}"
+
+
+def _check_sso_token(token: str) -> bool:
+    if not (SSO_SECRET and token and ":" in token):
+        return False
+    user_id, sig = token.split(":", 1)
+    expected = hmac.new(SSO_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(sig, expected)
+
+
+def _set_sso_cookie(resp, request: "Request", user_id: str) -> None:
+    """Attach the shared cross-host SSO cookie, if the feature is configured."""
+    if not SSO_SECRET:
+        return
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    kw = dict(max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    if SSO_COOKIE_DOMAIN:
+        kw["domain"] = SSO_COOKIE_DOMAIN
+    resp.set_cookie(SSO_COOKIE, _make_sso_token(user_id), **kw)
+
+
+def _clear_sso_cookie(resp) -> None:
+    if not SSO_SECRET:
+        return
+    if SSO_COOKIE_DOMAIN:
+        resp.delete_cookie(SSO_COOKIE, domain=SSO_COOKIE_DOMAIN)
+    else:
+        resp.delete_cookie(SSO_COOKIE)
 
 
 # --- Multi-user store ---
@@ -1623,6 +1838,15 @@ def _ensure_user_claude_config_dir(user: dict):
             "hasCompletedOnboarding": True,
             "numStartups": 1,
         }, indent=2))
+    # ...and tell it how Claude Code was installed, or its auto-updater cannot
+    # tell this is a native install and switches itself off the first time an
+    # update fails. Must run after the stub exists so the merge keeps
+    # hasCompletedOnboarding. See _seed_profile_update_config.
+    _seed_profile_update_config(d)
+    # Carrying on after a turn looks done is the Auto-push control's job alone.
+    # This strips the retired keep-going Stop hook from any config that still
+    # carries it, and keeps the AskUserQuestion denial, which is separate.
+    _remove_keep_going_hooks(d)
     # Team mode: shared Claude auth token, managed global context block,
     # and the soft-sandbox guard hook. Re-applied every call so it self-heals and
     # stays current (e.g. after the admin edits the global context).
@@ -1778,6 +2002,121 @@ def _clear_session_convo(session_name: str):
             logger.debug("Failed to save session conversations", exc_info=True)
 
 
+# WHAT THIS SESSION WAS ASKED TO RUN, which is not always what it is running.
+# Claude Code substitutes a model of its own when the chosen one is short of
+# capacity, and it does so silently. Reading the switch out of the transcript
+# catches it only while the record is still inside the tail window and only for
+# as long as this process lives, so the intent is written down instead: set when
+# somebody chooses a model, compared against reality on every poll. That comparison
+# survives a dashboard restart and a transcript that has moved on by megabytes.
+SESSION_MODEL_CHOICE_FILE = MESSAGES_DIR / "session_model_choice.json"
+_session_model_choice_cache: Optional[Dict[str, str]] = None
+
+
+def _load_session_model_choices() -> Dict[str, str]:
+    global _session_model_choice_cache
+    if _session_model_choice_cache is not None:
+        return _session_model_choice_cache
+    try:
+        if SESSION_MODEL_CHOICE_FILE.exists():
+            data = json.loads(SESSION_MODEL_CHOICE_FILE.read_text())
+            if isinstance(data, dict):
+                _session_model_choice_cache = {str(k): str(v) for k, v in data.items()}
+                return _session_model_choice_cache
+    except Exception:
+        logger.debug("Failed to load session model choices", exc_info=True)
+    _session_model_choice_cache = {}
+    return _session_model_choice_cache
+
+
+def _set_session_model_choice(session_name: str, model_id: str):
+    """Remember the model this session was deliberately put on."""
+    if not session_name or not model_id:
+        return
+    choices = _load_session_model_choices()
+    if choices.get(session_name) == model_id:
+        return
+    choices[session_name] = model_id
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_MODEL_CHOICE_FILE.write_text(json.dumps(choices, indent=2))
+    except Exception:
+        logger.debug("Failed to save session model choices", exc_info=True)
+
+
+def _session_model_choice(session_name: str) -> str:
+    return _load_session_model_choices().get(session_name, "")
+
+
+# A substitution the CLI made, kept on disk. Holding it in memory alone meant it
+# vanished on every dashboard restart, and re-finding it in the transcript is not
+# guaranteed: the record was 1.04 MB back on a busy session, just past the window
+# a cold start is willing to read. A fact this hard to recover is written down
+# once, and cleared when the session is no longer on the model it was moved to.
+SESSION_FALLBACK_FILE = MESSAGES_DIR / "session_fallback.json"
+_session_fallback_disk: Optional[Dict[str, dict]] = None
+
+
+def _load_session_fallbacks() -> Dict[str, dict]:
+    global _session_fallback_disk
+    if _session_fallback_disk is not None:
+        return _session_fallback_disk
+    try:
+        if SESSION_FALLBACK_FILE.exists():
+            data = json.loads(SESSION_FALLBACK_FILE.read_text())
+            if isinstance(data, dict):
+                _session_fallback_disk = {
+                    str(k): v for k, v in data.items()
+                    if isinstance(v, dict) and v.get("from") and v.get("to")}
+                return _session_fallback_disk
+    except Exception:
+        logger.debug("Failed to load session fallbacks", exc_info=True)
+    _session_fallback_disk = {}
+    return _session_fallback_disk
+
+
+def _write_session_fallbacks(mutate) -> Dict[str, dict]:
+    """Read the file, apply `mutate` to it, write it back.
+
+    Never write the in-memory copy over the file: it was read once at startup and
+    anything else that has touched the file since (another process, a repair,
+    the tool that seeded it) would be silently erased. That is not theoretical, it
+    is how a correct record disappeared between two restarts.
+    """
+    global _session_fallback_disk
+    _session_fallback_disk = None            # force a re-read
+    store = _load_session_fallbacks()
+    mutate(store)
+    try:
+        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_FALLBACK_FILE.write_text(json.dumps(store, indent=2))
+    except Exception:
+        logger.debug("Failed to save session fallbacks", exc_info=True)
+    return store
+
+
+def _set_session_fallback(session_name: str, src: str, dst: str):
+    if _load_session_fallbacks().get(session_name) == {"from": src, "to": dst}:
+        return
+    _write_session_fallbacks(
+        lambda s: s.__setitem__(session_name, {"from": src, "to": dst}))
+
+
+def _clear_session_fallback(session_name: str):
+    if session_name not in _load_session_fallbacks():
+        return
+    _write_session_fallbacks(lambda s: s.pop(session_name, None))
+
+
+def _clear_session_model_choice(session_name: str):
+    choices = _load_session_model_choices()
+    if choices.pop(session_name, None) is not None:
+        try:
+            SESSION_MODEL_CHOICE_FILE.write_text(json.dumps(choices, indent=2))
+        except Exception:
+            logger.debug("Failed to save session model choices", exc_info=True)
+
+
 def _user_for_session(session_name: str) -> Optional[dict]:
     """Find the user record that owns this session, falling back to admin."""
     owner_id = _session_owner_id(session_name)
@@ -1890,6 +2229,10 @@ def _render_page(kind: str, prefix: str) -> str:
     if hit is not None:
         return hit
     out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
+    # One definition of "approaching cold": the page blinks on the same number of
+    # seconds the keep-alive pushes on, so the warning and the action agree.
+    out = out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
+    out = out.replace("__CACHE_BEEP_LEAD__", str(CACHE_BEEP_LEAD))
     _page_cache[key] = out
     return out
 
@@ -2011,10 +2354,15 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     if path in ("/logout", "/logout/", rp + "/logout", rp + "/logout/"):
         return await call_next(request)
+    # The filing app moved to its own service. Send an old bookmark straight there
+    # rather than through a login for an app that no longer lives here.
+    if path == "/patents" or path.startswith("/patents/") or \
+            path == rp + "/patents" or path.startswith(rp + "/patents/"):
+        return await call_next(request)
     # SSO verify endpoint for nginx auth_request from sibling knowva.ai apps:
     # it must return its own 200/401 based on the cookie, NOT the login-page
     # fallback (auth_request only treats a real 2xx as authenticated).
-    if path.endswith("/api/auth/verify"):
+    if path.endswith("/api/auth/verify") or path.endswith("/api/sso/verify"):
         return await call_next(request)
     # Allow qa-output files without auth
     if path.startswith("/qa-output/") or path.startswith(rp + "/qa-output/"):
@@ -2057,7 +2405,44 @@ async def auth_middleware(request: Request, call_next):
     # The route's own _current_user() call may return early from cache, so
     # presence is recorded here too or it never fires.
     _touch_user_presence(user)
-    return await call_next(request)
+    resp = await call_next(request)
+    # Backfill the cross-host SSO cookie for sessions that logged in BEFORE the
+    # feature existed: they hold a valid per-host cookie but no rotem_sso, so the
+    # private apps on the parent domain still prompt. Set it on the next
+    # authenticated page load so re-login is not required. No-op if the feature
+    # is off or the cookie is already present and valid.
+    if SSO_SECRET and not _check_sso_token(request.cookies.get(SSO_COOKIE, "")):
+        try:
+            _set_sso_cookie(resp, request, user["id"])
+        except Exception:
+            logger.debug("failed to backfill SSO cookie", exc_info=True)
+    return resp
+
+
+# WHICH BUILD THIS PAGE CAME FROM. The whole UI is one long-lived tab: the poll
+# keeps the data fresh but the JAVASCRIPT is whatever was served when the tab was
+# opened, so a fix deployed hours ago is simply not running for anyone who never
+# reloaded, and it looks like the fix does not work. Stamped on every response and
+# compared by the frontend against the build it loaded with.
+def _build_id() -> str:
+    try:
+        st = os.stat(__file__)
+        return hashlib.sha1(f"{int(st.st_mtime)}:{st.st_size}".encode()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+BUILD_ID = _build_id()
+
+
+@app.middleware("http")
+async def build_stamp_middleware(request: Request, call_next):
+    resp = await call_next(request)
+    try:
+        resp.headers["X-Dash-Build"] = BUILD_ID
+    except Exception:
+        pass
+    return resp
 
 
 @app.middleware("http")
@@ -2093,6 +2478,27 @@ async def api_auth_verify(request: Request):
         # ignore it. ASCII-safe: header values must not carry raw unicode.
         uname = str(u.get("username") or u.get("email") or "").encode("ascii", "ignore").decode()
         return JSONResponse({"ok": True}, headers={"X-Sso-User": uname})
+    return JSONResponse({"ok": False}, status_code=401)
+
+
+@app.get("/api/sso/verify")
+async def api_sso_verify(request: Request):
+    """Cross-host SSO check for nginx ``auth_request`` from the private apps on
+    the parent domain (rotem.ai/cameras, the rotem.ai/apps portal).
+
+    Validates the shared ``rotem_sso`` cookie, which any builder dashboard sets
+    (scoped to .rotem.ai) on login. 200 = a valid login on some builder box,
+    401 = none. The user id is exposed as X-Sso-User for apps that log it.
+
+    This is intentionally lighter than /api/auth/verify: the cookie proves a
+    valid dashboard login on the shared domain, and these apps do not need this
+    box's own per-user record (which would not exist for a user who logged in on
+    a different box). Requires TMUX_DASH_SSO_SECRET; 401s if the feature is off.
+    """
+    token = request.cookies.get(SSO_COOKIE, "")
+    if _check_sso_token(token):
+        uid = token.split(":", 1)[0].encode("ascii", "ignore").decode()
+        return JSONResponse({"ok": True}, headers={"X-Sso-User": uid})
     return JSONResponse({"ok": False}, status_code=401)
 
 
@@ -2218,6 +2624,7 @@ async def do_login(request: Request):
     resp = RedirectResponse(url=nxt, status_code=303)
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30, httponly=True, samesite="lax", secure=is_https)
+    _set_sso_cookie(resp, request, target_user["id"])
     return resp
 
 
@@ -2225,6 +2632,7 @@ async def do_login(request: Request):
 async def do_logout(request: Request):
     resp = RedirectResponse(url=request.scope.get("root_path", "") + "/login", status_code=303)
     resp.delete_cookie(AUTH_COOKIE)
+    _clear_sso_cookie(resp)
     return resp
 
 
@@ -2738,6 +3146,8 @@ def _set_auth_cookie(resp, request: Request, token: str):
     is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
     resp.set_cookie(AUTH_COOKIE, token, max_age=86400 * 30,
                     httponly=True, samesite="lax", secure=is_https)
+    # token is "<user_id>:<sig>"; the SSO cookie is keyed by the same user id
+    _set_sso_cookie(resp, request, token.split(":", 1)[0])
     return resp
 
 
@@ -4329,6 +4739,85 @@ def _install_sandbox_hook(cfg_dir: Path, user: dict):
         logger.debug("Failed to install sandbox hook into %s", settings_path, exc_info=True)
 
 
+# --- keep-going hooks ------------------------------------------------------
+# A member session runs with its own CLAUDE_CONFIG_DIR, so it never reads the
+# owner's ~/.claude/settings.json and none of the fleet-wide autonomy settings
+# reach it. Register the same Stop hooks and the same AskUserQuestion denial in
+# every member config dir, or members are the one class of session that can
+# still stop half-done and ask a question nobody is there to answer.
+#
+# The scripts are NOT copied per user: every config dir points at the single
+# canonical pair under ~/.claude/hooks so there is nothing to drift. They are
+# readable by every session because all sessions run as the same OS user.
+KEEP_GOING_HOOK = Path.home() / ".claude" / "hooks" / "keep_going.py"
+KEEP_GOING_RESET_HOOK = Path.home() / ".claude" / "hooks" / "keep_going_reset.py"
+_KEEP_GOING_EVENTS = (
+    ("Stop", KEEP_GOING_HOOK),
+    ("SubagentStop", KEEP_GOING_HOOK),
+    ("UserPromptSubmit", KEEP_GOING_RESET_HOOK),
+)
+
+
+def _remove_keep_going_hooks(cfg_dir: Path):
+    """Take the keep-going Stop hook back out, and keep it out.
+
+    Retired 2026-09-04: whether a session carries on after it looks done is the
+    Auto-push control's job (off / basic / full) and nothing else. A Stop hook
+    doing it as well meant two mechanisms with one steering wheel, and the hook
+    won every argument because it fires inside the session.
+
+    This STRIPS rather than merely stopping installation, so a member config
+    that already carries the registration is cleaned on the next setup call
+    instead of keeping it forever. Only entries naming our own two scripts go;
+    an unrelated Stop hook someone else registered is left alone.
+    """
+    settings_path = cfg_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        if not isinstance(settings, dict):
+            settings = {}
+    except Exception:
+        settings = {}
+
+    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    ours = {KEEP_GOING_HOOK.name, KEEP_GOING_RESET_HOOK.name}
+    for event in list(hooks):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        kept = [h for h in entries
+                if not any(name in json.dumps(h) for name in ours)]
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)      # no empty event lists left behind
+    if hooks:
+        settings["hooks"] = hooks
+    else:
+        settings.pop("hooks", None)
+
+    # Kept deliberately. A blocking multiple-choice prompt is a separate way a
+    # session stalls on an absent user, it is a standing preference of its own,
+    # and Auto-push does not cover it. Denying the tool removes it from the
+    # model's tool list.
+    perms = settings.get("permissions")
+    if not isinstance(perms, dict):
+        perms = {}
+    deny = perms.get("deny")
+    if not isinstance(deny, list):
+        deny = []
+    if "AskUserQuestion" not in deny:
+        deny.append("AskUserQuestion")
+    perms["deny"] = deny
+    settings["permissions"] = perms
+
+    try:
+        _backup_before_dashboard_write(settings_path)
+        settings_path.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        logger.debug("Failed to strip keep-going hooks from %s", settings_path, exc_info=True)
+
+
 # --- email (Resend) --------------------------------------------------------
 def _send_email(subject: str, html_body: str, to: Optional[str] = None) -> bool:
     to = to or ADMIN_APPROVAL_EMAIL
@@ -5760,6 +6249,31 @@ def _find_session_for_user(session_name: str, user: Optional[dict]) -> tuple:
     return sessions, sess
 
 
+# How many lines of output tmux keeps per pane. The server default is 2000,
+# which on this box meant a session could only be scrolled back about half an
+# hour before its own history was gone. It is a per-SERVER option applied when a
+# pane is created (tmux 3.3 has no way to grow an existing pane's ring), so the
+# dashboard sets it at startup: every session it creates from then on gets the
+# larger ring, and panes that predate it keep whatever they were born with.
+TMUX_HISTORY_LIMIT = int(os.environ.get("TMUX_DASH_HISTORY_LIMIT", "50000"))
+
+
+def _enforce_tmux_history() -> None:
+    """Raise the tmux server's history-limit to TMUX_HISTORY_LIMIT."""
+    try:
+        cur = subprocess.run(["tmux", "show-options", "-gv", "history-limit"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if cur.isdigit() and int(cur) >= TMUX_HISTORY_LIMIT:
+            return
+        subprocess.run(["tmux", "set-option", "-g", "history-limit",
+                        str(TMUX_HISTORY_LIMIT)],
+                       capture_output=True, text=True, timeout=5)
+        logger.info("tmux history-limit %s -> %d (applies to new panes)",
+                    cur or "unset", TMUX_HISTORY_LIMIT)
+    except Exception:
+        logger.debug("Failed to set tmux history-limit", exc_info=True)
+
+
 def capture_pane_full(session_name: str) -> str:
     try:
         # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
@@ -5782,6 +6296,196 @@ def capture_pane_recent(session_name: str, lines: int = 80) -> str:
         return result.stdout if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+# ── Scrollback that outlives tmux ───────────────────────────────────────────
+# tmux keeps a session's output in a fixed ring (history-limit). Once it is full
+# the oldest line is dropped for every new one, silently — which is how a session
+# people had been reading all day could only be scrolled back half an hour. The
+# ring was 2000 lines here; it is 50000 now (see _enforce_tmux_history), but a
+# ring is still a ring and it is emptied outright when a pane restarts.
+#
+# So the dashboard keeps its own copy. Only SETTLED lines are archived: a line
+# that has scrolled off the visible area can never be rewritten, whereas the
+# bottom of the pane is redrawn several times a second and committing that would
+# write the composer and the spinner into the log over and over. `-E -1` ends the
+# capture one line above the visible top, which is exactly that boundary.
+SCROLLBACK_DIR = Path.home() / ".tmux-dashboard" / "scrollback"
+# How much of our own tail we look for in the pane to find where our copy ends.
+_SCROLLBACK_ANCHOR = 40
+# Windows tried when hunting for that anchor. A quiet session needs the first;
+# the last is for a session that produced tens of thousands of lines between two
+# archive passes.
+_SCROLLBACK_WINDOWS = (400, 4000, 50000)
+_SCROLLBACK_MAX_BYTES = 64 * 1024 * 1024
+_scrollback_state: Dict[str, dict] = {}   # {name: {"tail": [str], "lines": int}}
+_scrollback_lock = threading.Lock()
+
+
+def _scrollback_path(session_name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_name)[:120] or "_"
+    return SCROLLBACK_DIR / f"{safe}.log"
+
+
+def _settled_pane_lines(session_name: str, count: int) -> list:
+    """The last `count` lines of a pane's settled scrollback, oldest first."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-J",
+             "-S", f"-{max(1, int(count))}", "-E", "-1"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    lines = result.stdout.split("\n")
+    # capture-pane ends with a newline, so the split leaves one empty element.
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _scrollback_tail(session_name: str) -> dict:
+    """Our archive's line count and its last `_SCROLLBACK_ANCHOR` lines."""
+    st = _scrollback_state.get(session_name)
+    if st is not None:
+        return st
+    path = _scrollback_path(session_name)
+    tail, total = [], 0
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    total += 1
+                    tail.append(line.rstrip("\n"))
+                    if len(tail) > _SCROLLBACK_ANCHOR:
+                        tail.pop(0)
+        except Exception:
+            logger.debug("Failed to read scrollback for '%s'", session_name, exc_info=True)
+    st = {"tail": tail, "lines": total}
+    _scrollback_state[session_name] = st
+    return st
+
+
+def _find_anchor(window: list, anchor: list) -> int:
+    """Index in `window` just past the last occurrence of the `anchor` block,
+    or -1. Searched from the end: an agent that prints the same block twice must
+    resume after the newer copy, not the older one."""
+    n = len(anchor)
+    if not n or len(window) < n:
+        return -1
+    for i in range(len(window) - n, -1, -1):
+        if window[i:i + n] == anchor:
+            return i + n
+    return -1
+
+
+def archive_scrollback(session_name: str) -> int:
+    """Append this session's newly-settled pane lines to its own log. Returns
+    how many lines were added.
+
+    Finding where our copy ends is done by matching our own tail inside the
+    pane rather than by trusting a line count: tmux's `history_size` saturates
+    once the ring is full, so after that it stops growing while the content
+    underneath keeps moving, and any counter-based scheme silently stops
+    archiving exactly when the ring starts dropping lines."""
+    with _scrollback_lock:
+        state = _scrollback_tail(session_name)
+        anchor = state["tail"]
+        new: Optional[list] = None
+        resynced = False
+        # Nothing archived yet: take everything tmux still holds, in one go.
+        # Starting from the small window would throw away the history that is
+        # sitting right there, which is the whole point of the archive.
+        windows = _SCROLLBACK_WINDOWS if anchor else (_SCROLLBACK_WINDOWS[-1],)
+        for window in windows:
+            lines = _settled_pane_lines(session_name, window)
+            if not lines:
+                return 0
+            if not anchor:
+                new = lines
+                break
+            at = _find_anchor(lines, anchor)
+            if at >= 0:
+                new = lines[at:]
+                break
+            # Anchor not in this window. If the window already covers the whole
+            # scrollback there is nothing more to look at: the pane has been
+            # cleared or restarted under us, so keep the old log and start a new
+            # stretch after a marker rather than dropping either.
+            if len(lines) < window:
+                new, resynced = lines, True
+                break
+        if new is None:
+            new, resynced = _settled_pane_lines(session_name, _SCROLLBACK_WINDOWS[-1]), True
+        if not new:
+            return 0
+        try:
+            SCROLLBACK_DIR.mkdir(parents=True, exist_ok=True)
+            path = _scrollback_path(session_name)
+            with open(path, "a", encoding="utf-8") as f:
+                if resynced and state["lines"]:
+                    f.write("\n")
+                    state["lines"] += 1
+                for line in new:
+                    f.write(line + "\n")
+        except Exception:
+            logger.debug("Failed to append scrollback for '%s'", session_name, exc_info=True)
+            return 0
+        state["lines"] += len(new)
+        state["tail"] = (state["tail"] + new)[-_SCROLLBACK_ANCHOR:]
+        return len(new)
+
+
+def read_scrollback(session_name: str, start: int = 0, limit: int = 4000) -> dict:
+    """A slice of the archive, oldest first, plus how long the whole thing is."""
+    state = _scrollback_tail(session_name)
+    total = state["lines"]
+    start = max(0, min(int(start), total))
+    limit = max(1, min(int(limit), 20000))
+    out = []
+    path = _scrollback_path(session_name)
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i < start:
+                        continue
+                    if len(out) >= limit:
+                        break
+                    out.append(line.rstrip("\n"))
+        except Exception:
+            logger.debug("Failed to read scrollback slice for '%s'", session_name,
+                         exc_info=True)
+    return {"start": start, "lines": out, "total": total}
+
+
+def _trim_scrollback_files() -> None:
+    """Keep each log under _SCROLLBACK_MAX_BYTES by dropping its oldest half.
+    A log is the one copy of that history, so it is halved rather than deleted,
+    and only when it is genuinely large."""
+    try:
+        paths = list(SCROLLBACK_DIR.glob("*.log"))
+    except Exception:
+        return
+    for path in paths:
+        try:
+            if path.stat().st_size <= _SCROLLBACK_MAX_BYTES:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            keep = lines[len(lines) // 2:]
+            tmp = path.with_suffix(".log.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+            tmp.replace(path)
+            # The cache is keyed on the session name, not the file name, so the
+            # cheap and correct move is to drop all of it and re-read.
+            _scrollback_state.clear()
+            logger.info("Scrollback %s trimmed to %d lines", path.name, len(keep))
+        except Exception:
+            logger.debug("Failed to trim scrollback %s", path, exc_info=True)
 
 
 def get_pane_width(session_name: str) -> int:
@@ -5844,6 +6548,16 @@ _RE_COMPLETION = re.compile(
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
+# "3 local agents still running", "Waiting for completion of 2 agents": these are
+# Claude Code's own status lines and they always carry a COUNT. Matching the bare
+# words instead meant an agent that merely WROTE "Still running: the redraft turn"
+# in its last reply pinned its session on "working" for ever, because step 3
+# returns before the content-stability check that would have caught it.
+_AGENTS_RUNNING_RE = re.compile(
+    r'(?:^|[\s⎿│>])\d+\s+(?:local\s+|background\s+)?(?:agents?|tasks?|tools?)\b[^.]{0,40}?'
+    r'\b(?:still\s+running|running|in\s+progress)\b'
+    r'|waiting\s+for\s+completion\s+of\s+\d+',
+    re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
@@ -6003,6 +6717,22 @@ def _detect_activity_raw(session_name: str) -> dict:
         # Auto-approve disabled: never type/select on the user's behalf.
         # _check_auto_approve(session_name, visible)
 
+        return _classify_pane(session_name, visible, cmd)
+    except Exception:
+        logger.debug("Activity detection failed for session '%s'", session_name, exc_info=True)
+    return info
+
+
+def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
+    """Decide busy vs idle from the pane text alone.
+
+    Split out of _detect_activity_raw so the rules can be tested against captured
+    panes instead of a live tmux server: the two bugs this has had, prose matching
+    a status phrase and a leftover spinner outliving its turn, were both only
+    reproducible from real pane text.
+    """
+    info = {"status": "unknown", "command": cmd, "detail": ""}
+    try:
         all_lines = visible.split("\n")
         # Strip trailing empty lines to find the real bottom
         while all_lines and not all_lines[-1].strip():
@@ -6019,25 +6749,45 @@ def _detect_activity_raw(session_name: str) -> dict:
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
         # Lines containing these phrases override idle — session is still working
-        busy_overrides = [
-            "still running",
-            "agents running",
-            "waiting for completion",
-            "in progress",
-        ]
+        # Only a counted status line overrides an idle prompt. The bare phrases used
+        # to live here and any of them in ordinary prose cancelled a real idle.
+        busy_overrides = []
         has_idle_prompt = False
         for pattern in idle_prompt_patterns:
             for line in bottom:
                 stripped = line.strip()
                 if pattern.search(stripped):
                     # Check if the same line has a busy override
-                    lower = stripped.lower()
-                    if any(phrase in lower for phrase in busy_overrides):
-                        continue  # not truly idle
+                    if _AGENTS_RUNNING_RE.search(stripped):
+                        continue  # a counted status line: not truly idle
                     has_idle_prompt = True
                     break
             if has_idle_prompt:
                 break
+
+        # --- Stability, measured BEFORE the spinner scan ---
+        # A spinner is evidence of work only while it is animating. Claude Code
+        # leaves its last spinner line on screen when a turn ends, so a pane can sit
+        # for ever on "Churned… (8m 05s)" with the work long finished. Step 3 used
+        # to return busy on sight of that and never reach the stability check below,
+        # which made the false positive PERMANENT rather than transient: the session
+        # showed working until it was touched again.
+        content_hash = hashlib.md5(visible.encode()).hexdigest()
+        now = time.time()
+        prev = _pane_stability.get(session_name)
+        if prev and prev[0] == content_hash:
+            stable_since = prev[1]
+            stable_seconds = now - stable_since
+            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
+        else:
+            stable_seconds = 0
+            _pane_stability[session_name] = (content_hash, now, 1)
+
+        content_is_static = stable_seconds >= 20
+        # A live spinner repaints every frame, so an unchanged pane means it is a
+        # leftover. "esc to interrupt" is the footer Claude shows only while a turn
+        # is actually running, so it still overrides staleness on its own.
+        spinner_is_live = has_esc_to_interrupt or not content_is_static
 
         # --- Step 3: Check for active spinners/progress ---
         # Scan a wider window (bottom 25 lines) because Claude Code's
@@ -6057,12 +6807,12 @@ def _detect_activity_raw(session_name: str) -> dict:
             if _RE_COMPLETION.match(stripped):
                 continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
-            if _RE_RUNNING_TASK.match(stripped):
+            if _RE_RUNNING_TASK.match(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 info["detail"] = "Running task"
                 return info
             # Spinner icon + verb… at START of line
-            if _RE_SPINNER_START.match(stripped):
+            if _RE_SPINNER_START.match(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
@@ -6070,7 +6820,7 @@ def _detect_activity_raw(session_name: str) -> dict:
                     info["detail"] = "Working"
                 return info
             # Spinner icon + verb… anywhere in line (catches inline spinners)
-            if _RE_SPINNER_INLINE.search(stripped):
+            if _RE_SPINNER_INLINE.search(stripped) and spinner_is_live:
                 info["status"] = "busy"
                 if '(thinking)' in stripped or 'thought for' in stripped:
                     info["detail"] = "Thinking"
@@ -6078,36 +6828,19 @@ def _detect_activity_raw(session_name: str) -> dict:
                     info["detail"] = "Working"
                 return info
             # "(thought for Xs)" or "(thinking)" near end of line — strong busy signal
-            if _RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)'):
+            if (_RE_THOUGHT.search(stripped) or stripped.endswith('(thinking)')) \
+                    and spinner_is_live:
                 info["status"] = "busy"
                 info["detail"] = "Thinking"
                 return info
-            # "N local agents still running" or "Waiting for completion" = busy
-            lower = stripped.lower()
-            if "still running" in lower or "waiting for completion" in lower:
+            # "N local agents still running" / "Waiting for completion of N" = busy.
+            # The COUNT is what makes it a status line rather than a sentence.
+            if _AGENTS_RUNNING_RE.search(stripped):
                 info["status"] = "busy"
                 info["detail"] = "Agents running"
                 return info
 
-        # --- Step 4: Content stability check ---
-        # If the terminal content hasn't changed for 20+ seconds and there's no
-        # "esc to interrupt", the session is idle — real work produces output,
-        # real spinners animate.  This catches cases text patterns miss.
-        content_hash = hashlib.md5(visible.encode()).hexdigest()
-        now = time.time()
-        prev = _pane_stability.get(session_name)
-        if prev and prev[0] == content_hash:
-            # Content unchanged since last check
-            stable_since = prev[1]
-            stable_seconds = now - stable_since
-            _pane_stability[session_name] = (content_hash, stable_since, prev[2] + 1)
-        else:
-            # Content changed — reset
-            stable_seconds = 0
-            _pane_stability[session_name] = (content_hash, now, 1)
-
-        content_is_static = stable_seconds >= 20
-
+        # --- Step 4: (stability was measured above, before the spinner scan) ---
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
@@ -6598,7 +7331,7 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     # call relative to an OpenAI request.
     full_output = None
     sig = ""
-    might_need = AUTO_SUMMARIZER_ENABLED and (force_all or (
+    might_need = force_all or (AUTO_SUMMARIZER_ENABLED and (
         not has_description
         or not has_progress or progress_ttl_expired
         or not has_notes or notes_ttl_expired
@@ -6619,8 +7352,14 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
         notes_ttl_expired and bool(sig) and entry.get("notes_sig") != sig
     )
 
-    # Auto-summarizer removed: never issue LLM title/description/progress/notes calls.
-    if not AUTO_SUMMARIZER_ENABLED:
+    # The AUTOMATIC summarizer is off unless TMUX_DASH_AUTO_SUMMARY is set: it
+    # fired an LLM call per session per poll forever, whether or not anyone was
+    # reading the result. `force_all` is the other thing entirely, someone
+    # pressed Full, and it stays live, because the Key Info notes are the ONLY
+    # source for the "Saved from this project" drawer, and with this gate also
+    # swallowing the button that drawer could never fill on any box where the
+    # env var was unset, which is all of them. Nothing here runs unasked.
+    if not AUTO_SUMMARIZER_ENABLED and not force_all:
         need_description = need_progress = need_notes = False
 
     tasks = {}
@@ -7041,13 +7780,14 @@ def build_session_response(
     sess: dict,
     data: dict,
     activity: dict = None,
-    tab_labels: dict | None = None,
+    display_names: dict | None = None,
 ) -> dict:
     if activity is None:
         activity = detect_activity(sess["name"])
     return {
         "name": sess["name"],
-        "tab_label": _session_tab_label(sess["name"], tab_labels),
+        "display_name": _session_display_name(sess["name"], display_names,
+                                              sess.get("created", "")),
         "windows": sess["windows"],
         "attached": sess["attached"],
         "cwd": sess.get("cwd", ""),     # the project this session belongs to
@@ -7067,6 +7807,7 @@ def build_session_response(
         "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+        "cache_keepalive": _cache_keepalive_active(sess["name"]),
         **_session_model_fields(sess["name"]),
         **_session_auth_fields(sess["name"]),
         "profile_id": _get_session_profile_id(sess["name"]),
@@ -7092,9 +7833,9 @@ async def api_sessions(request: Request):
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
     )
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     return JSONResponse([
-        build_session_response(sess, data, activity=act, tab_labels=tab_labels)
+        build_session_response(sess, data, activity=act, display_names=display_names)
         for sess, data, act in zip(sessions, results, activities)
     ])
 
@@ -7109,7 +7850,7 @@ async def api_sessions_fast(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     _owners_map = _load_session_owners()
     _uid_to_name = {u["id"]: u.get("username", "") for u in _load_users()}
     for sess, activity in zip(sessions, activities):
@@ -7121,7 +7862,8 @@ async def api_sessions_fast(request: Request):
         cache[sess["name"]] = entry
         out.append({
             "name": sess["name"],
-            "tab_label": _session_tab_label(sess["name"], tab_labels),
+            "display_name": _session_display_name(sess["name"], display_names,
+                                                  sess.get("created", "")),
             "windows": sess["windows"],
             "attached": sess["attached"],
             # The working directory IS the project: it selects the CLAUDE.md,
@@ -7146,6 +7888,7 @@ async def api_sessions_fast(request: Request):
             "auth_mode": _session_auth_mode.get(sess["name"], "subscription"),
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "cache_keepalive": _cache_keepalive_active(sess["name"]),
             **_session_model_fields(sess["name"]),
             **_session_auth_fields(sess["name"]),
             "profile_id": _get_session_profile_id(sess["name"]),
@@ -7184,33 +7927,21 @@ async def api_status(request: Request):
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
     out = []
-    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    display_names = await asyncio.to_thread(_session_display_name_rows)
     for sess, activity in zip(sessions, activities):
         out.append({
             "name": sess["name"],
-            "tab_label": _session_tab_label(sess["name"], tab_labels),
+            "display_name": _session_display_name(sess["name"], display_names,
+                                                  sess.get("created", "")),
             "activity_status": activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+            "cache_keepalive": _cache_keepalive_active(sess["name"]),
             **_session_model_fields(sess["name"]),
             **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
-
-
-@app.get("/api/tab-labels")
-async def api_tab_labels(request: Request):
-    """Return only labels visible to the current dashboard account."""
-    user = _current_user(request)
-    sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
-    rows = await asyncio.to_thread(_session_tab_label_rows)
-    return JSONResponse(
-        [
-            {"name": session["name"], "tab_label": _session_tab_label(session["name"], rows)}
-            for session in sessions
-        ]
-    )
 
 
 @app.get("/api/sessions/{session_name}/raw")
@@ -7269,6 +8000,10 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     vis_hash = await asyncio.to_thread(_visible_pane_hash, session_name)
     pane_width = await asyncio.to_thread(get_pane_width, session_name)
 
+    # How much older history the archive holds beyond what tmux still has, so
+    # the terminal can offer to load it (see /history below).
+    archived = _scrollback_tail(session_name)["lines"]
+
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
         raw = await asyncio.to_thread(capture_pane_full, session_name)
@@ -7279,6 +8014,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
             "pane_total": current_total,
             "pane_width": pane_width,
             "visible_hash": vis_hash,
+            "archived_lines": archived,
         })
 
     # No scrollback growth, but visible content changed (TUI redraw) → full
@@ -7292,6 +8028,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
                 "pane_total": current_total,
                 "pane_width": pane_width,
                 "visible_hash": vis_hash,
+                "archived_lines": archived,
             })
         return JSONResponse({
             "mode": "none",
@@ -7299,6 +8036,7 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
             "pane_total": current_total,
             "pane_width": pane_width,
             "visible_hash": vis_hash,
+            "archived_lines": archived,
         })
 
     # Delta: capture only the new lines + small overlap for dedup
@@ -7313,6 +8051,33 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
         "pane_width": pane_width,
         "overlap": overlap,
         "visible_hash": vis_hash,
+        "archived_lines": archived,
+    })
+
+
+@app.get("/api/sessions/{session_name}/history")
+async def api_session_history(session_name: str, before: int = -1, limit: int = 3000):
+    """Older output from this session's own archive, for scrolling back past
+    what tmux still holds.
+
+    `before` is a line index into the archive: the response is the `limit` lines
+    that come before it, so the terminal can walk backwards a chunk at a time.
+    Pass -1 (the default) to start from the end of the archive."""
+    _, found = _find_session(session_name)
+    if not found:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    total = _scrollback_tail(session_name)["lines"]
+    limit = max(1, min(int(limit), 20000))
+    end = total if before is None or before < 0 else min(int(before), total)
+    start = max(0, end - limit)
+    chunk = await asyncio.to_thread(read_scrollback, session_name, start, end - start)
+    return JSONResponse({
+        "start": start,
+        "end": end,
+        "total": total,
+        "raw": "\n".join(chunk["lines"]),
+        "lines": len(chunk["lines"]),
+        "more": start > 0,
     })
 
 
@@ -7380,17 +8145,29 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     case is not hypothetical."""
     if not _UUID_RE.fullmatch(str(resume_uuid or "")):
         raise ValueError("invalid Claude resume UUID")
+    # RESUMING A CONVERSATION IS NOT STARTING ONE. The launch defaults belong to a
+    # new session; applying them here silently moved a restored session back onto
+    # DEFAULT_MODEL and DEFAULT_EFFORT, so a session deliberately put on Fable at
+    # max came back as Opus at xhigh with the same history and no notice. Carry
+    # the session's own model and effort across instead, exactly as the crash and
+    # relogin relaunches do. Both helpers fall back to the defaults on their own
+    # when there is nothing to read, which is the right answer for a fresh restore.
     command, _model, _effort = _claude_cmd_with_flags(
         NEW_SESSION_CMD or "claude --dangerously-skip-permissions",
+        pin_model=False,
     )
     command = re.sub(
         r"\s+--(?:session-id|resume)\s+(?:'[^']*'|\"[^\"]*\"|\S+)",
         "",
         command,
     )
+    command = re.sub(r"\s+--effort(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)", "", command)
     command = re.sub(r"\s+--continue\b", "", command)
     flag = "--resume" if _convo_has_transcript(session_name, resume_uuid) else "--session-id"
-    command = command.strip() + " " + flag + " " + resume_uuid
+    command = (command.strip()
+               + _model_flag_for_relaunch(session_name)
+               + _effort_flag_for_relaunch(session_name)
+               + " " + flag + " " + resume_uuid)
     return _managed_agent_command(session_name, command)
 
 
@@ -7483,11 +8260,16 @@ def _restore_durable_session(candidate: dict) -> dict:
         elif (profile_id := _get_session_profile_id(name)) != DEFAULT_PROFILE_ID:
             boot.append(_profile_export_line(profile_id))
         boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
-        boot.append(_claude_recovery_command(name, resume_uuid))
+        recovery = _claude_recovery_command(name, resume_uuid)
+        boot.append(recovery)
+        # Name what this restore is ACTUALLY starting on, not the box defaults:
+        # the recovery command now carries the session's own model and effort.
         launch = _launch_script_line(
             name,
             boot,
-            _launch_banner(name, owner_name, DEFAULT_MODEL, DEFAULT_EFFORT),
+            _launch_banner(name, owner_name,
+                           _flag_value(recovery, "model") or DEFAULT_MODEL,
+                           _flag_value(recovery, "effort") or DEFAULT_EFFORT),
         )
         for command in (
             ["tmux", "send-keys", "-t", created_id, "-l", launch],
@@ -7657,20 +8439,44 @@ class CreateSession(BaseModel):
     name: str = ""
     profile_id: str = ""
     cwd: str = ""       # start the session in this project directory
+    # What to LAUNCH on. Empty means the box defaults. Until these existed the
+    # only way to a non-default model was to start the session on the default and
+    # then switch it, which is a switch that has to survive a busy pane, shows the
+    # default in the header until the first reply lands, and cannot reach `max` at
+    # all before the session has begun. Choosing at launch makes the header right
+    # from the first turn because the flags themselves say so.
+    model: str = ""
+    effort: str = ""
+    # Forbid the CLI's silent model substitution for this session
+    # (CLAUDE_CODE_NO_MODEL_FALLBACK). Off by default on purpose: with it set the
+    # session REFUSES rather than quietly continuing on another model, and that
+    # includes refusing to compact, which would wedge a long run. It is the right
+    # answer when the whole point of the session is which model it runs on.
+    no_fallback: bool = False
 
 
 @app.post("/api/sessions/create")
 async def api_create_session(request: Request, body: CreateSession):
     """Create a new tmux session."""
     user = _current_user(request)
-    name = body.name.strip()
+    # Spaces are allowed in what the user types. tmux gets the name with the
+    # spaces taken out (it is a shell argument and a URL segment everywhere
+    # else); the typed form is kept for the tab.
+    name, display_name = _split_session_name(body.name)
+    if body.name.strip() and not name:
+        return JSONResponse({"error": "Invalid name. Use letters, numbers, spaces, dash, underscore."}, status_code=400)
     if name:
-        # Validate name: alphanumeric, dash, underscore only
-        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-            return JSONResponse({"error": "Invalid name. Use letters, numbers, dash, underscore."}, status_code=400)
         existing = [s["name"] for s in get_tmux_sessions()]
         if name in existing:
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+            return JSONResponse({"error": f"Session '{display_name}' already exists."}, status_code=409)
+    # What to launch on, if the dialog said. Validated against the same allowlists
+    # the header dropdowns use; empty means the box defaults.
+    _want_model = (body.model or "").strip()
+    if _want_model and _want_model not in ALLOWED_SESSION_MODELS:
+        return JSONResponse({"error": f"Unknown model: {_want_model}"}, status_code=400)
+    _want_effort = (body.effort or "").strip().lower()
+    if _want_effort and _want_effort not in ALLOWED_SESSION_EFFORTS:
+        return JSONResponse({"error": f"Unknown effort level: {_want_effort}"}, status_code=400)
     # The project the session belongs to. A session's cwd is what decides which
     # CLAUDE.md, .mcp.json and auto-memories Claude Code loads, so "open a session
     # in project B" has to mean starting tmux there — everything else follows.
@@ -7699,8 +8505,11 @@ async def api_create_session(request: Request, body: CreateSession):
         # requests can both pass the earlier friendly validation before either
         # reaches tmux.
         if name and any(session["name"] == name for session in get_tmux_sessions()):
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
+            return JSONResponse({"error": f"Session '{display_name}' already exists."}, status_code=409)
         created_id, created = _create_exact_tmux_session(name, start_cwd)
+        # Remember the spaced form only if tmux gave us the name we asked for;
+        # an auto-assigned name is its own display name.
+        _set_session_display_name(created, display_name if created == name else "")
         # Record session ownership. If auth is disabled, fall back to admin.
         owner_id = user["id"] if user else "admin"
         _set_session_owner(created, owner_id)
@@ -7805,7 +8614,18 @@ async def api_create_session(request: Request, body: CreateSession):
                         _pin_model = False
             except Exception:
                 logger.debug("Profile model lookup failed on create", exc_info=True)
-            _cmd_line, _model, _effort = _claude_cmd_with_flags(NEW_SESSION_CMD, pin_model=_pin_model)
+            # An explicit choice from the New-session dialog goes on the command
+            # line itself, which _claude_cmd_with_flags then leaves alone. Both are
+            # validated against the same allowlists the dropdowns use, so an
+            # unknown id cannot reach a shell.
+            _base_cmd = NEW_SESSION_CMD
+            if _want_model:
+                # Already on the command line, so the pin below leaves it alone:
+                # a stated choice outranks both the box default and a profile's.
+                _base_cmd = f"{_base_cmd} --model {shlex.quote(_want_model)}"
+            if _want_effort:
+                _base_cmd = f"{_base_cmd} --effort {shlex.quote(_want_effort)}"
+            _cmd_line, _model, _effort = _claude_cmd_with_flags(_base_cmd, pin_model=_pin_model)
             # Name the conversation ourselves. Every session on this box starts in
             # the same cwd, so a later `--continue` would otherwise resume whichever
             # neighbour spoke last; with an id on record every relaunch is --resume.
@@ -7815,7 +8635,14 @@ async def api_create_session(request: Request, body: CreateSession):
                 _cmd_line = f"{_cmd_line} --session-id {_convo}"
                 _set_session_convo(created, _convo)
             _banner = _launch_banner(created, _owner_name, _model, _effort)
+            if _model:
+                _set_session_model_choice(created, _model)
             _boot.append(_claude_launch_env_prefix().strip().rstrip(";"))
+            if body.no_fallback:
+                # The CLI's own guard: it refuses the swap and says so, instead of
+                # switching models without a word. Exported for the pane, so it
+                # survives every relaunch this session goes through.
+                _boot.append("export CLAUDE_CODE_NO_MODEL_FALLBACK=1")
             _boot.append(_managed_agent_command(created, _cmd_line))
         # One short line into the pane: `source ~/.tmux-dashboard/launch/<name>.sh`.
         _line = _launch_script_line(created, _boot, _banner)
@@ -7841,7 +8668,8 @@ async def api_create_session(request: Request, body: CreateSession):
             expected_generation=lifecycle_generation,
         )
         logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
-        return JSONResponse({"ok": True, "name": created})
+        return JSONResponse({"ok": True, "name": created,
+                             "display_name": _session_display_name(created)})
     except Exception as e:
         logger.error("Failed to create session '%s': %s", name, e)
         if created_id:
@@ -7863,6 +8691,7 @@ async def api_create_session(request: Request, body: CreateSession):
         if created_id:
             _clear_session_owner(created)
             _clear_session_convo(created)
+            _remove_session_display_name(created)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         await asyncio.to_thread(_release_tmux_mutation_fd, mutation_fd)
@@ -7983,7 +8812,13 @@ async def api_delete_session(request: Request, session_name: str):
         # A new session that reuses this name must not inherit the dead one's
         # conversation — that is the same mix-up by another route.
         _clear_session_convo(session_name)
-        _remove_session_tab_label(session_name)
+        # Same reasoning for the model it was put on: a reused name must not
+        # inherit a dead session's choice and get relaunched on it.
+        _clear_session_model_choice(session_name)
+        _session_fallback.pop(session_name, None)
+        _clear_session_fallback(session_name)
+        _session_fb_scan.pop(session_name, None)
+        _remove_session_display_name(session_name)
         SESSION_LIFECYCLE.remove(
             session_name,
             expected_generation=lifecycle_generation,
@@ -8193,6 +9028,62 @@ async def api_list_uploads(session_name: str):
                 continue
     files.sort(key=lambda f: f["mtime"], reverse=True)
     return JSONResponse({"files": files})
+
+
+class SessionDisplayNameBody(BaseModel):
+    name: str = Field(default="", max_length=80)
+
+
+@app.patch("/api/sessions/{session_name}/display-name")
+async def api_set_session_display_name(request: Request, session_name: str,
+                                       body: SessionDisplayNameBody):
+    """Rename a session, for reading. The tmux name never changes.
+
+    THE TMUX NAME IS THE IDENTITY: it is a URL segment, a DOM id, a shell
+    argument, the key under which this session's owner, autopush mode, messages
+    and notes are filed, and what `tmux -t` is given. Renaming that would mean
+    renaming all of it, and would break any tab someone still has open. So the
+    name people read is a label stored beside it, and the two are kept from
+    drifting apart by recording the tmux creation stamp with the label: a
+    recycled tmux name has a different stamp and does not inherit the label.
+
+    An empty name clears the label and the tmux name shows through again.
+    """
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    display = " ".join(str(body.name or "").split())
+    if display and not _SESSION_NAME_RE.match(display):
+        return JSONResponse(
+            {"error": "Letters, numbers, spaces, dashes and underscores only."},
+            status_code=400)
+    created = str(sess.get("created", "") or "")
+    await asyncio.to_thread(_set_session_display_name, session_name, display, created)
+    return JSONResponse({"ok": True, "name": session_name,
+                         "display_name": display or session_name})
+
+
+@app.get("/api/sessions/{session_name}/saved")
+async def api_session_saved(request: Request, session_name: str):
+    """Links, logins and files this session produced — the Saved-from-this-project
+    drawer under the terminal.
+
+    Read straight off the session's own transcript, so it is complete the moment
+    the session does something rather than whenever a summariser last ran.
+
+    OWNERSHIP-SCOPED, unlike its neighbours here: this is the one session endpoint
+    that hands back CREDENTIALS, so a member asking for a name that is not theirs
+    gets the same 404 as a name that does not exist."""
+    _, sess = _find_session_for_user(session_name, _current_user(request))
+    if not sess:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        data = await asyncio.to_thread(_session_saved_reference, session_name)
+    except Exception:
+        logger.debug("saved-reference scan failed for '%s'", session_name, exc_info=True)
+        return JSONResponse({"urls": [], "creds": [], "files": [], "identified": False})
+    return JSONResponse(data)
 
 
 @app.delete("/api/sessions/{session_name}/uploads/{filename}")
@@ -9438,6 +10329,100 @@ def _profile_dir(profile_id: str) -> Path:
     return Path.home() / f".claude-{profile_id}"
 
 
+# Claude Code records how it was installed in <CLAUDE_CONFIG_DIR>/.claude.json,
+# and a config dir we create starts without those keys. Left unset, the updater
+# cannot tell it is running a native install, and the moment anything writes
+# autoUpdates:false into that profile the auto-updater switches itself off
+# silently -- which is how this box sat on an old version. Seed the keys from
+# the authoritative ~/.claude.json, never overwriting what is already there.
+_UPDATE_CONFIG_KEYS = ("installMethod", "autoUpdates", "autoUpdatesProtectedForNative")
+
+
+def _seed_profile_update_config(config_dir: Path):
+    source = Path.home() / ".claude.json"
+    try:
+        base = json.loads(source.read_text())
+    except Exception:
+        return
+    if not isinstance(base, dict):
+        return
+    seed = {k: base[k] for k in _UPDATE_CONFIG_KEYS if k in base}
+    if not seed:
+        return
+    target = config_dir / ".claude.json"
+    current: dict = {}
+    if target.exists():
+        try:
+            loaded = json.loads(target.read_text())
+            current = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            logger.debug("%s was not valid JSON; leaving it alone", target)
+            return
+    # All three keys are one unit. The updater reads them together as
+    # `autoUpdates is false AND (installMethod is not native OR not protected)
+    # => disabled`, so dropping autoUpdates:false onto a profile that records a
+    # different installMethod would switch its updates off. Only seed a config
+    # that has no installMethod of its own; one that has it maintains itself.
+    if "installMethod" in current:
+        return
+    missing = {k: v for k, v in seed.items() if k not in current}
+    if not missing:
+        return
+    current.update(missing)
+    try:
+        tmp = target.with_suffix(".json.seedtmp")
+        tmp.write_text(json.dumps(current, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        logger.info("Seeded update config %s into %s", sorted(missing), target)
+    except Exception:
+        logger.debug("Failed to seed update config into %s", target, exc_info=True)
+
+
+_REPORT_STYLE_BEGIN = "<!-- REPORT STYLE (managed) -->"
+_REPORT_STYLE_END = "<!-- END REPORT STYLE -->"
+_REPORT_STYLE = """## How to write the summary at the end
+
+Write it for a busy reader who was not in the session.
+- Lead with the finding that changes what the reader believes, and let it hint at what the task was.
+- Say what happened and what the fix was, not how it was done.
+- No command flags, function names or file paths unless the reader has to type them. DO give the live URL of anything you built, with the login if it needs one.
+- Fragments fine. Clarity, not grammar. No fluff.
+- No em dash, no pipe character. It has to be copy-paste ready.
+- Close with what was left undone and why, if anything was.
+- No preamble, no "I've completed", no offer to do more, no menu of options, never "want me to".
+- Under 200 words for a whole session. Less if it holds."""
+
+
+def _strip_report_style(text: str) -> str:
+    """Remove every copy of the managed block, so it never accumulates.
+
+    The Profiles editor reads CLAUDE.md back off disk and saves the whole thing
+    into the stored record, so the block round-trips into `claude_md` unless it
+    is stripped on the way in.
+    """
+    body = text or ""
+    while _REPORT_STYLE_BEGIN in body:
+        pre, rest = body.split(_REPORT_STYLE_BEGIN, 1)
+        body = pre + (rest.split(_REPORT_STYLE_END, 1)[1] if _REPORT_STYLE_END in rest else "")
+    return body.rstrip("\n")
+
+
+def _with_report_style(text: str) -> str:
+    """Append the managed report-style block to a role profile's CLAUDE.md.
+
+    A role profile's CLAUDE.md is rewritten from the stored record on every
+    materialize, and that record is itself refreshed from `_PROFILE_PRESETS`
+    unless the profile is marked `edited`, so anything appended to the file by
+    hand is gone within minutes. Spelled out rather than pointed at: a pointer
+    would have to name `$HOME/CLAUDE.md`, which on a tenant box is readable by
+    every tenant session and is not always where the rules live.
+    """
+    body = _strip_report_style(text)
+    block = _REPORT_STYLE_BEGIN + "\n" + _REPORT_STYLE + "\n" + _REPORT_STYLE_END + "\n"
+    return (body + "\n\n" if body else "") + block
+
+
 def _materialize_profile(profile: dict):
     """Write settings.json, CLAUDE.md, and ensure skills/ exists.
 
@@ -9453,6 +10438,7 @@ def _materialize_profile(profile: dict):
     d = _profile_dir(pid)
     d.mkdir(parents=True, exist_ok=True)
     (d / "skills").mkdir(parents=True, exist_ok=True)
+    _seed_profile_update_config(d)
     is_default = (pid == DEFAULT_PROFILE_ID)
 
     settings_path = d / "settings.json"
@@ -9507,7 +10493,10 @@ def _materialize_profile(profile: dict):
             _backup_before_dashboard_write(settings_path)
             settings_path.write_text(json.dumps(managed, indent=2))
         _backup_before_dashboard_write(claudemd_path)
-        claudemd_path.write_text(profile.get("claude_md") or "")
+        # ~/.claude/CLAUDE.md is the account's own file and already carries the
+        # global rules; only the role dirs we own get the managed block.
+        claudemd_path.write_text(profile.get("claude_md") or "" if is_default
+                                 else _with_report_style(profile.get("claude_md")))
         _backup_before_dashboard_write(memorymd_path)
         memorymd_path.write_text(profile.get("memory_md") or "")
         # Seed initial skill files only when they are missing -- never overwrite,
@@ -9662,7 +10651,8 @@ async def api_update_profile(profile_id: str, body: UpdateProfileBody):
     if body.effort is not None:
         p["effort"] = body.effort
     if body.claude_md is not None:
-        p["claude_md"] = body.claude_md
+        # The editor sends back what it read off disk, managed block included.
+        p["claude_md"] = _strip_report_style(body.claude_md)
     if body.memory_md is not None:
         p["memory_md"] = body.memory_md
     if body.permissions is not None:
@@ -10832,6 +11822,39 @@ def _cpu_utilisation_pct() -> float:
         return _CPU_SAMPLE["pct"]
 
 
+def _billing_state() -> dict:
+    """What a session launched from this dashboard actually spends.
+
+    Exists because the CLI's own banner cannot be trusted to answer it: with
+    CLAUDE_CODE_OAUTH_TOKEN exported it prints "Claude API" on a Max plan (see
+    _claude_launch_env_prefix). This reports the launch path instead of the
+    label, so the answer comes from what the dashboard is about to do rather
+    than from what the session says about itself afterwards.
+
+    `metered` is the only field worth acting on: True means an Anthropic API key
+    is configured and inference is billed per token.
+    """
+    key = bool(_stored_anthropic_key)
+    plan, tier = "", ""
+    try:
+        o = json.loads(SHARED_CREDENTIALS.read_text()).get("claudeAiOauth", {})
+        if int(o.get("expiresAt") or 0) > int(time.time() * 1000):
+            plan = o.get("subscriptionType") or ""
+            tier = o.get("rateLimitTier") or ""
+    except Exception:
+        logger.debug("Could not read the plan credential for billing state", exc_info=True)
+    env_token = bool(_load_longlived_token()) and not _plan_credential_is_static()
+    return {
+        "metered": key,
+        "plan": plan,
+        "tier": tier,
+        "mode": _auth_mode_label(),
+        # True while the CLI will mislabel itself. Kept as its own field so the
+        # UI can explain the banner rather than contradict it.
+        "banner_says_api": env_token and not key,
+    }
+
+
 _HOST_IDENTITY: Dict[str, str] = {}
 
 
@@ -10881,6 +11904,142 @@ def _host_identity() -> Dict[str, str]:
     return _HOST_IDENTITY
 
 
+# ── Who owns each running `claude` ────────────────────────────────────────────
+#
+# The Stats panel used to print `pgrep -a claude` verbatim: fifty identical
+# "claude --dangerously-skip-permissions" lines, no owner, no size, no age. It
+# reads as leaked history, which is the one thing it is not — every line is a
+# live process holding 150-250MB. What is missing is the attribution, so this
+# supplies it: the tmux session each one belongs to, the socket that session
+# lives on, and how long it has been there. Anything whose tmux server is not
+# this dashboard's is flagged as unattached, because that is the whole answer to
+# "should these still be running".
+_CLAUDE_INVENTORY_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_CLAUDE_INVENTORY_TTL = 20
+
+
+def _read_proc_table() -> dict:
+    """`{pid: {"ppid", "rss_mb", "age_s", "argv"}}` for every visible process."""
+    try:
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        page = os.sysconf("SC_PAGE_SIZE") or 4096
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except Exception:
+        return {}
+    table = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                raw = f.read()
+            # comm sits in parentheses and may itself contain spaces and
+            # parentheses, so the fields after it start past the LAST ')'.
+            fields = raw[raw.rindex(")") + 2:].split()
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            table[pid] = {
+                "ppid": int(fields[1]),
+                "rss_mb": int(fields[21]) * page // (1024 * 1024),
+                "age_s": max(0, int(uptime - int(fields[19]) / hz)),
+                "argv": " ".join(a for a in argv.split("\0") if a),
+            }
+        except (IndexError, ValueError):
+            continue
+    return table
+
+
+def _tmux_socket_of(argv: str) -> str:
+    m = re.search(r"(?:^|\s)-L\s+(\S+)", argv)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:^|\s)-S\s+(\S+)", argv)
+    return os.path.basename(m.group(1)) if m else "default"
+
+
+def _claude_process_inventory() -> dict:
+    """Every live `claude`, with the tmux session and socket that owns it."""
+    now = time.time()
+    cached = _CLAUDE_INVENTORY_CACHE
+    if cached["data"] is not None and now - cached["ts"] < _CLAUDE_INVENTORY_TTL:
+        return cached["data"]
+
+    table = _read_proc_table()
+    # tmux SERVERS, by pid. A server's argv keeps the -L/-S it was started with,
+    # which is the only place the socket name is written down.
+    servers = {pid: _tmux_socket_of(p["argv"]) for pid, p in table.items()
+               if p["argv"].split(" ", 1)[0].rsplit("/", 1)[-1] == "tmux"}
+
+    def ancestry(pid):
+        chain, seen = [], set()
+        while pid and pid not in seen and pid != 1:
+            seen.add(pid)
+            chain.append(pid)
+            pid = table.get(pid, {}).get("ppid", 0)
+        return chain
+
+    claudes = [pid for pid, p in table.items()
+               if re.match(r"^(?:\S*/)?claude(?:\s|$)", p["argv"])]
+
+    # pane pid -> session name, per socket, asked only of sockets that actually
+    # have a claude under them.
+    panes: Dict[str, dict] = {}
+    for sock in {servers[a] for pid in claudes for a in ancestry(pid) if a in servers}:
+        cmd = ["tmux"] + ([] if sock == "default" else ["-L", sock])
+        try:
+            out = subprocess.run(cmd + ["list-panes", "-a", "-F",
+                                        "#{pane_pid} #{session_name}"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            out = ""
+        m = {}
+        for line in out.splitlines():
+            bits = line.split(None, 1)
+            if len(bits) == 2 and bits[0].isdigit():
+                m[int(bits[0])] = bits[1]
+        panes[sock] = m
+
+    procs = []
+    for pid in sorted(claudes):
+        p = table[pid]
+        chain = ancestry(pid)
+        sock, session = "", ""
+        for anc in chain:
+            if anc in servers:
+                sock = servers[anc]
+                break
+        if sock:
+            for anc in chain:
+                if anc in panes.get(sock, {}):
+                    session = panes[sock][anc]
+                    break
+        procs.append({
+            "pid": pid,
+            "session": session,
+            "socket": sock or "-",
+            "rss_mb": p["rss_mb"],
+            "age_s": p["age_s"],
+            # On this dashboard's own tmux socket, in a session that still
+            # exists. Anything else is running with nobody watching it.
+            "attached": bool(session) and sock == "default",
+            "argv": p["argv"],
+        })
+    procs.sort(key=lambda x: (x["attached"], -x["rss_mb"]))
+    data = {
+        "processes": procs,
+        "total": len(procs),
+        "attached": sum(1 for x in procs if x["attached"]),
+        "orphaned": sum(1 for x in procs if not x["attached"]),
+        "orphan_rss_mb": sum(x["rss_mb"] for x in procs if not x["attached"]),
+    }
+    _CLAUDE_INVENTORY_CACHE.update({"ts": now, "data": data})
+    return data
+
+
 @app.get("/api/stats")
 async def api_stats(request: Request):
     """System stats: CPU, disk, memory, tmux sessions, Claude processes.
@@ -10896,6 +12055,7 @@ async def api_stats(request: Request):
     stats = {}
     # Which box answered. Cached, so this is a dict lookup after the first call.
     stats["host"] = await asyncio.to_thread(_host_identity)
+    stats["billing"] = _billing_state()
     # CPU load
     try:
         with open('/proc/loadavg') as f:
@@ -10947,16 +12107,22 @@ async def api_stats(request: Request):
         stats["disk"] = {}
     # tmux sessions
     stats["tmux_sessions"] = _filter_sessions_for_user(get_tmux_sessions(), user)
-    # Claude processes. Command lines leak other members' cwd/model, so members
-    # get the count only.
+    # Claude processes, attributed to the tmux session that owns each one.
+    # Command lines leak other members' cwd/model, so members get counts only.
     try:
-        result = subprocess.run(
-            ["pgrep", "-a", "claude"],
-            capture_output=True, text=True, timeout=5
-        )
-        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-        stats["claude_processes"] = lines if is_admin else len(lines)
+        inv = await asyncio.to_thread(_claude_process_inventory)
+        stats["claude_inventory"] = {
+            "total": inv["total"], "attached": inv["attached"],
+            "orphaned": inv["orphaned"], "orphan_rss_mb": inv["orphan_rss_mb"],
+            "processes": inv["processes"] if is_admin else [],
+        }
+        # Kept for anything still reading the old shape.
+        stats["claude_processes"] = ([p["argv"] for p in inv["processes"]]
+                                     if is_admin else inv["total"])
     except Exception:
+        logger.debug("Claude process inventory failed", exc_info=True)
+        stats["claude_inventory"] = {"total": 0, "attached": 0, "orphaned": 0,
+                                     "orphan_rss_mb": 0, "processes": []}
         stats["claude_processes"] = [] if is_admin else 0
     # Node processes (Claude Code runs as node)
     try:
@@ -10979,6 +12145,233 @@ async def api_stats(request: Request):
     except Exception:
         stats["uptime"] = "unknown"
     return JSONResponse(stats)
+
+
+# --- Process table (the "what is actually running" half of the stats popup) ---
+#
+# `ps`'s %CPU is the average over the whole life of the process, so a session
+# that pinned a core for an hour this morning and has been idle since still
+# reads high, and the one eating the box right now reads low. top and htop do
+# not do that: they sample the counters twice and divide by the wall clock in
+# between. So does this. The sample costs a sleep, which is exactly why it is
+# NOT in /api/stats: the nav bar polls that for every signed-in user every 30
+# seconds, and a 0.6s sleep in there would be paid by all of them for a number
+# nobody is looking at.
+#
+# One second, not less. CPU is counted in kernel ticks (100/s here), so the
+# smallest non-zero reading is one tick over the window: at 0.6s that is 1.6%,
+# and a dozen daemons that merely woke up once all report it. At 1.0s the floor
+# is a round 1.0% and the table reads the way top does.
+_PROC_SAMPLE_SECS = 1.0
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_PAGE_KB = (os.sysconf("SC_PAGE_SIZE") // 1024) if hasattr(os, "sysconf") else 4
+
+
+def _proc_tick_table() -> Dict[int, tuple]:
+    """pid -> (ppid, cpu_ticks, rss_kb, comm). One pass over /proc.
+
+    Reads only `stat`, which is a single line and needs no parsing of the
+    /proc/<pid>/status key-value format. The comm field can itself contain
+    spaces and brackets, so it is cut out on the LAST ')' rather than split on
+    whitespace, the classic way this parser goes wrong.
+    """
+    out: Dict[int, tuple] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat") as fh:
+                line = fh.read()
+        except OSError:
+            continue            # exited between listdir and open; normal
+        try:
+            lp = line.rindex(")")
+            comm = line[line.index("(") + 1:lp]
+            f = line[lp + 2:].split()
+            # Fields after comm, 0-indexed: 0 state, 1 ppid, 11 utime, 12 stime,
+            # 21 rss (pages). See proc(5).
+            out[int(name)] = (int(f[1]), int(f[11]) + int(f[12]),
+                              int(f[21]) * _PAGE_KB, comm)
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _pid_to_session() -> Dict[int, str]:
+    """pid -> tmux session, for the pane process and everything under it.
+
+    A pane's own pid IS the agent process (tmux execs the launch script in the
+    pane), so every descendant of it (the MCP servers, a build, a stray
+    browser) is that session's work. Attributing them is the whole point of
+    the panel: "node is eating a core" is not actionable, "the node under
+    session `builder` is" is.
+    """
+    panes: Dict[int, str] = {}
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                            "#{session_name} #{pane_pid}"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            sess, _, pid = line.rpartition(" ")
+            if sess and pid.strip().isdigit():
+                panes[int(pid)] = sess
+    except Exception:
+        logger.debug("tmux pane listing failed for the process table", exc_info=True)
+    if not panes:
+        return {}
+    children: Dict[int, list] = {}
+    for pid, (ppid, _t, _r, _c) in _proc_tick_table().items():
+        children.setdefault(ppid, []).append(pid)
+    owner: Dict[int, str] = {}
+    for root, sess in panes.items():
+        stack = [root]
+        while stack:                       # BFS, not recursion: a deep pipeline
+            pid = stack.pop()              # of shells would blow the stack
+            if pid in owner:
+                continue
+            owner[pid] = sess
+            stack.extend(children.get(pid, ()))
+    return owner
+
+
+def _cmdline(pid: int, comm: str) -> str:
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read(4096)
+    except OSError:
+        return comm
+    txt = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    # A kernel thread has an empty cmdline; `ps` shows those in brackets.
+    return txt or "[" + comm + "]"
+
+
+_UID_NAMES: Dict[int, str] = {}
+
+
+def _uid_name(uid: int) -> str:
+    if uid not in _UID_NAMES:
+        try:
+            import pwd
+            _UID_NAMES[uid] = pwd.getpwuid(uid).pw_name
+        except Exception:
+            _UID_NAMES[uid] = str(uid)
+    return _UID_NAMES[uid]
+
+
+def _process_snapshot(limit: int = 24) -> dict:
+    """Two /proc samples, `_PROC_SAMPLE_SECS` apart, as a top-style table.
+
+    `cpu` is a share of ONE core, the way top and htop report it, so a process
+    using four cores reads 400%. Saying that in the UI matters: on an 8-vCPU
+    box "312%" is healthy and "98%" next to a stalled session is not, and the
+    two are indistinguishable if the number is silently normalised to the core
+    count.
+    """
+    first = _proc_tick_table()
+    t0 = time.monotonic()
+    time.sleep(_PROC_SAMPLE_SECS)
+    second = _proc_tick_table()
+    elapsed = max(time.monotonic() - t0, 0.05)
+    owner = _pid_to_session()
+    total_kb = 0
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+
+    rows = []
+    for pid, (ppid, ticks, rss_kb, comm) in second.items():
+        prev = first.get(pid)
+        # A process born inside the sample window has no baseline. Charging it
+        # its whole lifetime's ticks would spike it to a meaningless number, so
+        # it enters the table at 0 and is measured properly on the next poll.
+        used = (ticks - prev[1]) if prev else 0
+        cpu = round(100.0 * used / _CLK_TCK / elapsed, 1)
+        rows.append({
+            "pid": pid, "ppid": ppid, "comm": comm,
+            "cpu": max(cpu, 0.0),
+            "rss_mb": round(rss_kb / 1024.0, 1),
+            "mem": round(100.0 * rss_kb / total_kb, 1) if total_kb else 0.0,
+            "session": owner.get(pid, ""),
+        })
+
+    # Union of the two leaderboards. A 6 GB process at 0% CPU is exactly what
+    # you open this panel to find, and a pure CPU sort hides it completely.
+    by_cpu = sorted(rows, key=lambda r: -r["cpu"])[:limit]
+    by_mem = sorted(rows, key=lambda r: -r["rss_mb"])[:limit]
+    keep, seen = [], set()
+    for r in by_cpu + by_mem:
+        if r["pid"] in seen:
+            continue
+        seen.add(r["pid"])
+        keep.append(r)
+    for r in keep:
+        r["cmd"] = _cmdline(r["pid"], r["comm"])
+        try:
+            r["user"] = _uid_name(os.stat("/proc/%d" % r["pid"]).st_uid)
+        except OSError:
+            r["user"] = ""
+    return {
+        "processes": keep,
+        "total": len(rows),
+        "cpu_count": os.cpu_count() or 1,
+        "sample_secs": round(elapsed, 2),
+        # Across every process on the box, not just the rows above, so the panel
+        # can say what share of the machine the table actually accounts for.
+        # Deliberately no RSS total to go with it: summing RSS counts every
+        # shared page once per process and lands far above the RAM in the box,
+        # which would contradict the Memory section three rows higher up.
+        "cpu_sum": round(sum(r["cpu"] for r in rows), 1),
+    }
+
+
+# Its own single thread, never asyncio.to_thread. The default executor is where
+# every tmux capture and CDP probe already queues, and a 0.3s read has been
+# measured taking 12-21s behind them; a sampler that HOLDS a thread for a full
+# second would both wait in that queue and make it longer for everyone else.
+# One thread also serialises the sampler with itself, which is what makes the
+# cache below a real bound rather than a hope.
+_PROC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="proctop")
+_PROC_CACHE: dict = {"ts": 0.0, "snap": None}
+_PROC_CACHE_TTL = 2.5      # under the panel's 4s poll, so a single viewer always
+                           # gets a fresh sample and a second tab rides along
+
+
+def _process_snapshot_cached() -> dict:
+    now = time.monotonic()
+    snap = _PROC_CACHE["snap"]
+    if snap is not None and now - _PROC_CACHE["ts"] < _PROC_CACHE_TTL:
+        return snap
+    snap = _process_snapshot()
+    _PROC_CACHE["ts"] = time.monotonic()
+    _PROC_CACHE["snap"] = snap
+    return snap
+
+
+@app.get("/api/stats/processes")
+async def api_stats_processes(request: Request):
+    """top-style process table for the stats popup.
+
+    Command lines carry other people's cwd, model and prompts, so a member sees
+    only the processes under their OWN sessions. The host-level totals stay
+    whole for everyone: they are the same numbers the nav bar already shows.
+    """
+    user = _current_user(request)
+    snap = dict(await asyncio.get_running_loop().run_in_executor(
+        _PROC_POOL, _process_snapshot_cached))
+    if not _is_admin(user):
+        mine = {s["name"] for s in _filter_sessions_for_user(get_tmux_sessions(), user)}
+        snap["processes"] = [p for p in snap["processes"] if p.get("session") in mine]
+        snap["scoped"] = True
+    return JSONResponse(snap)
 
 
 @app.get("/api/health")
@@ -11541,8 +12934,12 @@ _BROWSER_LAUNCHER_SCRIPT = r'''#!/usr/bin/env bash
 # core per attached viewer, continuously, and nothing at all with none. Chrome,
 # the profile and any agent driving it over CDP are untouched either way.
 set -uo pipefail
-export HOME=/home/nimrod_rotem
-# shellcheck source=/home/nimrod_rotem/.claude-browser/bin/chrome-common.sh
+# Keep the HOME we were started with and only fall back to the usual one. It is
+# not the same on every box: builder4 is a tenant on the patents VM and its HOME
+# is /home/nimrod_rotem/builder4-home, so hardcoding sent every profile, log and
+# proxy config to the neighbour's directory.
+export HOME="${HOME:-/home/nimrod_rotem}"
+# shellcheck source=chrome-common.sh
 source "$HOME/.claude-browser/bin/chrome-common.sh"
 ACTION="${1:-}"; ID="${2:-}"
 [ -z "$ACTION" ] || [ -z "$ID" ] && { echo "usage: browser-session.sh start|stop|vnc-start|vnc-stop <id> ..."; exit 2; }
@@ -11598,6 +12995,18 @@ if [ "$ACTION" = "stop" ]; then
 fi
 
 DISP="${3:?display}"; RFB="${4:?rfbport}"; VNC="${5:?vncport}"; CDP="${6:?cdpport}"
+
+# A CDP PORT THAT ALREADY ANSWERS IS SOMEBODY'S BROWSER. Starting a second Chrome
+# on it does not fail loudly: one keeps 127.0.0.1, the other quietly takes ::1,
+# and every client afterwards reaches whichever its resolver happens to prefer.
+# Found on instance-3 2026-09-04 with the resident profile and a session called
+# "default" both on 9222, one of them holding a half-finished payroll login that
+# nothing could address. Refuse instead, and say which port.
+if curl -s --max-time 2 "http://127.0.0.1:$CDP/json/version" >/dev/null 2>&1 \
+   || curl -s --max-time 2 -g "http://[::1]:$CDP/json/version" >/dev/null 2>&1; then
+  echo "refusing to start session $ID: a browser already answers CDP on $CDP"
+  exit 3
+fi
 mkdir -p "$LOGS" "$PROFILE"
 export DISPLAY=":$DISP"
 : > "$PIDS"
@@ -15366,7 +16775,8 @@ async def _auto_fix_login(session_name: str) -> dict:
         "NODE_OPTIONS=--max-old-space-size=8192 "
         "claude --dangerously-skip-permissions "
         + await _async_resume_flag(session_name)
-        + _model_flag_for_relaunch(session_name)))
+        + _model_flag_for_relaunch(session_name)
+        + _effort_flag_for_relaunch(session_name)))
     # 4. Confirm it came back authenticated.
     for _ in range(20):
         await asyncio.sleep(2)
@@ -15654,7 +17064,8 @@ async def api_session_relogin(session_name: str, request: Request):
                         "NODE_OPTIONS=--max-old-space-size=8192 "
                         "claude --dangerously-skip-permissions "
                         + await _async_resume_flag(session_name)
-                        + _model_flag_for_relaunch(session_name))],
+                        + _model_flag_for_relaunch(session_name)
+                        + _effort_flag_for_relaunch(session_name))],
         capture_output=True, text=True, timeout=5)
     await asyncio.to_thread(subprocess.run,
         ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -16701,6 +18112,8 @@ _session_model_cache: Dict[str, dict] = {}  # {session_name: {"model": str, "ts"
 # transcript (the JSONL only shows the new model on the NEXT assistant reply).
 _session_model_pending: Dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
 _session_effort_pending: Dict[str, dict] = {}  # {session_name: {"effort": str, "ts": float}}
+# Model changes the CLI made for ITSELF (capacity fallback), while they still hold.
+_session_fallback: Dict[str, dict] = {}  # {session_name: {"from": str, "to": str}}
 
 
 # --- How is each session actually signed in? --------------------------------
@@ -16744,17 +18157,36 @@ def _creds_plan(config_dir: str = "") -> str:
         return "Claude"
 
 
-def _session_claude_env(session_name: str) -> dict:
-    """Environment of the `claude` process running in a session's first pane."""
+_session_claude_proc_cache: Dict[str, dict] = {}
+_CLAUDE_PROC_TTL = 60
+
+
+def _session_claude_proc(session_name: str) -> dict:
+    """`{"pid": …, "cmdline": …, "env": {…}}` of the `claude` process in a
+    session's first pane. Cached — it costs two subprocess calls and only
+    changes on a restart.
+
+    The command line is read as well as the environment because Claude Code's
+    1M-context tier is a `--model …[1m]` LAUNCH FLAG: the transcript records the
+    plain model id, so argv is the only place the wide window is written down.
+    The pid is kept because it is the one hard link between a tmux session and
+    the transcript it is writing (see _session_transcript_uuid)."""
+    now = time.time()
+    cached = _session_claude_proc_cache.get(session_name)
+    if cached and now - cached["ts"] < _CLAUDE_PROC_TTL:
+        return cached["data"]
+    data = {"pid": 0, "cmdline": "", "env": {}}
     try:
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
             capture_output=True, text=True, timeout=5).stdout.split()
     except Exception:
-        return {}
+        out = []
     pids = [p for p in out if p.isdigit()]
     # The pane's own pid is a shell; `claude` is a descendant of it.
     for pid in pids:
+        if data["env"]:
+            break
         try:
             kids = subprocess.run(["pgrep", "-P", pid], capture_output=True,
                                   text=True, timeout=5).stdout.split()
@@ -16762,8 +18194,9 @@ def _session_claude_env(session_name: str) -> dict:
             kids = []
         for cand in [*kids, pid]:
             try:
-                if "claude" not in Path(f"/proc/{cand}/cmdline").read_bytes().decode(
-                        "utf-8", "replace"):
+                cmdline = Path(f"/proc/{cand}/cmdline").read_bytes().decode(
+                    "utf-8", "replace")
+                if "claude" not in cmdline:
                     continue
                 raw = Path(f"/proc/{cand}/environ").read_bytes().decode("utf-8", "replace")
             except Exception:
@@ -16773,8 +18206,60 @@ def _session_claude_env(session_name: str) -> dict:
                 k, _, v = item.partition("=")
                 if k:
                     env[k] = v
-            return env
-    return {}
+            data = {"pid": int(cand), "cmdline": " ".join(cmdline.split("\0")).strip(),
+                    "env": env}
+            break
+    _session_claude_proc_cache[session_name] = {"data": data, "ts": now}
+    return data
+
+
+# `/tmp/claude-<uid>/<encoded-cwd>/<session-uuid>/…` — the per-session scratch
+# directory Claude Code opens and keeps open. The uuid in it is the transcript's
+# file name, which is what makes this a proof of ownership rather than a guess.
+_CLAUDE_SCRATCH_RE = re.compile(
+    r"/tmp/claude-\d+/[^/]+/([0-9a-fA-F-]{36})(?:/|$)")
+
+
+def _session_transcript_uuid(session_name: str) -> str:
+    """The transcript UUID this tmux session's `claude` process is writing, or ''.
+
+    SEVERAL SESSIONS SHARE ONE PROJECT DIRECTORY. Transcripts are filed per
+    working directory, so a dozen sessions opened on the same checkout all land
+    in one folder and "the newest file" hands every one of them whichever
+    sibling typed last — which is how a session three minutes old reported a
+    neighbour's 800k-token prompt as its own context.
+
+    Two facts settle it outright, both read off the session's own process:
+      * `--session-id <uuid>` in argv, which is how the dashboard launches a
+        session and names its transcript up front;
+      * an open descriptor on the per-session scratch directory, whose path
+        carries the same uuid. Present whatever the session was launched with.
+    Neither is a heuristic, so a hit here needs no corroboration."""
+    proc = _session_claude_proc(session_name)
+    sid = _flag_value(proc.get("cmdline", ""), "session-id")
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", sid or ""):
+        return sid.lower()
+    pid = proc.get("pid") or 0
+    if not pid:
+        return ""
+    try:
+        fd_dir = f"/proc/{pid}/fd"
+        for entry in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, entry))
+            except OSError:
+                continue
+            m = _CLAUDE_SCRATCH_RE.search(target)
+            if m:
+                return m.group(1).lower()
+    except OSError:
+        pass
+    return ""
+
+
+def _session_claude_env(session_name: str) -> dict:
+    """Environment of the `claude` process running in a session's first pane."""
+    return _session_claude_proc(session_name)["env"]
 
 
 def _session_auth_fields(session_name: str) -> dict:
@@ -16809,16 +18294,24 @@ def _session_auth_fields(session_name: str) -> dict:
 
 
 def _session_model_fields(session_name: str) -> dict:
-    """`model`/`effort` plus their pending markers, for API payloads. A pending
-    marker clears once the transcript confirms the switch, or after 15 min
-    (request abandoned)."""
+    """`model`/`effort` plus their pending markers, the context the last turn
+    actually carried and when that turn ended — for API payloads.
+
+    A pending marker clears once the session confirms the switch, or after
+    15 min (request abandoned)."""
     detected = _detect_session_model_effort(session_name)
     model, effort = detected.get("model", ""), detected.get("effort", "")
+    # The reported id carries the `[1m]` suffix when the session was launched on
+    # the wide-context tier, so the badge reads "Opus 5 · 1M" and the dropdown
+    # ticks the row the session is actually on. Comparisons against a REQUESTED
+    # id therefore have to drop the suffix from both sides.
+    model_base = model.split("[", 1)[0]
 
     pend = _session_model_pending.get(session_name)
     if pend:
         base = pend.get("model", "").split("[", 1)[0]
-        confirmed = bool(model and base and (model == base or model.startswith(base + "-")))
+        confirmed = bool(model_base and base
+                         and (model_base == base or model_base.startswith(base + "-")))
         if confirmed or time.time() - pend.get("ts", 0) > 900:
             _session_model_pending.pop(session_name, None)
             pend = None
@@ -16832,6 +18325,9 @@ def _session_model_fields(session_name: str) -> dict:
 
     return {
         "model": model, "model_pending": (pend or {}).get("model", ""),
+        # The model the CLI moved OFF on its own, while that move still holds.
+        # Empty for the normal case: somebody chose this model.
+        "fell_back_from": detected.get("fell_back_from", ""),
         # False when several sessions share a working directory and this one's
         # transcript could not be told apart from its siblings.
         "detect_sure": bool(detected.get("sure", True)),
@@ -16839,7 +18335,19 @@ def _session_model_fields(session_name: str) -> dict:
         # the transcript to read, so fall back to what it was launched with.
         "effort": effort or DEFAULT_EFFORT,
         "effort_detected": bool(effort),
+        # Where the shown value came from: 'pane' (a /effort the session itself
+        # confirmed), 'transcript' (the level the last reply ran at), 'launch'
+        # (the --effort it started on) or 'default' (nothing to read — a guess).
+        "effort_source": detected.get("effort_source", ""),
         "effort_pending": (epend or {}).get("effort", ""),
+        # Prompt size of the last reply, its window, when it landed, and which
+        # cache TTL the session is buying. The bar under the terminal turns
+        # these into "ctx 47k · 5%" and "ended 4m ago".
+        "context_tokens": int(detected.get("context_tokens", 0) or 0),
+        "context_limit": int(detected.get("context_limit", 0) or 0),
+        "cache_ttl": int(detected.get("cache_ttl", 0) or 0),
+        "cache_read_tokens": int(detected.get("cache_read_tokens", 0) or 0),
+        "last_turn_end": float(detected.get("last_turn_end", 0) or 0),
     }
 
 
@@ -16885,6 +18393,16 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
         if p and os.path.exists(p):
             return p
 
+    # The process knows which file it is writing. Ask it before guessing.
+    uuid = _session_transcript_uuid(session_name)
+    if uuid:
+        by_uuid = {os.path.splitext(os.path.basename(f))[0].lower(): f for f in files}
+        hit = by_uuid.get(uuid)
+        if hit:
+            _session_transcript_cache[session_name] = {"path": hit, "ts": now,
+                                                       "confident": True}
+            return hit
+
     resolved, confident = newest, False
     try:
         cand = _pane_match_fragments(session_name)
@@ -16904,7 +18422,16 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
             # Clear the floor AND beat the field. A score two transcripts both
             # reach says the fragments were not distinctive, and picking one of
             # them anyway is how a guess gets presented as a fact.
-            if best is not None and best_score >= 2 and best_score > runner_up:
+            #
+            # One match against a field of ZERO counts. Fragments are runs of at
+            # least five words and 24 characters; one of those landing in
+            # exactly one transcript out of a dozen and in none of the others is
+            # not a coincidence. Holding out for two was rejecting the correct
+            # file on a live session (measured: 1 against eleven 0s), which
+            # dropped it back to "newest in the directory" and let a neighbour's
+            # model, effort and token counts be shown as this session's.
+            decisive = best_score >= 2 or (best_score == 1 and runner_up == 0)
+            if best is not None and decisive and best_score > runner_up:
                 resolved, confident = best, True
     except Exception:
         logger.debug("Transcript disambiguation failed for '%s'", session_name,
@@ -16998,59 +18525,605 @@ def _transcript_match_text(path: str) -> str:
     return text
 
 
-def _detect_session_model_effort(session_name: str) -> dict:
-    """Read model + effort out of this session's transcript in one pass.
+# Context windows. The 1M tier is a launch flag, not something the transcript
+# records, so the wide window is read off argv and then self-heals: a prompt
+# measured above the standard window proves the session is on the wide one.
+_CTX_WINDOW_STD = 200_000
+_CTX_WINDOW_1M = 1_000_000
+# What a `/effort` or `/model` prints into the pane the moment it takes effect.
+# Anchored on the CLI's own result elbow: an agent that merely PRINTS the phrase
+# (grepping this very file will) must not be read as having switched.
+_PANE_EFFORT_RE = re.compile(r"⎿\s*Set effort level to ([a-z]+)", re.I)
+_PANE_MODEL_RE = re.compile(r"⎿\s*Set model to\s+([^\n]+)", re.I)
+_MODEL_1M_RE = re.compile(r"\[1m\]|\b1m context\b", re.I)
+# How many assistant entries to keep reading past a complete answer, looking for
+# a fallback record. Wide enough to cover the 30s detection cache (so a switch is
+# seen at least once while it is fresh and can be remembered), narrow enough that
+# the extra work is parsing a handful of lines already in memory.
+_FALLBACK_LOOKBACK = 20
+# Where the forward scan for fallback records has read up to, per session.
+_session_fb_scan: Dict[str, dict] = {}   # {name: {"path": str, "off": int}}
+_FB_FIRST_LOOK = 1_000_000    # history to check the first time a file is seen
+_FB_MAX_CATCHUP = 8_000_000   # never read more than this in one pass
 
-    Both live on `type: "assistant"` entries: `model` inside the message (or at
-    the top level on older writes), `effort` at the top level. They are read
-    together so the tail is only decoded once."""
+
+def _fallback_since_last_look(session_name: str, path: str) -> dict:
+    """The newest fallback record written since the last time we looked.
+
+    The tail read that yields model and effort deliberately keeps a small window,
+    and ONE tool result is regularly bigger than the whole window, so a fallback
+    two turns back can already be out of reach: that is how a switch that plainly
+    happened still showed nothing. Following the file forward instead means the
+    cost is the bytes the session has actually written since the last poll, and no
+    record is missed however large a turn was. Returns {"from":…, "to":…} or {}.
+    """
+    state = _session_fb_scan.get(session_name) or {}
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    off = state.get("off", 0) if state.get("path") == path else None
+    if off is None:                      # first sight of this file
+        off = max(0, size - _FB_FIRST_LOOK)
+    elif off > size:                     # truncated or replaced under us
+        off = 0
+    if size - off > _FB_MAX_CATCHUP:     # been away a long time: skip the middle
+        off = size - _FB_MAX_CATCHUP
+    if size <= off:
+        _session_fb_scan[session_name] = {"path": path, "off": off}
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            chunk = fh.read(size - off)
+    except OSError:
+        return {}
+    # Stop at the last complete line so a half-written record is read next time,
+    # not skipped.
+    cut = chunk.rfind(b"\n") + 1
+    _session_fb_scan[session_name] = {"path": path, "off": off + (cut or 0)}
+    found = {}
+    for raw in chunk[:cut].split(b"\n"):
+        if b'"fallback"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        for part in (msg.get("content") or []):
+            if isinstance(part, dict) and part.get("type") == "fallback":
+                src = (part.get("from") or {}).get("model") or ""
+                dst = (part.get("to") or {}).get("model") or ""
+                if src and dst:
+                    found = {"from": src, "to": dst}
+                break
+    return found
+
+
+def _iso_epoch(ts: str) -> float:
+    """Epoch seconds from a transcript's ISO-8601 `timestamp`, 0 if unreadable."""
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _scan_assistant_tail(lines: list) -> dict:
+    """Walk transcript lines newest-first and pull the facts off the most recent
+    MAIN-THREAD assistant entry.
+
+    Sub-agent turns (`isSidechain`) are written into the same file and run with
+    their own model, effort and context window, so "the last assistant entry"
+    was reporting a sub-agent's settings as the session's. They are skipped.
+
+    `ctx` is the whole prompt the reply carried — fresh input plus both cache
+    buckets — which is what "context used" means. `ttl` is which cache the
+    session is buying, read from the usage record rather than assumed: a 1h
+    entry means the transcript is still warm an hour later, a 5m one means it
+    is cold after five minutes."""
+    out = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
+           "fell_back_from": "", "cache_read": 0}
+    seen = 0
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        seen += 1
+        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+        if not isinstance(msg, dict):
+            msg = d
+        if not out["model"]:
+            out["model"] = msg.get("model") or d.get("model") or ""
+        # THE CLI CAN CHANGE THE MODEL ON ITS OWN. When the chosen model is out of
+        # capacity Claude Code falls back, writes the switch as a first-class
+        # assistant entry, and prints NOTHING in the pane: a session started on
+        # Fable 5.1 quietly finishes on Opus 5, and the badge that reports it looks
+        # like it is lying. Read the record so the badge can name who switched.
+        if not out["fell_back_from"] and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if not isinstance(part, dict) or part.get("type") != "fallback":
+                    continue
+                src = ((part.get("from") or {}) or {}).get("model") or ""
+                dst = ((part.get("to") or {}) or {}).get("model") or ""
+                # Only while it is still in force: a later switch back to the
+                # original leaves the newest turns on that model instead.
+                if src and dst and dst == (out["model"] or dst):
+                    out["fell_back_from"] = src
+                break
+        if not out["effort"] and isinstance(d.get("effort"), str) and d["effort"]:
+            out["effort"] = d["effort"]
+        if not out["ts"]:
+            out["ts"] = _iso_epoch(d.get("timestamp"))
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        if usage:
+            if not out["ctx"]:
+                out["ctx"] = (int(usage.get("input_tokens") or 0)
+                              + int(usage.get("cache_read_input_tokens") or 0)
+                              + int(usage.get("cache_creation_input_tokens") or 0))
+            # Whether the NEWEST turn read from cache. This is the one honest
+            # "was it still cached" measurement available: non-zero means the
+            # cache was warm for that request and its timer restarted then.
+            # Older turns say nothing about now, so only the first entry the
+            # reversed walk reaches (seen == 1) is recorded.
+            if seen == 1:
+                out["cache_read"] = int(usage.get("cache_read_input_tokens") or 0)
+            if not out["ttl"]:
+                # A turn that only READ from cache creates nothing, so the TTL
+                # is only stated on turns that wrote — keep looking back until
+                # one of the buckets is non-zero.
+                cc = usage.get("cache_creation") if isinstance(
+                    usage.get("cache_creation"), dict) else {}
+                h1 = int(cc.get("ephemeral_1h_input_tokens") or 0)
+                m5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
+                if h1 or m5:
+                    out["ttl"] = 3600 if h1 >= m5 else 300
+        # The four facts are usually complete on the first entry, but a fallback
+        # is a single record a few turns back and stopping there would miss it
+        # for the whole rest of the run. Keep parsing a short way past the answer,
+        # far enough to cover the gap between two polls, never past the old cap.
+        if (out["model"] and out["effort"] and out["ctx"] and out["ttl"]
+                and (out["fell_back_from"] or seen >= _FALLBACK_LOOKBACK)):
+            break
+        if seen >= 60:
+            break
+    out["n"] = seen
+    return out
+
+
+def _last_assistant_facts(path: str) -> dict:
+    """Model, effort, context size, cache TTL and end time of a transcript's
+    newest main-thread reply.
+
+    The window GROWS rather than sitting at a fixed 32KB. One tool result can be
+    hundreds of KB, so a fixed tail regularly held no complete assistant record
+    at all: the read came back empty, the caller substituted the configured
+    default, and a session running at one effort was labelled with another."""
+    empty = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "n": 0,
+             "fell_back_from": "", "cache_read": 0}
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return empty
+    out = empty
+    for budget in (65_536, 512_000, 4_000_000):
+        out = _scan_assistant_tail(_read_jsonl_tail(path, budget))
+        # Stop as soon as the answer is complete, the file is exhausted, or the
+        # window already held several replies — a field still missing after five
+        # of them (an older CLI that never wrote `effort`) is not going to turn
+        # up in an older one, and re-reading 4MB every 30s to find that out is
+        # how a detail nobody looks at becomes the most expensive poll on the box.
+        if (out["model"] and out["effort"] and out["ctx"]) or out["n"] >= 5 or budget >= size:
+            break
+    return out
+
+
+# ── "Saved from this project": links, logins and files, read off the transcript ──
+#
+# This drawer was fed by an LLM pass over the pane (get_notes) that has been off
+# by default for months, so it said "nothing saved yet" for every session on
+# every box — a permanently empty panel promising the one thing it never did.
+# The transcript already records all three facts exactly, so nothing has to be
+# inferred and nothing has to be paid for: files come from the write tools' own
+# arguments, links from what was said and fetched, logins from the lines that
+# state them. Scanning is INCREMENTAL — each pass reads only the bytes appended
+# since the last one — so a 20MB transcript costs one full read, once.
+
+_SAVED_URL_RE = re.compile(r"https?://[^\s,;'\"`)<>\]]+")
+# `label: value` where the label names a credential. The label is allowed a few
+# words of context ("dashboard login", "Basic auth user") so real lines survive,
+# but it is capped so a paragraph mentioning a password is not swallowed whole.
+_SAVED_CRED_RE = re.compile(
+    r"(?im)(?:^|[\s,;(\[|])"
+    r"([\w .\-/()]{0,28}?"
+    # `token` refuses its plural on purpose: `max_tokens`, `input_tokens` and
+    # `output tokens` are counts, and matching them turned every usage line in
+    # an LLM session into a fake login.
+    r"(?:user(?:name)?s?|logins?|e?mails?|passwords?|passwd|passphrases?|"
+    r"api[ _-]?keys?|secrets?|token(?!s)|pin(?![a-z])|otp|credentials?)"
+    r"[\w .\-/()]{0,16}?)"
+    r"\s*[:=]\s*"
+    r"([^\s,;'\"`]{2,120})")
+# Values that are code, prose or a placeholder rather than a credential.
+_SAVED_CRED_JUNK_RE = re.compile(
+    r"os\.getenv|getenv\(|process\.env|hashlib\.|secrets\.token|token_hex\(|"
+    r"^\s*(?:import|from|export|const|let|var|def|return|if|for)\b|"
+    r"[<>{}()\[\]]|\*\*|\*{3,}|x{6,}|"
+    r"^(?:str|int|float|bool|dict|list|none|null|nil|n/?a|tbd|todo|yes|no|true|false|"
+    r"the|an?|and|or|it|is|was)$",
+    re.I)
+# Labels that name a MEASUREMENT, not a credential. `max_tokens`, `output
+# tokens` and `input_tokens` are all over an LLM session's own prose, and each
+# one used to be filed under Logins with its number as the password.
+_SAVED_CRED_LABEL_JUNK_RE = re.compile(
+    r"(?:^|\s)(?:max|min|input|output|cache|total|count|used|usage|per|avg|num|"
+    r"limit|len|size|price|cost|budget|def|class|self|kwargs|args|return|"
+    r"remaining|reset|window)(?:\s|$)|[(){}\[\]]", re.I)
+
+
+def _saved_cred_ok(label: str, value: str) -> bool:
+    """Is this `label: value` pair a credential worth keeping?"""
+    if len(value) < 3 or value.isdigit():
+        return False
+    if not re.search(r"[A-Za-z0-9]", value):
+        return False
+    if _SAVED_CRED_JUNK_RE.search(value):
+        return False
+    # Separators are normalised to spaces so `max_tokens` reads as `max tokens`
+    # and the word-boundary rules above can see the `max`.
+    return not _SAVED_CRED_LABEL_JUNK_RE.search(re.sub(r"[_\-/.]+", " ", label).lower())
+_SAVED_PATH_DENY_RE = re.compile(
+    r"(^|/)\.[^/]+(/|$)|^/etc/|^/tmp/|^/proc/|^/var/(log|lib|cache)/|"
+    r"(^|/)(SKILL|CLAUDE|AGENTS|MEMORY)\.md$|"
+    r"(^|/)(claude-roles|session_owners|users)\.json$|"
+    r"\.(pyc|log|bak|lock)$", re.I)
+# The session's own output directory. It sits under a DOT-dir
+# (~/.tmux-dashboard/uploads/<session>/), and the blanket dot-dir rule above —
+# written to keep ~/.claude and ~/.codex out — was therefore throwing away the
+# deliverables themselves: every report, draft and figure a session produced.
+_SAVED_UPLOAD_DIR_RE = re.compile(r"/uploads?/", re.I)
+# A URL still carrying shell or template syntax was never a real address: it is
+# a `curl "$BASE/x"` line, or a format string, caught mid-substitution.
+_SAVED_URL_JUNK_RE = re.compile(r"[$`{}\\]|%[sd]\b|(^|\.)example\.(com|org|net)(/|$|:)", re.I)
+_SAVED_WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "create_file",
+                      "str_replace_editor"}
+_SAVED_CAPS = {"urls": 30, "creds": 25, "files": 60}
+# path -> {"key": (inode, offset), "urls": [...], "creds": [...], "files": [...]}
+_saved_scan_state: Dict[str, dict] = {}
+
+
+def _saved_url_useful(u: str) -> bool:
+    """Is this a link someone would click again, or plumbing?
+
+    Mirrors the filter the drawer already applied client-side so the two agree:
+    no loopback or private addresses, no `api.*`, no LLM-provider or Google
+    OAuth endpoints, no bare API/health/callback paths or data files."""
+    if _SAVED_URL_JUNK_RE.search(u):
+        return False
+    try:
+        p = urllib.parse.urlparse(u)
+    except Exception:
+        return False
+    host = (p.hostname or "").lower()
+    if not host or host in ("localhost", "0.0.0.0", "127.0.0.1", "::1"):
+        return False
+    if re.match(r"^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+        return False
+    if host.startswith("api."):
+        return False
+    if re.search(r"(^|\.)(anthropic|openai)\.com$", host):
+        return False
+    if host.endswith(".googleapis.com") or host in ("accounts.google.com",
+                                                    "oauth2.googleapis.com"):
+        return False
+    # XML/RDF namespace declarations. They appear in every SVG and XHTML file a
+    # session writes and are not addresses anybody visits.
+    if host in ("www.w3.org", "w3.org", "schemas.microsoft.com", "schema.org"):
+        return False
+    path = p.path or ""
+    if re.search(r"(^|/)(api|v1|v2|oauth|rest|graphql|health|callback|\.well-known)(/|$)"
+                 r"|\.(json|xml|txt|log|ico|png|jpe?g|svg|css|js)$", path, re.I):
+        return False
+    return True
+
+
+def _saved_path_useful(p: str) -> bool:
+    p = (p or "").strip()
+    if not p or "<" in p or ">" in p or not p.startswith(("/", "~/")):
+        return False
+    if not re.search(r"\.[A-Za-z0-9]{1,8}$", p.rstrip("/")):
+        return False
+    if _SAVED_UPLOAD_DIR_RE.search(p):
+        return True
+    return not _SAVED_PATH_DENY_RE.search(p)
+
+
+def _saved_harvest_text(text: str, urls: list, creds: list) -> None:
+    """Pull links and stated logins out of one block of prose."""
+    for m in _SAVED_URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;:)")
+        if _saved_url_useful(u):
+            urls.append(u)
+    for m in _SAVED_CRED_RE.finditer(text or ""):
+        label, value = m.group(1).strip(), m.group(2).strip().strip("`\"'")
+        # The match may have started mid-sentence, so the label can pick up the
+        # connective in front of it ("with Basic auth user").
+        label = re.sub(r"^(?:with|and|the|a|an|its|our|your|use|using|via|for|to|in)\s+",
+                       "", label, flags=re.I).strip()
+        # A URL is already reported as a link; "login page: https://…" is not a
+        # credential and putting it under Logins loses the distinction.
+        # A link is reported as a link. `//host/path` is what is left of one when
+        # the regex split "https://…" at its own colon, which is how the question
+        # "whats the password for https://gateway…" became a saved login.
+        if not label or not value or value.startswith(("http://", "https://", "//")):
+            continue
+        if not _saved_cred_ok(label, value):
+            continue
+        creds.append({"label": label, "value": value})
+
+
+def _saved_scan_transcript(path: str) -> dict:
+    """Links, logins and written files harvested from a transcript, incrementally.
+
+    The scan resumes at the byte offset it stopped at last time; a truncated or
+    replaced file (inode change, or a file shorter than the offset) restarts it."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"urls": [], "creds": [], "files": []}
+    state = _saved_scan_state.get(path)
+    if not state or state.get("inode") != st.st_ino or state.get("offset", 0) > st.st_size:
+        state = {"inode": st.st_ino, "offset": 0, "urls": [], "creds": [], "files": []}
+    if state["offset"] == st.st_size:
+        return state
+    urls, creds, files = state["urls"], state["creds"], state["files"]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(state["offset"])
+            for line in fh:
+                if not line.endswith("\n"):
+                    break            # a half-written record; pick it up next pass
+                state["offset"] += len(line.encode("utf-8", "replace"))
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") not in ("assistant", "user"):
+                    continue
+                msg = d.get("message") if isinstance(d.get("message"), dict) else d
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, str):
+                    _saved_harvest_text(content, urls, creds)
+                    continue
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if isinstance(b.get("text"), str):
+                        _saved_harvest_text(b["text"], urls, creds)
+                    elif b.get("type") == "tool_use":
+                        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                        tool = str(b.get("name") or "").lower()
+                        if tool in _SAVED_WRITE_TOOLS:
+                            fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+                            if isinstance(fp, str) and _saved_path_useful(fp):
+                                files.append(fp)
+                        elif tool in ("webfetch", "web_fetch"):
+                            u = inp.get("url")
+                            if isinstance(u, str) and _saved_url_useful(u):
+                                urls.append(u)
+                        elif tool == "bash":
+                            # Commands are where a deploy URL usually first
+                            # appears; the command text is not prose, so only
+                            # links are taken from it.
+                            cmd = inp.get("command")
+                            if isinstance(cmd, str):
+                                for m in _SAVED_URL_RE.finditer(cmd):
+                                    u = m.group(0).rstrip(".,;:)")
+                                    if _saved_url_useful(u):
+                                        urls.append(u)
+    except OSError:
+        return {"urls": [], "creds": [], "files": []}
+    # Newest first, deduped, capped. A later mention of the same thing is the
+    # current one, so the last occurrence wins its position.
+    state["urls"] = _saved_dedupe(urls, lambda u: u.rstrip("/").lower(),
+                                  _SAVED_CAPS["urls"])
+    state["creds"] = _saved_dedupe(
+        creds, lambda c: (c["label"].lower(), c["value"].lower()), _SAVED_CAPS["creds"])
+    state["files"] = _saved_dedupe(files, lambda f: f.rstrip("/"),
+                                   _SAVED_CAPS["files"])
+    _saved_scan_state[path] = state
+    return state
+
+
+def _saved_dedupe(items: list, key, cap: int) -> list:
+    seen, out = set(), []
+    for it in reversed(items):
+        k = key(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _session_saved_reference(session_name: str) -> dict:
+    """The Saved-from-this-project payload for one session, or empty when this
+    session's own transcript could not be identified. Never a neighbour's."""
+    empty = {"urls": [], "creds": [], "files": [], "identified": False}
+    files = _find_session_jsonl_files(session_name)
+    if not files:
+        return empty
+    path = _pick_session_transcript_file(session_name, files)
+    if not path:
+        return empty
+    confident = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
+                     or len([f for f in files
+                             if not os.path.basename(f).startswith("agent-")]) == 1)
+    if not confident:
+        return empty
+    got = _saved_scan_transcript(path)
+    return {"urls": got["urls"], "creds": got["creds"], "files": got["files"],
+            "identified": True}
+
+
+def _pane_model_effort(session_name: str) -> dict:
+    """Model and effort switches the SESSION ITSELF confirmed, read off its pane.
+
+    `/effort high` prints "Set effort level to high" the moment it takes, but
+    the transcript only records the new level on the NEXT reply. In the gap the
+    badge showed the previous turn's value — the "dropdown says max, the session
+    is on high" bug, and it lasts as long as the session is idle, which is
+    exactly when someone looks. The pane line is session-local and unambiguous,
+    so where it disagrees with the transcript it is the newer of the two."""
+    try:
+        pane = capture_pane_recent(session_name, 600)
+    except Exception:
+        return {}
+    out = {}
+    hits = _PANE_EFFORT_RE.findall(pane)
+    if hits:
+        level = hits[-1].strip().lower()
+        if level in ALLOWED_SESSION_EFFORTS:
+            out["effort"] = level
+    mhits = _PANE_MODEL_RE.findall(pane)
+    if mhits:
+        out["model_line"] = mhits[-1].strip()
+    return out
+
+
+def _detect_session_model_effort(session_name: str) -> dict:
+    """What this session is actually running: model, reasoning effort, the
+    context its last reply carried, and when that reply landed.
+
+    Read together so the transcript tail is only decoded once, then corrected
+    against the pane, which knows about a switch a turn earlier than the
+    transcript does."""
     now = time.time()
     cached = _session_model_cache.get(session_name)
     if cached and now - cached.get("ts", 0) < 30:
         return cached
-    blank = {"model": "", "effort": "", "ts": now}
     files = _find_session_jsonl_files(session_name)
-    if not files:
-        _session_model_cache[session_name] = blank
-        return blank
-    newest = _pick_session_transcript_file(session_name, files)
-    if not newest:
-        _session_model_cache[session_name] = blank
-        return blank
-    # Was the file actually identified as this session's, or is it just the
-    # most recent one in a shared project dir? The caller marks the badge so a
-    # guess is never shown as fact.
-    sure = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
-                or len(files) == 1)
-    model, effort = "", ""
-    try:
-        with open(newest, "rb") as f:
-            # Read last ~32KB to find recent model entries
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 32768))
-            tail = f.read().decode("utf-8", errors="replace")
-        for line in reversed(tail.strip().split("\n")):
-            try:
-                d = json.loads(line)
-                if d.get("type") != "assistant":
-                    continue
-                if not effort:
-                    e = d.get("effort", "")
-                    if isinstance(e, str) and e:
-                        effort = e
-                if not model:
-                    msg = d if "model" in d else d.get("message", {})
-                    m = msg.get("model", "")
-                    if m:
-                        model = m
-                if model and effort:
-                    break
-            except (json.JSONDecodeError, KeyError):
-                continue
-    except Exception:
-        logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
-    out = {"model": model, "effort": effort, "ts": now, "sure": sure}
+    newest = _pick_session_transcript_file(session_name, files) if files else None
+    # No transcript yet is not an ambiguous read — it is nothing to read yet, and
+    # argv still says what the session was launched on. `sure` stays true so a
+    # brand-new session is not badged as a guess.
+    sure = True
+    facts = {"model": "", "effort": "", "ctx": 0, "ttl": 0, "ts": 0.0, "cache_read": 0}
+    if newest:
+        # Was the file actually identified as this session's, or is it just the
+        # most recent one in a shared project dir? The caller marks the badge so
+        # a guess is never shown as fact.
+        sure = bool((_session_transcript_cache.get(session_name) or {}).get("confident")
+                    or len([f for f in files
+                            if not os.path.basename(f).startswith("agent-")]) == 1)
+        try:
+            facts = _last_assistant_facts(newest)
+        except Exception:
+            logger.debug("Failed to read transcript facts for '%s'", session_name,
+                         exc_info=True)
+    model, effort = facts["model"], facts["effort"]
+    source = "transcript" if effort else ""
+
+    proc = _session_claude_proc(session_name)
+    argv = proc.get("cmdline", "")
+    # A transcript that was only GUESSED to be this session's (the newest file in
+    # a shared project dir, before the session has written its own) is some other
+    # session's history. argv is this session's own, so its launch flags outrank
+    # a borrowed transcript; the badge otherwise shows a neighbour's level and
+    # model until the first reply lands.
+    if not sure and argv:
+        launched_effort = (_flag_value(argv, "effort") or "").lower()
+        if launched_effort in ALLOWED_SESSION_EFFORTS:
+            effort, source = launched_effort, "launch"
+        launched_model = _flag_value(argv, "model")
+        if launched_model:
+            model = launched_model
+    pane = _pane_model_effort(session_name)
+    # A pane-confirmed /effort outranks the transcript: it happened after the
+    # reply the transcript's level belongs to.
+    if pane.get("effort") and pane["effort"] != effort:
+        effort, source = pane["effort"], "pane"
+    if not effort:
+        launched = _flag_value(argv, "effort")
+        if launched and launched.lower() in ALLOWED_SESSION_EFFORTS:
+            effort, source = launched.lower(), "launch"
+    if not effort:
+        source = "default"
+
+    # A fallback the CLI made for itself stays worth showing for as long as the
+    # session is still on the model it was moved to, which is usually the rest of
+    # the run. Remembered rather than re-read: the record is one line in a
+    # transcript that grows past 4 MB, and re-scanning for it every 30s is how a
+    # detail nobody looks at becomes the most expensive poll on the box.
+    fb = facts.get("fell_back_from") or ""
+    if not fb and newest:
+        # Nothing in the window this time. Follow the file forward from where we
+        # last looked, which catches a record a huge turn has already pushed out.
+        seen_fb = _fallback_since_last_look(session_name, newest)
+        if seen_fb:
+            _session_fallback[session_name] = seen_fb
+            _set_session_fallback(session_name, seen_fb["from"], seen_fb["to"])
+    if fb and model:
+        _session_fallback[session_name] = {"from": fb, "to": model}
+        _set_session_fallback(session_name, fb, model)
+    # Disk first on a cold start: this process may have begun long after the
+    # switch, and the record itself can be further back in the transcript than a
+    # cold scan is willing to read.
+    kept = _session_fallback.get(session_name) or _load_session_fallbacks().get(session_name)
+    # Forget it only on EVIDENCE that the session has moved on: a model read off a
+    # transcript we could not prove belongs to this session is not evidence, and
+    # deleting a true record on the strength of a neighbour's transcript is a fact
+    # that cannot be recovered afterwards.
+    if kept and model and sure and kept.get("to") != model:
+        _session_fallback.pop(session_name, None)  # switched again since
+        _clear_session_fallback(session_name)
+        kept = None
+    elif kept:
+        _session_fallback[session_name] = kept
+    fell_back_from = (kept or {}).get("from", "")
+
+    # The wide-context tier. argv is where it is written down, but a /model
+    # since launch overrides it in BOTH directions, so a pane line wins outright
+    # when there is one. A prompt measured past the standard window settles it
+    # either way.
+    model_line = pane.get("model_line") or ""
+    wide = bool(_MODEL_1M_RE.search(model_line) if model_line
+                else "[1m]" in argv.lower())
+    wide = wide or (sure and facts["ctx"] > _CTX_WINDOW_STD)
+    if model and wide and not model.endswith("[1m]"):
+        model += "[1m]"
+    limit = (_CTX_WINDOW_1M if wide else _CTX_WINDOW_STD) if model else 0
+
+    # A BORROWED TRANSCRIPT HAS NO FALLBACK, so its numbers must not be shown.
+    # Model and effort survive an unproven read because argv carries this
+    # session's own launch flags; the prompt size, the cache TTL and the time of
+    # the last reply exist nowhere else, so an unproven read of them is simply
+    # the neighbour's figure with this session's name on it. That is what put
+    # "ctx 804k · 80%" under a session three minutes old. Report nothing instead:
+    # the bar already hides a zero.
+    if not sure:
+        facts = dict(facts, ctx=0, ttl=0, ts=0.0, cache_read=0)
+
+    out = {"model": model, "effort": effort, "ts": now, "sure": sure,
+           "effort_source": source, "fell_back_from": fell_back_from,
+           "context_tokens": facts["ctx"], "context_limit": limit,
+           "cache_ttl": facts["ttl"], "last_turn_end": facts["ts"],
+           "cache_read_tokens": facts.get("cache_read", 0)}
     _session_model_cache[session_name] = out
     return out
 
@@ -17410,15 +19483,6 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
         except Exception:
             logger.exception(
                 "Failed to append prompt audit for session '%s'", session_name)
-        try:
-            await asyncio.to_thread(
-                _set_session_tab_label,
-                session_name,
-                _session_owner_id(session_name),
-                body.command,
-            )
-        except Exception:
-            logger.exception("Failed to update tab label for session '%s'", session_name)
         return JSONResponse({"ok": True, "sent": cmd_text,
                              "attached": [i.get("path") for i in pending]})
     except Exception as e:
@@ -17565,10 +19629,12 @@ class EffortBody(BaseModel):
 
 @app.get("/api/models")
 async def api_models():
-    """The model dropdown catalog ([id, label] rows) + the launch default. Kept
+    """The model dropdown catalog ([id, label] rows) + the launch defaults. Kept
     current by the 24h auto-detect; the frontend fetches this on load so newly
-    released models appear without a redeploy."""
-    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL})
+    released models appear without a redeploy. The defaults come with it so the
+    New-session dialog can preselect what the box would have launched anyway."""
+    return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL,
+                         "efforts": EFFORT_CATALOG, "default_effort": DEFAULT_EFFORT})
 
 
 @app.post("/api/models/refresh")
@@ -17647,7 +19713,34 @@ async def api_set_session_model(session_name: str, body: ModelBody):
                 downgraded = True
         except Exception:
             logger.debug("Pane check after /model failed", exc_info=True)
-        _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
+        # DID IT ACTUALLY LAND? A pane that is mid-turn swallows the keystrokes:
+        # the text goes into the composer, no /model runs, and this endpoint used
+        # to answer 200 anyway. The badge then showed a pending model for 15
+        # minutes and fell back to the one the session was really on, which reads
+        # as the dashboard switching the model back on its own. /effort has always
+        # watched for its confirmation line; do the same here and say so when it
+        # never comes, rather than showing a switch that did not happen.
+        confirmed = False
+        for _ in range(6):
+            try:
+                tail = await asyncio.to_thread(capture_pane_recent, session_name, 12)
+            except Exception:
+                logger.debug("Pane confirm check after /model failed", exc_info=True)
+                break
+            if "set model to" in tail.lower():
+                confirmed = True
+                break
+            await asyncio.sleep(0.8)
+        if confirmed:
+            _session_model_pending[session_name] = {"model": mid, "ts": time.time()}
+            # On disk, so a restart still knows what this session was put on even
+            # if the CLI has substituted a model of its own since.
+            _set_session_model_choice(session_name, mid)
+            # A deliberate switch ends any substitution that was in force: the
+            # session is on what somebody asked for again, whatever it answers on
+            # next. Leaving the old record would keep the badge accusing the CLI.
+            _session_fallback.pop(session_name, None)
+            _clear_session_fallback(session_name)
         _session_model_cache.pop(session_name, None)
         # /model persists the choice into settings.json as the default for NEW
         # sessions ("saved as your default") — the exact drift that turned the
@@ -17656,10 +19749,11 @@ async def api_set_session_model(session_name: str, body: ModelBody):
         # explicitly anyway; this guards manual `claude` runs).
         await asyncio.sleep(0.8)
         _restore_default_model_setting()
-        logger.info("Session '%s' model switch requested -> %s%s",
-                    session_name, mid, " (downgraded from 1M)" if downgraded else "")
-        return JSONResponse({"ok": True, "model": mid, "pending": True,
-                             "downgraded": downgraded})
+        logger.info("Session '%s' model switch requested -> %s%s%s",
+                    session_name, mid, " (downgraded from 1M)" if downgraded else "",
+                    "" if confirmed else " (UNCONFIRMED: the pane never echoed it)")
+        return JSONResponse({"ok": True, "model": mid, "pending": confirmed,
+                             "confirmed": confirmed, "downgraded": downgraded})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -18190,6 +20284,39 @@ async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
         return False
 
 
+SCROLLBACK_ARCHIVE_INTERVAL = int(os.environ.get("TMUX_DASH_SCROLLBACK_INTERVAL", "20"))
+
+
+async def _scrollback_archive_loop():
+    """Background loop: copy each session's settled output into its own log.
+
+    This is what makes the terminal's history survive. tmux's ring drops the
+    oldest line once it is full and loses the lot when a pane restarts, so the
+    archive has to be taken continuously; there is no way to go back for it
+    afterwards. It only ever reads lines that have scrolled out of the visible
+    area, so it never races the TUI's redraw."""
+    log = logging.getLogger("scrollback")
+    await asyncio.sleep(5)
+    passes = 0
+    while True:
+        try:
+            await asyncio.sleep(SCROLLBACK_ARCHIVE_INTERVAL)
+            for sess in await asyncio.to_thread(get_tmux_sessions):
+                try:
+                    added = await asyncio.to_thread(archive_scrollback, sess["name"])
+                    if added:
+                        log.debug("archived %d lines for %s", added, sess["name"])
+                except Exception:
+                    log.debug("archive failed for %s", sess["name"], exc_info=True)
+            passes += 1
+            if passes % 180 == 0:            # roughly hourly
+                await asyncio.to_thread(_trim_scrollback_files)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("scrollback loop iteration failed", exc_info=True)
+
+
 async def _simple_watchdog_loop():
     """Background loop: nudge sessions that are paused waiting for 'continue'."""
     slog = logging.getLogger("simple-watchdog")
@@ -18352,6 +20479,118 @@ _LOGIN_CODE_PROMPT_RE = re.compile(
     r"(?:paste|enter)\s+(?:the\s+)?(?:(?:authorization|oauth|login)\s+)?code\b",
     re.I,
 )
+# ── Basic+ : keep the prompt cache warm ─────────────────────────────────────
+# The cache is what makes a follow-up cheap, and it expires on a timer that
+# restarts on every turn (see CACHE_WARN_LEAD above). Basic+ spends one cheap
+# turn to restart that timer shortly before it would lapse, so a session left
+# alone over lunch is still warm when its owner comes back.
+#
+# Deliberately NOT the autopilot. That one screenshots the pane and lets a model
+# compose an instruction, which is why it stays opt-in and off by default: it
+# cannot tell a finished hand-back from a stall, and it has typed a new task
+# into a session that was legitimately done. This sends ONE fixed sentence and
+# never composes anything, so the worst case is a redundant verification pass on
+# work that was already finished.
+_CACHE_KEEPALIVE_INTERVAL = 30     # seconds between scans
+_cache_keepalive_state: Dict[str, dict] = {}
+
+
+def _cache_keepalive_active(session_name: str) -> bool:
+    """Is this session mid-run because the keep-alive pushed it?
+
+    True from the moment the nudge is sent until the turn it started finishes.
+    The UI colours the session on this, so it answers "it is working, but only
+    to hold the cache" rather than "someone asked it for something".
+    """
+    return bool((_cache_keepalive_state.get(session_name) or {}).get("fired_for"))
+
+
+async def _cache_keepalive_loop():
+    """Push one continue into an idle Basic+ session before its cache goes cold."""
+    log = logging.getLogger("cache-keepalive")
+    await asyncio.sleep(12)  # let startup settle
+    while True:
+        try:
+            await asyncio.sleep(_CACHE_KEEPALIVE_INTERVAL)
+            now = time.time()
+            sessions_list = await asyncio.to_thread(get_tmux_sessions)
+            for sess in sessions_list:
+                name = sess["name"]
+                if _get_autopush_mode(name) != "basicplus":
+                    _cache_keepalive_state.pop(name, None)
+                    continue
+                try:
+                    fields = await asyncio.to_thread(_session_model_fields, name)
+                except Exception:
+                    continue
+                ttl = int(fields.get("cache_ttl") or 0)
+                deadline = _cache_deadline(fields)
+                turn_end = float(fields.get("last_turn_end") or 0)
+                # No measured TTL means no transcript to read yet, or no cache
+                # write seen. Guessing a deadline would push on a made-up clock.
+                if not deadline or ttl < CACHE_KEEPALIVE_MIN_TTL:
+                    continue
+                # When several sessions share a working directory the transcript
+                # cannot be told apart, and detect_sure says so. Reporting a
+                # neighbour's countdown is a cosmetic error; TYPING on it is not,
+                # so the nudge only fires on a transcript we can prove is ours.
+                if not fields.get("detect_sure", True):
+                    continue
+                st = _cache_keepalive_state.setdefault(name, {})
+                # A turn landed after our nudge: the cache clock restarted, so
+                # drop the marker (the session stops showing as maintaining) and
+                # let the deadline test below decide afresh.
+                if st.get("fired_for") and turn_end > st["fired_for"] + 1:
+                    st.clear()
+                if now < deadline - CACHE_WARN_LEAD:
+                    continue
+                if st.get("fired_for"):
+                    continue          # already pushed for this turn
+                if not await _async_is_claude_running(name):
+                    continue
+                # Busy is the point of the exercise: a session that is working is
+                # issuing requests, and every one of them refreshes the cache.
+                try:
+                    activity = await async_detect_activity(name)
+                except Exception:
+                    continue
+                if activity.get("status") != "idle":
+                    continue
+                try:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if vis.returncode != 0:
+                        continue
+                    visible = vis.stdout
+                except Exception:
+                    continue
+                # The same three things that make any auto-typing unsafe: a menu
+                # the auto-responder owns, a shell where Claude used to be, and a
+                # half-typed message we would clobber. A fresh session has no
+                # conversation to keep warm, so it is skipped too.
+                if (_detect_interactive_prompt(visible)
+                        or _looks_like_bare_shell(visible)
+                        or _looks_like_fresh_claude_session(visible)
+                        or _has_pending_user_input(visible)):
+                    continue
+                ok = await _simple_watchdog_send_text(name, CACHE_KEEPALIVE_PROMPT)
+                if ok:
+                    st["fired_for"] = turn_end
+                    st["at"] = now
+                    left = int(deadline - now)
+                    _simple_watchdog_record(
+                        name, f"cache keep-alive ({left // 60}m before cold)")
+                    log.info("Cache keep-alive pushed to '%s' (%ds before cold)",
+                             name, left)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("cache keep-alive loop iteration failed", exc_info=True)
+
+
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
@@ -19012,7 +21251,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
-.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
+.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
 .nav-indicators{display:flex;align-items:center;gap:5px}
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
@@ -19024,10 +21263,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
+.nav-session-rename{width:11ch;min-width:70px;max-width:22ch;background:#0d1117;border:1px solid #58a6ff;border-radius:4px;color:#e6edf3;font:inherit;font-size:inherit;padding:0 4px;outline:none}
+.nav-proj-more .npi-path{color:#6e7681;font-style:italic}
 .nav-spacer{flex:1}
-.nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;padding-right:10px;display:flex;align-items:center;gap:8px;border-right:1px solid #30363d;margin-right:10px;padding:4px 10px 4px 0;transition:color .15s}
+/* CPU and RAM stack into two rows, laid out exactly like the 5h/7d usage pair
+   next to them: same label column, same 82px track, same .6rem number. One row
+   each keeps the header the same height as the bars beside it instead of
+   stretching it. */
+.nav-server-stats{color:#8b949e;white-space:nowrap;display:flex;flex-direction:column;justify-content:center;gap:2px;border-right:1px solid #30363d;margin-right:10px;padding-right:12px;flex-shrink:0;transition:color .15s}
 .nav-server-stats:hover{color:#c9d1d9}
-.nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
+.nav-stat-item{display:flex;align-items:center;gap:5px;line-height:1}
+.nav-stat-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
+.nav-stat-bar{position:relative;width:22px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-stat-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
+.nav-stat-fill.warn{background:#d29922}
+.nav-stat-fill.crit{background:#f85149}
+.nav-server-stats .stat-val{color:#c9d1d9;font-weight:600;font-size:.6rem;width:26px;text-align:right;font-variant-numeric:tabular-nums}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
 /* Always laid out, never display:none on data loss. Hiding the whole block when
@@ -19037,7 +21288,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage{display:flex;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
 .nav-usage-item{display:flex;align-items:center;gap:5px;cursor:help;line-height:1}
 .nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
-.nav-usage-bar{position:relative;width:82px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-usage-bar{position:relative;width:22px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
 .nav-usage-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
@@ -19124,11 +21375,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .badge.model-badge:hover{background:#3c444d;color:#e6edf3}
 .badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
 .badge.model-badge.pending{opacity:.75;font-style:italic}
+/* The CLI moved this session off the model it was put on, by itself and
+   silently. Amber, like the metered-key badge: not an error, but not what
+   anyone asked for either. */
+.badge.model-badge.fellback{background:#d2992222;color:#e3b341;border:1px solid #d2992255}
 .model-menu{position:fixed;z-index:3000;background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.55);padding:4px;min-width:172px}
 .model-menu .mm-title{padding:4px 10px 3px;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:#6e7681}
 .model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
 .model-menu .mm-item:hover{background:#21262d}
 .model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
+/* A tab left open across a deploy. Sits out of the way, bottom right. */
+.build-pill{position:fixed;right:14px;bottom:14px;z-index:4000;background:#d2992222;color:#e3b341;border:1px solid #d2992255;border-radius:999px;padding:7px 14px;font-size:.75rem;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.build-pill:hover{background:#d2992244}
+.build-pill b{text-decoration:underline}
+/* Undo the CLI's own substitution. Amber, like the badge that reports it. */
+.model-menu .mm-item.mm-restore{color:#e3b341;border-bottom:1px solid #30363d;border-radius:6px 6px 0 0;margin-bottom:2px}
+.model-menu .mm-item.mm-restore:hover{background:#d2992222}
 .tab-more-model-value{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
 .badge.unsure{opacity:.55;font-style:italic}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
@@ -19248,6 +21510,10 @@ body.member-admin .more-member-only{display:none}
 .raw-frozen-pill:hover{background:#4d3806;border-color:#d29922}
 .raw-output.frozen{border-color:#d2992255}
 .key-btn.key-freeze.active{background:#3d2c05;border-color:#d2992288;color:#e3b341}
+/* Navigation, not a keystroke sent to the agent — tinted to match the highlight
+   on your own messages so the pair reads as one idea. */
+.key-btn.key-jump{color:#79c0ff;border-color:#1f6feb55}
+.key-btn.key-jump:hover{background:#1f6feb22;border-color:#1f6feb99;color:#a5d6ff}
 .btn-stop{display:none;background:#da3633;color:#fff;border:1px solid #da3633;font-weight:600;font-size:.8rem;padding:4px 12px;letter-spacing:.03em}
 .btn-stop:hover{background:#f85149;border-color:#f85149;color:#fff}
 .btn-stop.visible{display:inline-block}
@@ -19276,6 +21542,26 @@ body.member-admin .more-member-only{display:none}
    reflows to whatever width there is, with a hanging indent so nesting reads. */
 .raw-output.flow{font-size:13.5px}
 .raw-output.flow .tl{padding-left:2.2em;text-indent:-2.2em}
+/* Your own words. The pane echoes what you send back at the agent's own indent
+   and in the agent's own colour, so on a long scrollback the one thing you are
+   hunting for is the one thing you cannot see. A tinted block with a rule down
+   its left edge; the rule sits in the terminal's own padding so no character
+   moves sideways. */
+.raw-output .tl-you{display:block;margin-left:-7px;padding-left:5px;border-left:2px solid #58a6ff;background:#1f6feb1f;color:#d8e8ff;border-radius:0 2px 2px 0}
+/* Flow mode hangs every line on a -2.2em indent. The block box would take the
+   parent's padding a second time, so it is pulled back out and the hanging
+   indent re-applied here — otherwise your own words sit two columns further in
+   than the agent's and the two stop lining up. */
+.raw-output.flow .tl-you{margin-left:-2.3em;padding-left:2.4em;text-indent:-2.2em}
+/* Where a jump landed. Fades on its own so nothing is left highlighted. */
+.raw-output .tl-you.jumped{background:#1f6feb4d;border-left-color:#79c0ff;animation:tl-you-flash 1.6s ease-out}
+@keyframes tl-you-flash{0%,20%{background:#1f6feb80}100%{background:#1f6feb1f}}
+/* The way back to output tmux has already dropped. Hidden entirely when the
+   archive holds nothing older than what is on screen, so it costs no height on
+   a fresh session. */
+.raw-older{display:none;padding:5px 10px;margin-bottom:6px;border:1px dashed #30363d;border-radius:6px;background:#0d1117;color:#79c0ff;font-size:.72rem;text-align:center;cursor:pointer;user-select:none;flex-shrink:0}
+.raw-older.on{display:block}
+.raw-older:hover{border-color:#1f6feb99;background:#1f6feb14;color:#a5d6ff}
 .raw-output::-webkit-scrollbar{width:12px;height:12px}
 .raw-output::-webkit-scrollbar-track{background:#0d1117}
 .raw-output::-webkit-scrollbar-thumb{background:#484f58;border-radius:6px;border:2px solid #0d1117}
@@ -19314,6 +21600,21 @@ body.member-admin .more-member-only{display:none}
 .tl-sep{color:#30363d}
 .tl-spacer{flex:1}
 .tl-note{color:#6e7681;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Silence between turns, and how much of the window the last one filled. Both
+   are facts about what the NEXT message will cost: while the prompt cache is
+   still warm the whole transcript is re-read at a fraction of the price, and a
+   context near the top of the window is about to be compacted. Each carries its
+   own separator so an empty one leaves no orphaned dot. */
+.tl-since,.tl-ctx{white-space:nowrap;font-variant-numeric:tabular-nums;color:#6e7681}
+.term-live .tl-tok:not(:empty)::before,
+.term-live .tl-since:not(:empty)::before,
+.term-live .tl-ctx:not(:empty)::before{content:'· ';color:#30363d}
+.tl-since.warm{color:#3fb950}
+.tl-since.cooling{color:#d29922}
+.tl-since.cold{color:#8b949e}
+.tl-ctx.high{color:#d29922}
+.tl-ctx.crit{color:#f85149;font-weight:600}
+.tl-ctx.unsure,.tl-since.unsure{opacity:.55;font-style:italic}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -19344,6 +21645,11 @@ body.member-admin .more-member-only{display:none}
 .key-saved-body{display:none;flex-direction:column;gap:8px;margin-top:8px}
 .key-saved-body.open{display:flex}
 .key-saved-empty{font-size:.7rem;color:#6e7681}
+.key-saved-scan{margin-top:6px}
+.key-saved-scanbtn{font-size:.68rem;padding:3px 9px;border-radius:5px;cursor:pointer;
+  background:#21262d;border:1px solid #30363d;color:#c9d1d9}
+.key-saved-scanbtn:hover:not(:disabled){background:#30363d;color:#f0f6fc}
+.key-saved-scanbtn:disabled{opacity:.6;cursor:default}
 .key-saved-group{display:flex;flex-direction:column;gap:3px}
 .key-saved-title{font-size:.6rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em}
 .key-saved-row{display:flex;align-items:center;gap:8px;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:0}
@@ -19432,7 +21738,23 @@ body.member-admin .more-member-only{display:none}
 .autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
+.autopush-seg button.ap-basicplus.active{background:#9e6a03}
 .autopush-seg button.ap-full.active{background:#238636}
+/* Approaching cold: the GREEN idle state, blinking fast, so it is caught out of
+   the corner of an eye from across the room. Deliberately still green. Amber is
+   reserved for the keep-alive below, and one colour meaning two different things
+   is exactly the confusion this is supposed to prevent: green blinking means
+   "come and type", amber steady means "it is handling it". */
+@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
+.status-pill.idle.expiring{background:#3fb95033;color:#56d364;border-color:#3fb950aa;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.status-pill.idle.expiring .status-dot{background:#56d364;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
+/* Working, but only to hold the cache. Amber, and NOT blinking: it wants to be
+   distinguishable from a session someone actually asked for something. */
+.status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
+.status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
 .idle-nudge-seg button.in-off.active{background:#484f58}
 .idle-nudge-seg button.in-light.active{background:#1f6feb}
 .idle-nudge-seg button.in-adhd.active{background:#da3633}
@@ -19459,6 +21781,12 @@ body.member-admin .more-member-only{display:none}
 .modal h3{color:#f0f6fc;margin-bottom:12px;font-size:1.1rem}
 .modal p{color:#8b949e;font-size:.9rem;margin-bottom:16px;line-height:1.5}
 .modal-input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px 12px;font-size:.9rem;margin-bottom:16px;outline:none}
+/* Model and effort, side by side, on the New-session dialog. */
+.new-session-launch{display:flex;gap:10px}
+.new-session-launch label{flex:1;font-size:.7rem;color:#8b949e;display:block}
+.new-session-launch select.modal-input{margin-top:4px;margin-bottom:6px;cursor:pointer}
+.new-session-nofb{display:flex;gap:8px;align-items:flex-start;font-size:.72rem;color:#8b949e;margin:2px 0 14px;cursor:pointer;line-height:1.35}
+.new-session-nofb input{margin-top:2px;flex:none;cursor:pointer}
 .modal-input:focus{border-color:#58a6ff}
 .modal-input::placeholder{color:#484f58}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end}
@@ -19580,6 +21908,30 @@ body.member-simple .hide-in-simple{display:none!important}
 .stats-usage-table tr.stats-totals-row{border-top:1px solid #30363d;font-weight:600}
 .stats-usage-table tr.stats-totals-row td{color:#f0f6fc;padding-top:6px}
 .stats-usage-table .model-tag{font-size:.65rem;padding:1px 5px;background:#30363d;border-radius:3px;color:#c9d1d9;display:inline-block}
+
+/* Process table (top/htop, inside the stats popup) */
+.proc-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.proc-head .proc-note{font-size:.7rem;color:#6e7681;margin-left:auto}
+.proc-sort{display:inline-flex;border:1px solid #30363d;border-radius:5px;overflow:hidden}
+.proc-sort button{background:#161b22;border:none;color:#8b949e;font-size:.68rem;padding:2px 8px;cursor:pointer}
+.proc-sort button+button{border-left:1px solid #30363d}
+.proc-sort button.active{background:#1f6feb;color:#fff;font-weight:600}
+.proc-table{width:100%;border-collapse:collapse;font-size:.72rem;table-layout:fixed}
+.proc-table th{color:#8b949e;font-weight:600;text-align:right;padding:3px 5px;border-bottom:1px solid #21262d;white-space:nowrap}
+.proc-table th.l,.proc-table td.l{text-align:left}
+.proc-table td{padding:2px 5px;color:#c9d1d9;text-align:right;white-space:nowrap;
+  font-family:'SF Mono','Fira Code',Consolas,monospace}
+/* The command is the only column allowed to be long, and it is the one worth
+   reading, so it takes whatever the fixed columns leave and clips with an
+   ellipsis. title= carries the whole line. */
+.proc-table td.proc-cmd{width:100%;overflow:hidden;text-overflow:ellipsis;color:#8b949e}
+.proc-table tr.mine td{background:#1f6feb14}
+.proc-table tr:hover td{background:#161b22}
+.proc-sess{display:inline-block;max-width:110px;overflow:hidden;text-overflow:ellipsis;
+  vertical-align:bottom;color:#58a6ff}
+.proc-hot{color:#f85149;font-weight:600}
+.proc-warm{color:#d29922}
+.proc-empty{font-size:.75rem;color:#6e7681;padding:6px 0}
 
 /* CLAUDE.md editor modal */
 /* Skills tab */
@@ -20091,7 +22443,7 @@ body.member-simple .hide-in-simple{display:none!important}
     display:flex;flex-direction:row;gap:16px;border:none;margin:0;padding:0}
   body:not(.member-simple) .mobile-bottom-bar .nav-server-stats{
     display:flex;border:none;margin:0;padding:0}
-  .mobile-bottom-bar .nav-usage-bar{width:96px;height:5px}
+  .mobile-bottom-bar .nav-usage-bar,.mobile-bottom-bar .nav-stat-bar{width:26px;height:5px}
   .mobile-bottom-bar .nav-browser-badge{padding:4px 9px}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
@@ -20311,6 +22663,12 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+// Seconds before the prompt cache goes cold that the session starts
+// blinking, and that Basic+ pushes its keep-alive. Substituted from the
+// server's CACHE_WARN_LEAD so the two can never drift apart.
+const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
+// And the seconds before it goes cold that the double beep sounds, once.
+const CACHE_BEEP_LEAD=__CACHE_BEEP_LEAD__;
 
 // ── Tab-scoped impersonation ────────────────────────────────────────────────
 // The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
@@ -20411,7 +22769,17 @@ const rawState={};
 // against it and rewrites only what moved. `_bodyText` is the transcript with
 // the live counter already stripped, so a repaint of the counter alone is a
 // no-op. `live` is what that counter said, redrawn by us in the status strip.
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+// olderText / olderFrom / archived: history pulled back out of the server's own
+// scrollback archive, which reaches further back than tmux's ring. It is kept
+// separate from fullText because fullText is replaced wholesale on every resync.
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',olderText:'',olderFrom:-1,archived:0,loadingOlder:false,paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+// Everything the terminal should show: the history someone asked for, then the
+// live pane.
+function _rawSource(st){
+  const older=st.olderText||'';
+  const live=st.fullText||'';
+  return older?(live?older+'\n'+live:older):live;
+}
 
 // --- "Clean view" terminal filter ---
 // One switch. On, the terminal shows only what the agent SAID to you and drops
@@ -20532,14 +22900,31 @@ const _NOISE_RES=[
   /^context (left|remaining|window):/i,
   /^esc to interrupt\b/i,
   /^shell cwd was reset\b/i,
-  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,
+  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,   // but see _HOOK_HEADER_RE
   /^made \d+\s+\S+.*\b(edit|change)/i,
   /^⏵/,
   /\bnew task\?\s*\/clear to save\b/i,
   /^shift\+tab to cycle\b/i,
 ];
+// A hook that blocked or spoke: "Ran 2 stop hooks (ctrl+o to expand)" and the
+// `⎿` block under it. The CLI hands that text back to the model in the USER
+// role, so it is an instruction the session is acting on, not chatter, and it
+// is the one thing that explains why a turn carried on after it looked done.
+// Clean view used to swallow it twice over: the header matched the
+// "(ctrl+o to expand)" noise rule, and the body matched the tool-output rule.
+// The echo markers are in the optional group so one regex matches the row both
+// before the rewrite (`● Ran 2 stop hooks …`) and after it (`> Ran 2 stop hooks …`).
+const _HOOK_HEADER_RE=/^\s*(?:[●⏺•·❯›»>]\s*)?Ran \d+ [A-Za-z]+ hooks?\b/;
+// `>`, the way a message from you is written. The highlight does NOT come from
+// this character: _markUserRows keys the row off _isHookHeader, so the marker is
+// free to be whatever reads best. _PANE_STRUCTURE_RE also matches a leading `>`
+// but its one caller tests the INPUT row, never what we emit here, so nothing
+// downstream mistakes this for pane furniture.
+const _HOOK_ECHO_PREFIX='> ';
+function _isHookHeader(line){return !!line&&_HOOK_HEADER_RE.test(line)}
 function _isNoise(line){
   if(!line)return false;
+  if(_isHookHeader(line))return false;
   const s=line.replace(/^[\s⎿●⏺•·│└├>*\-]+/,'').trim();
   if(!s)return false;
   for(let i=0;i<_NOISE_RES.length;i++){if(_NOISE_RES[i].test(s))return true;}
@@ -20581,16 +22966,28 @@ function _looksLikeAgentPane(text){
 // prose/tool bullets. `·` doubles as a spinner frame, so a match also has to
 // carry evidence: a clock, a token tally, or the interrupt hint.
 const _LIVE_HEAD_RE=/^ {0,6}([✻✽✢✳✴✱✲✵✶✷✸✹✺✧✦·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒▌▐])[ \t]+(\S.*)$/;
+// AND THE PLAIN ASTERISK. Measured on Claude Code 2.1.250 by capturing a live pane
+// frame by frame: the spinner cycles · ✻ ✽ ✢ ✶ and, one frame in five, a bare ASCII
+// `*`. That one frame did not match, so the status row survived into the transcript
+// on every fifth poll and the whole view jumped a row down and back, twice a second,
+// which is exactly what a reader sees as "the text is bouncing". It gets its own
+// pattern rather than a place in the class above, because `*` also opens a markdown
+// bullet: this one additionally requires the spinner's own shape, a single
+// capitalised word ending in an ellipsis and then a bracket.
+const _LIVE_ASCII_HEAD_RE=/^ {0,6}([*∗])[ \t]+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’-]*…\s*\(.*)$/;
 const _LIVE_EVID_RE=/\(\s*\d+\s*[hms]\b|\bfor\s+\d+\s*[hms]\b|\besc to interrupt\b|\btokens?\b|\bthought for\b|…\s*\(/i;
 const _LIVE_VERB_RE=/^([A-Za-z][A-Za-zÀ-ÿ'’-]{1,24})/;   // accents count: "Sautéing…" is one word
 const _LIVE_TIME_RE=/(?:^|[\s(·•])(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(\d+)\s*s\b/;
 const _LIVE_TOK_RE=/([↑↓⇡⇣])?\s*([\d.]+\s*[kKmM]?)\s*tokens?/;
+function _liveStatusParts(line){
+  const m=_LIVE_HEAD_RE.exec(line||'')||_LIVE_ASCII_HEAD_RE.exec(line||'');
+  return m&&_LIVE_EVID_RE.test(m[2])?m:null;
+}
 function _isLiveStatusLine(line){
-  const m=_LIVE_HEAD_RE.exec(line||'');
-  return !!m&&_LIVE_EVID_RE.test(m[2]);
+  return !!_liveStatusParts(line);
 }
 function _readLiveStatus(line,live){
-  const m=_LIVE_HEAD_RE.exec(line||'');
+  const m=_liveStatusParts(line);
   if(!m)return;
   const rest=m[2];
   const v=_LIVE_VERB_RE.exec(rest);
@@ -20723,7 +23120,25 @@ function applyRawFilter(text){
     // blocks still win: a `⎿`/`└` result (a table printed BY a command is tool
     // output, and breaking out would leak the rest of the block) and the
     // launch-command block (whose tail is Claude Code's own `╭…│…╰` banner).
-    if(mode!=='output'&&mode!=='shell'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    if(mode!=='output'&&mode!=='shell'&&mode!=='hook'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    // 'hook' is the one mode that EMITS. A hook that blocked is an instruction
+    // the session then obeyed, so hiding it leaves the next few minutes of work
+    // looking unprompted. The header is re-stamped with the pane's own user
+    // marker so it reads, highlights and jumps like the turn it actually is.
+    if(_isHookHeader(line)){
+      mode='hook';
+      out.push(_HOOK_ECHO_PREFIX+line.replace(_ANY_DECORATION_RE,'').trim());
+      continue;
+    }
+    if(mode==='hook'){
+      // Ends on what this row IS: a bullet, or anything at column 0. A blank
+      // row does NOT end it, because the hook's own text has paragraph breaks
+      // in it and stopping at the first one truncates the instruction. Decided
+      // from the row alone, which keeps this filter backwards-only in a
+      // renderer that is append-only.
+      if(!(_LEADING_BULLET_RE.test(line)||/^\S/.test(line))){out.push(line);continue;}
+      mode='';   // and fall through, so this row is judged on its own merits
+    }
     if(_isNoise(line)){mode='noise';continue;}
     if(_CALL_CONT_RE.test(line)){mode='call';continue;}
     if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
@@ -21226,13 +23641,57 @@ function _setRawScroll(el,target){
 // crawl forward a line at a time (which would repaint everything, every poll).
 const RAW_MAX_LINES=5000;
 
+// ── Telling your own words apart from the agent's ───────────────────────────
+// Claude Code echoes every message you send straight back into the pane behind a
+// `❯`, with its continuation rows indented two columns, and from there on it
+// looks exactly like everything else on screen. Scrolling back through an hour
+// of tool output, those echoes are the only landmarks anyone is actually looking
+// for. Marking them buys two things: a colour, and something for "jump to my
+// last message" to aim at.
+const _USER_ECHO_RE=/^ {0,3}[❯›»]\s*\S/;
+// An indented row opening with one of these is the CLI answering, not the tail
+// of what you typed. It matters most for a slash command, whose `⎿` result is
+// drawn at the same indent as a continuation row would be.
+const _NOT_USER_CONT_RE=/^\s*[⎿└●⏺•✻✽✢✳✴✱✲✵✶✷✸✹✺◐◓◑◒│┃╭╰╮╯├┤─━═]/;
+// 0 = not yours, 1 = a continuation row, 2 = the `❯` row the block opens with.
+function _markUserRows(rows){
+  const flags=new Array(rows.length).fill(0);
+  let inUser=false;
+  // A hook block reaches the model in the user role, so it is marked like one.
+  // Its body is a `⎿` result, which _NOT_USER_CONT_RE would otherwise read as
+  // the CLI answering; inside a hook block that row IS the message.
+  let inHook=false;
+  const isCont=row=>/^ {2,}\S/.test(row)&&(inHook||!_NOT_USER_CONT_RE.test(row));
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    // Matched in both views: clean view restamps the header with `>`, exact
+    // view leaves the CLI's own bullet on it, and either way it is your turn.
+    if(_USER_ECHO_RE.test(row)||_isHookHeader(row)){
+      flags[i]=2;inUser=true;inHook=_isHookHeader(row);continue;
+    }
+    if(!inUser)continue;
+    if(row.trim()===''){
+      // A blank row belongs to the message only if the message carries on under
+      // it — a paragraph break inside what you typed. Otherwise it is the gap
+      // before the reply starts.
+      let j=i+1;
+      while(j<rows.length&&rows[j].trim()==='')j++;
+      if(j<rows.length&&isCont(rows[j])){flags[i]=1;continue;}
+      inUser=false;inHook=false;continue;
+    }
+    if(isCont(row)){flags[i]=1;continue;}
+    inUser=false;inHook=false;
+  }
+  return flags;
+}
+
 function renderRawText(name,force){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
   // The live counter comes off FIRST, in both views. It changes every second,
   // and everything below this line would otherwise re-run every second.
-  const split=splitLiveTail((st.fullText||'').split('\n'));
+  const split=splitLiveTail(_rawSource(st).split('\n'));
   if(split.live.seen){
     split.live.at=_nowMs();
     st.live=split.live;
@@ -21262,10 +23721,17 @@ function renderRawText(name,force){
     // otherwise fits exactly.
     rows=rows.map(l=>l.replace(/\s+$/,''));
   }
-  if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
+  // The cap trims from the HEAD, so it has to make room for history that was
+  // deliberately loaded — otherwise "load earlier" would delete what it just
+  // fetched. Nothing is trimmed off the front of an explicit request.
+  const olderRows=st.olderText?st.olderText.split('\n').length:0;
+  const cap=RAW_MAX_LINES+olderRows;
+  if(rows.length>cap+400)rows=rows.slice(rows.length-cap);
   let htmlLines;
+  const prevUserCount=(st.userRows||[]).length;
+  st.userRows=[];
   if(!rows.length||!rows.join('').trim()){
-    htmlLines=(st.fullText||'').trim()
+    htmlLines=_rawSource(st).trim()
       ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
       : [];
   }else{
@@ -21273,7 +23739,19 @@ function renderRawText(name,force){
     // split across rows still works; neither renderer ever emits a tag that
     // straddles a newline, so splitting the result back per line is safe.
     htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+    // Your own words, wrapped so they can be coloured and jumped to. The flags
+    // are computed on the FINAL rows, after filtering and unwrapping, so the
+    // indices line up with the divs that get painted.
+    const mine=_markUserRows(rows);
+    for(let i=0;i<htmlLines.length;i++){
+      if(!mine[i])continue;
+      if(mine[i]===2)st.userRows.push(i);   // the ❯ row: where a jump lands
+      htmlLines[i]='<span class="tl-you">'+htmlLines[i]+'</span>';
+    }
   }
+  // A new message of yours (or the scrollback cap dropping an old one) moves
+  // every position in that list, so the walk starts again from the newest.
+  if(st.userRows.length!==prevUserCount)st._jumpAt=undefined;
 
   const prev=st.painted||[];
   const d=_lineDiff(prev,htmlLines);
@@ -21361,13 +23839,112 @@ let _liveTicker=null;
 function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
+    // Every session, not just the one on screen: a cache lapsing on a tab you
+    // are not looking at is precisely the one worth being told about. Cheap: a
+    // handful of arithmetic comparisons, and it fires at most once per turn.
+    _checkCacheExpiry();
     if(!selectedSession)return;
+    // The silence counter has to keep running while the session is IDLE — being
+    // idle is the whole point of it — so it is updated on every tick regardless
+    // of the busy state. It only rewrites the span when the rendered text
+    // actually changes, which past a minute is once a minute.
+    _paintIdleSince(selectedSession);
+    // The pill's cache state is a function of elapsed time, not of anything the
+    // server pushes, so it has to be re-evaluated on the tick as well. Without
+    // this a session that is already idle never starts blinking, because the
+    // pill is otherwise only repainted when its status CHANGES.
+    _paintPillCache(selectedSession);
     const st=rawState[selectedSession];
     if(!st||!st.live||!st.live.seen||!_sessionBusy(selectedSession))return;
     const e=document.getElementById('tl-time-'+selectedSession);
     const secs=_liveSeconds(st,true);
     if(e&&secs!==null)e.textContent=_fmtElapsed(secs);
   },1000);
+}
+// Coarse elapsed time, for a counter that is read rather than watched: seconds
+// under a minute, then whole minutes, then hours. Deliberately not _fmtElapsed —
+// a ticking "4m 07s" of silence redraws sixty times a minute to say nothing.
+function _fmtAgo(sec){
+  sec=Math.max(0,Math.floor(sec||0));
+  if(sec<60)return sec+'s';
+  if(sec<3600)return Math.floor(sec/60)+'m';
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);
+  return m?h+'h '+m+'m':h+'h';
+}
+function _fmtTokens(n){
+  n=Math.max(0,Math.round(n||0));
+  if(n>=1000000)return (n/1000000).toFixed(n>=10000000?0:1).replace(/\.0$/,'')+'M';
+  if(n>=1000)return (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k';
+  return String(n);
+}
+// How long the session has been quiet, and what that costs. The prompt cache is
+// what makes a long transcript cheap to carry into the next message: while it is
+// warm the whole thing is re-read at a fraction of the price, and once it lapses
+// the next message pays to write it all again. The TTL is not assumed — it is
+// read off the last reply's own usage record (see _scan_assistant_tail).
+function _paintIdleSince(name){
+  const el=document.getElementById('tl-since-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const end=s.last_turn_end||0;
+  if(!end||_sessionBusy(name)){
+    if(el.textContent!==''){el.textContent='';el.className='tl-since';el.title='';}
+    return;
+  }
+  const ago=Date.now()/1000-end;
+  const ttl=s.cache_ttl||0;
+  let cls='tl-since',hint='Silence since the last reply landed.';
+  let left=0;
+  if(ttl){
+    const warm=ago<ttl*0.8, cooling=ago<ttl;
+    left=Math.max(0,ttl-ago);
+    cls+=warm?' warm':(cooling?' cooling':' cold');
+    // Blink once inside the last CACHE_WARN_LEAD seconds, and only while there
+    // is still something to save: after it is cold there is nothing to hurry for.
+    if(cooling&&left<=CACHE_WARN_LEAD)cls+=' expiring';
+    const ttlTxt=ttl>=3600?'1h':Math.round(ttl/60)+'m';
+    // What the last turn ACTUALLY did is a measurement; everything after it is a
+    // countdown. Report them as the different things they are.
+    const read=s.cache_read_tokens||0;
+    hint='Silence since the last reply landed. This session buys a '+ttlTxt+
+         ' prompt cache, so the transcript is '+
+         (cooling?'still warm, so the next message re-reads it at cache-read price.'
+                 :'cold, so the next message pays to write the whole prompt again.')+
+         (cooling?' Goes cold in '+_fmtAgo(left)+'.':'')+
+         (read?' The last turn read '+read.toLocaleString()+' tokens from cache, '+
+               'which is what restarted this timer.'
+             :' The last turn read nothing from cache: it paid to write the prompt.');
+  }
+  if(s.detect_sure===false)cls+=' unsure';
+  const txt='idle '+_fmtAgo(ago)+
+    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_WARN_LEAD?' · cold in '+_fmtAgo(left):'')):'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+// Context the last reply carried, against the window it has. Both numbers come
+// off that reply's usage record: fresh input plus both cache buckets is the
+// whole prompt the model read.
+function _paintContext(name){
+  const el=document.getElementById('tl-ctx-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const tok=s.context_tokens||0,lim=s.context_limit||0;
+  if(!tok){
+    if(el.textContent!==''){el.textContent='';el.className='tl-ctx';el.title='';}
+    return;
+  }
+  const pct=lim?Math.round(tok/lim*100):0;
+  const txt='ctx '+_fmtTokens(tok)+(lim?' · '+pct+'%':'');
+  let cls='tl-ctx';
+  if(lim&&pct>=90)cls+=' crit';else if(lim&&pct>=75)cls+=' high';
+  if(s.detect_sure===false)cls+=' unsure';
+  const hint=tok.toLocaleString()+' tokens of prompt on the last reply'+
+    (lim?' out of a '+_fmtTokens(lim)+' window ('+pct+'%).':'.')+
+    (s.detect_sure===false?' Best guess: this session shares a working directory with others.':'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
 }
 function updateLiveBar(name){
   const bar=document.getElementById('term-live-'+name);
@@ -21376,7 +23953,12 @@ function updateLiveBar(name){
   const st=getRawState(name);
   const live=st.live||{};
   const busy=_sessionBusy(name);
-  const show=busy||!!live.seen;
+  // A session that has been idle since before the page loaded has no spinner
+  // row left in its pane, so `live.seen` is false — and that is exactly when the
+  // silence counter and the context reading are worth having. The bar also
+  // shows on the strength of what the server measured off the transcript.
+  const sess=sessions.find(x=>x.name===name)||{};
+  const show=busy||!!live.seen||!!(sess.context_tokens||sess.last_turn_end);
   bar.classList.toggle('on',show);
   if(!show)return;
   bar.classList.toggle('idle',!busy);
@@ -21392,11 +23974,159 @@ function updateLiveBar(name){
   const secs=_liveSeconds(st,busy);
   set('tl-time-',secs===null?'':(busy?'':'last turn ')+_fmtElapsed(secs));
   set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
+  _paintIdleSince(name);
+  _paintContext(name);
   const note=document.getElementById('tl-note-'+name);
   if(note){
     const txt=busy&&live.esc?'Stop to interrupt':'';
     if(note.textContent!==txt)note.textContent=txt;
   }
+}
+
+// ── History from before tmux forgot it ──────────────────────────────────────
+// tmux keeps a pane's output in a ring and drops the oldest line once it is
+// full, so scrolling up in a long-running session used to stop dead somewhere in
+// the middle of the day. The server keeps its own archive of the settled lines
+// (see archive_scrollback); this pulls it back a chunk at a time and prepends it.
+//
+// The archive OVERLAPS what is already on screen, because it holds the same
+// settled lines tmux still has. Rather than trying to compute where the seam is
+// from two line counts that are only approximately comparable, the overlap is
+// measured directly: the longest tail of the fetched chunk that equals the head
+// of what is displayed is dropped.
+const OLDER_CHUNK=3000;
+const OLDER_MATCH_RUN=40;
+// Find where the displayed text starts inside the fetched chunk and cut there.
+// Deliberately NOT "the longest tail of the chunk that equals the head of the
+// screen": the archive is written a few seconds behind the pane and routinely
+// runs a little PAST the seam, so an exact-suffix test finds no overlap at all
+// and the whole chunk gets prepended on top of itself. Measured on a live
+// session: 1848 lines agreed, then the archive carried 70 more, and the suffix
+// test duplicated all 1918.
+function _trimOverlap(older,current){
+  if(!older.length||!current.length)return older;
+  const first=current[0];
+  // Only positions where the first displayed line actually occurs can begin the
+  // overlap, so the run comparison happens a handful of times, not thousands.
+  for(let i=older.length-1;i>=0;i--){
+    if(older[i]!==first)continue;
+    const run=Math.min(OLDER_MATCH_RUN,current.length,older.length-i);
+    // Ten identical lines in a row is evidence; one is a coincidence. A
+    // terminal showing fewer than ten lines has nothing worth overlapping, so
+    // the chunk goes in whole.
+    if(run<10)continue;
+    let ok=true;
+    for(let j=0;j<run;j++){if(older[i+j]!==current[j]){ok=false;break}}
+    if(ok)return older.slice(0,i);
+  }
+  return older;
+}
+function updateOlderBar(name){
+  const el=document.getElementById('raw-older-'+name);
+  if(!el)return;
+  const st=getRawState(name);
+  // Before any load: the archive counts SETTLED lines and fullText counts
+  // settled plus the visible area, so an archive longer than what is on screen
+  // is the tell that tmux has already dropped something. After a load,
+  // olderFrom is simply how far back the walk has got.
+  const shown=(st.fullText||'').split('\n').length;
+  const more=st.olderFrom<0?(st.archived>shown):(st.olderFrom>0);
+  el.classList.toggle('on',!!more);
+  if(!more)return;
+  el.textContent=st.loadingOlder
+    ? 'Loading earlier history…'
+    : '⤒ Load earlier history'+(st.olderFrom>0?' · '+st.olderFrom+' more lines':'');
+}
+async function loadEarlierHistory(name){
+  const st=getRawState(name);
+  if(st.loadingOlder)return;
+  const rawEl=document.getElementById('raw-'+name);
+  st.loadingOlder=true;updateOlderBar(name);
+  try{
+    const shown=_rawSource(st).split('\n');
+    const before=st.olderFrom<0?-1:st.olderFrom;
+    // The first pull has to clear whatever the live pane is already showing
+    // before it reaches anything new, so it asks for that much extra.
+    const want=Math.min(20000,OLDER_CHUNK+(st.olderFrom<0?shown.length:0));
+    const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)
+      +'/history?before='+before+'&limit='+want);
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    st.archived=d.total||st.archived;
+    let chunk=(d.raw||'').split('\n');
+    if(chunk.length===1&&chunk[0]==='')chunk=[];
+    // Trimmed on EVERY pull, not just the first. A chunk that does not reach
+    // past the seam is entirely overlap, and the walk still has to advance
+    // past it, so the next pull can land on the seam again.
+    chunk=_trimOverlap(chunk,shown);
+    st.olderFrom=d.start||0;
+    if(chunk.length){
+      st.olderText=chunk.join('\n')+(st.olderText?'\n'+st.olderText:'');
+      // Hold the reader's place: everything they were looking at moves down by
+      // however tall the new block turns out to be.
+      const beforeH=rawEl?rawEl.scrollHeight:0,beforeTop=rawEl?rawEl.scrollTop:0;
+      st.userScrolledUp=true;
+      renderRawText(name,true);
+      if(rawEl){
+        const delta=rawEl.scrollHeight-beforeH;
+        if(delta>0)_setRawScroll(rawEl,beforeTop+delta);
+      }
+    }
+    if(statusInfoEl){
+      statusInfoEl.textContent=st.olderFrom>0
+        ? 'Loaded earlier history · '+st.olderFrom+' older lines still available'
+        : 'Loaded the whole archived history';
+    }
+  }catch(e){
+    if(statusInfoEl)statusInfoEl.textContent='Could not load earlier history: '+(e&&e.message?e.message:e);
+  }finally{
+    st.loadingOlder=false;updateOlderBar(name);
+  }
+}
+
+// ── Jumping back to what you said ───────────────────────────────────────────
+// The instruction you gave is the thing you scroll back for, and on a long run
+// it is thousands of rows up. renderRawText already knows which lines are yours
+// (see _markUserRows) and records the index of each `❯` row, so this is a walk
+// backwards through that list rather than a search. The scroll listener sets
+// userScrolledUp off the resulting position by itself, so the next poll leaves
+// the view where it was put.
+function jumpToLastUserMessage(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  const rows=(st&&st.userRows)||[];
+  if(!rawEl||!rows.length){
+    if(statusInfoEl)statusInfoEl.textContent='Nothing of yours in this scrollback yet';
+    return;
+  }
+  // Repeat clicks step further back; from the oldest, round to the newest.
+  let at=(typeof st._jumpAt==='number')?st._jumpAt:rows.length;
+  at=at-1;
+  if(at<0)at=rows.length-1;
+  st._jumpAt=at;
+  const idx=rows[at];
+  const el=rawEl.children[idx];
+  if(!el)return;
+  _setRawScroll(rawEl,Math.max(0,el.offsetTop-10));
+  const mark=el.querySelector('.tl-you')||el;
+  mark.classList.remove('jumped');
+  void mark.offsetWidth;              // restart the flash on a repeat click
+  mark.classList.add('jumped');
+  setTimeout(()=>mark.classList.remove('jumped'),1700);
+  if(statusInfoEl){
+    statusInfoEl.textContent=rows.length>1
+      ? 'Your message '+(at+1)+' of '+rows.length+', click again to step back'
+      : 'Your last message';
+  }
+}
+function jumpToLive(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  st._jumpAt=undefined;
+  st.userScrolledUp=false;
+  _setRawScroll(rawEl,rawEl.scrollHeight);
+  if(statusInfoEl)statusInfoEl.textContent='Following the output again';
 }
 
 // ── Freeze ──────────────────────────────────────────────────────────────────
@@ -21630,6 +24360,66 @@ function playCompletionChime(){
   else play();
 }
 
+// ── The cache-expiry double beep ────────────────────────────────────────────
+// One chime means a session finished. TWO, lower and falling, mean a session is
+// idle and about to lose its prompt cache: nothing is done, something is about
+// to be thrown away. Deliberately not a louder version of the completion chime,
+// because the two need to be told apart from the next room without looking.
+function playCacheExpiryChime(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const play=function(){
+    if(ctx.state!=='running')return;
+    const now=ctx.currentTime+0.015;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.72,now);
+    master.gain.exponentialRampToValueAtTime(0.0001,now+0.85);
+    master.connect(ctx.destination);
+    // E5 then B4, 190 ms apart: a falling pair, well below the completion
+    // chime's C6/E6, each with one quiet partial so it rings rather than beeps.
+    [[659.25,0,0.17,0.24],[1318.5,0.003,0.12,0.05],
+     [493.88,0.19,0.26,0.24],[987.77,0.193,0.16,0.05]]
+      .forEach(t=>_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3]));
+    setTimeout(function(){try{master.disconnect()}catch(e){}},1000);
+  };
+  if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
+  else play();
+}
+
+// Which turn each session has already been warned about. Keyed on the turn's
+// end time, not a boolean: a new reply restarts the cache clock, so it must also
+// re-arm the warning. Nothing is remembered across a reload, which is right:
+// the deadline is recomputed from the transcript either way.
+const _cacheBeeped={};
+function _checkCacheExpiry(){
+  const names=new Set();
+  let fired=false;
+  for(let i=0;i<sessions.length;i++){
+    const s=sessions[i];
+    names.add(s.name);
+    const end=s.last_turn_end||0, ttl=s.cache_ttl||0;
+    // No measured TTL means no cache write seen in the transcript. Warning on a
+    // guessed deadline would be worse than staying quiet.
+    if(!end||!ttl)continue;
+    if(_cacheBeeped[s.name]===end)continue;
+    // lastStatus, not s.activity_status: the poll updates the former every ten
+    // seconds and leaves the latter at whatever the last full load said.
+    if((lastStatus[s.name]||s.activity_status)!=='idle')continue;
+    const left=ttl-(Date.now()/1000-end);
+    // Inside the window, and only while there is still something to save. Once
+    // it is cold the money is spent and a chime is just noise.
+    if(left>CACHE_BEEP_LEAD||left<=0)continue;
+    _cacheBeeped[s.name]=end;
+    if(!fired){                 // one sound even if two sessions lapse together
+      playCacheExpiryChime();
+      showToast('“'+s.name+'” loses its prompt cache in '+_fmtAgo(left)+
+                '. Send it something now and the next message stays cheap.',12000);
+      fired=true;
+    }
+  }
+  for(const k in _cacheBeeped)if(!names.has(k))delete _cacheBeeped[k];
+}
+
 function trackSessionStatus(name,status,interrupted){
   const prev=lastStatus[name];
   lastStatus[name]=status;
@@ -21731,6 +24521,8 @@ function formatModelName(model){
 let MODEL_CHOICES=[
   ['claude-opus-5[1m]','Opus 5 · 1M'],
   ['claude-opus-5','Opus 5'],
+  ['claude-fable-5-1[1m]','Fable 5.1 · 1M'],
+  ['claude-fable-5-1','Fable 5.1'],
   ['claude-sonnet-5[1m]','Sonnet 5 · 1M'],
   ['claude-sonnet-5','Sonnet 5'],
   ['claude-opus-4-8[1m]','Opus 4.8 · 1M'],
@@ -21741,12 +24533,19 @@ let MODEL_CHOICES=[
   ['claude-sonnet-4-6','Sonnet 4.6'],
   ['claude-haiku-4-5','Haiku 4.5'],
 ];
+// What this box launches a new session on, so the New-session dialog can open on
+// it. Filled by the fetch below; until it lands the dialog just shows the first
+// row, which is the same model the box would have used anyway.
+let DEFAULT_MODEL_ID='';
+let DEFAULT_EFFORT_ID='';
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
       if(d&&Array.isArray(d.models)&&d.models.length){
         MODEL_CHOICES=d.models.filter(m=>Array.isArray(m)&&m.length===2);
       }
+      if(d&&d.default)DEFAULT_MODEL_ID=d.default;
+      if(d&&d.default_effort)DEFAULT_EFFORT_ID=d.default_effort;
     }).catch(()=>{});
   }catch(e){}
 })();
@@ -21800,12 +24599,26 @@ function openEffortMenu(name,anchor,ev){
   _effortMenuEl=menu;
   setTimeout(()=>document.addEventListener('click',_effortMenuDocClose,true),0);
 }
+// Where the level shown came from, said plainly. 'default' means nothing could
+// be read and the dashboard's own default is standing in — the one case where
+// the badge used to state a level the session was demonstrably not running at.
+function effortTip(s){
+  const src=(s&&s.effort_source)||'';
+  if(src==='default')return 'Reasoning effort. GUESS: nothing readable in this session yet, so this is the dashboard default. Click to set it.';
+  if(s&&s.detect_sure===false)return 'Reasoning effort, best guess: this session shares a working directory with others, so its transcript could not be told apart. Click to switch.';
+  if(src==='pane')return 'Reasoning effort, confirmed by this session\'s own /effort. Click to switch.';
+  if(src==='launch')return 'Reasoning effort: what this session was launched with, no reply to read yet. Click to switch.';
+  return 'Reasoning effort: the level the last reply ran at. Click to switch (runs /effort in this session).';
+}
 function _paintEffortBadge(name){
   const s=sessions.find(x=>x.name===name);
   const lbl=effortBadgeLabel(s);
+  const unsure=!!(s&&(s.detect_sure===false||s.effort_source==='default'));
   const eb=document.getElementById('effort-badge-'+name);
   if(eb){
     eb.classList.toggle('pending',!!(s&&s.effort_pending));
+    eb.classList.toggle('unsure',unsure);
+    eb.title=effortTip(s);
     eb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
   }
   const me=document.getElementById('more-effort-'+name);
@@ -21830,8 +24643,22 @@ async function setSessionEffort(name,effort){
     alert('Effort switch failed: '+(e&&e.message?e.message:e));
   }
 }
+// The id that would put a substituted session back on what it was set to. The
+// transcript records a bare id, so re-apply the wide-context tier when the
+// session was on it and the family offers one.
+function _restoreModelId(s){
+  const base=s&&s.fell_back_from;
+  if(!base)return '';
+  if((s.model||'').endsWith('[1m]')&&MODEL_CHOICES.some(c=>c[0]===base+'[1m]'))return base+'[1m]';
+  return MODEL_CHOICES.some(c=>c[0]===base)?base:'';
+}
 function modelBadgeLabel(s){
   if(s&&s.model_pending)return modelChoiceLabel(s.model_pending)+'…';
+  // A model the CLI moved to ON ITS OWN is named as such. Without this the badge
+  // reads exactly like a model somebody chose, and the honest answer to "why does
+  // it say Opus when I started on Fable" is invisible.
+  if(s&&s.model&&s.fell_back_from)
+    return formatModelName(s.model)+' ← '+formatModelName(s.fell_back_from);
   if(s&&s.model)return formatModelName(s.model);
   return'model';
 }
@@ -21853,6 +24680,14 @@ function openModelMenu(name,anchor,ev){
   const menu=document.createElement('div');
   menu.className='model-menu';
   let html='<div class="mm-title">Model · applies from next reply</div>';
+  // Undoing the CLI's own substitution is the reason this menu is being opened
+  // at all, so it goes at the top rather than leaving somebody to remember which
+  // of thirteen rows they had picked.
+  const back=_restoreModelId(s);
+  if(back){
+    html+='<div class="mm-item mm-restore" onclick="setSessionModel(\''+esc(name)+'\',\''+esc(back)+'\')">'
+      +'<span>&#8617; Back to '+esc(modelChoiceLabel(back))+'</span></div>';
+  }
   MODEL_CHOICES.forEach(([id,label])=>{
     // Transcript-detected models carry no [1m]; treat the base-id match as
     // current only when no exact [1m] choice matches.
@@ -21868,12 +24703,30 @@ function openModelMenu(name,anchor,ev){
   _modelMenuEl=menu;
   setTimeout(()=>document.addEventListener('click',_modelMenuDocClose,true),0);
 }
+// The unsure marker is repainted here as well as in the template. It was only
+// ever set at render time, so a badge that started out as a guess kept looking
+// like one after the session was identified — and, worse, one that turned into
+// a guess went on reading as fact.
+const UNSURE_MODEL_TIP='Claude model, best guess: this session shares a working directory with others, so its transcript could not be told apart. Click to switch.';
+const SURE_MODEL_TIP='Claude model. Click to switch (runs /model in this session).';
+function modelTip(s){
+  if(s&&s.fell_back_from)
+    return 'Claude Code switched this session from '+formatModelName(s.fell_back_from)
+      +' to '+formatModelName(s.model)+' by itself, which it does when the chosen model'
+      +' is out of capacity. It prints nothing in the terminal when it happens.'
+      +' Click to switch back.';
+  return (s&&s.detect_sure===false)?UNSURE_MODEL_TIP:SURE_MODEL_TIP;
+}
 function _paintModelBadge(name){
   const s=sessions.find(x=>x.name===name);
   const lbl=modelBadgeLabel(s);
+  const unsure=!!(s&&s.detect_sure===false);
   const mb=document.getElementById('model-badge-'+name);
   if(mb){
     mb.classList.toggle('pending',!!(s&&s.model_pending));
+    mb.classList.toggle('unsure',unsure);
+    mb.classList.toggle('fellback',!!(s&&s.fell_back_from));
+    mb.title=modelTip(s);
     mb.innerHTML=esc(lbl)+' <span class="caret">▾</span>';
   }
   const mm=document.getElementById('more-model-'+name);
@@ -21891,6 +24744,16 @@ async function setSessionModel(name,model){
       body:JSON.stringify({model})});
     const d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    // The backend watches the pane for the CLI's own confirmation. No echo means
+    // the session was mid-turn and swallowed the keystrokes, so the switch never
+    // ran: drop the pending badge and say so instead of showing a model change
+    // that is not going to happen.
+    if(d.confirmed===false){
+      if(si>=0)sessions[si].model_pending='';
+      _paintModelBadge(name);
+      if(statusInfoEl)statusInfoEl.textContent='Model switch did not land — the session was busy. Try again when it is idle.';
+      return;
+    }
     if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+' (applies from the next reply)';
   }catch(e){
     if(si>=0)sessions[si].model_pending=prev;
@@ -21914,7 +24777,66 @@ function authBadge(s){
          esc(s.auth_detail||'')+'">'+esc(s.auth_label)+'</span>';
 }
 
+/* A session's tmux name carries no spaces: it is a shell argument, a URL
+   segment and a DOM id. This is the name the user typed, for reading. */
+function sessionLabel(sessionOrName){
+  if(sessionOrName&&typeof sessionOrName==='object')
+    return sessionOrName.display_name||sessionOrName.name||'';
+  const s=(sessions||[]).find(x=>x.name===sessionOrName);
+  return (s&&s.display_name)||sessionOrName||'';
+}
+
+// A rename puts an <input> inside the tab, and renderNav rebuilds every tab on
+// each poll, so a repaint mid-edit would take the box away under the cursor.
+let _renamingSession=null;
+
+// ── Rename a session ────────────────────────────────────────────────────────
+// The tmux name is the identity and never changes: it is a URL segment, a DOM
+// id, a shell argument and the key every per-session file is stored under. What
+// changes is the label shown on the tab, which the server keeps beside it.
+function startSessionRename(name,labelEl){
+  if(_renamingSession)return;
+  _renamingSession=name;
+  const before=sessionLabel(name);
+  const input=document.createElement('input');
+  input.type='text';input.className='nav-session-rename';input.value=before;
+  input.maxLength=80;
+  input.setAttribute('aria-label','Session name');
+  labelEl.replaceChildren(input);
+  input.focus();input.select();
+  let done=false;
+  const finish=async function(commit){
+    if(done)return;
+    done=true;
+    const typed=input.value.trim();
+    _renamingSession=null;
+    if(!commit||typed===before){renderNav();return}
+    try{
+      const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/display-name',{
+        method:'PATCH',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:typed})});
+      const data=await resp.json();
+      if(!resp.ok){showToast(data.error||'Could not rename the session.');renderNav();return}
+      const idx=sessions.findIndex(x=>x.name===name);
+      if(idx>=0)sessions[idx].display_name=data.display_name;
+      renderNav();
+      showToast(typed?('Renamed to "'+data.display_name+'".')
+                     :('Name cleared — showing '+name+'.'));
+    }catch(e){showToast('Could not reach the server to rename.');renderNav()}
+  };
+  input.addEventListener('keydown',function(ev){
+    ev.stopPropagation();
+    if(ev.key==='Enter'){ev.preventDefault();finish(true)}
+    else if(ev.key==='Escape'){ev.preventDefault();finish(false)}
+  });
+  // Clicking away keeps what you typed: losing an edit because the mouse moved
+  // is the more annoying of the two mistakes.
+  input.addEventListener('blur',function(){finish(true)});
+  input.addEventListener('click',function(ev){ev.stopPropagation()});
+}
+
 function renderNav(){
+  if(_renamingSession)return;            // finish the rename first
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
   // Session tabs sit AFTER the project switcher, not between it and the brand.
   const anchor=navEl.querySelector('#nav-proj-wrap')||navEl.querySelector('.nav-brand');
@@ -21922,13 +24844,22 @@ function renderNav(){
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.title=s.name;
+    item.title=sessionLabel(s)+(s.name===selectedSession?' — click the name to rename':'');
     item.onclick=()=>selectSession(s.name);
     item.innerHTML=`
-      <span class="nav-session-id">${esc(s.name)}</span>
+      <span class="nav-session-id">${esc(sessionLabel(s))}</span>
       <span class="nav-indicators">
         <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
+    // On the tab you are already in, the name is the rename handle. On any
+    // other tab the first click still has to select it, or switching sessions
+    // would mean clicking the dot.
+    const label=item.querySelector('.nav-session-id');
+    if(label)label.addEventListener('click',function(ev){
+      if(s.name!==selectedSession)return;
+      ev.stopPropagation();
+      startSessionRename(s.name,label);
+    });
     anchor.after(item);
   });
   const items=Array.from(navEl.querySelectorAll('.nav-item'));
@@ -21961,7 +24892,31 @@ function projShort(p){
 }
 
 // Projects offered in the switcher.
-function projectList(){ return (PROJECTS||[]).filter(p => !projHidden(p.path)); }
+// EVERY DIRECTORY CLAUDE CODE HAS EVER RUN IN gets recorded in ~/.claude.json,
+// and this list was built straight off that, so the switcher filled up with the
+// throwaway run directories the filing apps make one of per submission: 23 of
+// the 25 entries here, none of them holding a CLAUDE.md, a .mcp.json or a
+// .claude/ anything, none with a session in it, none anybody chose. They are
+// history, not workspaces. A directory earns a place in the picker by having
+// something in it: a live session, a project-scope file, or being the one you
+// are in. `showAllProjects` puts the rest back, and Remove drops one for good.
+let PROJ_SHOW_ALL=false;
+let PROJ_HIDDEN=0;
+function projectList(){
+  const all=(PROJECTS||[]).filter(p => !projHidden(p.path));
+  if(PROJ_SHOW_ALL){PROJ_HIDDEN=0;return all}
+  const live=new Set((sessions||[]).map(s => s.cwd||''));
+  const kept=all.filter(p => live.has(p.path) || (p.present||0) > 0
+                             || p.path===CURRENT_PROJECT || PROJ_ALIAS[p.path]);
+  // Never hide everything: an empty picker is worse than a noisy one.
+  PROJ_HIDDEN=kept.length ? all.length-kept.length : 0;
+  return kept.length ? kept : all;
+}
+function toggleAllProjects(ev){
+  if(ev)ev.stopPropagation();
+  PROJ_SHOW_ALL=!PROJ_SHOW_ALL;
+  renderProjectNav();
+}
 
 // The real directory of the current selection, or '' for the pseudo-entries.
 // Anything that hands a path to the backend (new session cwd, profile scoping,
@@ -22053,6 +25008,17 @@ function renderProjectNav(){
       + ' title="Sessions whose directory is not a registered project">'
       + '<span class="npi-path">Other sessions</span>'
       + '<span class="npi-meta"><b>'+orphans.length+' live</b></span></div>';
+  }
+  // Say what is being kept out, and let it back in. Silently shortening a list
+  // is how a directory someone does want stops existing as far as they know.
+  if(PROJ_HIDDEN||PROJ_SHOW_ALL){
+    html += '<div class="nav-proj-sep"></div>'
+      + '<div class="nav-proj-item nav-proj-more" onclick="toggleAllProjects(event)"'
+      + ' title="Directories Claude Code recorded because it ran there once. No session, and no CLAUDE.md, .mcp.json or .claude/ files of their own.">'
+      + '<span class="npi-path">'
+      + (PROJ_SHOW_ALL ? 'Hide directories with nothing in them'
+                       : PROJ_HIDDEN+(PROJ_HIDDEN===1?' directory':' directories')+' with nothing in them')
+      + '</span><span class="npi-meta">'+(PROJ_SHOW_ALL?'hide':'show')+'</span></div>';
   }
   listEl.innerHTML = html;
 }
@@ -22351,8 +25317,8 @@ function renderDetail(){
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
-        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="model-badge-${s.name}" title="${s.detect_sure===false?'Claude model (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Claude model — click to switch (runs /model in this session)'}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
-        <span class="badge model-badge${s.effort_pending?' pending':''}${s.detect_sure===false?' unsure':''}" id="effort-badge-${s.name}" title="${s.detect_sure===false?'Reasoning effort (best guess: this session shares a working directory with others, so its transcript could not be told apart) — click to switch':'Reasoning effort — click to switch (runs /effort in this session)'}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <span class="badge model-badge${s.effort_pending?' pending':''}${(s.detect_sure===false||s.effort_source==='default')?' unsure':''}" id="effort-badge-${s.name}" title="${esc(effortTip(s))}" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></span>
         ${s.attached?'<span class="badge attached">attached</span>':''}
         ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Claude publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <!-- The terminal line count lived here. It is a number nobody acts on, sitting
@@ -22391,6 +25357,9 @@ function renderDetail(){
       <!-- No control row here on purpose: Stop / Reload / the line count and the
            pane title all live in the header line next to Delete, which buys the
            terminal ~34px of height on every screen. -->
+      <!-- Only on screen when the server's archive reaches further back than
+           tmux's ring still does. Clicking prepends a chunk of it. -->
+      <div class="raw-older" id="raw-older-${s.name}" onclick="loadEarlierHistory('${esc(s.name)}')"></div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
       <!-- The spinner, the seconds counter and the token tally the CLI paints
            into the pane are cut out of the transcript and redrawn here, outside
@@ -22399,7 +25368,9 @@ function renderDetail(){
         <span class="tl-dots"><i></i><i></i><i></i></span>
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
+        <span class="tl-since" id="tl-since-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
+        <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
       </div>
@@ -22523,8 +25494,12 @@ function renderDetail(){
   renderComposerAttachments(s.name,'raw');
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
-  // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
+  // Populate the saved keys/URLs/files list inside the Keys & Commands drawer.
+  // Paint immediately from whatever is already cached, then re-read the
+  // transcript in the background so a session that has just written something
+  // shows it without a page reload.
   renderSavedKeys(s.name, s);
+  refreshSavedKeys(s.name);
   // Scroll chat to bottom
   const chatEl=document.getElementById('chat-'+s.name);
   if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
@@ -23414,6 +26389,7 @@ async function pollRawDelta(name){
     const data=await resp.json();
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
+    if(typeof data.archived_lines==='number'){st.archived=data.archived_lines;updateOlderBar(name);}
     if(data.mode==='full'){
       st.fullText=data.raw||'';
       st.knownLines=data.pane_total;
@@ -23470,6 +26446,7 @@ async function loadRaw(name){
   st.visibleHash='';
   st.firstLoad=true;
   st.fullText='';
+  st.olderText='';st.olderFrom=-1;st.loadingOlder=false;
   st.painted=null;st._bodyText=null;st.live=null;
   // Reload is an explicit "show me the terminal as it is now", which is the
   // opposite of a freeze — so it lifts one.
@@ -23493,10 +26470,43 @@ function reloadActive(name){
   else refreshOne(name);
 }
 
+// Seconds until this session's prompt cache goes cold, or null when unknown.
+// Null and 0 mean different things and must not be conflated: null is "no
+// measured TTL, say nothing", 0 is "already cold".
+function _cacheSecondsLeft(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  if(!s.cache_ttl||!s.last_turn_end)return null;
+  return Math.max(0,s.cache_ttl-(Date.now()/1000-s.last_turn_end));
+}
+// The two cache states the pill can carry. Kept apart from updateStatusPill so
+// the per-second ticker can re-apply them without touching the label.
+function _pillCacheClasses(name,status){
+  const s=sessions.find(x=>x.name===name)||{};
+  let extra='';
+  if(status==='busy'&&s.cache_keepalive)extra+=' keepcache';
+  if(status==='idle'){
+    const left=_cacheSecondsLeft(name);
+    if(left!==null&&left>0&&left<=CACHE_WARN_LEAD)extra+=' expiring';
+  }
+  return extra;
+}
+function _paintPillCache(name){
+  const pill=document.getElementById('status-'+name);
+  if(!pill)return;
+  // lastStatus is what the 10-second poll writes; s.activity_status is only as
+  // fresh as the last full load. Rebuilding the class list off the stale one
+  // would drag the pill back to a status it left minutes ago, once a second.
+  const s=sessions.find(x=>x.name===name)||{};
+  const status=lastStatus[name]||s.activity_status||'unknown';
+  const want='status-pill '+status+_pillCacheClasses(name,status);
+  if(pill.className!==want)pill.className=want;
+}
 function updateStatusPill(name,status,detail){
   const pill=document.getElementById('status-'+name);
   if(pill){
-    pill.className='status-pill '+(status||'unknown');
+    // Amber steady = working only to hold the cache. Amber blinking = idle with
+    // the cache about to lapse, which is the one that wants you at the keyboard.
+    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status);
     pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
       +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
@@ -23518,6 +26528,7 @@ function updateCard(s){
   const rawTitle=document.getElementById('raw-title-'+s.name);
   if(rawTitle&&s.title)rawTitle.textContent=s.title;
   renderSavedKeys(s.name, s);
+  refreshSavedKeys(s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
   updateStatusPill(s.name,s.activity_status,s.activity_detail);
@@ -23540,7 +26551,29 @@ function updateCard(s){
   }
 }
 
-async function loadAll(){
+// Bring `name` into view even if the project filter currently excludes it.
+// Returns false only when the session genuinely is not there yet.
+//
+// The filter can exclude a session you just made: with the "Other" workspace
+// selected, a new session starts in the DEFAULT directory, which is usually a
+// real project, so it is neither in "Other" nor in the filter you were looking
+// at. Widening to the one that contains it is what you meant by creating it.
+function _scopeToSession(name){
+  const s=sessions.find(x=>x.name===name);
+  if(!s)return false;
+  if(projectSessions().some(x=>x.name===name))return true;
+  const cwd=s.cwd||'';
+  CURRENT_PROJECT = projectList().some(p=>p.path===cwd) ? cwd
+                  : (orphanSessions().some(x=>x.name===name) ? '__other__' : '');
+  try{ localStorage.setItem('navProject',CURRENT_PROJECT); }catch(e){}
+  return true;
+}
+
+// `focus` names a session that must win the selection this time round: the one
+// just created by the + button. Without it the reload re-reads the URL hash,
+// which still names the session you were LOOKING at when you pressed +, and
+// puts you straight back on it.
+async function loadAll(focus){
   try{
     // Resolve simple-mode before the first render so member toggles don't flash.
     await loadCurrentUser();
@@ -23555,9 +26588,13 @@ async function loadAll(){
     });
     // Default the selection to the CURRENT project's sessions, not the global
     // first one, or switching workspaces would land you on a foreign session.
-    const _inScope=projectSessions();
+    const _focused=!!(focus&&_scopeToSession(focus));
+    const _inScope=projectSessions();      // after _scopeToSession may have widened it
     const _route=_sessionRoute();
-    if(_route&&_inScope.some(s=>s.name===_route.name)){
+    if(_focused){
+      selectedSession=focus;
+      activeTabs[focus]=_allowedSessionTab(activeTabs[focus]);
+    }else if(_route&&_inScope.some(s=>s.name===_route.name)){
       selectedSession=_route.name;
       activeTabs[_route.name]=_allowedSessionTab(_route.tab);
     }
@@ -23566,7 +26603,11 @@ async function loadAll(){
     }
     renderNav();
     renderDetail();
-    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),true);
+    // A create is a navigation, so it goes on the history stack and Back
+    // returns you to the session you were reading. Every other path through
+    // loadAll is a reload of where you already are: replace, or the stack fills
+    // with copies of one entry.
+    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),!_focused);
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
@@ -23614,9 +26655,48 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// The build this tab is RUNNING, learned from the first poll, versus the build
+// the server is serving now. A dashboard left open across a deploy keeps polling
+// fresh data through stale JavaScript, so a change to the UI is invisible and
+// looks like it was never shipped. Say so instead, and offer the reload.
+let _loadedBuild='';
+// Reloading is only safe when there is nothing of the user's to lose. A draft in
+// a composer, an open dialog or menu, a switch still settling: any of those and
+// the pill waits, and the next poll tries again. Nothing here is state the server
+// does not already hold, so an idle page can just take the new build.
+function _safeToReload(){
+  try{
+    if(document.querySelector('#modal-overlay.active'))return false;
+    if(document.querySelector('.model-menu, .effort-menu'))return false;
+    for(const t of document.querySelectorAll('textarea.cmd-input, input.modal-input'))
+      if((t.value||'').trim())return false;
+    if(sessions.some(s=>s.model_pending||s.effort_pending))return false;
+    // _recording is a per-session map, not a flag: it is always truthy, so ask
+    // whether any session is actually recording.
+    if(typeof _recording==='object'&&_recording&&Object.values(_recording).some(Boolean))return false;
+  }catch(e){return false}
+  return true;
+}
+function _checkBuild(resp){
+  try{
+    const b=resp&&resp.headers?resp.headers.get('X-Dash-Build'):'';
+    if(!b)return;
+    if(!_loadedBuild){_loadedBuild=b;return;}
+    if(b===_loadedBuild)return;
+    if(_safeToReload()){location.reload();return;}
+    if(document.getElementById('build-pill'))return;
+    const pill=document.createElement('div');
+    pill.id='build-pill';
+    pill.className='build-pill';
+    pill.innerHTML='This page is running an older build. <b>Reload</b>';
+    pill.onclick=()=>location.reload();
+    document.body.appendChild(pill);
+  }catch(e){}
+}
 async function pollStatus(){
   try{
     const resp=await fetch(BASE+'/api/status');
+    _checkBuild(resp);
     const statuses=await resp.json();
     let changed=false;
     for(const st of statuses){
@@ -23633,16 +26713,39 @@ async function pollStatus(){
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
+        if(st.display_name&&(sessions[si].display_name||'')!==st.display_name){
+          sessions[si].display_name=st.display_name;navChanged=true;
+        }
         let badgeChanged=false;
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
         if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
+        // A fallback appears WITHOUT anyone touching the dropdown, so it has to
+        // repaint off the poll or the badge keeps the label it was rendered with.
+        if((sessions[si].fell_back_from||'')!==(st.fell_back_from||'')){
+          sessions[si].fell_back_from=st.fell_back_from||'';badgeChanged=true;
+        }
         if(badgeChanged)_paintModelBadge(st.name);
         let effortChanged=false;
         const epend=st.effort_pending||'';
         if((sessions[si].effort_pending||'')!==epend){sessions[si].effort_pending=epend;effortChanged=true;}
         if(st.effort&&sessions[si].effort!==st.effort){sessions[si].effort=st.effort;effortChanged=true;}
+        if((sessions[si].effort_source||'')!==(st.effort_source||'')){
+          sessions[si].effort_source=st.effort_source||'';effortChanged=true;
+        }
+        if(sessions[si].detect_sure!==st.detect_sure){
+          sessions[si].detect_sure=st.detect_sure;effortChanged=true;
+          _paintModelBadge(st.name);
+        }
         if(effortChanged)_paintEffortBadge(st.name);
+        // Context size, the last turn's end and which cache the session buys —
+        // measured server-side off the transcript, painted into the bar under
+        // the terminal.
+        sessions[si].context_tokens=st.context_tokens||0;
+        sessions[si].context_limit=st.context_limit||0;
+        sessions[si].cache_ttl=st.cache_ttl||0;
+        sessions[si].last_turn_end=st.last_turn_end||0;
+        if(st.name===selectedSession){_paintContext(st.name);_paintIdleSince(st.name);}
         if(navChanged)renderNav();
       }
     }
@@ -23666,7 +26769,16 @@ async function refreshNavStats(){
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
     const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
     const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span></span><span>RAM <span class="stat-val '+memClass+'">'+memPct+'%</span></span>';
+    const row=(label,pct,cls,title)=>'<span class="nav-stat-item" title="'+esc(title)+'">'+
+      '<span class="nav-stat-label">'+label+'</span>'+
+      '<span class="nav-stat-bar"><span class="nav-stat-fill '+cls+'" style="width:'+Math.min(100,pct)+'%"></span></span>'+
+      '<span class="stat-val '+cls+'">'+pct+'%</span></span>';
+    const memTxt=s.memory&&s.memory.total_mb
+      ? Math.round(s.memory.used_mb/1024*10)/10+'G of '+Math.round(s.memory.total_mb/1024*10)/10+'G used'
+      : 'Memory';
+    navStatsEl.innerHTML=
+      row('CPU',cpuPct,cpuClass,cpuPct+'% across '+cpuCount+' vCPU · '+threads+' threads runnable')+
+      row('RAM',memPct,memClass,memTxt);
   }catch(e){navStatsEl.innerHTML=''}
 }
 refreshNavStats();
@@ -23851,7 +26963,7 @@ function renderLoginHealth(){
   });
 }
 async function reloginSession(name){
-  if(!confirm('Restart Claude in "'+name+'" on the current login?\n\nIt will exit and relaunch on this session\'s own conversation, which is preserved.'))return;
+  if(!confirm('Restart Claude in "'+sessionLabel(name)+'" on the current login?\n\nIt will exit and relaunch on this session\'s own conversation, which is preserved.'))return;
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/relogin',{method:'POST'});
     const data=await resp.json();
@@ -23881,11 +26993,29 @@ function showCreateModal(){
     : `<p class="conn-note">No project selected, so it starts in the default directory. Pick one in the top bar to open sessions inside a project.</p>`;
   modal.innerHTML=`
     <h3>New __BRAND__ session</h3>
-    <p>${MEMBER_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
+    <p>${MEMBER_SIMPLE ? 'A name is pre-filled, keep it or type your own. Spaces are fine.' : 'Leave blank for an auto-assigned name, or enter a custom name. Spaces are fine: the tab shows them, tmux gets the name without them.'}</p>
     ${where}
     <input type="text" class="modal-input" id="new-session-name" value="${pre}"
-      placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
+      placeholder="e.g. my project" autocomplete="off" spellcheck="false"
       onkeydown="if(event.key==='Enter')createSession()">
+    ${MEMBER_SIMPLE?'':`<div class="new-session-launch">
+      <label>Model
+        <select class="modal-input" id="new-session-model">
+          ${MODEL_CHOICES.map(([id,label])=>'<option value="'+esc(id)+'"'+(id===DEFAULT_MODEL_ID?' selected':'')+'>'+esc(label)+'</option>').join('')}
+        </select>
+      </label>
+      <label>Effort
+        <select class="modal-input" id="new-session-effort">
+          ${EFFORT_CHOICES.map(([v,label])=>'<option value="'+esc(v)+'"'+(v===DEFAULT_EFFORT_ID?' selected':'')+'>'+esc(label)+'</option>').join('')}
+        </select>
+      </label>
+    </div>
+    <p class="conn-note">It launches on these, so the header is right from the first
+      reply. max cannot be set any other way before a session starts.</p>
+    <label class="new-session-nofb"><input type="checkbox" id="new-session-nofb">
+      Refuse a model swap: Claude Code substitutes another model when this one is
+      short of capacity, silently. Ticked, the session says so and stops instead,
+      including refusing to compact.</label>`}
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
       <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
@@ -23897,6 +27027,12 @@ function showCreateModal(){
 async function createSession(){
   const input=document.getElementById('new-session-name');
   const name=input?input.value.trim():'';
+  const mSel=document.getElementById('new-session-model');
+  const eSel=document.getElementById('new-session-effort');
+  const nfSel=document.getElementById('new-session-nofb');
+  const model=mSel?mSel.value:'';
+  const effort=eSel?eSel.value:'';
+  const no_fallback=!!(nfSel&&nfSel.checked);
   const modal=document.getElementById('modal-content');
   // Immediately show a loading state so it never looks frozen (the first session
   // for a member can take a few seconds to provision).
@@ -23908,7 +27044,7 @@ async function createSession(){
   try{
     const resp=await fetch(BASE+'/api/sessions/create',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name, cwd: projectCwd()})
+      body:JSON.stringify({name, cwd: projectCwd(), model, effort, no_fallback})
     });
     const data=await resp.json();
     if(!resp.ok){
@@ -23918,9 +27054,12 @@ async function createSession(){
         <button class="modal-confirm-create" onclick="showCreateModal()">Try again</button></div>`;}
       return;
     }
-    selectedSession=data.name;
+    _openNewSession(data.name);
     closeModal();
-    await loadAll();
+    await loadAll(data.name);
+    // Arm the completion chime straight away: you asked for this session, so
+    // the first thing it finishes is the thing you are waiting on.
+    armCompletionChime(data.name);
   }catch(e){
     if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
       <p class="conn-note">Network error — please try again.</p>
@@ -23928,6 +27067,18 @@ async function createSession(){
   }
 }
 
+// OPEN THE SESSION YOU JUST MADE. Setting `selectedSession` is not enough:
+// loadAll() re-reads the URL hash and, because the hash still names the session
+// you were looking at a moment ago and that session is still in scope, it puts
+// the selection straight back. The new session was created and you were left
+// staring at the old one. The route is the source of truth, so move the route.
+function _openNewSession(name){
+  if(!name)return;
+  selectedSession=name;
+  const tab=MEMBER_SIMPLE?'chat':'raw';
+  activeTabs[name]=tab;
+  location.hash=_sessionRouteHash(name,tab);
+}
 function _randName(n){const c='abcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;}
 async function createSessionAuto(){
   for(let attempt=0;attempt<5;attempt++){
@@ -23937,7 +27088,7 @@ async function createSessionAuto(){
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({name, cwd: projectCwd()})});
       const data=await resp.json();
-      if(resp.ok){selectedSession=data.name;await loadAll();return}
+      if(resp.ok){_openNewSession(data.name);await loadAll(data.name);armCompletionChime(data.name);return}
       if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
     }catch(e){alert('Failed to create session.');return}
   }
@@ -24009,7 +27160,7 @@ async function saveGlobalContext(){
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>Kill session ${esc(name)}?</h3>
+    <h3>Kill session ${esc(sessionLabel(name))}?</h3>
     <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
@@ -24387,11 +27538,16 @@ let _watchdogTimers={};
 const AUTOPUSH_TITLES={
   off:'Off — the dashboard never types into this terminal',
   basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
+  basicplus:'Basic +: Basic, plus one fixed "continue" '+
+            (CACHE_WARN_LEAD/60)+' minutes before the prompt cache goes cold, so the '+
+            'transcript stays warm and your next message is still cheap. Never composes '+
+            'a task; the session turns amber while it is running for this reason.',
   full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
 };
 function autopushDesc(mode){
   return ({off:'Off — no auto-typing',
            basic:'Basic — picks options + confirms prompts',
+           basicplus:'Basic +: Basic, plus keeps the prompt cache warm',
            full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
 }
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
@@ -24401,7 +27557,7 @@ function autopushSeg(name,mode,compact){
     esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
     esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
-    b('off','Off')+b('basic','Basic')+b('full','Full')+'</div>';
+    b('off','Off')+b('basic','Basic')+b('basicplus','Basic +')+b('full','Full')+'</div>';
 }
 // Reflect a mode across every rendered control for this session (More menu + Info tab).
 function syncAutopushUI(name,mode){
@@ -24502,7 +27658,6 @@ function buildKeyBar(name,tab){
     <span class="key-bar-label">Keys:</span>
     <button class="key-btn key-esc" onclick="sendRawKeys('${name}',['Escape'])" title="Escape — exit menus/dialogs">Esc</button>
     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['C-u'])" title="Ctrl+U — clear input line (wipes any stale/phantom text from Claude Code's input buffer without interrupting the running task)">Clear Input</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
@@ -24511,7 +27666,10 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
     ${tab==='raw'?`<span class="key-bar-sep"></span>
-    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
+    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>
+    <button class="key-btn key-jump" id="jump-btn-${name}" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to the last thing YOU wrote. Click again to step back through earlier messages; from the oldest it returns to the newest.">&#8613; My last message</button>
+    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>
+    <button class="key-btn key-jump" onclick="loadEarlierHistory('${esc(name)}')" title="Pull back output older than tmux still holds, from the dashboard's own archive of this session. Click again for another chunk.">&#8676; Earlier history</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
@@ -24519,7 +27677,6 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Plan mode">/plan</button>
     <span class="key-bar-sep"></span>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
@@ -24687,9 +27844,41 @@ function _savedFileRow(p,disambiguate){
   r.appendChild(_savedCopyBtn(p));
   return r;
 }
+// What the server read straight out of this session's transcript, per session.
+// The notes-derived list (parseKeyInfo above) is kept and merged rather than
+// replaced: on a box where the LLM summariser IS switched on it still has
+// things the transcript does not state outright.
+const savedRefCache={};
+const _savedRefAt={};
+async function refreshSavedKeys(name,force){
+  // The scan itself is incremental and costs almost nothing, but the poll that
+  // repaints the card runs every few seconds and there is no point re-reading
+  // that often. 30s is well under how long anyone spends reading the drawer.
+  const now=Date.now();
+  if(!force&&_savedRefAt[name]&&now-_savedRefAt[name]<30000)return;
+  _savedRefAt[name]=now;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/saved');
+    if(!resp.ok)return;
+    savedRefCache[name]=await resp.json();
+  }catch(e){return}
+  renderSavedKeys(name);
+}
+function _mergeSaved(a,b){
+  const seen=new Set(),out=[];
+  [...(a||[]),...(b||[])].forEach(function(it){
+    const k=(typeof it==='string'?it.replace(/\/+$/,''):it.label+'~'+it.value).toLowerCase();
+    if(seen.has(k))return; seen.add(k); out.push(it);
+  });
+  return out;
+}
 function renderSavedKeys(name,sessionObj){
   const s=sessionObj||sessions.find(x=>x.name===name);
-  const info=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  const notesInfo=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  const ref=savedRefCache[name]||{urls:[],creds:[],files:[]};
+  const info={urls:_mergeSaved(ref.urls,notesInfo.urls),
+              creds:_mergeSaved(ref.creds,notesInfo.creds),
+              files:_mergeSaved(ref.files,notesInfo.files)};
   // Basenames that collide across kept files → show the parent dir to tell apart.
   const baseCount={};
   info.files.forEach(p=>{const b=p.replace(/\/+$/,'').split('/').pop();baseCount[b]=(baseCount[b]||0)+1});
@@ -24718,8 +27907,27 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='Nothing captured yet. This is the quick-reference for THIS session: files it created, external URLs, and any logins or passwords it set up, so you do not have to scroll back through the terminal. Press "Full" on the Info tab to extract them.';
+      empty.textContent=(savedRefCache[name]&&savedRefCache[name].identified===false)
+        ? 'This session shares a working directory with others and its own transcript could not be told apart from theirs yet, so nothing is listed rather than a neighbour’s links. It fills in once the session has run a turn of its own.'
+        : 'Nothing to show yet. This is the quick-reference for THIS session: the files it wrote, the links it produced, and any logins it set up, so you do not have to scroll back through the terminal. It fills itself in as the session works.';
       body.appendChild(empty);
+      // The extractor is one button away, so put the button here rather than
+      // naming a control on another tab. It reads the pane and fills the list.
+      const act=document.createElement('div');
+      act.className='key-saved-scan';
+      const btn=document.createElement('button');
+      btn.type='button';btn.className='key-saved-scanbtn';btn.textContent='Scan this session';
+      btn.title='Reads the terminal and pulls out the URLs, logins and files it produced. Takes a few seconds.';
+      btn.addEventListener('click',function(ev){
+        ev.preventDefault();ev.stopPropagation();
+        btn.disabled=true;btn.textContent='Scanning…';
+        // refreshFull repaints this drawer through updateCard when it lands.
+        Promise.resolve(refreshFull(name)).catch(function(){}).then(function(){
+          if(btn.isConnected){btn.disabled=false;btn.textContent='Scan again'}
+        });
+      });
+      act.appendChild(btn);
+      body.appendChild(act);
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('Links & URLs',info.urls.map(u=>_savedLinkRow(u,u))));
       if(info.creds.length)body.appendChild(_savedGroup('Logins & passwords',info.creds.map(_savedCredRow)));
@@ -28694,6 +31902,7 @@ async function openStats(){
     let usage=null;
     if(usageResp.ok) usage=await usageResp.json();
     renderStats(s,usage);
+    startProcPolling();
   }catch(e){
     document.getElementById('stats-content').innerHTML='<div style="color:#f85149">Failed to load stats.</div>';
   }
@@ -28714,6 +31923,34 @@ function renderStats(s,usage){
     html+='<div class="stats-row"><span class="stats-row-label">IP</span><span class="stats-row-value">'+esc(ips.join(' / '))+'</span></div>';
   }
   html+='<div class="stats-row"><span class="stats-row-label">Uptime</span><span class="stats-row-value">'+esc(s.uptime||'—')+'</span></div>';
+  // What sessions on this box SPEND. Here because the CLI's own banner prints
+  // "Claude API" on a plan-backed token whenever CLAUDE_CODE_OAUTH_TOKEN is
+  // exported, and the only sane place to settle that is somewhere that knows
+  // how the session was launched.
+  if(s.billing){
+    const b=s.billing;
+    const planName={max:'Claude Max',pro:'Claude Pro',team:'Claude Team',enterprise:'Claude Enterprise'}[b.plan]||'';
+    let txt,cls,hint;
+    if(b.metered){
+      txt='Metered API key';cls='#f85149';
+      hint='An Anthropic API key is configured, so inference on this box is billed per token.';
+    }else if(planName){
+      txt=planName+(b.tier?' · '+b.tier.replace(/_/g,' '):'');cls='#3fb950';
+      hint='Sessions authenticate with the subscription, not a metered API key. '+
+           'No ANTHROPIC_API_KEY is set for any pane.'+
+           (b.banner_says_api?' Claude Code still prints "Claude API" in its own '+
+             'welcome box: it reads the plan off the credentials file and ignores '+
+             'that file whenever CLAUDE_CODE_OAUTH_TOKEN is exported. Billing is '+
+             'unaffected.':'');
+    }else{
+      txt='No plan credential';cls='#d29922';
+      hint='No valid subscription token was found, and no API key is set. New sessions will ask you to log in.';
+    }
+    html+='<div class="stats-row" title="'+esc(hint)+'"><span class="stats-row-label">Billing</span>'+
+          '<span class="stats-row-value" style="color:'+cls+'">'+esc(txt)+
+          (b.banner_says_api?' <span style="color:#8b949e;font-weight:400">(banner says “Claude API”)</span>':'')+
+          '</span></div>';
+  }
   if(s.cpu_load&&s.cpu_load['1m']){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Load</span><span class="stats-row-value">'+esc(s.cpu_load['1m'])+' / '+esc(s.cpu_load['5m'])+' / '+esc(s.cpu_load['15m'])+'</span></div>';
   }
@@ -28755,18 +31992,49 @@ function renderStats(s,usage){
     });
     html+='</div>';
   }
-  // Claude Processes
-  html+='<div class="stats-section"><div class="stats-section-title">Claude Processes</div>';
-  if(s.claude_processes&&s.claude_processes.length){
-    s.claude_processes.forEach(p=>{
-      const short=p.length>80?p.substring(0,80)+'...':p;
-      html+='<div class="stats-row" style="word-break:break-all"><span class="stats-row-value" style="font-size:.7rem">'+esc(short)+'</span></div>';
+  // Claude Processes.
+  // Every row here is a LIVE process, not a log of past ones — a list of
+  // identical command lines read like leftover history, which is the single
+  // most misleading thing this panel could do while nine gigabytes sit in
+  // abandoned agents. So each one is named by the tmux session that owns it,
+  // sized, aged, and separated into "this dashboard's" and "nobody's".
+  const inv=s.claude_inventory||null;
+  const fmtAgeShort=sec=>{
+    if(sec==null)return'';
+    if(sec<3600)return Math.max(1,Math.round(sec/60))+'m';
+    if(sec<86400)return Math.round(sec/3600)+'h';
+    return (sec/86400).toFixed(1)+'d';
+  };
+  const fmtMb=mb=>mb>=1024?(mb/1024).toFixed(1)+'G':(mb||0)+'M';
+  if(inv){
+    html+='<div class="stats-section"><div class="stats-section-title">Claude Processes ('+inv.total+' running)</div>';
+    html+='<div class="stats-row"><span class="stats-row-label">In a session on this dashboard</span><span class="stats-row-value">'+inv.attached+'</span></div>';
+    const orphColor=inv.orphaned?(inv.orphan_rss_mb>=2048?'#f85149':'#d29922'):'#8b949e';
+    html+='<div class="stats-row"><span class="stats-row-label">Not attached to any session here</span>'+
+      '<span class="stats-row-value" style="color:'+orphColor+'">'+inv.orphaned+
+      (inv.orphaned?' &middot; '+fmtMb(inv.orphan_rss_mb)+' held':'')+'</span></div>';
+    if(inv.orphaned)
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#6e7681;font-size:.7rem">'+
+        'Agents on another tmux socket, or whose session is gone. They keep their memory until killed.</span></div>';
+    const rows=(inv.processes||[]);
+    const shown=rows.slice(0,30);
+    shown.forEach(p=>{
+      const who=p.session
+        ? (p.attached?esc(p.session):esc(p.socket)+' / '+esc(p.session))
+        : 'pid '+p.pid+' (no session)';
+      const dot=p.attached?'#3fb950':'#d29922';
+      html+='<div class="stats-row" title="pid '+p.pid+' &middot; '+esc(p.argv||'')+'">'+
+        '<span class="stats-row-label"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:'+dot+';margin-right:7px"></span>'+who+'</span>'+
+        '<span class="stats-row-value" style="font-size:.72rem">'+fmtMb(p.rss_mb)+' &middot; '+fmtAgeShort(p.age_s)+'</span></div>';
     });
-  }else{
-    html+='<div class="stats-row"><span class="stats-row-label">No Claude processes found</span></div>';
+    if(rows.length>shown.length)
+      html+='<div class="stats-row"><span class="stats-row-label" style="color:#6e7681">+'+(rows.length-shown.length)+' more</span></div>';
+    if(!rows.length&&inv.total)
+      html+='<div class="stats-row"><span class="stats-row-label">'+inv.total+' running (details are admin-only)</span></div>';
+    if(!inv.total)
+      html+='<div class="stats-row"><span class="stats-row-label">No Claude processes running</span></div>';
+    html+='</div>';
   }
-  if(s.claude_related) html+='<div class="stats-row"><span class="stats-row-label">Total related processes</span><span class="stats-row-value">'+s.claude_related+'</span></div>';
-  html+='</div>';
 
   // Claude Usage
   if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
@@ -28787,11 +32055,117 @@ function renderStats(s,usage){
     html+='</tbody></table></div>';
   }
 
+  // Running processes. Its own section element, filled by its own poll, so a
+  // 1-second CPU sample never holds up everything above it.
+  html+='<div class="stats-section" id="stats-procs">'+
+        '<div class="stats-section-title">Running processes</div>'+
+        '<div class="proc-empty"><span class="spinner"></span> Sampling CPU…</div></div>';
+
   document.getElementById('stats-content').innerHTML=html;
+  renderProcesses();
 }
+
+// ── Running processes (top/htop, live while the popup is open) ──────────────
+// The server samples /proc twice a second apart, so `cpu` is what the process
+// is doing NOW, as a share of one core: 400% on this box means all four. That
+// is the number `ps` cannot give you and the reason this panel exists.
+let _procSort='cpu';
+let _procTimer=null;
+let _procRows=null;
+
+function setProcSort(mode){
+  _procSort=(mode==='mem'?'mem':'cpu');
+  document.querySelectorAll('.proc-sort button').forEach(b=>{
+    b.classList.toggle('active',b.dataset.sort===_procSort);
+  });
+  if(_procRows)_paintProcTable();
+}
+
+function _procCpuClass(cpu){return cpu>=90?'proc-hot':(cpu>=40?'proc-warm':'')}
+function _procMemClass(pct){return pct>=15?'proc-hot':(pct>=5?'proc-warm':'')}
+
+function _paintProcTable(){
+  const body=document.getElementById('proc-body');
+  if(!body||!_procRows)return;
+  const rows=_procRows.slice().sort((a,b)=>
+    _procSort==='mem'?(b.rss_mb-a.rss_mb):(b.cpu-a.cpu));
+  // Everything at a flat zero is padding: on a quiet box two thirds of the
+  // table is daemons that did not run at all during the sample. Drop those
+  // from the CPU view, but never from the memory view, where 0% CPU and 6 GB
+  // resident is exactly the row you came here for.
+  const shown=(_procSort==='cpu'?rows.filter(r=>r.cpu>0):rows).slice(0,20);
+  if(!shown.length){
+    body.innerHTML='<tr><td colspan="6" class="l proc-empty">Nothing measurable ran during the sample.</td></tr>';
+    return;
+  }
+  body.innerHTML=shown.map(r=>{
+    const sess=r.session
+      ? '<span class="proc-sess" title="tmux session '+esc(r.session)+'">'+esc(r.session)+'</span>'
+      : '<span style="color:#484f58">—</span>';
+    return '<tr'+(r.session===selectedSession?' class="mine"':'')+'>'+
+      '<td>'+r.pid+'</td>'+
+      '<td class="'+_procCpuClass(r.cpu)+'">'+r.cpu.toFixed(1)+'</td>'+
+      '<td class="'+_procMemClass(r.mem)+'">'+(r.rss_mb>=1024?(r.rss_mb/1024).toFixed(1)+'G':Math.round(r.rss_mb)+'M')+'</td>'+
+      '<td class="l">'+esc(r.user||'')+'</td>'+
+      '<td class="l">'+sess+'</td>'+
+      '<td class="l proc-cmd" title="'+esc(r.cmd||'')+'">'+esc(r.cmd||r.comm||'')+'</td></tr>';
+  }).join('');
+}
+
+async function renderProcesses(){
+  const host=document.getElementById('stats-procs');
+  if(!host)return;
+  let d;
+  try{
+    const r=await fetch(BASE+'/api/stats/processes');
+    if(!r.ok)throw new Error('http '+r.status);
+    d=await r.json();
+  }catch(e){
+    host.innerHTML='<div class="stats-section-title">Running processes</div>'+
+      '<div class="proc-empty">Could not read the process table on this box.</div>';
+    return;
+  }
+  _procRows=d.processes||[];
+  const cores=d.cpu_count||1;
+  // Say what the number means, in the panel, not just in the code: a reader who
+  // sees 312% next to a 4-core box has to be told that is three cores busy and
+  // not an error.
+  const note=(d.scoped?'Your sessions only. ':'')+
+    'CPU is a share of one core, so '+(cores*100)+'% is all '+cores+' of them. '+
+    'Everything on the box is using '+(d.cpu_sum||0)+'%. Sampled over '+
+    (d.sample_secs||1)+'s across '+(d.total||0)+' processes.';
+  host.innerHTML='<div class="stats-section-title">Running processes</div>'+
+    '<div class="proc-head">'+
+      '<div class="proc-sort" role="group" aria-label="Sort processes">'+
+        '<button type="button" data-sort="cpu" class="'+(_procSort==='cpu'?'active':'')+'" onclick="setProcSort(\'cpu\')">CPU</button>'+
+        '<button type="button" data-sort="mem" class="'+(_procSort==='mem'?'active':'')+'" onclick="setProcSort(\'mem\')">Memory</button>'+
+      '</div>'+
+      '<span class="proc-note">'+esc(note)+'</span>'+
+    '</div>'+
+    '<table class="proc-table"><thead><tr>'+
+      '<th style="width:62px">PID</th><th style="width:52px">CPU%</th><th style="width:56px">RES</th>'+
+      '<th class="l" style="width:92px">User</th><th class="l" style="width:118px">Session</th>'+
+      '<th class="l">Command</th>'+
+    '</tr></thead><tbody id="proc-body"></tbody></table>';
+  _paintProcTable();
+}
+
+function startProcPolling(){
+  stopProcPolling();
+  // 4 seconds: slower than top, because each poll costs the server a 1-second
+  // sleep and this is a glance, not a monitor.
+  _procTimer=setInterval(()=>{
+    if(!document.getElementById('stats-overlay').classList.contains('active')){
+      stopProcPolling();return;
+    }
+    renderProcesses();
+  },4000);
+}
+function stopProcPolling(){if(_procTimer){clearInterval(_procTimer);_procTimer=null}}
 
 function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
+  stopProcPolling();
 }
 
 // ── Phone layout: header status widgets move to the bottom ──────────────────

@@ -1,3 +1,5 @@
+import os
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -753,26 +755,35 @@ async def test_admin_can_trigger_durable_recovery(monkeypatch):
     assert b'"restored":["drafting"]' in response.body
 
 
-def test_tab_labels_are_two_words_persistent_and_ignore_continue(monkeypatch, tmp_path: Path):
+def test_a_spaced_session_name_is_shown_but_never_given_to_tmux(monkeypatch, tmp_path: Path):
     import app
     from runtime_control import LockedJsonStore
 
     store = LockedJsonStore(
-        tmp_path / "session-tab-labels.json",
+        tmp_path / "session-display-names.json",
         lambda: {"version": 1, "sessions": {}},
     )
-    monkeypatch.setattr(app, "SESSION_TAB_LABELS", store)
+    monkeypatch.setattr(app, "SESSION_DISPLAY_NAMES", store)
 
-    first = app._set_session_tab_label(
-        "drafting",
-        "admin",
-        "Please fix durable session recovery on builder4",
-    )
-    continued = app._set_session_tab_label("drafting", "admin", "continue")
+    assert app._split_session_name("  word1   word2 ") == ("word1word2", "word1 word2")
+    assert app._split_session_name("plain") == ("plain", "plain")
+    assert app._split_session_name("bad;rm -rf /") == ("", "")
 
-    assert first == "Durable Session"
-    assert continued == first
-    assert app._session_tab_label("drafting") == "Durable Session"
+    app._set_session_display_name("word1word2", "word1 word2")
+    assert app._session_display_name("word1word2") == "word1 word2"
+    # A name with no spaces needs no row, and an unknown session is its own name.
+    app._set_session_display_name("plain", "plain")
+    assert store.read()["sessions"] == {
+        "word1word2": store.read()["sessions"]["word1word2"]
+    }
+    assert app._session_display_name("plain") == "plain"
+
+    # A recycled tmux name must not inherit a stale display name.
+    app._set_session_display_name("word1word2", "other name")
+    assert app._session_display_name("word1word2") == "word1word2"
+
+    app._remove_session_display_name("word1word2")
+    assert store.read()["sessions"] == {}
 
 
 def test_clipboard_images_become_sendable_composer_attachments():
@@ -805,12 +816,29 @@ def test_session_and_view_are_deep_linked_through_the_hash():
     assert "history.pushState(null,'',_sessionRouteHash(name,tab))" in html
 
 
+def test_a_session_tab_shows_the_typed_name_and_no_two_word_label():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "function sessionLabel(sessionOrName)" in html
+    assert '<span class="nav-session-id">${esc(sessionLabel(s))}</span>' in html
+    # The two-word label that used to sit beside the name is gone for good.
+    assert "tab_label" not in html
+    assert "nav-title" not in html
+
+
 def test_nav_status_includes_memory_and_admin_recovery_control():
     import app
 
     html = app.HTML_PAGE
 
-    assert "RAM <span class=\"stat-val '+memClass+'\">'+memPct+'%</span>" in html
+    # CPU and RAM are two stacked rows, laid out like the 5h/7d usage pair they
+    # sit next to: a labelled track plus the percentage, not a run of prose.
+    assert "row('CPU',cpuPct,cpuClass," in html
+    assert "row('RAM',memPct,memClass,memTxt)" in html
+    assert '<span class="nav-stat-bar"><span class="nav-stat-fill ' in html
+    assert ".nav-server-stats{color:#8b949e;white-space:nowrap;display:flex;flex-direction:column" in html
     assert "onclick=\"recoverSessions();closeToolsMenu()\"" in html
     assert "async function recoverSessions()" in html
     assert "BASE+'/api/admin/sessions/recover'" in html
@@ -950,3 +978,561 @@ def test_scaffold_sessions_are_never_adopted_by_durable_recovery(monkeypatch):
     assert [row["name"] for row in app._durable_session_candidates(set())] == ["drafting"]
     assert app._is_ephemeral_session("prime_4242") and app._is_ephemeral_session("_authsetup")
     assert not app._is_ephemeral_session("authsetup")
+
+
+def _assistant(effort, model, ts, ctx=(10, 20, 30), ttl_1h=0, ttl_5m=0, sidechain=False):
+    import json
+
+    return json.dumps({
+        "type": "assistant",
+        "effort": effort,
+        "isSidechain": sidechain,
+        "timestamp": ts,
+        "message": {
+            "model": model,
+            "usage": {
+                "input_tokens": ctx[0],
+                "cache_read_input_tokens": ctx[1],
+                "cache_creation_input_tokens": ctx[2],
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": ttl_1h,
+                    "ephemeral_5m_input_tokens": ttl_5m,
+                },
+            },
+        },
+    })
+
+
+def test_a_subagents_effort_is_never_read_as_the_sessions_own():
+    import app
+
+    lines = [
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ttl_1h=99),
+        # A sub-agent turn lands in the SAME transcript and runs with its own
+        # model, effort and context. Reading "the last assistant entry" made it
+        # the session's.
+        _assistant("low", "claude-haiku-4-5", "2026-09-01T00:01:00.000Z",
+                   ctx=(1, 2, 3), sidechain=True),
+    ]
+    facts = app._scan_assistant_tail(lines)
+
+    assert facts["effort"] == "high"
+    assert facts["model"] == "claude-opus-5"
+    assert facts["ctx"] == 60
+    assert facts["ttl"] == 3600
+
+
+def test_context_and_end_time_come_off_the_newest_reply():
+    import app
+
+    lines = [
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ctx=(1, 1, 1)),
+        _assistant("max", "claude-opus-5", "2026-09-01T00:05:00.000Z",
+                   ctx=(100, 200, 300), ttl_5m=7),
+    ]
+    facts = app._scan_assistant_tail(lines)
+
+    assert facts["effort"] == "max"
+    assert facts["ctx"] == 600
+    assert facts["ttl"] == 300           # a 5m cache, read rather than assumed
+    assert facts["ts"] == app._iso_epoch("2026-09-01T00:05:00.000Z")
+
+
+def test_a_transcript_tail_grows_until_it_holds_a_reply(tmp_path):
+    import app
+
+    # One enormous tool result between the newest reply and the end of the file:
+    # the old fixed 32KB window held none of the reply, so the caller fell back
+    # to the configured default and mislabelled the session.
+    p = tmp_path / "t.jsonl"
+    filler = '{"type":"user","content":"' + ("x" * 200_000) + '"}'
+    p.write_text("\n".join([
+        _assistant("high", "claude-opus-5", "2026-09-01T00:00:00.000Z", ttl_1h=5),
+        filler,
+    ]))
+
+    facts = app._last_assistant_facts(str(p))
+
+    assert facts["effort"] == "high"
+    assert facts["model"] == "claude-opus-5"
+
+
+def test_a_printed_effort_line_is_not_a_switch(monkeypatch):
+    import app
+
+    # An agent that merely PRINTS the phrase (grepping app.py does) must not be
+    # read as having run /effort. Only the CLI's own result elbow counts.
+    monkeypatch.setattr(app, "capture_pane_recent",
+                        lambda name, lines=80: 'grep -n "set effort level to low" app.py\n')
+    assert app._pane_model_effort("s") == {}
+
+    monkeypatch.setattr(app, "capture_pane_recent", lambda name, lines=80: (
+        "  ⎿  Set effort level to high (this session only)\n"
+        "  ⎿  Set effort level to max (this session only): Maximum capability\n"))
+    # The LAST confirmation wins: it is the one that is still in force.
+    assert app._pane_model_effort("s")["effort"] == "max"
+
+
+def test_the_live_bar_carries_silence_and_context():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert 'class="tl-since" id="tl-since-${s.name}"' in html
+    assert 'class="tl-ctx" id="tl-ctx-${s.name}"' in html
+    assert "function _paintIdleSince(name)" in html
+    assert "function _paintContext(name)" in html
+    # The silence counter has to keep ticking while the session is idle.
+    assert "_paintIdleSince(selectedSession);" in html
+    # And the bar shows on server-measured facts alone, for a session that was
+    # already idle before the page loaded and has no spinner row left.
+    assert "!!(sess.context_tokens||sess.last_turn_end)" in html
+
+
+def _stub_proc(monkeypatch, cmdline="", pid=0, fds=()):
+    """Pretend a session's `claude` runs with this argv and these open files."""
+    import app
+
+    monkeypatch.setattr(app, "_session_claude_proc",
+                        lambda name: {"pid": pid, "cmdline": cmdline, "env": {}})
+    if pid:
+        monkeypatch.setattr(app.os, "listdir",
+                            lambda p: [str(i) for i in range(len(fds))]
+                            if p == f"/proc/{pid}/fd" else os.listdir(p))
+        monkeypatch.setattr(app.os, "readlink",
+                            lambda p: fds[int(os.path.basename(p))]
+                            if p.startswith(f"/proc/{pid}/fd/") else os.readlink(p))
+
+
+def test_the_session_id_flag_names_the_transcript(monkeypatch):
+    import app
+
+    _stub_proc(monkeypatch, cmdline=(
+        "claude --dangerously-skip-permissions --model claude-opus-5[1m] "
+        "--effort xhigh --session-id 20d33bb7-bb5b-4770-9b67-e2b83b16a64c"))
+
+    assert app._session_transcript_uuid("s") == "20d33bb7-bb5b-4770-9b67-e2b83b16a64c"
+
+
+def test_the_open_scratch_dir_names_the_transcript(monkeypatch):
+    import app
+
+    # A session launched WITHOUT --session-id still holds its per-session scratch
+    # directory open, and that path carries the same uuid.
+    _stub_proc(monkeypatch, cmdline="claude --dangerously-skip-permissions", pid=4242,
+               fds=("/dev/pts/9", "socket:[123]",
+                    "/tmp/claude-1000/-home-nimo-proj/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/tasks"))
+
+    assert app._session_transcript_uuid("s") == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def test_the_named_transcript_wins_over_the_newest_one(tmp_path, monkeypatch):
+    import app
+
+    # A dozen sessions share one project directory. "Newest by mtime" hands each
+    # of them a sibling's file, which is how a three-minute-old session reported
+    # an 800k-token prompt as its own.
+    mine = tmp_path / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+    theirs = tmp_path / "ffffffff-1111-2222-3333-444444444444.jsonl"
+    mine.write_text("{}\n")
+    theirs.write_text("{}\n")
+    os.utime(mine, (1, 1))                       # mine is the OLDER file
+    _stub_proc(monkeypatch, cmdline=(
+        "claude --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+    app._session_transcript_cache.pop("s", None)
+
+    picked = app._pick_session_transcript_file("s", [str(mine), str(theirs)])
+
+    assert picked == str(mine)
+    assert app._session_transcript_cache["s"]["confident"] is True
+
+
+def test_an_unproven_transcript_reports_no_context(monkeypatch, tmp_path):
+    import app
+
+    # Model and effort survive an unproven read because argv carries this
+    # session's own launch flags. The prompt size, the cache TTL and the time of
+    # the last reply exist nowhere but the transcript, so an unproven read of
+    # them is a neighbour's figure wearing this session's name.
+    a = tmp_path / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    b = tmp_path / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    for p in (a, b):
+        p.write_text(_assistant("high", "claude-opus-5",
+                                "2026-09-01T00:00:00.000Z", ctx=(1, 800_000, 1)) + "\n")
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda n: [str(a), str(b)])
+    monkeypatch.setattr(app, "_pane_match_fragments", lambda n: [])
+    monkeypatch.setattr(app, "_pane_model_effort", lambda n: {})
+    _stub_proc(monkeypatch, cmdline="claude --effort high --model claude-opus-5")
+    app._session_model_cache.pop("s", None)
+    app._session_transcript_cache.pop("s", None)
+
+    out = app._detect_session_model_effort("s")
+
+    assert out["sure"] is False
+    assert out["effort"] == "high"           # from argv, which is this session's
+    assert out["context_tokens"] == 0        # never a neighbour's number
+    assert out["cache_ttl"] == 0
+    assert out["last_turn_end"] == 0
+
+
+def _tool_use(name, **inp):
+    import json
+
+    return json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": inp}]}})
+
+
+def _said(text):
+    import json
+
+    return json.dumps({"type": "assistant",
+                       "message": {"content": [{"type": "text", "text": text}]}})
+
+
+def test_saved_reference_is_read_off_the_transcript(tmp_path):
+    import app
+
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join([
+        _tool_use("Write", file_path="/home/n/proj/report.md", content="x"),
+        _tool_use("Edit", file_path="/home/n/.tmux-dashboard/uploads/s-1/DRAFT.md"),
+        _tool_use("Write", file_path="/home/n/.claude/settings.json"),
+        _tool_use("Bash", command="curl -s https://demo.rotem.ai/panel/ | head"),
+        _said("Live at https://demo.rotem.ai/panel/ with login user: nimo\n"
+              "Password: hunter2-correct-horse\n"
+              "max_tokens: 1024\n"
+              "See http://www.w3.org/2000/svg for the namespace."),
+    ]) + "\n")
+
+    got = app._saved_scan_transcript(str(p))
+
+    assert "/home/n/proj/report.md" in got["files"]
+    # The session's OWN output directory sits under a dot-dir; the rule that
+    # keeps ~/.claude out was throwing away every deliverable with it.
+    assert "/home/n/.tmux-dashboard/uploads/s-1/DRAFT.md" in got["files"]
+    assert "/home/n/.claude/settings.json" not in got["files"]
+    assert got["urls"] == ["https://demo.rotem.ai/panel/"]      # deduped, no w3.org
+    pairs = {(c["label"].lower(), c["value"]) for c in got["creds"]}
+    assert ("login user", "nimo") in pairs
+    assert ("password", "hunter2-correct-horse") in pairs
+    # A token COUNT is not a login. Matching `max_tokens` turned every usage line
+    # in an LLM session into a fake credential.
+    assert not [c for c in got["creds"] if "token" in c["label"].lower()]
+
+
+def test_saved_reference_scan_resumes_where_it_stopped(tmp_path):
+    import app
+
+    p = tmp_path / "t.jsonl"
+    p.write_text(_tool_use("Write", file_path="/home/n/one.md") + "\n")
+    first = app._saved_scan_transcript(str(p))
+    assert first["files"] == ["/home/n/one.md"]
+
+    with open(p, "a") as fh:
+        fh.write(_tool_use("Write", file_path="/home/n/two.md") + "\n")
+    second = app._saved_scan_transcript(str(p))
+
+    # The appended record is picked up WITHOUT re-reading the earlier bytes, and
+    # the earlier finding is still there.
+    assert set(second["files"]) == {"/home/n/one.md", "/home/n/two.md"}
+    assert app._saved_scan_state[str(p)]["offset"] == p.stat().st_size
+
+
+def test_saved_reference_is_empty_when_the_transcript_is_unproven(monkeypatch, tmp_path):
+    import app
+
+    a = tmp_path / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    b = tmp_path / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    for p in (a, b):
+        p.write_text(_tool_use("Write", file_path="/home/n/theirs.md") + "\n")
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda n: [str(a), str(b)])
+    monkeypatch.setattr(app, "_pane_match_fragments", lambda n: [])
+    _stub_proc(monkeypatch, cmdline="claude")
+    app._session_transcript_cache.pop("s", None)
+
+    got = app._session_saved_reference("s")
+
+    assert got == {"urls": [], "creds": [], "files": [], "identified": False}
+
+
+def test_the_saved_drawer_reads_the_server_not_a_dead_summariser():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "async function refreshSavedKeys(name,force)" in html
+    assert "'/api/sessions/'+encodeURIComponent(name)+'/saved'" in html
+    # The old empty state told the reader to press "Full" on the Info tab, which
+    # has not extracted anything since the auto-summariser was switched off.
+    assert 'Press "Full" on the Info tab' not in html
+
+
+def test_a_new_session_is_the_one_you_land_on():
+    import app
+
+    html = app.HTML_PAGE
+
+    # loadAll() re-reads the URL hash, so setting `selectedSession` alone was
+    # undone the moment it ran: the new session was created and you stayed on
+    # the old one. The route has to move.
+    assert "function _openNewSession(name)" in html
+    assert "location.hash=_sessionRouteHash(name,tab);" in html
+    assert "_openNewSession(data.name);" in html
+    assert "selectedSession=data.name;" not in html
+
+
+def test_the_key_bar_drops_the_retired_controls():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "sendSlashCommand('${name}','/plan')" not in html
+    assert ">Clear Input</button>" not in html
+    # The ones that earn their place are still there.
+    assert "sendSlashCommand('${name}','/context')" in html
+    assert "sendSlashCommand('${name}','/usage')" in html
+
+
+def test_the_account_caps_are_shown_once(): 
+    import app
+
+    html = app.HTML_PAGE
+
+    # The header already carries 5h and 7d. A second copy under every terminal
+    # meant the same pair twice on one screen, which is a duplicate rather than
+    # a reading.
+    assert "tl-cap" not in html
+    assert "paintSessionUsageCaps" not in html
+    assert 'id="nav-usage-5h-fill"' in html
+    assert 'id="nav-usage-7d-fill"' in html
+    # The percentage beside each track is the reading, so the track itself is
+    # short: it only has to say roughly where in the range the number sits.
+    assert ".nav-usage-bar{position:relative;width:22px" in html
+    assert ".nav-stat-bar{position:relative;width:22px" in html
+
+
+def test_claude_processes_are_attributed_to_their_session(monkeypatch):
+    import app
+
+    # pid 100 tmux server on the dashboard's own socket; 200 its pane shell;
+    # 300 the agent. pid 400 is an agent under a tmux server on another socket,
+    # which is exactly the shape of an abandoned test fixture.
+    table = {
+        100: {"ppid": 1, "rss_mb": 3, "age_s": 900, "argv": "tmux new-session -d -s work"},
+        200: {"ppid": 100, "rss_mb": 4, "age_s": 900, "argv": "-bash"},
+        300: {"ppid": 200, "rss_mb": 500, "age_s": 900,
+              "argv": "claude --dangerously-skip-permissions"},
+        400: {"ppid": 500, "rss_mb": 220, "age_s": 160000,
+              "argv": "claude --dangerously-skip-permissions"},
+        500: {"ppid": 1, "rss_mb": 3, "age_s": 160000,
+              "argv": "tmux -L pffive new-session -d -s de-43"},
+    }
+    monkeypatch.setattr(app, "_read_proc_table", lambda: table)
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        stdout="200 work\n" if "-L" not in a[0] else "", returncode=0))
+    app._CLAUDE_INVENTORY_CACHE.update({"ts": 0.0, "data": None})
+
+    inv = app._claude_process_inventory()
+
+    assert inv["total"] == 2
+    assert inv["attached"] == 1
+    assert inv["orphaned"] == 1
+    # The number that answers "should these still be running".
+    assert inv["orphan_rss_mb"] == 220
+    by_pid = {p["pid"]: p for p in inv["processes"]}
+    assert by_pid[300]["session"] == "work" and by_pid[300]["attached"] is True
+    assert by_pid[400]["socket"] == "pffive" and by_pid[400]["attached"] is False
+
+
+def test_the_stats_panel_names_the_owner_of_every_agent():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "const inv=s.claude_inventory||null;" in html
+    assert "Claude Processes ('+inv.total+' running)</div>" in html
+    assert "Not attached to any session here" in html
+
+
+def test_your_own_words_are_marked_and_jumpable():
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "function _markUserRows(rows)" in html
+    assert "function jumpToLastUserMessage(name)" in html
+    assert "function jumpToLive(name)" in html
+    assert '<span class="tl-you">' in html
+    assert ".raw-output .tl-you{" in html
+    assert 'onclick="jumpToLastUserMessage(' in html
+
+
+def test_settled_scrollback_is_archived_without_duplicating(monkeypatch, tmp_path):
+    import app
+
+    # A pane whose settled region grows, exactly as tmux reports it.
+    pane = {"lines": [f"line {i}" for i in range(120)]}
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    monkeypatch.setattr(app, "_settled_pane_lines",
+                        lambda name, count: pane["lines"][-count:])
+    app._scrollback_state.clear()
+
+    assert app.archive_scrollback("s") == 120
+    # Nothing new: a second pass must add nothing, or the log doubles every poll.
+    assert app.archive_scrollback("s") == 0
+
+    pane["lines"] += [f"line {i}" for i in range(120, 150)]
+    assert app.archive_scrollback("s") == 30
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert stored == [f"line {i}" for i in range(150)]
+
+
+def test_the_archive_keeps_what_the_tmux_ring_has_already_dropped(monkeypatch, tmp_path):
+    import app
+
+    # tmux keeps a fixed ring: here the last 100 lines. The archive has to hold
+    # everything the ring has already thrown away, which is the whole point of
+    # it. It can, as long as it is read again before its anchor scrolls out.
+    all_lines = [f"line {i}" for i in range(300)]
+    ring, seen = 100, {"upto": 120}
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    monkeypatch.setattr(
+        app, "_settled_pane_lines",
+        lambda name, count: all_lines[max(0, seen["upto"] - ring):seen["upto"]][-count:])
+    app._scrollback_state.clear()
+
+    app.archive_scrollback("s")
+    for upto in (180, 240, 300):     # the ring drops 60 lines between passes
+        seen["upto"] = upto
+        app.archive_scrollback("s")
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert stored == all_lines[20:]          # 0..19 predate the first read
+    assert app.read_scrollback("s", 0, 5)["lines"] == all_lines[20:25]
+    assert app.read_scrollback("s", 0, 5)["total"] == 280
+
+
+def test_a_pane_that_moved_past_the_anchor_resyncs_instead_of_duplicating(monkeypatch, tmp_path):
+    import app
+
+    # Poll too slowly and the ring drops the anchor. Nothing can bring those
+    # lines back, but the archive must not silently glue unrelated stretches
+    # together either: it marks the break and carries on.
+    monkeypatch.setattr(app, "SCROLLBACK_DIR", tmp_path)
+    pane = {"lines": [f"old {i}" for i in range(60)]}
+    monkeypatch.setattr(app, "_settled_pane_lines",
+                        lambda name, count: pane["lines"][-count:])
+    app._scrollback_state.clear()
+    app.archive_scrollback("s")
+
+    pane["lines"] = [f"new {i}" for i in range(60)]      # nothing in common
+    added = app.archive_scrollback("s")
+
+    stored = (tmp_path / "s.log").read_text().splitlines()
+    assert added == 60
+    assert stored[:60] == [f"old {i}" for i in range(60)]
+    assert stored[60] == ""                              # the break marker
+    assert stored[61:] == [f"new {i}" for i in range(60)]
+
+
+def test_terminal_can_load_history_from_before_the_ring(monkeypatch):
+    import app
+
+    html = app.HTML_PAGE
+
+    assert "async function loadEarlierHistory(name)" in html
+    assert "function _trimOverlap(older,current)" in html
+    assert "function updateOlderBar(name)" in html
+    assert "/history?before=" in html
+    assert 'id="raw-older-${s.name}"' in html
+    # The head trim must make room for history that was deliberately loaded.
+    assert "const cap=RAW_MAX_LINES+olderRows;" in html
+
+
+def test_a_borrowed_transcript_never_outranks_the_launch_flags(tmp_path, monkeypatch):
+    import app
+
+    # A brand-new session has no transcript of its own yet, so the newest file in
+    # a shared project dir belongs to some OTHER session. Its level and model
+    # must not be shown as this session's: argv still says what it launched on.
+    other = tmp_path / "other.jsonl"
+    other.write_text(_assistant("high", "claude-fable-5-1", "2026-09-01T00:00:00.000Z"))
+    files = [str(other), str(tmp_path / "another.jsonl")]
+    monkeypatch.setattr(app, "_find_session_jsonl_files", lambda name: files)
+    monkeypatch.setattr(app, "_pick_session_transcript_file", lambda name, fs: str(other))
+    monkeypatch.setattr(app, "_session_transcript_cache", {})
+    monkeypatch.setattr(app, "_session_model_cache", {})
+    monkeypatch.setattr(app, "_session_claude_proc", lambda name: {
+        "cmdline": "claude --dangerously-skip-permissions --model claude-opus-5[1m] --effort xhigh"})
+    monkeypatch.setattr(app, "capture_pane_recent", lambda name, lines=80: "")
+
+    out = app._detect_session_model_effort("fresh")
+
+    assert out["effort"] == "xhigh"
+    assert out["effort_source"] == "launch"
+    assert out["model"] == "claude-opus-5[1m]"
+
+
+# ── Renaming a session, and the tmux name that must not move ─────────────────
+
+def test_a_renamed_session_shows_the_new_name():
+    import app
+
+    rows = {"report": {"display": "Q3 revenue report", "created": "1788800000"}}
+
+    assert app._session_display_name("report", rows, "1788800000") == "Q3 revenue report"
+
+
+def test_a_recycled_tmux_name_does_not_inherit_the_old_label(tmp_path):
+    """Kill `report` and make a new `report`: the label belonged to the session
+    that is gone, and wearing it would be worse than showing the plain name. The
+    tmux creation stamp is what tells the two apart."""
+    import app
+
+    rows = {"report": {"display": "Q3 revenue report", "created": "1788800000"}}
+
+    assert app._session_display_name("report", rows, "1788899999") == "report"
+
+
+def test_a_label_written_before_the_stamp_existed_still_works():
+    """Rows predating the stamp were only ever allowed to re-space the tmux
+    name, and that rule still governs them, so nobody's existing name changes."""
+    import app
+
+    old = {"twoword": {"display": "two word"}}
+
+    assert app._session_display_name("twoword", old, "1788800000") == "two word"
+    # ...and the guard those rows relied on is still enforced for them.
+    wrong = {"twoword": {"display": "something else"}}
+    assert app._session_display_name("twoword", wrong, "1788800000") == "twoword"
+
+
+def test_the_rename_endpoint_is_wired_and_scoped():
+    import app
+
+    routes = {getattr(r, "path", "") : getattr(r, "methods", set()) for r in app.app.routes}
+    assert "PATCH" in routes.get("/api/sessions/{session_name}/display-name", set())
+    src = app.HTML_PAGE
+    # First click on another tab still SELECTS it; only the tab you are in renames.
+    assert "if(s.name!==selectedSession)return;" in src
+    assert "function startSessionRename(name,labelEl)" in src
+    assert "'/display-name'" in src or "/display-name'" in src
+    # A repaint mid-edit would take the input away under the cursor.
+    assert "if(_renamingSession)return;" in src
+
+
+def test_the_project_picker_hides_directories_with_nothing_in_them():
+    import app
+
+    src = app.HTML_PAGE
+
+    # A directory earns its place by having a session, a project-scope file, or
+    # being the current selection. Claude Code records every directory it has
+    # ever run in, so without this the picker fills with throwaway run dirs.
+    assert "live.has(p.path) || (p.present||0) > 0" in src
+    assert "p.path===CURRENT_PROJECT || PROJ_ALIAS[p.path]" in src
+    # Never hide everything, and always say what was hidden.
+    assert "return kept.length ? kept : all;" in src
+    assert "function toggleAllProjects(ev)" in src
+    assert "with nothing in them" in src

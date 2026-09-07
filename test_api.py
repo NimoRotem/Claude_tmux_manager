@@ -293,7 +293,7 @@ class TestSessionCreateDelete:
     def test_create_session_invalid_name(self, mock_sessions, authed_client):
         resp = authed_client.post(
             "/api/sessions/create",
-            json={"name": "bad name with spaces"},
+            json={"name": "bad/name$with-punctuation"},
 
         )
         assert resp.status_code == 400
@@ -1369,12 +1369,20 @@ class TestCreateSession:
     @pytest.fixture(autouse=True)
     def _isolate_lifecycle_state(self, monkeypatch, tmp_path):
         import app
-        from runtime_control import SessionLifecycleStore
+        from runtime_control import LockedJsonStore, SessionLifecycleStore
 
         monkeypatch.setattr(
             app,
             "SESSION_LIFECYCLE",
             SessionLifecycleStore(tmp_path / "session-lifecycle.json"),
+        )
+        monkeypatch.setattr(
+            app,
+            "SESSION_DISPLAY_NAMES",
+            LockedJsonStore(
+                tmp_path / "session-display-names.json",
+                lambda: {"version": 1, "sessions": {}},
+            ),
         )
         monkeypatch.setattr(app, "TMUX_MUTATION_LOCK", tmp_path / "tmux-mutation.lock")
 
@@ -1392,6 +1400,31 @@ class TestCreateSession:
         data = resp.json()
         assert data["ok"] is True
         assert data["name"] == "my-session"
+
+    @patch("app.get_tmux_sessions", return_value=[])
+    @patch("app.subprocess.run")
+    def test_create_session_with_spaces_keeps_the_typed_name_for_display(
+        self, mock_run, mock_sessions, authed_client
+    ):
+        """tmux gets 'word1word2'; the dashboard still shows 'word1 word2'."""
+        asked = []
+
+        def run_tmux(command, **_kwargs):
+            if command[:2] == ["tmux", "new-session"]:
+                asked.append(command)
+                return MagicMock(returncode=0, stdout="$1\tword1word2\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = run_tmux
+        resp = authed_client.post("/api/sessions/create", json={"name": "word1  word2"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "word1word2"
+        assert data["display_name"] == "word1 word2"
+        assert all("word1 word2" not in part for part in asked[0])
+
+        import app
+        assert app._session_display_name("word1word2") == "word1 word2"
 
     @patch("app.get_tmux_sessions", return_value=[])
     @patch("app.subprocess.run")
@@ -1471,12 +1504,20 @@ class TestDeleteSession:
     @pytest.fixture(autouse=True)
     def _isolate_lifecycle_state(self, monkeypatch, tmp_path):
         import app
-        from runtime_control import SessionLifecycleStore
+        from runtime_control import LockedJsonStore, SessionLifecycleStore
 
         monkeypatch.setattr(
             app,
             "SESSION_LIFECYCLE",
             SessionLifecycleStore(tmp_path / "session-lifecycle.json"),
+        )
+        monkeypatch.setattr(
+            app,
+            "SESSION_DISPLAY_NAMES",
+            LockedJsonStore(
+                tmp_path / "session-display-names.json",
+                lambda: {"version": 1, "sessions": {}},
+            ),
         )
         monkeypatch.setattr(app, "TMUX_MUTATION_LOCK", tmp_path / "tmux-mutation.lock")
 
