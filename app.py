@@ -20651,7 +20651,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-server-stats:hover{color:#c9d1d9}
 .nav-stat-item{display:flex;align-items:center;gap:5px;line-height:1}
 .nav-stat-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
-.nav-stat-bar{position:relative;width:82px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-stat-bar{position:relative;width:22px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
 .nav-stat-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
 .nav-stat-fill.warn{background:#d29922}
 .nav-stat-fill.crit{background:#f85149}
@@ -20665,7 +20665,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage{display:flex;flex-direction:column;justify-content:center;gap:2px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
 .nav-usage-item{display:flex;align-items:center;gap:5px;cursor:help;line-height:1}
 .nav-usage-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:14px;text-transform:uppercase}
-.nav-usage-bar{position:relative;width:82px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-usage-bar{position:relative;width:22px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
 .nav-usage-fill{position:absolute;top:0;left:0;bottom:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
@@ -20992,18 +20992,6 @@ body.member-admin .more-member-only{display:none}
 .tl-ctx.high{color:#d29922}
 .tl-ctx.crit{color:#f85149;font-weight:600}
 .tl-ctx.unsure,.tl-since.unsure{opacity:.55;font-style:italic}
-/* Anthropic 5h / 7d caps, pinned to the right of the live bar. Sized to fit the
-   existing 16px row, so adding them costs no terminal height. */
-.tl-cap{display:flex;align-items:center;gap:10px;flex:none;margin-left:4px}
-.tl-cap.no-data{opacity:.45}
-.tl-cap-item{display:flex;align-items:center;gap:4px;cursor:help;line-height:1}
-.tl-cap-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
-.tl-cap-bar{position:relative;width:44px;height:3px;background:#21262d;border-radius:2px;overflow:hidden}
-.tl-cap-fill{position:absolute;top:0;left:0;bottom:0;width:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
-.tl-cap-fill.warn{background:#d29922}
-.tl-cap-fill.crit{background:#f85149}
-.tl-cap-pct{color:#8b949e;font-size:.6rem;font-weight:600;width:24px;text-align:right;font-variant-numeric:tabular-nums}
-body.member-simple .tl-cap{display:none}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -21803,7 +21791,7 @@ body.member-simple .hide-in-simple{display:none!important}
     display:flex;flex-direction:row;gap:16px;border:none;margin:0;padding:0}
   body:not(.member-simple) .mobile-bottom-bar .nav-server-stats{
     display:flex;border:none;margin:0;padding:0}
-  .mobile-bottom-bar .nav-usage-bar,.mobile-bottom-bar .nav-stat-bar{width:96px;height:5px}
+  .mobile-bottom-bar .nav-usage-bar,.mobile-bottom-bar .nav-stat-bar{width:26px;height:5px}
   .mobile-bottom-bar .nav-browser-badge{padding:4px 9px}
   .claude-auth-label{display:none}
   .claude-auth{padding:8px 10px}
@@ -21832,8 +21820,6 @@ body.member-simple .hide-in-simple{display:none!important}
   .raw-output.flow .tl{padding-left:1.3em;text-indent:-1.3em}
   .term-live{font-size:.66rem;gap:6px;padding:5px 9px}
   .term-live .tl-note{display:none}
-  .term-live .tl-cap{gap:6px;margin-left:0}
-  .term-live .tl-cap-bar{width:30px}
   .modal{min-width:280px;margin:0 16px}
   .tab{padding:8px 12px;font-size:.8rem}
   .tab-more-menu{min-width:210px}
@@ -23332,10 +23318,6 @@ function updateLiveBar(name){
   set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
   _paintIdleSince(name);
   _paintContext(name);
-  // The bar is rebuilt whenever the detail pane re-renders, so the cap fills
-  // have to be re-applied from the last fetch rather than left at their markup
-  // defaults. Cheap: at most one session's worth of nodes.
-  paintSessionUsageCaps();
   const note=document.getElementById('tl-note-'+name);
   if(note){
     const txt=busy&&live.esc?'Stop to interrupt':'';
@@ -24579,22 +24561,6 @@ function renderDetail(){
         <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
-        <!-- The account's Anthropic caps, on the session that is spending them.
-             Same two windows and the same colours as the header pair; here so
-             the answer to "can I keep going" sits next to the terminal you would
-             keep going in. -->
-        <span class="tl-cap" id="tl-cap-${s.name}">
-          <span class="tl-cap-item" id="tl-cap-5h-wrap-${s.name}">
-            <span class="tl-cap-label">5h</span>
-            <span class="tl-cap-bar"><span class="tl-cap-fill" id="tl-cap-5h-fill-${s.name}"></span></span>
-            <span class="tl-cap-pct" id="tl-cap-5h-pct-${s.name}">&mdash;</span>
-          </span>
-          <span class="tl-cap-item" id="tl-cap-7d-wrap-${s.name}">
-            <span class="tl-cap-label">7d</span>
-            <span class="tl-cap-bar"><span class="tl-cap-fill" id="tl-cap-7d-fill-${s.name}"></span></span>
-            <span class="tl-cap-pct" id="tl-cap-7d-pct-${s.name}">&mdash;</span>
-          </span>
-        </span>
       </div>
       <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
            which is collapsed by default, so the frozen state needs to announce
@@ -26098,40 +26064,9 @@ async function refreshUsageLimits(){
     const tsd=document.getElementById('tools-usage-7d-wrap');
     if(tfh)tfh.title=fhTitle;
     if(tsd)tsd.title=sdTitle;
-    _usageCaps={has:true,fh:Number(fh.utilization)||0,sd:Number(sd.utilization)||0,
-                fhTitle:fhTitle,sdTitle:sdTitle};
-    paintSessionUsageCaps();
   }catch(e){
     /* keep last known display */
   }
-}
-// The same two windows, repeated under every open terminal. The header pair is
-// off-screen on a phone and easy to miss on a laptop, and "how much of the cap
-// is left" is a question you ask WHILE a session is running, not while looking
-// at the header. One fetch feeds both: the last answer is kept here and the
-// session bars are repainted from it, so this adds no upstream traffic.
-let _usageCaps={has:false,fh:0,sd:0,fhTitle:'',sdTitle:''};
-function _applyCapStyle(fillEl,pctNum){
-  if(!fillEl)return;
-  fillEl.style.width=Math.min(100,Math.max(0,pctNum))+'%';
-  const cls=pctNum>=90?'crit':(pctNum>=70?'warn':'');
-  fillEl.className='tl-cap-fill'+(cls?' '+cls:'');
-}
-function paintSessionUsageCaps(){
-  document.querySelectorAll('.tl-cap').forEach(function(wrap){
-    const name=wrap.id.slice('tl-cap-'.length);
-    wrap.classList.toggle('no-data',!_usageCaps.has);
-    [['5h',_usageCaps.fh,_usageCaps.fhTitle],['7d',_usageCaps.sd,_usageCaps.sdTitle]]
-      .forEach(function(row){
-        const key=row[0],val=row[1],title=row[2];
-        _applyCapStyle(document.getElementById('tl-cap-'+key+'-fill-'+name),
-                       _usageCaps.has?val:0);
-        const pct=document.getElementById('tl-cap-'+key+'-pct-'+name);
-        if(pct)pct.textContent=_usageCaps.has?Math.round(val)+'%':'—';
-        const w=document.getElementById('tl-cap-'+key+'-wrap-'+name);
-        if(w)w.title=_usageCaps.has?title:'Anthropic usage unavailable.';
-      });
-  });
 }
 // When the backend has no fresh number (upstream down or rate-limited) retry in
 // 5 minutes instead of waiting out the full hourly tick, so the bars fill in as

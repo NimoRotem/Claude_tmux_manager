@@ -961,15 +961,22 @@ def test_the_key_bar_drops_the_retired_controls():
     assert "sendSlashCommand('${name}','/usage')" in html
 
 
-def test_the_live_bar_carries_the_account_caps():
+def test_the_account_caps_are_shown_once(): 
     import app
 
     html = app.HTML_PAGE
 
-    assert 'class="tl-cap" id="tl-cap-${s.name}"' in html
-    assert "function paintSessionUsageCaps()" in html
-    # Fed from the fetch the header already makes, not a second one.
-    assert "_usageCaps={has:true," in html
+    # The header already carries 5h and 7d. A second copy under every terminal
+    # meant the same pair twice on one screen, which is a duplicate rather than
+    # a reading.
+    assert "tl-cap" not in html
+    assert "paintSessionUsageCaps" not in html
+    assert 'id="nav-usage-5h-fill"' in html
+    assert 'id="nav-usage-7d-fill"' in html
+    # The percentage beside each track is the reading, so the track itself is
+    # short: it only has to say roughly where in the range the number sits.
+    assert ".nav-usage-bar{position:relative;width:22px" in html
+    assert ".nav-stat-bar{position:relative;width:22px" in html
 
 
 def test_claude_processes_are_attributed_to_their_session(monkeypatch):
