@@ -76,3 +76,34 @@ codex-config.tmp.toml
 # Environment / secrets
 .env
 .env.*
+
+#  THIS REPOSITORY IS PUBLIC. Verified 2026-09-04.
+#  The rules above already keep spreadsheets, archives and images out, which is most of the way
+#  there, but the working tree also collects business documents as MARKDOWN and JSON and those
+#  were unprotected: EBITDA and balance-sheet audits, a QuickBooks consolidation, expense data,
+#  billing notes, a mailbox search dump, a client handover. None of it has ever been committed,
+#  checked across every branch. But 1,283 untracked files sat here against 100 tracked ones, so
+#  `git add -A` in this tree was one keystroke from publishing the company's finances.
+*_AUDIT_*.md
+EBITDA_*.md
+BS_AUDIT_*.md
+QB_*.md
+GRABO_*.md
+HANDOVER-*.md
+billing*.md
+expenses_data.json
+doba_*.json
+gmail-outbound-search.md
+
+#  Agent working state, not source.
+.claude/
+.playwright-mcp/
+
+#  Same reasoning, second pass: an expense review, a for-sale report, a sourcing comparison, a
+#  pending trademark list, and a vendor binary distribution that is nobody's source.
+LV_STORAGE_OPTIONS_*.md
+charts/
+gripster_shots/
+td_pending.json
+tm_list.json
+ExpansionHunter-*/

@@ -1,0 +1,157 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - button [ref=e771] [cursor=pointer]:
+          - img [ref=e774]: close
+        - heading "Ads" [level=1] [ref=e12]:
+          - generic [ref=e13] [cursor=pointer]:
+            - img [ref=e14]
+            - img [ref=e21]
+            - generic [ref=e23]: Ads
+        - button "Manager account nebula 453-663-8374" [ref=e26] [cursor=pointer]:
+          - generic [ref=e29]:
+            - generic [ref=e30]: Manager account nebula
+            - generic [ref=e31]: 453-663-8374
+            - img [ref=e33]: arrow_drop_down
+      - generic [ref=e34]:
+        - generic [ref=e35]:
+          - button "Search" [ref=e37] [cursor=pointer]:
+            - generic [ref=e39]:
+              - img [ref=e41]: search
+              - generic [ref=e42]: Search
+          - button "Appearance" [ref=e45] [cursor=pointer]:
+            - generic [ref=e47]:
+              - img [ref=e49]: responsive_layout
+              - generic [ref=e50]: Appearance
+          - button "Help" [ref=e61] [cursor=pointer]:
+            - generic [ref=e63]:
+              - img [ref=e65]: help_outline
+              - generic [ref=e66]: Help
+          - generic [ref=e70]:
+            - button "Notifications" [ref=e73] [cursor=pointer]:
+              - generic [ref=e75]:
+                - img [ref=e78]: notifications
+                - generic [ref=e79]: Notifications
+            - dialog "Notifications" [ref=e776]:
+              - generic [ref=e780]:
+                - generic [ref=e781]:
+                  - img "Warning notification icon" [ref=e783]: error_outline
+                  - button "3 accounts are suspended View" [ref=e784] [cursor=pointer]:
+                    - text: 3 accounts are suspended
+                    - generic [ref=e785]: View
+                - generic [ref=e786]:
+                  - img "Warning notification icon" [ref=e788]: error_outline
+                  - button "3 accounts have no ads running View" [ref=e789] [cursor=pointer]:
+                    - text: 3 accounts have no ads running
+                    - generic [ref=e790]: View
+                - button "Close notifications" [ref=e791] [cursor=pointer]:
+                  - img [ref=e794]: clear
+        - generic [ref=e82]:
+          - generic "453-663-8374 Manager account nebula" [ref=e83]
+          - generic [ref=e84]: nimrod.rotem@gmail.com
+        - img "Google account (nimrod.rotem@gmail.com)" [ref=e86] [cursor=pointer]
+    - main [ref=e234]:
+      - generic [ref=e236]:
+        - tabpanel [ref=e802]:
+          - generic [ref=e805]:
+            - generic [ref=e806]:
+              - region "Name" [ref=e809]:
+                - generic [ref=e811]:
+                  - button "Name panel" [expanded] [ref=e812] [cursor=pointer]:
+                    - img "Name panel" [ref=e813]: expand_less
+                  - generic [ref=e815]:
+                    - generic [ref=e816]: Name
+                    - textbox "Enter account name" [ref=e823]: iaoij.com
+              - region "Type" [ref=e828]:
+                - generic [ref=e830]:
+                  - button "Type panel" [expanded] [ref=e831] [cursor=pointer]:
+                    - img "Type panel" [ref=e832]: expand_less
+                  - generic [ref=e834]:
+                    - generic [ref=e835]: Type
+                    - button "Google Ads account" [ref=e840] [cursor=pointer]:
+                      - generic [ref=e841]: Google Ads account
+                      - img [ref=e843]: arrow_drop_down
+              - region "Country" [ref=e846]:
+                - generic [ref=e848]:
+                  - button "Country panel" [expanded] [ref=e849] [cursor=pointer]:
+                    - img "Country panel" [ref=e850]: expand_less
+                  - generic [ref=e852]:
+                    - generic [ref=e853]: Country
+                    - button "United States" [ref=e858] [cursor=pointer]:
+                      - generic [ref=e859]: United States
+                      - img [ref=e861]: arrow_drop_down
+              - region "Time zone" [ref=e864]:
+                - generic [ref=e866]:
+                  - button "Time zone panel" [expanded] [ref=e867] [cursor=pointer]:
+                    - img "Time zone panel" [ref=e868]: expand_less
+                  - generic [ref=e870]:
+                    - generic [ref=e871]: Time zone
+                    - button "(GMT-07:00) Los Angeles Time" [ref=e976] [cursor=pointer]:
+                      - generic [ref=e877]: (GMT-07:00) Los Angeles Time
+                      - img [ref=e879]: arrow_drop_down
+              - region "Currency" [ref=e882]:
+                - generic [ref=e884]:
+                  - button "Currency panel" [expanded] [ref=e885] [cursor=pointer]:
+                    - img "Currency panel" [ref=e886]: expand_less
+                  - generic [ref=e888]:
+                    - generic [ref=e889]: Currency
+                    - generic [ref=e890]:
+                      - generic "Select a currency" [ref=e892]:
+                        - button "US Dollar (USD $)" [ref=e894] [cursor=pointer]:
+                          - generic [ref=e895]: US Dollar (USD $)
+                          - img [ref=e897]: arrow_drop_down
+                      - generic [ref=e900]:
+                        - text: This is the currency you'll use to pay Google. Review the
+                        - link "available payment options." [ref=e901] [cursor=pointer]:
+                          - /url: https://billing.google.com/payments/paymentsinfofinder?hl=en_US
+              - region "Data protection contact" [ref=e905]:
+                - generic [ref=e907]:
+                  - button "Data protection contact panel" [expanded] [ref=e908] [cursor=pointer]:
+                    - img "Data protection contact panel" [ref=e909]: expand_less
+                  - generic [ref=e911]:
+                    - generic [ref=e912]: Data protection contact
+                    - checkbox "Use data protection contact information from this manager" [ref=e914] [cursor=pointer]:
+                      - img [ref=e917]: check_box_outline_blank
+                      - generic [ref=e919]: Use data protection contact information from this manager
+              - region "Invite user" [ref=e922]:
+                - generic [ref=e924]:
+                  - button "Invite user panel" [expanded] [ref=e925] [cursor=pointer]:
+                    - img "Invite user panel" [ref=e926]: expand_less
+                  - generic [ref=e928]:
+                    - generic [ref=e929]: Invite user
+                    - generic [ref=e931]:
+                      - generic [ref=e932]:
+                        - text: Invite users to this account (optional)
+                        - button "More information" [ref=e934] [cursor=pointer]:
+                          - img "More information" [ref=e935]: help_outline
+                      - generic [ref=e936]:
+                        - generic [ref=e940]:
+                          - generic:
+                            - generic: Enter email address
+                          - textbox "Enter email address" [ref=e941]
+                        - button "Admin" [ref=e946] [cursor=pointer]:
+                          - generic [ref=e947]: Admin
+                          - img [ref=e949]: arrow_drop_down
+            - iframe [ref=e986]:
+              - generic [ref=f19e2]:
+                - generic [ref=f19e3]:
+                  - checkbox "I'm not a robot" [ref=f19e7]
+                  - generic [ref=f19e11]: I'm not a robot
+                - generic [ref=f19e15]: reCAPTCHA
+        - generic [ref=e718]: © Google, 2026.
+  - generic:
+    - dialog:
+      - generic:
+        - generic:
+          - heading [level=1]: Turn off ad blockers
+          - paragraph: Google Ads can't work when you're using an ad blocker. To use Google Ads, please turn off any ad blockers for now.
+  - generic:
+    - generic:
+      - generic:
+        - dialog "dialog"
+  - generic:
+    - status [ref=e1013]
+    - generic:
+      - generic:
+        - dialog "dialog"
