@@ -1,0 +1,24 @@
+cd /home/nimrod_rotem/patent-v3 && set -a && . /home/nimrod_rotem/patent-v3/.env
+ && set +a && PYTHONPATH=/home/nimrod_rotem/patent-v3/src /home/nimrod_rotem/pat
+ent-v3/.venv/bin/python -u /tmp/mk20.py 2>&1 | tee /tmp/mk20.log
+nimrod_rotem@nimo-iptorch-patents:/home/nimrod_rotem/patent-v3$ cd /home/nimrod_
+rotem/patent-v3 && set -a && . /home/nimrod_rotem/patent-v3/.env && set +a && PY
+THONPATH=/home/nimrod_rotem/patent-v3/src /home/nimrod_rotem/patent-v3/.venv/bin
+/python -u /tmp/mk20.py 2>&1 | tee /tmp/mk20.log
+[chrome] masthead from /home/nimrod_rotem/iptorch-chrome
+slug adhoc-9144cc2d963d | pubs 20 | app 19/318,450
+done in 284s | files 89
+nimrod_rotem@nimo-iptorch-patents:/home/nimrod_rotem/patent-v3$
+
+
+
+
+
+
+
+
+
+
+
+
+

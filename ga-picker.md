@@ -1,0 +1,347 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e6]:
+      - generic [ref=e7]:
+        - generic [ref=e11]: Analytics
+        - button "Open the universal picker." [ref=e549] [cursor=pointer]:
+          - generic [ref=e550]:
+            - generic [ref=e551]:
+              - generic [ref=e552]: ID.grabo.com
+              - img [ref=e553]: chevron_right
+              - generic [ref=e554]: GRABO Indonesia
+            - generic [ref=e555]:
+              - generic [ref=e557]: GRABO Indonesia
+              - img [ref=e558]: arrow_drop_down
+        - search [ref=e14]:
+          - img [ref=e15]: search
+          - textbox "Search" [ref=e17]:
+            - /placeholder: Try searching "measurement ID"
+        - button "Switch products" [ref=e19] [cursor=pointer]:
+          - img [ref=e20]
+        - button "Ask Advisor" [ref=e24] [cursor=pointer]:
+          - img [ref=e25]: search_spark
+        - button "Help entry menu" [ref=e29] [cursor=pointer]:
+          - img [ref=e30]: help
+        - button "Open the user account switcher panel." [ref=e34] [cursor=pointer]
+    - generic [ref=e37]:
+      - generic [ref=e41]:
+        - navigation "Main pages" [ref=e42]:
+          - link "Home" [ref=e44] [cursor=pointer]:
+            - img [ref=e45]:
+              - img [ref=e46]
+            - generic [ref=e49]: Home
+          - link "Reports" [ref=e52] [cursor=pointer]:
+            - img [ref=e53]: insert_chart_filled
+            - generic [ref=e54]: Reports
+          - link "Explore" [ref=e56] [cursor=pointer]:
+            - img [ref=e57]: data_exploration
+            - generic [ref=e58]: Explore
+          - link "Advertising" [ref=e60] [cursor=pointer]:
+            - img [ref=e61]: ads_click
+            - generic [ref=e62]: Advertising
+        - navigation "Settings pages" [ref=e63]:
+          - link "Tasks" [ref=e65] [cursor=pointer]:
+            - img [ref=e66]: task_alt
+            - generic [ref=e67]: Tasks
+          - link "Admin" [ref=e69] [cursor=pointer]:
+            - img [ref=e70]: settings_filled
+            - generic [ref=e71]: Admin
+      - generic [ref=e75]:
+        - main [ref=e76]:
+          - generic [ref=e77]:
+            - generic [ref=e80]:
+              - generic [ref=e83]:
+                - heading "Home" [level=1] [ref=e88]
+                - generic [ref=e93]:
+                  - generic "View annotations" [ref=e94]:
+                    - button "View annotations" [ref=e95] [cursor=pointer]:
+                      - img [ref=e97]:
+                        - img [ref=e98]
+                  - generic "Insights" [ref=e102]:
+                    - button "Insights" [ref=e103] [cursor=pointer]:
+                      - img [ref=e105]:
+                        - img [ref=e106]
+              - generic [ref=e116]:
+                - heading "No data received from your website yet." [level=2] [ref=e117]
+                - paragraph [ref=e118]: "To start collecting data make sure your website is tagged using the Measurement ID: G-XWW31H73P3"
+                - button "Get tagging instructions" [ref=e119] [cursor=pointer]:
+                  - generic [ref=e120]: Get tagging instructions
+              - generic [ref=e125]:
+                - generic [ref=e129]:
+                  - generic [ref=e130]:
+                    - generic [ref=e137]:
+                      - generic [ref=e138]:
+                        - generic [ref=e139]:
+                          - tablist [ref=e142]:
+                            - generic [ref=e143]:
+                              - tab "Active users 0" [selected] [ref=e144] [cursor=pointer]:
+                                - generic "Active users 0" [ref=e150]:
+                                  - button "Active users" [ref=e152]:
+                                    - generic [ref=e153]: Active users
+                                    - img [ref=e154]: arrow_drop_down
+                                  - generic [ref=e157]: "0"
+                              - tab "Event count 0" [ref=e158] [cursor=pointer]:
+                                - generic "Event count 0" [ref=e164]:
+                                  - button "Event count" [ref=e166]:
+                                    - generic [ref=e167]: Event count
+                                    - img [ref=e168]: arrow_drop_down
+                                  - generic [ref=e171]: "0"
+                              - tab "Key events 0" [ref=e172] [cursor=pointer]:
+                                - generic "Key events 0" [ref=e178]:
+                                  - button "Key events" [ref=e180]:
+                                    - generic [ref=e181]: Key events
+                                    - img [ref=e182]: arrow_drop_down
+                                  - generic [ref=e185]: "0"
+                              - tab "New users 0" [ref=e186] [cursor=pointer]:
+                                - generic "New users 0" [ref=e192]:
+                                  - button "New users" [ref=e194]:
+                                    - generic [ref=e195]: New users
+                                    - img [ref=e196]: arrow_drop_down
+                                  - generic [ref=e199]: "0"
+                          - generic:
+                            - tabpanel "Active users 0"
+                        - generic [ref=e200]:
+                          - button "Benchmarking data off" [ref=e202] [cursor=pointer]:
+                            - img [ref=e203]:
+                              - img [ref=e204]
+                            - generic [ref=e206]: "Off"
+                          - button "This card uses 100% of available data. Click to view more information." [ref=e211] [cursor=pointer]:
+                            - img [ref=e212]: check_circle
+                            - generic [ref=e213]: This card uses 100% of available data. Click to view more information.
+                            - img [ref=e214]: arrow_drop_down
+                      - img [ref=e219]:
+                        - generic [ref=e221]:
+                          - generic [ref=e223]: 30Jun
+                          - generic [ref=e225]: 01Jul
+                          - generic [ref=e227]: "02"
+                          - generic [ref=e229]: "03"
+                          - generic [ref=e231]: "04"
+                          - generic [ref=e233]: "05"
+                          - generic [ref=e235]: "06"
+                    - generic [ref=e246]:
+                      - combobox "Open date range picker" [ref=e250] [cursor=pointer]:
+                        - generic [ref=e253]: Last 7 days
+                        - img [ref=e254]: arrow_drop_down
+                      - button "View reports snapshot" [ref=e258] [cursor=pointer]:
+                        - generic [ref=e260]: View reports snapshot
+                        - img [ref=e261]: arrow_forward
+                  - generic [ref=e264]:
+                    - generic [ref=e267]:
+                      - generic:
+                        - generic [ref=e271]:
+                          - generic [ref=e272]:
+                            - button "Active users in last 30 minutes" [ref=e274]
+                            - generic [ref=e275]: "0"
+                          - button "This card uses 100% of available data. Click to view more information." [ref=e278] [cursor=pointer]:
+                            - img [ref=e279]: check_circle
+                            - generic [ref=e280]: This card uses 100% of available data. Click to view more information.
+                            - img [ref=e281]: arrow_drop_down
+                        - generic [ref=e291]: Active users per minute
+                        - img [ref=e296]:
+                          - listbox [ref=e298]:
+                            - group "Active users 0 Active users" [ref=e301]
+                            - group "Active users 0 Active users" [ref=e303]
+                            - group "Active users 0 Active users" [ref=e305]
+                            - group "Active users 0 Active users" [ref=e307]
+                            - group "Active users 0 Active users" [ref=e309]
+                            - group "Active users 0 Active users" [ref=e311]
+                            - group "Active users 0 Active users" [ref=e313]
+                            - group "Active users 0 Active users" [ref=e315]
+                            - group "Active users 0 Active users" [ref=e317]
+                            - group "Active users 0 Active users" [ref=e319]
+                            - group "Active users 0 Active users" [ref=e321]
+                            - group "Active users 0 Active users" [ref=e323]
+                            - group "Active users 0 Active users" [ref=e325]
+                            - group "Active users 0 Active users" [ref=e327]
+                            - group "Active users 0 Active users" [ref=e329]
+                            - group "Active users 0 Active users" [ref=e331]
+                            - group "Active users 0 Active users" [ref=e333]
+                            - group "Active users 0 Active users" [ref=e335]
+                            - group "Active users 0 Active users" [ref=e337]
+                            - group "Active users 0 Active users" [ref=e339]
+                            - group "Active users 0 Active users" [ref=e341]
+                            - group "Active users 0 Active users" [ref=e343]
+                            - group "Active users 0 Active users" [ref=e345]
+                            - group "Active users 0 Active users" [ref=e347]
+                            - group "Active users 0 Active users" [ref=e349]
+                            - group "Active users 0 Active users" [ref=e351]
+                            - group "Active users 0 Active users" [ref=e353]
+                            - group "Active users 0 Active users" [ref=e355]
+                            - group "Active users 0 Active users" [ref=e357]
+                            - group "Active users 0 Active users" [ref=e561]
+                        - generic [ref=e370]:
+                          - table [ref=e371]:
+                            - row "Country Active users" [ref=e372]:
+                              - columnheader "Country" [ref=e373]:
+                                - button "Country" [ref=e377] [cursor=pointer]:
+                                  - generic [ref=e379]:
+                                    - generic [ref=e380]: Country
+                                    - img [ref=e381]: arrow_drop_down
+                              - columnheader "Active users" [ref=e384]:
+                                - button "Active users" [ref=e388] [cursor=pointer]:
+                                  - generic [ref=e390]:
+                                    - generic [ref=e391]: Active users
+                                    - img [ref=e392]: arrow_drop_down
+                          - generic [ref=e395]: No data available
+                          - table:
+                            - row
+                    - button "View realtime" [ref=e398] [cursor=pointer]:
+                      - generic [ref=e400]: View realtime
+                      - img [ref=e401]: arrow_forward
+                - generic [ref=e405]:
+                  - heading "Get started with Google Analytics 4" [level=2] [ref=e408]:
+                    - generic [ref=e409]: Get started with Google Analytics 4
+                  - generic [ref=e411]:
+                    - generic [ref=e414]:
+                      - generic [ref=e415]:
+                        - heading "Continue setting up your property" [level=3] [ref=e427]:
+                          - generic [ref=e428]: Continue setting up your property
+                        - generic [ref=e437]: A property holds all the measurement data for your website, mobile app, or both. Set up your property so that you can collect data, measure activity, and much more.
+                      - link "Go to Tasks" [ref=e444] [cursor=pointer]:
+                        - /url: "#/a213350875p294207966/task-assistant"
+                        - generic [ref=e448]: Go to Tasks
+                    - generic [ref=e453]:
+                      - generic [ref=e454]:
+                        - heading "Try the Analytics demo account" [level=3] [ref=e466]:
+                          - generic [ref=e467]: Try the Analytics demo account
+                        - generic [ref=e471]:
+                          - generic [ref=e476]: Get to know Google Analytics 4 features by analyzing and experimenting with real business data.
+                          - generic [ref=e481]: The demo trial lets you explore GA4 using demo data, without affecting your own data. You can remove the demo account at any time.
+                      - link "Access the account" [ref=e488] [cursor=pointer]:
+                        - /url: https://support.google.com/analytics/answer/6367342#access
+                        - generic [ref=e490]:
+                          - generic [ref=e492]: Access the account
+                          - img [ref=e493]: open_in_new
+                    - generic [ref=e498]:
+                      - generic [ref=e499]:
+                        - heading "Learn about Analytics" [level=3] [ref=e511]:
+                          - generic [ref=e512]: Learn about Analytics
+                        - generic [ref=e521]: Get the most out of Google Analytics with this free course.
+                      - link "Take the course on Skillshop" [ref=e528] [cursor=pointer]:
+                        - /url: https://goo.gle/ga-courses
+                        - generic [ref=e530]:
+                          - generic [ref=e532]: Take the course on Skillshop
+                          - img [ref=e533]: open_in_new
+            - generic [ref=e537]:
+              - text: © 2026 Google |
+              - link "Analytics home" [ref=e538] [cursor=pointer]:
+                - /url: https://www.google.com/analytics/?hl=en-US
+              - text: "|"
+              - link "Terms of Service" [ref=e539] [cursor=pointer]:
+                - /url: https://www.google.com/analytics/tos.html?hl=en-US
+              - text: "|"
+              - link "Privacy Policy" [ref=e540] [cursor=pointer]:
+                - /url: https://www.google.com/policies/privacy/?hl=en-US
+              - text: "|"
+              - button "Send feedback" [ref=e541] [cursor=pointer]:
+                - img [ref=e542]: feedback
+                - generic [ref=e543]: Send feedback
+        - generic:
+          - complementary
+      - generic:
+        - button "Open context menu"
+  - generic [ref=e566]:
+    - generic [ref=e567]:
+      - generic [ref=e568]:
+        - tablist [ref=e571]:
+          - generic [ref=e572]:
+            - tab "All" [selected] [ref=e573] [cursor=pointer]:
+              - generic [ref=e575]: All
+            - tab "Favorites" [ref=e576] [cursor=pointer]:
+              - generic [ref=e578]: Favorites
+            - tab "Recents" [ref=e579] [cursor=pointer]:
+              - generic [ref=e581]: Recents
+        - generic:
+          - tabpanel "All"
+      - generic [ref=e583]:
+        - img [ref=e585]: search
+        - textbox "Search" [active] [ref=e587]
+      - link "Visit Platform Home" [ref=e590] [cursor=pointer]:
+        - /url: //marketingplatform.google.com/home/?utm_campaign=SuiteHeader&utm_source=UniversalPicker&utm_medium=platformHomeButton
+    - generic [ref=e591]:
+      - generic [ref=e593]:
+        - tablist [ref=e596]:
+          - generic [ref=e597]:
+            - tab "Analytics" [selected] [ref=e598] [cursor=pointer]:
+              - img "Analytics" [ref=e601]
+            - tab "Tag Manager" [ref=e602] [cursor=pointer]:
+              - img "Tag Manager" [ref=e605]
+        - generic:
+          - tabpanel "Analytics"
+      - button "Select an organization" [ref=e608] [cursor=pointer]:
+        - generic [ref=e609]:
+          - generic "ID.grabo.com logo" [ref=e611]:
+            - img "ID.grabo.com" [ref=e613]:
+              - generic [ref=e615]: I
+          - generic [ref=e616]: ID.grabo.com
+          - img [ref=e617]: arrow_drop_down
+    - tree [ref=e620]:
+      - treeitem "Analytics Accounts GRABO Indonesia 213350875" [ref=e621]:
+        - generic [ref=e622]:
+          - button "Analytics Accounts" [ref=e623]
+          - listbox "Analytics Accounts" [ref=e626]:
+            - option "GRABO Indonesia 213350875" [selected] [ref=e627] [cursor=pointer]:
+              - button "GRABO Indonesia 213350875" [ref=e628]:
+                - generic [ref=e630]:
+                  - generic [ref=e631]:
+                    - generic [ref=e634]:
+                      - text: GRABO Indonesia
+                      - strong
+                    - generic [ref=e636]:
+                      - text: "213350875"
+                      - strong
+                  - img [ref=e638]: chevron_right
+            - option "IAoij 400212909" [ref=e639] [cursor=pointer]:
+              - button "IAoij 400212909" [ref=e640]:
+                - generic [ref=e643]:
+                  - generic [ref=e646]:
+                    - text: IAoij
+                    - strong
+                  - generic [ref=e648]:
+                    - text: "400212909"
+                    - strong
+      - treeitem "Properties & Apps GRABO Indonesia 294207966 Star item" [ref=e650]:
+        - generic [ref=e651]:
+          - button "Properties & Apps" [ref=e652]
+          - listbox "Properties & Apps" [ref=e655]:
+            - option "GRABO Indonesia 294207966 Star item" [selected] [ref=e656] [cursor=pointer]:
+              - link "GRABO Indonesia 294207966 Star item" [ref=e657]:
+                - /url: "#/a213350875p294207966/reports/intelligenthome"
+                - generic [ref=e659]:
+                  - generic [ref=e660]:
+                    - generic [ref=e663]:
+                      - text: GRABO Indonesia
+                      - strong
+                    - generic [ref=e665]:
+                      - text: "294207966"
+                      - strong
+                  - generic [ref=e666]:
+                    - img [ref=e667]: check
+                    - button "Star item" [ref=e669]:
+                      - img [ref=e670]: star_border
+            - option "GRABO Software 544451438 Star item" [ref=e673] [cursor=pointer]:
+              - link "GRABO Software 544451438 Star item" [ref=e674]:
+                - /url: "#/a213350875p544451438/reports/intelligenthome"
+                - generic [ref=e676]:
+                  - generic [ref=e677]:
+                    - generic [ref=e680]:
+                      - text: GRABO Software
+                      - strong
+                    - generic [ref=e682]:
+                      - text: "544451438"
+                      - strong
+                  - button "Star item" [ref=e685]:
+                    - img [ref=e686]: star_border
+            - option "id.grabo.com 316711039 Star item" [ref=e689] [cursor=pointer]:
+              - link "id.grabo.com 316711039 Star item" [ref=e690]:
+                - /url: "#/a213350875p316711039/reports/intelligenthome"
+                - generic [ref=e692]:
+                  - generic [ref=e693]:
+                    - generic [ref=e696]:
+                      - text: id.grabo.com
+                      - strong
+                    - generic [ref=e698]:
+                      - text: "316711039"
+                      - strong
+                  - button "Star item" [ref=e701]:
+                    - img [ref=e702]: star_border
