@@ -1582,6 +1582,13 @@ def _clear_sso_cookie(resp) -> None:
 # existing messages.json / notes.json / uploads). Per-user Claude config lives
 # at ~/.claude-user-<id>/ for non-admin users; admin still uses ~/.claude.
 USERS_FILE = MESSAGES_DIR / "users.json"
+# Last known-good copy of USERS_FILE, refreshed on every successful save. It is
+# the fallback when the live file cannot be read, so an unreadable users.json
+# never costs anybody their account.
+USERS_BACKUP_FILE = MESSAGES_DIR / "users.json.bak"
+# Serialises saves inside this process so two requests cannot interleave their
+# temp file + rename.
+_users_write_lock = threading.RLock()
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -1596,16 +1603,59 @@ def _new_user_id() -> str:
     return "u_" + secrets.token_hex(8)
 
 
+def _read_users_file(path: Path) -> Optional[list]:
+    """Return the user list in `path`, or None if it is absent or unusable.
+
+    Deliberately never repairs anything: the caller decides what an unreadable
+    file means, because getting that wrong deletes accounts."""
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.error("Cannot read %s", path, exc_info=True)
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.error("%s is not valid JSON (%d bytes)", path, len(raw), exc_info=True)
+        return None
+    users = data.get("users") if isinstance(data, dict) else None
+    return users if isinstance(users, list) and users else None
+
+
 def _load_users() -> list:
-    """Load users from disk. On first run, seed an admin from env vars."""
+    """Load users from disk. On first run, seed an admin from env vars.
+
+    An unreadable users.json is NOT read as "there are no users". Re-seeding
+    writes a lone env-var admin over everybody, and on 2026-09-11 that is
+    exactly what deleted two admins off codex.lisa.my: a request read the file
+    during the truncate window of a concurrent save, got zero bytes, and the
+    recovery path saved its replacement. Saves are atomic now, and this side
+    falls back to the backup and keeps whatever it could not parse rather than
+    seeding over the top of it."""
+    users = _read_users_file(USERS_FILE)
+    if users:
+        return users
+    users = _read_users_file(USERS_BACKUP_FILE)
+    if users:
+        logger.warning(
+            "%s was unusable -- recovered %d user(s) from %s",
+            USERS_FILE, len(users), USERS_BACKUP_FILE,
+        )
+        _save_users(users)
+        return users
+    # Nothing usable on either path. Keep the evidence before seeding, so a
+    # file that was merely unlucky can still be put back by hand.
     if USERS_FILE.exists():
         try:
-            data = json.loads(USERS_FILE.read_text())
-            users = data.get("users") if isinstance(data, dict) else None
-            if isinstance(users, list) and users:
-                return users
+            kept = USERS_FILE.with_name(
+                USERS_FILE.name + ".unreadable-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            )
+            shutil.copy2(USERS_FILE, kept)
+            logger.error("Seeding a fresh admin; the old %s is kept at %s", USERS_FILE, kept)
         except Exception:
-            logger.exception("Failed to read %s -- re-seeding", USERS_FILE)
+            logger.debug("Could not preserve the unreadable %s", USERS_FILE, exc_info=True)
     # Seed admin from env vars (single-user legacy mode)
     salt = _new_salt()
     admin = {
@@ -1622,13 +1672,34 @@ def _load_users() -> list:
 
 
 def _save_users(users: list):
+    """Persist the user list atomically, refreshing the known-good backup.
+
+    A plain write_text truncates the file first, so every concurrent reader in
+    that window sees an empty file. Every login writes here (last_login), so
+    the window is hit often enough to matter. Land the new content with
+    os.replace instead: a reader gets either the old file or the new one."""
+    if not users:
+        logger.error("Refusing to save an empty user list to %s", USERS_FILE)
+        return
     try:
         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        USERS_FILE.write_text(json.dumps({"users": users}, indent=2))
-        try:
-            USERS_FILE.chmod(0o600)
-        except Exception:
-            logger.debug("chmod 600 on users.json failed", exc_info=True)
+        payload = json.dumps({"users": users}, indent=2)
+        with _users_write_lock:
+            # Only ever back up a file that parses, or a bad save would poison
+            # the fallback the next load depends on.
+            if _read_users_file(USERS_FILE):
+                try:
+                    shutil.copy2(USERS_FILE, USERS_BACKUP_FILE)
+                    USERS_BACKUP_FILE.chmod(0o600)
+                except Exception:
+                    logger.debug("Could not refresh %s", USERS_BACKUP_FILE, exc_info=True)
+            tmp = USERS_FILE.with_name(f"{USERS_FILE.name}.tmp-{os.getpid()}")
+            with open(tmp, "w") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, USERS_FILE)
     except Exception:
         logger.exception("Failed to save users to %s", USERS_FILE)
 
