@@ -2456,10 +2456,9 @@ def _load_users() -> list:
     """Load users from disk. On first run, seed an admin from env vars.
 
     An unreadable users.json is NOT read as "there are no users". Re-seeding
-    writes a lone env-var admin over everybody, and on 2026-09-11 that is
-    exactly what deleted two admins off codex.lisa.my: a request read the file
-    during the truncate window of a concurrent save, got zero bytes, and the
-    recovery path saved its replacement. Saves are atomic now, and this side
+    writes a lone env-var admin over everybody. A read during the truncate
+    window of a concurrent save can return zero bytes and mistakenly trigger
+    that destructive recovery path. Saves are atomic now, and this side
     falls back to the backup and keeps whatever it could not parse rather than
     seeding over the top of it."""
     users = _read_users_file(USERS_FILE)
