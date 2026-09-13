@@ -2083,11 +2083,10 @@ class TestSessionStats:
 
     @patch("app._find_session_jsonl_files", return_value=[])
     def test_session_stats_nonexistent_session(self, mock_jsonl, authed_client):
-        # The stats endpoint doesn't validate session existence — it just
-        # tries to find JSONL files and returns available:false if none found
+        # Owner isolation rejects an unknown tab before any transcript lookup.
         resp = authed_client.get("/api/sessions/nonexistent/stats")
-        assert resp.status_code == 200
-        assert resp.json()["available"] is False
+        assert resp.status_code == 404
+        mock_jsonl.assert_not_called()
 
     def test_session_stats_uses_cache(self, authed_client):
         """Second call within 15s should return cached result."""
@@ -2095,6 +2094,7 @@ class TestSessionStats:
 
         import app
         unique_session = "cache-hit-test-session"
+        app._set_session_owner(unique_session, "admin")
         cached_result = {
             "available": False,
             "_ts": time.time(),
@@ -3614,8 +3614,9 @@ class TestCreateSession:
 
         with (
             patch("app._find_session_for_user", return_value=(MOCK_SESSIONS, MOCK_SESSIONS[0])),
-            patch("app._session_config_base", return_value=codex_home),
-            patch("app._session_owner_id", side_effect=["admin", "another-user"]),
+            patch("app.CODEX_HOME", codex_home),
+            patch("app._user_codex_config_dir", return_value=codex_home),
+            patch("app._strict_session_owner", side_effect=[("admin", {"id": "admin", "role": "admin"}), None]),
             patch("app._async_is_codex_running", new=AsyncMock()) as running,
         ):
             resp = authed_client.post(

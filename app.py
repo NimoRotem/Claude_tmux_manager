@@ -51,6 +51,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from pydantic import BaseModel, Field
 
 import google_policy
+import chat_summaries
 from runtime_control import (
     BrowserLeaseStore,
     LockedJsonStore,
@@ -2270,6 +2271,7 @@ async def lifespan(_app: FastAPI):
         ("browser lifecycle", _browser_lifecycle_loop()),
         ("session lifecycle", _session_lifecycle_loop()),
         ("session tab labels", _session_tab_label_loop()),
+        ("session chat summaries", _session_chat_summary_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
@@ -8295,8 +8297,44 @@ def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
     return len(records)
 
 
+def _chat_message_id(message: dict, user_id: str = "", position: int = 0) -> str:
+    if message.get("id"):
+        return str(message["id"])
+    if message.get("role") == "assistant":
+        material = ["legacy-assistant", user_id, position]
+    else:
+        material = [message.get("role"), message.get("ts"), message.get("text")]
+    return "legacy-" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def _merge_chat_messages(existing: list, incoming: list) -> list:
+    """Merge stale worker snapshots without losing another worker's messages."""
+    merged: dict[str, dict] = {}
+    for rows in (existing, incoming):
+        user_id, assistant_position = "", 0
+        for original in rows:
+            if not isinstance(original, dict) or original.get("role") not in {"user", "assistant"}:
+                continue
+            row = dict(original)
+            key = _chat_message_id(row, user_id, assistant_position)
+            row["id"] = key
+            if row["role"] == "user":
+                user_id, assistant_position = key, 0
+            else:
+                assistant_position += 1
+            previous = merged.get(key)
+            if previous is not None and row["role"] == "user" and float(row.get("ts") or 0) == float(previous.get("ts") or 0):
+                # The controller associates canonical source identity with an
+                # already-sent user row. A stale API cache must not erase that
+                # mapping merely because its unchanged prompt timestamp ties.
+                merged[key] = {**row, **previous}
+            elif previous is None or float(row.get("ts") or 0) >= float(previous.get("ts") or 0):
+                merged[key] = row
+    return sorted(merged.values(), key=lambda row: float(row.get("ts") or 0))
+
+
 def _save_messages():
-    """Persist all session messages to per-user files based on session ownership."""
+    """Atomically merge owner-bound chat rows across API/controller processes."""
     by_user: dict[str, dict[str, list]] = {}
     owners = _load_session_owners()
     for name, entry in cache.items():
@@ -8307,16 +8345,21 @@ def _save_messages():
             and name not in owners
             and not _session_lifecycle.get(name).get("managed")
         )
-        if not msgs or not owner_id or not owner_matches:
+        if not msgs or not owner_id or not owner_matches or not _session_cache_entry_is_current(name, entry):
             continue
         by_user.setdefault(owner_id, {})[name] = msgs
 
     for uid, updates in by_user.items():
-        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
+        owner = _find_user_by_id(uid)
+        if not owner:
+            continue
         path = _user_messages_file(owner)
-        existing = _read_json_file(path)
-        existing.update(updates)
-        _write_json_file(path, existing)
+        def merge(existing: dict) -> None:
+            for name, messages in updates.items():
+                entry = cache.get(name) or {}
+                if _session_cache_entry_is_current(name, entry):
+                    existing[name] = _merge_chat_messages(existing.get(name, []), messages)
+        LockedJsonStore(path, dict).update(merge)
 
 
 def _load_session_messages(session_name: str, owner_id: str = "") -> list:
@@ -10401,22 +10444,9 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
         tasks["realtime"] = get_realtime(session_name)
 
-    # Simplified Chat tab: when Codex is idle, (re)generate ONE plain-language
-    # recap of its whole last turn. Triggered promptly on the busy->idle edge,
-    # then at most every REALTIME_TTL; the signature gate inside get_chat_summary
-    # skips the LLM call when the turn output hasn't changed.
-    _chat_status = _activity_state.get(session_name, {}).get("status", "")
-    if _chat_status == "busy":
-        entry["_chat_was_busy"] = True
-    _summary_due = (now - entry.get("chat_summary_at", 0)) >= REALTIME_TTL
-    if _chat_status == "idle" and (force_all or entry.get("_chat_was_busy") or _summary_due):
-        # Pass the last user message so the right transcript is matched when
-        # several sessions share a cwd (project dir).
-        _last_user = next((m.get("text", "") for m in reversed(entry.get("messages", []))
-                           if m.get("role") == "user"), "")
-        tasks["chat_summary"] = get_chat_summary(session_name, entry.get("chat_summary_sig", ""), _last_user)
-        entry["chat_summary_at"] = now
-        entry["_chat_was_busy"] = False
+    # The controller is the single summary producer, including while browsers
+    # are closed. HTTP refreshes only ask it to reconcile this account's chat.
+    tasks["chat_messages"] = _get_chat_messages(session_name, owner_id)
 
     if tasks:
         results = await asyncio.gather(*tasks.values())
@@ -10452,12 +10482,10 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
                 # Chat tab (that now shows the idle summary below, not raw text).
                 entry["realtime"] = realtime
                 entry["realtime_at"] = now
-        if "chat_summary" in result_map:
-            cs = result_map["chat_summary"]
-            if cs and (cs.get("summary") or cs.get("full")):
-                _append_assistant_msg(entry, cs.get("summary", ""), now,
-                                      full=cs.get("full", ""), links=cs.get("links") or [])
-                entry["chat_summary_sig"] = cs["sig"]
+        if "chat_messages" in result_map:
+            entry["messages"] = _merge_chat_messages(
+                entry.get("messages", []), result_map["chat_messages"] or []
+            )
 
     if not _session_cache_entry_is_current(session_name, entry):
         return {}
@@ -10789,6 +10817,411 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
         return None
     links = await asyncio.to_thread(_extract_turn_links, turn_text)
     return {"sig": sig, "summary": summary or _trim_plain(full, 600), "full": full, "links": links}
+
+
+_CHAT_PROGRESS_SECONDS = 20 * 60
+_CHAT_CHECK_SECONDS = 30
+_CHAT_READ_BYTES = 2_000_000
+_chat_refresh_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_chat_checked: dict[tuple, float] = {}
+_chat_backfilled: dict[tuple, str] = {}
+
+
+def _latest_chat_user(messages: list) -> dict:
+    return next((row for row in reversed(messages) if row.get("role") == "user"), {})
+
+
+def _chat_user_fingerprint(messages: list) -> str:
+    user = _latest_chat_user(messages)
+    return _chat_message_id(user) if user else ""
+
+
+def _chat_binding_matches(session_name: str, owner_id: str, generation: str) -> bool:
+    lifecycle = _session_lifecycle.get(session_name)
+    return bool(
+        owner_id and _strict_session_owner(session_name, owner_id)
+        and str(lifecycle.get("generation") or "") == generation
+        and lifecycle.get("desired_state") not in {"deleting", "deleted"}
+    )
+
+
+def _chat_pane_prose(text: str) -> tuple[str, str]:
+    """Safe fallback for the bound tab's Claude/Codex human-facing bubbles."""
+    rows = text.splitlines()
+    boundary = -1
+    prompt = ""
+    for index, line in enumerate(rows):
+        match = re.match(r"^\s*[›❯»]\s+(.+)", line)
+        if match:
+            boundary, prompt = index, match.group(1).strip()
+    out, active, seen_assistant = [], False, False
+    prompt_lines = [prompt] if prompt else []
+    for line in rows[boundary + 1:]:
+        stripped = line.strip()
+        bullet = re.match(r"^[●⏺•·]\s+(.*)", stripped)
+        if bullet:
+            seen_assistant = True
+            body = bullet.group(1)
+            tool = re.match(
+                r"(?:[A-Za-z_][\w:.-]*\(|(?:Ran|Called|Explored|Read|Searched|"
+                r"Edited|Edit|Added|Add|Updated|Update|Deleted|Delete|Created|Create|"
+                r"Wrote|Write|Moved|Renamed)\s+(?:\S|$))", body,
+            )
+            # Past-tense prose such as 'Added mobile creation. Tests pass.' is
+            # not a tool header unless it carries tool/diff syntax.
+            file_prose = re.match(r"(?:Added|Updated|Created|Edited|Deleted)\s", body)
+            if file_prose and not re.search(r"\([+−-]?\d|[/\\]|\.[A-Za-z]{1,8}(?:\s|$)", body):
+                tool = None
+            active = not tool and not _is_pane_residue(body)
+            if active:
+                out.append(body)
+        elif re.match(r"^[›❯»✻✽✶✢·]|^(?:⎿|└|╰|│|─{3})", stripped):
+            active = False
+        elif active:
+            out.append(stripped)
+        elif not seen_assistant and stripped and not _is_pane_residue(stripped):
+            prompt_lines.append(stripped)
+    return "\n".join(prompt_lines), chat_summaries.clean_prose("\n".join(out))
+
+
+def _read_chat_snapshot(session_name: str, owner_id: str, messages: list) -> dict | None:
+    """Read only this tab's validated root, never a cwd/mtime-matched sibling."""
+    if not _strict_session_owner(session_name, owner_id):
+        return None
+    user = _latest_chat_user(messages)
+    root = _terminal_history_binding(session_name, owner_id)
+    if root:
+        try:
+            fd, _relative, _fingerprint = _open_session_close_rollout(root)
+            with os.fdopen(fd, "rb") as source:
+                metadata = json.loads(source.readline())
+                payload = metadata.get("payload") or {}
+                if (metadata.get("type") != "session_meta"
+                        or payload.get("id") != root["resume_uuid"]
+                        or payload.get("session_id") != root["resume_uuid"]
+                        or payload.get("thread_source") != "user"):
+                    return None
+                size = os.fstat(source.fileno()).st_size
+                if size > _CHAT_READ_BYTES:
+                    source.seek(size - _CHAT_READ_BYTES)
+                    source.readline()
+                lines = source.read(_CHAT_READ_BYTES).decode("utf-8", "replace").splitlines()
+            records = []
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        records.append(record)
+                except (ValueError, TypeError):
+                    continue
+            turn = chat_summaries.latest_turn(
+                records, fallback_user=str(user.get("text") or ""),
+                fallback_ts=float(user.get("ts") or 0),
+            )
+            turn["_root"] = root["resume_uuid"]
+            turn["_generation"] = root["generation"]
+            turn["_recent_turns"] = chat_summaries.recent_turns(records, limit=30)
+            return turn
+        except (_SessionCloseError, OSError, ValueError, TypeError):
+            return None  # A known root that became invalid must not fall through.
+    binding = _terminal_binding(session_name, owner_id)
+    if not binding:
+        return None
+    try:
+        prompt, prose = _chat_pane_prose(capture_pane_recent(binding["session_id"], 400))
+        if _terminal_binding_state(binding) != "current":
+            return None
+    except Exception:
+        return None
+    if not prose:
+        return None
+    # The fallback reads one already-authorized pane, including Claude Code's
+    # text format. An unmatched prompt is not guessed to be the latest request.
+    if prompt and user and _norm_text(prompt) != _norm_text(user.get("text", "")):
+        return None
+    turn = chat_summaries.latest_turn(
+        [], fallback_user=str(user.get("text") or prompt),
+        fallback_ts=float(user.get("ts") or 0),
+    )
+    turn.update(text=prose, final_text="", source="pane", _terminal=binding,
+                _generation=str(binding.get("generation") or ""))
+    return turn
+
+
+async def _chat_short_summary(text: str, kind: str) -> str:
+    body = chat_summaries.clean_prose(text)
+    fallback = chat_summaries.compact_summary(body)
+    if not fallback or client is None or len(body.split()) <= 55:
+        return fallback
+    try:
+        generated = await asyncio.wait_for(llm_call(
+            system_prompt=(
+                "Write a tiny WhatsApp-style update for a non-technical user. "
+                "At most 3 short sentences and 55 words. Fragments fine. Clear, direct. "
+                "No code, commands, file paths, preamble or sign-off. Preserve useful "
+                "outcomes, questions and links. Use only stated facts; never invent "
+                "success or completion. "
+                + ("This task is STILL RUNNING. Say what is done and what is happening now."
+                   if kind == "progress" else
+                   "This is the assistant's reply. Mention any blocker or question; do not assume the task succeeded.")
+            ),
+            user_content=body[-8000:], max_tokens=145,
+        ), timeout=12)
+    except Exception:
+        generated = ""
+    return chat_summaries.compact_summary(generated) or fallback
+
+
+def _commit_chat_message(session_name: str, owner_id: str, generation: str,
+                         expected_user: str, message: dict, source_user: dict | None = None) -> list | None:
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        return None
+    def commit(data: dict):
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return None
+        rows = data.get(session_name, [])
+        if _chat_user_fingerprint(rows) != expected_user:
+            return None
+        additions = ([source_user] if source_user else []) + [message]
+        data[session_name] = _merge_chat_messages(rows, additions)
+        return data[session_name]
+    _data, rows = LockedJsonStore(_user_messages_file(owner), dict).update(commit)
+    return rows
+
+
+def _chat_turn_context(snapshot: dict, messages: list, generation: str) -> tuple[str, dict | None]:
+    """Bind canonical user identity once; clipped tails retain that association."""
+    root = str(snapshot.get("_root") or generation)
+    user_text = str(snapshot.get("user_text") or "")
+    source_ts = float(snapshot.get("started_at") or 0)
+    source_id = str(snapshot.get("turn_id") or "")
+    has_user = snapshot.get("has_user", True)
+    if not has_user:
+        user = _latest_chat_user(messages)
+        if user.get("source_root") == root and user.get("turn_id"):
+            return str(user["turn_id"]), None
+        source_id = _chat_user_fingerprint(messages) or source_id
+    turn_id = hashlib.sha256((root + ":" + source_id).encode()).hexdigest()[:24]
+    if not user_text:
+        return turn_id, None
+    candidates = []
+    for user in messages:
+        if user.get("role") != "user":
+            continue
+        if user.get("source_turn_id") == source_id and user.get("source_root") == root:
+            candidates.append(user)
+            continue
+        if user.get("source_turn_id") and user.get("source_root") == root:
+            continue
+        # /send stores the original prompt just after submission. The CLI may
+        # prefix an injected policy, but identical prompts at different times
+        # are separate user turns and must never collapse into one bubble.
+        same_text = _norm_text(user_text).endswith(_norm_text(user.get("text", "")))
+        near_time = not source_ts or abs(float(user.get("ts") or 0) - source_ts) <= 15
+        if same_text and near_time:
+            candidates.append(user)
+    if candidates:
+        user = min(candidates, key=lambda row: abs(float(row.get("ts") or 0) - source_ts))
+        source_user = {**user, "id": _chat_message_id(user), "turn_id": turn_id}
+    elif has_user:
+        source_user = {"id": "chat-" + turn_id + "-user", "role": "user",
+                       "text": user_text, "ts": source_ts, "turn_id": turn_id}
+    else:
+        return turn_id, None
+    source_user.update(source_turn_id=source_id, source_root=root)
+    return turn_id, source_user
+
+
+def _backfill_chat_history(session_name: str, owner_id: str, generation: str,
+                           snapshot: dict) -> list | None:
+    """Repair recent user-only history with bounded, local extractive recaps."""
+    turns = snapshot.get("_recent_turns") or []
+    if len(turns) < 2 or not snapshot.get("_root"):
+        return None
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        return None
+    def backfill(data: dict):
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return None
+        current = _terminal_history_binding(session_name, owner_id)
+        if not current or current.get("resume_uuid") != snapshot["_root"]:
+            return None
+        messages = data.get(session_name, [])
+        additions = []
+        for original in turns[:-1]:
+            turn = {**original, "_root": snapshot["_root"]}
+            if not turn.get("has_user") or not turn.get("user_text"):
+                continue
+            full = chat_summaries.clean_prose(turn.get("final_text") or turn.get("text") or "")
+            summary = chat_summaries.compact_summary(full)
+            if not summary:
+                continue
+            turn_id, source_user = _chat_turn_context(turn, messages, generation)
+            message_id = "chat-" + turn_id + "-final"
+            if any(row.get("id") == message_id for row in messages):
+                continue
+            # Already-summarized legacy turns should not acquire a second reply.
+            start = float(turn.get("started_at") or 0)
+            end = float(turn.get("last_output_at") or start)
+            if any(row.get("role") == "assistant" and not row.get("turn_id")
+                   and start <= float(row.get("ts") or 0) <= end + 15 for row in messages):
+                continue
+            if source_user:
+                additions.append(source_user)
+            additions.append({"id": message_id, "turn_id": turn_id, "role": "assistant",
+                              "kind": "final", "text": summary, "full": _turn_full_text(full),
+                              "links": _extract_turn_links(full), "ts": end,
+                              "source_sig": _output_signature(full)})
+        if additions:
+            data[session_name] = _merge_chat_messages(messages, additions)
+        return data.get(session_name, [])
+    _data, messages = LockedJsonStore(_user_messages_file(owner), dict).update(backfill)
+    return messages
+
+
+async def _refresh_session_chat(session_name: str, owner_id: str, *, now: float | None = None) -> list:
+    """Single-controller, owner-fenced final replies and durable 20-minute updates."""
+    if not _strict_session_owner(session_name, owner_id):
+        return []
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    key = (session_name, owner_id, generation)
+    lock = _chat_refresh_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        checked_at = float(now if now is not None else time.time())
+        messages = await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return []
+        if checked_at - _chat_checked.get(key, 0) < 15:
+            return messages
+        _chat_checked[key] = checked_at
+        expected_user = _chat_user_fingerprint(messages)
+        latest_user = _latest_chat_user(messages)
+        activity = await async_detect_activity(session_name)
+        snapshot = await asyncio.to_thread(_read_chat_snapshot, session_name, owner_id, messages)
+        if not snapshot or not _chat_binding_matches(session_name, owner_id, generation):
+            return messages
+        prior_turns = (snapshot.get("_recent_turns") or [])[:-1]
+        backfill_sig = _output_signature(str(snapshot.get("_root") or "") + ":"
+                                        + ",".join(str(turn.get("turn_id") or "") for turn in prior_turns))
+        if prior_turns and _chat_backfilled.get(key) != backfill_sig:
+            repaired = await asyncio.to_thread(_backfill_chat_history, session_name, owner_id, generation, snapshot)
+            if repaired is not None:
+                _chat_backfilled[key] = backfill_sig
+                messages = repaired
+                expected_user = _chat_user_fingerprint(messages)
+                latest_user = _latest_chat_user(messages)
+        text = chat_summaries.clean_prose(snapshot.get("text") or "")
+        if not text:
+            return messages
+        source_user_text = str(snapshot.get("user_text") or "")
+        source_ts = float(snapshot.get("started_at") or latest_user.get("ts")
+                          or _activity_state.get(session_name, {}).get("since") or checked_at)
+        # A just-sent prompt may still be queued in the CLI while its previous
+        # reply is visible. Never attach that previous turn to the new prompt.
+        if latest_user and snapshot.get("has_user", True) and source_user_text:
+            saved_ts = float(latest_user.get("ts") or 0)
+            same_prompt = _norm_text(source_user_text).endswith(_norm_text(latest_user.get("text", "")))
+            if source_ts < saved_ts - 15 or (not same_prompt and source_ts <= saved_ts):
+                return messages
+        turn_id, source_user = _chat_turn_context(snapshot, messages, generation)
+        if (source_user and latest_user and source_user.get("id") != _chat_message_id(latest_user)
+                and source_ts <= float(latest_user.get("ts") or 0)):
+            return messages
+        previous = [m for m in messages if m.get("role") == "assistant" and m.get("turn_id") == turn_id]
+        final_text = chat_summaries.clean_prose(snapshot.get("final_text") or "")
+        explicit_final = bool(final_text and snapshot.get("explicit_final", snapshot.get("source") == "codex"))
+        is_final = explicit_final or activity.get("status") == "idle"
+        kind = "final" if is_final else "progress"
+        last_progress = max((float(m.get("ts") or 0) for m in previous if m.get("kind") == "progress"), default=source_ts)
+        if not is_final:
+            if activity.get("status") not in {"busy", "stalled"}:
+                return messages
+            if checked_at - last_progress < _CHAT_PROGRESS_SECONDS:
+                return messages
+            if any(m.get("kind") == "final" for m in previous):
+                return messages
+        full = final_text if is_final and final_text else text
+        signature = _output_signature(text if kind == "progress" else full)
+        same_kind = [m for m in previous if m.get("kind") == kind]
+        if any(m.get("source_sig") == signature for m in same_kind):
+            return messages
+        summary = await _chat_short_summary(full, kind)
+        if not summary:
+            return messages
+        if kind == "progress" and any(m.get("text") == summary for m in same_kind):
+            return messages
+        # Direct terminal input can change the root's latest turn without an
+        # HTTP send. Re-read that same source as well as doing the persisted
+        # latest-user compare-and-swap below.
+        current = await asyncio.to_thread(_read_chat_snapshot, session_name, owner_id, messages)
+        if (not current or current.get("turn_id") != snapshot.get("turn_id")
+                or current.get("_root") != snapshot.get("_root")
+                or current.get("_generation") != snapshot.get("_generation")):
+            return messages
+        if is_final and not explicit_final:
+            # A pause in a Claude/pane reply can look idle before work resumes.
+            # Do not freeze that still-running turn behind a premature final.
+            current_activity = await async_detect_activity(session_name)
+            if current_activity.get("status") != "idle":
+                return messages
+        message = {
+            "id": "chat-" + turn_id + ("-final" if is_final else "-progress-" + str(int(checked_at // _CHAT_PROGRESS_SECONDS))),
+            "turn_id": turn_id, "role": "assistant", "kind": kind,
+            "text": summary, "full": _turn_full_text(full),
+            "links": _extract_turn_links(full), "ts": checked_at,
+            "source_sig": signature,
+        }
+        rows = await asyncio.to_thread(_commit_chat_message, session_name, owner_id,
+                                       generation, expected_user, message, source_user)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return []
+        return rows if rows is not None else await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+
+
+async def _get_chat_messages(session_name: str, owner_id: str) -> list:
+    if PROCESS_ROLE == "api":
+        result = await _controller_call("chat_refresh", session=session_name, owner_id=owner_id)
+        if result.get("ok"):
+            return result.get("messages") or []
+        return await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+    return await _refresh_session_chat(session_name, owner_id)
+
+
+async def _session_chat_summary_pass() -> None:
+    sessions = await asyncio.to_thread(get_tmux_sessions)
+    owners = await asyncio.to_thread(_load_session_owners)
+    sem = asyncio.Semaphore(3)
+    async def refresh(session: dict):
+        name = str(session.get("name") or "")
+        owner_id = str(owners.get(name) or "")
+        if not owner_id or _session_lifecycle.get(name).get("parked"):
+            return
+        async with sem:
+            try:
+                await _refresh_session_chat(name, owner_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Could not refresh session chat for '%s'", name, exc_info=True)
+    await asyncio.gather(*(refresh(session) for session in sessions))
+    live = {str(session.get("name") or "") for session in sessions}
+    for key in list(_chat_checked):
+        if key[0] not in live:
+            _chat_checked.pop(key, None)
+            _chat_backfilled.pop(key, None)
+
+
+async def _session_chat_summary_loop() -> None:
+    while True:
+        await asyncio.sleep(_CHAT_CHECK_SECONDS)
+        try:
+            await _session_chat_summary_pass()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session chat-summary pass failed")
 
 
 def build_session_response(
@@ -13559,6 +13992,16 @@ async def _controller_dispatch(message: dict) -> dict:
         return {"ok": True, "pid": os.getpid(), "role": PROCESS_ROLE}
     if op == "runtime":
         return {"ok": True, **_controller_runtime_data()}
+    if op == "chat_refresh":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
+        if not owner_id or not _strict_session_owner(session_name, owner_id):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+        rows = await _refresh_session_chat(session_name, owner_id)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        return {"ok": True, "messages": rows}
     if op == "session_input_check":
         session_name = str(message.get("session") or "")
         owner_id = str(message.get("owner_id") or "")
