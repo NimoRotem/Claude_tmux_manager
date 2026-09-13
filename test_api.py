@@ -473,7 +473,7 @@ class TestDashboardFrontendRegressions:
 
         assert "btn.setAttribute('aria-label',label)" in html[update_start:update_end]
 
-    def test_successful_sends_return_both_buttons_to_microphone_state(
+    def test_successful_sends_return_shared_button_to_microphone_state(
         self,
         authed_client,
     ):
@@ -485,8 +485,9 @@ class TestDashboardFrontendRegressions:
 
         assert (
             "updateComposerBtn('chat-'+name)" in html[chat_start:chat_end],
-            "updateComposerBtn(source+'-'+name)" in html[raw_start:raw_end],
+            "updateComposerBtn(key)" in html[raw_start:raw_end],
         ) == (True, True)
+        assert "const key=_sessionComposerKey(name,source)" in html[raw_start:raw_end]
 
     def test_restored_drafts_restore_the_send_button_state(self, authed_client):
         html = authed_client.get("/").text
@@ -855,10 +856,12 @@ class TestDashboardFrontendRegressionsContinued:
 
         assert send_rule and "background:#238636" in send_rule.group(1)
 
-    def test_typing_updates_both_composer_buttons(self, authed_client):
+    def test_typing_updates_the_single_shared_composer_button(self, authed_client):
         html = authed_client.get("/").text
 
-        assert html.count('oninput="autoGrow(this);updateComposerBtn(\'') == 2
+        assert html.count('oninput="autoGrow(this);updateComposerBtn(\'') == 1
+        assert 'id="cmd-chat-${s.name}"' in html
+        assert 'id="cmd-raw-${s.name}"' not in html
 
     def test_clipboard_images_become_sendable_composer_attachments(
         self,
@@ -869,8 +872,8 @@ class TestDashboardFrontendRegressionsContinued:
         paste_end = html.index("function handleDrop(event,name,tab)", paste_start)
         paste = html[paste_start:paste_end]
 
-        assert html.count('onpaste="handleComposerPaste(event,') == 2
-        assert html.count("or paste an image...") == 2
+        assert html.count('onpaste="handleComposerPaste(event,') == 1
+        assert "input.placeholder=tab==='raw'?'Type a command or paste an image...':'Send a message or paste an image...'" in html
         assert "item.kind==='file'" in html
         assert ".startsWith('image/')" in html
         assert "new File([blob],filename" in html
@@ -885,7 +888,7 @@ class TestDashboardFrontendRegressionsContinued:
             "_commandWithComposerAttachments(typed,attachments)"
         ) == 2
         assert "_clearComposerAttachments(name,'chat')" in html
-        assert "_clearComposerAttachments(name,source)" in html
+        assert "_clearComposerAttachments(name,tab)" in html
 
     def test_stop_restores_the_last_submitted_draft_for_editing(
         self,
@@ -909,13 +912,13 @@ class TestDashboardFrontendRegressionsContinued:
         assert "if(!resp.ok)" in interrupt
         assert "_restoreSubmittedDraft(name,target)" in interrupt
 
-    def test_empty_chat_and_terminal_composers_render_microphone_buttons(
+    def test_empty_chat_and_terminal_share_one_microphone_button(
         self,
         authed_client,
     ):
         html = authed_client.get("/").text
 
-        assert html.count('class="btn cmd-send composer-action is-mic"') == 2
+        assert html.count('class="btn cmd-send composer-action is-mic"') == 1
 
     def test_message_composer_is_tall_enough_for_multiple_lines(self, authed_client):
         html = authed_client.get("/").text

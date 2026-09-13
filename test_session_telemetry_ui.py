@@ -29,7 +29,7 @@ const base={name:'alpha',owner:'admin',logical_incarnation:'logical-a',metrics_t
   avg_tps:14.175,tps_completed_turns:2,tps_output_tokens:567,tps_active_seconds:40};
 function makeElement(){
   const el={textContent:'',title:'',className:''};
-  el.classList={toggle(cls,enabled){
+  el.classList={add(cls){this.toggle(cls,true)},remove(cls){this.toggle(cls,false)},toggle(cls,enabled){
     const classes=new Set(el.className.split(' ').filter(Boolean));
     enabled?classes.add(cls):classes.delete(cls);
     el.className=[...classes].join(' ');
@@ -67,6 +67,20 @@ const snapshot=elements=>Object.fromEntries(Object.entries(elements).map(([id,el
   [id,{text:el.textContent,title:el.title,classes:el.className}]));
 const scenario=process.argv[2];
 (async()=>{
+  if(scenario==='shared-views'){
+    const {context:c,elements}=setup();
+    c.activeTabs={alpha:'chat'};
+    c.updateLiveBar('alpha');
+    const chat=snapshot(elements);
+    c.activeTabs.alpha='raw';
+    c.sessions[0].session_total_tokens=2345678;
+    c.updateLiveBar('alpha');
+    const raw=snapshot(elements);
+    c.activeTabs.alpha='chat';
+    Object.assign(c.sessions[0],{activity_status:'unknown',context_tokens:null,last_turn_end:null,session_total_tokens:null});
+    c.updateLiveBar('alpha');
+    return {chat,raw,unknown:snapshot(elements)};
+  }
   if(scenario==='timeline'){
     const {context:c,elements,tick}=setup();
     const states=[];
@@ -277,6 +291,15 @@ def test_metrics_show_real_totals_context_window_and_honest_tps():
     assert result["overflow"]["tl-ctx-alpha"]["text"] == "ctx 11k / 10k · 110%"
     assert "crit" in result["overflow"]["tl-ctx-alpha"]["classes"]
     assert result["overflow"]["tl-tps-alpha"]["text"] == "avg 0.0 tps"
+
+
+def test_shared_status_strip_updates_in_chat_and_terminal_and_keeps_unknowns_visible():
+    result = run_scenario("shared-views")
+    assert result["chat"]["tl-total-alpha"]["text"] == "session 1.2M tokens"
+    assert result["raw"]["tl-total-alpha"]["text"] == "session 2.3M tokens"
+    assert result["unknown"]["tl-total-alpha"]["text"] == "session — tokens"
+    for view in ("chat", "raw", "unknown"):
+        assert "on" in result[view]["term-live-alpha"]["classes"].split()
 
 
 def test_tabs_share_alert_claim_and_busy_transition_cancels_queued_sound():

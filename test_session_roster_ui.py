@@ -41,7 +41,7 @@ context=vm.createContext({
   _completionWatch:{same:true},_completedUnread:{same:true},_idleNudgeAdhdPending:{same:true},
   _uploadTab:{same:'chat'},_bracketedPaste:{same:true},_sessionClientEpoch:{same:0},_uploadRequests:{},
   draftText:{'chat-same':'unsent'},_composerAttachments:{'chat-same':[{}]},_composerUploadTasks:{},
-  _recording:{},_mediaRec:{},_audioChunks:{},
+  _recording:{},_mediaRec:{},_audioChunks:{},_voiceTranscribing:{},_sessionComposerNodes:{same:{remove(){}}},
   mainEl:{replaceChildren(){replaced++}},
   stopRawPolling(){stopped++},stopWatchdogPolling(){},saveDrafts(){},saveRawCache(){},
   setAutopushPending(name,pending){if(pending)context._autopushPending.add(name);else context._autopushPending.delete(name)},

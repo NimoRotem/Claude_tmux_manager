@@ -27434,7 +27434,10 @@ body.member-simple .nav-codex-alert{display:none !important}
 /* Command bar */
 .cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:visible;flex-shrink:0}
 .cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
+.cmd-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
+.session-composer{flex-shrink:0;min-width:0;width:100%}
+.session-composer[hidden]{display:none}
+.session-composer[data-view="chat"] .key-freeze,.session-composer[data-view="chat"] .key-freeze-sep{display:none}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
 .composer-attachments{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;flex-shrink:0}
@@ -29960,9 +29963,9 @@ function updateLiveBar(name){
   // An idle session has no spinner row left in its pane, and that is exactly
   // when the silence counter and the cache countdown are worth having.
   const sess=sessions.find(x=>x.name===name)||{};
-  const show=busy||!!live.seen||!!(sess.context_tokens||sess.last_turn_end)||_metricNumber(sess.session_total_tokens)!==null;
-  bar.classList.toggle('on',show);
-  if(!show)return;
+  // The shared footer is useful even before telemetry arrives: unknown values
+  // stay explicit instead of making the entire status strip disappear.
+  bar.classList.add('on');
   bar.classList.toggle('idle',sess.activity_status==='idle');
   const set=function(id,txt){
     const e=document.getElementById(id+name);
@@ -30296,6 +30299,54 @@ const draftText={};
 const lastSubmittedDraft={};
 // Cache terminal content + scroll position across session switches
 const rawCache={}; // name -> {text, scrollTop, scrollHeight}
+// One physical composer per session. Caching the node preserves caret, pending
+// sends, recording UI and attachments through a view switch or detail rebuild.
+const _sessionComposerNodes={};
+function _sessionComposerKey(name,source='chat'){
+  return (_sessionComposerNodes[name]||document.getElementById('session-composer-'+name)?'chat':source)+'-'+name;
+}
+function _sessionComposerView(name){
+  const node=_sessionComposerNodes[name]||document.getElementById('session-composer-'+name);
+  return (node&&node.dataset.view)||activeTabs[name]||'chat';
+}
+function _composerElement(id,key){
+  const live=document.getElementById(id);
+  if(live)return live;
+  const name=key.replace(/^(chat|raw)-/,'');
+  const node=_sessionComposerNodes[name];
+  return node?Array.from(node.querySelectorAll('[id]')).find(el=>el.id===id)||null:null;
+}
+function _saveSessionComposerNodes(){
+  for(const s of sessions){
+    const node=document.getElementById('session-composer-'+s.name);
+    if(node)_sessionComposerNodes[s.name]=node;
+  }
+}
+function _updateSessionComposerView(name,tab){
+  const node=document.getElementById('session-composer-'+name);
+  if(!node)return;
+  node.hidden=!['chat','raw'].includes(tab);
+  node.dataset.view=tab;
+  const prompt=document.getElementById('composer-prompt-'+name);
+  if(prompt)prompt.textContent=tab==='raw'?'$':'›';
+  const input=document.getElementById('cmd-chat-'+name);
+  if(input){
+    input.placeholder=tab==='raw'?'Type a command or paste an image...':'Send a message or paste an image...';
+    if(input.dataset.needsGrow){autoGrow(input);delete input.dataset.needsGrow;}
+  }
+  updateLiveBar(name);
+  updateFreezeUi(name);
+  updateComposerBtn('chat-'+name);
+}
+function _mountSessionComposer(name,tab){
+  const fresh=document.getElementById('session-composer-'+name);
+  const cached=_sessionComposerNodes[name];
+  const reused=!!(fresh&&cached&&fresh!==cached);
+  if(reused)fresh.replaceWith(cached);
+  if(fresh)_sessionComposerNodes[name]=cached||fresh;
+  _updateSessionComposerView(name,tab);
+  return reused;
+}
 
 function _copyComposerAttachments(attachments){
   return (attachments||[]).map(function(attachment){
@@ -30312,9 +30363,9 @@ function _rememberSubmittedDraft(name,text,attachments){
 }
 function _restoreSubmittedDraft(name,source){
   const submitted=lastSubmittedDraft[name];
-  const tab=source==='chat'?'chat':'raw';
-  const key=tab+'-'+name;
-  const input=document.getElementById('cmd-'+key);
+  const key=_sessionComposerKey(name,source==='chat'?'chat':'raw');
+  const tab=key.startsWith('chat-')?'chat':'raw';
+  const input=_composerElement('cmd-'+key,key);
   if(!submitted||!input)return false;
   // Never overwrite something the user started composing while Codex worked.
   if(input.value.length||(_composerAttachments[key]||[]).length){
@@ -30997,6 +31048,7 @@ function saveRawCache(){
 function renderDetail(){
   const composerFocus=captureComposerFocus();
   saveDrafts();
+  _saveSessionComposerNodes();
   saveRawCache();
   saveChatViewState();
   const s=sessions.find(x=>x.name===selectedSession);
@@ -31088,22 +31140,6 @@ function renderDetail(){
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
-        <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
-        <div class="cmd-bar" style="position:relative">
-          <span class="cmd-prompt">&gt;</span>
-          <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
-            placeholder="Send a message or paste an image..."
-            onkeydown="handleChatKey(event,'${s.name}')"
-            onpaste="handleComposerPaste(event,'${s.name}','chat')"
-            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
-            autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send composer-action is-mic"
-            id="cmd-send-chat-${s.name}"
-            onclick="composerAction('chat-${s.name}')"
-            aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
-          <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
-        </div>
-        ${buildKeyBar(s.name,'chat')}
       </div>
     </div>
 
@@ -31114,9 +31150,14 @@ function renderDetail(){
         <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}','raw')" title="Stop Codex and edit your last message">Stop</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
-      <!-- The spinner, the seconds counter and the token tally the CLI paints
-           into the pane are cut out of the transcript and redrawn here, outside
-           the scroll area, off a clock that ticks locally. See updateLiveBar. -->
+      <!-- Freeze belongs only to the terminal output, not the shared footer. -->
+      <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
+      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
+    </div>
+
+    <!-- Chat and Terminal are two views of this session, with ONE persistent
+         status strip, draft, attachment tray, recorder and Keys & Commands. -->
+    <div class="session-composer" id="session-composer-${s.name}" data-view="${tab}" ${['chat','raw'].includes(tab)?'':'hidden'}>
       <div class="term-live" id="term-live-${s.name}">
         <span class="tl-dots"><i></i><i></i><i></i></span>
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
@@ -31129,27 +31170,22 @@ function renderDetail(){
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
       </div>
-      <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
-           which is collapsed by default, so the frozen state needs to announce
-           itself (and undo itself) from on top of the terminal. -->
-      <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
-      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
-      <div class="composer-attachments" id="composer-attachments-raw-${s.name}" aria-live="polite"></div>
+      <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
       <div class="cmd-bar" style="position:relative">
-        <span class="cmd-prompt">$</span>
-        <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a command or paste an image..."
-          onkeydown="handleRawKey(event,'${s.name}')"
-          onpaste="handleComposerPaste(event,'${s.name}','raw')"
-          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
+        <span class="cmd-prompt" id="composer-prompt-${s.name}">›</span>
+        <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
+          placeholder="Send a message or paste an image..."
+          onkeydown="handleSessionComposerKey(event,'${s.name}')"
+          onpaste="handleComposerPaste(event,'${s.name}','chat')"
+          oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
         <button class="btn cmd-send composer-action is-mic"
-          id="cmd-send-raw-${s.name}"
-          onclick="composerAction('raw-${s.name}')"
+          id="cmd-send-chat-${s.name}"
+          onclick="composerAction('chat-${s.name}')"
           aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
-        <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+        <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
-      ${buildKeyBar(s.name,'raw')}
+      ${buildKeyBar(s.name,'chat')}
     </div>
 
     <div class="tab-content ${tab==='skills'?'active':''}" id="tab-skills-${s.name}">
@@ -31272,15 +31308,17 @@ function renderDetail(){
       </div>
     </div>`;
 
-  // Restore draft text in textareas
-  restoreDrafts();
+  // Reattach the actual composer before restoring focus. Pending sends and
+  // recording callbacks keep their original nodes; never overwrite them with
+  // an older saved draft when a roster update rebuilds the surrounding view.
+  const composerReused=_mountSessionComposer(s.name,tab);
+  if(!composerReused)restoreDrafts();
   // Status/role refreshes rebuild the detail DOM. Keep the active composer and
   // caret attached so Enter still reaches its key handler after that rebuild.
   restoreComposerFocus(composerFocus);
   // A clipboard image is a draft attachment until the next message is sent.
   // Repaint its preview after status refreshes rebuild the composer DOM.
   renderComposerAttachments(s.name,'chat');
-  renderComposerAttachments(s.name,'raw');
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
@@ -31351,6 +31389,7 @@ function selectSession(name){
 }
 
 function switchTab(name,tab){
+  const composerFocus=captureComposerFocus();
   saveChatViewState();
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
@@ -31376,6 +31415,7 @@ function switchTab(name,tab){
   }
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
+  _updateSessionComposerView(name,tab);
   stopAllRawPolling();
   stopStatsPolling();
   // Neither of these has ever been DEFINED in this file — away mode and go-nuts
@@ -31412,6 +31452,7 @@ function switchTab(name,tab){
     }
     refreshActiveChat(true);
   }
+  if(['chat','raw'].includes(tab))restoreComposerFocus(composerFocus);
 }
 
 // ── Tab-more dropdown ──
@@ -31585,16 +31626,27 @@ function handleRawKey(e,name){
   if(_composerEnterSends(e)){e.preventDefault();sendCmd(name,'raw');}
   // Otherwise Enter inserts a newline; send via the button (mobile) or Enter (desktop).
 }
+function handleSessionComposerKey(e,name){
+  if(_sessionComposerView(name)==='raw')handleRawKey(e,name);
+  else handleChatKey(e,name);
+}
 
 // --- WhatsApp-style composer: mic icon when empty, paper-plane when typing ---
 const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3.3 20.7l18-8a.8.8 0 0 0 0-1.4l-18-8a.8.8 0 0 0-1.1.9L4 11l9 1-9 1-1.8 6.8a.8.8 0 0 0 1.1.9z"/></svg>';
 const _COMPOSER_MIC_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg>';
 const _COMPOSER_STOP_SVG='<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
-const _recording={},_mediaRec={},_audioChunks={};
+const _recording={},_mediaRec={},_audioChunks={},_voiceTranscribing={};
 // `key` is 'chat-<name>' or 'raw-<name>'. Input id = cmd-<key>, button id = cmd-send-<key>.
 function updateComposerBtn(key){
-  const inp=document.getElementById('cmd-'+key),btn=document.getElementById('cmd-send-'+key);
+  const inp=_composerElement('cmd-'+key,key),btn=_composerElement('cmd-send-'+key,key);
   if(!inp||!btn||_recording[key])return;
+  if(inp.disabled){btn.disabled=true;return;}
+  if(_voiceTranscribing[key]){
+    btn.disabled=true;btn.classList.add('is-transcribing');
+    btn.innerHTML='<span class="composer-spin"></span>';
+    btn.title='Transcribing voice message…';btn.setAttribute('aria-label','Transcribing voice message');
+    return;
+  }
   if(_composerUploadTasks[key]){
     btn.disabled=true;
     btn.classList.remove('is-mic','is-send');
@@ -31615,13 +31667,16 @@ function updateComposerBtn(key){
   btn.setAttribute('aria-label',label);
 }
 function composerAction(key){
-  const inp=document.getElementById('cmd-'+key);
+  const inp=_composerElement('cmd-'+key,key);
+  if((inp&&inp.disabled)||_voiceTranscribing[key])return;
   if(inp&&(inp.value.trim().length>0||(_composerAttachments[key]||[]).length>0)){
     if(key.indexOf('raw-')===0)sendCmd(key.slice(4),'raw');
+    else if(_sessionComposerView(key.slice(5))==='raw')sendCmd(key.slice(5),'raw');
     else sendChat(key.slice(5));
   }else{toggleRecording(key);}
 }
 async function toggleRecording(key){
+  if(_voiceTranscribing[key])return;
   if(_recording[key]){const m=_mediaRec[key];if(m&&m.state!=='inactive')m.stop();return;}
   const sessionName=key.indexOf('raw-')===0?key.slice(4):key.slice(5);
   const epoch=_sessionClientEpoch[sessionName]||0;
@@ -31639,10 +31694,12 @@ async function toggleRecording(key){
     if((_sessionClientEpoch[sessionName]||0)!==epoch)return;
     _recording[key]=false;
     const blob=new Blob(_audioChunks[key],{type:(mr.mimeType||'audio/webm')});
-    const btn=document.getElementById('cmd-send-'+key);
+    const btn=_composerElement('cmd-send-'+key,key);
     if(btn)btn.classList.remove('is-recording');
     if(!blob.size){updateComposerBtn(key);return;}
+    _voiceTranscribing[key]=true;
     if(btn){
+      btn.disabled=true;
       btn.classList.add('is-transcribing');
       btn.innerHTML='<span class="composer-spin"></span>';
       btn.title='Transcribing voice message…';
@@ -31653,17 +31710,23 @@ async function toggleRecording(key){
       const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
       const j=await resp.json().catch(()=>({}));
       if((_sessionClientEpoch[sessionName]||0)!==epoch)return;
-      const inp=document.getElementById('cmd-'+key);
+      const inp=_composerElement('cmd-'+key,key);
       if(resp.ok&&j.text){
-        if(inp){inp.value=(inp.value.trim()?inp.value.replace(/\s*$/,'')+' ':'')+j.text;autoGrow(inp);inp.focus();updateComposerBtn(key);}
+        if(inp){
+          inp.value=(inp.value.trim()?inp.value.replace(/\s*$/,'')+' ':'')+j.text;
+          if(inp.isConnected){autoGrow(inp);inp.focus();}else inp.dataset.needsGrow='true';
+        }
       }else{alert((j&&j.error)||'Transcription failed.');}
     }catch(e){alert('Transcription failed.');}
-    if(btn)btn.classList.remove('is-transcribing');
-    updateComposerBtn(key);
+    if((_sessionClientEpoch[sessionName]||0)===epoch){
+      delete _voiceTranscribing[key];
+      if(btn)btn.classList.remove('is-transcribing');
+      updateComposerBtn(key);
+    }
   };
   try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
   _recording[key]=true;
-  const btn=document.getElementById('cmd-send-'+key);
+  const btn=_composerElement('cmd-send-'+key,key);
   if(btn){
     btn.classList.remove('is-mic','is-send');
     btn.classList.add('is-recording');
@@ -31674,13 +31737,14 @@ async function toggleRecording(key){
 }
 
 async function sendChat(name){
-  const input=document.getElementById('cmd-chat-'+name);
-  if(!input)return;
+  const input=_composerElement('cmd-chat-'+name,'chat-'+name);
+  if(!input||input.disabled)return;
   const logicalIncarnation=_sessionLogicalIncarnation(name);
   input.disabled=true;
   let sent=false;
   try{
     await _awaitComposerUploads('chat-'+name);
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
     const typed=input.value.trim();
     const attachments=_composerAttachments['chat-'+name]||[];
     const cmd=_commandWithComposerAttachments(typed,attachments);
@@ -31703,7 +31767,8 @@ async function sendChat(name){
     sent=true;
   }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
-  input.focus();
+  updateComposerBtn('chat-'+name);
+  if(input.isConnected)input.focus();
   // After a delay, verify the busy state from the actual terminal
   if(sent)scheduleBusyVerification(name);
 }
@@ -31922,7 +31987,7 @@ function _clipboardImages(event){
 
 function renderComposerAttachments(name,tab){
   const key=tab+'-'+name;
-  const tray=document.getElementById('composer-attachments-'+key);
+  const tray=_composerElement('composer-attachments-'+key,key);
   if(!tray)return;
   const attachments=_composerAttachments[key]||[];
   tray.replaceChildren();
@@ -32000,32 +32065,38 @@ function handleComposerPaste(event,name,tab){
   if(!blobs.length)return;
   event.preventDefault();
   const key=tab+'-'+name;
+  const epoch=_sessionClientEpoch[name]||0;
   const previous=_composerUploadTasks[key]||Promise.resolve();
   const task=previous.then(async function(){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
     _uploadTab[name]=tab;
     for(let i=0;i<blobs.length;i++){
       const file=_clipboardImageFile(blobs[i]);
       const uploaded=await _uploadOneFile(name,tab,file);
+      if((_sessionClientEpoch[name]||0)!==epoch)return;
       if(!uploaded||!uploaded.path)continue;
       const attachment={
         name:file.name,path:uploaded.path,size:file.size,type:file.type,
         previewUrl:await _clipboardImagePreview(file)
       };
+      if((_sessionClientEpoch[name]||0)!==epoch)return;
       (_composerAttachments[key]||(_composerAttachments[key]=[])).push(attachment);
       renderComposerAttachments(name,tab);
     }
   }).catch(function(error){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
     console.warn('clipboard image upload failed:',error);
     appendChatBubble(name,'assistant','Could not attach the pasted image.',Date.now()/1000);
   });
   _composerUploadTasks[key]=task;
   updateComposerBtn(key);
   task.finally(function(){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
     if(_composerUploadTasks[key]===task)delete _composerUploadTasks[key];
     renderComposerAttachments(name,tab);
     updateComposerBtn(key);
-    const input=document.getElementById('cmd-'+key);
-    if(input)input.focus();
+    const input=_composerElement('cmd-'+key,key);
+    if(input&&input.isConnected)input.focus();
   });
 }
 
@@ -32040,15 +32111,17 @@ function handleDrop(event,name,tab){
 }
 
 async function sendCmd(name,source){
-  const inputId='cmd-'+source+'-'+name;
-  const input=document.getElementById(inputId);
-  if(!input)return;
+  const key=_sessionComposerKey(name,source);
+  const tab=key.startsWith('chat-')?'chat':'raw';
+  const inputId='cmd-'+key;
+  const input=_composerElement(inputId,key);
+  if(!input||input.disabled)return;
   const logicalIncarnation=_sessionLogicalIncarnation(name);
   input.disabled=true;
   let sent=false;
   try{
-    const key=source+'-'+name;
     await _awaitComposerUploads(key);
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
     const typed=input.value.trim();
     const attachments=_composerAttachments[key]||[];
     const cmd=_commandWithComposerAttachments(typed,attachments);
@@ -32065,9 +32138,9 @@ async function sendCmd(name,source){
     setOptimisticBusy(name);
     _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';
-    _clearComposerAttachments(name,source);
-    updateComposerBtn(source+'-'+name);
-    delete draftText[source+'-'+name];
+    _clearComposerAttachments(name,tab);
+    updateComposerBtn(key);
+    delete draftText[key];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
       const st=getRawState(name);
@@ -32077,7 +32150,8 @@ async function sendCmd(name,source){
     sent=true;
   }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
-  input.focus();
+  updateComposerBtn(key);
+  if(input.isConnected)input.focus();
   if(sent)scheduleBusyVerification(name);
 }
 
@@ -32313,6 +32387,7 @@ function _discardSessionClientState(name){
   setAutopushPending(name,false);
   _resetSessionRuntimeState(name);
   delete chatMessages[name];
+  delete _sessionComposerNodes[name];
   delete _chatRefreshState[name];
   delete _chatScrollState[name];
   for(const key of _chatExpanded){try{if(JSON.parse(key)[0]===name)_chatExpanded.delete(key)}catch(e){}}
@@ -32337,6 +32412,7 @@ function _discardSessionClientState(name){
     delete _recording[key];
     delete _mediaRec[key];
     delete _audioChunks[key];
+    delete _voiceTranscribing[key];
     delete draftText[key];
     delete _composerAttachments[key];
     delete _composerUploadTasks[key];
@@ -33654,7 +33730,7 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
-    ${tab==='raw'?`<span class="key-bar-sep"></span>
+    ${['raw','chat'].includes(tab)?`<span class="key-bar-sep key-freeze-sep"></span>
     <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
