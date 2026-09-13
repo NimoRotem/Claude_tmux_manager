@@ -26951,23 +26951,26 @@ body.member-simple .nav-codex-alert{display:none !important}
 .chat-messages::-webkit-scrollbar{width:6px}
 .chat-messages::-webkit-scrollbar-track{background:transparent}
 .chat-messages::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
-.chat-msg{max-width:85%;padding:12px 16px;border-radius:12px;font-size:1.05rem;line-height:1.6;position:relative}
-.chat-msg.user{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
-/* An assistant bubble holds the whole reply now, so it gets room: wider than a
-   user bubble, and no clamp — nothing here is cut. */
-.chat-msg.assistant{align-self:flex-start;max-width:94%;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
+.chat-msg{max-width:85%;padding:10px 14px;border-radius:12px;font-size:1rem;line-height:1.5;position:relative;min-width:0}
+.chat-msg.user{align-self:flex-end;background:#075e54;color:#fff;border-bottom-right-radius:4px}
+.chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
+.chat-kind{font-size:.7rem;color:#8b949e;margin-bottom:5px}
+.chat-kind.progress{color:#7ee2b8}
+.chat-read-more{display:block;border:0;background:none;color:#7ee2b8;padding:8px 0 4px;font:inherit;font-size:.85rem;cursor:pointer;min-height:36px}
+.chat-read-more:focus-visible{outline:2px solid #7ee2b8;outline-offset:3px;border-radius:3px}
+.chat-body[hidden]{display:none}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
 /* Newlines are the agent's paragraphing — keep them, wrap long tokens. */
 .chat-body{white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-body code{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:1px 5px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
-.chat-msg.user .chat-body code{background:#0b4ec2;border-color:#ffffff33;color:#fff}
+.chat-msg.user .chat-body code{background:#064a42;border-color:#ffffff33;color:#fff}
 .chat-body .chat-h{display:block;margin:10px 0 2px;color:#e6edf3;font-size:.95em;letter-spacing:.01em}
 .chat-body .chat-h:first-child{margin-top:0}
 .chat-lead{white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:10px;padding:8px 12px;border-left:2px solid #58a6ff;background:#0d1117;border-radius:0 6px 6px 0;color:#8b949e;font-size:.88rem;line-height:1.5}
 .chat-link{color:#58a6ff;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
 .chat-link:hover{color:#79c0ff}
-.chat-msg.user .chat-link{color:#cfe3ff}
+.chat-msg.user .chat-link{color:#d1ffe6}
 /* Deliverables. The reader is remote — a path is only useful as a link this
    dashboard can serve, so these open through /file behind the same login. */
 .chat-links{margin-top:12px;padding-top:10px;border-top:1px solid #21262d}
@@ -26978,9 +26981,9 @@ body.member-simple .nav-codex-alert{display:none !important}
 .chat-chip-ico{filter:grayscale(1) opacity(.8);flex:0 0 auto}
 .chat-chip:hover .chat-chip-ico{filter:none}
 .chat-empty{align-self:center;margin:auto 0;max-width:80%;text-align:center;color:#6e7681;font-size:.9rem;line-height:1.6}
-.chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
+.chat-typing{align-self:flex-start;padding:10px 14px;background:#161b22;border:1px solid #30363d;border-radius:12px;border-bottom-left-radius:4px;color:#8b949e;font-size:.85rem;display:flex;align-items:center;gap:10px}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
-.chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
+.chat-typing .typing-dot{width:6px;height:6px;border-radius:50%;background:#7ee2b8;animation:typing-bounce 1.4s ease-in-out infinite}
 .chat-typing .typing-dot:nth-child(2){animation-delay:.2s}
 .chat-typing .typing-dot:nth-child(3){animation-delay:.4s}
 @keyframes typing-bounce{0%,80%,100%{opacity:.3;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
@@ -30334,9 +30337,8 @@ navEl.addEventListener('drop',event=>{
 });
 
 /* ── Chat bubbles ────────────────────────────────────────────────────────────
-   A bubble carries the agent's reply IN FULL, not a truncated recap. The recap
-   the server still generates is kept as a lead line on long answers only, where
-   a headline earns its space.
+   Short, plain-language recaps are the default. Longer prose is available with
+   Read more; terminal code stays in Terminal, including for older saved turns.
 
    Everything is linkified on the way in. That matters more here than anywhere
    else in the app: the reader is remote, so "I wrote /home/nimo/REPORT.md" is
@@ -30411,11 +30413,12 @@ function _chatRich(text,sessionName){
   return out;
 }
 function _chatLinksHtml(links,sessionName){
-  if(!links||!links.length)return'';
+  if(!Array.isArray(links)||!links.length)return'';
   const chips=links.map(l=>{
+    if(!l||typeof l!=='object')return'';
     const isFile=l.kind==='file';
     const target=isFile?l.path:l.href;
-    if(!target)return'';
+    if(typeof target!=='string'||!target||!(isFile?/^(~\/|\/)/.test(target):/^https?:\/\//i.test(target)))return'';
     const ico=isFile?(l.dir?'&#128193;':'&#128196;'):'&#128279;';
     return '<a class="chat-chip" href="'+_escTermHtml(_chatHref(target,sessionName))+'" target="_blank" rel="noopener"'
       +' title="'+_escTermHtml(target)+'"><span class="chat-chip-ico">'+ico+'</span>'
@@ -30426,33 +30429,113 @@ function _chatLinksHtml(links,sessionName){
     +'<div class="chat-chips">'+chips+'</div></div>';
 }
 function _normLoose(s){return (s||'').replace(/\s+/g,' ').trim().toLowerCase()}
-// When the recap LLM is unavailable the server falls back to the reply's own
-// opening 600 characters. Showing that as a lead above the same reply is just
-// the first paragraph printed twice, so a prefix never earns the slot.
-function _isRecapWorthShowing(summary,full){
-  if(!summary||!full)return false;
-  const s=_normLoose(summary).replace(/[…\.]+$/,'').trim();
-  const f=_normLoose(full);
-  return !!s && s!==f && !f.startsWith(s);
+const _chatExpanded=new Set();
+const _chatScrollState={};
+function _chatMessageKey(name,m){
+  return JSON.stringify([name,m.id||[m.role,m.turn_id||'',m.kind||'',m.ts||0]]);
+}
+function _chatPlainProse(text){
+  // The server sanitizes new recaps. This also protects the no-code Chat view
+  // when a saved pre-recap message still contains the complete terminal reply.
+  const rows=String(text||'').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g,'').split('\n');
+  const kept=[];let fence='';
+  for(const row of rows){
+    const mark=row.match(/^\s*(`{3,}|~{3,})/);
+    if(mark){if(!fence)fence=mark[1][0];else if(mark[1][0]===fence)fence='';continue;}
+    if(fence)continue;
+    if(/^\s*(?:diff --git|@@\s|[+\-]{3}\s|[+\-]\s*\d+\s|\d+\s+[+\-])/.test(row))continue;
+    if(/^\s{4,}(?:return|raise|assert|pass|break|continue)\b/.test(row))continue;
+    if(/^\s*<\/?[a-z][\w-]*(?:\s[^>]*|\/?)>.*$/i.test(row))continue;
+    if(/^\s*(?:(?:async\s+)?(?:def|function)\s+\w+\s*\(|class\s+\w+\s*[:({]|(?:const|let|var)\s+\w+\s*=|(?:from\s+[\w.]+\s+)?import\s+|(?:return|raise|assert)\s+.*[=();]|(?:if|for|while|with|except)\s+.*[:{]\s*$|[{}\[\]]+[;,]?\s*$)/.test(row))continue;
+    if(/^\s*(?:\$\s+|(?:python3?|node|npm|pip3?|pytest|git|curl|sudo)\s+[-\w./])/.test(row))continue;
+    if(/^\s*(?:[A-Za-z_$][\w.$]*\([^\n]*\);?|["'][^"']+["']\s*:\s*.*[,}]|[A-Za-z_$][\w.$]*\s*(?:=|=>)\s*.+)\s*$/.test(row))continue;
+    kept.push(row.replace(/`([^`\n]+)`/g,'$1').replace(/^\s{0,3}#{1,6}\s+/,'').replace(/\*\*([^*]+)\*\*/g,'$1'));
+  }
+  return kept.join('\n').replace(/\n{3,}/g,'\n\n').trim();
+}
+function _chatBrief(text){
+  const plain=_chatPlainProse(text).replace(/\s+/g,' ').trim();
+  if(!plain)return'';
+  const sentences=plain.match(/.+?(?:[.!?]+(?=\s|$)|$)/g)||[plain];
+  let brief=sentences.slice(0,3).join('').trim();
+  const words=brief.split(/\s+/);
+  if(words.length>55)brief=words.slice(0,55).join(' ');
+  if(brief.length>360){brief=brief.slice(0,360);const space=brief.lastIndexOf(' ');if(space>240)brief=brief.slice(0,space);}
+  return brief.length<plain.length?brief.replace(/[,. ;:]+$/,'')+'…':brief;
+}
+function toggleChatMessage(button){
+  const bubble=button.closest('.chat-msg');
+  if(!bubble)return;
+  const key=bubble.dataset.messageKey;
+  const expanded=button.getAttribute('aria-expanded')!=='true';
+  if(expanded)_chatExpanded.add(key);else _chatExpanded.delete(key);
+  bubble.querySelector('.chat-preview').hidden=expanded;
+  bubble.querySelector('.chat-expanded').hidden=!expanded;
+  button.setAttribute('aria-expanded',String(expanded));
+  button.textContent=expanded?'Read less':'Read more';
 }
 function chatBubbleInner(m,sessionName){
   const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
   if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'',sessionName)+'</div>'+ts;
-  const full=(m.full||'').trim();
-  const summary=(m.text||'').trim();
-  let html='';
-  if(full.length>700&&_isRecapWorthShowing(summary,full))
-    html+='<div class="chat-lead">'+_chatRich(summary,sessionName)+'</div>';
-  html+='<div class="chat-body">'+_chatRich(full||summary,sessionName)+'</div>';
+  const full=_chatPlainProse(m.full||m.text||'');
+  const summary=_chatBrief(m.text||full)||'Reply ready. Open Terminal for technical details.';
+  const details=full.length>summary.length?full:_chatPlainProse(m.text||'');
+  const hasMore=details.length>summary.length&&_normLoose(details)!==_normLoose(summary);
+  const expanded=hasMore&&_chatExpanded.has(_chatMessageKey(sessionName,m));
+  const progress=m.kind==='progress';
+  let html='<div class="chat-kind'+(progress?' progress':'')+'">'+(progress?'Still working':'Reply')+'</div>';
+  html+='<div class="chat-body chat-preview"'+(expanded?' hidden':'')+'>'+_chatRich(summary,sessionName)+'</div>';
+  if(hasMore){
+    html+='<div class="chat-body chat-expanded"'+(expanded?'':' hidden')+'>'+_chatRich(details,sessionName)+'</div>';
+    html+='<button type="button" class="chat-read-more" aria-expanded="'+expanded+'" onclick="toggleChatMessage(this)">'+(expanded?'Read less':'Read more')+'</button>';
+  }
   html+=_chatLinksHtml(m.links,sessionName);
   return html+ts;
 }
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Codex — every reply shows up here in full, with links to anything it produced.</div>';
+    return '<div class="chat-empty">Your messages and short replies appear here. Longer tasks get a brief update about every 20 minutes when there is something useful to share.</div>';
   }
-  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m,name)}</div>`).join('');
+  return msgs.map(m=>'<div class="chat-msg '+(m.role==='assistant'?'assistant':'user')+'" data-message-key="'+_escTermHtml(_chatMessageKey(name,m))+'">'+chatBubbleInner(m,name)+'</div>').join('');
+}
+function _chatFocusedMessage(chatEl){
+  const active=document.activeElement;
+  if(!active||!chatEl.contains(active)||!active.classList.contains('chat-read-more'))return'';
+  const bubble=active.closest('.chat-msg');
+  return bubble?bubble.dataset.messageKey:'';
+}
+function _restoreChatFocus(chatEl,key){
+  if(!key)return;
+  const button=Array.from(chatEl.querySelectorAll('.chat-read-more')).find(el=>el.closest('.chat-msg').dataset.messageKey===key);
+  if(button)button.focus({preventScroll:true});
+}
+function _captureChatViewport(chatEl){
+  const state={top:chatEl.scrollTop,bottom:isChatAtBottom(chatEl),focus:_chatFocusedMessage(chatEl)};
+  if(!state.bottom&&chatEl.getBoundingClientRect){
+    const top=chatEl.getBoundingClientRect().top;
+    const bubble=Array.from(chatEl.querySelectorAll('.chat-msg')).find(el=>el.getBoundingClientRect().bottom>top);
+    if(bubble)state.anchor={key:bubble.dataset.messageKey,offset:bubble.getBoundingClientRect().top-top};
+  }
+  return state;
+}
+function _restoreChatViewport(chatEl,state){
+  chatEl.scrollTop=!state||state.bottom?chatEl.scrollHeight:state.top;
+  if(state&&state.anchor&&chatEl.getBoundingClientRect){
+    const bubble=Array.from(chatEl.querySelectorAll('.chat-msg')).find(el=>el.dataset.messageKey===state.anchor.key);
+    if(bubble)chatEl.scrollTop+=bubble.getBoundingClientRect().top-chatEl.getBoundingClientRect().top-state.anchor.offset;
+  }
+  if(state)_restoreChatFocus(chatEl,state.focus);
+}
+function saveChatViewState(){
+  for(const s of sessions){
+    const chatEl=document.getElementById('chat-'+s.name),pane=document.getElementById('tab-chat-'+s.name);
+    if(chatEl&&pane&&pane.classList.contains('active'))
+      _chatScrollState[s.name]=_captureChatViewport(chatEl);
+  }
+}
+function restoreChatViewState(name,chatEl){
+  _restoreChatViewport(chatEl,_chatScrollState[name]);
 }
 
 function saveRawCache(){
@@ -30473,6 +30556,7 @@ function renderDetail(){
   const composerFocus=captureComposerFocus();
   saveDrafts();
   saveRawCache();
+  saveChatViewState();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   if(s.runtime_state==='recovering'){
@@ -30759,9 +30843,9 @@ function renderDetail(){
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
   renderSavedKeys(s.name, s);
-  // Scroll chat to bottom
+  // Keep a reader in an expanded older reply through roster/status rebuilds.
   const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+  if(chatEl)restoreChatViewState(s.name,chatEl);
   // Start/stop raw polling based on active tab
   stopAllRawPolling();
   stopStatsPolling();
@@ -30795,6 +30879,7 @@ function renderDetail(){
     else loadWatchdogStatus(s.name);
   }
   if(tab==='skills')loadAccountSkills(s.name);
+  if(tab==='chat')refreshActiveChat();
 }
 
 function _sessionRouteName(){
@@ -30824,6 +30909,7 @@ function selectSession(name){
 }
 
 function switchTab(name,tab){
+  saveChatViewState();
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
   allTabs.forEach(t=>t.classList.remove('active'));
@@ -30880,8 +30966,9 @@ function switchTab(name,tab){
         typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
         chatEl.appendChild(typing);
       }
-      chatEl.scrollTop=chatEl.scrollHeight;
+      restoreChatViewState(name,chatEl);
     }
+    refreshActiveChat(true);
   }
 }
 
@@ -30967,26 +31054,19 @@ document.addEventListener('click',function(){closeTabMore();closeViewMenu();clos
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeStatusMenu();closeToolsMenu()}});
 
 function mergeChatMessages(name, serverMsgs){
-  // Merge server messages with local messages, preserving any locally-added
-  // messages (e.g. from raw tab) that the server hasn't echoed back yet.
+  // Assistant history is server-owned: each progress checkpoint and final reply
+  // has its own ID. Only pending local user posts may outlive a server snapshot.
   const local=chatMessages[name]||[];
-  if(!local.length){chatMessages[name]=[...serverMsgs];return}
-  // Build a set of server message signatures for dedup
-  const serverSet=new Set(serverMsgs.map(m=>m.role+':'+m.text+':'+Math.floor(m.ts)));
-  // Find local-only messages (user messages added via appendChatBubble that
-  // the server already recorded but with slightly different timestamp)
-  const localOnly=[];
-  for(const m of local){
-    const sig=m.role+':'+m.text+':'+Math.floor(m.ts);
-    if(!serverSet.has(sig)){
-      // Check if server has same role+text with close timestamp (within 5s)
-      const dup=serverMsgs.some(s=>s.role===m.role&&s.text===m.text&&Math.abs(s.ts-m.ts)<5);
-      if(!dup)localOnly.push(m);
-    }
+  const seen=new Set(),server=[];
+  for(const m of serverMsgs){
+    if(!m||!['user','assistant'].includes(m.role))continue;
+    const key=m.id||JSON.stringify([m.role,m.kind||'',m.ts,m.text]);
+    if(seen.has(key))continue;
+    seen.add(key);server.push({...m});
   }
-  // Merge: server messages + any local-only messages, sorted by timestamp
-  const merged=[...serverMsgs,...localOnly].sort((a,b)=>a.ts-b.ts);
-  chatMessages[name]=merged;
+  const pending=local.filter(m=>(m._localNotice||(m.role==='user'&&m._optimistic))&&!server.some(s=>
+    s.role===m.role&&((m.id&&m.id===s.id)||(s.text===m.text&&Math.abs((s.ts||0)-(m.ts||0))<10))));
+  chatMessages[name]=[...server,...pending].sort((a,b)=>(a.ts||0)-(b.ts||0));
 }
 
 function isChatAtBottom(chatEl){
@@ -30995,18 +31075,10 @@ function isChatAtBottom(chatEl){
 
 function appendChatBubble(name,role,text,ts,extra){
   if(!chatMessages[name])chatMessages[name]=[];
-  // Avoid duplicate assistant messages
-  if(role==='assistant'){
-    const msgs=chatMessages[name];
-    for(let i=msgs.length-1;i>=0;i--){
-      if(msgs[i].role==='assistant'){
-        if(msgs[i].text===text&&(msgs[i].full||'')===((extra&&extra.full)||''))return;
-        break;
-      }
-    }
-  }
-  const msg={role,text,ts};
-  if(extra){msg.full=extra.full||'';msg.links=extra.links||[];}
+  const msg={role,text,ts,...(extra||{})};
+  if(role==='user')msg._optimistic=true;
+  else if(!msg.id)msg._localNotice=true;
+  if(msg.id&&chatMessages[name].some(m=>m.id===msg.id))return;
   chatMessages[name].push(msg);
   // If this session's chat is visible, append to DOM
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
@@ -31019,7 +31091,8 @@ function appendChatBubble(name,role,text,ts,extra){
       const typing=chatEl.querySelector('.chat-typing');
       if(typing)typing.remove();
       const bubble=document.createElement('div');
-      bubble.className='chat-msg '+role;
+      bubble.className='chat-msg '+(role==='assistant'?'assistant':'user');
+      bubble.dataset.messageKey=_chatMessageKey(name,msg);
       bubble.innerHTML=chatBubbleInner(msg,name);
       chatEl.appendChild(bubble);
       // Only auto-scroll if user was at bottom or this is their own message
@@ -31028,43 +31101,20 @@ function appendChatBubble(name,role,text,ts,extra){
   }
 }
 
-// Mirror the server's "one assistant summary per turn" model into the local
-// chat + DOM: update the latest assistant bubble in place when its text changes,
-// append it when the turn is new. Prevents duplicate summary bubbles.
+// Reconcile the complete timeline, not just the last assistant. A background
+// hour-long run may deliver two checkpoints plus a final reply in one poll.
 function reconcileAssistantSummary(name, serverMsgs){
-  // The server's latest assistant message within the current turn.
-  let srv=null;
-  for(let i=serverMsgs.length-1;i>=0;i--){
-    if(serverMsgs[i].role==='assistant'){srv=serverMsgs[i];break;}
-    if(serverMsgs[i].role==='user')break;
-  }
-  if(!srv||!(srv.text||srv.full))return;
-  const local=chatMessages[name]||(chatMessages[name]=[]);
-  // Latest local assistant message after the last local user message.
-  let lu=-1;for(let i=local.length-1;i>=0;i--){if(local[i].role==='user'){lu=i;break;}}
-  let la=-1;for(let i=local.length-1;i>lu;i--){if(local[i].role==='assistant'){la=i;break;}}
-  if(la>=0){
-    // The full reply and the deliverables grow as the turn settles even when the
-    // recap wording lands the same, so all three decide whether to repaint.
-    const changed=local[la].text!==srv.text
-      ||(local[la].full||'')!==(srv.full||'')
-      ||JSON.stringify(local[la].links||[])!==JSON.stringify(srv.links||[]);
-    if(changed){
-      local[la].text=srv.text;local[la].ts=srv.ts;
-      local[la].full=srv.full||'';local[la].links=srv.links||[];
-      updateLastAssistantBubble(name,local[la]);
-    }
-  }else{
-    appendChatBubble(name,'assistant',srv.text,srv.ts,{full:srv.full,links:srv.links});
-  }
-}
-function updateLastAssistantBubble(name,msg){
+  const before=JSON.stringify(chatMessages[name]||[]);
+  mergeChatMessages(name,serverMsgs);
+  if(before===JSON.stringify(chatMessages[name]))return;
   if(name!==selectedSession||(activeTabs[name]||'chat')!=='chat')return;
   const chatEl=document.getElementById('chat-'+name);
   if(!chatEl)return;
-  const bubbles=chatEl.querySelectorAll('.chat-msg.assistant');
-  const el=bubbles[bubbles.length-1];
-  if(el)el.innerHTML=chatBubbleInner(msg,name);
+  const viewport=_captureChatViewport(chatEl);
+  const typing=chatEl.querySelector('.chat-typing');
+  chatEl.innerHTML=renderChatBubbles(name);
+  if(typing)chatEl.appendChild(typing);
+  _restoreChatViewport(chatEl,viewport);
 }
 
 function autoGrow(el){
@@ -31642,6 +31692,7 @@ document.addEventListener('visibilitychange',()=>{
   if(selectedSession)_acknowledgeCompletion(selectedSession);
   reconcileSessionRoster();
   pollTabLabels();
+  refreshActiveChat(true);
   const pane=selectedSession&&document.getElementById('tab-raw-'+selectedSession);
   if(pane&&pane.classList.contains('active'))startRawPolling(selectedSession);
 });
@@ -31761,11 +31812,8 @@ function updateStatusPill(name,status,detail){
 }
 
 function updateCard(s){
-  // Sync messages from server. The server keeps ONE assistant summary per turn,
-  // updated in place as Codex's output settles, so mirror that: refresh the
-  // latest assistant bubble when its text changes, append it when it's new —
-  // never duplicate it.
-  if(s.messages&&s.messages.length){
+  // Include every progress checkpoint and final reply, even after reconnecting.
+  if(Array.isArray(s.messages)){
     reconcileAssistantSummary(s.name, s.messages);
   }
 
@@ -31798,11 +31846,12 @@ function updateCard(s){
   if(chatEl){
     const existing=chatEl.querySelector('.chat-typing');
     if(s.activity_status==='busy'&&!existing){
+      const atBottom=isChatAtBottom(chatEl);
       const typing=document.createElement('div');
       typing.className='chat-typing';
       typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
       chatEl.appendChild(typing);
-      chatEl.scrollTop=chatEl.scrollHeight;
+      if(atBottom)chatEl.scrollTop=chatEl.scrollHeight;
     }else if(s.activity_status!=='busy'&&existing){
       existing.remove();
     }
@@ -31822,6 +31871,9 @@ function _discardSessionClientState(name){
   setAutopushPending(name,false);
   _resetSessionRuntimeState(name);
   delete chatMessages[name];
+  delete _chatRefreshState[name];
+  delete _chatScrollState[name];
+  for(const key of _chatExpanded){try{if(JSON.parse(key)[0]===name)_chatExpanded.delete(key)}catch(e){}}
   delete lastStatus[name];
   delete activeTabs[name];
   delete lastSubmittedDraft[name];
@@ -31969,6 +32021,27 @@ async function refreshOne(name){
   if(btn){btn.disabled=false;btn.textContent='Update'}
 }
 
+// Chat does not depend on observing a busy -> idle edge. That edge may happen
+// while the phone is asleep, and checkpoints arrive while status stays busy.
+const _chatRefreshState={};
+async function refreshActiveChat(force=false){
+  const name=selectedSession;
+  if(!name||document.hidden||(activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'))!=='chat')return;
+  const now=Date.now(),state=_chatRefreshState[name]||(_chatRefreshState[name]={at:0,pending:false});
+  if(state.pending||(!force&&now-state.at<30000))return;
+  state.at=now;state.pending=true;
+  const incarnation=_sessionLogicalIncarnation(name);
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/refresh',{method:'POST'});
+    if(!resp.ok)return;
+    const data=await resp.json();
+    if(_sessionLogicalIncarnation(name)!==incarnation||_chatRefreshState[name]!==state)return;
+    const idx=sessions.findIndex(s=>s.name===name);
+    if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx]);}
+  }catch(e){}
+  finally{state.pending=false;}
+}
+
 async function refreshFull(name){
   const logicalIncarnation=_sessionLogicalIncarnation(name);
   const btn=document.getElementById('btn-full-'+name);
@@ -32017,6 +32090,7 @@ async function pollTabLabels(){
 
 async function pollStatus(){
   await reconcileSessionRoster();
+  refreshActiveChat();
   // A hidden tab normally rests, but a tab waiting to announce a request must
   // keep the cheap status poll alive. Keep watching any known-busy session too,
   // so work begun outside this page still becomes an unread completion. Raw

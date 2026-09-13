@@ -36,6 +36,7 @@ context=vm.createContext({
   sessions:[old],selectedSession:'same',_sessionRosterGeneration:'old',_sessionRosterRequest:0,_sessionRosterPromise:null,
   _autopushRevision:new Map(),_autopushPending:new Set(),_autopushSetRequests:{},
   rawState:{same:{polling:true}},rawCache:{same:{text:'old terminal'}},chatMessages:{same:[{role:'user',text:'keep'}]},
+  _chatRefreshState:{},_chatExpanded:new Set(),_chatScrollState:{},
   lastStatus:{same:'idle'},activeTabs:{same:'raw'},lastSubmittedDraft:{same:{text:'keep'}},
   _completionWatch:{same:true},_completedUnread:{same:true},_idleNudgeAdhdPending:{same:true},
   _uploadTab:{same:'chat'},_bracketedPaste:{same:true},_sessionClientEpoch:{same:0},_uploadRequests:{},
