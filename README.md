@@ -8,7 +8,8 @@ A single-file FastAPI web app that turns every `tmux` session on your box into a
 
 Claude Code runs beautifully inside a `tmux` session, but once you start juggling five or ten of them across different projects, the terminal stops scaling. This dashboard gives you:
 
-- A **tabbed view of every session** with live terminal output and a parallel chat transcript
+- A **tabbed view of every session** with live terminal output and a compact, two-sided chat
+- A pinned green **New session** button on phones, beside settings and outside the scrolling tabs
 - **AI-generated titles, descriptions, and progress summaries** (OpenAI) so you know what each session is doing at a glance
 - **System stats**, per-session cost, token usage, idle detection, context-window warnings, and activity sparklines
 - **Keyboard-first navigation** — rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
@@ -16,6 +17,19 @@ Claude Code runs beautifully inside a `tmux` session, but once you start jugglin
 - **Hardened auth** — HMAC session cookie, rate-limited login, CSP/HSTS/Permissions-Policy headers, session-name validation before any shell call
 
 It's a single Python file with no database — everything persists as JSON under `~/.tmux-dashboard/`.
+
+## Chat view
+
+Chat shows your messages on the right and short assistant replies on the left.
+Replies use a few plain-language sentences, without code or tool logs. Longer
+explanations stay collapsed behind **Read more**; use Terminal for technical output.
+
+During long tasks, new useful assistant output produces a separate progress
+message about every 20 minutes. Unchanged output does not create repeated updates.
+The completed turn gets its own final reply, preserving earlier progress messages.
+Progress collection continues while the browser is closed, and saved chat history
+is restored when you return. If the summarizer is unavailable, concise excerpts of
+the assistant's own prose keep replies visible without inventing results.
 
 ## Prerequisites
 
