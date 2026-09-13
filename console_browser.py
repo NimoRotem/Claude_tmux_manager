@@ -500,6 +500,8 @@ class InteractiveCast(browser_live.Screencast):
     shift-click and ctrl-A behave.
     """
 
+    PACE_ACKS = True
+
     def __init__(self, ws_url: str, quality: int = 55, fps: float = 5.0,
                  max_width: int = 1152, max_height: int = 720, active_fps: float = 20.0):
         super().__init__(ws_url, quality=quality, max_width=max_width,
