@@ -30,10 +30,11 @@ async function fetchStub(){
   if(scenario==='transient-error')return response(503,{authoritative:false,sessions:[]});
   return response(200,{authoritative:true,generation:'next',sessions:[next]});
 }
-const context=vm.createContext({
+let context;
+context=vm.createContext({
   console,Promise,Map,Set,Array,String,Math,fetch:fetchStub,BASE:'',
   sessions:[old],selectedSession:'same',_sessionRosterGeneration:'old',_sessionRosterRequest:0,_sessionRosterPromise:null,
-  _autopushRevision:new Map(),_autopushPending:new Set(),
+  _autopushRevision:new Map(),_autopushPending:new Set(),_autopushSetRequests:{},
   rawState:{same:{polling:true}},rawCache:{same:{text:'old terminal'}},chatMessages:{same:[{role:'user',text:'keep'}]},
   lastStatus:{same:'idle'},activeTabs:{same:'raw'},lastSubmittedDraft:{same:{text:'keep'}},
   _completionWatch:{same:true},_completedUnread:{same:true},_idleNudgeAdhdPending:{same:true},
@@ -42,6 +43,7 @@ const context=vm.createContext({
   _recording:{},_mediaRec:{},_audioChunks:{},
   mainEl:{replaceChildren(){replaced++}},
   stopRawPolling(){stopped++},stopWatchdogPolling(){},saveDrafts(){},saveRawCache(){},
+  setAutopushPending(name,pending){if(pending)context._autopushPending.add(name);else context._autopushPending.delete(name)},
   renderNav(){},renderDetail(){},_syncIdleNudgeTimer(){},mergeChatMessages(){},
 });
 vm.runInContext(region,context);
@@ -55,6 +57,53 @@ vm.runInContext(region,context);
     chats:(context.chatMessages.same||[]).length,
     raw:!!context.rawState.same,
     epoch:context._sessionClientEpoch.same||0,
+  }));
+})().catch(error=>{console.error(error);process.exit(1)});
+"""
+
+
+AUTOPUSH_DRIVER = r"""
+const fs=require('fs'),vm=require('vm');
+const source=fs.readFileSync(process.argv[1],'utf8');
+const quotes='"'.repeat(3);
+const html=source.match(new RegExp('^HTML_PAGE = r'+quotes+'([\\s\\S]*?)^'+quotes,'m'))[1];
+const js=html.match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
+const start=js.indexOf('function setAutopushPending(name,pending)');
+const end=js.indexOf('function renderWatchdogLog',start);
+const region=js.slice(start,end);
+const requests=[];
+function response(mode){return {ok:true,json:async()=>({mode,log:[]})}}
+function fetchStub(){return new Promise(resolve=>requests.push(resolve))}
+let context;
+context=vm.createContext({
+  console,Promise,Map,Set,Array,String,Math,fetch:fetchStub,BASE:'',
+  sessions:[{name:'same',autopush_mode:'basic',logical_incarnation:'logical-a'}],
+  _autopushPending:new Set(),_autopushRevision:new Map(),_autopushSetRequests:{},
+  _sessionClientEpoch:{same:0},
+  document:{querySelectorAll(){return []},getElementById(){return null}},
+  _sessionLogicalIncarnation(name){const row=context.sessions.find(s=>s.name===name);return row&&row.logical_incarnation},
+  syncAutopushUI(){},stopWatchdogPolling(){},startWatchdogPolling(){},renderWatchdogLog(){},
+});
+vm.runInContext(region,context);
+(async()=>{
+  const oldRequest=context.setAutopush('same','off');
+  await Promise.resolve();
+  context._sessionClientEpoch.same++;
+  context._autopushSetRequests.same++;
+  context.setAutopushPending('same',false);
+  context.sessions=[{name:'same',autopush_mode:'basic',logical_incarnation:'logical-b'}];
+  const newRequest=context.setAutopush('same','full');
+  await Promise.resolve();
+  requests[0](response('off'));
+  await oldRequest;
+  const pendingAfterOld=context._autopushPending.has('same');
+  const modeAfterOld=context.sessions[0].autopush_mode;
+  requests[1](response('full'));
+  await newRequest;
+  process.stdout.write(JSON.stringify({
+    pendingAfterOld,modeAfterOld,
+    pendingAfterNew:context._autopushPending.has('same'),
+    modeAfterNew:context.sessions[0].autopush_mode,
   }));
 })().catch(error=>{console.error(error);process.exit(1)});
 """
@@ -107,3 +156,19 @@ def test_logical_replacement_purges_old_session_state():
     assert state["raw"] is False
     assert state["epoch"] == 1
     assert state["replaced"] == 1
+
+
+def test_old_autopush_request_cannot_unlock_or_repaint_replacement():
+    result = subprocess.run(
+        [NODE, "-e", AUTOPUSH_DRIVER, str(APP)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "pendingAfterOld": True,
+        "modeAfterOld": "full",
+        "pendingAfterNew": False,
+        "modeAfterNew": "full",
+    }

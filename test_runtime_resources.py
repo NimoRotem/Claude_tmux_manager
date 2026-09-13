@@ -411,7 +411,9 @@ async def test_manual_durable_reconcile_reports_healthy_tabs_idempotently(monkey
     monkeypatch.setattr(
         app._session_lifecycle, "snapshot", lambda: {"sessions": lifecycle}
     )
-    monkeypatch.setattr(app, "_activate_pending_autonomous_modes", AsyncMock())
+    monkeypatch.setattr(
+        app, "_activate_pending_autonomous_modes", AsyncMock(return_value=0)
+    )
 
     first = await app._run_durable_session_reconciliation(
         source="test", owner_id="u_michiel"
@@ -477,12 +479,14 @@ async def test_pending_autonomous_activation_is_scoped_to_requested_owner(monkey
         lambda: {"mine": "u_michiel", "other": "u_other"},
     )
     monkeypatch.setattr(app, "_durable_running_intent_exists", lambda _name: True)
-    start = MagicMock(return_value=True)
+    start = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "_start_restored_autonomous_mode", start)
-    monkeypatch.setattr(app, "_save_autonomous_state", MagicMock())
+    monkeypatch.setattr(
+        app, "_save_autonomous_state_async", AsyncMock(return_value=True)
+    )
 
     assert await app._activate_pending_autonomous_modes(owner_id="u_michiel") == 1
-    start.assert_called_once_with("mine", {"away_mode": True})
+    start.assert_awaited_once_with("mine", {"away_mode": True})
 
 
 @pytest.mark.asyncio
@@ -493,11 +497,11 @@ async def test_pending_autonomous_activation_rechecks_owner_inside_fence(monkeyp
     monkeypatch.setattr(app, "_live_tmux_session_names", lambda: {"mine"})
     monkeypatch.setattr(app, "_durable_running_intent_exists", lambda _name: True)
     monkeypatch.setattr(app, "_load_session_owners", lambda: {"mine": "u_other"})
-    start = MagicMock(return_value=True)
+    start = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "_start_restored_autonomous_mode", start)
 
     assert await app._activate_pending_autonomous_modes(owner_id="u_michiel") == 0
-    start.assert_not_called()
+    start.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -505,7 +509,7 @@ async def test_manual_reconcile_does_not_report_another_owners_new_tab(monkeypat
     candidate = _durable_candidate("mine")
     live = iter([set(), {"mine", "other"}])
     checkpoint = MagicMock(return_value=1)
-    activate = AsyncMock()
+    activate = AsyncMock(return_value=0)
     monkeypatch.setattr(app, "_checkpoint_live_sessions", checkpoint)
     monkeypatch.setattr(app, "_live_tmux_session_names", lambda: next(live))
     monkeypatch.setattr(app, "_durable_session_candidates", lambda: [candidate])

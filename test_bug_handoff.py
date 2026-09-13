@@ -123,4 +123,4 @@ def test_dashboard_selects_and_scrubs_the_handoff_session():
     assert "async function loadAll(preferredSession)" in dashboard.HTML_PAGE
     assert "url.searchParams.get('bug_session')" in dashboard.HTML_PAGE
     assert "history.replaceState" in dashboard.HTML_PAGE
-    assert "await loadAll(bugSession)" in dashboard.HTML_PAGE
+    assert "await loadAll(bugSession||_sessionRouteName())" in dashboard.HTML_PAGE

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault("TMUX_DASH_SECRET", "test-secret-key-for-testing")
@@ -253,3 +254,188 @@ def test_stale_open_member_thread_receives_updated_account_instructions_once(tmp
 
     assert unchanged == "eli"
     assert marker is None
+
+
+# ─── Roster: an unowned tmux session is nobody's tab ───
+
+ROSTER_ROWS = [
+    {
+        "name": "admin-work",
+        "windows": "1",
+        "created": "1",
+        "attached": False,
+        "managed": False,
+        "owner_id": "admin",
+    },
+    {
+        "name": "member-work",
+        "windows": "1",
+        "created": "2",
+        "attached": False,
+        "managed": False,
+        "owner_id": "u_member",
+    },
+    {
+        # What the inventory says about a session nobody claimed: its identity
+        # fallback names the admin. That must not decide who sees the tab.
+        "name": "started-from-a-shell",
+        "windows": "1",
+        "created": "3",
+        "attached": False,
+        "managed": False,
+        "owner_id": "admin",
+    },
+]
+
+ROSTER_INVENTORY = {
+    "state": "ok",
+    "authoritative": True,
+    "owners": OWNERS,
+    "sessions": ROSTER_ROWS,
+    "expected_rows": {},
+    "missing_expected": [],
+}
+
+
+def _roster_names(user):
+    with patch.object(app_module, "_session_tab_order", return_value=[]):
+        return [
+            row["name"]
+            for row in app_module._roster_sessions_for_user(ROSTER_INVENTORY, user)
+        ]
+
+
+def test_roster_never_hands_an_unowned_session_to_the_admin():
+    """The tab strip is built from the roster, not from _filter_sessions_for_user.
+
+    Fixing only the workspace list left this path defaulting an unowned session
+    to the admin, so shell sessions belonging to other accounts kept appearing
+    in their tab strip.
+    """
+    assert _roster_names(ADMIN) == ["admin-work"]
+    assert _roster_names(SECONDARY_ADMIN) == []
+    assert _roster_names(MEMBER) == ["member-work"]
+
+
+def test_an_unowned_session_cannot_make_the_whole_roster_unavailable():
+    """An unowned row can never be bound to a terminal.
+
+    While one was being selected into the admin's roster, _bind_session_response_rows
+    failed for the whole request and /api/session-roster answered 503 for every
+    tab that account had, not just the unclaimed one.
+    """
+    for row in app_module._roster_sessions_for_user(ROSTER_INVENTORY, ADMIN):
+        assert OWNERS.get(row["name"]) == "admin"
+
+
+def test_a_managed_row_still_needs_both_its_owner_records_to_agree():
+    forged = dict(ROSTER_ROWS[1], managed=True, owner_id="admin")
+    inventory = dict(ROSTER_INVENTORY, sessions=[forged])
+    with patch.object(app_module, "_session_tab_order", return_value=[]):
+        assert app_module._roster_sessions_for_user(inventory, ADMIN) == []
+
+
+# ─── Recovery: only promise a tab that can actually come back ───
+
+RESUME_UUID = "0199f0a1-2b3c-4d5e-8f60-112233445566"
+RECOVERABLE_ROW = {
+    "managed": True,
+    "owner_id": "admin",
+    "desired_state": "running",
+    "restore_on_startup": True,
+    "generation": "a" * 32,
+    "resume_uuid": RESUME_UUID,
+}
+GHOST_ROW = {key: value for key, value in RECOVERABLE_ROW.items() if key != "resume_uuid"}
+
+
+def test_a_tab_with_no_resume_thread_can_never_be_recovered():
+    assert app_module._session_row_is_recoverable(RECOVERABLE_ROW) is True
+    assert app_module._session_row_is_recoverable(GHOST_ROW) is False
+    assert app_module._session_row_is_recoverable(dict(RECOVERABLE_ROW, generation="")) is False
+    assert app_module._session_row_is_recoverable({}) is False
+
+
+def _inventory_with_rows(rows):
+    listing = Mock(returncode=0, stdout="", stderr="")
+    with (
+        patch.object(app_module._session_lifecycle, "snapshot", return_value={"sessions": rows}),
+        patch.object(app_module, "_load_session_owners", return_value={"ghost": "admin", "live": "admin"}),
+        patch.object(app_module.subprocess, "run", return_value=listing),
+    ):
+        return app_module._tmux_inventory_snapshot()
+
+
+def test_a_tab_that_cannot_be_restored_is_not_reported_as_recovering():
+    """It used to render "Restoring X…" forever with nothing able to finish it.
+
+    Recovery runs once, at controller startup, and drops any row without a
+    resume thread. Expecting such a row also held /health/ready at degraded for
+    as long as it existed.
+    """
+    inventory = _inventory_with_rows({"ghost": GHOST_ROW})
+    assert inventory["missing_expected"] == []
+    assert inventory["expected_rows"] == {}
+
+
+def test_a_tab_that_can_be_restored_is_still_reported_as_recovering():
+    inventory = _inventory_with_rows({"live": RECOVERABLE_ROW})
+    assert inventory["missing_expected"] == ["live"]
+
+
+def test_startup_retires_a_tab_whose_session_is_gone_and_cannot_return():
+    rows = {"ghost": dict(GHOST_ROW), "live": dict(RECOVERABLE_ROW)}
+    removed: list[str] = []
+
+    def remove(name, *, expected_generation="", owner_id=""):
+        removed.append(name)
+        return True
+
+    with (
+        patch.object(app_module._session_lifecycle, "snapshot", return_value={"sessions": rows}),
+        patch.object(app_module._session_lifecycle, "remove", side_effect=remove),
+        patch.object(app_module, "_live_tmux_session_names", return_value=set()),
+    ):
+        retired = app_module._retire_unrecoverable_session_rows(set())
+
+    assert retired == ["ghost"]
+    assert removed == ["ghost"]
+
+
+def test_startup_keeps_a_tab_whose_tmux_session_is_still_alive():
+    rows = {"ghost": dict(GHOST_ROW)}
+    with (
+        patch.object(app_module._session_lifecycle, "snapshot", return_value={"sessions": rows}),
+        patch.object(app_module._session_lifecycle, "remove", side_effect=AssertionError("must not remove")),
+        patch.object(app_module, "_live_tmux_session_names", return_value={"ghost"}),
+    ):
+        assert app_module._retire_unrecoverable_session_rows({"ghost"}) == []
+
+
+# ─── Closing a session saves nothing ───
+
+
+def test_closing_a_session_has_no_summarize_or_archive_step():
+    """Context is kept in the advisor and reaches a session over MCP.
+
+    The dashboard used to summarize the transcript with an LLM and write it into
+    a TECHNICAL_SPEC.md on close. Nothing in the close path may do that again.
+    """
+    for name in (
+        "_start_session_close",
+        "_session_close_status",
+        "_run_session_close_job",
+        "_summarize_session_close",
+        "_persist_session_close_knowledge",
+        "_technical_spec_path",
+        "_install_session_close_barrier",
+        "_session_close_barriers",
+    ):
+        assert not hasattr(app_module, name), f"{name} is still defined"
+
+
+def test_no_route_or_controller_op_can_start_a_close_job():
+    paths = {getattr(route, "path", "") for route in app_module.app.routes}
+    assert "/api/sessions/{session_name}/close/{job_id}" not in paths
+    source = (Path(app_module.__file__).with_name("app.py")).read_text()
+    assert "session_close_start" not in source

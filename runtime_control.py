@@ -194,6 +194,7 @@ class SessionLifecycleStore:
         cwd: str,
         owner_id: str,
         source: str = "session-create",
+        launch_options: dict | None = None,
     ) -> dict[str, Any]:
         """Register a fresh tab generation and discard stale same-name roots."""
         owner = str(owner_id or "").strip()
@@ -215,6 +216,9 @@ class SessionLifecycleStore:
             "last_checkpoint": now,
             "checkpoint_source": str(source or "session-create")[:64],
         }
+
+        if launch_options is not None:
+            row["launch_options"] = dict(launch_options)
 
         def mutate(value: dict[str, Any]) -> dict[str, Any]:
             value["version"] = 2

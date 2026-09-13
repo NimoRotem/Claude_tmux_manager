@@ -635,6 +635,8 @@ class TestGetTmuxSessions:
                     "desired_state": "running",
                     "restore_on_startup": True,
                     "parked": False,
+                    # Only a row that can actually be resumed is still expected.
+                    "resume_uuid": "0199f0a1-2b3c-4d5e-8f60-112233445566",
                 }
             }
         }
@@ -665,6 +667,8 @@ class TestGetTmuxSessions:
                     "desired_state": "running",
                     "restore_on_startup": True,
                     "parked": False,
+                    # Only a row that can actually be resumed is still expected.
+                    "resume_uuid": "0199f0a1-2b3c-4d5e-8f60-112233445566",
                 }
             }
         }
