@@ -20,6 +20,7 @@ It's a single Python file with no database — everything persists as JSON under
 
 ## Chat view
 
+Chat is the default view for everyone, including admins. Switch to Terminal any time.
 Chat shows your messages on the right and short assistant replies on the left.
 Replies use a few plain-language sentences, without code or tool logs. Longer
 explanations stay collapsed behind **Read more**; use Terminal for technical output.

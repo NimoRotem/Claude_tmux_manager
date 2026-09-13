@@ -31007,8 +31007,8 @@ function renderDetail(){
     mainEl.innerHTML='<div class="empty"><strong>Restoring '+esc(sessionTabLabel(s))+'…</strong><br><span>The tab will reconnect automatically when its terminal is ready.</span></div>';
     return;
   }
-  // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
-  const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
+  // Everyone starts in Chat; retain an explicitly selected view for this session.
+  const tab=activeTabs[s.name]||'chat';
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -32468,7 +32468,7 @@ async function refreshOne(name){
 const _chatRefreshState={};
 async function refreshActiveChat(force=false){
   const name=selectedSession;
-  if(!name||document.hidden||(activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'))!=='chat')return;
+  if(!name||document.hidden||(activeTabs[name]||'chat')!=='chat')return;
   const now=Date.now(),state=_chatRefreshState[name]||(_chatRefreshState[name]={at:0,pending:false});
   if(state.pending||(!force&&now-state.at<30000))return;
   state.at=now;state.pending=true;

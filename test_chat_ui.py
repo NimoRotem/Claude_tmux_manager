@@ -1,6 +1,7 @@
 """Run the actual Chat UI JavaScript with synthetic, account-free transcripts."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -252,6 +253,33 @@ def test_backfilled_earlier_reply_keeps_visible_message_anchored():
       ({top:test.chat.scrollTop})
     """)
     assert state["top"] == 325
+
+
+@pytest.mark.parametrize("simple", [False, True])
+@pytest.mark.parametrize("selected", [None, "chat", "raw", "info"])
+def test_initial_view_defaults_to_chat_and_preserves_explicit_choice(simple, selected):
+    render_detail = APP.read_text().split("function renderDetail(){", 1)[1]
+    expression = re.search(r"const tab=(.+);", render_detail).group(1)
+    state = run_js(f"""
+      MEMBER_SIMPLE={json.dumps(simple)};
+      activeTabs.demo={json.dumps(selected)};
+      const s=sessions[0];
+      ({expression})
+    """)
+    assert state == (selected or "chat")
+
+
+@pytest.mark.parametrize("simple", [False, True])
+def test_default_chat_refreshes_before_any_view_is_selected(simple):
+    state = run_js(f"""
+      (async()=>{{
+        MEMBER_SIMPLE={json.dumps(simple)};
+        delete activeTabs.demo;
+        await refreshActiveChat();
+        return test.counts();
+      }})()
+    """)
+    assert state["fetches"] == state["updates"] == 1
 
 
 def test_active_chat_refreshes_without_status_changes_and_is_throttled():
