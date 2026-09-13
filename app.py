@@ -26876,6 +26876,9 @@ body.member-simple .nav-codex-alert{display:none !important}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
+.nav-new-mobile-btn{display:none;background:#238636;color:#fff;border:none;width:44px;height:44px;border-radius:6px;cursor:pointer;font-size:1.4rem;font-weight:700;line-height:1;flex-shrink:0;align-items:center;justify-content:center;margin-right:4px}
+.nav-new-mobile-btn:hover{background:#2ea043}
+.nav-new-mobile-btn:focus-visible{outline:2px solid #7ee787;outline-offset:2px}
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
 
@@ -27712,17 +27715,18 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-session-id{max-width:92px}
   .nav-title{display:none}
   .nav-attached{display:none}
-  /* Give the complete phone header to the horizontally scrolling session tabs
-     and one pinned gear. Every displaced control is available in that menu. */
+  /* Keep session creation and settings pinned beside the scrolling tabs.
+     The desktop create button remains the tab-order anchor, hidden on phones. */
   .nav-new-btn,.nav-compact-status,.nav-status-toggle,.nav-status-text,
   .nav-right>.member-only{display:none!important}
+  .nav-new-mobile-btn{display:flex}
   .nav-status-wrap{margin:0;width:0}
   body.member-simple .nav-tools-wrap{display:block}
   .nav-tools-mobile{display:flex}
   body.member-simple .nav-tools-mobile-member{display:flex}
   .nav-tools-mobile-divider{display:block}
-  .nav-tools-menu{position:fixed;top:42px;left:8px;right:8px;min-width:0;max-height:calc(100vh - 50px);overflow:auto}
-  .nav-status-menu{position:fixed;top:42px;left:8px;right:8px;min-width:0;max-width:none;max-height:calc(100vh - 50px)}
+  .nav-tools-menu{position:fixed;top:48px;left:8px;right:8px;min-width:0;max-height:calc(100vh - 56px);overflow:auto}
+  .nav-status-menu{position:fixed;top:48px;left:8px;right:8px;min-width:0;max-width:none;max-height:calc(100vh - 56px)}
   .codex-auth-label{display:none}
   .codex-auth{padding:8px 10px}
   .codex-auth .status-dot{width:10px;height:10px}
@@ -27764,6 +27768,7 @@ body.member-simple .hide-in-simple{display:none!important}
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
+  <button class="nav-new-mobile-btn" type="button" onclick="createSessionAuto()" title="New session" aria-label="New session"><span aria-hidden="true">+</span></button>
   <span class="nav-compact-status" aria-label="System status summary">
     <span class="nav-compact-stat" id="nav-cpu-summary" title="CPU usage">CPU <span class="stat-val" id="nav-cpu-summary-value">&mdash;</span></span>
     <span class="nav-compact-stat" id="nav-usage-cap-summary" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>

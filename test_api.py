@@ -334,7 +334,7 @@ class TestDashboardFrontendRegressions:
         assert "mobile-bottom-bar" not in html
         assert "syncMobileBottomBar" not in html
 
-    def test_mobile_toolbar_reserves_header_for_tabs_and_gear(self, authed_client):
+    def test_mobile_toolbar_pins_new_session_and_gear_beside_tabs(self, authed_client):
         html = authed_client.get("/").text
         mobile_start = html.index("@media(max-width:768px){", html.index("/* Mobile */"))
         mobile_end = html.index("</style>", mobile_start)
@@ -343,6 +343,7 @@ class TestDashboardFrontendRegressions:
         assert ".top-nav{padding:0 0 0 8px}" in mobile
         assert ".nav-new-btn,.nav-compact-status,.nav-status-toggle,.nav-status-text," in mobile
         assert ".nav-right>.member-only{display:none!important}" in mobile
+        assert ".nav-new-mobile-btn{display:flex}" in mobile
         assert "body.member-simple .nav-tools-wrap{display:block}" in mobile
         assert "body.member-simple .nav-status-wrap{display:block" not in mobile
         assert ".nav-tools-mobile{display:flex}" in mobile
@@ -354,6 +355,30 @@ class TestDashboardFrontendRegressions:
         assert 'id="top-nav"' in nav
         assert 'id="nav-tools-toggle"' in nav
         assert 'aria-label="Settings and tools"' in nav
+
+        # The new-session action cannot scroll out of view with a long tab list.
+        scrolling_nav, pinned_nav = nav.split('<div class="nav-right">', 1)
+        assert 'class="nav-new-mobile-btn"' not in scrolling_nav
+        assert 'class="nav-new-btn"' in scrolling_nav
+        assert 'class="nav-new-mobile-btn"' in pinned_nav
+        assert pinned_nav.index('class="nav-new-mobile-btn"') < pinned_nav.index('id="nav-tools-toggle"')
+
+    def test_mobile_new_session_is_accessible_green_and_touch_sized(self, authed_client):
+        html = authed_client.get("/").text
+        desktop_css = html[:html.index("/* Mobile */")]
+        style = re.search(r"\.nav-new-mobile-btn\{([^}]+)\}", desktop_css).group(1)
+        assert "display:none" in style
+        assert "background:#238636" in style
+        assert "width:44px" in style
+        assert "height:44px" in style
+        assert "flex-shrink:0" in style
+        button = re.search(r'<button class="nav-new-mobile-btn"[^>]*>', html).group(0)
+        assert 'type="button"' in button
+        assert 'aria-label="New session"' in button
+        assert 'onclick="createSessionAuto()"' in button
+        assert "member-only" not in button
+        assert "nav-tools-admin" not in button
+        assert html.count('class="nav-new-mobile-btn"') == 1
 
     def test_mobile_gear_preserves_displaced_toolbar_actions(self, authed_client):
         html = authed_client.get("/").text
