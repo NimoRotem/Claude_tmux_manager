@@ -8,9 +8,9 @@ import app
 from runtime_control import SessionLifecycleStore
 
 
-def test_create_defaults_are_astra_max():
+def test_create_defaults_are_astra_high():
     body = app.CreateSession(name="work")
-    assert (body.model, body.effort, body.no_fallback) == ("gpt-6-astra", "max", False)
+    assert (body.model, body.effort, body.no_fallback) == ("gpt-6-astra", "high", False)
 
 
 def test_new_session_settings_survive_checkpoints_without_changing_account(tmp_path):

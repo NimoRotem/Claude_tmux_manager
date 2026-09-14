@@ -12,7 +12,7 @@ const node=()=>({innerHTML:'',textContent:'',value:'',style:{},classList:{add:no
 for(const id of ['modal-overlay','modal-content','new-session-name','session-create-error','new-session-model','new-session-effort','new-session-nofb'])nodes[id]=node();
 nodes['new-session-name'].value=input.name||'';
 nodes['new-session-model'].value=input.model||'gpt-6-astra';
-nodes['new-session-effort'].value=input.effort||'max';
+nodes['new-session-effort'].value=input.effort||'high';
 nodes['new-session-nofb'].checked=!!input.no_fallback;
 const st={userRows:[1,3],userScrolledUp:false};
 nodes['raw-alpha']={scrollTop:0,scrollHeight:900,children:[0,1,2,3].map(i=>({offsetTop:i*100,classList:{add:noop,remove:noop}}))};
@@ -56,7 +56,7 @@ def test_plus_opens_blank_name_form_without_creating():
 
 def test_typed_name_is_used_and_created_session_opens_after_roster_refresh():
     state=run(action='create',name='my-project')
-    assert state['requests'] == [{'name':'my-project','name_generated':False,'model':'gpt-6-astra','effort':'max','no_fallback':False}]
+    assert state['requests'] == [{'name':'my-project','name_generated':False,'model':'gpt-6-astra','effort':'high','no_fallback':False}]
     assert state['selected'] == 'created'
 
 
@@ -75,7 +75,7 @@ def test_generated_name_collision_retries_keep_automatic_naming_enabled():
 
 def test_named_collision_never_falls_back_to_random_name():
     state=run(action='create',name='taken',conflict=True)
-    assert state['requests'] == [{'name':'taken','name_generated':False,'model':'gpt-6-astra','effort':'max','no_fallback':False}]
+    assert state['requests'] == [{'name':'taken','name_generated':False,'model':'gpt-6-astra','effort':'high','no_fallback':False}]
     assert state['selected'] == 'old'
 
 
@@ -100,11 +100,11 @@ process.stdout.write(JSON.stringify({parsed,updates,selected:context.selectedSes
 def test_creation_form_defaults_and_effort_cap():
     state=run(action='form')
     assert '<option value="gpt-6-astra" selected>' in state['html']
-    assert '<option value="max" selected>Max</option>' in state['efforts']
+    assert '<option value="high" selected>High</option>' in state['efforts']
     assert '<option value="ultra" selected>' not in state['efforts']
     assert 'id="new-session-nofb" type="checkbox"  ' in state['html']
     limited=run(action='form',model='gpt-5.5')
-    assert '<option value="xhigh" selected>' in limited['efforts']
+    assert '<option value="high" selected>High</option>' in limited['efforts']
     assert 'value="ultra"' not in limited['efforts']
 
 
