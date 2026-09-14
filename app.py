@@ -28,7 +28,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 
 try:
     import tomllib
@@ -22673,6 +22673,23 @@ def _saved_session_model_effort(
     return model, effort
 
 
+@asynccontextmanager
+async def _settings_restart_operation_lock(session_name: str):
+    """Wait briefly for metadata work, only before any restart side effect."""
+    deadline = time.monotonic() + 2.0
+    with ExitStack() as locks:
+        while True:
+            try:
+                locks.enter_context(_session_operation_lock(session_name))
+                break
+            except _SessionOperationBusy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.1, remaining))
+        yield
+
+
 async def _restart_codex_for_session_tmux_locked(
     session_name: str,
     expected_owner_id: str | None = None,
@@ -22681,10 +22698,11 @@ async def _restart_codex_for_session_tmux_locked(
     autopush_guard: bool = False,
     expected_binding: dict | None = None,
     voice_request: Request | None = None,
+    raise_busy: bool = False,
 ) -> tuple[bool, bool]:
     """Exit Codex and resume the generation-bound root under one mutation lock."""
     try:
-        with _session_operation_lock(session_name):
+        async with _settings_restart_operation_lock(session_name):
             if voice_request is not None:
                 if not voice_mode.request_target_matches(sys.modules[__name__], voice_request, session_name):
                     return False, False
@@ -22705,6 +22723,8 @@ async def _restart_codex_for_session_tmux_locked(
             if not owner_binding:
                 return False, False
             owner_id, owner = owner_binding
+            if expected_generation and str(_session_lifecycle.get(session_name).get("generation") or "") != expected_generation:
+                return False, False
             await asyncio.to_thread(
                 _checkpoint_active_session,
                 session_name,
@@ -22913,6 +22933,8 @@ async def _restart_codex_for_session_tmux_locked(
             return restarted, restarted
     except _SessionOperationBusy:
         logger.info("Settings restart skipped while '%s' is being mutated", session_name)
+        if raise_busy:
+            raise
     except Exception:
         logger.exception("Failed to restart Codex in '%s'", session_name)
     return False, False
@@ -22926,7 +22948,17 @@ async def _restart_codex_for_session(
     autopush_guard: bool = False,
     expected_binding: dict | None = None,
     voice_request: Request | None = None,
+    raise_busy: bool = False,
 ) -> tuple[bool, bool]:
+    # Capture the selected generation before waiting on either fence. A new tab
+    # reusing the same name is not the target of this confirmed restart.
+    selected = _session_lifecycle.get(session_name)
+    if not expected_generation:
+        expected_generation = str(selected.get("generation") or "")
+    if expected_owner_id is None:
+        expected_owner_id = str(selected.get("owner_id") or "") or None
+    if not expected_generation:
+        return False, False
     try:
         async with _async_tmux_server_mutation_lock():
             return await _restart_codex_for_session_tmux_locked(
@@ -22936,9 +22968,12 @@ async def _restart_codex_for_session(
                 autopush_guard=autopush_guard,
                 expected_binding=expected_binding,
                 **({"voice_request": voice_request} if voice_request is not None else {}),
+                **({"raise_busy": True} if raise_busy else {}),
             )
     except _TmuxMutationBusy:
         logger.info("Settings restart skipped while tmux is being mutated")
+        if raise_busy:
+            raise
         return False, False
 
 
@@ -23328,6 +23363,9 @@ async def api_set_session_effort(
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     expected_owner_id = str((user or {}).get("id") or "")
+    selected_generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    if body.restart and not selected_generation:
+        return JSONResponse({"error": "Session identity changed. Refresh before restarting."}, status_code=409)
     effort = _normalize_reasoning_effort(body.effort)
     if effort is None or effort == "":
         allowed = ", ".join(_CODEX_REASONING_EFFORTS)
@@ -23365,9 +23403,15 @@ async def api_set_session_effort(
             session_name, expected_owner_id
         )
     elif body.restart:
-        exported, restarted = await _restart_codex_for_session(
-            session_name, expected_owner_id
-        )
+        try:
+            exported, restarted = await _restart_codex_for_session(
+                session_name, expected_owner_id, expected_generation=selected_generation, raise_busy=True
+            )
+        except (_SessionOperationBusy, _TmuxMutationBusy):
+            return JSONResponse({"ok": False, "saved": True, "restarted": False,
+                                 "code": "session_busy", "effort": effort,
+                                 "error": "Session is busy. Settings were saved; retry the restart shortly."},
+                                status_code=409)
         if not _session_owner_matches(session_name, expected_owner_id):
             return JSONResponse({"error": "Session owner changed"}, status_code=409)
     return JSONResponse({
@@ -23389,6 +23433,9 @@ async def api_set_session_model(
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     expected_owner_id = str((user or {}).get("id") or "")
+    selected_generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    if body.restart and not selected_generation:
+        return JSONResponse({"error": "Session identity changed. Refresh before restarting."}, status_code=409)
     model = (body.model or "").strip()
     if not _MODEL_ID_RE.fullmatch(model):
         return JSONResponse({"error": "Invalid model id."}, status_code=400)
@@ -23429,9 +23476,15 @@ async def api_set_session_model(
             session_name, expected_owner_id
         )
     elif body.restart:
-        exported, restarted = await _restart_codex_for_session(
-            session_name, expected_owner_id
-        )
+        try:
+            exported, restarted = await _restart_codex_for_session(
+                session_name, expected_owner_id, expected_generation=selected_generation, raise_busy=True
+            )
+        except (_SessionOperationBusy, _TmuxMutationBusy):
+            return JSONResponse({"ok": False, "saved": True, "restarted": False,
+                                 "code": "session_busy", "model": model, "effort": selected_effort,
+                                 "error": "Session is busy. Settings were saved; retry the restart shortly."},
+                                status_code=409)
         if not _session_owner_matches(session_name, expected_owner_id):
             return JSONResponse({"error": "Session owner changed"}, status_code=409)
     return JSONResponse({

@@ -45,6 +45,7 @@ const context=vm.createContext({
     if(url==='/api/models')return {ok:false};
     requests.push({url,body:JSON.parse(options.body)});
     const response=(input.responses||[])[requests.length-1]||{ok:true,body:{ok:true}};
+    if(response.throw)throw new Error(response.throw);
     return {ok:response.ok,status:response.status||200,json:async()=>response.body};
   },
 });
@@ -194,6 +195,72 @@ def test_model_switch_repaints_server_selected_supported_effort():
     assert state["session"]["effort"] == "xhigh"
     assert state["effortBadge"].startswith("Effort xhigh ")
     assert state["moreEffort"] == "xhigh ▾"
+
+
+def test_confirmed_model_restart_sets_active_model_and_clears_pending():
+    state = run_controls(
+        action="model", model="gpt-5.6-terra", restart=True,
+        session={"model": "gpt-6-astra", "effort": "ultra"},
+        responses=[
+            {"ok": True, "body": {"ok": True, "codex_was_running": True, "effort": "max", "restarted": False}},
+            {"ok": True, "body": {"ok": True, "codex_was_running": True, "effort": "max", "restarted": True}},
+        ],
+    )
+    assert state["requests"] == [
+        {"url": "/api/sessions/alpha/model", "body": {"model": "gpt-5.6-terra", "restart": False}},
+        {"url": "/api/sessions/alpha/model", "body": {"model": "gpt-5.6-terra", "restart": True}},
+    ]
+    assert state["session"]["model"] == "gpt-5.6-terra"
+    assert state["session"]["model_pending"] == ""
+    assert state["session"]["effort"] == "max"
+    assert state["effortBadge"].startswith("Effort max ")
+    assert state["alerts"] == []
+    assert state["message"] == "Model → GPT-5.6 Terra · restarted"
+
+
+@pytest.mark.parametrize(("restart_response", "reason"), [
+    ({"ok": False, "status": 409, "body": {"saved": True, "error": "Session is busy. Try again."}},
+     "Session is busy. Try again."),
+    ({"ok": True, "body": {"ok": True, "saved": True, "restarted": False}},
+     "Codex did not restart"),
+    ({"ok": False, "status": 500, "body": {"saved": True, "error": "Restart unavailable"}},
+     "Restart unavailable"),
+    ({"throw": "Network connection lost"}, "Network connection lost"),
+], ids=["busy-saved-409", "restart-unconfirmed-200", "restart-500", "restart-network-loss"])
+def test_model_restart_failure_retains_saved_pending_model_and_effort(restart_response, reason):
+    state = run_controls(
+        action="model", model="gpt-5.6-terra", restart=True,
+        session={"model": "gpt-6-astra", "effort": "ultra"},
+        responses=[
+            {"ok": True, "body": {"ok": True, "codex_was_running": True, "effort": "max"}},
+            restart_response,
+        ],
+    )
+    assert len(state["requests"]) == 2
+    assert state["requests"][-1]["body"] == {"model": "gpt-5.6-terra", "restart": True}
+    assert state["session"]["model"] == "gpt-6-astra", "An unconfirmed restart must not claim the new model is active"
+    assert state["session"]["model_pending"] == "gpt-5.6-terra"
+    assert state["session"]["effort"] == "max", "Keep the reasoning level returned by the successful save"
+    assert state["effortBadge"].startswith("Effort max ")
+    assert "GPT-5.6 Terra…" in state["modelBadge"]
+    assert state["alerts"] == ["Model saved, but restart failed: " + reason]
+    assert "restarted" not in state["message"]
+
+
+def test_declining_model_restart_saves_once_and_keeps_selection_pending():
+    state = run_controls(
+        action="model", model="gpt-5.6-terra", restart=False,
+        session={"model": "gpt-6-astra", "effort": "ultra"},
+        responses=[{"ok": True, "body": {"ok": True, "codex_was_running": True, "effort": "max"}}],
+    )
+    assert state["requests"] == [
+        {"url": "/api/sessions/alpha/model", "body": {"model": "gpt-5.6-terra", "restart": False}}
+    ]
+    assert state["session"]["model"] == "gpt-6-astra"
+    assert state["session"]["model_pending"] == "gpt-5.6-terra"
+    assert state["session"]["effort"] == "max"
+    assert state["alerts"] == []
+    assert state["message"] == "Model → GPT-5.6 Terra · saved"
 
 
 def test_project_link_is_in_more_and_effort_sits_next_to_model():

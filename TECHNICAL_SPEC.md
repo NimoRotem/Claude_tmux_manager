@@ -30,6 +30,7 @@ The dashboard manages owner-scoped coding conversations running in tmux. It pres
 - The browser badge distinguishes disconnected, connected, and currently working states using the signed-in account's browser and its active leases. Members reach their own browser settings; administrative browser management remains restricted to administrators.
 - Rename changes only the visible session label. The stable session route, tmux name, project directory, owner, generation, and rollout root do not change. Manual labels are persisted under owner and generation checks and are not overwritten by delayed automatic naming.
 - Account Preferences controls automatic session naming. The default preserves automatic naming; disabling it prevents subsequent automatic renaming without clearing manual labels. Preferences are private to the signed-in account.
+- Saving a model or reasoning choice is distinct from restarting a running worker. Settings restarts briefly wait for a busy session before touching the coding worker; persistent contention returns an explicit busy response with the choice still saved. Waiting never retries terminal writes, and owner, generation, working directory, and conversation-root checks remain mandatory.
 
 ## Saved project details
 
