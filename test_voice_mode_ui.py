@@ -21,7 +21,7 @@ const fs=require('fs'),vm=require('vm'),scenario=process.argv[3];
 const source=fs.readFileSync(process.argv[1]+'/app.py','utf8'),quotes='"'.repeat(3);
 const html=source.match(new RegExp('^HTML_PAGE = r'+quotes+'([\\s\\S]*?)^'+quotes,'m'))[1];
 const js=html.match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
-const media=[],sockets=[],pcs=[],recorders=[],requests=[],alerts=[],dispatch=[],timers=new Map(),listeners={};
+const media=[],sockets=[],pcs=[],recorders=[],requests=[],alerts=[],dispatch=[],confirmations=[],timers=new Map(),listeners={};
 let timerId=0,resolveStop,resolveTranscript,pendingTranscript;
 const noop=()=>{},all=[];
 class Element {
@@ -64,7 +64,7 @@ const track=()=>({enabled:true,stops:0,stop(){this.stops++;this.enabled=false}})
 const makeStream=()=>{const t=track();return {track:t,getTracks:()=>[t],getAudioTracks:()=>[t]}};
 class Socket {static OPEN=1;constructor(url){this.url=url;this.readyState=0;this.sent=[];this.closed=0;sockets.push(this)}send(data){this.sent.push(JSON.parse(data))}close(){this.closed++;this.readyState=3}}
 class Peer {constructor(){this.closed=0;this.connectionState='new';pcs.push(this)}addTrack(){}createDataChannel(){return this.events={readyState:'open',sent:[],closed:0,send(data){this.sent.push(JSON.parse(data))},close(){this.closed++;this.readyState='closed'}}}async createOffer(){if(scenario==='offer-failure')throw new Error('offer failed');return {sdp:'offer'}}async setLocalDescription(){}async setRemoteDescription(){}close(){this.closed++;this.connectionState='closed'}}
-const window={RTCPeerConnection:Peer,addEventListener:(type,callback)=>{(listeners[type]||=[]).push(callback)}};
+const window={RTCPeerConnection:Peer,confirm:message=>{confirmations.push(message);return scenario!=='advanced-decline'},addEventListener:(type,callback)=>{(listeners[type]||=[]).push(callback)}};
 const context=vm.createContext({console,Promise,Map,Set,WeakMap,Math,Number,String,Array,Date,JSON,URL,Blob,FormData,AbortController,
   window,document,location:{href:'https://codex.lisa.my/',protocol:'https:'},BASE:'',
   sessions:[{name:'alpha',logical_incarnation:'one'},{name:'beta',logical_incarnation:'two'}],selectedSession:'alpha',
@@ -90,7 +90,9 @@ function snapshot(){return {voice:window.voiceMode.state(),media:media.length,pe
   channelClosed:pcs.map(item=>item.events?.closed||0),busy:window.dashboardMicrophone.busy(),
   draft:document.getElementById('cmd-chat-alpha').value,status:node('status')?.textContent||'',timers:timers.size,
   focused:document.activeElement?.id,button:document.getElementById('cmd-send-chat-alpha').getAttribute('aria-label'),
-  waveform:document.getElementById('voice-mode-open-alpha').getAttribute('aria-label')}}
+  waveform:document.getElementById('voice-mode-open-alpha').getAttribute('aria-label'),
+  advanced:['supervision','checkin'].map(option=>({option,checked:!!node(option)?.checked,disabled:!!node(option)?.disabled})),
+  releaseHidden:node('release-hold')?.hidden}}
 async function grant(index=0){const item=media[index];item.stream=makeStream();item.resolve(item.stream);await settle()}
 (async()=>{
   const states=[snapshot()];
@@ -134,12 +136,26 @@ async function grant(index=0){const item=media[index];item.stream=makeStream();i
   await grant();await pending;states.push(snapshot());
   if(scenario==='offer-failure')return {states,requests,alerts};
   const socket=sockets[0];socket.readyState=Socket.OPEN;socket.onopen();
-  if(scenario!=='unbound-close')await socket.onmessage({data:JSON.stringify({type:'binding',nonce:'our-connection',generation:'our-generation'})});
+  if(scenario!=='unbound-close')await socket.onmessage({data:JSON.stringify({type:'binding',nonce:'our-connection',generation:'our-generation',root:scenario==='advanced-rootless'?'':'root-alpha',held:scenario==='advanced-release'})});
   if(scenario==='changed-binding'){
     await socket.onmessage({data:JSON.stringify({type:'binding',nonce:'different-connection',generation:'our-generation'})});
     states.push(snapshot());return {states,requests,alerts};
   }
   pcs[0].events.onmessage({data:JSON.stringify({type:'session.started'})});states.push(snapshot());
+  if(scenario.startsWith('advanced-')){
+    const option=scenario==='advanced-checkin'?'checkin':'supervision';
+    if(scenario==='advanced-release')node('release-hold').onclick();
+    else node(option).onchange({target:{checked:true}});
+    states.push(snapshot());
+    if(['advanced-supervision','advanced-checkin','advanced-release'].includes(scenario)){
+      await socket.onmessage({data:JSON.stringify({type:'advanced',supervision:scenario==='advanced-supervision',checkin:scenario==='advanced-checkin',held:false})});
+      states.push(snapshot());
+    }
+    if(scenario==='advanced-timeout'){for(const callback of [...timers.values()])callback();states.push(snapshot())}
+    await window.voiceMode.close();states.push(snapshot());
+    await window.voiceMode.open('alpha');states.push(snapshot());
+    return {states,requests,alerts,confirmations,sent:socket.sent};
+  }
   if(scenario.startsWith('nested-')){
     pcs[0].ontrack({streams:[media[0].stream]});await settle();
     const greeting=pcs[0].events.sent.find(event=>event.type==='session.instructions.append');
@@ -269,7 +285,7 @@ def test_owned_stop_includes_nonce_and_generation_and_cannot_close_reopened_pane
     stops = [row for row in result["requests"] if row["url"].endswith("/voice/stop")]
     assert len(stops) == 1
     assert stops[0]["url"] == "/api/sessions/alpha/voice/stop"
-    assert json.loads(stops[0]["options"]["body"]) == {"nonce": "our-connection", "generation": "our-generation"}
+    assert json.loads(stops[0]["options"]["body"]) == {"nonce": "our-connection", "generation": "our-generation", "root": "root-alpha"}
     assert result["states"][-1]["voice"]["open"]
     assert result["states"][-1]["voice"]["session"] == "beta"
     assert result["states"][-1]["media"] == 1
@@ -330,6 +346,51 @@ def test_nested_audio_error_identity_still_mutes_until_explicit_retry():
     assert after_error["voice"]["connected"]
     assert after_error["enabled"] == [False]
     assert "audio control" in after_error["status"]
+
+
+@pytest.mark.parametrize("option", ["supervision", "checkin"])
+def test_advanced_voice_requires_confirmation_and_exact_root_before_acknowledged_enable(option):
+    result = run_voice("advanced-" + option)
+    assert all(not control["checked"] and control["disabled"] for control in result["states"][1]["advanced"])
+    assert all(not control["checked"] and control["disabled"] for control in result["states"][3]["advanced"])
+    assert len(result["confirmations"]) == 1
+    advanced = [frame for frame in result["sent"] if frame["type"] == "advanced"]
+    assert advanced == [{"type": "advanced", "option": option, "enabled": True, "consent": True,
+                         "restart_acknowledged": option == "supervision", "nonce": "our-connection",
+                         "generation": "our-generation", "root": "root-alpha"}]
+    assert all(not control["checked"] and control["disabled"] for control in result["states"][5]["advanced"])
+    enabled = {control["option"] for control in result["states"][6]["advanced"] if control["checked"]}
+    assert enabled == {option}
+    assert all(not control["checked"] and control["disabled"] for control in result["states"][-1]["advanced"])
+    assert result["states"][-1]["draft"] == "Unsent private draft"
+    assert result["states"][-1]["stopped"][0] >= 1
+
+
+@pytest.mark.parametrize("scenario", ["advanced-decline", "advanced-rootless"])
+def test_advanced_voice_never_sends_without_consent_and_bound_root(scenario):
+    result = run_voice(scenario)
+    assert not any(frame["type"] == "advanced" for frame in result["sent"])
+    assert all(not control["checked"] for control in result["states"][5]["advanced"])
+    assert len(result["confirmations"]) == (1 if scenario == "advanced-decline" else 0)
+
+
+def test_existing_tool_hold_can_be_released_without_enabling_restart():
+    result = run_voice("advanced-release")
+    assert result["states"][4]["releaseHidden"] is False
+    advanced = next(frame for frame in result["sent"] if frame["type"] == "advanced")
+    assert advanced["option"] == "supervision" and advanced["enabled"] is False
+    assert advanced["restart_acknowledged"] is False
+    assert advanced["root"] == "root-alpha"
+    assert result["states"][6]["releaseHidden"] is True
+
+
+def test_unconfirmed_advanced_result_does_not_enable_controls_or_leak_audio_after_reopen():
+    result = run_voice("advanced-timeout")
+    assert "unconfirmed" in result["states"][6]["status"]
+    assert all(not control["checked"] for control in result["states"][6]["advanced"])
+    assert all(not control["checked"] and control["disabled"] for control in result["states"][-1]["advanced"])
+    assert result["states"][-1]["stopped"][0] >= 1
+    assert result["states"][-1]["draft"] == "Unsent private draft"
 
 
 @pytest.mark.parametrize("view", ["chat", "raw"])

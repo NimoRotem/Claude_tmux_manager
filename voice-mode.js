@@ -19,6 +19,7 @@
   const mic = () => window.dashboardMicrophone;
   let connected = false, starting = false, ending = false, mode = 'continuous', muted = false;
   let updateScope = 'current', preferencePending = false;
+  let supervision = false, checkin = false, advancedPending = false, advancedTimer, held = false;
   const updateScopes = ['off', 'current', 'all'];
   const updateLabels = {off:'Off', current:'On', all:'All Sessions'};
   let playbackReady = false, greetingId = '', greetingTimer;
@@ -65,6 +66,28 @@
     node('hold').setAttribute('aria-pressed', String(capturing && mode === 'push'));
     node('pause').disabled = !connected;
     node('mode').disabled = starting;
+    for(const option of ['supervision','checkin']) {
+      const control=node(option);
+      if(control){control.checked=option==='supervision'?supervision:checkin;
+        control.disabled=!connected||!binding?.root||advancedPending||ending;}
+    }
+    if(node('release-hold'))node('release-hold').hidden=!connected||!held;
+  }
+  function advanced(option, enabled) {
+    if(!connected||!binding?.root||advancedPending||ending)return;
+    const disclosure=option==='supervision'?(enabled?
+      'Enable managed pause controls? This may interrupt and restart the coding worker in this exact conversation. It suspends automatic dashboard prompts. Explicit pauses survive End and disconnect. Reconnect and use Release existing tool hold to release them. Hooks cover supported local tools, not every possible action.':
+      'Disable managed controls and release any explicit tool hold for this conversation? This does not send new work or override other approvals.'):
+      (enabled?'Enable 3-minute pre-test check-ins for this connection? A scoped instruction will ask for feature tweaks before testing. After that exact question and 3 minutes without input, already-requested testing and the normal workflow may continue only under existing rules and approvals. This is not deployment consent.':
+      'Disable the pre-test inactivity timer? Silence will no longer trigger a continuation.');
+    paint();
+    if(!window.confirm(disclosure))return;
+    advancedPending=true;paint();
+    send({type:'advanced',option,enabled,consent:true,restart_acknowledged:option==='supervision'&&enabled,
+      nonce:binding.nonce,generation:binding.generation,root:binding.root});
+    const run=epoch;
+    clearTimeout(advancedTimer);advancedTimer=setTimeout(()=>{if(run===epoch){advancedPending=false;paint();
+      status('Advanced control result is unconfirmed. Reconnect before trying again; existing explicit holds remain.');}},90000);
   }
   function capture(enabled) {
     capturing = Boolean(enabled && connected && !ending && !muted && !document.hidden);
@@ -118,6 +141,7 @@
     }
   }
   function cleanup() {
+    clearTimeout(advancedTimer);advancedPending=false;supervision=false;checkin=false;
     clearTimeout(activityPulseTimer);
     playbackReady=false; greetingId=''; clearTimeout(greetingTimer);
     if(node('sound')) node('sound').hidden=true;
@@ -136,7 +160,7 @@
   }
   function failed(text) {
     ++epoch; cleanup(); status(text);
-    guard('Voice is disconnected. Reconnect to continue. Your coding session is unchanged.');
+    guard('Voice is disconnected. Existing explicit coding holds remain; reconnect to release them deliberately.');
   }
   async function start() {
     if(starting || connected || ending) return;
@@ -212,7 +236,9 @@
         if(data.type==='binding' || data.type==='answer') {
           if(typeof data.nonce==='string'&&data.nonce&&typeof data.generation==='string'&&data.generation){
             if(binding&&(binding.nonce!==data.nonce||binding.generation!==data.generation)){failed('Voice connection identity changed. Reconnect to continue.');return;}
-            binding={nonce:data.nonce,generation:data.generation};
+            if(binding?.root&&data.root&&binding.root!==data.root){failed('The coding conversation changed. Reconnect voice.');return;}
+            binding={nonce:data.nonce,generation:data.generation,root:data.root||binding?.root||''};
+            if(typeof data.held==='boolean')held=data.held;
           }else if(data.type==='binding'){failed('Voice service returned an invalid connection identity.');return;}
           if(data.type==='binding'){paint();return;}
           try {await peer.setRemoteDescription({type:'answer',sdp:data.sdp});}
@@ -222,6 +248,10 @@
           else if(typeof data.proactive_updates === 'boolean') updateScope=data.proactive_updates?'current':'off';
           preferencePending=false;paint();
           if(data.error)status(data.error);
+        } else if(data.type==='advanced') {
+          clearTimeout(advancedTimer);advancedPending=false;supervision=data.supervision===true;
+          checkin=data.checkin===true;held=data.held===true;paint();
+          guard(data.error||('Managed pause controls: '+(supervision?'on':'off')+'. Pre-test timer: '+(checkin?'on':'off')+'.'+(held?' An explicit tool hold remains.':'')));
         } else if(data.type==='error') failed(data.message);
         else if(data.type==='feature_checkin') {guard(data.message);}
         else if(data.type==='target_confirmation') {guard(data.message);status('Confirmation for '+data.spoken_name+'. Voice stays attached to the current session.');}
@@ -277,7 +307,7 @@
   }
   async function open(session) {
     if(panel) {panel.hidden=false; panel.focus(); if(session!==name) status('Voice is attached to '+name+'. You can ask about your other sessions without switching voice.'); return;}
-    ++epoch;name=session;off=false;ending=false;binding=null;
+    ++epoch;name=session;off=false;ending=false;binding=null;held=false;supervision=false;checkin=false;
     returnFocus=document.activeElement;
     panel=document.createElement('section'); panel.className='voice-panel'; panel.tabIndex=-1;
     panel.setAttribute('role','dialog');panel.setAttribute('aria-label','Voice Mode');panel.id='voice-mode-panel';
@@ -290,6 +320,10 @@
       <div class="voice-row"><button id="voice-start" class="voice-primary">Connect</button><button id="voice-hold" class="voice-hold" hidden aria-pressed="false" title="Hold the Control key (⌃ on Mac), or hold this button, to talk">Hold Control to talk</button><button id="voice-sound" hidden>Enable sound</button></div>
       <p class="voice-subtle voice-mic-state" id="voice-mic-state" role="status"></p>
       <div class="voice-guard" id="voice-guard">Talk through ideas. Coding actions happen only when you ask for them.</div>
+      <details class="voice-subtle"><summary>Advanced controls · off by default</summary>
+      <p><label><input type="checkbox" id="voice-supervision" disabled> Managed pause controls</label><br>May restart this coding worker. End and disconnect keep explicit tool holds. Reconnect, then use Release existing tool hold. Disabling also releases it. Hooks cover supported local tools, not all actions.</p>
+      <p><label><input type="checkbox" id="voice-checkin" disabled> 3-minute pre-test check-in</label><br>Only after the exact feature-tweak question. Input resets the timer; holds cancel it. Existing rules and approvals still apply. No new deployment permission.</p>
+      <button id="voice-release-hold" hidden type="button">Release existing tool hold</button></details>
       </div><div class="voice-row voice-footer"><button id="voice-pause" aria-label="Interrupt coding" disabled><span aria-hidden="true">⏸</span> Interrupt coding</button><button id="voice-end" class="voice-end">End voice</button><button id="voice-close" aria-label="Close Voice Mode">Close</button></div>`;
     const main = document.getElementById('main');
     if(main) main.before(panel); else document.body.append(panel);
@@ -311,6 +345,9 @@
     };
     node('sound').onclick=()=>{if(audio)enableSound(epoch);};
     node('pause').onclick=()=>send({type:'pause'});
+    node('supervision').onchange=event=>advanced('supervision',event.target.checked);
+    node('checkin').onchange=event=>advanced('checkin',event.target.checked);
+    node('release-hold').onclick=()=>advanced('supervision',false);
     node('end').onclick=()=>stop(); node('close').onclick=()=>stop(true);
     const hold=node('hold');
     hold.onpointerdown=event=>{

@@ -1,0 +1,18 @@
+# Managed hook is inert unless this coding session was launched with voice supervision.
+[features]
+hooks = true
+
+[hooks]
+managed_dir = "/usr/local/libexec/tmux-dashboard-voice"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/usr/bin/python3 /usr/local/libexec/tmux-dashboard-voice/voice_hook.py"
+timeout = 6
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 /usr/local/libexec/tmux-dashboard-voice/voice_hook.py"
+timeout = 6

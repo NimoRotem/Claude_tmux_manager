@@ -74,7 +74,7 @@ def _run(scenario: str) -> dict:
 
 def test_close_confirmation_has_no_summary_or_save_step():
     state = _run("success")
-    assert "Close demo?" in state["confirmation"]
+    assert "Close session demo?" in state["confirmation"]
     assert "Close session" in state["confirmation"]
     assert "Cancel" in state["confirmation"]
     assert "summar" not in state["confirmation"].lower()
@@ -94,7 +94,7 @@ def test_confirmed_close_dismisses_dialog_and_refreshes_without_polling():
 def test_unconfirmed_close_preserves_local_state_and_offers_refresh(scenario):
     state = _run(scenario)
     assert state["polls"] == 0
-    assert state["loads"] == 0
+    assert state["loads"] == 1, "An uncertain DELETE must refresh the actual roster without retrying deletion"
     assert state["closes"] == 0
     assert state["selectedSession"] == "demo"
     assert state["chatPreserved"] is True

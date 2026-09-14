@@ -260,7 +260,11 @@ class TestDashboardFrontendRegressions:
     def test_delete_ui_closes_without_summary_or_save_step(self, authed_client):
         html = authed_client.get("/").text
 
-        assert "Close ${esc(name)}?" in html
+        close_start = html.index("function showDeleteModal(name){")
+        close_end = html.index("function _closeModalOwns(run){", close_start)
+        close_controls = html[close_start:close_end]
+        assert "<h3>Close session ${esc(name)}?</h3>" in close_controls
+        assert "deleteSession('${esc(name)}')" in close_controls
         assert ">Close session</button>" in html
         assert "Summarize &amp; Close" not in html
         assert "Saving session knowledge…" not in html
@@ -292,6 +296,8 @@ class TestDashboardFrontendRegressions:
 
         assert 'id="nav-cpu-summary"' in nav_before_menu
         assert 'id="nav-usage-cap-summary"' in nav_before_menu
+        assert 'id="nav-browser-badge"' in nav_before_menu
+        assert html.count('id="nav-browser-badge"') == 1
         assert '>Status <span class="nav-status-chevron">' in nav_before_menu
         assert 'title="Settings"' in html[tools_start:]
 
@@ -299,7 +305,6 @@ class TestDashboardFrontendRegressions:
             "nav-server-stats",
             "nav-usage",
             "nav-codex-alert",
-            "nav-browser-badge",
             "codex-auth",
             "nav-status-whoami",
         ):
@@ -320,11 +325,15 @@ class TestDashboardFrontendRegressions:
             "nav-server-stats",
             "nav-usage",
             "nav-codex-alert",
-            "nav-browser-badge",
             "codex-auth",
             "nav-status-whoami",
         ):
             assert f'id="{moved_id}"' in status
+
+        header_start = html.index('<div class="nav-right">')
+        assert 'id="nav-browser-badge"' in html[header_start:status_start]
+        assert 'id="nav-browser-badge"' not in status
+        assert html.count('id="nav-browser-badge"') == 1
 
         assert "Full system stats" in status
         assert "Log out" in status
@@ -411,7 +420,7 @@ class TestDashboardFrontendRegressions:
         assert 'id="new-session-model"' in html
         assert 'id="new-session-effort"' in html
         assert 'id="new-session-nofb"' in html
-        assert "JSON.stringify({name:requested||_autoSessionName(),...choices})" in html
+        assert "JSON.stringify({name:requested||_autoSessionName(),name_generated:!requested,...choices})" in html
         assert "await loadAll(created.name)" in html
         assert "selectSession(created.name)" in html
 

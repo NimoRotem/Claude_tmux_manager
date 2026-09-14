@@ -1,6 +1,7 @@
 """Voice security contracts with synthetic owners, temp state and no provider I/O."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -50,6 +51,7 @@ def host(tmp_path):
         _terminal_binding=lambda name, owner: {"generation": identities[name]["generation"], "owner_id": owner},
         _session_lifecycle={name: {"desired_state": "running", "owner_id": "one", "resume_uuid": ""}
                             for name in identities},
+        _session_operation_lock=lambda name: contextlib.nullcontext(),
         _managed_openai_key=lambda: "synthetic-provider-key-not-for-output",
         _read_terminal_history=Mock(return_value={"entries": [], "cursor": "", "has_more": False}),
         _session_tab_label_rows=lambda: {},
@@ -411,7 +413,7 @@ def test_stop_requires_exact_nonce_and_generation(client, connection, body):
 def test_stop_only_disconnects_bound_voice_not_coding_work(client, connection):
     client.cookies.set("test", "one")
     response = client.post("/api/sessions/alpha/voice/stop", json={
-        "nonce": connection.nonce, "generation": GENERATION}, headers={"origin": "http://testserver"})
+        "nonce": connection.nonce, "generation": GENERATION, "root": "root"}, headers={"origin": "http://testserver"})
     assert response.status_code == 200 and response.json()["ok"]
     assert not connection.state()["active"] and not connection.state()["connected"]
     connection.host.api_interrupt_session.assert_not_awaited()

@@ -56,18 +56,26 @@ def test_plus_opens_blank_name_form_without_creating():
 
 def test_typed_name_is_used_and_created_session_opens_after_roster_refresh():
     state=run(action='create',name='my-project')
-    assert state['requests'] == [{'name':'my-project','model':'gpt-6-astra','effort':'max','no_fallback':False}]
+    assert state['requests'] == [{'name':'my-project','name_generated':False,'model':'gpt-6-astra','effort':'max','no_fallback':False}]
     assert state['selected'] == 'created'
 
 
 def test_only_empty_submission_generates_a_name():
     state=run(action='create',name='   ')
     assert len(state['requests'][0]['name']) == 8
+    assert state['requests'][0]['name_generated'] is True
+
+
+def test_generated_name_collision_retries_keep_automatic_naming_enabled():
+    state=run(action='create',name='',conflict=True)
+    assert len(state['requests']) == 5
+    assert all(row['name_generated'] is True and len(row['name']) == 8 for row in state['requests'])
+    assert state['selected'] == 'old'
 
 
 def test_named_collision_never_falls_back_to_random_name():
     state=run(action='create',name='taken',conflict=True)
-    assert state['requests'] == [{'name':'taken','model':'gpt-6-astra','effort':'max','no_fallback':False}]
+    assert state['requests'] == [{'name':'taken','name_generated':False,'model':'gpt-6-astra','effort':'max','no_fallback':False}]
     assert state['selected'] == 'old'
 
 
@@ -102,7 +110,7 @@ def test_creation_form_defaults_and_effort_cap():
 
 def test_custom_model_effort_and_opt_out_are_submitted():
     state=run(action='create',name='custom',model='gpt-5.6-luna',effort='high',no_fallback=True)
-    assert state['requests']==[{'name':'custom','model':'gpt-5.6-luna','effort':'high','no_fallback':True}]
+    assert state['requests']==[{'name':'custom','name_generated':False,'model':'gpt-5.6-luna','effort':'high','no_fallback':True}]
     assert state['selected']=='created'
 
 
