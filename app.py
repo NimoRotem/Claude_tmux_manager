@@ -1,25 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
+import grp
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
+import pwd
 import re
 import secrets
 import select
 import shlex
 import shutil
 import signal
+import socket
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 try:
     import tomllib
@@ -42,15 +51,20 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from pydantic import BaseModel, Field
 
 import google_policy
+import chat_summaries
+import voice_mode
 from runtime_control import (
     BrowserLeaseStore,
     LockedJsonStore,
     SessionLifecycleStore,
     browser_start_argv,
     browser_unit_name,
+    build_pytest_serialization_env_prefix,
+    default_codex_aggregate_cpu_quota_percent,
     scoped_codex_command,
     user_systemd_argv,
 )
+from session_metrics import CodexRolloutMetrics, empty_metrics
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CODEX_API_FALLBACK_ENABLED = os.environ.get(
@@ -59,13 +73,38 @@ CODEX_API_FALLBACK_ENABLED = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8505"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/codex")
+
+
+def _loopback_bind_host(configured: str) -> str:
+    candidate = (configured or "").strip()
+    try:
+        if candidate != "localhost" and not ipaddress.ip_address(candidate).is_loopback:
+            raise ValueError("dashboard bind address must be loopback")
+        return candidate
+    except ValueError:
+        logger.warning(
+            "Ignoring non-loopback TMUX_DASH_BIND_HOST=%r; using 127.0.0.1",
+            candidate,
+        )
+        return "127.0.0.1"
+
+
+API_HOST = _loopback_bind_host(
+    os.environ.get("TMUX_DASH_BIND_HOST", "127.0.0.1")
+)
 PROCESS_ROLE = os.environ.get("TMUX_DASH_PROCESS_ROLE", "combined").strip().lower()
 if PROCESS_ROLE not in {"combined", "api", "controller"}:
     PROCESS_ROLE = "combined"
-# Default launch command for codex sessions. config.toml already sets
-# sandbox_mode=danger-full-access and approval_policy=never so bare `codex`
-# is non-interactive; we still pass the explicit flag for safety on hosts that
-# haven't been pre-configured.
+try:
+    TRUSTED_MAIN_PID = int(os.environ.get("TMUX_DASH_TRUSTED_MAIN_PID", "0"))
+except ValueError:
+    TRUSTED_MAIN_PID = 0
+TRUSTED_MAIN_START = os.environ.get("TMUX_DASH_TRUSTED_MAIN_START", "").strip()
+# Default launch command for Codex sessions. The explicit flag makes the
+# dashboard's launch policy independent of a user's persistent config.toml.
+# Directory new sessions start in. Unset => the dashboard's own cwd, which is its source
+# tree: fine on a general-purpose box, a footgun on one dedicated to a single product.
+SESSION_CWD = os.environ.get("TMUX_DASH_SESSION_CWD", "").strip()
 NEW_SESSION_CMD = os.environ.get(
     "TMUX_DASH_NEW_SESSION_CMD",
     "codex --dangerously-bypass-approvals-and-sandbox",
@@ -78,9 +117,10 @@ _CODEX_DEFAULT_MODEL = os.environ.get(
     "TMUX_DASH_DEFAULT_MODEL",
     os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol"),
 ).strip() or "gpt-5.6-sol"
-_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+_CODEX_REASONING_EFFORTS = (
+    "none", "low", "medium", "high", "xhigh", "max", "ultra"
+)
 _CODEX_REASONING_EFFORT_ALIASES = {
-    "ultra": "max",
     "extra-high": "xhigh",
     "extra_high": "xhigh",
 }
@@ -106,61 +146,139 @@ _DISABLE_STALLED_OPENAI_DOCS_MCP = os.environ.get(
 # Compatibility name retained for the newer Grabo frontend and API payloads.
 DEFAULT_MODEL = _CODEX_DEFAULT_MODEL
 MODELS_FILE = Path.home() / ".tmux-dashboard" / "codex-models.json"
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{2,80}$")
 _SEED_MODEL_CATALOG = [
+    ["gpt-6-astra", "GPT-6 Astra"],
     ["gpt-5.6-sol", "GPT-5.6 Sol"],
-    ["gpt-5.6", "GPT-5.6 (Sol alias)"],
     ["gpt-5.6-terra", "GPT-5.6 Terra"],
     ["gpt-5.6-luna", "GPT-5.6 Luna"],
     ["gpt-5.5", "GPT-5.5"],
-    ["gpt-5.4", "GPT-5.4"],
+    ["gpt-5.4-mini", "GPT-5.4 Mini"],
+    ["gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"],
 ]
+_SEED_MODEL_EFFORTS = {
+    "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-5.5": ["low", "medium", "high", "xhigh"],
+    "gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
+    "gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"],
+}
 
 
-def _load_model_catalog() -> list:
+def _model_catalog_file_for_user(user: dict | None = None) -> Path:
+    if not user or str(user.get("id") or "") == "admin":
+        return MODELS_FILE
+    return _user_data_dir(user) / "codex-models.json"
+
+
+def _load_model_snapshot(
+    path: Path = MODELS_FILE,
+) -> tuple[list, dict[str, list[str]], float]:
     try:
-        data = json.loads(MODELS_FILE.read_text())
+        data = json.loads(path.read_text())
         rows = data.get("models") if isinstance(data, dict) else data
         rows = [list(row) for row in (rows or [])
                 if isinstance(row, (list, tuple)) and len(row) == 2]
         if rows:
-            return rows
+            allowed_models = {str(row[0]) for row in rows}
+            efforts: dict[str, list[str]] = {}
+            saved = data.get("model_efforts", {}) if isinstance(data, dict) else {}
+            for model, values in saved.items():
+                if str(model) not in allowed_models or not isinstance(values, list):
+                    continue
+                supported = [
+                    effort for effort in values
+                    if effort in _CODEX_REASONING_EFFORTS
+                ]
+                if supported:
+                    efforts[str(model)] = list(dict.fromkeys(supported))
+            last_check = float(data.get("last_check", 0)) if isinstance(data, dict) else 0.0
+            return rows, efforts, last_check
     except Exception:
-        logger.debug("No usable Codex model catalog at %s", MODELS_FILE, exc_info=True)
-    return [list(row) for row in _SEED_MODEL_CATALOG]
-
-
-def _save_model_catalog(catalog: list, last_check: float = 0.0):
-    try:
-        MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MODELS_FILE.write_text(json.dumps({"models": catalog, "last_check": last_check}, indent=2))
-    except Exception:
-        logger.debug("Failed to save %s", MODELS_FILE, exc_info=True)
-
-
-def _fetch_codex_model_catalog() -> list:
-    """Read the model catalog bundled with the installed Codex CLI."""
-    result = subprocess.run(
-        ["codex", "debug", "models", "--bundled"],
-        capture_output=True,
-        text=True,
-        timeout=20,
+        logger.debug("No usable Codex model catalog at %s", path, exc_info=True)
+    return (
+        [list(row) for row in _SEED_MODEL_CATALOG],
+        {model: list(values) for model, values in _SEED_MODEL_EFFORTS.items()},
+        0.0,
     )
-    if result.returncode != 0:
-        return []
-    data = json.loads(result.stdout or "{}")
-    rows = []
-    for model in data.get("models", []):
-        if not isinstance(model, dict) or model.get("visibility") == "hide":
+
+
+def _load_model_catalog(path: Path = MODELS_FILE) -> list:
+    return _load_model_snapshot(path)[0]
+
+
+def _load_model_efforts(path: Path = MODELS_FILE) -> dict[str, list[str]]:
+    return _load_model_snapshot(path)[1]
+
+
+def _save_model_catalog(
+    catalog: list,
+    last_check: float = 0.0,
+    model_efforts: dict[str, list[str]] | None = None,
+    path: Path = MODELS_FILE,
+):
+    try:
+        _atomic_write_json(path, {
+            "models": catalog,
+            "model_efforts": model_efforts or {},
+            "last_check": last_check,
+        })
+    except Exception:
+        logger.debug("Failed to save %s", path, exc_info=True)
+
+
+def _fetch_codex_model_catalog(
+    codex_home: Path | None = None,
+) -> tuple[list, dict[str, list[str]]]:
+    """Read the account catalog, falling back to models bundled with Codex."""
+    commands = (
+        ["codex", "debug", "models"],
+        ["codex", "debug", "models", "--bundled"],
+    )
+    for command in commands:
+        rows = []
+        model_efforts: dict[str, list[str]] = {}
+        seen: set[str] = set()
+        try:
+            kwargs = {"capture_output": True, "text": True, "timeout": 20}
+            if codex_home is not None:
+                env = os.environ.copy()
+                env["CODEX_HOME"] = str(codex_home)
+                kwargs["env"] = env
+            result = subprocess.run(command, **kwargs)
+            if result.returncode != 0:
+                continue
+            data = json.loads(result.stdout or "{}")
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
             continue
-        slug = str(model.get("slug") or "").strip()
-        if not slug:
-            continue
-        label = str(model.get("display_name") or slug).strip()
-        rows.append([slug, label])
-    return rows
+        for model in data.get("models", []):
+            if not isinstance(model, dict) or model.get("visibility") == "hide":
+                continue
+            slug = str(model.get("slug") or "").strip()
+            if not _MODEL_ID_RE.fullmatch(slug):
+                continue
+            label = str(model.get("display_name") or slug).strip()
+            if slug not in seen:
+                seen.add(slug)
+                rows.append([slug, label])
+            supported = model_efforts.setdefault(slug, [])
+            for level in model.get("supported_reasoning_levels", []):
+                if not isinstance(level, dict):
+                    continue
+                effort = str(level.get("effort") or "").strip().lower()
+                if effort in _CODEX_REASONING_EFFORTS and effort not in supported:
+                    supported.append(effort)
+        if rows:
+            return rows, {
+                model: values for model, values in model_efforts.items() if values
+            }
+    return [], {}
 
 
 MODEL_CATALOG = _load_model_catalog()
+MODEL_EFFORTS = _load_model_efforts()
 ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
 if DEFAULT_MODEL not in ALLOWED_SESSION_MODELS:
     MODEL_CATALOG.insert(0, [DEFAULT_MODEL, DEFAULT_MODEL])
@@ -194,30 +312,28 @@ def _codex_cli_readiness() -> tuple[bool, str, dict]:
     return True, "ready", details
 
 
-async def _refresh_model_catalog(force: bool = False) -> bool:
-    global MODEL_CATALOG, ALLOWED_SESSION_MODELS
+async def _refresh_model_catalog(
+    force: bool = False, user: dict | None = None
+) -> bool:
+    global MODEL_CATALOG, MODEL_EFFORTS, ALLOWED_SESSION_MODELS
     try:
-        last_check = 0.0
-        try:
-            last_check = float(json.loads(MODELS_FILE.read_text()).get("last_check", 0))
-        except Exception:
-            pass
+        path = _model_catalog_file_for_user(user)
+        current_catalog, current_efforts, last_check = _load_model_snapshot(path)
         now = time.time()
         if not force and now - last_check < MODEL_CHECK_INTERVAL:
             return False
-        detected = await asyncio.to_thread(_fetch_codex_model_catalog)
+        codex_home = _user_codex_config_dir(user) if user else CODEX_HOME
+        detected, detected_efforts = await asyncio.to_thread(
+            _fetch_codex_model_catalog, codex_home
+        )
         if not detected:
             return False
-        seen = set()
-        merged = []
-        for row in detected + _SEED_MODEL_CATALOG:
-            if row[0] not in seen:
-                seen.add(row[0])
-                merged.append(list(row))
-        changed = merged != MODEL_CATALOG
-        MODEL_CATALOG = merged
-        ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
-        _save_model_catalog(MODEL_CATALOG, now)
+        changed = detected != current_catalog or detected_efforts != current_efforts
+        _save_model_catalog(detected, now, detected_efforts, path)
+        if path == MODELS_FILE:
+            MODEL_CATALOG = detected
+            MODEL_EFFORTS = detected_efforts
+            ALLOWED_SESSION_MODELS = [row[0] for row in detected]
         return changed
     except Exception:
         logger.debug("Codex model catalog refresh failed", exc_info=True)
@@ -286,22 +402,122 @@ _CODEX_DOCS_OVERRIDE_RE = re.compile(
 )
 
 
+_CODEX_THREAD_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _validated_codex_thread_id(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    return candidate.lower() if _CODEX_THREAD_ID_RE.fullmatch(candidate) else None
+
+
+def _resolved_real_directory(path: Path | str) -> Path | None:
+    """Resolve an absolute directory while rejecting a symlink in any component."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return None
+    current = Path(candidate.anchor)
+    try:
+        for part in candidate.parts[1:]:
+            current /= part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return None
+        resolved = candidate.resolve(strict=True)
+        return resolved if resolved == candidate else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _validated_session_root_thread_id(
+    session_name: str,
+    value: object,
+    expected_owner_id: str = "",
+) -> str | None:
+    """Accept only a durable user-root rollout inside this tab owner's home."""
+    thread_id = _validated_codex_thread_id(value)
+    if not thread_id:
+        return None
+    if expected_owner_id:
+        owner_binding = _strict_session_owner(session_name, expected_owner_id)
+        if not owner_binding:
+            return None
+        owner = owner_binding[1]
+        sessions_dir = _user_codex_config_dir(owner) / "sessions"
+    else:
+        sessions_dir = _session_config_base(session_name) / "sessions"
+    try:
+        sessions_root = _resolved_real_directory(sessions_dir)
+        if not sessions_root:
+            return None
+        matches = list(sessions_root.rglob(f"rollout-*-{thread_id}.jsonl"))
+        if len(matches) != 1:
+            return None
+        if not matches[0].is_file() or matches[0].is_symlink():
+            return None
+        resolved_rollout = matches[0].resolve(strict=True)
+        resolved_rollout.relative_to(sessions_root)
+        if resolved_rollout != matches[0]:
+            return None
+        with matches[0].open() as handle:
+            meta = json.loads(handle.readline())
+        payload = meta.get("payload", {}) or {}
+        if (
+            meta.get("type") != "session_meta"
+            or _validated_codex_thread_id(payload.get("id")) != thread_id
+            or _validated_codex_thread_id(payload.get("session_id")) != thread_id
+            or payload.get("thread_source") != "user"
+        ):
+            return None
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            return None
+        return thread_id
+    except Exception:
+        logger.debug(
+            "Failed to validate recorded Codex root for '%s'", session_name,
+            exc_info=True,
+        )
+        return None
+
+
 def _launch_codex_cmd(
     cmd: str,
     pin_model: bool = True,
     resume: bool = False,
+    resume_uuid: str | None = None,
+    resume_cwd: str | None = None,
     codex_home: Path | None = None,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> str:
     """Build a Codex launch command using the account's standard configuration."""
     out = cmd.strip() or NEW_SESSION_CMD
     if resume:
-        out = "codex resume --last"
+        out = "codex resume"
+        if resume_uuid:
+            thread_id = _validated_codex_thread_id(resume_uuid)
+            cwd_path = Path(str(resume_cwd or ""))
+            if not thread_id:
+                raise ValueError("invalid Codex resume UUID")
+            if not cwd_path.is_absolute() or not cwd_path.is_dir():
+                raise ValueError("exact Codex resume requires an existing absolute cwd")
+            out += " -C " + shlex.quote(str(cwd_path))
+            out += " " + shlex.quote(thread_id)
+        else:
+            out += " --last"
         if "--yolo" in cmd or "--dangerously-bypass-approvals-and-sandbox" in cmd:
             out += " --yolo"
         elif "--sandbox" in cmd or " -s " in f" {cmd} ":
             out += " --sandbox workspace-write --ask-for-approval never"
-    if pin_model and DEFAULT_MODEL and "--model" not in out and " -m " not in f" {out} ":
-        out += " --model " + shlex.quote(DEFAULT_MODEL)
+    launch_model = model or (DEFAULT_MODEL if pin_model else "")
+    if launch_model and "--model" not in out and " -m " not in f" {out} ":
+        out += " --model " + shlex.quote(launch_model)
+    if effort:
+        out += " -c " + shlex.quote(f'model_reasoning_effort="{effort}"')
     # Strip any inherited copy first: a stored session command must not be able
     # to smuggle the override into a home that does not declare the server.
     out = _CODEX_DOCS_OVERRIDE_RE.sub("", out).strip()
@@ -319,27 +535,32 @@ def _session_launch_base(session_name: str = "", user: dict | None = None) -> st
     """Use the canonical full-access launch for members and configured admin command."""
     try:
         owner = user or (_user_for_session(session_name) if session_name else None)
-        if owner and not _is_admin(owner):
+        if _uses_private_account_runtime(owner):
             return "codex --yolo"
     except Exception:
         pass
     return NEW_SESSION_CMD
 
 
-def _session_launch_identity_prefix(session_name: str) -> str:
+def _session_launch_identity_prefix(
+    session_name: str, owner: dict | None = None
+) -> str:
     """Rebind account identity inside the login shell used by systemd-run.
 
     The shared OS login exports the admin Advisor token. A member's parent tmux
     shell may be correct, but ``bash -lc`` sources login files again, so the
     final child command must override both values after that startup sequence.
     """
-    owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
+    owner = owner or _user_for_session(session_name)
+    if _uses_private_account_runtime(owner):
         codex_home = _user_codex_config_dir(owner)
-        token_path = codex_home / "advisor-token"
+        token_path = _account_advisor_token_path(owner)
+        instructions_sha = _account_agents_digest(owner)
         return (
             "env CODEX_HOME="
             + shlex.quote(str(codex_home))
+            + " TMUX_DASH_ACCOUNT_INSTRUCTIONS_SHA="
+            + shlex.quote(instructions_sha)
             + " ADVISOR_TOKEN=\"$(cat "
             + shlex.quote(str(token_path))
             + " 2>/dev/null)\""
@@ -352,21 +573,152 @@ def _session_launch_identity_prefix(session_name: str) -> str:
     )
 
 
+
+# --- Per-account UNIX users ------------------------------------------------
+# Every member session used to run as nimrod_rotem, which made account
+# isolation a prompt instruction rather than a kernel boundary: one `cat` read
+# another account's advisor token and with it that account's advisor
+# permissions. provision_accounts.py creates one UNIX user per account and
+# writes the mapping here.
+_ACCOUNT_UNIX_USABLE: dict[str, bool] = {}
+
+
+def _account_unix_map_file() -> Path:
+    """Resolved on demand: MESSAGES_DIR is defined further down this module."""
+    return MESSAGES_DIR / "account-unix-users.json"
+
+
+def _unix_account_usable(name: str) -> bool:
+    """True when the account exists and nimrod_rotem may drop into it."""
+    if not name:
+        return False
+    if name in _ACCOUNT_UNIX_USABLE:
+        return _ACCOUNT_UNIX_USABLE[name]
+    ok = False
+    try:
+        pwd.getpwnam(name)
+        ok = subprocess.run(
+            ["sudo", "-n", "-u", name, "true"],
+            capture_output=True, timeout=10,
+        ).returncode == 0
+    except Exception:
+        ok = False
+    if not ok:
+        logger.warning("unix account %s not usable; session stays on the shared login", name)
+    _ACCOUNT_UNIX_USABLE[name] = ok
+    return ok
+
+
+def _account_unix_user(user: dict | None) -> str:
+    """The UNIX account this member's session runs as, or "" for the old path."""
+    if not _uses_private_account_runtime(user):
+        return ""
+    if os.environ.get("TMUX_DASH_PER_USER_UNIX", "1") == "0":
+        return ""
+    try:
+        mapping = json.loads(_account_unix_map_file().read_text())
+    except Exception:
+        return ""
+    name = str(mapping.get(str(user.get("id")), "") or "")
+    return name if _unix_account_usable(name) else ""
+
+
+def _session_unix_account_prefix(
+    session_name: str, launch: str, owner: dict | None = None
+) -> str:
+    """Drop the launch into the session owner's own UNIX user."""
+    try:
+        owner = owner or _user_for_session(session_name)
+    except Exception:
+        return launch
+    account = _account_unix_user(owner)
+    if not account:
+        return launch
+    # bash -lc keeps the existing single-string command intact, and the advisor
+    # token is read inside the account so the shared login never sees it.
+    # The cd belongs here too: the account can enter its own project directory,
+    # the shared parent shell cannot and must not.
+    try:
+        project_dir = _member_session_project_dir(owner, session_name)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        launch = "cd -- " + shlex.quote(str(project_dir)) + " && " + launch
+    except Exception:
+        logger.debug("No project dir for %s; launching in place", session_name, exc_info=True)
+    # The browser MCP proxy reaches the controller socket, the browser profiles
+    # and the shared playwright CLI through the dashboard owner's home, which is
+    # no longer $HOME now that the session runs as its own account.
+    launch = "TMUX_DASH_HOST_HOME=" + shlex.quote(str(Path.home())) + " " + launch
+    return (
+        "sudo -n -u "
+        + shlex.quote(account)
+        + " -H bash -lc "
+        + shlex.quote(launch)
+    )
+
+
 def _session_launch_command(
     session_name: str,
     base: str,
     *,
     pin_model: bool = True,
     resume: bool = False,
+    resume_uuid: str | None = None,
+    resume_cwd: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    expected_owner_id: str | None = None,
 ) -> str:
     """Build the Codex command and keep its process tree in a session scope."""
+    if expected_owner_id:
+        owner_binding = _strict_session_owner(session_name, expected_owner_id)
+        if not owner_binding:
+            raise _SessionOwnershipChangedError("Session owner changed")
+        owner = owner_binding[1]
+    else:
+        owner = _user_for_session(session_name)
+    codex_home = (
+        _user_codex_config_dir(owner)
+        if _uses_private_account_runtime(owner)
+        else CODEX_HOME
+    )
     launch = _launch_codex_cmd(
         base,
         pin_model=pin_model,
         resume=resume,
-        codex_home=_session_config_base(session_name),
+        resume_uuid=resume_uuid,
+        resume_cwd=resume_cwd,
+        codex_home=codex_home,
+        model=model,
+        effort=effort,
     )
-    launch = _session_launch_identity_prefix(session_name) + " " + launch
+    voice_environment = voice_mode.launch_environment(
+        MESSAGES_DIR, session_name, str(_session_lifecycle.get(session_name).get("generation") or "")
+    )
+    voice_prefix = " ".join(key + "=" + shlex.quote(value) for key, value in voice_environment.items())
+    launch = _session_launch_identity_prefix(session_name, owner) + " " + voice_prefix + " " + launch
+    try:
+        pytest_owner = owner or {}
+        pytest_account = str(
+            pytest_owner.get("id") or pytest_owner.get("username") or session_name
+        )
+    except Exception:
+        pytest_account = session_name
+    pytest_plugin_dir = Path(
+        os.environ.get(
+            "TMUX_DASH_PYTEST_PLUGIN_DIR",
+            "/usr/local/libexec/tmux-dashboard-python-hooks",
+        )
+    )
+    pytest_env = build_pytest_serialization_env_prefix(
+        pytest_plugin_dir, account=pytest_account
+    )
+    if pytest_env:
+        launch = pytest_env + " " + launch
+    launch = _session_unix_account_prefix(session_name, launch, owner)
+    if expected_owner_id and not _strict_session_owner(
+        session_name, expected_owner_id
+    ):
+        raise _SessionOwnershipChangedError("Session owner changed")
     return scoped_codex_command(
         session_name,
         launch,
@@ -374,6 +726,29 @@ def _session_launch_command(
         memory_max_mb=int(os.environ.get("TMUX_DASH_CODEX_MEMORY_MAX_MB", "4096")),
         tasks_max=int(os.environ.get("TMUX_DASH_CODEX_TASKS_MAX", "768")),
         cpu_weight=int(os.environ.get("TMUX_DASH_CODEX_CPU_WEIGHT", "100")),
+        nice_level=int(os.environ.get("TMUX_DASH_CODEX_NICE", "10")),
+        slice_name=os.environ.get("TMUX_DASH_CODEX_SLICE", "codexworkload.slice"),
+        aggregate_cpu_quota_percent=int(
+            os.environ.get(
+                "TMUX_DASH_CODEX_AGGREGATE_CPU_QUOTA_PERCENT",
+                str(default_codex_aggregate_cpu_quota_percent()),
+            )
+        ),
+        aggregate_cpu_weight=int(
+            os.environ.get("TMUX_DASH_CODEX_AGGREGATE_CPU_WEIGHT", "25")
+        ),
+        aggregate_io_weight=int(
+            os.environ.get("TMUX_DASH_CODEX_AGGREGATE_IO_WEIGHT", "25")
+        ),
+        aggregate_memory_high_percent=int(
+            os.environ.get("TMUX_DASH_CODEX_AGGREGATE_MEMORY_HIGH_PERCENT", "75")
+        ),
+        aggregate_memory_max_percent=int(
+            os.environ.get("TMUX_DASH_CODEX_AGGREGATE_MEMORY_MAX_PERCENT", "90")
+        ),
+        aggregate_tasks_max=int(
+            os.environ.get("TMUX_DASH_CODEX_AGGREGATE_TASKS_MAX", "4096")
+        ),
     )
 
 
@@ -385,16 +760,26 @@ def _launch_claude_cmd(
 
 
 def _restore_default_model_setting():
-    """Keep the default Codex config aligned with the dashboard selection."""
+    """Fill missing Codex defaults without overwriting account preferences."""
     try:
         CODEX_HOME.mkdir(parents=True, exist_ok=True)
         cfg = CODEX_HOME / "config.toml"
         existing = cfg.read_text() if cfg.exists() else ""
-        managed = {
+        try:
+            parsed = tomllib.loads(existing) if existing.strip() else {}
+        except tomllib.TOMLDecodeError:
+            logger.warning("Leaving invalid Codex config untouched: %s", cfg)
+            return
+        defaults = {
             "model": DEFAULT_MODEL,
             "model_reasoning_effort": _CODEX_DEFAULT_REASONING_EFFORT,
-            "sandbox_mode": "danger-full-access",
+            "sandbox_mode": "workspace-write",
             "approval_policy": "never",
+        }
+        managed = {
+            key: value
+            for key, value in defaults.items()
+            if not isinstance(parsed.get(key), str) or not parsed[key].strip()
         }
         merged = _merge_top_level_toml_keys(existing, managed)
         merged = _ensure_codex_project_trust(merged, os.getcwd())
@@ -433,7 +818,7 @@ TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", "max")
 # member even though everyone shares one OS user).
 GIT_EMAIL_DOMAIN = os.environ.get("TMUX_DASH_GIT_EMAIL_DOMAIN", "grabo.tech")
 
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = None
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
 AUTO_SUMMARIZER_ENABLED = os.environ.get("TMUX_DASH_AUTO_SUMMARY", "").lower() in ("1", "true", "yes")
@@ -453,13 +838,27 @@ MESSAGES_DIR = Path.home() / ".tmux-dashboard"
 CONTROLLER_SOCKET = Path(
     os.environ.get("TMUX_DASH_CONTROLLER_SOCKET", str(MESSAGES_DIR / "controller.sock"))
 )
+CONTROLLER_LEADER_LOCK = Path(
+    os.environ.get(
+        "TMUX_DASH_CONTROLLER_LEADER_LOCK",
+        str(MESSAGES_DIR / "controller.leader.lock"),
+    )
+)
 BROWSER_LEASES_FILE = MESSAGES_DIR / "browser-leases.json"
 BROWSER_RUNTIME_FILE = MESSAGES_DIR / "browser-runtime.json"
 SESSION_LIFECYCLE_FILE = MESSAGES_DIR / "session-lifecycle.json"
 CONTROLLER_SNAPSHOT_FILE = MESSAGES_DIR / "controller-runtime.json"
+SESSION_TAB_LABELS_FILE = MESSAGES_DIR / "session-tab-labels.json"
+SESSION_TAB_ORDER_FILE = MESSAGES_DIR / "session-tab-order.json"
 BROWSER_LEASE_TTL = max(60, int(os.environ.get("TMUX_DASH_BROWSER_LEASE_TTL", "300")))
 BROWSER_PARK_AFTER = max(300, int(os.environ.get("TMUX_DASH_BROWSER_PARK_AFTER", "1200")))
 SESSION_PARK_AFTER = max(3600, int(os.environ.get("TMUX_DASH_SESSION_PARK_AFTER", "86400")))
+TAB_RENAME_AFTER_SECONDS = max(
+    1, int(os.environ.get("TMUX_DASH_TAB_RENAME_AFTER_SECONDS", "120"))
+)
+TAB_LABEL_CHECK_INTERVAL_SECONDS = max(
+    1, int(os.environ.get("TMUX_DASH_TAB_LABEL_CHECK_INTERVAL_SECONDS", "2"))
+)
 SESSION_LIFECYCLE_INTERVAL = max(
     30, int(os.environ.get("TMUX_DASH_LIFECYCLE_INTERVAL", "300"))
 )
@@ -470,6 +869,12 @@ _browser_runtime = LockedJsonStore(
 _session_lifecycle = SessionLifecycleStore(SESSION_LIFECYCLE_FILE)
 _controller_snapshot = LockedJsonStore(
     CONTROLLER_SNAPSHOT_FILE, lambda: {"version": 1}
+)
+_session_tab_labels = LockedJsonStore(
+    SESSION_TAB_LABELS_FILE, lambda: {"version": 1, "sessions": {}}
+)
+_session_tab_order_store = LockedJsonStore(
+    SESSION_TAB_ORDER_FILE, lambda: {"version": 1, "owners": {}}
 )
 OPENAI_KEY_FILE = MESSAGES_DIR / "openai_api_key"
 GOOGLE_MCP_PYTHON = MESSAGES_DIR / "mcp" / "venv" / "bin" / "python"
@@ -499,6 +904,7 @@ DOCVAULT_MCP_URL = os.environ.get(
 DOCVAULT_MCP_KEY = os.environ.get("DOCVAULT_MCP_KEY", "")
 DOCVAULT_MCP_SCRIPT = Path(__file__).resolve().with_name("docvault_mcp.py")
 _stored_openai_key: str = ""
+LISA_KEYS_FILE = Path.home() / ".lisa-secrets" / "keys.env"
 
 
 def _google_mcp_command() -> str:
@@ -523,6 +929,29 @@ def _load_openai_key() -> str:
     except Exception:
         logger.debug("Failed to load OpenAI API key", exc_info=True)
     return _stored_openai_key
+
+
+def _managed_openai_key() -> str:
+    """Return the dashboard key or the host-managed lisa.my service key."""
+    key = _stored_openai_key or OPENAI_API_KEY
+    if key:
+        return key
+    try:
+        info = LISA_KEYS_FILE.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            return ""
+        for raw_line in LISA_KEYS_FILE.read_text().splitlines():
+            line = raw_line.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if not line.startswith("OPENAI_API_KEY="):
+                continue
+            values = shlex.split(line.split("=", 1)[1], comments=True, posix=True)
+            candidate = values[0].strip() if len(values) == 1 else ""
+            return candidate if candidate.startswith("sk-") else ""
+    except (OSError, ValueError):
+        logger.debug("Failed to load the managed OpenAI service key", exc_info=True)
+    return ""
 
 
 def _write_codex_api_auth(codex_home: Path, key: str):
@@ -560,6 +989,7 @@ def _clear_openai_key():
 
 
 _load_openai_key()
+client = openai.AsyncOpenAI(api_key=_managed_openai_key()) if _managed_openai_key() else None
 
 
 def _active_openai_key() -> str:
@@ -632,6 +1062,11 @@ _away_mode_state: dict[str, dict] = {}
 
 # Go Nuts mode state per session (same structure as away mode)
 _go_nuts_state: dict[str, dict] = {}
+# Durable autonomous intent that is waiting for a reboot-restored tab to become
+# available.  Every controller-side save merges this map so a transient tmux,
+# mount, or auth failure cannot silently erase the user's saved mode.
+_pending_autonomous_state: dict[str, dict] = {}
+_autonomous_toggle_revision: dict[str, int] = {}
 
 # Flag to prevent CancelledError handlers from wiping persisted state during shutdown.
 # When True, worker cancel handlers skip setting enabled=False and re-saving to disk.
@@ -640,30 +1075,248 @@ _shutting_down = False
 # --- Persistent autonomous mode state ---
 # Survives restarts: stores which sessions had away/go-nuts mode enabled.
 AUTONOMOUS_STATE_FILE = MESSAGES_DIR / "autonomous-modes.json"
+_autonomous_state_store = LockedJsonStore(AUTONOMOUS_STATE_FILE, dict)
+_autonomous_state_save_lock = asyncio.Lock()
 
-def _save_autonomous_state():
+
+async def _await_task_drain_on_cancel(worker: asyncio.Task):
+    """Keep surrounding safety locks held until an in-flight task finishes."""
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        # Retrieve a worker exception so asyncio does not report it as orphaned,
+        # but preserve cancellation as the result visible to the caller.
+        try:
+            worker.result()
+        except Exception:
+            pass
+        raise asyncio.CancelledError
+    return worker.result()
+
+
+async def _to_thread_drain_on_cancel(fn, *args, **kwargs):
+    return await _await_task_drain_on_cancel(
+        asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    )
+
+def _autonomous_state_snapshot(
+    preserve: dict[str, dict] | None = None,
+) -> dict[str, dict]:
+    """Build one immutable persistence snapshot on the controller event loop."""
+    state = {
+        str(name): dict(modes)
+        for name, modes in _pending_autonomous_state.items()
+        if isinstance(modes, dict)
+    }
+    for name, modes in (preserve or {}).items():
+        if isinstance(modes, dict):
+            state[str(name)] = dict(modes)
+
+    def add_enabled(name: str, current: dict, key: str) -> None:
+        captured_owner = str(current.get("owner_id") or "")
+        captured_generation = str(current.get("generation") or "")
+        row = _session_lifecycle.get(name)
+        if row.get("managed") and (
+            not captured_owner
+            or not re.fullmatch(r"[0-9a-f]{32}", captured_generation)
+            or captured_owner != str(row.get("owner_id") or "")
+            or captured_generation != str(row.get("generation") or "")
+        ):
+            # Never rebound an old in-memory worker to a same-name replacement.
+            state.pop(name, None)
+            return
+        entry = state.setdefault(name, {})
+        entry[key] = True
+        if captured_owner:
+            entry["owner_id"] = captured_owner
+        if captured_generation:
+            entry["generation"] = captured_generation
+
+    for name, current in _away_mode_state.items():
+        if current.get("enabled"):
+            add_enabled(name, current, "away_mode")
+    for name, current in _go_nuts_state.items():
+        if current.get("enabled"):
+            add_enabled(name, current, "go_nuts_mode")
+    return state
+
+
+def _save_autonomous_state(
+    preserve: dict[str, dict] | None = None,
+    snapshot: dict[str, dict] | None = None,
+) -> bool:
     """Persist which sessions have away/go-nuts mode enabled to disk."""
     try:
         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        state = {}
-        for name, s in _away_mode_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["away_mode"] = True
-        for name, s in _go_nuts_state.items():
-            if s.get("enabled"):
-                state.setdefault(name, {})["go_nuts_mode"] = True
-        AUTONOMOUS_STATE_FILE.write_text(json.dumps(state))
+        state = dict(snapshot) if snapshot is not None else _autonomous_state_snapshot(preserve)
+        def replace(data: dict) -> None:
+            data.clear()
+            data.update(state)
+
+        _autonomous_state_store.update(replace)
+        return True
     except Exception:
         logger.debug("Failed to save autonomous mode state", exc_info=True)
+        return False
+
+
+async def _save_autonomous_state_async(
+    preserve: dict[str, dict] | None = None,
+) -> bool:
+    """Serialize atomic writes; snapshot mutable state before leaving the loop."""
+    async with _autonomous_state_save_lock:
+        snapshot = _autonomous_state_snapshot(preserve)
+        saved = bool(
+            await _to_thread_drain_on_cancel(
+                _save_autonomous_state, None, snapshot
+            )
+        )
+        if saved:
+            return True
+        # Atomic replace may have succeeded even if a later fsync/close raised.
+        # Resolve that ambiguous outcome before an enable path rolls back a mode
+        # which is already durable, or a disable path reports a false failure.
+        try:
+            persisted = await _to_thread_drain_on_cancel(
+                _autonomous_state_store.read
+            )
+        except Exception:
+            return False
+        return persisted == snapshot
+
+
+async def _fail_closed_after_autonomous_enable_rollback(
+    session_name: str,
+) -> None:
+    """Make stale durable autonomous intent inert when its cleanup cannot save."""
+    async with _autopush_store_lock:
+        _autopush_mode[session_name] = "off"
+        try:
+            await _to_thread_drain_on_cancel(_save_autopush_mode)
+        except Exception:
+            loaded = await _reload_autopush_mode_after_write_error()
+            if not loaded or _get_autopush_mode(session_name) != "off":
+                logger.critical(
+                    "Could not persist either autonomous rollback or fail-closed "
+                    "Off mode for '%s'",
+                    session_name,
+                    exc_info=True,
+                )
+
 
 def _load_autonomous_state() -> dict[str, dict]:
     """Load persisted autonomous mode state from disk."""
     try:
         if AUTONOMOUS_STATE_FILE.exists():
-            return json.loads(AUTONOMOUS_STATE_FILE.read_text())
+            return _autonomous_state_store.read()
     except Exception:
         logger.debug("Failed to load autonomous mode state", exc_info=True)
     return {}
+
+
+def _start_restored_autonomous_mode_unlocked(
+    session_name: str, modes: dict
+) -> bool:
+    """Start one saved autonomous mode exactly once in the controller."""
+    if _get_autopush_mode(session_name) == "off":
+        _pending_autonomous_state.pop(session_name, None)
+        return False
+    row = _session_lifecycle.get(session_name)
+    saved_generation = str(modes.get("generation") or "")
+    saved_owner = str(modes.get("owner_id") or "")
+    if row.get("managed") and (
+        not saved_owner
+        or not re.fullmatch(r"[0-9a-f]{32}", saved_generation)
+    ):
+        _pending_autonomous_state.pop(session_name, None)
+        return False
+    if (
+        (saved_generation and saved_generation != str(row.get("generation") or ""))
+        or (saved_owner and saved_owner != str(row.get("owner_id") or ""))
+    ):
+        _pending_autonomous_state.pop(session_name, None)
+        return False
+    if modes.get("away_mode"):
+        target = _away_mode_state
+        mode = "away"
+        phase_name = "Continuous (restored)"
+        log_fn = _away_log
+        message = "Away mode restored after server restart"
+    elif modes.get("go_nuts_mode"):
+        target = _go_nuts_state
+        mode = "gonuts"
+        phase_name = "Continuous Build (restored)"
+        log_fn = _go_nuts_log
+        message = "Go Nuts mode restored after server restart"
+    else:
+        return False
+    existing = target.get(session_name) or {}
+    if existing.get("enabled"):
+        _pending_autonomous_state.pop(session_name, None)
+        return True
+    state = {
+        "enabled": True,
+        "owner_id": str(row.get("owner_id") or saved_owner),
+        "generation": str(row.get("generation") or saved_generation),
+        "phase": 4,
+        "phase_name": phase_name,
+        "step": 0,
+        "step_name": "Restored after restart",
+        "started_at": time.time(),
+        "log": [],
+        "report": "",
+        "task": None,
+    }
+    target[session_name] = state
+    log_fn(state, message)
+    state["task"] = asyncio.create_task(
+        _restore_autonomous_mode(session_name, state, mode)
+    )
+    _pending_autonomous_state.pop(session_name, None)
+    return True
+
+
+async def _start_restored_autonomous_mode(
+    session_name: str, modes: dict
+) -> bool:
+    """Publish restored intent behind the same barrier as switching Off."""
+    async with _autopush_action_lock(session_name):
+        if _get_autopush_mode(session_name) == "off":
+            _pending_autonomous_state.pop(session_name, None)
+            return False
+        return _start_restored_autonomous_mode_unlocked(session_name, modes)
+
+
+async def _activate_pending_autonomous_modes(*, owner_id: str = "") -> int:
+    """Activate saved modes whose durable sessions have become live again."""
+    live_names = _live_tmux_session_names()
+    started = 0
+    changed = False
+    for name, modes in list(_pending_autonomous_state.items()):
+        if name not in live_names or not _durable_running_intent_exists(name):
+            continue
+        try:
+            with _session_operation_lock(name):
+                # Re-read inside the same per-session mutation fence used by
+                # create/delete so an owner remap cannot race this activation.
+                if owner_id and _load_session_owners().get(name) != owner_id:
+                    continue
+                before = name in _pending_autonomous_state
+                started += int(
+                    await _start_restored_autonomous_mode(name, modes)
+                )
+                changed = changed or (
+                    before and name not in _pending_autonomous_state
+                )
+        except _SessionOperationBusy:
+            continue
+    if started or changed:
+        await _save_autonomous_state_async()
+    return started
 
 
 # --- Simple Watchdog ---
@@ -701,8 +1354,9 @@ def _load_simple_watchdog_disabled():
 # --- Auto-push mode (per session): "off" | "basic" | "full" ---
 # Governs how much the dashboard is allowed to type into a session's terminal on
 # the user's behalf when Codex stops or waits:
-#   off   — never write anything at all (no option-picking, no Enter on prompts,
-#           no auto /login, no free-form "keep going" messages).
+#   off   — no automatic option-picking, prompt confirmation, autonomous
+#           prompts, auto /login, or free-form "keep going" messages. Session
+#           lifecycle recovery may still relaunch Codex after a crash/restart.
 #   basic — auto-pick from Codex's option menus and confirm permission/plan
 #           prompts (press Enter), and keep the session logged in. Does NOT type
 #           any free-form instructions.
@@ -710,43 +1364,358 @@ def _load_simple_watchdog_disabled():
 #           types a "keep going" message when Codex pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
 # New sessions default to "basic". Persisted per session to disk.
-AUTOPUSH_MODES = ("off", "basic", "full")
+#   basic+  : everything in "basic" PLUS a keep-alive that re-reads the prompt
+#           cache shortly before it would expire. See the cache block below.
+#           It never composes a task: it sends one fixed continue instruction,
+#           which is what makes it safe where "full" is not.
+AUTOPUSH_MODES = ("off", "basic", "basicplus", "full")
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
+_autopush_mode_store = LockedJsonStore(AUTOPUSH_MODE_FILE, lambda: {})
 _autopush_mode: dict[str, str] = {}
+_AUTOPUSH_UNCHECKED_STAMP = object()
+_autopush_mode_file_stamp: tuple[int, int, int, int] | None | object = (
+    _AUTOPUSH_UNCHECKED_STAMP
+)
+_autopush_mode_state_valid = True
+# Serializes a mode change with the final automatic keystroke boundary.  A
+# successful switch to Off therefore means that no already-in-flight picker can
+# press Enter after the response reaches the browser.
+_autopush_action_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_autopush_store_lock = asyncio.Lock()
+
+# ── Codex prompt cache expiry ───────────────────────────────────────────────
+# OpenAI caching, checked against developers.openai.com on 2026-09-04. It is NOT
+# Anthropic's, and the differences drive this whole block:
+#
+#   * GPT-5.6 and later: cached prefixes have a minimum 30-MINUTE retention
+#     after their most recent write OR reuse. They may remain cached longer.
+#     Older models keep an in-memory cache that is typically 5 to 10 minutes.
+#   * A REUSE REFRESHES the lifetime, at no extra charge. Same key property as
+#     Anthropic's cache: the clock restarts on every turn, so the deadline is
+#     measured from the LAST metered request, not the end of tool execution.
+#   * Caching is on by default, and the minimum cacheable prefix is 1,024 tokens
+#     on GPT-5.6+ (2,048 below that). A short session may never cache at all.
+#   * There is no observed expiry signal. The UI countdown marks the minimum
+#     retention boundary as an estimate, not proof that an entry was evicted.
+#
+# There is no API that answers "is this prefix cached right now" on either
+# provider. What Codex does record, exactly, is how much of the last turn came
+# out of cache (`last_token_usage.cached_input_tokens`), which is a measurement
+# rather than a prediction. That is reported separately from the countdown.
+CODEX_CACHE_TTL_MODERN = 1800   # gpt-5.6 and later
+CODEX_CACHE_TTL_LEGACY = 300    # in-memory floor on older models
+CACHE_WARN_LEAD = 600           # start warning 10 minutes before it goes cold
+CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
+                                # more or less continuous, so leave those alone.
+CACHE_KEEPALIVE_PROMPT = (
+    "Continue. re-verify your own work end to end, then finish whatever is still left."
+)
+_CODEX_MODEL_RE = re.compile(r"gpt-(\d+)(?:\.(\d+))?")
+
+
+_codex_facts_cache: dict[str, dict] = {}
+_codex_rollout_metrics = CodexRolloutMetrics()
+
+
+def _codex_cache_ttl(model: str) -> int:
+    """Seconds a cached prefix stays reusable, from the model name.
+
+    Read from the model rather than assumed, the same way the Claude side reads
+    the TTL off the transcript: a session on an older model has a much shorter
+    cache and must not be given a 30 minute countdown.
+    """
+    m = _CODEX_MODEL_RE.search((model or "").lower())
+    if not m:
+        return 0
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    return CODEX_CACHE_TTL_MODERN if (major, minor) >= (5, 6) else CODEX_CACHE_TTL_LEGACY
+
+
+def _codex_cache_min_tokens(model: str) -> int:
+    """Documented cacheable input prefix minimum; 0 for unknown models."""
+    ttl = _codex_cache_ttl(model)
+    return (1024 if ttl == CODEX_CACHE_TTL_MODERN else 2048) if ttl else 0
+
+
+
+
+def _codex_session_facts(session_name: str) -> dict:
+    """Measured metrics from this owner's exact root, never a cwd/mtime guess."""
+    now = time.time()
+    owner_binding = _strict_session_owner(session_name)
+    lifecycle = _session_lifecycle.get(session_name)
+    identity = (
+        owner_binding[0] if owner_binding else "",
+        str(lifecycle.get("generation") or ""),
+        str(lifecycle.get("resume_uuid") or ""),
+    )
+    hit = _codex_facts_cache.get(session_name)
+    if hit and hit.get("_identity") == identity and now - hit.get("at", 0) < 10:
+        return hit
+    empty = {**empty_metrics(), "at": now, "_identity": identity,
+             "cache_ttl": 0, "cache_min_tokens": 0, "detect_sure": False}
+    if len(_codex_facts_cache) > 256:
+        _codex_facts_cache.pop(next(iter(_codex_facts_cache)), None)
+    if not owner_binding:
+        _codex_facts_cache[session_name] = empty
+        return empty
+    owner_id, owner = owner_binding
+    try:
+        # Newly created threads may precede the lifecycle checkpoint. An active
+        # process binding is exact; the durable validated mapping also works
+        # while a session is parked. Neither scans another account's transcripts.
+        thread_id = _active_session_root_thread_id(session_name, owner_id)
+        if not thread_id:
+            thread_id = _find_session_transcript_uuid(session_name)
+        if not thread_id:
+            _codex_facts_cache[session_name] = empty
+            return empty
+        binding = {"owner": owner, "owner_id": owner_id,
+                   "session_name": session_name, "resume_uuid": thread_id}
+        fd, relative, _fingerprint = _open_session_close_rollout(binding)
+        with os.fdopen(fd, "rb") as stream:
+            f = _codex_rollout_metrics.read(
+                stream, thread_id, repr((identity, relative))
+            )
+        # Do not publish a result if ownership/generation changed during I/O.
+        current = _session_lifecycle.get(session_name)
+        if (
+            not _strict_session_owner(session_name, owner_id)
+            or str(current.get("generation") or "") != identity[1]
+            or str(current.get("resume_uuid") or "") != identity[2]
+            or f.get("metrics_thread_id") != thread_id
+        ):
+            return empty
+    except (OSError, ValueError, _SessionCloseError):
+        logger.debug("Exact session metrics unavailable for '%s'", session_name, exc_info=True)
+        _codex_facts_cache[session_name] = empty
+        return empty
+    out = {**f, "at": now, "_identity": identity,
+           "cache_ttl": _codex_cache_ttl(f["cache_model"]),
+           "cache_min_tokens": _codex_cache_min_tokens(f["cache_model"]), "detect_sure": True}
+    _codex_facts_cache[session_name] = out
+    return out
+
+
+def _cache_deadline(sess: dict) -> float:
+    """Estimated retention boundary, or 0 without an observed cacheable request.
+
+    0 means "say nothing": no turn recorded, or a model whose cache rules we do
+    not know. A guessed deadline would blink at the wrong time and, in Basic+,
+    push on a made-up clock.
+    """
+    try:
+        ttl = float(sess.get("cache_ttl") or 0)
+        end = float(sess.get("cache_last_activity") or 0)
+        minimum = float(sess.get("cache_min_tokens") or 0)
+        cacheable = (float(sess.get("cache_read_tokens") or 0) > 0
+                     or (minimum > 0 and float(sess.get("last_input_tokens") or 0) >= minimum))
+    except (TypeError, ValueError):
+        return 0.0
+    return end + ttl if ttl and end and cacheable else 0.0
+
+
+
+def _valid_autopush_modes(data: object) -> dict[str, str]:
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v in AUTOPUSH_MODES}
+
+
+def _read_autopush_modes_strict() -> dict[str, str]:
+    """Read mode state without treating corruption as an empty Basic map."""
+    # Writers publish by atomic replace, so a reader sees either the complete old
+    # file or the complete new file. Avoid waiting on the writer's fsync lock in
+    # API request paths.
+    data = json.loads(AUTOPUSH_MODE_FILE.read_text())
+    if not isinstance(data, dict) or any(
+        not isinstance(name, str) or mode not in AUTOPUSH_MODES
+        for name, mode in data.items()
+    ):
+        raise ValueError("invalid auto-push mode state")
+    return dict(data)
+
+
+def _autopush_file_stamp() -> tuple[int, int, int, int] | None:
+    """Identity for an atomically replaced mode file, including its inode."""
+    try:
+        stat = AUTOPUSH_MODE_FILE.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def _refresh_autopush_mode_from_disk() -> None:
+    """Refresh an API worker's process-local view of controller-owned modes."""
+    global _autopush_mode_file_stamp, _autopush_mode_state_valid
+    stamp = _autopush_file_stamp()
+    if stamp == _autopush_mode_file_stamp:
+        return
+    try:
+        data = _read_autopush_modes_strict()
+        _autopush_mode_state_valid = True
+    except Exception:
+        data = {}
+        _autopush_mode_state_valid = False
+        logger.error("Auto-push mode state is unreadable; failing closed to Off")
+    _autopush_mode.clear()
+    _autopush_mode.update(data)
+    _autopush_mode_file_stamp = stamp
 
 
 def _get_autopush_mode(session_name: str) -> str:
+    if voice_mode.supervised(MESSAGES_DIR, session_name,
+                            generation=str(_session_lifecycle.get(session_name).get("generation") or "")):
+        return "off"  # Temporary guard, never rewrite the user's stored preference.
+    # API workers do not run the controller lifespan loader.  Read the small,
+    # atomic state file when it changes so roster/status refreshes cannot turn a
+    # persisted Off setting back into the Basic default in the UI.
+    if PROCESS_ROLE == "api":
+        _refresh_autopush_mode_from_disk()
+    if not _autopush_mode_state_valid:
+        return "off"
     m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
     return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
 
 
 def _save_autopush_mode():
-    try:
-        MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        AUTOPUSH_MODE_FILE.write_text(json.dumps(_autopush_mode))
-    except Exception:
-        logger.debug("Failed to save autopush-mode map", exc_info=True)
+    global _autopush_mode, _autopush_mode_file_stamp, _autopush_mode_state_valid
+    snapshot = _valid_autopush_modes(_autopush_mode)
+    if not _autopush_mode_state_valid:
+        # Recovering a corrupt file must not silently flip unrelated sessions
+        # from the fail-closed Off state back to the Basic default.
+        for session in get_tmux_sessions():
+            snapshot.setdefault(str(session.get("name") or ""), "off")
+        snapshot.pop("", None)
+
+    def replace(data: dict) -> None:
+        data.clear()
+        data.update(snapshot)
+
+    _autopush_mode_store.update(replace)
+    # The recovery snapshot may contain fail-closed Off entries for sessions
+    # absent from the formerly corrupt in-memory map. Publish exactly what was
+    # made durable before declaring the state valid again.
+    _autopush_mode = snapshot
+    _autopush_mode_file_stamp = _autopush_file_stamp()
+    _autopush_mode_state_valid = True
 
 
-def _load_autopush_mode():
-    global _autopush_mode
+def _load_autopush_mode() -> bool:
+    global _autopush_mode, _autopush_mode_file_stamp, _autopush_mode_state_valid
     try:
-        if AUTOPUSH_MODE_FILE.exists():
-            data = json.loads(AUTOPUSH_MODE_FILE.read_text())
-            if isinstance(data, dict):
-                _autopush_mode = {
-                    str(k): v for k, v in data.items() if v in AUTOPUSH_MODES
-                }
+        loaded = _read_autopush_modes_strict()
+        _autopush_mode = loaded
+        _autopush_mode_file_stamp = _autopush_file_stamp()
+        _autopush_mode_state_valid = True
+        return True
     except Exception:
-        logger.debug("Failed to load autopush-mode map", exc_info=True)
+        _autopush_mode = {}
+        _autopush_mode_file_stamp = _autopush_file_stamp()
+        _autopush_mode_state_valid = False
+        logger.exception("Auto-push mode state is unreadable; failing closed to Off")
+        return False
+
+
+async def _reload_autopush_mode_after_write_error() -> bool:
+    """Read in a worker, then atomically publish on the controller loop."""
+    global _autopush_mode, _autopush_mode_file_stamp, _autopush_mode_state_valid
+    try:
+        loaded = await _to_thread_drain_on_cancel(_read_autopush_modes_strict)
+    except Exception:
+        _autopush_mode = {}
+        _autopush_mode_file_stamp = _autopush_file_stamp()
+        _autopush_mode_state_valid = False
+        return False
+    _autopush_mode = loaded
+    _autopush_mode_file_stamp = _autopush_file_stamp()
+    _autopush_mode_state_valid = True
+    return True
+
+
+def _autopush_action_lock(session_name: str) -> asyncio.Lock:
+    lock = _autopush_action_locks.get(session_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _autopush_action_locks[session_name] = lock
+    return lock
+
+
+async def _autopush_terminal_binding(
+    session_name: str, expected_owner_id: str = ""
+) -> dict | None:
+    """Capture the exact terminal incarnation an automatic decision observed."""
+    owner_id = expected_owner_id or await asyncio.to_thread(
+        _session_owner_id, session_name
+    )
+    if not owner_id:
+        return None
+    return await asyncio.to_thread(_terminal_binding, session_name, owner_id)
+
+
+def _tmux_command_for_binding(
+    command: list[str], session_name: str, binding: dict | None
+) -> list[str]:
+    """Retarget a name-based tmux command to an immutable session id."""
+    if not binding:
+        return list(command)
+    target = str(binding.get("session_id") or "")
+    if not target:
+        return list(command)
+    resolved = list(command)
+    for index in range(1, len(resolved)):
+        if resolved[index - 1] == "-t" and resolved[index] == session_name:
+            resolved[index] = target
+    return resolved
+
+
+@asynccontextmanager
+async def _autopush_write_scope(session_name: str, automatic: bool = True):
+    """Serialize an automatic write with Off; manual writes bypass the mode."""
+    if not automatic:
+        yield True
+        return
+    async with _autopush_action_lock(session_name):
+        yield _get_autopush_mode(session_name) != "off"
+
+
+def _autopush_identity_matches(
+    session_name: str,
+    expected_owner_id: str,
+    expected_generation: str = "",
+    expected_incarnation: str = "",
+) -> bool:
+    """Keep a queued mode request bound to the session the API authorized."""
+    if not expected_owner_id:
+        return True
+    if not _strict_session_owner(session_name, expected_owner_id):
+        return False
+    lifecycle = _session_lifecycle.get(session_name)
+    if expected_generation and not hmac.compare_digest(
+        str(lifecycle.get("generation") or ""), expected_generation
+    ):
+        return False
+    if expected_incarnation:
+        _sessions, session = _find_session(session_name)
+        if not session or not hmac.compare_digest(
+            str(session.get("logical_incarnation") or ""),
+            expected_incarnation,
+        ):
+            return False
+    return str(lifecycle.get("desired_state") or "running") not in {
+        "deleting", "deleted"
+    }
 
 
 def _is_codex_running(session_name: str) -> bool:
     """Return True only when the tmux pane has a live Codex descendant."""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_pid}"],
+            ["tmux", "display-message", "-t", f"={session_name}:", "-p", "#{pane_pid}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -775,10 +1744,130 @@ async def _async_is_codex_running(session_name: str) -> bool:
     return await asyncio.to_thread(_is_codex_running, session_name)
 
 
-async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = None,
-                                resume_uuid: str = None) -> bool:
-    """Restart a crashed Codex pane and resume its most recent local thread."""
+async def _ensure_codex_running_unlocked(
+    session_name: str,
+    log_fn=None,
+    state: dict = None,
+    resume_uuid: str = None,
+    resume_cwd: str | None = None,
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_desired_states: set[str] | None = None,
+    allow_fresh: bool = False,
+    autopush_guard: bool = False,
+    expected_binding: dict | None = None,
+    autonomous_mode: str = "",
+    voice_request: Request | None = None,
+) -> bool:
+    """Restart a crashed Codex pane and resume its recorded root thread."""
     alog = logging.getLogger("autonomous")
+    lifecycle_row = _session_lifecycle.get(session_name)
+    managed = bool(lifecycle_row.get("managed"))
+    if managed:
+        recorded_owner_id = str(lifecycle_row.get("owner_id") or "")
+        recorded_generation = str(lifecycle_row.get("generation") or "")
+        recorded_state = str(lifecycle_row.get("desired_state") or "")
+        if (
+            not recorded_owner_id
+            or not re.fullmatch(r"[0-9a-f]{32}", recorded_generation)
+            or (expected_owner_id and expected_owner_id != recorded_owner_id)
+            or (expected_generation and expected_generation != recorded_generation)
+        ):
+            alog.error("Refusing to restart invalid managed session '%s'", session_name)
+            return False
+        expected_owner_id = recorded_owner_id
+        expected_generation = recorded_generation
+        if expected_desired_states is None:
+            expected_desired_states = {"running"}
+        if recorded_state not in expected_desired_states:
+            return False
+        if not resume_uuid:
+            resume_uuid = str(lifecycle_row.get("resume_uuid") or "") or None
+    owner_binding = (
+        _strict_session_owner(session_name, expected_owner_id)
+        if expected_owner_id or managed
+        else None
+    )
+    if managed and not owner_binding:
+        alog.error(
+            "Refusing to restart managed session '%s' without an explicit owner",
+            session_name,
+        )
+        return False
+    if expected_owner_id and not owner_binding:
+        alog.error(
+            "Refusing to restart '%s' after its owner changed", session_name
+        )
+        return False
+    if owner_binding:
+        expected_owner_id, owner = owner_binding
+    else:
+        owner = _user_for_session(session_name)
+    if managed:
+        durable_cwd = _durable_session_cwd(session_name, lifecycle_row, owner)
+        if not durable_cwd or (resume_cwd and resume_cwd != durable_cwd):
+            alog.error("Refusing to restart '%s' with an unsafe cwd", session_name)
+            return False
+        resume_cwd = durable_cwd
+
+    def binding_is_current() -> bool:
+        if voice_request is not None and not voice_mode.request_target_matches(
+                sys.modules[__name__], voice_request, session_name):
+            return False
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            return False
+        if expected_generation and not _session_lifecycle.matches(
+            session_name,
+            generation=expected_generation,
+            owner_id=expected_owner_id,
+            desired_states=expected_desired_states,
+            resume_uuid=str(resume_uuid or ""),
+        ):
+            return False
+        if expected_generation and resume_cwd:
+            current_cwd = _durable_session_cwd(
+                session_name,
+                _session_lifecycle.get(session_name),
+                owner,
+            )
+            if current_cwd != resume_cwd:
+                return False
+        return True
+
+    async def guarded_call(fn, *args):
+        if voice_request is not None:
+            def voice_call():
+                if not voice_mode.request_target_matches(sys.modules[__name__], voice_request, session_name):
+                    return None
+                return fn(*args)
+            return await asyncio.to_thread(voice_call)
+        if not autopush_guard:
+            return await asyncio.to_thread(fn, *args)
+        async with _autopush_action_lock(session_name):
+            if (
+                _get_autopush_mode(session_name) == "off"
+                or autonomous_mode and not _autonomous_state_is_current(
+                    session_name, state, autonomous_mode
+                )
+            ):
+                return None
+            if expected_binding and await _to_thread_drain_on_cancel(
+                _terminal_binding_state, expected_binding
+            ) != "current":
+                return None
+            return await _to_thread_drain_on_cancel(fn, *args)
+
+    if not binding_is_current():
+        return False
+    if managed and not await asyncio.to_thread(
+        _tmux_session_matches_owner,
+        session_name,
+        expected_owner_id,
+        expected_generation,
+    ):
+        return False
     if await _async_is_codex_running(session_name):
         return True
 
@@ -788,59 +1877,213 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         log_fn(state, msg)
 
     try:
+        if not binding_is_current():
+            return False
         # Re-export the owner's CODEX_HOME before launching in case the shell
         # was respawned (environment variables do not survive a fresh bash).
         try:
-            if not await asyncio.to_thread(
+            owner_env_ok = await guarded_call(
                 _send_session_owner_environment,
                 session_name,
-            ):
-                raise RuntimeError("could not restore the session owner environment")
-            await asyncio.sleep(0.2)
+                expected_owner_id,
+            )
         except Exception:
-            logger.debug("Failed to re-export owner env on auto-restart", exc_info=True)
+            logger.exception("Failed to re-export owner env on auto-restart")
+            return False
+        if not owner_env_ok:
+            logger.error(
+                "Refusing to restart '%s' without its owner environment",
+                session_name,
+            )
+            return False
+        await asyncio.sleep(0.2)
         # Re-apply clean member auth before relaunch so an accidental /login (which
         # writes stray creds that 401 against the shared key) self-heals on the next
         # start. Picks the right mode: subscription plan if live, else API key.
         try:
-            if _multi_tenant_enabled():
-                _owner = _find_user_by_id(_load_session_owners().get(session_name, "admin"))
-                if _owner and not _is_admin(_owner):
-                    _apply_member_auth(_user_codex_config_dir(_owner))
+            if _multi_tenant_enabled() and _uses_private_account_runtime(owner):
+                _apply_member_auth(_user_codex_config_dir(owner))
         except Exception:
             logger.debug("Failed to re-apply member auth on relaunch", exc_info=True)
         try:
             await asyncio.to_thread(
                 _ensure_codex_auth_with_fallback,
-                _session_config_base(session_name),
+                (
+                    _user_codex_config_dir(owner)
+                    if _uses_private_account_runtime(owner)
+                    else CODEX_HOME
+                ),
                 True,
             )
         except Exception:
             logger.debug("Failed to validate Codex auth before relaunch", exc_info=True)
-        # Codex stores local threads under CODEX_HOME. Resume the newest thread
-        # for this working directory instead of opening the interactive picker.
-        launch_base = _session_launch_base(session_name)
-        launch = _session_launch_command(
-            session_name, launch_base, pin_model=True, resume=True
+        if not binding_is_current():
+            alog.error(
+                "Refusing to launch '%s' after its owner changed", session_name
+            )
+            return False
+        # Codex stores local threads under CODEX_HOME. Prefer the root thread
+        # recorded for this dashboard tab. `--last` can otherwise select a
+        # newer subagent rollout that happens to share the same working tree.
+        if resume_uuid:
+            resume_uuid = _validated_session_root_thread_id(
+                session_name, resume_uuid, expected_owner_id
+            )
+            if not resume_uuid:
+                raise ValueError("Codex resume UUID is not this session's root thread")
+        elif not allow_fresh:
+            resume_uuid = _find_session_transcript_uuid(session_name)
+        if (
+            not resume_uuid
+            and _session_lifecycle.get(session_name).get("managed")
+            and not allow_fresh
+        ):
+            alog.error(
+                "Refusing to guess a root thread for managed session '%s'",
+                session_name,
+            )
+            return False
+        # A rollout remembers its previous model and effort, so pin the account's
+        # saved settings explicitly or crash recovery can silently restore stale
+        # thread settings over the user's current selection.
+        launch_base = _session_launch_base(session_name, owner)
+        model, effort = _saved_session_model_effort(
+            session_name, expected_owner_id or None
         )
+        launch_kwargs = {
+            "pin_model": False,
+            # A user-confirmed settings restart may relaunch a provably unused
+            # tab before Codex has created its first root rollout. Recovery of
+            # every used tab remains resume-only and fail-closed.
+            "resume": not (allow_fresh and not resume_uuid),
+            "model": model,
+            "effort": effort,
+        }
+        if resume_uuid:
+            # Recovery callers already know which root thread owns this tab.
+            # Use it explicitly: --last can select a newer subagent rollout,
+            # and -C prevents an unattended cwd-choice prompt from stalling.
+            launch_kwargs.update(
+                {
+                    "resume_uuid": resume_uuid,
+                    "resume_cwd": (
+                        resume_cwd
+                        or get_session_cwd(session_name)
+                        or str(_session_lifecycle.get(session_name).get("cwd") or "")
+                    ),
+                }
+            )
+        launch = _session_launch_command(
+            session_name,
+            launch_base,
+            expected_owner_id=expected_owner_id or None,
+            **launch_kwargs,
+        )
+        if not binding_is_current():
+            return False
         # C-c first: an unterminated paste leaves bash on a `>` continuation
         # prompt, where C-u only clears the current line and the relaunch would
         # be swallowed as more of the same command. C-u then discards any stray
         # text left on the prompt line (e.g. a "continue" a watchdog typed
         # before this loop took over).
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-c"],
-            capture_output=True, text=True, timeout=5)
+        session_id = await asyncio.to_thread(_exact_tmux_session_id, session_name)
+        if not session_id:
+            return False
+        if managed and not await asyncio.to_thread(
+            _tmux_session_matches_owner,
+            session_name,
+            expected_owner_id,
+            expected_generation,
+        ):
+            return False
+        pane_target = f"{session_id}:"
+        async def guarded_tmux(command: list[str]):
+            if voice_request is not None:
+                return await asyncio.to_thread(_voice_input_run, voice_request, session_name, command,
+                    capture_output=True, text=True, timeout=5)
+            if not autopush_guard:
+                return await asyncio.to_thread(
+                    subprocess.run, command,
+                    capture_output=True, text=True, timeout=5,
+                )
+            async with _autopush_action_lock(session_name):
+                if (
+                    _get_autopush_mode(session_name) == "off"
+                    or autonomous_mode and not _autonomous_state_is_current(
+                        session_name, state, autonomous_mode
+                    )
+                    or expected_binding and await _to_thread_drain_on_cancel(
+                        _terminal_binding_state, expected_binding
+                    ) != "current"
+                ):
+                    return None
+                return await _to_thread_drain_on_cancel(
+                    subprocess.run, command,
+                    capture_output=True, text=True, timeout=5,
+                )
+
+        async def guarded_tmux_sequence(commands: list[list[str]]) -> bool:
+            if voice_request is not None:
+                for command in commands:
+                    result = await asyncio.to_thread(_voice_input_run, voice_request, session_name, command,
+                        capture_output=True, text=True, timeout=5)
+                    if result is None or result.returncode != 0:
+                        return False
+                return True
+            if not autopush_guard:
+                for command in commands:
+                    result = await asyncio.to_thread(
+                        subprocess.run,
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode != 0:
+                        return False
+                return True
+            async with _autopush_action_lock(session_name):
+                if (
+                    _get_autopush_mode(session_name) == "off"
+                    or autonomous_mode and not _autonomous_state_is_current(
+                        session_name, state, autonomous_mode
+                    )
+                    or expected_binding and await _to_thread_drain_on_cancel(
+                        _terminal_binding_state, expected_binding
+                    ) != "current"
+                ):
+                    return False
+                for command in commands:
+                    result = await _to_thread_drain_on_cancel(
+                        subprocess.run,
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode != 0:
+                        return False
+                return True
+
+        interrupted = await guarded_tmux(
+            ["tmux", "send-keys", "-t", pane_target, "C-c"]
+        )
+        if interrupted is None or interrupted.returncode != 0:
+            return False
         await asyncio.sleep(0.2)
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-u"],
-            capture_output=True, text=True, timeout=5)
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", launch],
-            capture_output=True, text=True, timeout=5)
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5)
+        cleared = await guarded_tmux(
+            ["tmux", "send-keys", "-t", pane_target, "C-u"]
+        )
+        if cleared is None or cleared.returncode != 0 or not binding_is_current():
+            return False
+        if await asyncio.to_thread(_exact_tmux_session_id, session_name) != session_id:
+            return False
+        launched = await guarded_tmux_sequence([
+            ["tmux", "send-keys", "-t", pane_target, "-l", launch],
+            ["tmux", "send-keys", "-t", pane_target, "Enter"],
+        ])
+        if not launched or not binding_is_current():
+            return False
 
         # Wait for codex to start (up to 30s)
         for _ in range(15):
@@ -862,6 +2105,63 @@ async def _ensure_codex_running(session_name: str, log_fn=None, state: dict = No
         return False
 
 
+async def _ensure_codex_running(
+    session_name: str,
+    log_fn=None,
+    state: dict = None,
+    resume_uuid: str = None,
+    resume_cwd: str | None = None,
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_desired_states: set[str] | None = None,
+    allow_fresh: bool = False,
+    operation_locked: bool = False,
+    tmux_locked: bool = False,
+    autopush_guard: bool = False,
+    expected_binding: dict | None = None,
+    autonomous_mode: str = "",
+    voice_request: Request | None = None,
+) -> bool:
+    kwargs = {
+        "resume_uuid": resume_uuid,
+        "resume_cwd": resume_cwd,
+        "expected_owner_id": expected_owner_id,
+        "expected_generation": expected_generation,
+        "expected_desired_states": expected_desired_states,
+        "allow_fresh": allow_fresh,
+        "autopush_guard": autopush_guard,
+        "expected_binding": expected_binding,
+        "autonomous_mode": autonomous_mode,
+    }
+    if voice_request is not None:
+        kwargs["voice_request"] = voice_request
+    async def invoke() -> bool:
+        if operation_locked:
+            return await _ensure_codex_running_unlocked(
+                session_name, log_fn, state, **kwargs
+            )
+        try:
+            with _session_operation_lock(session_name):
+                return await _ensure_codex_running_unlocked(
+                    session_name, log_fn, state, **kwargs
+                )
+        except _SessionOperationBusy:
+            logger.debug("Codex session '%s' is already being mutated", session_name)
+            return False
+
+    if tmux_locked:
+        return await invoke()
+    try:
+        async with _async_tmux_server_mutation_lock():
+            return await invoke()
+    except _TmuxMutationBusy:
+        logger.debug("Tmux server is already being mutated while recovering '%s'", session_name)
+        return False
+    except Exception:
+        logger.exception("Could not acquire tmux mutation fence for '%s'", session_name)
+        return False
+
+
 # Backwards-compatible internal names used by newer Grabo browser/recovery code.
 _is_claude_running = _is_codex_running
 _async_is_claude_running = _async_is_codex_running
@@ -869,36 +2169,56 @@ _ensure_claude_running = _ensure_codex_running
 
 
 _background_tasks: list = []
+_durable_rehydration_task: asyncio.Task | None = None
+
+
+async def _initialize_durable_session_runtime() -> tuple[list[dict], list[str], int, int]:
+    """Publish readiness first, then restore shells and exact Codex roots."""
+    await _start_controller_socket()
+    try:
+        report = await _run_durable_session_reconciliation(
+            source="controller-startup"
+        )
+        prepared = report["prepared"]
+        recovered = len(report["ready"])
+        pending = len(report["pending"])
+    except Exception:
+        logger.exception("Initial durable Codex resume failed; background retry will continue")
+        prepared, recovered, pending = [], 0, 0
+    # Resume may have recreated a shell that the preparation pass could not.
+    # Inventory only after both phases so autonomous state sees the final tabs.
+    sessions = await asyncio.to_thread(get_tmux_sessions)
+    return sessions, prepared, recovered, pending
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Start watchdogs only in the controller; API workers stay stateless."""
-    global _shutting_down
+    global _shutting_down, _pending_autonomous_state, _durable_rehydration_task
     _shutting_down = False
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=8 if PROCESS_ROLE == "api" else 20))
     logger.info("Codex Dashboard starting — role=%s port=%s root_path=%s auth=%s openai=%s",
                 PROCESS_ROLE, PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "configured" if OPENAI_API_KEY else "missing")
+                "configured" if _managed_openai_key() else "missing")
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
+    if not _managed_openai_key():
+        logger.warning("No managed OpenAI key is configured — LLM summaries will not work.")
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
-    _load_simple_watchdog_disabled()
-    _load_autopush_mode()
-    _restore_default_model_setting()
-
     if PROCESS_ROLE == "api":
         # All mutation/watchdog ownership lives across the Unix socket in the
         # controller. API workers only serve HTTP and relay streams.
         yield
         return
+
+    _load_simple_watchdog_disabled()
+    _load_autopush_mode()
+    _restore_default_model_setting()
 
     if _multi_tenant_enabled():
         try:
@@ -912,7 +2232,7 @@ async def lifespan(_app: FastAPI):
         if not member:
             continue
         config_dir = _user_codex_config_dir(member)
-        if _multi_tenant_enabled() and not _is_admin(member):
+        if _uses_private_account_runtime(member):
             # Self-heal the full tenant config on startup, including global and
             # group instructions. Previously only the browser MCP was repaired,
             # so a host that accidentally omitted TEAM_MODE never received the
@@ -933,10 +2253,25 @@ async def lifespan(_app: FastAPI):
             logger.info("Backfilled %d human prompts into the account audit", migrated_prompts)
     except Exception:
         logger.exception("Failed to backfill the account prompt audit")
-    sessions = get_tmux_sessions()
-    logger.info("Found %d existing tmux sessions", len(sessions))
+    (
+        sessions,
+        prepared_sessions,
+        recovered_sessions,
+        pending_sessions,
+    ) = await _initialize_durable_session_runtime()
+    logger.info(
+        "Found %d tmux sessions after durable startup reconciliation (%d eligible)",
+        len(sessions),
+        len(prepared_sessions),
+    )
     _background_tasks.clear()
-    await _start_controller_socket()
+    # The helper opens the authenticated controller socket before awaiting
+    # potentially slow Codex startups, so the parent readiness gate stays fast.
+    logger.info(
+        "Initial durable Codex resume complete: %d ready, %d pending retry",
+        recovered_sessions,
+        pending_sessions,
+    )
 
     async def sync_advisor_accounts() -> None:
         if not _advisor_live_sync_enabled():
@@ -954,52 +2289,48 @@ async def lifespan(_app: FastAPI):
             logger.exception("Advisor account/group startup sync failed")
 
     controller_loops = (
+        ("durable session rehydration", _durable_session_rehydration_loop()),
         ("auto-responder", _auto_responder_loop()),
         ("autonomous watchdog", _watchdog_loop()),
         ("simple watchdog", _simple_watchdog_loop()),
+        ("cache keep-alive", _cache_keepalive_loop()),
         ("tmp watchdog", _tmp_watchdog_loop()),
         ("crash recovery", _crash_recovery_loop()),
         ("codex health watchdog", _codex_health_watchdog_loop()),
+        ("model service recovery", _model_fallback_loop()),
         ("model refresh", _model_refresh_loop()),
         ("browser lifecycle", _browser_lifecycle_loop()),
         ("session lifecycle", _session_lifecycle_loop()),
+        ("session tab labels", _session_tab_label_loop()),
+        ("session chat summaries", _session_chat_summary_loop()),
         ("controller snapshot", _controller_snapshot_loop()),
         ("advisor account sync", sync_advisor_accounts()),
     )
     for label, coroutine in controller_loops:
-        _background_tasks.append(asyncio.create_task(coroutine))
+        task = asyncio.create_task(coroutine)
+        _background_tasks.append(task)
+        if label == "durable session rehydration":
+            _durable_rehydration_task = task
         logger.info("%s started", label)
 
     # Restore persistent autonomous mode state from disk
     saved = _load_autonomous_state()
+    _pending_autonomous_state = {}
     if saved:
         session_names = {s["name"] for s in sessions}
         for name, modes in saved.items():
             if name not in session_names:
-                logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
+                if _durable_running_intent_exists(name):
+                    _pending_autonomous_state[name] = dict(modes)
+                    logger.info(
+                        "Deferring autonomous restore for '%s' until its durable tab returns",
+                        name,
+                    )
+                else:
+                    logger.info("Skipping autonomous restore for '%s' — session no longer exists", name)
                 continue
-            if modes.get("away_mode"):
-                logger.info("Restoring Away Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _away_mode_state[name] = state
-                _away_log(state, "Away mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "away"))
-                state["task"] = t
-            elif modes.get("go_nuts_mode"):
-                logger.info("Restoring Go Nuts Mode for '%s' (was active before restart)", name)
-                state = {
-                    "enabled": True, "phase": 4, "phase_name": "Continuous Build (restored)",
-                    "step": 0, "step_name": "Restored after restart",
-                    "started_at": time.time(), "log": [], "report": "", "task": None,
-                }
-                _go_nuts_state[name] = state
-                _go_nuts_log(state, "Go Nuts mode restored after server restart")
-                t = asyncio.create_task(_restore_autonomous_mode(name, state, "gonuts"))
-                state["task"] = t
+            logger.info("Restoring saved autonomous mode for '%s'", name)
+            await _start_restored_autonomous_mode(name, modes)
 
     # Clean up orphaned entries (sessions that no longer exist were skipped above
     # but file still has their old state). Re-save now based on in-memory dicts only.
@@ -1009,12 +2340,42 @@ async def lifespan(_app: FastAPI):
 
     _shutting_down = True  # Prevent CancelledError handlers from wiping persisted state
     logger.info("Controller shutting down — cancelling %d background tasks", len(_background_tasks))
+    # Cancel ordinary loops, but cooperatively drain the reconciler. Cancelling
+    # asyncio.to_thread does not stop its worker, so abandoning it could release
+    # the recovery fence while a tmux mutation is still in flight.
+    ordinary_tasks = [
+        task for task in _background_tasks
+        if task is not _durable_rehydration_task
+    ]
+    for task in ordinary_tasks:
+        if not task.done():
+            task.cancel()
+    if ordinary_tasks:
+        await asyncio.gather(*ordinary_tasks, return_exceptions=True)
+    manual_tasks = [
+        task for task in _manual_durable_reconcile_tasks.values()
+        if not task.done()
+    ]
+    close_tasks: list = []
+    try:
+        async with _durable_reconcile_lock:
+            checkpointed = await asyncio.to_thread(
+                _checkpoint_live_sessions_serialized, source="controller-shutdown"
+            )
+        logger.info("Checkpointed %d durable sessions before shutdown", checkpointed)
+    except Exception:
+        logger.exception("Final durable session checkpoint failed")
+    drain_tasks = [
+        task for task in [*_background_tasks, *manual_tasks, *close_tasks]
+        if not task.done()
+    ]
+    for task in drain_tasks:
+        task.cancel()
+    if drain_tasks:
+        await asyncio.gather(*drain_tasks, return_exceptions=True)
     # Save autonomous mode state BEFORE cancelling tasks (so enabled=True is preserved)
     _save_autonomous_state()
     logger.info("Autonomous mode state saved to disk for restore on next startup")
-    for t in _background_tasks:
-        if not t.done():
-            t.cancel()
     # Cancel any running away-mode workers
     for name, state in _away_mode_state.items():
         if state.get("task") and not state["task"].done():
@@ -1034,6 +2395,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+voice_mode.install(app, sys.modules[__name__])
 
 
 @app.exception_handler(RequestValidationError)
@@ -1082,6 +2444,13 @@ def _check_token(token: str) -> bool:
 # existing messages.json / notes.json / uploads). Per-user Codex config lives
 # at ~/.codex-user-<id>/ for non-admin users; admin still uses ~/.codex.
 USERS_FILE = MESSAGES_DIR / "users.json"
+# Last known-good copy of USERS_FILE, refreshed on every successful save. It is
+# the fallback when the live file cannot be read, so an unreadable users.json
+# never costs anybody their account.
+USERS_BACKUP_FILE = MESSAGES_DIR / "users.json.bak"
+# Serialises saves inside this process so two requests cannot interleave their
+# temp file + rename.
+_users_write_lock = threading.RLock()
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -1096,16 +2465,58 @@ def _new_user_id() -> str:
     return "u_" + secrets.token_hex(8)
 
 
+def _read_users_file(path: Path) -> Optional[list]:
+    """Return the user list in `path`, or None if it is absent or unusable.
+
+    Deliberately never repairs anything: the caller decides what an unreadable
+    file means, because getting that wrong deletes accounts."""
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.error("Cannot read %s", path, exc_info=True)
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.error("%s is not valid JSON (%d bytes)", path, len(raw), exc_info=True)
+        return None
+    users = data.get("users") if isinstance(data, dict) else None
+    return users if isinstance(users, list) and users else None
+
+
 def _load_users() -> list:
-    """Load users from disk. On first run, seed an admin from env vars."""
+    """Load users from disk. On first run, seed an admin from env vars.
+
+    An unreadable users.json is NOT read as "there are no users". Re-seeding
+    writes a lone env-var admin over everybody. A read during the truncate
+    window of a concurrent save can return zero bytes and mistakenly trigger
+    that destructive recovery path. Saves are atomic now, and this side
+    falls back to the backup and keeps whatever it could not parse rather than
+    seeding over the top of it."""
+    users = _read_users_file(USERS_FILE)
+    if users:
+        return users
+    users = _read_users_file(USERS_BACKUP_FILE)
+    if users:
+        logger.warning(
+            "%s was unusable -- recovered %d user(s) from %s",
+            USERS_FILE, len(users), USERS_BACKUP_FILE,
+        )
+        _save_users(users)
+        return users
+    # Nothing usable on either path. Keep the evidence before seeding, so a
+    # file that was merely unlucky can still be put back by hand.
     if USERS_FILE.exists():
         try:
-            data = json.loads(USERS_FILE.read_text())
-            users = data.get("users") if isinstance(data, dict) else None
-            if isinstance(users, list) and users:
-                return users
+            kept = USERS_FILE.with_name(
+                USERS_FILE.name + ".unreadable-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            )
+            shutil.copy2(USERS_FILE, kept)
+            logger.error("Seeding a fresh admin; the old %s is kept at %s", USERS_FILE, kept)
         except Exception:
-            logger.exception("Failed to read %s -- re-seeding", USERS_FILE)
+            logger.debug("Could not preserve the unreadable %s", USERS_FILE, exc_info=True)
     # Seed admin from env vars (single-user legacy mode)
     salt = _new_salt()
     admin = {
@@ -1122,13 +2533,34 @@ def _load_users() -> list:
 
 
 def _save_users(users: list):
+    """Persist the user list atomically, refreshing the known-good backup.
+
+    A plain write_text truncates the file first, so every concurrent reader in
+    that window sees an empty file. Every login writes here (last_login), so
+    the window is hit often enough to matter. Land the new content with
+    os.replace instead: a reader gets either the old file or the new one."""
+    if not users:
+        logger.error("Refusing to save an empty user list to %s", USERS_FILE)
+        return
     try:
         MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
-        USERS_FILE.write_text(json.dumps({"users": users}, indent=2))
-        try:
-            USERS_FILE.chmod(0o600)
-        except Exception:
-            logger.debug("chmod 600 on users.json failed", exc_info=True)
+        payload = json.dumps({"users": users}, indent=2)
+        with _users_write_lock:
+            # Only ever back up a file that parses, or a bad save would poison
+            # the fallback the next load depends on.
+            if _read_users_file(USERS_FILE):
+                try:
+                    shutil.copy2(USERS_FILE, USERS_BACKUP_FILE)
+                    USERS_BACKUP_FILE.chmod(0o600)
+                except Exception:
+                    logger.debug("Could not refresh %s", USERS_BACKUP_FILE, exc_info=True)
+            tmp = USERS_FILE.with_name(f"{USERS_FILE.name}.tmp-{os.getpid()}")
+            with open(tmp, "w") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, USERS_FILE)
     except Exception:
         logger.exception("Failed to save users to %s", USERS_FILE)
 
@@ -1220,19 +2652,31 @@ def _is_admin(user: dict | None) -> bool:
     return bool(user) and user.get("role") == "admin"
 
 
+def _uses_private_account_runtime(user: dict | None) -> bool:
+    """Whether this login owns a separate Codex home and browser profile.
+
+    ``role`` controls dashboard permissions. It must not decide runtime
+    identity: secondary administrators are still different people from the
+    canonical ``admin`` account and need their own AGENTS.md, credentials,
+    projects, and browser profile.
+    """
+    return bool(user) and str(user.get("id") or "") not in ("", "admin")
+
+
 def _multi_tenant_enabled() -> bool:
-    """Enable tenant behavior whenever real member accounts exist.
+    """Enable tenant behavior whenever additional account identities exist.
 
     Older deployments relied only on ``TMUX_DASH_TEAM_MODE``. That made a
     multi-user users.json silently run with the single-user security/UI policy
     when the environment flag was omitted. The explicit flag remains useful
-    for provisioning a fresh team host, while persisted non-admin accounts are
-    now sufficient to keep tenant isolation enabled after every restart.
+    for provisioning a fresh team host, while any persisted account other than
+    the canonical ``admin`` identity now keeps isolation enabled. Dashboard
+    roles grant permissions; they do not merge people's runtime identities.
     """
     if TEAM_MODE:
         return True
     try:
-        return any(not _is_admin(user) for user in _load_users())
+        return any(_uses_private_account_runtime(user) for user in _load_users())
     except Exception:
         return False
 
@@ -1280,6 +2724,28 @@ def _user_codex_config_dir(user: dict | None) -> Path:
     if not user or user.get("id") == "admin":
         return Path.home() / ".codex"
     return Path.home() / f".codex-user-{user['id']}"
+
+
+def _account_agents_digest(user: dict | None) -> str:
+    """Content identity for the account instructions a Codex process loaded."""
+    try:
+        content = (_user_codex_config_dir(user) / "AGENTS.md").read_bytes()
+    except OSError:
+        content = b""
+    return hashlib.sha256(content).hexdigest()
+
+
+def _account_advisor_token_path(user: dict | None) -> Path:
+    """Advisor credential for an account without merging its Codex home.
+
+    Ordinary accounts have an owner-bound token. A secondary dashboard admin
+    has the same Advisor permissions as the canonical administrator and may use
+    that credential, while still keeping separate Codex instructions and state.
+    """
+    private_path = _user_codex_config_dir(user) / "advisor-token"
+    if private_path.is_file() or not _is_admin(user):
+        return private_path
+    return Path.home() / ".advisor-token"
 
 
 def _member_session_project_dir(user: dict, session_name: str) -> Path:
@@ -1440,17 +2906,31 @@ def _existing_playwright_block(config_text: str) -> str:
     return begin + "\n" + "\n".join(out).rstrip() + "\n" + end + "\n"
 
 
-def _configure_member_codex_isolation(
+def _configure_member_codex_isolation_locked(
     cfg_dir: Path,
     user: dict,
+    config: Path,
+    existing: str,
+    existing_mode: int | None,
     browser: dict | None = None,
 ) -> bool:
-    """Write the complete unattended full-access config for one member."""
-    if not user or _is_admin(user):
-        return False
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    config = cfg_dir / "config.toml"
-    existing = config.read_text() if config.exists() else ""
+    """Build and write a member config while its sibling lock is held."""
+    parsed_existing = {}
+    try:
+        parsed_existing = tomllib.loads(existing) if existing.strip() else {}
+    except tomllib.TOMLDecodeError:
+        logger.warning("Replacing invalid Codex config %s", config)
+    saved_model = parsed_existing.get("model")
+    if not isinstance(saved_model, str) or not saved_model.strip():
+        saved_model = _CODEX_DEFAULT_MODEL
+    else:
+        saved_model = saved_model.strip()
+    saved_effort = parsed_existing.get("model_reasoning_effort")
+    if not isinstance(saved_effort, str):
+        saved_effort = ""
+    saved_effort = _normalize_reasoning_effort(saved_effort)
+    if not saved_effort:
+        saved_effort = _CODEX_DEFAULT_REASONING_EFFORT
     project_root = PROJECTS_ROOT / str(user.get("username") or user["id"])
     trusted_projects = []
     try:
@@ -1470,9 +2950,11 @@ def _configure_member_codex_isolation(
         )
 
     lines = [
-        'model = "gpt-5.6-sol"',
-        'model_reasoning_effort = "max"',
+        "model = " + _toml_basic_string(saved_model),
+        "model_reasoning_effort = " + _toml_basic_string(saved_effort),
         "check_for_update_on_startup = false",
+        # Every finished turn is posted to the advisor board (advisor.lisa.my), 2026-09-03.
+        'notify = ["python3", "/home/nimrod_rotem/.codex/board_post.py"]',
         'approval_policy = "never"',
         'default_permissions = ":danger-full-access"',
         (
@@ -1523,7 +3005,9 @@ def _configure_member_codex_isolation(
         browser_output = cfg_dir / "browser-output"
         browser_output.mkdir(parents=True, exist_ok=True)
         try:
-            browser_output.chmod(0o700)
+            browser_output.chmod(
+                0o2770 if _account_unix_user_for_config_dir(cfg_dir) else 0o700
+            )
         except OSError:
             logger.debug(
                 "Could not set private permissions on %s",
@@ -1599,7 +3083,7 @@ def _configure_member_codex_isolation(
     # member reaches it as THEMSELVES: the token file below is per-account and the
     # launcher exports it as ADVISOR_TOKEN, so the advisor applies that person's
     # role and group. Without this block the token existed but no tool did.
-    if (cfg_dir / "advisor-token").is_file():
+    if (cfg_dir / "advisor-token").is_file() or _account_advisor_token_path(user).is_file():
         lines.extend((
             "",
             "# BEGIN GRABO ADVISOR MCP (managed)",
@@ -1624,9 +3108,32 @@ def _configure_member_codex_isolation(
     tomllib.loads(updated)
     if updated == existing:
         return False
-    _backup_before_dashboard_write(config)
-    config.write_text(updated)
+    _backup_and_replace_codex_config(config, existing, existing_mode, updated)
     return True
+
+
+def _configure_member_codex_isolation(
+    cfg_dir: Path,
+    user: dict,
+    browser: dict | None = None,
+) -> bool:
+    """Write the complete unattended full-access config for one member."""
+    if not _uses_private_account_runtime(user):
+        return False
+    initial_config = _verified_codex_config_path(cfg_dir)
+    with _codex_config_write_lock(initial_config):
+        config = _verified_codex_config_path(cfg_dir)
+        if config != initial_config:
+            raise _UnsafeCodexConfigError("Codex config path changed while locking")
+        existing, existing_mode = _read_codex_config_no_follow(config)
+        return _configure_member_codex_isolation_locked(
+            config.parent,
+            user,
+            config,
+            existing,
+            existing_mode,
+            browser,
+        )
 
 
 def _strip_managed_block(text: str, marker: str) -> str:
@@ -1673,25 +3180,63 @@ def _materialize_member_skills(cfg_dir: Path) -> None:
             )
 
 
-def _set_member_codex_permissions(cfg_dir: Path) -> None:
-    """Keep every account-owned Codex file private at the filesystem level."""
+def _account_unix_user_for_config_dir(cfg_dir: Path) -> str:
+    """The UNIX account owning this CODEX_HOME, or "" on the shared login."""
     try:
-        cfg_dir.chmod(0o700)
+        mapping = json.loads(_account_unix_map_file().read_text())
+    except Exception:
+        return ""
+    suffix = cfg_dir.name.replace(".codex-user-", "", 1)
+    return str(mapping.get(suffix, "") or "")
+
+
+def _set_member_codex_permissions(cfg_dir: Path) -> None:
+    """Keep every account-owned Codex file private at the filesystem level.
+
+    When the account has its own UNIX user this tree is owned and group-owned by
+    that account, and the dashboard reaches it through that group. Clearing the
+    group bits would lock the dashboard out of the config it has to write, so
+    keep them and drop only "other", which is what private means now. setgid
+    stays as well: it is what keeps newly created files in the account's group.
+    """
+    grouped = bool(_account_unix_user_for_config_dir(cfg_dir))
+    dir_mode = 0o2770 if grouped else 0o700
+    exec_mode = 0o770 if grouped else 0o700
+    file_mode = 0o660 if grouped else 0o600
+    ours = os.getuid()
+
+    def _chmod_if_ours(path: Path, mode: int) -> None:
+        """chmod needs ownership. The account owns nearly all of its own tree.
+
+        Those entries are already correct by construction (the account created
+        them under umask 007, inside a setgid directory), so skipping them is
+        right, not a compromise. Dying on the first one, which is what a bare
+        walk does here, silently stops the fix-up for everything else.
+        """
+        try:
+            if path.stat().st_uid != ours:
+                return
+            path.chmod(mode)
+        except OSError:
+            logger.debug("Could not set mode on %s", path, exc_info=True)
+
+    try:
+        _chmod_if_ours(cfg_dir, dir_mode)
         for root, dir_names, file_names in os.walk(cfg_dir, followlinks=False):
             root_path = Path(root)
             for name in dir_names:
                 path = root_path / name
                 if not path.is_symlink():
-                    path.chmod(0o700)
+                    _chmod_if_ours(path, dir_mode)
             for name in file_names:
                 path = root_path / name
                 if path.is_symlink():
                     continue
                 current_mode = path.stat().st_mode
-                path.chmod(0o700 if current_mode & 0o111 else 0o600)
+                _chmod_if_ours(path, exec_mode if current_mode & 0o111 else file_mode)
     except OSError:
         logger.exception(
-            "Failed to set private permissions on member Codex home %s",
+            "Failed to walk member Codex home %s",
             cfg_dir,
         )
 
@@ -1700,8 +3245,9 @@ def _ensure_user_codex_config_dir(user: dict):
     """Create + seed a fresh Codex config dir for a non-admin user."""
     if not user or user.get("id") == "admin":
         return
-    d = _user_codex_config_dir(user)
-    d.mkdir(parents=True, exist_ok=True)
+    configured_dir = _user_codex_config_dir(user)
+    initial_config = _verified_codex_config_path(configured_dir)
+    d = initial_config.parent
     for sub in ("skills", "projects", "memories", "agents", "commands"):
         (d / sub).mkdir(parents=True, exist_ok=True)
     try:
@@ -1721,19 +3267,26 @@ def _ensure_user_codex_config_dir(user: dict):
             "# Account notes\n\n"
             "Optional dashboard notes; Codex does not load this file automatically.\n"
         )
-    config_toml = d / "config.toml"
-    existing_config = config_toml.read_text() if config_toml.exists() else ""
-    if existing_config:
-        desired_config = existing_config
-    else:
-        desired_config = (
-            f'model = "{_CODEX_DEFAULT_MODEL}"\n'
-            f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
-            'approval_policy = "never"\n'
-        )
-    if desired_config != existing_config:
-        _backup_before_dashboard_write(config_toml)
-        config_toml.write_text(desired_config)
+    with _codex_config_write_lock(initial_config):
+        config_toml = _verified_codex_config_path(configured_dir)
+        if config_toml != initial_config:
+            raise _UnsafeCodexConfigError("Codex config path changed while locking")
+        existing_config, existing_mode = _read_codex_config_no_follow(config_toml)
+        if existing_config:
+            desired_config = existing_config
+        else:
+            desired_config = (
+                f'model = "{_CODEX_DEFAULT_MODEL}"\n'
+                f'model_reasoning_effort = "{_CODEX_DEFAULT_REASONING_EFFORT}"\n'
+                'approval_policy = "never"\n'
+            )
+        if desired_config != existing_config:
+            _backup_and_replace_codex_config(
+                config_toml,
+                existing_config,
+                existing_mode,
+                desired_config,
+            )
     key = _active_openai_key()
     if key and not (d / "auth.json").exists():
         try:
@@ -1754,15 +3307,17 @@ def _ensure_user_codex_config_dir(user: dict):
             "Failed to apply managed context for user %s",
             user.get("id"),
         )
-    # TEAM_MODE additionally shares Codex authentication and applies the
-    # compatibility guard/model setup used by older team deployments.
-    if TEAM_MODE:
+    # Team members and secondary administrators use the shared Codex login.
+    # The latter still keep a private CODEX_HOME for their own instructions.
+    if TEAM_MODE or _is_admin(user):
         try:
             _apply_member_auth(d)
         except Exception:
-            logger.exception("Failed to apply team-mode setup for user %s", user.get("id"))
+            logger.exception("Failed to apply shared auth for user %s", user.get("id"))
     try:
         _configure_member_codex_isolation(d, user)
+    except _UnsafeCodexConfigError:
+        raise
     except Exception:
         logger.exception("Failed to configure Codex for user %s", user.get("id"))
     _set_member_codex_permissions(d)
@@ -1794,9 +3349,24 @@ def _load_session_owners() -> dict[str, str]:
 
 def _session_owner_id(session_name: str) -> str:
     """Return the owner user_id for a session. Pre-existing sessions with no
-    recorded owner default to the admin."""
+    recorded owner default to the admin.
+
+    Identity only: cache keys, config homes and session incarnations are derived
+    from this, so it always has to resolve to somebody. Anything deciding who may
+    SEE or OPEN a session uses _recorded_session_owner_id instead.
+    """
     owners = _load_session_owners()
     return owners.get(session_name, "admin")
+
+
+def _recorded_session_owner_id(session_name: str) -> str:
+    """The explicitly recorded owner, or "" when nobody owns this session.
+
+    A tmux session with no ownership record belongs to NOBODY. Falling back to
+    the admin here put every session anyone started from a shell into the
+    admin's dashboard as a tab they never opened.
+    """
+    return _load_session_owners().get(session_name, "")
 
 
 def _set_session_owner(session_name: str, user_id: str):
@@ -1820,11 +3390,163 @@ def _user_for_session(session_name: str) -> dict | None:
     return user
 
 
+def _strict_session_owner(
+    session_name: str, expected_owner_id: str = ""
+) -> tuple[str, dict] | None:
+    """Resolve an explicitly recorded owner without the legacy admin fallback.
+
+    Cold recovery is a privileged mutation.  A missing or concurrently changed
+    owner record must stop it instead of silently attaching the pane to admin.
+    """
+    owner_id = _load_session_owners().get(session_name, "")
+    if not owner_id or (expected_owner_id and owner_id != expected_owner_id):
+        return None
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        return None
+    return owner_id, owner
+
+
+class _SessionOperationBusy(RuntimeError):
+    """Another dashboard process is already mutating this tab."""
+
+
+class _TmuxMutationBusy(RuntimeError):
+    """Another process still owns the tmux server-generation mutation fence."""
+
+
+def _acquire_tmux_mutation_fd(timeout: float = 45.0) -> int:
+    """Acquire the cross-process fence that prevents tmux $N reuse mid-operation."""
+    MESSAGES_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_info = MESSAGES_DIR.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or MESSAGES_DIR.is_symlink()
+        or parent_info.st_uid != os.geteuid()
+    ):
+        raise PermissionError("tmux mutation lock directory is unsafe")
+    lock_path = MESSAGES_DIR / "tmux-server-mutation.lock"
+    if lock_path.is_symlink():
+        raise PermissionError("tmux mutation lock must not be a symlink")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_nlink != 1
+        ):
+            raise PermissionError("tmux mutation lock is unsafe")
+        deadline = time.monotonic() + max(0.1, timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise _TmuxMutationBusy("tmux mutation fence is busy") from None
+                time.sleep(0.05)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _release_tmux_mutation_fd(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _tmux_server_mutation_lock(timeout: float = 45.0):
+    fd = _acquire_tmux_mutation_fd(timeout)
+    try:
+        yield
+    finally:
+        _release_tmux_mutation_fd(fd)
+
+
+_async_tmux_mutation_queue_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _async_tmux_server_mutation_lock(timeout: float = 45.0):
+    # Only one local contender occupies the shared executor while polling the
+    # cross-process flock. Otherwise a request burst can exhaust every worker
+    # the current lock owner needs in order to finish and release the fence.
+    async with _async_tmux_mutation_queue_lock:
+        acquire = asyncio.create_task(
+            asyncio.to_thread(_acquire_tmux_mutation_fd, timeout)
+        )
+        cancelled = False
+        while not acquire.done():
+            try:
+                await asyncio.shield(acquire)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            try:
+                fd = acquire.result()
+            except Exception:
+                raise asyncio.CancelledError from None
+            await _to_thread_drain_on_cancel(_release_tmux_mutation_fd, fd)
+            raise asyncio.CancelledError
+        fd = acquire.result()
+        try:
+            yield
+        finally:
+            await _to_thread_drain_on_cancel(_release_tmux_mutation_fd, fd)
+
+
+@contextmanager
+def _session_operation_lock(session_name: str):
+    """Fence same-name create/park/delete/recovery across controller processes."""
+    if not _is_valid_session_name(session_name):
+        raise ValueError("invalid session name")
+    lock_dir = MESSAGES_DIR / "session-operation-locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = lock_dir.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or lock_dir.is_symlink()
+        or info.st_uid != os.geteuid()
+    ):
+        raise PermissionError("session operation lock directory is unsafe")
+    lock_dir.chmod(0o700)
+    lock_path = lock_dir / (
+        hashlib.sha256(session_name.encode("utf-8", "strict")).hexdigest() + ".lock"
+    )
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        lock_info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_info.st_mode) & 0o077
+            or lock_info.st_nlink != 1
+        ):
+            raise PermissionError("session operation lock is unsafe")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _SessionOperationBusy(session_name) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _user_can_access_session(user: dict | None, session_name: str) -> bool:
     """Return whether the effective signed-in account owns this session."""
     if not user:
         return False
-    return _session_owner_id(session_name) == user["id"]
+    return _recorded_session_owner_id(session_name) == user["id"]
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -1937,6 +3659,7 @@ def _apply_security_headers(request: Request, response: Response) -> Response:
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
+        "media-src 'self' blob:; "
         "font-src 'self' data:; "
         "frame-ancestors 'self'"
     )
@@ -2024,6 +3747,12 @@ async def session_ownership_middleware(request: Request, call_next):
     if not m:
         return await call_next(request)
     session_name = m.group(1)
+    # A successful close intentionally removes the live owner mapping before
+    # the browser receives the terminal job result. Close-job status remains
+    # owner-scoped by the controller's (owner, session, unguessable job id)
+    # lookup, so it must remain reachable after that cleanup.
+    if re.fullmatch(r"/api/sessions/[^/]+/close/[A-Za-z0-9_-]{16,64}", rel):
+        return await call_next(request)
     if not _user_can_access_session(user, session_name):
         return JSONResponse({"error": "Session not found"}, status_code=404)
     return await call_next(request)
@@ -2037,6 +3766,14 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     # Allow login routes without auth
     rp = request.scope.get("root_path", "")
+    rel = (path[len(rp):] or "/") if rp and path.startswith(rp) else path
+    if rel in {"/health/live", "/health/ready"}:
+        return await call_next(request)
+    # Lisa bug handoffs carry only an opaque capability. The landing route redeems it into a
+    # bounded server-side pending record, then serves this same login page when needed so the
+    # report survives authentication without putting its contents in the URL.
+    if rel == "/bug-handoff":
+        return await call_next(request)
     if path in ("/login", "/login/", rp + "/login", rp + "/login/"):
         return await call_next(request)
     if path in ("/logout", "/logout/", rp + "/logout", rp + "/logout/"):
@@ -2056,6 +3793,8 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
+        if rel == "/api/health":
+            return JSONResponse({"error": "Authentication required"}, status_code=401)
         resp = HTMLResponse(_login_page())
         return _apply_security_headers(request, resp)
     # Token signature is valid — also verify the user still exists. If users.json
@@ -2593,13 +4332,54 @@ def _user_lifetime_stats(users: list[dict]) -> dict[str, dict[str, int]]:
     return stats
 
 
+USER_USAGE_PERIODS = frozenset({"all", "today", "2", "5", "7"})
+_user_period_stats_cache: dict = {}
+_user_period_stats_lock = threading.Lock()
+
+
+def _user_period_stats(users: list[dict], period: str) -> dict[str, dict[str, int]]:
+    """Usage in UTC today or the preceding N days; lifetime remains the default."""
+    if period not in USER_USAGE_PERIODS:
+        raise ValueError("Unknown usage period")
+    if period == "all":
+        return _user_lifetime_stats(users)
+    now = datetime.now(timezone.utc)
+    roster = tuple(sorted((str(u.get("id") or ""), str(_user_codex_config_dir(u)))
+                          for u in users if u.get("id")))
+    key = (roster, now.date().isoformat())
+    # A single worker scan fills every selector window, coalescing concurrent
+    # requests and rapid filter changes without repeatedly reading long roots.
+    with _user_period_stats_lock:
+        cached = _user_period_stats_cache.get(key)
+        if cached and time.monotonic() - cached["at"] < 120:
+            return {uid: dict(row) for uid, row in cached["data"][period].items()}
+        starts = {window: (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                            if window == "today" else now - timedelta(days=int(window)))
+                  for window in USER_USAGE_PERIODS if window != "all"}
+        prompts = _prompt_counts_by_user({window: start.timestamp() for window, start in starts.items()})
+        iso_cutoffs = {window: start.isoformat() for window, start in starts.items()}
+        stats = {window: {} for window in starts}
+        for user_id, home in roster:
+            tokens = _token_usage_for_home(Path(home), iso_cutoffs)
+            for window in starts:
+                stats[window][user_id] = {
+                    "total_prompts": int(prompts.get(user_id, {}).get(window, 0)),
+                    "total_tokens": int((tokens.get(window) or {}).get("totalTokens") or 0)}
+        _user_period_stats_cache.clear()
+        _user_period_stats_cache[key] = {"at": time.monotonic(), "data": stats}
+        return {uid: dict(row) for uid, row in stats[period].items()}
+
+
 @app.get("/api/admin/users")
 async def api_admin_list_users(request: Request):
     user = _current_user(request)
     if not _is_admin(user):
         return JSONResponse({"error": "Admin only"}, status_code=403)
+    period = request.query_params.get("usage_period", "all")
+    if period not in USER_USAGE_PERIODS:
+        return JSONResponse({"error": "Unknown usage period"}, status_code=400)
     users = _load_users()
-    lifetime_stats = await asyncio.to_thread(_user_lifetime_stats, users)
+    lifetime_stats = await asyncio.to_thread(_user_period_stats, users, period)
     out = []
     for u in users:
         rec = _public_user(u)
@@ -2607,7 +4387,7 @@ async def api_admin_list_users(request: Request):
         rec["last_activity"] = _last_human_activity(u)
         rec.update(lifetime_stats.get(str(u.get("id") or ""), {}))
         out.append(rec)
-    return JSONResponse({"users": out})
+    return JSONResponse({"users": out, "usage_period": period}, headers={"Cache-Control": "private, no-store"})
 
 
 @app.post("/api/admin/users")
@@ -2767,17 +4547,32 @@ async def api_admin_delete_user(request: Request, user_id: str):
     target = next((u for u in users if u["id"] == user_id), None)
     if not target:
         return JSONResponse({"error": "User not found"}, status_code=404)
-    # Kill any tmux sessions this user owned (their content would otherwise
-    # become orphaned and visible only to admins).
+    # Retire every generation through the controller-owned delete transaction.
+    # Never delete the account/home while a live pane has ambiguous state: that
+    # would make its ownership fall back to the administrator.
     owners = _load_session_owners()
     owned = [name for name, oid in owners.items() if oid == user_id]
     for name in owned:
-        try:
-            subprocess.run(["tmux", "kill-session", "-t", name],
-                           capture_output=True, text=True, timeout=5)
-        except Exception:
-            logger.debug("Failed to kill session '%s' during user delete", name, exc_info=True)
-        _clear_session_owner(name)
+        result = await _controller_call(
+            "session_delete", session=name, owner_id=user_id
+        )
+        if not result.get("ok"):
+            result_status = int(result.pop("_status", 503))
+            logger.error(
+                "Refusing to delete user '%s': session '%s' remains bound (%s)",
+                user_id,
+                name,
+                result.get("error") or "unknown error",
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Could not safely retire session '{name}'. "
+                        "The account and its private data were left intact."
+                    )
+                },
+                status_code=result_status,
+            )
     # Remove the user record.
     users = [u for u in users if u["id"] != user_id]
     _save_users(users)
@@ -3736,21 +5531,17 @@ async def api_history(request: Request):
     live_sessions = set()
     owners = _load_session_owners()
     for sess in get_tmux_sessions():
-        if owners.get(sess["name"], "admin") == user["id"]:
+        if owners.get(sess["name"]) == user["id"]:
             live_sessions.add(sess["name"])
     out = []
     all_names = set(messages_by_session.keys()) | set(notes_by_session.keys()) | live_sessions
-    # Live sessions for the admin without explicit ownership records
-    if _is_admin(user):
-        for sess in get_tmux_sessions():
-            if owners.get(sess["name"], "admin") == "admin":
-                all_names.add(sess["name"])
-                live_sessions.add(sess["name"])
     for name in all_names:
         msgs = messages_by_session.get(name) or []
         # If the session is currently in cache (memory), prefer the live list
         # so newly-sent messages show up without waiting for the next save.
         cache_entry = cache.get(name) or {}
+        if str(cache_entry.get("_owner_id") or "") != str(user["id"]):
+            cache_entry = {}
         if cache_entry.get("messages"):
             msgs = cache_entry["messages"]
         notes = notes_by_session.get(name, "") or cache_entry.get("notes", "")
@@ -3789,6 +5580,8 @@ async def api_history_detail(request: Request, session_name: str):
     # Prefer the live cache for currently-active sessions, fall back to disk.
     msgs: list = []
     cache_entry = cache.get(session_name) or {}
+    if str(cache_entry.get("_owner_id") or "") != str(user["id"]):
+        cache_entry = {}
     if cache_entry.get("messages"):
         msgs = cache_entry["messages"]
     else:
@@ -3809,6 +5602,181 @@ async def api_history_detail(request: Request, session_name: str):
         "user_messages": user_msgs,
         "total_user_messages": len(user_msgs),
     })
+
+
+def _preferences_path(user: dict) -> Path:
+    return _user_data_dir(user) / "preferences.json"
+
+
+def _user_preferences(user: dict) -> dict:
+    import project_saved
+    path = _preferences_path(user)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {"auto_session_names": True}
+    data = project_saved.private_json(path)
+    return {"auto_session_names": data.get("auto_session_names", True) is True}
+
+
+def _auto_session_names_enabled(owner_id: str) -> bool:
+    user = _find_user_by_id(owner_id) if owner_id else None
+    try:
+        return bool(user and _user_preferences(user)["auto_session_names"])
+    except (OSError, ValueError):
+        return False
+
+
+class UserPreferences(BaseModel):
+    auto_session_names: bool = Field(strict=True)
+
+
+@app.get("/api/preferences")
+async def api_preferences(request: Request):
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    try:
+        data = await asyncio.to_thread(_user_preferences, user)
+    except (OSError, ValueError):
+        return JSONResponse({"error": "Preferences are unavailable."}, status_code=409)
+    return JSONResponse(data, headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/preferences")
+async def api_save_preferences(request: Request, body: UserPreferences):
+    import project_saved
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    try:
+        await asyncio.to_thread(project_saved.private_json, _preferences_path(user),
+                                lambda data: data.update(body.model_dump()))
+    except (OSError, ValueError):
+        return JSONResponse({"error": "Preferences are unavailable."}, status_code=409)
+    return JSONResponse(body.model_dump(), headers={"Cache-Control": "private, no-store"})
+
+
+def _saved_items_binding(session_name: str, owner_id: str) -> dict:
+    """Allow rootless new tabs, but never reinterpret an invalid known root."""
+    owner = _strict_session_owner(session_name, owner_id)
+    row = _session_lifecycle.get(session_name)
+    generation = str(row.get("generation") or "")
+    if (not owner or row.get("owner_id") != owner_id or not row.get("managed")
+            or not re.fullmatch(r"[0-9a-f]{32}", generation)
+            or row.get("desired_state") not in {"running", "parked"}):
+        raise ValueError("Session identity changed")
+    root = _terminal_history_binding(session_name, owner_id)
+    if not root and row.get("resume_uuid"):
+        # Parked sessions use their validated exact root, never a sibling.
+        resume = _validated_session_root_thread_id(session_name, row["resume_uuid"], owner_id)
+        if not resume:
+            raise ValueError("Session transcript is unavailable")
+        root = {"session_name": session_name, "owner_id": owner_id, "owner": owner[1],
+                "generation": generation, "resume_uuid": resume}
+    return root or {"session_name": session_name, "owner_id": owner_id, "owner": owner[1],
+                    "generation": generation, "resume_uuid": ""}
+
+
+def _collect_session_saved_items(session_name: str, user: dict, generation: str) -> dict:
+    import project_saved
+    owner_id = str(user["id"])
+    with _session_operation_lock(session_name):
+        binding = _saved_items_binding(session_name, owner_id)
+        if binding["generation"] != generation:
+            raise ValueError("Session identity changed")
+        key = hashlib.sha256(f"{session_name}\0{generation}".encode()).hexdigest()
+        path = _user_data_dir(user) / "saved-projects" / f"{key}.json"
+
+        def mutate(data):
+            identity = {"session_name": session_name, "generation": generation,
+                        "owner_id": owner_id, "root": binding["resume_uuid"]}
+            if any(data.get(k) != v for k, v in identity.items()):
+                data.clear()
+            if binding["resume_uuid"]:
+                fd, _relative, _fingerprint = _open_session_close_rollout(binding)
+                with os.fdopen(fd, "rb") as source:
+                    project_saved.scan_rollout(source, binding, data)
+                cwd = str(_session_lifecycle.get(session_name).get("cwd") or "")
+                if Path(cwd).is_absolute():
+                    data["files"] = [os.path.normpath(os.path.join(cwd, path))
+                                     if not path.startswith(("/", "~/")) else path
+                                     for path in data.get("files", [])]
+            texts = []
+            entry = cache.get(session_name) or {}
+            if str(entry.get("_owner_id") or "") == owner_id and _session_cache_entry_is_current(session_name, entry):
+                texts.extend(str(m.get("text", ""))[:32000] for m in entry.get("messages", [])[-250:]
+                             if isinstance(m, dict) and m.get("role") in {"user", "assistant"})
+                texts.append(str(entry.get("notes", ""))[:32000])
+            files = project_saved.upload_paths(_user_uploads_dir(user) / session_name)
+            data.update(project_saved.collect_saved_items(data, texts, files))
+            current = _saved_items_binding(session_name, owner_id)
+            if any(current[k] != binding[k] for k in ("owner_id", "generation", "resume_uuid")):
+                raise ValueError("Session identity changed")
+            data.update(identity)
+            return {key: data.get(key, []) for key in ("urls", "creds", "files")} | {
+                "catching_up": bool(data.get("catching_up"))}
+
+        return project_saved.private_json(path, mutate)
+
+
+@app.get("/api/sessions/{session_name}/saved-items")
+async def api_session_saved_items(request: Request, session_name: str):
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    if not user or not _is_valid_session_name(session_name) or not _strict_session_owner(session_name, owner_id):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    try:
+        binding = await asyncio.to_thread(_saved_items_binding, session_name, owner_id)
+        data = await asyncio.to_thread(_collect_session_saved_items, session_name, user, binding["generation"])
+        current = await asyncio.to_thread(_saved_items_binding, session_name, owner_id)
+        if any(current[k] != binding[k] for k in ("owner_id", "generation", "resume_uuid")):
+            raise ValueError("Session identity changed")
+    except (_SessionOperationBusy, _SessionCloseError, OSError, ValueError):
+        return JSONResponse({"error": "Saved items changed or are unavailable. Refresh and try again."},
+                            status_code=409, headers={"Cache-Control": "private, no-store"})
+    return JSONResponse(data, headers={"Cache-Control": "private, no-store"})
+
+
+class RenameSessionBody(BaseModel):
+    name: str = Field(max_length=128, strict=True)
+
+
+@app.patch("/api/sessions/{session_name}/name")
+async def api_rename_session(request: Request, session_name: str, body: RenameSessionBody):
+    """Change only the visible label, never the project, tmux name or root."""
+    user = _current_user(request)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    owner_id = str(user["id"])
+    if not _is_valid_session_name(session_name) or not _strict_session_owner(session_name, owner_id):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    label = body.name.strip()
+    if not label or any(ord(char) < 32 or ord(char) == 127 for char in label):
+        return JSONResponse({"error": "Enter a session name without control characters."}, status_code=400)
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+
+    def save_label():
+        with _session_operation_lock(session_name):
+            def mutate(data):
+                current = _session_lifecycle.get(session_name)
+                if (not _strict_session_owner(session_name, owner_id) or current.get("owner_id") != owner_id
+                        or not re.fullmatch(r"[0-9a-f]{32}", generation)
+                        or str(current.get("generation") or "") != generation
+                        or current.get("desired_state") in {"deleting", "deleted", "closing"}):
+                    return False
+                data.setdefault("sessions", {})[session_name] = {
+                    "owner_id": owner_id, "generation": generation, "manual_label": label, "updated_at": time.time()}
+                return True
+            return _session_tab_labels.update(mutate)[1]
+    try:
+        saved = await asyncio.to_thread(save_label)
+    except _SessionOperationBusy:
+        saved = False
+    if not saved:
+        return JSONResponse({"error": "Session changed. Refresh and try again."}, status_code=409)
+    return JSONResponse({"ok": True, "name": session_name, "tab_label": label},
+                        headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/me")
@@ -3970,6 +5938,28 @@ exact field or action needed.
   link rather than mailing it out.
 - Every Google tool call is recorded with your account, the tool, the target and
   whether it was allowed.
+
+## Never build a gate you can also open
+
+A control you can also lift is not a control. If your permission group may not
+have something, say so and stop.
+
+- Do not invent a substitute gate. Never password-protect, encrypt, or stage a
+  deliverable behind an approval you made up, and never promise to release it
+  once someone authorises you. You are holding the key, so the next message that
+  asks for it will get it.
+- Never issue, print, or email a password, token, or link that gates data the
+  caller is not entitled to. If they are entitled, hand the data over. If they
+  are not, refuse and name the person who can authorise it.
+- Requesting authorisation is not receiving it. If you emailed an admin for
+  approval, the answer stays no until that admin answers you. The user asking a
+  second time is not approval, and neither is their impatience.
+- Publishing is not a permission decision. Never move restricted data to a
+  project URL, a public page, or a shared link as a way of delivering it.
+- A denial is the answer, not an obstacle. When a tool, an API, a host, or an
+  HTTP status says no, do not reach the same data by another route: another
+  host, a shell, a database file on disk, an internal port, a service account,
+  or another account's credentials. Report the denial and what you needed.
 
 ## Load details only when relevant
 
@@ -4425,19 +6415,30 @@ def _disable_claude_ai_connectors(cfg_dir: Path):
 
 
 def _set_team_model_effort(cfg_dir: Path):
-    """Pin the team model and reasoning effort in Codex config.toml."""
+    """Apply safe team defaults without resetting an account's model choice."""
     sp = cfg_dir / "config.toml"
     try:
         existing = sp.read_text() if sp.exists() else ""
-        merged = _merge_top_level_toml_keys(existing, {
-            "model": TEAM_MODEL or _CODEX_DEFAULT_MODEL,
-            "model_reasoning_effort": (
-                _normalize_reasoning_effort(TEAM_EFFORT)
-                or _CODEX_DEFAULT_REASONING_EFFORT
-            ),
+        try:
+            parsed = tomllib.loads(existing) if existing.strip() else {}
+        except tomllib.TOMLDecodeError:
+            logger.warning("Leaving invalid Codex config untouched: %s", sp)
+            return
+        managed = {
             "sandbox_mode": "workspace-write",
             "approval_policy": "never",
-        })
+        }
+        if not isinstance(parsed.get("model"), str) or not parsed["model"].strip():
+            managed["model"] = TEAM_MODEL or _CODEX_DEFAULT_MODEL
+        if (
+            not isinstance(parsed.get("model_reasoning_effort"), str)
+            or not parsed["model_reasoning_effort"].strip()
+        ):
+            managed["model_reasoning_effort"] = (
+                _normalize_reasoning_effort(TEAM_EFFORT)
+                or _CODEX_DEFAULT_REASONING_EFFORT
+            )
+        merged = _merge_top_level_toml_keys(existing, managed)
         merged = _ensure_codex_project_trust(merged, os.getcwd())
         if merged != existing:
             _backup_before_dashboard_write(sp)
@@ -4827,7 +6828,7 @@ def _ensure_tenant_browser(user: dict) -> dict:
     The transaction prevents two API workers creating the same account browser
     with different ports.
     """
-    if not user or _is_admin(user):
+    if not _uses_private_account_runtime(user):
         return dict(_DEFAULT_BROWSER_SESSION)
     sid = _tenant_browser_id(user)
     snapshot = _load_browser_sessions()
@@ -4878,13 +6879,36 @@ def _user_can_access_browser(user: dict | None, browser_id: str) -> bool:
     return bool(browser) and _browser_owner_id(browser) == str(user.get("id") or "")
 
 
+BROWSER_MCP_ENABLED = os.environ.get("TMUX_DASH_BROWSER_MCP", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+
 def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
     """Give each Codex home a call-scoped, account-isolated browser lease."""
     cfg = cfg_dir / "config.toml"
     begin = "# BEGIN GRABO PLAYWRIGHT MCP (managed)"
     end = "# END GRABO PLAYWRIGHT MCP"
+    if not BROWSER_MCP_ENABLED:
+        # This box has no browser for the lease proxy to reach. Declaring the server anyway
+        # is not a harmless warning: the handshake fails and takes the Codex TUI with it, so
+        # strip any copy that is already there rather than leaving one behind.
+        try:
+            if cfg.exists():
+                existing = cfg.read_text()
+                if begin in existing:
+                    cfg.write_text(re.sub(
+                        rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?", "\n",
+                        existing, flags=re.DOTALL).rstrip() + "\n")
+                    return True
+        except OSError:
+            logger.debug("Could not strip the browser MCP block from %s", cfg, exc_info=True)
+        return False
     try:
-        browser = _ensure_tenant_browser(user) if user and not _is_admin(user) else dict(_DEFAULT_BROWSER_SESSION)
+        browser = (
+            _ensure_tenant_browser(user)
+            if _uses_private_account_runtime(user)
+            else dict(_DEFAULT_BROWSER_SESSION)
+        )
         browser_id = _toml_escape(str(browser.get("id") or "default"))
         cdp_port = int(browser.get("cdp_port") or 9222)
         output_dir = _toml_escape(str(Path.home() / ".playwright-mcp" / browser_id))
@@ -4898,6 +6922,10 @@ def _ensure_browser_mcp(cfg_dir: Path, user: dict | None = None) -> bool:
             f'TMUX_DASH_BROWSER_ID = "{browser_id}"\n'
             f'TMUX_DASH_BROWSER_CDP_PORT = "{cdp_port}"\n'
             f'TMUX_DASH_BROWSER_OUTPUT_DIR = "{output_dir}"\n'
+            # Codex replaces the environment with this table, so the proxy has
+            # to be told the dashboard owner's home explicitly: the session runs
+            # as its own UNIX account and $HOME no longer points there.
+            f'TMUX_DASH_HOST_HOME = "{Path.home()}"\n'
             f"{end}\n"
         )
         existing = cfg.read_text() if cfg.exists() else ""
@@ -5370,7 +7398,7 @@ def _context_root(scope: str, ident: str):
         if not u:
             return None
         d = _user_codex_config_dir(u)
-        if not _is_admin(u):
+        if _uses_private_account_runtime(u):
             _ensure_user_codex_config_dir(u)
         return d
     if scope == "group":
@@ -5486,7 +7514,7 @@ async def api_admin_context_write(request: Request, scope: str, ident: str, body
                     pass
     elif scope == "user":
         target_user = _find_user_by_id(ident)
-        if target_user and not _is_admin(target_user):
+        if _uses_private_account_runtime(target_user):
             try:
                 _ensure_user_codex_config_dir(target_user)
             except Exception:
@@ -5521,7 +7549,7 @@ async def api_admin_context_delete(request: Request, scope: str, ident: str, pat
         return JSONResponse({"error": "Delete failed"}, status_code=500)
     if scope == "user":
         target_user = _find_user_by_id(ident)
-        if target_user and not _is_admin(target_user):
+        if _uses_private_account_runtime(target_user):
             try:
                 _ensure_user_codex_config_dir(target_user)
             except Exception:
@@ -5545,7 +7573,7 @@ def _history_list_for(target: dict):
     messages_by_session = _load_messages(target)
     notes_by_session = _load_all_notes(target)
     owners = _load_session_owners()
-    live = {s["name"] for s in get_tmux_sessions() if owners.get(s["name"], "admin") == target["id"]}
+    live = {s["name"] for s in get_tmux_sessions() if owners.get(s["name"]) == target["id"]}
     out = []
     for name in set(messages_by_session) | set(notes_by_session) | live:
         msgs = messages_by_session.get(name) or []
@@ -6377,6 +8405,11 @@ def _atomic_write_json(path: Path, data):
             os.fsync(stream.fileno())
         os.replace(temp_name, path)
         path.chmod(0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         if fd >= 0:
             os.close(fd)
@@ -6404,11 +8437,17 @@ def _save_notes():
     """Persist all session notes to per-user files based on session ownership."""
     # Group cache entries by owning user
     by_user: dict[str, dict[str, str]] = {}
+    owners = _load_session_owners()
     for name, entry in cache.items():
         notes = entry.get("notes")
-        if not notes:
+        owner_id = str(entry.get("_owner_id") or "")
+        owner_matches = owners.get(name) == owner_id or (
+            owner_id == "admin"
+            and name not in owners
+            and not _session_lifecycle.get(name).get("managed")
+        )
+        if not notes or not owner_id or not owner_matches:
             continue
-        owner_id = _session_owner_id(name)
         by_user.setdefault(owner_id, {})[name] = notes
 
     # Write each user's file, merged with any sessions not currently in cache.
@@ -6422,9 +8461,9 @@ def _save_notes():
         _write_json_file(path, existing)
 
 
-def _load_session_notes(session_name: str) -> str:
+def _load_session_notes(session_name: str, owner_id: str = "") -> str:
     """Get persisted notes for a specific session, from its owner's file."""
-    owner = _user_for_session(session_name)
+    owner = _find_user_by_id(owner_id) if owner_id else _user_for_session(session_name)
     return _load_all_notes(owner).get(session_name, "")
 
 
@@ -6507,28 +8546,478 @@ def _backfill_prompt_audit(users: list[dict] | None = None) -> int:
     return len(records)
 
 
+def _chat_message_id(message: dict, user_id: str = "", position: int = 0) -> str:
+    if message.get("id"):
+        return str(message["id"])
+    if message.get("role") == "assistant":
+        material = ["legacy-assistant", user_id, position]
+    else:
+        material = [message.get("role"), message.get("ts"), message.get("text")]
+    return "legacy-" + hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def _merge_chat_messages(existing: list, incoming: list) -> list:
+    """Merge stale worker snapshots without losing another worker's messages."""
+    merged: dict[str, dict] = {}
+    for rows in (existing, incoming):
+        user_id, assistant_position = "", 0
+        for original in rows:
+            if not isinstance(original, dict) or original.get("role") not in {"user", "assistant"}:
+                continue
+            row = dict(original)
+            key = _chat_message_id(row, user_id, assistant_position)
+            row["id"] = key
+            if row["role"] == "user":
+                user_id, assistant_position = key, 0
+            else:
+                assistant_position += 1
+            previous = merged.get(key)
+            if previous is not None and row["role"] == "user" and float(row.get("ts") or 0) == float(previous.get("ts") or 0):
+                # The controller associates canonical source identity with an
+                # already-sent user row. A stale API cache must not erase that
+                # mapping merely because its unchanged prompt timestamp ties.
+                merged[key] = {**row, **previous}
+            elif previous is None or float(row.get("ts") or 0) >= float(previous.get("ts") or 0):
+                merged[key] = row
+    return sorted(merged.values(), key=lambda row: float(row.get("ts") or 0))
+
+
 def _save_messages():
-    """Persist all session messages to per-user files based on session ownership."""
+    """Atomically merge owner-bound chat rows across API/controller processes."""
     by_user: dict[str, dict[str, list]] = {}
+    owners = _load_session_owners()
     for name, entry in cache.items():
         msgs = entry.get("messages")
-        if not msgs:
+        owner_id = str(entry.get("_owner_id") or "")
+        owner_matches = owners.get(name) == owner_id or (
+            owner_id == "admin"
+            and name not in owners
+            and not _session_lifecycle.get(name).get("managed")
+        )
+        if not msgs or not owner_id or not owner_matches or not _session_cache_entry_is_current(name, entry):
             continue
-        owner_id = _session_owner_id(name)
         by_user.setdefault(owner_id, {})[name] = msgs
 
     for uid, updates in by_user.items():
-        owner = _find_user_by_id(uid) or _find_user_by_id("admin")
+        owner = _find_user_by_id(uid)
+        if not owner:
+            continue
         path = _user_messages_file(owner)
-        existing = _read_json_file(path)
-        existing.update(updates)
-        _write_json_file(path, existing)
+        def merge(existing: dict) -> None:
+            for name, messages in updates.items():
+                entry = cache.get(name) or {}
+                if _session_cache_entry_is_current(name, entry):
+                    existing[name] = _merge_chat_messages(existing.get(name, []), messages)
+        LockedJsonStore(path, dict).update(merge)
 
 
-def _load_session_messages(session_name: str) -> list:
+def _load_session_messages(session_name: str, owner_id: str = "") -> list:
     """Get persisted messages for a specific session from its owner's file."""
-    owner = _user_for_session(session_name)
+    owner = _find_user_by_id(owner_id) if owner_id else _user_for_session(session_name)
     return _load_messages(owner).get(session_name, [])
+
+
+def _bound_session_cache_entry(
+    session_name: str,
+    owner_id: str = "",
+    logical_incarnation: str = "",
+) -> dict:
+    """Never reuse one process's name-keyed cache across account generations."""
+    owner_id = owner_id or _session_owner_id(session_name)
+    lifecycle = _session_lifecycle.get(session_name)
+    generation = str(lifecycle.get("generation") or "")
+    logical_incarnation = logical_incarnation or _session_incarnation(
+        owner_id,
+        generation,
+        "logical" if generation else "legacy",
+    )
+    entry = cache.get(session_name) or {}
+    if (
+        str(entry.get("_owner_id") or "") != owner_id
+        or str(entry.get("_logical_incarnation") or "") != logical_incarnation
+    ):
+        entry = {
+            "_owner_id": owner_id,
+            "_logical_incarnation": logical_incarnation,
+        }
+        cache[session_name] = entry
+    return entry
+
+
+def _session_cache_entry_is_current(session_name: str, entry: dict) -> bool:
+    owner_id = str(entry.get("_owner_id") or "")
+    lifecycle = _session_lifecycle.get(session_name)
+    recorded_owner = str(_load_session_owners().get(session_name) or "")
+    legacy_admin = owner_id == "admin" and not recorded_owner and not lifecycle.get("managed")
+    if not owner_id or (recorded_owner != owner_id and not legacy_admin):
+        return False
+    generation = str(lifecycle.get("generation") or "")
+    if cache.get(session_name) is not entry:
+        return False
+    if not generation:
+        return True
+    logical = _session_incarnation(owner_id, generation, "logical")
+    return hmac.compare_digest(
+        str(entry.get("_logical_incarnation") or ""), logical
+    )
+
+
+_TAB_LABEL_WORD_RE = re.compile(r"[^\W_]+(?:-\d+)?", re.UNICODE)
+_TAB_LABEL_ACTIONS = {
+    "add": "Add", "adding": "Add", "build": "Build", "building": "Build",
+    "count": "Count", "create": "Create", "creating": "Create",
+    "debug": "Debug", "debugging": "Debug", "deploy": "Deploy",
+    "explain": "Explain", "fix": "Fix", "fixing": "Fix",
+    "implement": "Implement", "implementing": "Implement", "inspect": "Inspect",
+    "investigate": "Investigate", "make": "Build", "move": "Move",
+    "remove": "Remove", "rename": "Rename", "renaming": "Rename",
+    "review": "Review", "say": "Say", "summarize": "Summarize",
+    "summarized": "Summarize", "summarizing": "Summarize",
+    "summarise": "Summarize", "summarised": "Summarize",
+    "summarising": "Summarize", "test": "Test", "update": "Update",
+    "write": "Write",
+}
+_TAB_LABEL_STOP_WORDS = frozenset({
+    "a", "about", "actually", "after", "again", "all", "also", "an", "and",
+    "anything", "ask", "asked", "at", "back", "be", "because", "been", "before",
+    "being", "but", "by", "can", "code", "could", "currently", "did", "do",
+    "does", "doing", "done", "each", "else", "for", "from", "give", "given",
+    "first", "fixed", "has", "have", "having", "how", "i", "if", "in", "instead", "into", "is",
+    "it", "its", "just", "keep", "last", "like", "long", "make", "me", "minutes",
+    "more", "my", "name", "named", "new", "no", "not", "now", "of", "off", "ok",
+    "on", "once", "only", "or", "plan", "please", "previous", "request", "right",
+    "same", "set", "should", "something", "stays", "sure", "than", "that", "the",
+    "take", "takes", "then", "there", "this", "to", "two", "until", "up", "user", "want", "was",
+    "we", "what", "when", "where", "which", "while", "will", "with", "word", "words",
+    "work", "working", "write", "you", "your",
+})
+_TAB_LABEL_ACRONYMS = {
+    "adhd": "ADHD", "ai": "AI", "api": "API", "css": "CSS", "dns": "DNS",
+    "html": "HTML", "ios": "iOS", "js": "JS", "json": "JSON", "lisa": "Lisa",
+    "llm": "LLM", "macos": "macOS", "oauth": "OAuth", "ssh": "SSH",
+    "tmux": "tmux", "ui": "UI", "url": "URL", "ux": "UX",
+}
+
+
+def _tab_label_word(word: str) -> str:
+    word = str(word or "")[:24]
+    lower = word.lower()
+    if lower in _TAB_LABEL_ACRONYMS:
+        return _TAB_LABEL_ACRONYMS[lower]
+    if word.isupper() and len(word) <= 8:
+        return word
+    return word.capitalize()
+
+
+def _normalize_two_word_tab_label(value: str, fallback: str = "Active Task") -> str:
+    """Return exactly two safe, whitespace-separated display words."""
+    words = _TAB_LABEL_WORD_RE.findall(str(value or ""))[:2]
+    if not words:
+        words = _TAB_LABEL_WORD_RE.findall(fallback)[:2] or ["Active", "Task"]
+    if len(words) == 1:
+        words.append("Work" if words[0].lower() == "task" else "Task")
+    return " ".join(_tab_label_word(word) for word in words[:2])
+
+
+def _fallback_two_word_tab_label(prompt: str) -> str:
+    """Make a useful two-word title without requiring a paid LLM call."""
+    text = re.sub(r"^\s*\[Voice instructions\]\s*", "", str(prompt or ""), flags=re.I)
+    if re.search(r"(?i)please\s+inspect\s+the\s+attached\s+images?", text):
+        return "Image Review"
+    text = re.split(r"(?im)^\s*Attached images?:", text, maxsplit=1)[0]
+    text = re.sub(r"https?://\S+", " ", text)
+
+    # A user-supplied two-word phrase is usually the clearest possible title
+    # (for example, "idle nudge" or `clean view`).
+    quoted = re.findall(r'"([^"\n]{1,80})"|“([^”\n]{1,80})”|`([^`\n]{1,80})`', text)
+    for groups in quoted:
+        phrase = next((group for group in groups if group), "")
+        words = _TAB_LABEL_WORD_RE.findall(phrase)
+        if len(words) == 2 and not all(
+            word.lower() in _TAB_LABEL_STOP_WORDS for word in words
+        ):
+            return _normalize_two_word_tab_label(phrase)
+
+    tokens = _TAB_LABEL_WORD_RE.findall(text)
+    action = next(
+        (_TAB_LABEL_ACTIONS[token.lower()] for token in tokens
+         if token.lower() in _TAB_LABEL_ACTIONS),
+        "",
+    )
+    content = []
+    seen = set()
+    for token in tokens:
+        lower = token.lower()
+        if (
+            lower in _TAB_LABEL_STOP_WORDS
+            or lower in _TAB_LABEL_ACTIONS
+            or (token.isdigit() and action != "Count")
+            or (len(token) < 2 and not token.isupper())
+            or lower in seen
+        ):
+            continue
+        seen.add(lower)
+        content.append(token)
+        if len(content) == 2:
+            break
+    if len(content) >= 2:
+        return _normalize_two_word_tab_label(" ".join(content[:2]))
+    if content and action:
+        return _normalize_two_word_tab_label(f"{action} {content[0]}")
+    if content:
+        return _normalize_two_word_tab_label(content[0])
+    if action:
+        return _normalize_two_word_tab_label(action)
+    return "Active Task"
+
+
+_TAB_LABEL_CONTINUATIONS = frozenset({
+    "approved", "continue", "do it", "go ahead", "implement it",
+    "implement the plan", "ok", "ok do it", "okay", "proceed",
+    "sounds good", "start", "yes", "yep",
+})
+
+
+def _is_tab_label_continuation(prompt: str) -> bool:
+    normalized = " ".join(_TAB_LABEL_WORD_RE.findall(str(prompt or ""))).casefold()
+    return normalized in _TAB_LABEL_CONTINUATIONS
+
+
+def _tab_label_source_for_request(session_name: str, prompt: str) -> tuple[str, float]:
+    """Resolve approvals such as "ok" back to the substantive ask they approve."""
+    if not _is_tab_label_continuation(prompt):
+        return str(prompt or ""), 0.0
+    messages = _load_session_messages(session_name)
+    skipped_current = False
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = str(message.get("text") or "").strip()
+        if not skipped_current and text == str(prompt or "").strip():
+            skipped_current = True
+            continue
+        if text and not _is_tab_label_continuation(text):
+            return text, float(message.get("ts") or 0)
+    return str(prompt or ""), 0.0
+
+
+def _session_tab_label_rows() -> dict[str, dict]:
+    data = _session_tab_labels.read()
+    rows = data.get("sessions", {}) if isinstance(data, dict) else {}
+    return {
+        str(name): dict(row)
+        for name, row in rows.items()
+        if isinstance(row, dict)
+    }
+
+
+def _session_manual_tab_label(session_name: str, rows: dict | None = None) -> str:
+    rows = rows if rows is not None else _session_tab_label_rows()
+    label_row = rows.get(session_name) or {}
+    lifecycle = _session_lifecycle.get(session_name)
+    if (label_row.get("owner_id") == _session_owner_id(session_name)
+            and label_row.get("generation") and label_row.get("generation") == lifecycle.get("generation")
+            and label_row.get("owner_id") == lifecycle.get("owner_id")):
+        return str(label_row.get("manual_label") or "").strip()
+    return ""
+
+
+def _session_tab_label(session_name: str, rows: dict | None = None) -> str:
+    rows = rows if rows is not None else _session_tab_label_rows()
+    manual = _session_manual_tab_label(session_name, rows)
+    if manual:
+        return manual
+    row = rows.get(session_name) or {}
+    lifecycle = _session_lifecycle.get(session_name)
+    if (row.get("owner_id") != _session_owner_id(session_name)
+            or str(row.get("generation") or "") != str(lifecycle.get("generation") or "")
+            or not _auto_session_names_enabled(str(row.get("owner_id") or ""))):
+        return ""
+    label = str((rows.get(session_name) or {}).get("label") or "").strip()
+    return _normalize_two_word_tab_label(label) if label else ""
+
+
+def _queue_session_tab_label(
+    session_name: str,
+    owner_id: str,
+    prompt: str,
+    *,
+    started_at: float | None = None,
+) -> str:
+    """Start the rename clock only for sessions without an explicit name."""
+    if _session_manual_tab_label(session_name) or not _auto_session_names_enabled(owner_id):
+        return ""
+    if not _strict_session_owner(session_name, owner_id):
+        return ""
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    request_id = secrets.token_hex(12)
+    source_prompt, source_ts = _tab_label_source_for_request(session_name, prompt)
+    pending = {
+        "id": request_id,
+        "started_at": float(started_at if started_at is not None else time.time()),
+        "source_ts": source_ts,
+        "candidate": _fallback_two_word_tab_label(source_prompt),
+    }
+
+    def mutate(data: dict) -> None:
+        current = _session_lifecycle.get(session_name)
+        if (not _strict_session_owner(session_name, owner_id)
+                or str(current.get("generation") or "") != generation
+                or current.get("desired_state") in {"deleting", "deleted", "closing"}):
+            return
+        data["version"] = 1
+        rows = data.setdefault("sessions", {})
+        previous = rows.get(session_name)
+        row = dict(previous) if isinstance(previous, dict) else {}
+        if row.get("owner_id") != owner_id or str(row.get("generation") or "") != generation:
+            row = {}
+        if row.get("manual_label") and row.get("owner_id") == owner_id and row.get("generation") == generation:
+            return
+        row["owner_id"] = owner_id
+        row["generation"] = generation
+        row["pending"] = pending
+        rows[session_name] = row
+
+    _session_tab_labels.update(mutate)
+    return request_id
+
+
+def _finish_session_tab_label(
+    session_name: str,
+    request_id: str,
+    label: str = "",
+    *,
+    finished_at: float | None = None,
+) -> dict:
+    """Atomically apply/clear only the request that is still current."""
+    normalized = _normalize_two_word_tab_label(label) if label else ""
+
+    def mutate(data: dict) -> dict:
+        rows = data.setdefault("sessions", {})
+        row = rows.get(session_name)
+        if not isinstance(row, dict):
+            return {}
+        pending = row.get("pending")
+        if not isinstance(pending, dict) or pending.get("id") != request_id:
+            return {}
+        row.pop("pending", None)
+        owner_id = str(row.get("owner_id") or "")
+        current = _session_lifecycle.get(session_name)
+        allowed = (not row.get("manual_label") and _strict_session_owner(session_name, owner_id)
+                   and str(row.get("generation") or "") == str(current.get("generation") or "")
+                   and current.get("desired_state") not in {"deleting", "deleted", "closing"}
+                   and _auto_session_names_enabled(owner_id))
+        if normalized and allowed:
+            owner_id = str(row.get("owner_id") or "")
+            used = {
+                str(other.get("label") or "").casefold()
+                for other_name, other in rows.items()
+                if other_name != session_name
+                and isinstance(other, dict)
+                and str(other.get("owner_id") or "") == owner_id
+                and other.get("label")
+            }
+            unique = normalized
+            if unique.casefold() in used:
+                first, second = unique.split(" ", 1)
+                second = re.sub(r"-\d+$", "", second)
+                for suffix in range(2, 100):
+                    unique = f"{first} {second[:20]}-{suffix}"
+                    if unique.casefold() not in used:
+                        break
+            row["label"] = unique
+            row["updated_at"] = float(
+                finished_at if finished_at is not None else time.time()
+            )
+        rows[session_name] = row
+        return dict(row) if not normalized or allowed else {}
+
+    _data, result = _session_tab_labels.update(mutate)
+    return result
+
+
+def _remove_session_tab_label(session_name: str) -> None:
+    def mutate(data: dict) -> None:
+        data.setdefault("sessions", {}).pop(session_name, None)
+
+    _session_tab_labels.update(mutate)
+
+
+def _session_tab_order(owner_id: str) -> list[str]:
+    """Return one account's sanitized, de-duplicated persisted tab order."""
+    data = _session_tab_order_store.read()
+    owners = data.get("owners", {}) if isinstance(data, dict) else {}
+    row = owners.get(owner_id, {}) if isinstance(owners, dict) else {}
+    values = row.get("sessions", []) if isinstance(row, dict) else []
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values if isinstance(values, list) else []:
+        name = str(value or "")
+        if _is_valid_session_name(name) and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def _save_session_tab_order(owner_id: str, session_names: list[str]) -> list[str]:
+    """Persist only an explicitly authenticated account's tab order."""
+    ordered = list(dict.fromkeys(session_names))
+
+    def mutate(data: dict) -> list[str]:
+        owners = data.setdefault("owners", {})
+        owners[owner_id] = {
+            "sessions": ordered,
+            "updated_at": time.time(),
+        }
+        return list(ordered)
+
+    _data, result = _session_tab_order_store.update(mutate)
+    return result
+
+
+def _remove_session_from_tab_order(session_name: str, owner_id: str) -> None:
+    """Forget a genuinely deleted generation so a reused name appends as new."""
+    def mutate(data: dict) -> None:
+        owners = data.setdefault("owners", {})
+        row = owners.get(owner_id)
+        if not isinstance(row, dict):
+            return
+        values = row.get("sessions", [])
+        if isinstance(values, list):
+            row["sessions"] = [name for name in values if name != session_name]
+            row["updated_at"] = time.time()
+
+    _session_tab_order_store.update(mutate)
+
+
+def _latest_tab_label_prompt(
+    session_name: str,
+    owner_id: str,
+    source_ts: float = 0,
+) -> str:
+    owner = _find_user_by_id(owner_id) or _user_for_session(session_name)
+    messages = _load_messages(owner).get(session_name, [])
+    if source_ts:
+        matched = next(
+            (
+                str(message.get("text") or "")
+                for message in reversed(messages)
+                if isinstance(message, dict)
+                and message.get("role") == "user"
+                and abs(float(message.get("ts") or 0) - source_ts) < 0.001
+            ),
+            "",
+        )
+        if matched:
+            return matched
+    return next(
+        (
+            str(message.get("text") or "")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    )
 
 
 DESCRIPTION_TTL = 0    # never auto-expire
@@ -6586,6 +9075,239 @@ def _process_tree_snapshot() -> tuple[dict[str, list[str]], dict[str, str]]:
         return {}, {}
 
 
+def _session_codex_process_id(session_name: str) -> int | None:
+    """Return the nearest live Codex process below a session's pane shell."""
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "display-message", "-t", f"={session_name}:",
+                "-p", "#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        root = (result.stdout or "").strip()
+        if result.returncode != 0 or not root.isdigit():
+            return None
+        children, commands = _process_tree_snapshot()
+        pending = [root]
+        seen: set[str] = set()
+        cursor = 0
+        while cursor < len(pending) and len(seen) < 10000:
+            current = pending[cursor]
+            cursor += 1
+            if current in seen:
+                continue
+            seen.add(current)
+            if commands.get(current) == "codex":
+                return int(current)
+            pending.extend(children.get(current, ()))
+    except Exception:
+        logger.debug("Could not resolve Codex pid for '%s'", session_name, exc_info=True)
+    return None
+
+
+def _process_open_file_paths(pid: int) -> list[Path]:
+    """Return resolvable files held open by one same-UID process."""
+    paths: set[Path] = set()
+    try:
+        for descriptor in Path(f"/proc/{int(pid)}/fd").iterdir():
+            try:
+                paths.add(Path(os.readlink(descriptor)).resolve(strict=True))
+            except (OSError, RuntimeError, ValueError):
+                continue
+    except (OSError, ValueError):
+        return []
+    return sorted(paths, key=str)
+
+
+def _active_session_root_thread_id(
+    session_name: str, expected_owner_id: str = ""
+) -> str | None:
+    """Discover the one user-root rollout held open by this tab's Codex.
+
+    A root can have many subagent rollout files open at once.  Reading the open
+    file set and applying the same owner-home/root metadata validation used by
+    recovery avoids guessing by cwd or mtime.
+    """
+    if expected_owner_id and not _strict_session_owner(
+        session_name, expected_owner_id
+    ):
+        return None
+    pid = _session_codex_process_id(session_name)
+    if not pid:
+        return None
+    process_env = _process_environment(pid)
+    if process_env.get("DASH_SESSION") != session_name:
+        return None
+    try:
+        if expected_owner_id:
+            owner_binding = _strict_session_owner(session_name, expected_owner_id)
+            if not owner_binding:
+                return None
+            expected_home = _user_codex_config_dir(owner_binding[1])
+            if _uses_private_account_runtime(owner_binding[1]):
+                try:
+                    actual_home = Path(process_env.get("CODEX_HOME", "")).resolve()
+                except (OSError, RuntimeError):
+                    return None
+                if actual_home != expected_home.resolve():
+                    return None
+            sessions_root = (
+                expected_home / "sessions"
+            ).resolve()
+        else:
+            sessions_root = (_session_config_base(session_name) / "sessions").resolve()
+    except OSError:
+        return None
+    candidates: set[str] = set()
+    for target in _process_open_file_paths(pid):
+        try:
+            target.relative_to(sessions_root)
+        except ValueError:
+            continue
+        if not target.name.startswith("rollout-") or target.suffix != ".jsonl":
+            continue
+        match = re.search(
+            r"-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+            target.name,
+            re.IGNORECASE,
+        )
+        thread_id = _validated_codex_thread_id(match.group(1) if match else "")
+        if (
+            thread_id
+            and _validated_session_root_thread_id(
+                session_name, thread_id, expected_owner_id
+            )
+            == thread_id
+        ):
+            candidates.add(thread_id)
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if len(candidates) > 1:
+        logger.warning(
+            "Refusing to checkpoint ambiguous root rollouts for '%s'", session_name
+        )
+    return None
+
+
+def _process_environment(pid: int) -> dict[str, str]:
+    """Read a same-account process environment without ever logging values."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+    except (OSError, ValueError):
+        return {}
+    env: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        key, separator, value = item.partition(b"=")
+        if not separator:
+            continue
+        env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+_ACCOUNT_INSTRUCTIONS_PID_OPTION = "@dashboard_account_instructions_pid"
+_ACCOUNT_INSTRUCTIONS_SHA_OPTION = "@dashboard_account_instructions_sha"
+
+
+def _session_account_instruction_marker(session_name: str) -> tuple[str, str]:
+    values = []
+    for option in (
+        _ACCOUNT_INSTRUCTIONS_PID_OPTION,
+        _ACCOUNT_INSTRUCTIONS_SHA_OPTION,
+    ):
+        try:
+            result = subprocess.run(
+                ["tmux", "show-options", "-t", session_name, "-v", option],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            values.append((result.stdout or "").strip() if result.returncode == 0 else "")
+        except Exception:
+            values.append("")
+    return values[0], values[1]
+
+
+def _mark_session_account_instructions(
+    session_name: str,
+    pid: int,
+    digest: str,
+) -> None:
+    """Remember that one live conversation received the current instructions."""
+    for option, value in (
+        (_ACCOUNT_INSTRUCTIONS_PID_OPTION, str(pid)),
+        (_ACCOUNT_INSTRUCTIONS_SHA_OPTION, digest),
+    ):
+        subprocess.run(
+            ["tmux", "set-option", "-t", session_name, option, value],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
+
+def _account_instruction_refresh_for_prompt(
+    session_name: str,
+    original_message: str,
+) -> tuple[str, tuple[int, str] | None]:
+    """Add changed private AGENTS.md instructions to a legacy open thread once.
+
+    Codex snapshots AGENTS.md when a conversation starts. A dashboard user can
+    update that account file while several tabs remain open, and older member
+    panes may also predate the per-account CODEX_HOME binding. For those cases,
+    deliver the new instructions with the next real prompt. The dashboard still
+    stores and displays only ``original_message``.
+    """
+    # Codex only recognizes a slash command when the slash is the first byte of
+    # the submitted composer text. Wrapping it in the legacy instruction-refresh
+    # envelope turns it into an ordinary user prompt, so the assistant can claim
+    # that it changed a setting while the live TUI remains unchanged. Leave slash
+    # commands literal; the next ordinary prompt can carry any pending refresh.
+    if original_message.startswith("/"):
+        return original_message, None
+
+    owner = _user_for_session(session_name)
+    if not _uses_private_account_runtime(owner):
+        return original_message, None
+    agents_path = _user_codex_config_dir(owner) / "AGENTS.md"
+    try:
+        raw_instructions = agents_path.read_bytes()
+        instructions = raw_instructions.decode("utf-8", "replace").strip()
+    except OSError:
+        return original_message, None
+    if not instructions:
+        return original_message, None
+
+    digest = hashlib.sha256(raw_instructions).hexdigest()
+    pid = _session_codex_process_id(session_name)
+    if pid is None:
+        return original_message, None
+
+    env = _process_environment(pid)
+    expected_home = str(_user_codex_config_dir(owner))
+    if (
+        env.get("CODEX_HOME") == expected_home
+        and env.get("TMUX_DASH_ACCOUNT_INSTRUCTIONS_SHA") == digest
+    ):
+        return original_message, None
+
+    marked_pid, marked_digest = _session_account_instruction_marker(session_name)
+    if marked_pid == str(pid) and marked_digest == digest:
+        return original_message, None
+
+    # Point Codex at the file instead of pasting its full contents. The latter
+    # can push a short message over the TUI's large-paste threshold and leave it
+    # expanded but unsubmitted in the composer. A short notice is also cheaper.
+    wrapped = (
+        f"[Read/apply {agents_path}. For exact-message rules, use only ORIGINAL.]\n"
+        "ORIGINAL:\n"
+        f"{original_message}"
+    )
+    return wrapped, (pid, digest)
+
+
 def _session_is_codex(name: str) -> bool:
     """Return True if this tmux session belongs to the codex dashboard.
 
@@ -6634,52 +9356,271 @@ def _session_is_codex(name: str) -> bool:
     return decision
 
 
-def get_tmux_sessions() -> list[dict]:
+def _live_tmux_session_names() -> set[str]:
+    """Return real tmux names only, excluding lifecycle-synthesized tabs."""
     try:
         result = subprocess.run(
-            ["tmux", "list-sessions", "-F",
-             "#{session_name}:#{session_windows}:#{session_created}:#{session_attached}"],
-            capture_output=True, text=True, timeout=5
+            [
+                "tmux", "list-sessions", "-F",
+                "#{session_name}\t#{@dashboard_quarantined}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0:
-            result.stdout = ""
-        sessions = []
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split(":")
-            name = parts[0]
-            if name.startswith("__") and name.endswith("__"):
-                continue  # Skip internal sessions (e.g. __auth_login_tmp__)
-            if not _session_is_codex(name):
-                continue  # Hide non-Codex tmux sessions from the codex dashboard
-            sessions.append({
-                "name": name,
-                "windows": parts[1] if len(parts) > 1 else "?",
-                "created": parts[2] if len(parts) > 2 else "",
-                "attached": parts[3] == "1" if len(parts) > 3 else False,
-            })
-        live_names = {session["name"] for session in sessions}
-        lifecycle_rows = _session_lifecycle.snapshot().get("sessions", {})
-        for name, row in lifecycle_rows.items():
-            if (
-                name in live_names
-                or not row.get("parked")
-                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", str(name))
-            ):
-                continue
-            sessions.append(
-                {
-                    "name": name,
-                    "windows": "0",
-                    "created": str(int(row.get("parked_at") or 0)),
-                    "attached": False,
-                    "virtual": bool(row.get("virtual")),
-                }
-            )
-        return sessions
+            return set()
+        names: set[str] = set()
+        for line in (result.stdout or "").splitlines():
+            name, _separator, quarantined = line.strip().partition("\t")
+            if _is_valid_session_name(name) and quarantined != "1":
+                names.add(name)
+        return names
     except Exception:
-        return []
+        logger.debug("Could not list raw tmux sessions", exc_info=True)
+        return set()
+
+
+def _exact_tmux_session_state(session_name: str) -> tuple[str, str]:
+    """Return (present|absent|unknown, immutable id) for one exact tmux name."""
+    if not _is_valid_session_name(session_name):
+        return "unknown", ""
+    try:
+        probe = subprocess.run(
+            ["tmux", "has-session", "-t", f"={session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return "unknown", ""
+    if probe.returncode == 1:
+        return "absent", ""
+    if probe.returncode != 0:
+        return "unknown", ""
+    session_id = _exact_tmux_session_id(session_name)
+    return ("present", session_id) if session_id else ("unknown", "")
+
+
+def _session_incarnation(owner_id: str, generation: str, session_id: str) -> str:
+    """Return a UI-safe token that changes whenever a tmux tab is replaced."""
+    material = f"{owner_id}\0{generation}\0{session_id}".encode("utf-8", "strict")
+    return hashlib.sha256(material).hexdigest()[:20]
+
+
+def _session_row_is_recoverable(row: dict | None) -> bool:
+    """Whether a tab missing from tmux could actually be brought back.
+
+    Automatic recovery replays a Codex thread, so it needs a 32-hex generation
+    and a resume id; _durable_session_candidates() drops everything else. A row
+    that fails this bar is never a candidate, so calling it "recovering" left a
+    tab rendering "Restoring ..." forever with nothing able to finish it, and
+    held /health/ready at degraded for as long as the row existed.
+    """
+    row = row or {}
+    return bool(
+        re.fullmatch(r"[0-9a-f]{32}", str(row.get("generation") or ""))
+        and _validated_codex_thread_id(row.get("resume_uuid"))
+    )
+
+
+def _tmux_inventory_snapshot() -> dict:
+    """Return one tri-state, identity-aware tmux inventory.
+
+    ``get_tmux_sessions`` historically collapsed every tmux failure into ``[]``.
+    That remains its compatibility return value, but browser reconciliation and
+    readiness need to distinguish a real empty server from a failed query.
+    """
+    lifecycle_rows: dict = {}
+    owners: dict[str, str] = {}
+    sessions: list[dict] = []
+    ready_managed: set[str] = set()
+    continuity_invalid: set[str] = set()
+    state = "error"
+    error = ""
+    try:
+        lifecycle_rows = _session_lifecycle.snapshot().get("sessions", {}) or {}
+        owners = _load_session_owners()
+        result = subprocess.run(
+            [
+                "tmux", "list-sessions", "-F",
+                "#{session_name}:#{session_windows}:#{session_created}:"
+                "#{session_attached}:#{@dashboard_quarantined}:"
+                "#{@dashboard_owner_id}:#{@dashboard_managed}:"
+                "#{@dashboard_generation}:#{session_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        stderr = (result.stderr or "").strip()
+        if result.returncode == 0:
+            state = "ok"
+        elif "no server running" in stderr.lower():
+            state = "no_server"
+        else:
+            error = stderr[:240] or f"tmux exited {result.returncode}"
+
+        if state == "ok":
+            for line in (result.stdout or "").splitlines():
+                if not line:
+                    continue
+                parts = line.split(":")
+                if (
+                    len(parts) != 9
+                    or not _is_valid_session_name(parts[0])
+                    or not parts[1].isdigit()
+                    or not parts[2].isdigit()
+                    or parts[3] not in {"0", "1"}
+                    or parts[4] not in {"", "0", "1"}
+                    or parts[6] not in {"", "0", "1"}
+                    or not re.fullmatch(r"\$[0-9]+", parts[8])
+                ):
+                    state = "error"
+                    error = "malformed tmux inventory"
+                    sessions.clear()
+                    ready_managed.clear()
+                    break
+                name = parts[0]
+                quarantined = parts[4] == "1"
+                if quarantined or (name.startswith("__") and name.endswith("__")):
+                    continue
+                marker_owner = parts[5] if len(parts) > 5 else ""
+                marker_managed = parts[6] if len(parts) > 6 else ""
+                marker_generation = parts[7] if len(parts) > 7 else ""
+                session_id = parts[8] if len(parts) > 8 else ""
+                lifecycle = lifecycle_rows.get(name) or {}
+
+                if marker_managed == "1" or lifecycle.get("managed"):
+                    registered_owner = str(owners.get(name) or "")
+                    managed_identity_valid = bool(
+                        registered_owner
+                        and marker_owner == registered_owner
+                        and lifecycle.get("managed")
+                        and str(lifecycle.get("owner_id") or "") == registered_owner
+                        and re.fullmatch(r"[0-9a-f]{32}", marker_generation)
+                        and str(lifecycle.get("generation") or "") == marker_generation
+                    )
+                    desired_state = str(lifecycle.get("desired_state") or "")
+                    if managed_identity_valid and desired_state in {
+                        "parking", "parked", "deleting"
+                    }:
+                        continue
+                    if not managed_identity_valid or desired_state != "running":
+                        continuity_invalid.add(name)
+                        continue
+                    ready_managed.add(name)
+                    owner_id = registered_owner
+                    generation = marker_generation
+                else:
+                    # Legacy/raw tmux sessions have no durable identity markers.
+                    # Keep the old process heuristic only for those sessions.
+                    if not _session_is_codex(name):
+                        continue
+                    owner_id = str(owners.get(name) or "admin")
+                    generation = str(lifecycle.get("generation") or "")
+
+                sessions.append(
+                    {
+                        "name": name,
+                        "windows": parts[1] if len(parts) > 1 else "?",
+                        "created": parts[2] if len(parts) > 2 else "",
+                        "attached": parts[3] == "1" if len(parts) > 3 else False,
+                        "runtime_state": "running",
+                        "managed": bool(marker_managed == "1" or lifecycle.get("managed")),
+                        "owner_id": owner_id,
+                        "generation": generation,
+                        "incarnation": _session_incarnation(
+                            owner_id, generation, f"{session_id}@{parts[2]}"
+                        ),
+                        "logical_incarnation": _session_incarnation(
+                            owner_id,
+                            generation,
+                            "logical" if generation else session_id,
+                        ),
+                    }
+                )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:240]
+
+    live_names = {session["name"] for session in sessions}
+    for name, row in lifecycle_rows.items():
+        if (
+            name in live_names
+            or not (
+                row.get("parked")
+                or str(row.get("desired_state") or "") in {"parking", "deleting"}
+            )
+            or not _is_valid_session_name(str(name))
+        ):
+            continue
+        owner_id = str(row.get("owner_id") or "")
+        generation = str(row.get("generation") or "")
+        if row.get("managed") and (
+            not owner_id
+            or owners.get(name) != owner_id
+            or not re.fullmatch(r"[0-9a-f]{32}", generation)
+        ):
+            continuity_invalid.add(str(name))
+            continue
+        desired_state = str(row.get("desired_state") or "")
+        sessions.append(
+            {
+                "name": name,
+                "windows": "0",
+                "created": str(int(row.get("parked_at") or 0)),
+                "attached": False,
+                "virtual": True,
+                "managed": bool(row.get("managed")),
+                "owner_id": owner_id,
+                "generation": generation,
+                "runtime_state": (
+                    "closing"
+                    if desired_state == "deleting"
+                    else "parking" if desired_state == "parking" else "parked"
+                ),
+                "incarnation": _session_incarnation(owner_id, generation, "virtual"),
+                "logical_incarnation": _session_incarnation(
+                    owner_id, generation, "logical" if generation else "virtual"
+                ),
+            }
+        )
+
+    expected_rows = {
+        str(name): row
+        for name, row in lifecycle_rows.items()
+        if (
+            _is_valid_session_name(str(name))
+            and (row or {}).get("managed")
+            and (row or {}).get("restore_on_startup") is True
+            and not (row or {}).get("parked")
+            and str((row or {}).get("desired_state") or "") == "running"
+            and _session_row_is_recoverable(row)
+        )
+    }
+    missing_expected = sorted(set(expected_rows).difference(ready_managed))
+    generation_material = "\n".join(
+        f"{row['name']}:{row.get('runtime_state', '')}:{row.get('incarnation', '')}"
+        for row in sorted(sessions, key=lambda item: item["name"])
+    )
+    return {
+        "state": state,
+        "authoritative": state in {"ok", "no_server"} and not continuity_invalid,
+        "error": error,
+        "owners": owners,
+        "sessions": sessions,
+        "expected_rows": expected_rows,
+        "expected": len(expected_rows),
+        "missing_expected": missing_expected,
+        "continuity_invalid": sorted(continuity_invalid),
+        "ready_expected": len(expected_rows) - len(missing_expected),
+        "generation": hashlib.sha256(generation_material.encode()).hexdigest()[:20],
+        "observed_at": time.time(),
+    }
+
+
+def get_tmux_sessions() -> list[dict]:
+    return _tmux_inventory_snapshot()["sessions"]
 
 
 def _find_session(session_name: str) -> tuple:
@@ -6703,7 +9644,9 @@ def _filter_sessions_for_user(sessions: list, user: dict | None) -> list:
         return []
     owners = _load_session_owners()
     uid = user["id"]
-    return [s for s in sessions if owners.get(s["name"], "admin") == uid]
+    # No default: an unowned session is listed to nobody. See
+    # _recorded_session_owner_id.
+    return [s for s in sessions if owners.get(s["name"]) == uid]
 
 
 def _session_list_for_request(request: Request, sessions: list) -> tuple[list | None, str]:
@@ -6724,12 +9667,20 @@ def _find_session_for_user(session_name: str, user: dict | None) -> tuple:
     return sessions, sess
 
 
+def _tmux_pane_target(session_name_or_id: str) -> str:
+    return (
+        f"{session_name_or_id}:"
+        if session_name_or_id.startswith("$")
+        else f"={session_name_or_id}:"
+    )
+
+
 def capture_pane_full(session_name: str) -> str:
     try:
         # -J joins terminal-wrap continuation lines so long strings (e.g. OAuth
         # login URLs) come back intact instead of split at pane width.
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", "-"],
+            ["tmux", "capture-pane", "-t", _tmux_pane_target(session_name), "-p", "-J", "-S", "-"],
             capture_output=True, text=True, timeout=10
         )
         return result.stdout if result.returncode == 0 else ""
@@ -6740,7 +9691,7 @@ def capture_pane_full(session_name: str) -> str:
 def capture_pane_recent(session_name: str, lines: int = 80) -> str:
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session_name, "-p", "-J", "-S", f"-{lines}"],
+            ["tmux", "capture-pane", "-t", _tmux_pane_target(session_name), "-p", "-J", "-S", f"-{lines}"],
             capture_output=True, text=True, timeout=5
         )
         return result.stdout if result.returncode == 0 else ""
@@ -6828,6 +9779,15 @@ _auto_approve_sent: dict[str, float] = {}
 
 # Content stability tracking for idle detection
 # Stores (hash, first_seen_time, consecutive_count) per session
+# Codex draws "<spinner> Working (17s • esc to interrupt)" — the verb varies (Working,
+# Thinking, Exploring…) and the spinner glyph animates, so anchor on the verb + counter and
+# not on the glyph. The counter is what tells a busy session apart from a wedged one.
+_CODEX_WORK_RE = re.compile(r"([A-Z][a-z]+)\s*\((\d+)s\b")
+# session -> (detail_text, elapsed_seconds, first_seen_at) for the stall check below.
+_codex_work_seen: dict = {}
+# How long the elapsed counter may sit unchanged before we call it stalled rather than busy.
+_CODEX_STALL_AFTER = 120
+
 _pane_stability: dict[str, tuple] = {}
 
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
@@ -6917,14 +9877,15 @@ def _check_auto_approve(session_name: str, visible: str):
             target_num = numbered_options[best_line][0]
             # Type the number and press Enter
             try:
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "-l", str(target_num)],
-                    capture_output=True, text=True, timeout=3
-                )
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "Enter"],
-                    capture_output=True, text=True, timeout=3
-                )
+                with _session_operation_lock(session_name):
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", session_name, "-l", str(target_num)],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", session_name, "Enter"],
+                        capture_output=True, text=True, timeout=3
+                    )
                 _auto_approve_sent[session_name] = time.time()
             except Exception:
                 logger.debug("Auto-approve send failed for '%s'", session_name, exc_info=True)
@@ -6960,15 +9921,16 @@ def _check_auto_approve(session_name: str, visible: str):
 def _send_option(session_name: str, downs: int):
     """Send Down arrow keys + Enter to select an option in a tmux pane."""
     try:
-        for _ in range(downs):
+        with _session_operation_lock(session_name):
+            for _ in range(downs):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Down"],
+                    capture_output=True, text=True, timeout=3
+                )
             subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Down"],
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
                 capture_output=True, text=True, timeout=3
             )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=3
-        )
         _auto_approve_sent[session_name] = time.time()
     except Exception:
         logger.debug("Failed to send option keys to '%s'", session_name, exc_info=True)
@@ -7116,10 +10078,32 @@ def _detect_activity_raw(session_name: str) -> dict:
             info["detail"] = ""
             return info
 
-        # "esc to interrupt" without a spinner = background tasks running
+        # "esc to interrupt" is on screen. Say WHAT it is doing, and whether it is still moving.
         if has_esc_to_interrupt:
             info["status"] = "busy"
             info["detail"] = "Background tasks"
+            verb, secs = "", -1
+            for line in reversed(window):
+                if "esc to interrupt" not in line:
+                    continue
+                m = _CODEX_WORK_RE.search(line)
+                if m:
+                    verb, secs = m.group(1), int(m.group(2))
+                    break
+            if verb:
+                info["detail"] = f"{verb} ({secs:d}s)"
+                # Stall check: while Codex is alive that counter ticks every second. If the
+                # indicator is still drawn but the number has not moved, the session is wedged,
+                # not working — the case this dashboard previously could not tell apart.
+                prev_seen = _codex_work_seen.get(session_name)
+                now_t = time.time()
+                if prev_seen and prev_seen[1] == secs:
+                    frozen_for = now_t - prev_seen[2]
+                    if frozen_for >= _CODEX_STALL_AFTER:
+                        info["status"] = "stalled"
+                        info["detail"] = f"Stalled ({secs:d}s, not advancing)"
+                else:
+                    _codex_work_seen[session_name] = (verb, secs, now_t)
             return info
 
         # --- Step 6: Static content override ---
@@ -7268,6 +10252,101 @@ async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
         # `"LEGITIMATE" in ...`) treat empty as a no-op, which is the right
         # fail-safe behavior.
         return ""
+
+
+async def _summarize_two_word_tab_label(prompt: str, fallback: str) -> str:
+    """Prefer an LLM title when configured; always retain a local fallback."""
+    fallback = _normalize_two_word_tab_label(fallback)
+    if client is None or not str(prompt or "").strip():
+        return fallback
+    generated = await llm_call(
+        system_prompt=(
+            "Summarize the user's request as exactly two short words suitable for a tab label. "
+            "Name the subject, feature, or outcome; omit filler and punctuation. Return only two words."
+        ),
+        user_content=str(prompt)[:4000],
+        max_tokens=12,
+    )
+    generated_words = _TAB_LABEL_WORD_RE.findall(generated or "")
+    if len(generated_words) != 2:
+        return fallback
+    return _normalize_two_word_tab_label(generated)
+
+
+async def _session_tab_label_pass(
+    *,
+    now: float | None = None,
+    live_session_names: set[str] | None = None,
+) -> int:
+    """Apply every due label whose request is still actively working."""
+    checked_at = float(now if now is not None else time.time())
+    rows = await asyncio.to_thread(_session_tab_label_rows)
+    if live_session_names is None:
+        live_session_names = {
+            session["name"] for session in await asyncio.to_thread(get_tmux_sessions)
+        }
+    renamed = 0
+    for session_name, row in rows.items():
+        pending = row.get("pending")
+        if not isinstance(pending, dict):
+            continue
+        request_id = str(pending.get("id") or "")
+        started_at = float(pending.get("started_at") or 0)
+        if request_id and not _auto_session_names_enabled(str(row.get("owner_id") or "")):
+            await asyncio.to_thread(_finish_session_tab_label, session_name, request_id)
+            continue
+        if not request_id:
+            continue
+        if session_name not in live_session_names:
+            await asyncio.to_thread(_finish_session_tab_label, session_name, request_id)
+            continue
+        activity = await asyncio.to_thread(_detect_activity_raw, session_name)
+        if activity.get("status") not in {"busy", "stalled"}:
+            # Short requests retain the tab's previous label, if it had one.
+            await asyncio.to_thread(
+                _finish_session_tab_label, session_name, request_id
+            )
+            continue
+        if checked_at - started_at < TAB_RENAME_AFTER_SECONDS:
+            continue
+        prompt = await asyncio.to_thread(
+            _latest_tab_label_prompt,
+            session_name,
+            str(row.get("owner_id") or ""),
+            float(pending.get("source_ts") or 0),
+        )
+        fallback = str(pending.get("candidate") or "Active Task")
+        label = await _summarize_two_word_tab_label(prompt, fallback)
+        # Do not rename a task that completed while its label was being generated.
+        activity = await asyncio.to_thread(_detect_activity_raw, session_name)
+        if activity.get("status") not in {"busy", "stalled"}:
+            label = ""
+        result = await asyncio.to_thread(
+            _finish_session_tab_label,
+            session_name,
+            request_id,
+            label,
+            finished_at=checked_at,
+        )
+        if label and result.get("label"):
+            renamed += 1
+            logger.info(
+                "Tab label for '%s' changed to '%s' after a long request",
+                session_name,
+                result["label"],
+            )
+    return renamed
+
+
+async def _session_tab_label_loop() -> None:
+    while True:
+        try:
+            await _session_tab_label_pass()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session tab-label pass failed")
+        await asyncio.sleep(TAB_LABEL_CHECK_INTERVAL_SECONDS)
 
 
 async def get_title_and_description(session_name: str, full_output: str) -> tuple:
@@ -7591,11 +10670,12 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     # This prevents a race with api_send_command where a concurrent /send could
     # add a user message to a different cache entry, then get clobbered when this
     # function reassigns cache[session_name] below after awaiting LLM calls.
-    entry = cache.setdefault(session_name, {})
+    owner_id = str(_load_session_owners().get(session_name) or "")
+    entry = _bound_session_cache_entry(session_name, owner_id)
     if "messages" not in entry:
-        entry["messages"] = _load_session_messages(session_name)
+        entry["messages"] = _load_session_messages(session_name, owner_id)
     if "notes" not in entry:
-        entry["notes"] = _load_session_notes(session_name)
+        entry["notes"] = _load_session_notes(session_name, owner_id)
 
     has_description = "description" in entry
     has_progress = "progress" in entry
@@ -7644,25 +10724,14 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
     if force_all or "realtime" not in entry or (now - entry.get("realtime_at", 0)) >= REALTIME_TTL:
         tasks["realtime"] = get_realtime(session_name)
 
-    # Simplified Chat tab: when Codex is idle, (re)generate ONE plain-language
-    # recap of its whole last turn. Triggered promptly on the busy->idle edge,
-    # then at most every REALTIME_TTL; the signature gate inside get_chat_summary
-    # skips the LLM call when the turn output hasn't changed.
-    _chat_status = _activity_state.get(session_name, {}).get("status", "")
-    if _chat_status == "busy":
-        entry["_chat_was_busy"] = True
-    _summary_due = (now - entry.get("chat_summary_at", 0)) >= REALTIME_TTL
-    if _chat_status == "idle" and (force_all or entry.get("_chat_was_busy") or _summary_due):
-        # Pass the last user message so the right transcript is matched when
-        # several sessions share a cwd (project dir).
-        _last_user = next((m.get("text", "") for m in reversed(entry.get("messages", []))
-                           if m.get("role") == "user"), "")
-        tasks["chat_summary"] = get_chat_summary(session_name, entry.get("chat_summary_sig", ""), _last_user)
-        entry["chat_summary_at"] = now
-        entry["_chat_was_busy"] = False
+    # The controller is the single summary producer, including while browsers
+    # are closed. HTTP refreshes only ask it to reconcile this account's chat.
+    tasks["chat_messages"] = _get_chat_messages(session_name, owner_id)
 
     if tasks:
         results = await asyncio.gather(*tasks.values())
+        if not _session_cache_entry_is_current(session_name, entry):
+            return {}
         result_map = dict(zip(tasks.keys(), results))
         if "title_desc" in result_map:
             title, description = result_map["title_desc"]
@@ -7693,13 +10762,13 @@ async def get_session_data(session_name: str, force_all: bool = False) -> dict:
                 # Chat tab (that now shows the idle summary below, not raw text).
                 entry["realtime"] = realtime
                 entry["realtime_at"] = now
-        if "chat_summary" in result_map:
-            cs = result_map["chat_summary"]
-            if cs and (cs.get("summary") or cs.get("full")):
-                _append_assistant_msg(entry, cs.get("summary", ""), now,
-                                      full=cs.get("full", ""), links=cs.get("links") or [])
-                entry["chat_summary_sig"] = cs["sig"]
+        if "chat_messages" in result_map:
+            entry["messages"] = _merge_chat_messages(
+                entry.get("messages", []), result_map["chat_messages"] or []
+            )
 
+    if not _session_cache_entry_is_current(session_name, entry):
+        return {}
     cache[session_name] = entry
     if entry.get("messages"):
         _save_messages()
@@ -8030,13 +11099,424 @@ async def get_chat_summary(session_name: str, prev_sig: str, last_user_text: str
     return {"sig": sig, "summary": summary or _trim_plain(full, 600), "full": full, "links": links}
 
 
-def build_session_response(sess: dict, data: dict, activity: dict = None) -> dict:
+_CHAT_PROGRESS_SECONDS = 20 * 60
+_CHAT_CHECK_SECONDS = 30
+_CHAT_READ_BYTES = 2_000_000
+_chat_refresh_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_chat_checked: dict[tuple, float] = {}
+_chat_backfilled: dict[tuple, str] = {}
+
+
+def _latest_chat_user(messages: list) -> dict:
+    return next((row for row in reversed(messages) if row.get("role") == "user"), {})
+
+
+def _chat_user_fingerprint(messages: list) -> str:
+    user = _latest_chat_user(messages)
+    return _chat_message_id(user) if user else ""
+
+
+def _chat_binding_matches(session_name: str, owner_id: str, generation: str) -> bool:
+    lifecycle = _session_lifecycle.get(session_name)
+    return bool(
+        owner_id and _strict_session_owner(session_name, owner_id)
+        and str(lifecycle.get("generation") or "") == generation
+        and lifecycle.get("desired_state") not in {"deleting", "deleted"}
+    )
+
+
+def _chat_pane_prose(text: str) -> tuple[str, str]:
+    """Safe fallback for the bound tab's Claude/Codex human-facing bubbles."""
+    rows = text.splitlines()
+    boundary = -1
+    prompt = ""
+    for index, line in enumerate(rows):
+        match = re.match(r"^\s*[›❯»]\s+(.+)", line)
+        if match:
+            boundary, prompt = index, match.group(1).strip()
+    out, active, seen_assistant = [], False, False
+    prompt_lines = [prompt] if prompt else []
+    for line in rows[boundary + 1:]:
+        stripped = line.strip()
+        bullet = re.match(r"^[●⏺•·]\s+(.*)", stripped)
+        if bullet:
+            seen_assistant = True
+            body = bullet.group(1)
+            tool = re.match(
+                r"(?:[A-Za-z_][\w:.-]*\(|(?:Ran|Called|Explored|Read|Searched|"
+                r"Edited|Edit|Added|Add|Updated|Update|Deleted|Delete|Created|Create|"
+                r"Wrote|Write|Moved|Renamed)\s+(?:\S|$))", body,
+            )
+            # Past-tense prose such as 'Added mobile creation. Tests pass.' is
+            # not a tool header unless it carries tool/diff syntax.
+            file_prose = re.match(r"(?:Added|Updated|Created|Edited|Deleted)\s", body)
+            if file_prose and not re.search(r"\([+−-]?\d|[/\\]|\.[A-Za-z]{1,8}(?:\s|$)", body):
+                tool = None
+            active = not tool and not _is_pane_residue(body)
+            if active:
+                out.append(body)
+        elif re.match(r"^[›❯»✻✽✶✢·]|^(?:⎿|└|╰|│|─{3})", stripped):
+            active = False
+        elif active:
+            out.append(stripped)
+        elif not seen_assistant and stripped and not _is_pane_residue(stripped):
+            prompt_lines.append(stripped)
+    return "\n".join(prompt_lines), chat_summaries.clean_prose("\n".join(out))
+
+
+def _read_chat_snapshot(session_name: str, owner_id: str, messages: list) -> dict | None:
+    """Read only this tab's validated root, never a cwd/mtime-matched sibling."""
+    if not _strict_session_owner(session_name, owner_id):
+        return None
+    user = _latest_chat_user(messages)
+    root = _terminal_history_binding(session_name, owner_id)
+    if root:
+        try:
+            fd, _relative, _fingerprint = _open_session_close_rollout(root)
+            with os.fdopen(fd, "rb") as source:
+                metadata = json.loads(source.readline())
+                payload = metadata.get("payload") or {}
+                if (metadata.get("type") != "session_meta"
+                        or payload.get("id") != root["resume_uuid"]
+                        or payload.get("session_id") != root["resume_uuid"]
+                        or payload.get("thread_source") != "user"):
+                    return None
+                size = os.fstat(source.fileno()).st_size
+                if size > _CHAT_READ_BYTES:
+                    source.seek(size - _CHAT_READ_BYTES)
+                    source.readline()
+                lines = source.read(_CHAT_READ_BYTES).decode("utf-8", "replace").splitlines()
+            records = []
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        records.append(record)
+                except (ValueError, TypeError):
+                    continue
+            turn = chat_summaries.latest_turn(
+                records, fallback_user=str(user.get("text") or ""),
+                fallback_ts=float(user.get("ts") or 0),
+            )
+            turn["_root"] = root["resume_uuid"]
+            turn["_generation"] = root["generation"]
+            turn["_recent_turns"] = chat_summaries.recent_turns(records, limit=30)
+            return turn
+        except (_SessionCloseError, OSError, ValueError, TypeError):
+            return None  # A known root that became invalid must not fall through.
+    binding = _terminal_binding(session_name, owner_id)
+    if not binding:
+        return None
+    try:
+        prompt, prose = _chat_pane_prose(capture_pane_recent(binding["session_id"], 400))
+        if _terminal_binding_state(binding) != "current":
+            return None
+    except Exception:
+        return None
+    if not prose:
+        return None
+    # The fallback reads one already-authorized pane, including Claude Code's
+    # text format. An unmatched prompt is not guessed to be the latest request.
+    if prompt and user and _norm_text(prompt) != _norm_text(user.get("text", "")):
+        return None
+    turn = chat_summaries.latest_turn(
+        [], fallback_user=str(user.get("text") or prompt),
+        fallback_ts=float(user.get("ts") or 0),
+    )
+    turn.update(text=prose, final_text="", source="pane", _terminal=binding,
+                _generation=str(binding.get("generation") or ""))
+    return turn
+
+
+async def _chat_short_summary(text: str, kind: str) -> str:
+    body = chat_summaries.clean_prose(text)
+    fallback = chat_summaries.compact_summary(body)
+    if not fallback or client is None or len(body.split()) <= 55:
+        return fallback
+    try:
+        generated = await asyncio.wait_for(llm_call(
+            system_prompt=(
+                "Write a tiny WhatsApp-style update for a non-technical user. "
+                "At most 3 short sentences and 55 words. Fragments fine. Clear, direct. "
+                "No code, commands, file paths, preamble or sign-off. Preserve useful "
+                "outcomes, questions and links. Use only stated facts; never invent "
+                "success or completion. "
+                + ("This task is STILL RUNNING. Say what is done and what is happening now."
+                   if kind == "progress" else
+                   "This is the assistant's reply. Mention any blocker or question; do not assume the task succeeded.")
+            ),
+            user_content=body[-8000:], max_tokens=145,
+        ), timeout=12)
+    except Exception:
+        generated = ""
+    return chat_summaries.compact_summary(generated) or fallback
+
+
+def _commit_chat_message(session_name: str, owner_id: str, generation: str,
+                         expected_user: str, message: dict, source_user: dict | None = None) -> list | None:
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        return None
+    def commit(data: dict):
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return None
+        rows = data.get(session_name, [])
+        if _chat_user_fingerprint(rows) != expected_user:
+            return None
+        additions = ([source_user] if source_user else []) + [message]
+        data[session_name] = _merge_chat_messages(rows, additions)
+        return data[session_name]
+    _data, rows = LockedJsonStore(_user_messages_file(owner), dict).update(commit)
+    return rows
+
+
+def _chat_turn_context(snapshot: dict, messages: list, generation: str) -> tuple[str, dict | None]:
+    """Bind canonical user identity once; clipped tails retain that association."""
+    root = str(snapshot.get("_root") or generation)
+    user_text = str(snapshot.get("user_text") or "")
+    source_ts = float(snapshot.get("started_at") or 0)
+    source_id = str(snapshot.get("turn_id") or "")
+    has_user = snapshot.get("has_user", True)
+    if not has_user:
+        user = _latest_chat_user(messages)
+        if user.get("source_root") == root and user.get("turn_id"):
+            return str(user["turn_id"]), None
+        source_id = _chat_user_fingerprint(messages) or source_id
+    turn_id = hashlib.sha256((root + ":" + source_id).encode()).hexdigest()[:24]
+    if not user_text:
+        return turn_id, None
+    candidates = []
+    for user in messages:
+        if user.get("role") != "user":
+            continue
+        if user.get("source_turn_id") == source_id and user.get("source_root") == root:
+            candidates.append(user)
+            continue
+        if user.get("source_turn_id") and user.get("source_root") == root:
+            continue
+        # /send stores the original prompt just after submission. The CLI may
+        # prefix an injected policy, but identical prompts at different times
+        # are separate user turns and must never collapse into one bubble.
+        same_text = _norm_text(user_text).endswith(_norm_text(user.get("text", "")))
+        near_time = not source_ts or abs(float(user.get("ts") or 0) - source_ts) <= 15
+        if same_text and near_time:
+            candidates.append(user)
+    if candidates:
+        user = min(candidates, key=lambda row: abs(float(row.get("ts") or 0) - source_ts))
+        source_user = {**user, "id": _chat_message_id(user), "turn_id": turn_id}
+    elif has_user:
+        source_user = {"id": "chat-" + turn_id + "-user", "role": "user",
+                       "text": user_text, "ts": source_ts, "turn_id": turn_id}
+    else:
+        return turn_id, None
+    source_user.update(source_turn_id=source_id, source_root=root)
+    return turn_id, source_user
+
+
+def _backfill_chat_history(session_name: str, owner_id: str, generation: str,
+                           snapshot: dict) -> list | None:
+    """Repair recent user-only history with bounded, local extractive recaps."""
+    turns = snapshot.get("_recent_turns") or []
+    if len(turns) < 2 or not snapshot.get("_root"):
+        return None
+    owner = _find_user_by_id(owner_id)
+    if not owner:
+        return None
+    def backfill(data: dict):
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return None
+        current = _terminal_history_binding(session_name, owner_id)
+        if not current or current.get("resume_uuid") != snapshot["_root"]:
+            return None
+        messages = data.get(session_name, [])
+        additions = []
+        for original in turns[:-1]:
+            turn = {**original, "_root": snapshot["_root"]}
+            if not turn.get("has_user") or not turn.get("user_text"):
+                continue
+            full = chat_summaries.clean_prose(turn.get("final_text") or turn.get("text") or "")
+            summary = chat_summaries.compact_summary(full)
+            if not summary:
+                continue
+            turn_id, source_user = _chat_turn_context(turn, messages, generation)
+            message_id = "chat-" + turn_id + "-final"
+            if any(row.get("id") == message_id for row in messages):
+                continue
+            # Already-summarized legacy turns should not acquire a second reply.
+            start = float(turn.get("started_at") or 0)
+            end = float(turn.get("last_output_at") or start)
+            if any(row.get("role") == "assistant" and not row.get("turn_id")
+                   and start <= float(row.get("ts") or 0) <= end + 15 for row in messages):
+                continue
+            if source_user:
+                additions.append(source_user)
+            additions.append({"id": message_id, "turn_id": turn_id, "role": "assistant",
+                              "kind": "final", "text": summary, "full": _turn_full_text(full),
+                              "links": _extract_turn_links(full), "ts": end,
+                              "source_sig": _output_signature(full)})
+        if additions:
+            data[session_name] = _merge_chat_messages(messages, additions)
+        return data.get(session_name, [])
+    _data, messages = LockedJsonStore(_user_messages_file(owner), dict).update(backfill)
+    return messages
+
+
+async def _refresh_session_chat(session_name: str, owner_id: str, *, now: float | None = None) -> list:
+    """Single-controller, owner-fenced final replies and durable 20-minute updates."""
+    if not _strict_session_owner(session_name, owner_id):
+        return []
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    key = (session_name, owner_id, generation)
+    lock = _chat_refresh_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        checked_at = float(now if now is not None else time.time())
+        messages = await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return []
+        if checked_at - _chat_checked.get(key, 0) < 15:
+            return messages
+        _chat_checked[key] = checked_at
+        expected_user = _chat_user_fingerprint(messages)
+        latest_user = _latest_chat_user(messages)
+        activity = await async_detect_activity(session_name)
+        snapshot = await asyncio.to_thread(_read_chat_snapshot, session_name, owner_id, messages)
+        if not snapshot or not _chat_binding_matches(session_name, owner_id, generation):
+            return messages
+        prior_turns = (snapshot.get("_recent_turns") or [])[:-1]
+        backfill_sig = _output_signature(str(snapshot.get("_root") or "") + ":"
+                                        + ",".join(str(turn.get("turn_id") or "") for turn in prior_turns))
+        if prior_turns and _chat_backfilled.get(key) != backfill_sig:
+            repaired = await asyncio.to_thread(_backfill_chat_history, session_name, owner_id, generation, snapshot)
+            if repaired is not None:
+                _chat_backfilled[key] = backfill_sig
+                messages = repaired
+                expected_user = _chat_user_fingerprint(messages)
+                latest_user = _latest_chat_user(messages)
+        text = chat_summaries.clean_prose(snapshot.get("text") or "")
+        if not text:
+            return messages
+        source_user_text = str(snapshot.get("user_text") or "")
+        source_ts = float(snapshot.get("started_at") or latest_user.get("ts")
+                          or _activity_state.get(session_name, {}).get("since") or checked_at)
+        # A just-sent prompt may still be queued in the CLI while its previous
+        # reply is visible. Never attach that previous turn to the new prompt.
+        if latest_user and snapshot.get("has_user", True) and source_user_text:
+            saved_ts = float(latest_user.get("ts") or 0)
+            same_prompt = _norm_text(source_user_text).endswith(_norm_text(latest_user.get("text", "")))
+            if source_ts < saved_ts - 15 or (not same_prompt and source_ts <= saved_ts):
+                return messages
+        turn_id, source_user = _chat_turn_context(snapshot, messages, generation)
+        if (source_user and latest_user and source_user.get("id") != _chat_message_id(latest_user)
+                and source_ts <= float(latest_user.get("ts") or 0)):
+            return messages
+        previous = [m for m in messages if m.get("role") == "assistant" and m.get("turn_id") == turn_id]
+        final_text = chat_summaries.clean_prose(snapshot.get("final_text") or "")
+        explicit_final = bool(final_text and snapshot.get("explicit_final", snapshot.get("source") == "codex"))
+        is_final = explicit_final or activity.get("status") == "idle"
+        kind = "final" if is_final else "progress"
+        last_progress = max((float(m.get("ts") or 0) for m in previous if m.get("kind") == "progress"), default=source_ts)
+        if not is_final:
+            if activity.get("status") not in {"busy", "stalled"}:
+                return messages
+            if checked_at - last_progress < _CHAT_PROGRESS_SECONDS:
+                return messages
+            if any(m.get("kind") == "final" for m in previous):
+                return messages
+        full = final_text if is_final and final_text else text
+        signature = _output_signature(text if kind == "progress" else full)
+        same_kind = [m for m in previous if m.get("kind") == kind]
+        if any(m.get("source_sig") == signature for m in same_kind):
+            return messages
+        summary = await _chat_short_summary(full, kind)
+        if not summary:
+            return messages
+        if kind == "progress" and any(m.get("text") == summary for m in same_kind):
+            return messages
+        # Direct terminal input can change the root's latest turn without an
+        # HTTP send. Re-read that same source as well as doing the persisted
+        # latest-user compare-and-swap below.
+        current = await asyncio.to_thread(_read_chat_snapshot, session_name, owner_id, messages)
+        if (not current or current.get("turn_id") != snapshot.get("turn_id")
+                or current.get("_root") != snapshot.get("_root")
+                or current.get("_generation") != snapshot.get("_generation")):
+            return messages
+        if is_final and not explicit_final:
+            # A pause in a Claude/pane reply can look idle before work resumes.
+            # Do not freeze that still-running turn behind a premature final.
+            current_activity = await async_detect_activity(session_name)
+            if current_activity.get("status") != "idle":
+                return messages
+        message = {
+            "id": "chat-" + turn_id + ("-final" if is_final else "-progress-" + str(int(checked_at // _CHAT_PROGRESS_SECONDS))),
+            "turn_id": turn_id, "role": "assistant", "kind": kind,
+            "text": summary, "full": _turn_full_text(full),
+            "links": _extract_turn_links(full), "ts": checked_at,
+            "source_sig": signature,
+        }
+        rows = await asyncio.to_thread(_commit_chat_message, session_name, owner_id,
+                                       generation, expected_user, message, source_user)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return []
+        return rows if rows is not None else await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+
+
+async def _get_chat_messages(session_name: str, owner_id: str) -> list:
+    if PROCESS_ROLE == "api":
+        result = await _controller_call("chat_refresh", session=session_name, owner_id=owner_id)
+        if result.get("ok"):
+            return result.get("messages") or []
+        return await asyncio.to_thread(_load_session_messages, session_name, owner_id)
+    return await _refresh_session_chat(session_name, owner_id)
+
+
+async def _session_chat_summary_pass() -> None:
+    sessions = await asyncio.to_thread(get_tmux_sessions)
+    owners = await asyncio.to_thread(_load_session_owners)
+    sem = asyncio.Semaphore(3)
+    async def refresh(session: dict):
+        name = str(session.get("name") or "")
+        owner_id = str(owners.get(name) or "")
+        if not owner_id or _session_lifecycle.get(name).get("parked"):
+            return
+        async with sem:
+            try:
+                await _refresh_session_chat(name, owner_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Could not refresh session chat for '%s'", name, exc_info=True)
+    await asyncio.gather(*(refresh(session) for session in sessions))
+    live = {str(session.get("name") or "") for session in sessions}
+    for key in list(_chat_checked):
+        if key[0] not in live:
+            _chat_checked.pop(key, None)
+            _chat_backfilled.pop(key, None)
+
+
+async def _session_chat_summary_loop() -> None:
+    while True:
+        await asyncio.sleep(_CHAT_CHECK_SECONDS)
+        try:
+            await _session_chat_summary_pass()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session chat-summary pass failed")
+
+
+def build_session_response(
+    sess: dict,
+    data: dict,
+    activity: dict = None,
+    tab_labels: dict | None = None,
+) -> dict:
     if activity is None:
         activity = detect_activity(sess["name"])
     lifecycle = _session_lifecycle.get(sess["name"])
     autonomous = _load_autonomous_state().get(sess["name"], {})
     return {
         "name": sess["name"],
+        "tab_label": _session_tab_label(sess["name"], tab_labels),
         "windows": sess["windows"],
         "attached": sess["attached"],
         "title": data.get("title", ""),
@@ -8055,12 +11535,99 @@ def build_session_response(sess: dict, data: dict, activity: dict = None) -> dic
         "auth_mode": _session_real_auth_mode(sess["name"]),
         "autopush_mode": _get_autopush_mode(sess["name"]),
         "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
+        **_codex_session_payload(sess["name"]),
         "away_mode": bool(autonomous.get("away_mode")),
         "go_nuts_mode": bool(autonomous.get("go_nuts_mode")),
         "parked": bool(lifecycle.get("parked")),
         "parked_at": float(lifecycle.get("parked_at") or 0),
         **_session_model_fields(sess["name"]),
     }
+
+
+def _session_response_binding(sess: dict, owner_id: str) -> dict | None:
+    """Bind one list-row build to the logical/runtime session seen at its start.
+
+    List endpoints await activity and transcript work.  A tab name can be
+    deleted and reassigned during those awaits, so middleware's initial owner
+    check is not enough: every name-keyed value must be discarded unless the
+    same immutable tmux/lifecycle incarnation still exists at response time.
+    """
+    name = str(sess.get("name") or "")
+    runtime_state = str(sess.get("runtime_state") or "running")
+    if not name or not owner_id:
+        return None
+    if runtime_state == "running" and not sess.get("virtual"):
+        return _terminal_binding(name, owner_id)
+
+    lifecycle = _session_lifecycle.get(name)
+    generation = str(lifecycle.get("generation") or "")
+    recorded_owner = str(_load_session_owners().get(name) or "")
+    if (
+        recorded_owner != owner_id
+        or str(lifecycle.get("owner_id") or "") != owner_id
+        or not re.fullmatch(r"[0-9a-f]{32}", generation)
+    ):
+        return None
+    return {
+        "name": name,
+        "owner_id": owner_id,
+        "generation": generation,
+        "runtime_state": runtime_state,
+        "virtual": True,
+    }
+
+
+def _session_response_binding_state(binding: dict) -> str:
+    """Return current, replaced, or unknown for a list-row response binding."""
+    if not binding.get("virtual"):
+        return _terminal_binding_state(binding)
+    try:
+        name = str(binding.get("name") or "")
+        owner_id = str(binding.get("owner_id") or "")
+        lifecycle = _session_lifecycle.get(name)
+        if str(_load_session_owners().get(name) or "") != owner_id:
+            return "replaced"
+        if str(lifecycle.get("owner_id") or "") != owner_id:
+            return "replaced"
+        if str(lifecycle.get("generation") or "") != str(
+            binding.get("generation") or ""
+        ):
+            return "replaced"
+        return "current"
+    except Exception:
+        return "unknown"
+
+
+def _bind_session_response_rows(
+    sessions: list[dict], user: dict | None
+) -> list[tuple[dict, dict]] | None:
+    """Capture all row identities before an endpoint performs async work."""
+    owner_id = str((user or {}).get("id") or "")
+    bound: list[tuple[dict, dict]] = []
+    for sess in sessions:
+        binding = _session_response_binding(sess, owner_id)
+        if not binding:
+            return None
+        bound.append((sess, binding))
+    return bound
+
+
+async def _session_response_bindings_are_current(
+    bound: list[tuple[dict, dict]],
+) -> bool:
+    """Revalidate rows after all name-keyed response fields have been built."""
+    states = await asyncio.gather(*(
+        asyncio.to_thread(_session_response_binding_state, binding)
+        for _sess, binding in bound
+    ))
+    return all(state == "current" for state in states)
+
+
+def _session_list_changed_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "Session inventory changed while building the response"},
+        status_code=503,
+    )
 
 
 # --- Routes ---
@@ -8078,14 +11645,21 @@ async def api_sessions(request: Request):
     sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
     if sessions is None:
         return JSONResponse({"error": "Admin only"}, status_code=403)
+    bound = _bind_session_response_rows(sessions, _current_user(request))
+    if bound is None:
+        return _session_list_changed_response()
     results, activities = await asyncio.gather(
         asyncio.gather(*[get_session_data(s["name"]) for s in sessions]),
         asyncio.gather(*(async_detect_activity(s["name"]) for s in sessions)),
     )
-    return JSONResponse([
-        build_session_response(sess, data, activity=act)
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    rows = [
+        build_session_response(sess, data, activity=act, tab_labels=tab_labels)
         for sess, data, act in zip(sessions, results, activities)
-    ])
+    ]
+    if not await _session_response_bindings_are_current(bound):
+        return _session_list_changed_response()
+    return JSONResponse(rows)
 
 
 @app.get("/api/sessions-fast")
@@ -8094,24 +11668,60 @@ async def api_sessions_fast(request: Request):
     sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
     if sessions is None:
         return JSONResponse({"error": "Admin only"}, status_code=403)
-    # Run activity detection for all sessions in parallel threads
-    activities = await asyncio.gather(
-        *(async_detect_activity(sess["name"]) for sess in sessions)
-    )
+    bound = _bind_session_response_rows(sessions, _current_user(request))
+    if bound is None:
+        return _session_list_changed_response()
+    rows = await _fast_session_rows(sessions)
+    if not await _session_response_bindings_are_current(bound):
+        return _session_list_changed_response()
+    return JSONResponse(rows)
+
+
+async def _fast_session_rows(sessions: list[dict]) -> list[dict]:
+    """Build the cached session cards used by startup and roster polling."""
+    activities = await asyncio.gather(*(
+        (
+            asyncio.sleep(
+                0,
+                result={
+                    "status": "unknown",
+                    "command": "",
+                    "detail": "Restoring session…",
+                },
+            )
+            if sess.get("runtime_state") == "recovering"
+            else async_detect_activity(sess["name"])
+        )
+        for sess in sessions
+    ))
     out = []
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
     _owners_map = _load_session_owners()
     _uid_to_name = {u["id"]: u.get("username", "") for u in _load_users()}
+    autonomous_rows = _load_autonomous_state()
     for sess, activity in zip(sessions, activities):
-        entry = cache.get(sess["name"], {})
+        owner_id = str(sess.get("owner_id") or _owners_map.get(sess["name"]) or "")
+        entry = _bound_session_cache_entry(
+            sess["name"],
+            owner_id,
+            str(sess.get("logical_incarnation") or ""),
+        )
         if "messages" not in entry:
-            entry["messages"] = _load_session_messages(sess["name"])
+            entry["messages"] = _load_session_messages(sess["name"], owner_id)
         if "notes" not in entry:
-            entry["notes"] = _load_session_notes(sess["name"])
+            entry["notes"] = _load_session_notes(sess["name"], owner_id)
         cache[sess["name"]] = entry
         lifecycle = _session_lifecycle.get(sess["name"])
-        autonomous = _load_autonomous_state().get(sess["name"], {})
+        autonomous = autonomous_rows.get(sess["name"], {})
+        runtime_state = str(sess.get("runtime_state") or "running")
         out.append({
             "name": sess["name"],
+            "runtime_state": runtime_state,
+            "incarnation": str(sess.get("incarnation") or ""),
+            "logical_incarnation": str(
+                sess.get("logical_incarnation") or sess.get("incarnation") or ""
+            ),
+            "tab_label": _session_tab_label(sess["name"], tab_labels),
             "windows": sess["windows"],
             "attached": sess["attached"],
             "owner": _uid_to_name.get(_owners_map.get(sess["name"], "admin"), "") or AUTH_USER,
@@ -8125,7 +11735,11 @@ async def api_sessions_fast(request: Request):
             "realtime": entry.get("realtime", ""),
             "realtime_at": entry.get("realtime_at", 0),
             "messages": entry.get("messages", []),
-            "activity_status": "parked" if lifecycle.get("parked") else activity["status"],
+            "activity_status": (
+                "parked"
+                if lifecycle.get("parked")
+                else activity["status"]
+            ),
             "activity_command": activity.get("command", ""),
             "activity_detail": activity.get("detail", ""),
             "auth_mode": _session_real_auth_mode(sess["name"]),
@@ -8137,7 +11751,155 @@ async def api_sessions_fast(request: Request):
             "parked_at": float(lifecycle.get("parked_at") or 0),
             **_session_model_fields(sess["name"]),
         })
-    return JSONResponse(out)
+    return out
+
+
+def _roster_row_belongs_to(session: dict, owners: dict, owner_id: str) -> bool:
+    """Whether one inventory row is this account's tab to see.
+
+    A tmux session without an explicit owner must not appear in any account's
+    roster. Unowned sessions cannot be safely bound to a terminal; excluding
+    them also keeps one invalid row from breaking the complete roster.
+    """
+    recorded = str(owners.get(str(session.get("name") or "")) or "")
+    if not recorded or recorded != owner_id:
+        return False
+    if session.get("managed"):
+        return str(session.get("owner_id") or "") == owner_id
+    return True
+
+
+def _roster_sessions_for_user(inventory: dict, user: dict | None) -> list[dict]:
+    """Return only one account's live/parked/recovering session roster."""
+    if not user:
+        return []
+    owner_id = str(user.get("id") or "")
+    owners = inventory.get("owners") or {}
+    sessions = [
+        session
+        for session in inventory.get("sessions", [])
+        if _roster_row_belongs_to(session, owners, owner_id)
+    ]
+    present = {str(session.get("name") or "") for session in sessions}
+    for name in inventory.get("missing_expected", []):
+        row = (inventory.get("expected_rows") or {}).get(name) or {}
+        if (
+            str(row.get("owner_id") or "") != owner_id
+            or name in present
+            or owners.get(name) != owner_id
+        ):
+            continue
+        generation = str(row.get("generation") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", generation):
+            continue
+        sessions.append({
+            "name": name,
+            "windows": "0",
+            "created": str(int(row.get("created_at") or 0)),
+            "attached": False,
+            "virtual": True,
+            "managed": True,
+            "owner_id": owner_id,
+            "runtime_state": "recovering",
+            "incarnation": _session_incarnation(owner_id, generation, "recovering"),
+            "logical_incarnation": _session_incarnation(
+                owner_id, generation, "logical"
+            ),
+        })
+    # The legacy renderer displayed an unsaved alphabetical roster in reverse.
+    # Preserve that visual default during migration; once an account saves an
+    # explicit order, keep it exact and append unknown/new tabs alphabetically.
+    alphabetical = sorted(sessions, key=lambda session: session["name"])
+    persisted = _session_tab_order(owner_id)
+    if not persisted:
+        return list(reversed(alphabetical))
+    rank = {name: index for index, name in enumerate(persisted)}
+    return sorted(
+        alphabetical,
+        key=lambda session: (
+            0 if session["name"] in rank else 1,
+            rank.get(session["name"], 0),
+        ),
+    )
+
+
+class SessionTabOrderBody(BaseModel):
+    sessions: list[str]
+
+
+@app.post("/api/session-tab-order")
+async def api_session_tab_order(request: Request, body: SessionTabOrderBody):
+    """Save the visible tab order for the effective authenticated account."""
+    if request.headers.get("X-Tmux-Tab-Order") != "1":
+        return JSONResponse({"error": "Missing reorder confirmation"}, status_code=400)
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    if not owner_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    names = [str(name or "") for name in body.sessions]
+    if (
+        len(names) > 500
+        or len(names) != len(set(names))
+        or any(not _is_valid_session_name(name) for name in names)
+    ):
+        return JSONResponse({"error": "Invalid tab order"}, status_code=422)
+    owners = _load_session_owners()
+    if any(owners.get(name) != owner_id for name in names):
+        # Do not distinguish another tenant's tab from a stale/unknown name.
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    saved = await asyncio.to_thread(_save_session_tab_order, owner_id, names)
+    return {"ok": True, "sessions": saved}
+
+
+@app.get("/api/session-roster")
+async def api_session_roster(request: Request):
+    """Authoritative, owner-scoped roster for adding and removing browser tabs."""
+    inventory = await asyncio.to_thread(_tmux_inventory_snapshot)
+    user = _current_user(request)
+    sessions = _roster_sessions_for_user(inventory, user)
+    if not inventory.get("authoritative"):
+        return JSONResponse(
+            {
+                "authoritative": False,
+                "state": inventory.get("state", "error"),
+                "observed_at": inventory.get("observed_at", time.time()),
+                "sessions": [],
+            },
+            status_code=503,
+        )
+    bound = _bind_session_response_rows(sessions, user)
+    if bound is None:
+        return JSONResponse(
+            {
+                "authoritative": False,
+                "state": "changed",
+                "observed_at": inventory.get("observed_at", time.time()),
+                "sessions": [],
+            },
+            status_code=503,
+        )
+    rows = await _fast_session_rows(sessions)
+    if not await _session_response_bindings_are_current(bound):
+        return JSONResponse(
+            {
+                "authoritative": False,
+                "state": "changed",
+                "observed_at": inventory.get("observed_at", time.time()),
+                "sessions": [],
+            },
+            status_code=503,
+        )
+    generation_material = "\n".join(
+        f"{row['name']}:{row.get('runtime_state', '')}:{row.get('incarnation', '')}"
+        for row in rows
+    )
+    return JSONResponse({
+        "authoritative": True,
+        "state": inventory.get("state", "ok"),
+        "generation": hashlib.sha256(generation_material.encode()).hexdigest()[:20],
+        "observed_at": inventory.get("observed_at", time.time()),
+        "sessions": rows,
+    })
 
 
 @app.post("/api/sessions/{session_name}/refresh")
@@ -8168,33 +11930,126 @@ async def api_status(request: Request):
     sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
     if sessions is None:
         return JSONResponse({"error": "Admin only"}, status_code=403)
+    bound = _bind_session_response_rows(sessions, _current_user(request))
+    if bound is None:
+        return _session_list_changed_response()
     activities = await asyncio.gather(
         *(async_detect_activity(sess["name"]) for sess in sessions)
     )
+    metrics = await asyncio.gather(
+        *(asyncio.to_thread(_codex_session_payload, sess["name"]) for sess in sessions)
+    )
     out = []
-    for sess, activity in zip(sessions, activities):
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    for sess, activity, session_metrics in zip(sessions, activities, metrics):
         lifecycle = _session_lifecycle.get(sess["name"])
         out.append({
             "name": sess["name"],
+            "tab_label": _session_tab_label(sess["name"], tab_labels),
             "activity_status": "parked" if lifecycle.get("parked") else activity["status"],
             "activity_detail": activity["detail"],
             "autopush_mode": _get_autopush_mode(sess["name"]),
             "simple_watchdog": _get_autopush_mode(sess["name"]) == "full",
             "parked": bool(lifecycle.get("parked")),
+            **session_metrics,
             **_session_model_fields(sess["name"]),
         })
+    if not await _session_response_bindings_are_current(bound):
+        return _session_list_changed_response()
     return JSONResponse(out)
 
 
+@app.get("/api/tab-labels")
+async def api_tab_labels(request: Request):
+    """Return only this account's current nav labels for cheap live repainting."""
+    sessions, _scope = _session_list_for_request(request, get_tmux_sessions())
+    if sessions is None:
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    tab_labels = await asyncio.to_thread(_session_tab_label_rows)
+    return JSONResponse([
+        {
+            "name": sess["name"],
+            "tab_label": _session_tab_label(sess["name"], tab_labels),
+        }
+        for sess in sessions
+    ])
+
+
+def _terminal_history_binding(session_name: str, owner_id: str) -> dict | None:
+    owner = _strict_session_owner(session_name, owner_id)
+    if not owner:
+        return None
+    row = _session_lifecycle.get(session_name)
+    generation = str(row.get("generation") or "")
+    if (not row.get("managed") or row.get("owner_id") != owner_id
+            or not re.fullmatch(r"[0-9a-f]{32}", generation)
+            or row.get("desired_state") != "running"):
+        return None
+    root = _active_session_root_thread_id(session_name, owner_id)
+    if not root:
+        root = _validated_session_root_thread_id(session_name, row.get("resume_uuid"), owner_id)
+    if not root:
+        return None
+    return {"session_name": session_name, "owner_id": owner_id, "owner": owner[1],
+            "generation": generation, "resume_uuid": root}
+
+
+def _read_terminal_history(binding: dict, cursor: str, include_tools: bool = False) -> dict:
+    import terminal_history
+    fd, _relative, _fingerprint = _open_session_close_rollout(binding)
+    try:
+        # Validate the opened file as well as its name; an atomic replacement
+        # between lookup and open must never select a different conversation.
+        with os.fdopen(os.dup(fd), "rb") as source:
+            meta = json.loads(source.readline())
+        payload = meta.get("payload") or {}
+        if (meta.get("type") != "session_meta" or payload.get("id") != binding["resume_uuid"]
+                or payload.get("session_id") != binding["resume_uuid"]
+                or payload.get("thread_source") != "user"):
+            raise terminal_history.HistoryChanged("Session transcript identity changed")
+        return terminal_history.read_page(fd, binding, cursor, include_tools=include_tools)
+    finally:
+        os.close(fd)
+
+
+@app.get("/api/sessions/{session_name}/terminal-history")
+async def api_terminal_history(request: Request, session_name: str, cursor: str = "", tools: bool = False):
+    import terminal_history
+    user = _current_user(request)
+    if not user or not _user_can_access_session(user, session_name):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    owner_id = str(user.get("id") or "")
+    binding = await asyncio.to_thread(_terminal_history_binding, session_name, owner_id)
+    if not binding:
+        return JSONResponse({"error": "Saved history is not available for this session yet"}, status_code=409)
+    try:
+        page = await asyncio.to_thread(_read_terminal_history, binding, cursor, tools)
+    except (terminal_history.HistoryChanged, _SessionCloseError, OSError, ValueError):
+        return JSONResponse({"error": "Session history changed; reload its history"}, status_code=409)
+    current = await asyncio.to_thread(_terminal_history_binding, session_name, owner_id)
+    if not current or any(current[k] != binding[k] for k in ("owner_id", "generation", "resume_uuid")):
+        return JSONResponse({"error": "Session history changed; reload its history"}, status_code=409)
+    return JSONResponse(page, headers={"Cache-Control": "private, no-store"})
+
+
 @app.get("/api/sessions/{session_name}/raw")
-async def api_raw_output(session_name: str):
+async def api_raw_output(request: Request, session_name: str):
     """Return raw scrollback content for a session."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    raw = await asyncio.to_thread(capture_pane_full, session_name)
+    binding = await asyncio.to_thread(
+        _terminal_binding, session_name, str((user or {}).get("id") or "")
+    )
+    if not binding:
+        return JSONResponse({"error": "Session identity changed"}, status_code=409)
+    session_target = binding["session_id"]
+    raw = await asyncio.to_thread(capture_pane_full, session_target)
     activity = await async_detect_activity(session_name)
-    pane_width = await asyncio.to_thread(get_pane_width, session_name)
+    pane_width = await asyncio.to_thread(get_pane_width, session_target)
+    if await asyncio.to_thread(_terminal_binding_state, binding) != "current":
+        return JSONResponse({"error": "Session identity changed"}, status_code=409)
     return JSONResponse({
         "name": session_name,
         "raw": raw,
@@ -8226,25 +12081,39 @@ def _visible_pane_hash(session_name: str) -> str:
 
 
 @app.get("/api/sessions/{session_name}/raw-tail")
-async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str = ""):
+async def api_raw_tail(
+    request: Request,
+    session_name: str,
+    known_lines: int = 0,
+    last_hash: str = "",
+):
     """Return delta output since the client's last known line count.
 
     Also detects in-place TUI redraws (Codex's alternate screen) by
     hashing the visible pane — a hash mismatch forces a full capture even when
     scrollback length is unchanged.
     """
-    _, found = _find_session(session_name)
+    user = _current_user(request)
+    _, found = _find_session_for_user(session_name, user)
     if not found:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    binding = await asyncio.to_thread(
+        _terminal_binding, session_name, str((user or {}).get("id") or "")
+    )
+    if not binding:
+        return JSONResponse({"error": "Session identity changed"}, status_code=409)
+    session_target = binding["session_id"]
 
-    pos = await asyncio.to_thread(get_pane_position, session_name)
+    pos = await asyncio.to_thread(get_pane_position, session_target)
     current_total = pos["total_lines"]
-    vis_hash = await asyncio.to_thread(_visible_pane_hash, session_name)
-    pane_width = await asyncio.to_thread(get_pane_width, session_name)
+    vis_hash = await asyncio.to_thread(_visible_pane_hash, session_target)
+    pane_width = await asyncio.to_thread(get_pane_width, session_target)
 
     # First load or session reset → full capture
     if known_lines <= 0 or known_lines > current_total:
-        raw = await asyncio.to_thread(capture_pane_full, session_name)
+        raw = await asyncio.to_thread(capture_pane_full, session_target)
+        if await asyncio.to_thread(_terminal_binding_state, binding) != "current":
+            return JSONResponse({"error": "Session identity changed"}, status_code=409)
         return JSONResponse({
             "mode": "full",
             "raw": raw,
@@ -8257,7 +12126,9 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     # No scrollback growth, but visible content changed (TUI redraw) → full
     if current_total <= known_lines:
         if last_hash and vis_hash and last_hash != vis_hash:
-            raw = await asyncio.to_thread(capture_pane_full, session_name)
+            raw = await asyncio.to_thread(capture_pane_full, session_target)
+            if await asyncio.to_thread(_terminal_binding_state, binding) != "current":
+                return JSONResponse({"error": "Session identity changed"}, status_code=409)
             return JSONResponse({
                 "mode": "full",
                 "raw": raw,
@@ -8266,6 +12137,8 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
                 "pane_width": pane_width,
                 "visible_hash": vis_hash,
             })
+        if await asyncio.to_thread(_terminal_binding_state, binding) != "current":
+            return JSONResponse({"error": "Session identity changed"}, status_code=409)
         return JSONResponse({
             "mode": "none",
             "total_lines": known_lines,
@@ -8277,7 +12150,9 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     # Delta: capture only the new lines + small overlap for dedup
     overlap = 5
     lines_from_end = (current_total - known_lines) + overlap
-    raw = await asyncio.to_thread(capture_pane_recent, session_name, lines_from_end)
+    raw = await asyncio.to_thread(capture_pane_recent, session_target, lines_from_end)
+    if await asyncio.to_thread(_terminal_binding_state, binding) != "current":
+        return JSONResponse({"error": "Session identity changed"}, status_code=409)
     return JSONResponse({
         "mode": "delta",
         "raw": raw,
@@ -8292,8 +12167,10 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
 # --- Shared terminal stream + controller IPC -------------------------------
 # One controller process owns one tmux capture loop per viewed session. API
 # workers only relay its line-delimited JSON over authenticated WebSockets.
-_terminal_channels: dict[str, dict] = {}
+_terminal_channels: dict[tuple[str, str, str, str], dict] = {}
 _controller_server = None
+_controller_leader_fd: int | None = None
+_controller_socket_inode: int | None = None
 
 
 class _TerminalQueueWriter:
@@ -8319,7 +12196,13 @@ class _TerminalQueueWriter:
             raise ConnectionError("terminal subscriber closed")
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.closed = True
+        try:
+            self.queue.put_nowait(b"")
+        except asyncio.QueueFull:
+            pass
 
     async def wait_closed(self) -> None:
         return None
@@ -8408,8 +12291,139 @@ async def _terminal_send(writer: asyncio.StreamWriter, payload: dict) -> bool:
         return False
 
 
-async def _terminal_broadcast(session_name: str, payload: dict) -> None:
-    channel = _terminal_channels.get(session_name)
+def _terminal_binding(
+    session_name: str, expected_owner_id: str
+) -> dict | None:
+    """Resolve one terminal subscription to an immutable tmux incarnation."""
+    if not _is_valid_session_name(session_name) or not expected_owner_id:
+        return None
+    owner_binding = _strict_session_owner(session_name, expected_owner_id)
+    if not owner_binding:
+        return None
+    session_id = _exact_tmux_session_id(session_name)
+    if not session_id:
+        return None
+    lifecycle = _session_lifecycle.get(session_name)
+    managed = bool(lifecycle.get("managed"))
+    generation = str(lifecycle.get("generation") or "")
+    session_created = ""
+    if managed:
+        if (
+            str(lifecycle.get("owner_id") or "") != expected_owner_id
+            or not re.fullmatch(r"[0-9a-f]{32}", generation)
+        ):
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "tmux", "display-message", "-t", session_id, "-p",
+                    "#{@dashboard_owner_id}\t#{@dashboard_managed}\t"
+                    "#{@dashboard_generation}\t#{@dashboard_quarantined}\t"
+                    "#{session_created}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            values = (result.stdout or "").strip().split("\t")
+            if (
+                result.returncode != 0
+                or len(values) != 5
+                or values[:4] != [expected_owner_id, "1", generation, "0"]
+                or not values[4].isdigit()
+            ):
+                return None
+            session_created = values[4]
+        except Exception:
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-t", session_id, "-p", "#{session_created}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            session_created = (result.stdout or "").strip()
+            if result.returncode != 0 or not session_created.isdigit():
+                return None
+        except Exception:
+            return None
+    return {
+        "name": session_name,
+        "owner_id": expected_owner_id,
+        "generation": generation,
+        "session_id": session_id,
+        "session_created": session_created,
+        "managed": managed,
+        "key": (
+            session_name,
+            expected_owner_id,
+            generation,
+            f"{session_id}@{session_created}",
+        ),
+    }
+
+
+def _terminal_binding_state(binding: dict) -> str:
+    """Return current, replaced, or unknown from one exact identity probe."""
+    name = str(binding.get("name") or "")
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "display-message", "-t", f"={name}:", "-p",
+                "#{session_id}\t#{session_name}\t#{@dashboard_owner_id}\t"
+                "#{@dashboard_managed}\t#{@dashboard_generation}\t"
+                "#{@dashboard_quarantined}\t#{session_created}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return "unknown"
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        return "replaced" if "can't find session" in stderr else "unknown"
+    values = (result.stdout or "").rstrip("\n").split("\t")
+    if len(values) != 7 or values[1] != name:
+        return "unknown"
+    if values[0] != binding.get("session_id"):
+        return "replaced"
+    if values[6] != binding.get("session_created"):
+        return "replaced"
+    if binding.get("managed") and (
+        values[2:6] != [
+        binding.get("owner_id"),
+        "1",
+        binding.get("generation"),
+        "0",
+        ]
+    ):
+        return "replaced"
+    return "current"
+
+
+def _terminal_session_has_writers(session_name: str) -> bool:
+    return any(
+        key[0] == session_name and bool(channel.get("writers"))
+        for key, channel in _terminal_channels.items()
+    )
+
+
+def _terminal_unavailable_payload(session_name: str, error: str = "") -> dict:
+    state, _session_id = _exact_tmux_session_state(session_name)
+    permanent = state == "absent" and not _durable_running_intent_exists(session_name)
+    return {
+        "mode": "error",
+        "code": "session_not_found" if permanent else "session_unavailable",
+        "error": "Session not found" if permanent else (error or "Session temporarily unavailable")[:240],
+        "retryable": not permanent,
+    }
+
+
+async def _terminal_broadcast(channel_key: tuple[str, str, str, str], payload: dict) -> None:
+    channel = _terminal_channels.get(channel_key)
     if not channel:
         return
     writers = list(channel.get("writers", set()))
@@ -8428,25 +12442,52 @@ async def _terminal_broadcast(session_name: str, payload: dict) -> None:
                 pass
 
 
-async def _terminal_producer(session_name: str) -> None:
-    channel = _terminal_channels[session_name]
+async def _terminal_producer(channel_key: tuple[str, str, str, str]) -> None:
+    channel = _terminal_channels[channel_key]
+    binding = channel["binding"]
+    session_target = binding["session_id"]
     quiet_ticks = 0
     try:
         while channel.get("writers"):
             try:
+                binding_state = await asyncio.to_thread(
+                    _terminal_binding_state, binding
+                )
+                if binding_state != "current":
+                    await _terminal_broadcast(
+                        channel_key,
+                        {
+                            "mode": "error",
+                            "code": (
+                                "session_replaced"
+                                if binding_state == "replaced"
+                                else "session_unavailable"
+                            ),
+                            "error": (
+                                "Terminal session changed"
+                                if binding_state == "replaced"
+                                else "Terminal temporarily unavailable"
+                            ),
+                            "retryable": binding_state == "unknown",
+                        },
+                    )
+                    for writer in list(channel.get("writers", set())):
+                        writer.close()
+                    channel["writers"].clear()
+                    break
                 payload = await asyncio.to_thread(
-                    _terminal_next_payload, session_name, channel
+                    _terminal_next_payload, session_target, channel
                 )
                 if payload:
                     quiet_ticks = 0
                     channel["last_emit"] = time.time()
-                    await _terminal_broadcast(session_name, payload)
+                    await _terminal_broadcast(channel_key, payload)
                 else:
                     quiet_ticks += 1
                     if time.time() - channel.get("last_emit", 0) >= 20:
                         channel["last_emit"] = time.time()
                         await _terminal_broadcast(
-                            session_name,
+                            channel_key,
                             {
                                 "mode": "ping",
                                 "pane_total": channel.get("pane_total", 0),
@@ -8456,22 +12497,31 @@ async def _terminal_producer(session_name: str) -> None:
                         )
             except Exception as exc:
                 await _terminal_broadcast(
-                    session_name, {"mode": "error", "error": str(exc)[:240]}
+                    channel_key,
+                    {
+                        "mode": "error",
+                        "code": "capture_failed",
+                        "error": str(exc)[:240],
+                        "retryable": True,
+                    },
                 )
                 quiet_ticks += 1
             await asyncio.sleep(0.6 if quiet_ticks < 5 else min(2.0, 0.8 + quiet_ticks / 10))
     finally:
-        channel["task"] = None
-        if not channel.get("writers"):
-            _terminal_channels.pop(session_name, None)
+        if channel.get("task") is asyncio.current_task():
+            channel["task"] = None
+        if not channel.get("writers") and _terminal_channels.get(channel_key) is channel:
+            _terminal_channels.pop(channel_key, None)
 
 
 async def _terminal_subscribe(
-    session_name: str, writer: asyncio.StreamWriter
+    binding: dict, writer: asyncio.StreamWriter
 ) -> dict:
+    channel_key = binding["key"]
     channel = _terminal_channels.setdefault(
-        session_name,
+        channel_key,
         {
+            "binding": binding,
             "writers": set(),
             "task": None,
             "full_text": "",
@@ -8494,24 +12544,33 @@ async def _terminal_subscribe(
                 "visible_hash": channel.get("visible_hash", ""),
             },
         )
-    if not channel.get("task") or channel["task"].done():
-        channel["task"] = asyncio.create_task(_terminal_producer(session_name))
+    task = channel.get("task")
+    if not task or task.done() or task.cancelling():
+        channel["task"] = asyncio.create_task(_terminal_producer(channel_key))
     return channel
 
 
-async def _terminal_unsubscribe(session_name: str, writer: asyncio.StreamWriter) -> None:
-    channel = _terminal_channels.get(session_name)
+async def _terminal_unsubscribe(
+    channel_key: tuple[str, str, str, str], writer: asyncio.StreamWriter
+) -> None:
+    channel = _terminal_channels.get(channel_key)
     if not channel:
         return
     channel.get("writers", set()).discard(writer)
-    if not channel.get("writers") and channel.get("task"):
-        channel["task"].cancel()
+    task = channel.get("task")
+    if not channel.get("writers") and task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    if channel.get("writers") and not channel.get("task"):
+        channel["task"] = asyncio.create_task(_terminal_producer(channel_key))
+    elif not channel.get("writers") and _terminal_channels.get(channel_key) is channel:
+        _terminal_channels.pop(channel_key, None)
 
 
 def _session_tmux_activity(session_name: str) -> float:
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{session_activity}"],
+            ["tmux", "display-message", "-t", f"={session_name}:", "-p", "#{session_activity}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -8545,7 +12604,7 @@ def _session_has_autonomous_work(session_name: str) -> bool:
 def _pane_is_dead(session_name: str) -> bool:
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_dead}"],
+            ["tmux", "display-message", "-t", f"={session_name}:", "-p", "#{pane_dead}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -8573,85 +12632,1258 @@ def _archive_tmux_scrollback(session_name: str) -> str:
     return ""
 
 
-def _restore_parked_tmux_shell(session_name: str, lifecycle: dict) -> bool:
+_TMUX_OWNER_OPTION = "@dashboard_owner_id"
+_TMUX_MANAGED_OPTION = "@dashboard_managed"
+_TMUX_GENERATION_OPTION = "@dashboard_generation"
+_TMUX_QUARANTINED_OPTION = "@dashboard_quarantined"
+_TMUX_CREATE_TOKEN_OPTION = "@dashboard_create_token"
+
+
+def _exact_tmux_session_id(session_name: str) -> str:
+    """Resolve an exact name to tmux's immutable in-server ``$N`` id."""
+    if not _is_valid_session_name(session_name):
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "display-message", "-t", f"={session_name}:",
+                "-p", "#{session_id}\t#{session_name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        session_id, separator, resolved_name = (result.stdout or "").strip().partition("\t")
+        if (
+            result.returncode == 0
+            and separator
+            and resolved_name == session_name
+            and re.fullmatch(r"\$[0-9]+", session_id)
+        ):
+            return session_id
+    except Exception:
+        logger.debug("Could not resolve exact tmux id for '%s'", session_name, exc_info=True)
+    return ""
+
+
+def _mark_tmux_session_managed(
+    session_name: str,
+    owner_id: str,
+    generation: str = "",
+    create_token: str = "",
+) -> bool:
+    """Bind a real tmux session to its durable dashboard owner."""
+    if (
+        not _is_valid_session_name(session_name)
+        or not owner_id
+        or (generation and not re.fullmatch(r"[0-9a-f]{32}", generation))
+    ):
+        return False
+    session_target = _exact_tmux_session_id(session_name)
+    if not session_target:
+        return False
+    try:
+        if create_token:
+            token_result = subprocess.run(
+                [
+                    "tmux", "show-options", "-t", session_target,
+                    "-v", _TMUX_CREATE_TOKEN_OPTION,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if (
+                token_result.returncode != 0
+                or (token_result.stdout or "").strip() != create_token
+            ):
+                return False
+        values = [
+            (_TMUX_OWNER_OPTION, owner_id),
+            (_TMUX_MANAGED_OPTION, "1"),
+        ]
+        if generation:
+            values.append((_TMUX_GENERATION_OPTION, generation))
+        for option, value in values:
+            result = subprocess.run(
+                ["tmux", "set-option", "-t", session_target, option, value],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+        return True
+    except Exception:
+        logger.debug("Could not mark tmux session '%s' as managed", session_name, exc_info=True)
+        return False
+
+
+def _publish_tmux_session(
+    session_name: str,
+    owner_id: str,
+    generation: str,
+    create_token: str = "",
+) -> bool:
+    """Expose a provisioned shell only after its durable identity is complete."""
+    session_target = _exact_tmux_session_id(session_name)
+    if (
+        not session_target
+        or not _tmux_session_matches_owner(session_name, owner_id, generation)
+    ):
+        return False
+    try:
+        if create_token:
+            token_result = subprocess.run(
+                [
+                    "tmux", "show-options", "-t", session_target,
+                    "-v", _TMUX_CREATE_TOKEN_OPTION,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if (
+                token_result.returncode != 0
+                or (token_result.stdout or "").strip() != create_token
+            ):
+                return False
+        committed = subprocess.run(
+            [
+                "tmux", "set-option", "-t", session_target,
+                _TMUX_QUARANTINED_OPTION, "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return committed.returncode == 0
+    except Exception:
+        logger.debug("Could not publish tmux session '%s'", session_name, exc_info=True)
+        return False
+
+
+def _tmux_session_matches_owner(
+    session_name: str, owner_id: str, generation: str = ""
+) -> bool:
+    """Reject an exact-name tmux collision that is not this owner's tab."""
+    if (
+        (generation and not re.fullmatch(r"[0-9a-f]{32}", generation))
+        or not _strict_session_owner(session_name, owner_id)
+    ):
+        return False
+    session_target = _exact_tmux_session_id(session_name)
+    if not session_target:
+        return False
+    try:
+        values = []
+        options = [_TMUX_OWNER_OPTION, _TMUX_MANAGED_OPTION]
+        if generation:
+            options.append(_TMUX_GENERATION_OPTION)
+        for option in options:
+            result = subprocess.run(
+                [
+                    "tmux", "show-options", "-t", session_target,
+                    "-v", option,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            values.append((result.stdout or "").strip() if result.returncode == 0 else "")
+        expected = [owner_id, "1"] + ([generation] if generation else [])
+        if values == expected:
+            return True
+    except Exception:
+        return False
+
+    # A non-empty conflicting marker belongs to another owner/generation. Only
+    # genuinely legacy tabs with a missing generation may be adopted.
+    if values[0] and values[0] != owner_id:
+        return False
+    if values[1] and values[1] != "1":
+        return False
+    if generation and len(values) > 2 and values[2] and values[2] != generation:
+        return False
+
+    # Legacy live tabs predate the tmux marker.  Their running Codex process is
+    # still owner-bound by its private home and dashboard session environment;
+    # accept it once, then persist the marker for future bare-shell recovery.
+    pid = _session_codex_process_id(session_name)
+    if not pid:
+        return False
+    process_env = _process_environment(pid)
+    if process_env.get("DASH_SESSION") != session_name:
+        return False
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    if not owner_binding:
+        return False
+    owner = owner_binding[1]
+    if _uses_private_account_runtime(owner):
+        try:
+            if Path(process_env.get("CODEX_HOME", "")).resolve() != _user_codex_config_dir(owner).resolve():
+                return False
+        except (OSError, RuntimeError):
+            return False
+    if generation:
+        row = _session_lifecycle.get(session_name)
+        if not _session_lifecycle.matches(
+            session_name,
+            generation=generation,
+            owner_id=owner_id,
+        ):
+            return False
+        active_root = _active_session_root_thread_id(session_name, owner_id)
+        if not active_root or active_root != str(row.get("resume_uuid") or ""):
+            return False
+        safe_cwd = _durable_session_cwd(session_name, row, owner)
+        try:
+            live_cwd = str(Path(get_session_cwd(session_name)).resolve(strict=True))
+        except OSError:
+            return False
+        if not safe_cwd or live_cwd != safe_cwd:
+            return False
+    return _mark_tmux_session_managed(session_name, owner_id, generation)
+
+
+def _restore_parked_tmux_shell(
+    session_name: str,
+    lifecycle: dict,
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_desired_states: set[str] | None = None,
+) -> bool:
     """Reanimate a dead/virtual pane without changing its worktree or transcript."""
-    owner = _user_for_session(session_name)
+    def lifecycle_still_matches() -> bool:
+        if not expected_generation:
+            return True
+        return _session_lifecycle.matches(
+            session_name,
+            generation=expected_generation,
+            owner_id=expected_owner_id,
+            desired_states=expected_desired_states,
+            resume_uuid=str(lifecycle.get("resume_uuid") or ""),
+        )
+
+    if expected_owner_id:
+        owner_binding = _strict_session_owner(session_name, expected_owner_id)
+        if not owner_binding:
+            logger.error(
+                "Refusing to restore '%s' after its owner changed", session_name
+            )
+            return False
+        owner = owner_binding[1]
+    else:
+        owner = _user_for_session(session_name)
     cwd = str(lifecycle.get("cwd") or "")
-    if not cwd and _multi_tenant_enabled() and owner and not _is_admin(owner):
+    if lifecycle.get("resume_uuid"):
+        exact_cwd = Path(cwd)
+        if not cwd or not exact_cwd.is_absolute() or not exact_cwd.is_dir():
+            logger.error(
+                "Refusing to restore mapped session '%s' with invalid cwd %r",
+                session_name,
+                cwd,
+            )
+            return False
+    if not cwd and _multi_tenant_enabled() and _uses_private_account_runtime(owner):
         cwd = str(PROJECTS_ROOT / str(owner.get("username") or "member") / session_name)
     if not cwd or not Path(cwd).is_dir():
         cwd = str(Path(__file__).resolve().parent)
+    session_target = f"={session_name}"
+    created_session_id = ""
+
+    def cleanup_new_session() -> None:
+        if not created_session_id:
+            return
+        if not _kill_exact_created_tmux(session_name, created_session_id):
+            logger.critical(
+                "Could not clean up incomplete durable tmux '%s' (%s)",
+                session_name,
+                created_session_id,
+            )
+
     try:
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            return False
+        if not lifecycle_still_matches():
+            return False
         has_session = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
+            ["tmux", "has-session", "-t", session_target],
             capture_output=True,
             text=True,
             timeout=5,
         ).returncode == 0
+        existing_session_id = _exact_tmux_session_id(session_name) if has_session else ""
+        if has_session and not existing_session_id:
+            logger.error("Could not resolve exact tmux identity for '%s'", session_name)
+            return False
+        if has_session and expected_owner_id and not _tmux_session_matches_owner(
+            session_name, expected_owner_id, expected_generation
+        ):
+            logger.error(
+                "Refusing to restore '%s': exact tmux name belongs elsewhere",
+                session_name,
+            )
+            return False
         if has_session and _pane_is_dead(session_name):
+            pane_target = f"{existing_session_id}:"
             result = subprocess.run(
-                ["tmux", "respawn-pane", "-k", "-t", session_name, "-c", cwd],
+                [
+                    "tmux", "set-option", "-t", existing_session_id,
+                    _TMUX_QUARANTINED_OPTION, "1",
+                    ";", "respawn-pane", "-k", "-t", pane_target, "-c", cwd,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
         elif not has_session:
+            create_cmd = [
+                "tmux", "new-session", "-d", "-P", "-F",
+                "#{session_id}\t#{session_name}",
+                "-s", session_name, "-c", cwd,
+                ";", "set-option", _TMUX_QUARANTINED_OPTION, "1",
+            ]
+            if expected_owner_id:
+                create_cmd += [
+                    ";", "set-option", _TMUX_OWNER_OPTION, expected_owner_id,
+                    ";", "set-option", _TMUX_MANAGED_OPTION, "1",
+                ]
+                if expected_generation:
+                    create_cmd += [
+                        ";", "set-option", _TMUX_GENERATION_OPTION,
+                        expected_generation,
+                    ]
             result = subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session_name, "-c", cwd],
+                create_cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
+            session_id, separator, resolved_name = (result.stdout or "").strip().partition("\t")
+            if (
+                result.returncode == 0
+                and separator
+                and resolved_name == session_name
+                and re.fullmatch(r"\$[0-9]+", session_id)
+            ):
+                created_session_id = session_id
         else:
-            return True
-        if result.returncode != 0:
+            # A transient raw-inventory miss can land here for a perfectly
+            # healthy live Codex. Never paste shell exports into that TUI. Only
+            # continue setup when this exact immutable session is explicitly
+            # marked as a quarantined interrupted dashboard attempt.
+            if expected_owner_id and not _tmux_session_matches_owner(
+                session_name, expected_owner_id, expected_generation
+            ):
+                return False
+            quarantined = subprocess.run(
+                [
+                    "tmux", "show-options", "-t", existing_session_id,
+                    "-v", _TMUX_QUARANTINED_OPTION,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if quarantined.returncode not in {0, 1}:
+                return False
+            if (quarantined.stdout or "").strip() != "1":
+                return (
+                    lifecycle_still_matches()
+                    and _exact_tmux_session_id(session_name) == existing_session_id
+                )
+            result = subprocess.CompletedProcess([], 0, "", "")
+        if result.returncode != 0 or (not has_session and not created_session_id):
             logger.error("Could not restore parked tmux '%s': %s", session_name, result.stderr.strip())
+            cleanup_new_session()
             return False
-        subprocess.run(
-            ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
+        restored_session_id = created_session_id or existing_session_id
+        pane_target = f"{restored_session_id}:"
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            logger.error(
+                "Owner changed while restoring tmux session '%s'", session_name
+            )
+            cleanup_new_session()
+            return False
+        if not lifecycle_still_matches():
+            cleanup_new_session()
+            return False
+        if _exact_tmux_session_id(session_name) != restored_session_id:
+            cleanup_new_session()
+            return False
+        marker_owner_id = expected_owner_id or _load_session_owners().get(
+            session_name, ""
+        )
+        if marker_owner_id and not _mark_tmux_session_managed(
+            session_name, marker_owner_id, expected_generation
+        ):
+            logger.error(
+                "Could not persist tmux owner marker for '%s'", session_name
+            )
+            cleanup_new_session()
+            return False
+        remain = subprocess.run(
+            ["tmux", "set-option", "-pt", pane_target, "remain-on-exit", "on"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        owner_name = ((owner or {}).get("username") or AUTH_USER or "admin")
-        project_dir = str(PROJECTS_ROOT / owner_name / session_name)
-        git_email = f"{owner_name}@{GIT_EMAIL_DOMAIN}"
-        assignments = {
-            "DASH_USER": owner_name,
-            "DASH_SESSION": session_name,
-            "DASH_PROJECT_DIR": project_dir,
-            "DASH_PROJECT_URL": f"{PUB_URL}/{owner_name}/{session_name}",
-            "GIT_AUTHOR_NAME": owner_name,
-            "GIT_AUTHOR_EMAIL": git_email,
-            "GIT_COMMITTER_NAME": owner_name,
-            "GIT_COMMITTER_EMAIL": git_email,
-        }
-        if owner and not _is_admin(owner):
-            assignments["CODEX_HOME"] = str(_user_codex_config_dir(owner))
-        export = "export " + " ".join(
-            f"{key}={shlex.quote(value)}" for key, value in assignments.items()
-        )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "-l", export],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        if remain.returncode != 0 or not _send_session_owner_environment(
+            session_name, expected_owner_id
+        ):
+            cleanup_new_session()
+            return False
+        if (
+            not lifecycle_still_matches()
+            or _exact_tmux_session_id(session_name) != restored_session_id
+        ):
+            cleanup_new_session()
+            return False
+        if marker_owner_id and not _publish_tmux_session(
+            session_name, marker_owner_id, expected_generation
+        ):
+            cleanup_new_session()
+            return False
         return True
     except Exception:
+        cleanup_new_session()
         logger.exception("Failed to restore parked tmux shell '%s'", session_name)
         return False
 
 
-async def _park_session_local(session_name: str, last_activity: float) -> dict:
+_DURABLE_SESSION_REHYDRATE_INTERVAL = max(
+    15, int(os.environ.get("TMUX_DASH_REHYDRATE_INTERVAL", "15"))
+)
+_DURABLE_SESSION_REHYDRATE_ENABLED = os.environ.get(
+    "TMUX_DASH_AUTO_REHYDRATE", "1"
+).lower() not in {"0", "false", "no", "off"}
+
+
+def _durable_session_cwd(
+    session_name: str, lifecycle: dict, owner: dict
+) -> str:
+    """Resolve a persisted cwd without substituting an unrelated directory."""
+    username = str(owner.get("username") or owner.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9.@_-]{1,128}", username):
+        username = str(owner.get("id") or "")
+    account_project = PROJECTS_ROOT / username / session_name
+    private_runtime = _uses_private_account_runtime(owner)
+    verified_project = (
+        _resolved_real_directory(account_project) if private_runtime else None
+    )
+    if private_runtime and not verified_project:
+        return ""
+    recorded = str(lifecycle.get("cwd") or "")
+    if recorded:
+        path = Path(recorded)
+        if not path.is_absolute() or not path.is_dir():
+            return ""
+        try:
+            resolved = _resolved_real_directory(path)
+            if not resolved:
+                return ""
+            if private_runtime:
+                resolved.relative_to(verified_project)
+            return str(resolved)
+        except (OSError, RuntimeError):
+            return ""
+        except ValueError:
+            return ""
+
+    # Legacy active rows recorded the root UUID but not cwd.  The account's
+    # existing per-tab project directory is the only safe migration fallback;
+    # never create it here and never fall back to the dashboard source tree.
+    return str(verified_project) if verified_project else ""
+
+
+def _durable_session_candidates() -> list[dict]:
+    """Return fully validated active tabs eligible for automatic recovery."""
+    if not _DURABLE_SESSION_REHYDRATE_ENABLED:
+        return []
+    rows = _session_lifecycle.snapshot().get("sessions", {}) or {}
+    candidates: list[dict] = []
+    for session_name in sorted(rows):
+        row = rows.get(session_name) or {}
+        if not _is_valid_session_name(session_name):
+            continue
+        desired = str(row.get("desired_state") or "")
+        if (
+            not row.get("managed")
+            or row.get("parked")
+            or desired != "running"
+            or row.get("restore_on_startup") is not True
+        ):
+            continue
+        generation = str(row.get("generation") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", generation):
+            continue
+        resume_uuid = _validated_codex_thread_id(row.get("resume_uuid"))
+        if not resume_uuid:
+            continue
+        owner_binding = _strict_session_owner(session_name)
+        if not owner_binding:
+            logger.error(
+                "Skipping durable recovery for '%s': explicit owner is missing",
+                session_name,
+            )
+            continue
+        owner_id, owner = owner_binding
+        recorded_owner = str(row.get("owner_id") or "")
+        if not recorded_owner or recorded_owner != owner_id:
+            logger.error(
+                "Skipping durable recovery for '%s': lifecycle owner mismatch",
+                session_name,
+            )
+            continue
+        validated_uuid = _validated_session_root_thread_id(
+            session_name, resume_uuid, owner_id
+        )
+        if not validated_uuid:
+            logger.error(
+                "Skipping durable recovery for '%s': root rollout is invalid",
+                session_name,
+            )
+            continue
+        cwd = _durable_session_cwd(session_name, row, owner)
+        if not cwd:
+            logger.error(
+                "Skipping durable recovery for '%s': persisted cwd is invalid",
+                session_name,
+            )
+            continue
+        candidates.append(
+            {
+                "name": session_name,
+                "owner_id": owner_id,
+                "owner": owner,
+                "cwd": cwd,
+                "generation": generation,
+                "resume_uuid": validated_uuid,
+                "lifecycle": {**row, "cwd": cwd, "resume_uuid": validated_uuid},
+            }
+        )
+    return candidates
+
+
+def _durable_running_intent_exists(session_name: str) -> bool:
+    """Keep user intent while a valid registry row awaits transient recovery."""
+    row = _session_lifecycle.get(session_name)
+    generation = str(row.get("generation") or "")
+    owner_id = str(row.get("owner_id") or "")
+    return bool(
+        _is_valid_session_name(session_name)
+        and row.get("managed")
+        and str(row.get("desired_state") or "") == "running"
+        and row.get("restore_on_startup") is True
+        and re.fullmatch(r"[0-9a-f]{32}", generation)
+        and owner_id
+        and _strict_session_owner(session_name, owner_id)
+    )
+
+
+def _durable_candidate_still_current(candidate: dict) -> bool:
+    """Revalidate an owner/root/cwd generation immediately before mutation."""
+    session_name = str(candidate.get("name") or "")
+    owner_id = str(candidate.get("owner_id") or "")
+    generation = str(candidate.get("generation") or "")
+    resume_uuid = str(candidate.get("resume_uuid") or "")
+    if not _session_lifecycle.matches(
+        session_name,
+        generation=generation,
+        owner_id=owner_id,
+        desired_states={"running"},
+        resume_uuid=resume_uuid,
+        restore_on_startup=True,
+    ):
+        return False
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    if not owner_binding:
+        return False
+    if (
+        _validated_session_root_thread_id(session_name, resume_uuid, owner_id)
+        != resume_uuid
+    ):
+        return False
+    current_row = _session_lifecycle.get(session_name)
+    current_cwd = _durable_session_cwd(
+        session_name, current_row, owner_binding[1]
+    )
+    return bool(current_cwd and current_cwd == str(candidate.get("cwd") or ""))
+
+
+def _reconcile_provisional_tmux_sessions() -> int:
+    """Adopt or retire dashboard-created shells left hidden by a crash.
+
+    Only sessions carrying the unguessable create token and quarantine marker
+    are eligible. A launched, owner-bound Codex root is checkpointed and
+    published; an incomplete shell is removed with the same token fence.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux", "list-sessions", "-F",
+                "#{session_id}\t#{session_name}\t"
+                "#{@dashboard_quarantined}\t#{@dashboard_create_token}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return 0
+    if result.returncode != 0:
+        return 0
+    reconciled = 0
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        session_id, session_name, quarantined, create_token = parts
+        if (
+            quarantined != "1"
+            or not re.fullmatch(r"\$[0-9]+", session_id)
+            or not _is_valid_session_name(session_name)
+            or not re.fullmatch(r"[0-9a-f]{32}", create_token)
+        ):
+            continue
+        try:
+            with _session_operation_lock(session_name):
+                row = _session_lifecycle.get(session_name)
+                owner_id = str(_load_session_owners().get(session_name) or "")
+                generation = str(row.get("generation") or "")
+                can_adopt = bool(
+                    owner_id
+                    and row.get("managed")
+                    and str(row.get("owner_id") or "") == owner_id
+                    and str(row.get("desired_state") or "") == "running"
+                    and re.fullmatch(r"[0-9a-f]{32}", generation)
+                    and _tmux_session_matches_owner(
+                        session_name, owner_id, generation
+                    )
+                    and _active_session_root_thread_id(session_name, owner_id)
+                )
+                if can_adopt:
+                    checkpointed = _checkpoint_active_session(
+                        session_name,
+                        source="startup-provisional-adopt",
+                        expected_owner_id=owner_id,
+                    )
+                    if (
+                        checkpointed.get("resume_uuid")
+                        and _publish_tmux_session(
+                            session_name, owner_id, generation, create_token
+                        )
+                    ):
+                        reconciled += 1
+                        logger.warning(
+                            "Completed interrupted session creation for '%s'",
+                            session_name,
+                        )
+                        continue
+
+                if generation and owner_id:
+                    try:
+                        _session_lifecycle.begin_transition(
+                            session_name,
+                            owner_id=owner_id,
+                            desired_state="deleting",
+                            expected_generation=generation,
+                            expected_desired_states={"running", "deleting"},
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not tombstone provisional session '%s'",
+                            session_name,
+                        )
+                        continue
+                if not _kill_exact_created_tmux(
+                    session_name, session_id, create_token
+                ):
+                    logger.error(
+                        "Could not retire provisional tmux session '%s'",
+                        session_name,
+                    )
+                    continue
+                if generation and owner_id:
+                    _session_lifecycle.remove(
+                        session_name,
+                        expected_generation=generation,
+                        owner_id=owner_id,
+                    )
+                    if _load_session_owners().get(session_name) == owner_id:
+                        _clear_session_owner(session_name)
+                reconciled += 1
+                logger.warning(
+                    "Retired incomplete provisional tmux session '%s'",
+                    session_name,
+                )
+        except _SessionOperationBusy:
+            continue
+        except Exception:
+            logger.exception(
+                "Could not reconcile provisional tmux session '%s'",
+                session_name,
+            )
+    return reconciled
+
+
+def _checkpoint_active_session(
+    session_name: str, *, source: str = "controller", expected_owner_id: str = ""
+) -> dict:
+    """Persist cwd, owner and the exact live root for one managed tab."""
+    owner_binding = _strict_session_owner(session_name)
+    if not owner_binding or (
+        expected_owner_id and owner_binding[0] != expected_owner_id
+    ):
+        return {}
+    owner_id, owner = owner_binding
+    row = _session_lifecycle.get(session_name)
+    if (
+        row.get("parked")
+        or str(row.get("desired_state") or "")
+        in {"parking", "parked", "deleting", "deleted"}
+    ):
+        return row
+    recorded_owner = str(row.get("owner_id") or "")
+    if recorded_owner and recorded_owner != owner_id:
+        logger.error("Refusing to checkpoint owner-mismatched '%s'", session_name)
+        return row
+    existing_generation = str(row.get("generation") or "")
+    if not _tmux_session_matches_owner(
+        session_name, owner_id, existing_generation
+    ):
+        logger.error("Refusing to checkpoint unowned tmux session '%s'", session_name)
+        return row
+    cwd = get_session_cwd(session_name)
+    cwd_path = Path(cwd)
+    if not cwd or not cwd_path.is_absolute() or not cwd_path.is_dir():
+        return row
+    # The root held open by the live native Codex process is authoritative. This
+    # updates the durable mapping after an intentional /new instead of keeping a
+    # still-valid but no-longer-active older root forever.
+    resume_uuid = _active_session_root_thread_id(session_name, owner_id)
+    if not resume_uuid:
+        resume_uuid = _validated_session_root_thread_id(
+            session_name, row.get("resume_uuid"), owner_id
+        )
+    try:
+        checkpointed = _session_lifecycle.checkpoint_active(
+            session_name,
+            cwd=str(cwd_path.resolve()),
+            owner_id=owner_id,
+            resume_uuid=resume_uuid or "",
+            source=source,
+            expected_generation=str(row.get("generation") or ""),
+        )
+        generation = str(checkpointed.get("generation") or "")
+        if not generation or not _mark_tmux_session_managed(
+            session_name, owner_id, generation
+        ):
+            logger.error("Could not bind tmux generation for '%s'", session_name)
+            return row
+        return checkpointed
+    except Exception:
+        logger.exception("Could not checkpoint durable session '%s'", session_name)
+        return row
+
+
+async def _checkpoint_active_session_serialized(
+    session_name: str, *, source: str, expected_owner_id: str = ""
+) -> dict:
+    """Checkpoint one live tab without racing a tmux server replacement."""
+    try:
+        async with _async_tmux_server_mutation_lock():
+            with _session_operation_lock(session_name):
+                return await asyncio.to_thread(
+                    _checkpoint_active_session,
+                    session_name,
+                    source=source,
+                    expected_owner_id=expected_owner_id,
+                )
+    except (_TmuxMutationBusy, _SessionOperationBusy):
+        return _session_lifecycle.get(session_name)
+
+
+def _checkpoint_live_sessions(
+    *, source: str = "controller", owner_id: str = ""
+) -> int:
+    checkpointed = 0
+    owners = _load_session_owners()
+    for session_name in sorted(_live_tmux_session_names()):
+        session_owner_id = owners.get(session_name)
+        if not session_owner_id or (owner_id and session_owner_id != owner_id):
+            continue
+        try:
+            with _session_operation_lock(session_name):
+                if _load_session_owners().get(session_name) != session_owner_id:
+                    continue
+                row = _checkpoint_active_session(
+                    session_name,
+                    source=source,
+                    expected_owner_id=session_owner_id,
+                )
+        except _SessionOperationBusy:
+            continue
+        if row.get("restore_on_startup"):
+            checkpointed += 1
+    return checkpointed
+
+
+def _checkpoint_live_sessions_serialized(
+    *, source: str = "controller", owner_id: str = ""
+) -> int:
+    with _tmux_server_mutation_lock():
+        return _checkpoint_live_sessions(source=source, owner_id=owner_id)
+
+
+def _retire_unrecoverable_session_rows(live_names: set[str]) -> list[str]:
+    """Forget tabs whose tmux session is gone and that cannot be restored.
+
+    Recovery only runs here, at controller startup. A row that is not a
+    candidate now will not become one later, so leaving it on the books kept a
+    permanently "Restoring ..." tab in its owner's dashboard and a permanently
+    degraded readiness probe. Removing the row does not touch that session's
+    saved conversation or project files.
+    """
+    retired: list[str] = []
+    rows = _session_lifecycle.snapshot().get("sessions", {}) or {}
+    for session_name in sorted(rows):
+        row = rows.get(session_name) or {}
+        if (
+            session_name in live_names
+            or not _is_valid_session_name(session_name)
+            or not row.get("managed")
+            or row.get("parked")
+            or row.get("restore_on_startup") is not True
+            or str(row.get("desired_state") or "") != "running"
+            or _session_row_is_recoverable(row)
+        ):
+            continue
+        try:
+            with _session_operation_lock(session_name):
+                if session_name in _live_tmux_session_names():
+                    continue
+                removed = _session_lifecycle.remove(
+                    session_name,
+                    expected_generation=str(row.get("generation") or ""),
+                    owner_id=str(row.get("owner_id") or ""),
+                )
+        except _SessionOperationBusy:
+            continue
+        except Exception:
+            logger.exception("Could not retire unrecoverable tab '%s'", session_name)
+            continue
+        if not removed:
+            continue
+        retired.append(session_name)
+        logger.warning(
+            "Retired tab '%s': its tmux session is gone and it carries no "
+            "resume thread to restore from",
+            session_name,
+        )
+    return retired
+
+
+def _prepare_durable_sessions_on_startup_tmux_locked() -> list[str]:
+    """Recreate missing tmux shells after the controller publishes readiness."""
+    _reconcile_provisional_tmux_sessions()
+    _checkpoint_live_sessions(source="controller-startup")
+    live_names = _live_tmux_session_names()
+    _retire_unrecoverable_session_rows(live_names)
+    prepared: list[str] = []
+    for candidate in _durable_session_candidates():
+        session_name = candidate["name"]
+        owner_id = candidate["owner_id"]
+        try:
+            with _session_operation_lock(session_name):
+                if not _durable_candidate_still_current(candidate):
+                    continue
+                if session_name in live_names:
+                    if _tmux_session_matches_owner(
+                        session_name, owner_id, candidate["generation"]
+                    ):
+                        prepared.append(session_name)
+                    else:
+                        logger.error(
+                            "Refusing durable recovery for '%s': exact tmux name collision",
+                            session_name,
+                        )
+                    continue
+                if not _strict_session_owner(session_name, owner_id):
+                    continue
+                if not _restore_parked_tmux_shell(
+                    session_name,
+                    candidate["lifecycle"],
+                    expected_owner_id=owner_id,
+                    expected_generation=candidate["generation"],
+                    expected_desired_states={"running"},
+                ):
+                    logger.error("Could not recreate durable tmux tab '%s'", session_name)
+                    continue
+                if not _durable_candidate_still_current(candidate):
+                    continue
+                _session_lifecycle.checkpoint_active(
+                    session_name,
+                    cwd=candidate["cwd"],
+                    owner_id=owner_id,
+                    resume_uuid=candidate["resume_uuid"],
+                    source="startup-shell-restore",
+                    expected_generation=candidate["generation"],
+                )
+                live_names.add(session_name)
+                prepared.append(session_name)
+                logger.warning("Recreated durable tmux tab '%s' after restart", session_name)
+        except _SessionOperationBusy:
+            logger.debug("Durable tmux '%s' is already being mutated", session_name)
+        except Exception:
+            logger.exception(
+                "Durable tmux preparation failed for '%s'; leaving it for retry",
+                session_name,
+            )
+    return prepared
+
+
+def _prepare_durable_sessions_on_startup() -> list[str]:
+    with _tmux_server_mutation_lock():
+        return _prepare_durable_sessions_on_startup_tmux_locked()
+
+
+async def _resume_one_durable_session_tmux_locked(
+    candidate: dict,
+    semaphore: asyncio.Semaphore,
+    *,
+    stop_on_shutdown: bool = False,
+) -> bool:
+    async with semaphore:
+        if stop_on_shutdown and _shutting_down:
+            return False
+        session_name = candidate["name"]
+        owner_id = candidate["owner_id"]
+        try:
+            with _session_operation_lock(session_name):
+                if not await asyncio.to_thread(
+                    _durable_candidate_still_current, candidate
+                ):
+                    return False
+                live_names = await asyncio.to_thread(_live_tmux_session_names)
+                if session_name not in live_names:
+                    restored = await asyncio.to_thread(
+                        _restore_parked_tmux_shell,
+                        session_name,
+                        candidate["lifecycle"],
+                        owner_id,
+                        candidate["generation"],
+                        {"running"},
+                    )
+                    if not restored:
+                        return False
+                if not await asyncio.to_thread(
+                    _tmux_session_matches_owner,
+                    session_name,
+                    owner_id,
+                    candidate["generation"],
+                ):
+                    return False
+                if not await asyncio.to_thread(
+                    _durable_candidate_still_current, candidate
+                ):
+                    return False
+                if await _async_is_codex_running(session_name):
+                    await asyncio.to_thread(
+                        _checkpoint_active_session,
+                        session_name,
+                        source="durable-already-running",
+                    )
+                    return True
+                resumed = await _ensure_codex_running(
+                    session_name,
+                    resume_uuid=candidate["resume_uuid"],
+                    resume_cwd=candidate["cwd"],
+                    expected_owner_id=owner_id,
+                    expected_generation=candidate["generation"],
+                    expected_desired_states={"running"},
+                    operation_locked=True,
+                    tmux_locked=True,
+                )
+                if not resumed:
+                    logger.error("Durable Codex resume failed for '%s'; will retry", session_name)
+                    return False
+                if not await asyncio.to_thread(
+                    _durable_candidate_still_current, candidate
+                ):
+                    return False
+                await asyncio.to_thread(
+                    _session_lifecycle.checkpoint_active,
+                    session_name,
+                    cwd=candidate["cwd"],
+                    owner_id=owner_id,
+                    resume_uuid=candidate["resume_uuid"],
+                    source="startup-codex-resume",
+                    expected_generation=candidate["generation"],
+                )
+                _seen_claude_running.add(session_name)
+                return True
+        except _SessionOperationBusy:
+            logger.debug("Durable Codex '%s' is already being mutated", session_name)
+            return False
+        except Exception:
+            logger.exception("Durable Codex resume failed for '%s'", session_name)
+            return False
+
+
+async def _resume_one_durable_session(
+    candidate: dict,
+    semaphore: asyncio.Semaphore,
+    *,
+    stop_on_shutdown: bool = False,
+) -> bool:
+    try:
+        async with _async_tmux_server_mutation_lock():
+            return await _resume_one_durable_session_tmux_locked(
+                candidate,
+                semaphore,
+                stop_on_shutdown=stop_on_shutdown,
+            )
+    except _TmuxMutationBusy:
+        logger.debug(
+            "Durable Codex '%s' is waiting for the tmux mutation fence",
+            candidate.get("name", ""),
+        )
+        return False
+
+
+async def _resume_durable_sessions_once() -> tuple[int, int]:
+    candidates = await asyncio.to_thread(_durable_session_candidates)
+    semaphore = asyncio.Semaphore(2)
+    results = await asyncio.gather(
+        *(
+            _resume_one_durable_session(candidate, semaphore)
+            for candidate in candidates
+        ),
+        return_exceptions=True,
+    )
+    recovered = sum(result is True for result in results)
+    failed = len(results) - recovered
+    return recovered, failed
+
+
+_durable_reconcile_lock = asyncio.Lock()
+_manual_durable_reconcile_jobs: dict[str, dict] = {}
+_manual_durable_reconcile_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _run_durable_session_reconciliation(
+    *, source: str, owner_id: str = ""
+) -> dict:
+    """Run one serialized, owner-scoped durable recovery pass.
+
+    The automatic loop uses the same fence as the admin recovery button so two
+    passes cannot race and turn a harmless per-session lock collision into a
+    false failure. Targets still come exclusively from the validated durable
+    registry; callers cannot supply a cwd, generation, or Codex root.
+    """
+    async with _durable_reconcile_lock:
+        checkpointed = await asyncio.to_thread(
+            _checkpoint_live_sessions_serialized, source=source, owner_id=owner_id
+        )
+        before_live = await asyncio.to_thread(_live_tmux_session_names)
+        candidates = await asyncio.to_thread(_durable_session_candidates)
+        if owner_id:
+            candidates = [
+                candidate for candidate in candidates
+                if candidate.get("owner_id") == owner_id
+            ]
+        candidate_names = [str(candidate["name"]) for candidate in candidates]
+        before_running = {
+            name: await _async_is_codex_running(name)
+            for name in candidate_names
+        }
+
+        # Preserve the established automatic sequence. An owner-scoped manual
+        # pass lets _resume_one_durable_session recreate only that owner's
+        # missing shells rather than preparing another account's tabs too.
+        prepared: list[str] = []
+        if not owner_id:
+            prepared = await asyncio.to_thread(_prepare_durable_sessions_on_startup)
+
+        semaphore = asyncio.Semaphore(2)
+        results = await asyncio.gather(
+            *(
+                _resume_one_durable_session(
+                    candidate, semaphore, stop_on_shutdown=True
+                )
+                for candidate in candidates
+            ),
+            return_exceptions=True,
+        )
+        ready = sorted(
+            name for name, result in zip(candidate_names, results)
+            if result is True
+        )
+        result_by_name = dict(zip(candidate_names, results))
+        after_live = await asyncio.to_thread(_live_tmux_session_names)
+        already_ready = sorted(
+            name for name in ready if name in before_live and before_running.get(name)
+        )
+        restored = sorted(
+            name for name in ready if name not in before_live
+        )
+        restarted = sorted(
+            name for name in ready
+            if name in before_live and not before_running.get(name)
+        )
+
+        lifecycle_rows = (
+            await asyncio.to_thread(_session_lifecycle.snapshot)
+        ).get("sessions", {}) or {}
+        tracked = sorted(
+            name for name, row in lifecycle_rows.items()
+            if (
+                (not owner_id or str((row or {}).get("owner_id") or "") == owner_id)
+                and (row or {}).get("managed")
+                and (row or {}).get("restore_on_startup") is True
+                and str((row or {}).get("desired_state") or "") == "running"
+            )
+        )
+        pending = sorted(
+            set(tracked).difference(candidate_names)
+            | {
+                name for name in candidate_names
+                if result_by_name.get(name) is not True
+            }
+        )
+        await _activate_pending_autonomous_modes(owner_id=owner_id)
+        return {
+            "ok": not pending,
+            "source": source,
+            "checkpointed": checkpointed,
+            "eligible": sorted(candidate_names),
+            "prepared": sorted(prepared),
+            "shells_recreated": sorted(
+                set(after_live).difference(before_live).intersection(candidate_names)
+            ),
+            "already_ready": already_ready,
+            "restored": restored,
+            "restarted": restarted,
+            "ready": ready,
+            "pending": pending,
+        }
+
+
+def _public_durable_reconcile_job(job: dict) -> dict:
+    """Return only UI-safe recovery state; lifecycle bindings stay private."""
+    return {
+        key: job.get(key)
+        for key in (
+            "id", "status", "requested_at", "started_at", "finished_at",
+            "checkpointed", "eligible", "shells_recreated", "already_ready",
+            "restored", "restarted", "ready", "pending", "error",
+        )
+    }
+
+
+async def _run_manual_durable_reconcile_job(owner_id: str, job: dict) -> None:
+    job["status"] = "running"
+    job["started_at"] = time.time()
+    try:
+        result = await _run_durable_session_reconciliation(
+            source="admin-manual-recovery", owner_id=owner_id
+        )
+        job.update(result)
+        job["status"] = "completed"
+    except asyncio.CancelledError:
+        job.update({"status": "failed", "error": "Tab recovery was interrupted"})
+        raise
+    except Exception:
+        logger.exception("Manual durable tab recovery failed")
+        job.update({"status": "failed", "error": "Tab recovery failed"})
+    finally:
+        job["finished_at"] = time.time()
+
+
+async def _start_manual_durable_reconcile(owner_id: str) -> dict:
+    if _shutting_down:
+        return {
+            "ok": False,
+            "error": "Dashboard is shutting down",
+            "_status": 503,
+        }
+    existing = _manual_durable_reconcile_jobs.get(owner_id) or {}
+    task = _manual_durable_reconcile_tasks.get(owner_id)
+    if existing.get("status") in {"queued", "running"} and task and not task.done():
+        return {
+            "ok": True,
+            "accepted": False,
+            "job": _public_durable_reconcile_job(existing),
+            "_status": 202,
+        }
+    now = time.time()
+    job = {
+        "id": secrets.token_urlsafe(18),
+        "status": "queued",
+        "requested_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "checkpointed": 0,
+        "eligible": [],
+        "shells_recreated": [],
+        "already_ready": [],
+        "restored": [],
+        "restarted": [],
+        "ready": [],
+        "pending": [],
+        "error": "",
+    }
+    _manual_durable_reconcile_jobs[owner_id] = job
+    _manual_durable_reconcile_tasks[owner_id] = asyncio.create_task(
+        _run_manual_durable_reconcile_job(owner_id, job)
+    )
+    return {
+        "ok": True,
+        "accepted": True,
+        "job": _public_durable_reconcile_job(job),
+        "_status": 202,
+    }
+
+
+def _manual_durable_reconcile_status(owner_id: str, job_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", str(job_id or "")):
+        return {"ok": False, "error": "Recovery job not found", "_status": 404}
+    job = _manual_durable_reconcile_jobs.get(owner_id) or {}
+    if not job or not hmac.compare_digest(str(job.get("id") or ""), job_id):
+        return {"ok": False, "error": "Recovery job not found", "_status": 404}
+    return {"ok": True, "job": _public_durable_reconcile_job(job), "_status": 200}
+
+
+async def _durable_session_rehydration_loop() -> None:
+    await asyncio.sleep(_DURABLE_SESSION_REHYDRATE_INTERVAL)
+    while True:
+        try:
+            report = await _run_durable_session_reconciliation(
+                source="durable-rehydration"
+            )
+            if report["pending"]:
+                logger.info(
+                    "Durable session reconciliation complete: %d ready, %d pending",
+                    len(report["ready"]),
+                    len(report["pending"]),
+                )
+            await asyncio.sleep(_DURABLE_SESSION_REHYDRATE_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Durable session reconciliation failed; will retry")
+            await asyncio.sleep(_DURABLE_SESSION_REHYDRATE_INTERVAL)
+
+
+async def _park_session_local_unlocked(session_name: str, last_activity: float) -> dict:
     """Checkpoint by gracefully exiting Codex; tmux, Git and rollouts remain intact."""
-    if _terminal_channels.get(session_name, {}).get("writers"):
+    if _terminal_session_has_writers(session_name):
         return {"ok": False, "skipped": "terminal is being viewed"}
     if _session_has_autonomous_work(session_name):
         return {"ok": False, "skipped": "autonomous work is enabled"}
@@ -8660,9 +13892,53 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
         return {"ok": False, "skipped": f"session is {activity.get('status', 'unknown')}"}
     scrollback_file = await asyncio.to_thread(_archive_tmux_scrollback, session_name)
     session_cwd = await asyncio.to_thread(get_session_cwd, session_name)
+    owner_binding = _strict_session_owner(session_name)
+    if not owner_binding:
+        return {"ok": False, "error": "session owner is not durably recorded"}
+    owner_id, owner = owner_binding
+    await asyncio.to_thread(
+        _checkpoint_active_session, session_name, source="park-transition"
+    )
+    lifecycle = _session_lifecycle.get(session_name)
+    generation = str(lifecycle.get("generation") or "")
+    active_root = _active_session_root_thread_id(session_name, owner_id)
+    resume_uuid = _validated_session_root_thread_id(
+        session_name, lifecycle.get("resume_uuid"), owner_id
+    )
+    safe_cwd = _durable_session_cwd(session_name, lifecycle, owner)
+    live_cwd = _resolved_real_directory(Path(session_cwd)) if session_cwd else None
+    if (
+        not generation
+        or str(lifecycle.get("desired_state") or "") != "running"
+        or not resume_uuid
+        or active_root != resume_uuid
+        or not safe_cwd
+        or not live_cwd
+        or str(live_cwd) != safe_cwd
+    ):
+        return {"ok": False, "error": "session lifecycle is not safely checkpointed"}
+    session_cwd = safe_cwd
+    session_id = await asyncio.to_thread(_exact_tmux_session_id, session_name)
+    if not session_id or not await asyncio.to_thread(
+        _tmux_session_matches_owner, session_name, owner_id, generation
+    ):
+        return {"ok": False, "error": "tmux session owner could not be verified"}
+    try:
+        await asyncio.to_thread(
+            _session_lifecycle.begin_transition,
+            session_name,
+            owner_id=owner_id,
+            desired_state="parking",
+            expected_generation=generation,
+            expected_desired_states={"running"},
+        )
+    except Exception:
+        logger.exception("Could not persist park intent for '%s'", session_name)
+        return {"ok": False, "error": "could not safely checkpoint park intent"}
+    pane_target = f"{session_id}:"
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "set-option", "-pt", session_name, "remain-on-exit", "on"],
+        ["tmux", "set-option", "-pt", pane_target, "remain-on-exit", "on"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -8675,19 +13951,25 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
             last_activity=last_activity,
             cwd=session_cwd,
             scrollback_file=scrollback_file,
+            owner_id=owner_id,
+            expected_generation=generation,
+            expected_desired_states={"parking"},
         )
         return {"ok": True, "parked": True, "session": row}
 
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+        ["tmux", "send-keys", "-t", pane_target, "-l", "/quit"],
         capture_output=True,
         text=True,
         timeout=5,
     )
+    # Codex coalesces a rapid literal burst as a paste. Give its composer time
+    # to finish that burst before Enter, or /quit remains typed but unsubmitted.
+    await asyncio.sleep(1.0)
     await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
+        ["tmux", "send-keys", "-t", pane_target, "Enter"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -8701,7 +13983,7 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
         # accepts /quit. This is used only after an idle re-check.
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "C-c"],
+            ["tmux", "send-keys", "-t", pane_target, "C-c"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -8709,14 +13991,15 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
         await asyncio.sleep(0.5)
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
+            ["tmux", "send-keys", "-t", pane_target, "-l", "/quit"],
             capture_output=True,
             text=True,
             timeout=5,
         )
+        await asyncio.sleep(1.0)
         await asyncio.to_thread(
             subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            ["tmux", "send-keys", "-t", pane_target, "Enter"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -8726,6 +14009,14 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
             if not await _async_is_codex_running(session_name):
                 break
     if await _async_is_codex_running(session_name):
+        await asyncio.to_thread(
+            _session_lifecycle.mark_resumed,
+            session_name,
+            source="park-failed",
+            owner_id=owner_id,
+            expected_generation=generation,
+            expected_desired_states={"parking"},
+        )
         return {"ok": False, "error": "Codex did not exit cleanly; left running"}
     row = await asyncio.to_thread(
         _session_lifecycle.mark_parked,
@@ -8734,35 +14025,171 @@ async def _park_session_local(session_name: str, last_activity: float) -> dict:
         last_activity=last_activity,
         cwd=session_cwd,
         scrollback_file=scrollback_file,
+        owner_id=owner_id,
+        expected_generation=generation,
+        expected_desired_states={"parking"},
     )
     _seen_claude_running.discard(session_name)
     logger.info("Parked inactive Codex session '%s' without removing tmux or state", session_name)
     return {"ok": True, "parked": True, "session": row}
 
 
-async def _resume_parked_session(session_name: str, source: str = "dashboard") -> dict:
+async def _park_session_local(session_name: str, last_activity: float) -> dict:
+    try:
+        async with _async_tmux_server_mutation_lock():
+            with _session_operation_lock(session_name):
+                return await _park_session_local_unlocked(session_name, last_activity)
+    except _SessionOperationBusy:
+        return {"ok": False, "skipped": "session lifecycle operation is in progress"}
+    except _TmuxMutationBusy:
+        return {"ok": False, "skipped": "tmux lifecycle operation is in progress"}
+
+
+_SESSION_CONVERSATION_INPUT_SOURCES = frozenset({
+    "away-mode",
+    "go-nuts-mode",
+})
+
+
+def _source_records_conversation_input(source: str) -> bool:
+    return str(source or "") in _SESSION_CONVERSATION_INPUT_SOURCES
+
+
+async def _resume_parked_session_unlocked(
+    session_name: str,
+    source: str = "dashboard",
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+) -> dict:
+    if expected_owner_id and not _strict_session_owner(
+        session_name, expected_owner_id
+    ):
+        return {"ok": False, "error": "session owner changed"}
+    if expected_generation and not _session_lifecycle.matches(
+        session_name,
+        generation=expected_generation,
+        owner_id=expected_owner_id,
+    ):
+        return {"ok": False, "error": "session generation changed"}
     row = await asyncio.to_thread(
-        _session_lifecycle.touch, session_name, source=source
+        _session_lifecycle.touch,
+        session_name,
+        source=source,
+        records_input=_source_records_conversation_input(source),
     )
+    if expected_generation and (
+        str(row.get("generation") or "") != expected_generation
+        or str(row.get("owner_id") or "") != expected_owner_id
+    ):
+        return {"ok": False, "error": "session generation changed"}
     if not row.get("parked"):
+        if session_name in await asyncio.to_thread(_live_tmux_session_names):
+            row = await asyncio.to_thread(
+                _checkpoint_active_session,
+                session_name,
+                source=f"{source}-checkpoint",
+            )
         return {"ok": True, "parked": False, "resumed": False, "session": row}
-    if row.get("virtual") or _pane_is_dead(session_name):
+    owner_binding = _strict_session_owner(session_name, expected_owner_id)
+    if not owner_binding:
+        return {"ok": False, "error": "session owner is not durably recorded"}
+    owner_id, owner = owner_binding
+    generation = str(row.get("generation") or "")
+    if row.get("resume_uuid"):
+        safe_cwd = _durable_session_cwd(session_name, row, owner)
+        if not safe_cwd:
+            return {"ok": False, "error": "parked session worktree is no longer safe"}
+        row = {**row, "cwd": safe_cwd}
+    parked_states = {"parked", "parking"}
+    tmux_missing = session_name not in await asyncio.to_thread(
+        _live_tmux_session_names
+    )
+    if row.get("virtual") or tmux_missing or _pane_is_dead(session_name):
         restored = await asyncio.to_thread(
-            _restore_parked_tmux_shell, session_name, row
+            _restore_parked_tmux_shell,
+            session_name,
+            row,
+            owner_id,
+            generation,
+            parked_states if generation else None,
         )
         if not restored:
             return {"ok": False, "error": "parked tmux shell could not be restored"}
     if not _find_session(session_name)[1]:
         return {"ok": False, "error": "session not found"}
-    resumed = await _ensure_codex_running(session_name)
+    resumed = await _ensure_codex_running(
+        session_name,
+        resume_uuid=str(row.get("resume_uuid") or "") or None,
+        resume_cwd=str(row.get("cwd") or "") or None,
+        expected_owner_id=owner_id,
+        expected_generation=generation,
+        expected_desired_states=parked_states if generation else None,
+        operation_locked=True,
+        tmux_locked=True,
+    )
     if not resumed:
         return {"ok": False, "error": "Codex resume failed; tmux and state are intact"}
     row = await asyncio.to_thread(
-        _session_lifecycle.mark_resumed, session_name, source=source
+        _session_lifecycle.mark_resumed,
+        session_name,
+        source=source,
+        records_input=_source_records_conversation_input(source),
+        owner_id=owner_id,
+        expected_generation=generation,
+        expected_desired_states=parked_states if generation else None,
     )
     _seen_claude_running.add(session_name)
     logger.info("Resumed parked Codex session '%s' on demand", session_name)
     return {"ok": True, "parked": False, "resumed": True, "session": row}
+
+
+async def _resume_parked_session(
+    session_name: str,
+    source: str = "dashboard",
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_incarnation: str = "",
+    *,
+    autopush_guard: bool = False,
+) -> dict:
+    try:
+        async with _async_tmux_server_mutation_lock():
+            with _session_operation_lock(session_name):
+                if autopush_guard:
+                    async with _autopush_action_lock(session_name):
+                        if (
+                            _get_autopush_mode(session_name) == "off"
+                            or not _autopush_identity_matches(
+                                session_name,
+                                expected_owner_id,
+                                expected_generation,
+                                expected_incarnation,
+                            )
+                        ):
+                            return {
+                                "ok": False,
+                                "error": "auto-push is Off or session identity changed",
+                            }
+                        return await _await_task_drain_on_cancel(
+                            asyncio.create_task(
+                                _resume_parked_session_unlocked(
+                                    session_name,
+                                    source,
+                                    expected_owner_id,
+                                    expected_generation,
+                                )
+                            )
+                        )
+                return await _resume_parked_session_unlocked(
+                    session_name,
+                    source,
+                    expected_owner_id,
+                    expected_generation,
+                )
+    except _SessionOperationBusy:
+        return {"ok": False, "error": "session lifecycle operation is in progress"}
+    except _TmuxMutationBusy:
+        return {"ok": False, "error": "tmux lifecycle operation is in progress"}
 
 
 async def _session_lifecycle_loop() -> None:
@@ -8773,10 +14200,15 @@ async def _session_lifecycle_loop() -> None:
             sessions = await asyncio.to_thread(get_tmux_sessions)
             for session in sessions:
                 name = session["name"]
+                if not session.get("virtual"):
+                    await _checkpoint_active_session_serialized(
+                        name,
+                        source="session-lifecycle",
+                    )
                 lifecycle = _session_lifecycle.get(name)
                 if lifecycle.get("parked") or _session_has_autonomous_work(name):
                     continue
-                if _terminal_channels.get(name, {}).get("writers"):
+                if _terminal_session_has_writers(name):
                     continue
                 last_activity = await asyncio.to_thread(
                     _session_last_activity, name, float(session.get("created") or 0)
@@ -8833,22 +14265,118 @@ async def _controller_snapshot_loop() -> None:
 
 async def _controller_dispatch(message: dict) -> dict:
     op = str(message.get("op") or "")
+    if op == "voice_supervision":
+        name = str(message.get("session") or "")
+        cookie = str(message.get("cookie") or "")
+        state = message.get("state")
+        if not isinstance(state, dict) or not _is_valid_session_name(name):
+            return {"ok": False}
+        request = Request({"type": "http", "method": "POST", "path": "/",
+                           "headers": [(b"cookie", cookie.encode("latin1"))], "state": state})
+        user = voice_mode.fresh_user(sys.modules[__name__], request)
+        if not user or not _voice_supervision_available(name):
+            return {"ok": False}
+        _, restarted = await _restart_codex_for_session(name, expected_owner_id=str(user["id"]),
+            expected_generation=str((state.get("voice_target_binding") or {}).get("generation") or ""),
+            voice_request=request)
+        return {"ok": restarted}
     if op == "ping":
         return {"ok": True, "pid": os.getpid(), "role": PROCESS_ROLE}
     if op == "runtime":
         return {"ok": True, **_controller_runtime_data()}
+    if op == "chat_refresh":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
+        if not owner_id or not _strict_session_owner(session_name, owner_id):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+        rows = await _refresh_session_chat(session_name, owner_id)
+        if not _chat_binding_matches(session_name, owner_id, generation):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        return {"ok": True, "messages": rows}
+    if op == "session_input_check":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
+        if owner_id and not _strict_session_owner(session_name, owner_id):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        row = {}
+        if message.get("records_input"):
+            row = await asyncio.to_thread(
+                _session_lifecycle.touch,
+                session_name,
+                source=str(message.get("source") or "session-input"),
+                records_input=True,
+            )
+        return {"ok": True, "session": row, "_status": 200}
     if op == "session_touch":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
+        if owner_id and not _strict_session_owner(session_name, owner_id):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        source = str(message.get("source") or "dashboard")
         row = await asyncio.to_thread(
             _session_lifecycle.touch,
-            str(message.get("session") or ""),
-            source=str(message.get("source") or "dashboard"),
+            session_name,
+            source=source,
+            records_input=_source_records_conversation_input(source),
         )
+        if (
+            not row.get("parked")
+            and session_name in await asyncio.to_thread(_live_tmux_session_names)
+        ):
+            row = await _checkpoint_active_session_serialized(
+                session_name,
+                source="dashboard-interaction",
+            )
         return {"ok": True, "session": row}
     if op == "session_resume":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
         return await _resume_parked_session(
-            str(message.get("session") or ""),
+            session_name,
             source=str(message.get("source") or "dashboard"),
+            expected_owner_id=owner_id,
         )
+    if op in {"durable_reconcile_start", "durable_reconcile_status"}:
+        owner_id = str(message.get("owner_id") or "")
+        owner = _find_user_by_id(owner_id)
+        if not owner or not _is_admin(owner):
+            return {"ok": False, "error": "Admin only", "_status": 403}
+        if op == "durable_reconcile_start":
+            return await _start_manual_durable_reconcile(owner_id)
+        return _manual_durable_reconcile_status(
+            owner_id, str(message.get("job_id") or "")
+        )
+    if op == "session_delete":
+        session_name = str(message.get("session") or "")
+        owner_id = str(message.get("owner_id") or "")
+        owner = _find_user_by_id(owner_id)
+        if not owner or not _strict_session_owner(session_name, owner_id):
+            return {"ok": False, "error": "Session owner changed", "_status": 409}
+        try:
+            async with _async_tmux_server_mutation_lock():
+                with _session_operation_lock(session_name):
+                    response = await _api_delete_session_unlocked(
+                        None, session_name, expected_user=owner
+                    )
+        except _SessionOperationBusy:
+            return {
+                "ok": False,
+                "error": "Session lifecycle operation is in progress",
+                "_status": 409,
+            }
+        except _TmuxMutationBusy:
+            return {
+                "ok": False,
+                "error": "Tmux lifecycle operation is in progress",
+                "_status": 409,
+            }
+        try:
+            payload = json.loads(bytes(response.body).decode("utf-8"))
+        except Exception:
+            payload = {"error": "Session deletion returned an invalid response"}
+        payload["_status"] = int(response.status_code)
+        return payload
     if op == "session_register_virtual":
         name = str(message.get("session") or "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
@@ -8892,37 +14420,170 @@ async def _controller_dispatch(message: dict) -> dict:
         )
         return {"ok": stopped, "stopped": stopped}
     if op == "away_toggle":
+        name = str(message.get("session") or "")
         return await _away_toggle_local(
-            str(message.get("session") or ""), bool(message.get("enabled"))
+            name,
+            bool(message.get("enabled")),
+            expected_owner_id=str(message.get("owner_id") or ""),
+            expected_generation=str(message.get("generation") or ""),
+            expected_incarnation=str(message.get("incarnation") or ""),
         )
     if op == "away_status":
-        return {"ok": True, **_away_state_summary(
-            _away_mode_state.get(str(message.get("session") or ""), {})
-        )}
+        name = str(message.get("session") or "")
+        expected_owner_id = str(message.get("owner_id") or "")
+        expected_generation = str(message.get("generation") or "")
+        if not _autopush_identity_matches(
+            name,
+            expected_owner_id,
+            expected_generation,
+        ):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        state = _away_mode_state.get(name, {})
+        if not _autonomous_state_matches_identity(
+            state, expected_owner_id, expected_generation
+        ):
+            state = {}
+        return {"ok": True, **_away_state_summary(state)}
     if op == "go_nuts_toggle":
+        name = str(message.get("session") or "")
         return await _go_nuts_toggle_local(
-            str(message.get("session") or ""), bool(message.get("enabled"))
+            name,
+            bool(message.get("enabled")),
+            expected_owner_id=str(message.get("owner_id") or ""),
+            expected_generation=str(message.get("generation") or ""),
+            expected_incarnation=str(message.get("incarnation") or ""),
         )
     if op == "go_nuts_status":
-        return {"ok": True, **_go_nuts_state_summary(
-            _go_nuts_state.get(str(message.get("session") or ""), {})
-        )}
+        name = str(message.get("session") or "")
+        expected_owner_id = str(message.get("owner_id") or "")
+        expected_generation = str(message.get("generation") or "")
+        if not _autopush_identity_matches(
+            name,
+            expected_owner_id,
+            expected_generation,
+        ):
+            return {"ok": False, "error": "Session not found", "_status": 404}
+        state = _go_nuts_state.get(name, {})
+        if not _autonomous_state_matches_identity(
+            state, expected_owner_id, expected_generation
+        ):
+            state = {}
+        return {"ok": True, **_go_nuts_state_summary(state)}
     if op == "watchdog_status":
         name = str(message.get("session") or "")
+        expected_owner_id = str(message.get("owner_id") or "")
+        expected_generation = str(message.get("generation") or "")
+        if not _autopush_identity_matches(
+            name, expected_owner_id, expected_generation
+        ):
+            return {"ok": False, "error": "Session not found", "_status": 404}
         return {
             "ok": True,
             "mode": _get_autopush_mode(name),
             "log": list(_simple_watchdog_log.get(name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
         }
+    if op == "autopush_reset":
+        name = str(message.get("session") or "")
+        expected_owner_id = str(message.get("owner_id") or "")
+        expected_generation = str(message.get("generation") or "")
+        async with _autopush_action_lock(name):
+            if not _autopush_identity_matches(
+                name, expected_owner_id, expected_generation
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            _autonomous_toggle_revision[name] = (
+                _autonomous_toggle_revision.get(name, 0) + 1
+            )
+            _pending_autonomous_state.pop(name, None)
+            for state in (_away_mode_state.get(name), _go_nuts_state.get(name)):
+                if not state:
+                    continue
+                state["enabled"] = False
+                task = state.get("task")
+                if task and not task.done():
+                    task.cancel()
+            _away_mode_state.pop(name, None)
+            _go_nuts_state.pop(name, None)
+            _simple_watchdog_log.pop(name, None)
+            _watchdog_snapshots.pop(name, None)
+            if not await _save_autonomous_state_async():
+                return {
+                    "ok": False,
+                    "error": "could not reset autonomous mode",
+                    "_status": 503,
+                }
+            async with _autopush_store_lock:
+                previous = _autopush_mode.get(name)
+                _autopush_mode[name] = AUTOPUSH_DEFAULT
+                try:
+                    await _to_thread_drain_on_cancel(_save_autopush_mode)
+                except Exception:
+                    loaded = await _reload_autopush_mode_after_write_error()
+                    if not loaded or _get_autopush_mode(name) != AUTOPUSH_DEFAULT:
+                        if previous is None:
+                            _autopush_mode.pop(name, None)
+                        else:
+                            _autopush_mode[name] = previous
+                        return {"ok": False, "error": "could not reset auto-push mode", "_status": 503}
+        return {"ok": True, "mode": AUTOPUSH_DEFAULT}
     if op == "autopush_set":
         name = str(message.get("session") or "")
+        expected_owner_id = str(message.get("owner_id") or "")
+        expected_generation = str(message.get("generation") or "")
+        expected_incarnation = str(message.get("incarnation") or "")
         mode = str(message.get("mode") or "").lower()
         if mode not in AUTOPUSH_MODES:
             return {"ok": False, "error": f"mode must be one of {list(AUTOPUSH_MODES)}", "_status": 400}
-        _autopush_mode[name] = mode
-        _save_autopush_mode()
-        if mode != "full":
-            _simple_watchdog_state.pop(name, None)
+        async with _autopush_action_lock(name):
+            if not _autopush_identity_matches(
+                name,
+                expected_owner_id,
+                expected_generation,
+                expected_incarnation,
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            previous_effective = _get_autopush_mode(name)
+            if mode == "off" or previous_effective == "off":
+                # Make the autonomous tombstone durable before acknowledging
+                # Off or allowing a later non-Off mode to be restored.
+                _autonomous_toggle_revision[name] = (
+                    _autonomous_toggle_revision.get(name, 0) + 1
+                )
+                _pending_autonomous_state.pop(name, None)
+                if mode == "off":
+                    for state in (
+                        _away_mode_state.get(name), _go_nuts_state.get(name)
+                    ):
+                        if not state:
+                            continue
+                        state["enabled"] = False
+                        task = state.get("task")
+                        if task and not task.done():
+                            task.cancel()
+                if not await _save_autonomous_state_async():
+                    return {
+                        "ok": False,
+                        "error": "could not persist autonomous stop state",
+                        "_status": 503,
+                    }
+            async with _autopush_store_lock:
+                previous = _autopush_mode.get(name)
+                _autopush_mode[name] = mode
+                try:
+                    await _to_thread_drain_on_cancel(_save_autopush_mode)
+                except Exception:
+                    logger.exception("Failed to persist auto-push mode for '%s'", name)
+                    # os.replace can succeed before a directory fsync reports an
+                    # error. Re-read the file rather than guessing which side won.
+                    loaded = await _reload_autopush_mode_after_write_error()
+                    if not loaded or _get_autopush_mode(name) != mode:
+                        if previous is None:
+                            _autopush_mode.pop(name, None)
+                        else:
+                            _autopush_mode[name] = previous
+                        return {"ok": False, "error": "could not persist auto-push mode", "_status": 503}
+            if mode != "full":
+                _simple_watchdog_state.pop(name, None)
         return {
             "ok": True,
             "mode": mode,
@@ -8932,21 +14593,345 @@ async def _controller_dispatch(message: dict) -> dict:
     return {"ok": False, "error": f"unknown controller operation: {op}"}
 
 
+def _proc_parent_and_start(
+    pid: int, proc_root: Path = Path("/proc")
+) -> tuple[int, str]:
+    """Read PPID and process start jiffies without being confused by comm spaces."""
+    raw = (proc_root / str(int(pid)) / "stat").read_text()
+    close = raw.rfind(")")
+    if close < 0:
+        raise ValueError("invalid /proc stat")
+    fields = raw[close + 2 :].split()
+    if len(fields) < 20:
+        raise ValueError("short /proc stat")
+    return int(fields[1]), fields[19]
+
+
+def _process_descends_from(
+    pid: int,
+    ancestor_pid: int,
+    ancestor_start: str = "",
+    proc_root: Path = Path("/proc"),
+) -> bool:
+    """Check a live Linux process ancestry chain, including PID reuse identity."""
+    current = int(pid)
+    ancestor = int(ancestor_pid)
+    if current <= 0 or ancestor <= 1:
+        return False
+    seen: set[int] = set()
+    for _ in range(128):
+        if current in seen or current <= 1:
+            return False
+        seen.add(current)
+        try:
+            parent, started = _proc_parent_and_start(current, proc_root)
+        except (OSError, ValueError):
+            return False
+        if current == ancestor:
+            return not ancestor_start or hmac.compare_digest(started, ancestor_start)
+        current = parent
+    return False
+
+
+def _controller_peer_credentials(writer: asyncio.StreamWriter) -> tuple[int, int, int]:
+    peer_socket = writer.get_extra_info("socket")
+    if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        raise PermissionError("peer credentials unavailable")
+    size = struct.calcsize("3i")
+    return struct.unpack(
+        "3i", peer_socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size)
+    )
+
+
+def _controller_peer_authorized(writer: asyncio.StreamWriter) -> bool:
+    """Allow only this controller or API workers descended from its main process."""
+    try:
+        peer_pid, peer_uid, _peer_gid = _controller_peer_credentials(writer)
+    except (OSError, PermissionError, TypeError, struct.error):
+        return False
+    if peer_uid != os.geteuid():
+        return False
+    if peer_pid == os.getpid():
+        return True
+    return _process_descends_from(
+        peer_pid, TRUSTED_MAIN_PID, TRUSTED_MAIN_START
+    )
+
+
+def _proc_environment(pid: int) -> dict[str, str]:
+    raw = (Path("/proc") / str(int(pid)) / "environ").read_bytes()
+    environment: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        environment[key.decode("utf-8", "replace")] = value.decode(
+            "utf-8", "replace"
+        )
+    return environment
+
+
+def _peer_tmux_session(peer_pid: int) -> str:
+    """Resolve an IPC peer to exactly one live dashboard tmux session.
+
+    The browser id in the proxy environment is caller-controlled.  The tmux
+    pane process tree is not: the controller resolves the kernel-authenticated
+    peer PID back to its pane and then uses the dashboard's persisted session
+    ownership map as the authority for the account/browser binding.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    matches: set[str] = set()
+    for line in (result.stdout or "").splitlines():
+        session_name, separator, pane_pid = line.partition("\t")
+        if (
+            not separator
+            or not _is_valid_session_name(session_name)
+            or not pane_pid.isdigit()
+        ):
+            continue
+        if _process_descends_from(peer_pid, int(pane_pid)):
+            matches.add(session_name)
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def _mapped_unix_account_name(user: dict | None) -> str:
+    """Return the configured runtime account without executing caller input."""
+    if (
+        not _uses_private_account_runtime(user)
+        or os.environ.get("TMUX_DASH_PER_USER_UNIX", "1") == "0"
+    ):
+        return ""
+    try:
+        mapping = json.loads(_account_unix_map_file().read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    return str(mapping.get(str(user.get("id") or ""), "") or "")
+
+
+def _browser_ipc_peer_binding(writer: asyncio.StreamWriter) -> dict | None:
+    """Return the server-derived session/account/browser identity for a peer."""
+    try:
+        peer_pid, peer_uid, _peer_gid = _controller_peer_credentials(writer)
+    except (OSError, PermissionError, TypeError, struct.error):
+        return None
+    session_name = _peer_tmux_session(peer_pid)
+    if not session_name:
+        return None
+    try:
+        owner_id = _load_session_owners().get(session_name, "")
+        user = _find_user_by_id(owner_id) if owner_id else None
+    except Exception:
+        return None
+    if not user:
+        return None
+
+    unix_account = _mapped_unix_account_name(user)
+    if unix_account:
+        try:
+            expected_uid = pwd.getpwnam(unix_account).pw_uid
+        except KeyError:
+            return None
+        if peer_uid != expected_uid:
+            return None
+    elif peer_uid != os.geteuid():
+        return None
+
+    expected_browser = (
+        _tenant_browser_id(user)
+        if _uses_private_account_runtime(user)
+        else str(_DEFAULT_BROWSER_SESSION["id"])
+    )
+    browser = _browser_session_by_id(expected_browser)
+    if (
+        not browser
+        or not browser.get("account_browser")
+        or _browser_owner_id(browser) != str(user.get("id") or "")
+    ):
+        return None
+    try:
+        _parent_pid, peer_start = _proc_parent_and_start(peer_pid)
+    except (OSError, ValueError):
+        return None
+    principal_digest = hashlib.sha256(
+        "\0".join(
+            (
+                session_name,
+                str(user.get("id") or ""),
+                expected_browser,
+                str(peer_uid),
+            )
+        ).encode("utf-8", "replace")
+    ).hexdigest()[:20]
+    return {
+        "peer_pid": peer_pid,
+        "peer_start": peer_start,
+        "peer_uid": peer_uid,
+        "session": session_name,
+        "user_id": str(user.get("id") or ""),
+        "browser_id": expected_browser,
+        "owner_prefix": f"playwright-mcp:{peer_pid}:",
+        "lease_owner": f"playwright-mcp:{peer_pid}:{peer_start}:{principal_digest}",
+    }
+
+
+def _browser_lease_for_token(token: str) -> dict:
+    """Look up an active lease without trusting token-associated client fields."""
+    if not token:
+        return {}
+    try:
+        leases = _browser_leases.snapshot().get("leases", [])
+    except Exception:
+        return {}
+    for lease in leases:
+        lease_token = str((lease or {}).get("token") or "")
+        if lease_token and hmac.compare_digest(lease_token, token):
+            return dict(lease)
+    return {}
+
+
+def _untrusted_browser_ipc_allowed(
+    writer: asyncio.StreamWriter, message: dict
+) -> bool:
+    """Authorize the lease proxy from server-derived session ownership only."""
+    op = str(message.get("op") or "")
+    binding = _browser_ipc_peer_binding(writer)
+    if not binding:
+        return False
+    owner_prefix = str(binding["owner_prefix"])
+    expected_browser = str(binding["browser_id"])
+    if op == "browser_acquire":
+        owner = str(message.get("owner") or "")
+        allowed = bool(
+            str(message.get("browser_id") or "") == expected_browser
+            and str(message.get("kind") or "") == "agent"
+            and str(message.get("mode") or "") == "headless"
+            and owner.startswith(owner_prefix)
+            and len(owner) > len(owner_prefix)
+        )
+        if allowed:
+            # Store only the controller-derived principal.  It binds the lease
+            # to the peer PID *and start tick*, session, owner, UID, and browser;
+            # caller-controlled owner text never reaches the lease store.
+            message["owner"] = str(binding["lease_owner"])
+            message["ttl"] = BROWSER_LEASE_TTL
+        return allowed
+    if op not in {"browser_renew", "browser_release"}:
+        return False
+    lease = _browser_lease_for_token(str(message.get("token") or ""))
+    allowed = bool(
+        lease
+        and str(lease.get("browser_id") or "") == expected_browser
+        and str(lease.get("kind") or "") == "agent"
+        and hmac.compare_digest(
+            str(lease.get("owner") or ""), str(binding["lease_owner"])
+        )
+    )
+    if allowed and op == "browser_renew":
+        message["ttl"] = BROWSER_LEASE_TTL
+    return allowed
+
+
+def _trusted_main_alive() -> bool:
+    return _process_descends_from(
+        os.getpid(), TRUSTED_MAIN_PID, TRUSTED_MAIN_START
+    )
+
+
 async def _controller_client(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     session_name = ""
+    channel_key = None
     subscribed = False
     try:
+        trusted_peer = _controller_peer_authorized(writer)
         line = await asyncio.wait_for(reader.readline(), timeout=10)
         message = json.loads(line.decode("utf-8", "replace"))
+        if message.get("op") == "voice_hook":
+            peer = _browser_ipc_peer_binding(writer)
+            result = {"ok": False, "reason": "Voice hook identity could not be verified."}
+            if peer:
+                current = _terminal_history_binding(peer["session"], peer["user_id"])
+                payload = message.get("payload") or {}
+                if (isinstance(payload, dict) and current
+                        and current.get("resume_uuid") == payload.get("session_id")
+                        and (not message.get("generation") or current.get("generation") == message["generation"])):
+                    verified = _terminal_history_binding(peer["session"], peer["user_id"])
+                    if verified == current:
+                        result = voice_mode.check_hook(MESSAGES_DIR, peer["session"], peer["user_id"],
+                                                       {**message, "generation": current["generation"]})
+            writer.write((json.dumps(result) + "\n").encode())
+            await writer.drain()
+            return
+        # Codex's narrow browser lease proxy is intentionally a same-login IPC
+        # client. It may request only unguessable-token lease bookkeeping; all
+        # session, watchdog, terminal and browser-stop controls require an API
+        # worker descended from the trusted combined main process.
+        if not trusted_peer and not _untrusted_browser_ipc_allowed(writer, message):
+            logger.warning(
+                "Rejected untrusted controller IPC operation %r", message.get("op")
+            )
+            writer.write(b'{"ok":false,"error":"forbidden"}\n')
+            await writer.drain()
+            return
         if message.get("op") == "terminal_subscribe":
             session_name = str(message.get("session") or "")
-            if not _is_valid_session_name(session_name) or not _find_session(session_name)[1]:
-                await _terminal_send(writer, {"mode": "error", "error": "Session not found"})
+            owner_id = str(message.get("owner_id") or "")
+            if (
+                not _is_valid_session_name(session_name)
+                or not owner_id
+                or not _strict_session_owner(session_name, owner_id)
+            ):
+                await _terminal_send(
+                    writer,
+                    {
+                        "mode": "error",
+                        "code": "session_not_found",
+                        "error": "Session not found",
+                        "retryable": False,
+                    },
+                )
                 return
-            await _resume_parked_session(session_name, source="terminal-stream")
-            await _terminal_subscribe(session_name, writer)
+            if not _find_session(session_name)[1]:
+                await _terminal_send(writer, _terminal_unavailable_payload(session_name))
+                return
+            resumed = await _resume_parked_session(
+                session_name,
+                source="terminal-stream",
+                expected_owner_id=owner_id,
+            )
+            if not resumed.get("ok"):
+                await _terminal_send(
+                    writer,
+                    _terminal_unavailable_payload(
+                        session_name, str(resumed.get("error") or "")
+                    ),
+                )
+                return
+            binding = await asyncio.to_thread(
+                _terminal_binding, session_name, owner_id
+            )
+            if not binding:
+                await _terminal_send(writer, _terminal_unavailable_payload(session_name))
+                return
+            channel_key = binding["key"]
+            await _terminal_subscribe(binding, writer)
             subscribed = True
             await reader.read()
             return
@@ -8960,8 +14945,8 @@ async def _controller_client(
         except Exception:
             pass
     finally:
-        if subscribed:
-            await _terminal_unsubscribe(session_name, writer)
+        if subscribed and channel_key:
+            await _terminal_unsubscribe(channel_key, writer)
         try:
             writer.close()
             await writer.wait_closed()
@@ -8969,30 +14954,113 @@ async def _controller_client(
             pass
 
 
-async def _start_controller_socket() -> None:
-    global _controller_server
-    CONTROLLER_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+def _acquire_controller_leader_lock() -> int:
+    """Hold the controller mutation lease for this process's full lifetime."""
+    lock_path = CONTROLLER_LEADER_LOCK
+    if lock_path.is_symlink():
+        raise PermissionError("controller leader lock must not be a symlink")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
     try:
-        CONTROLLER_SOCKET.unlink()
-    except FileNotFoundError:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_nlink != 1
+        ):
+            raise PermissionError("controller leader lock is unsafe")
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "another lifecycle controller still owns the lease"
+                    ) from None
+                time.sleep(0.05)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+async def _start_controller_socket() -> None:
+    global _controller_server, _controller_leader_fd, _controller_socket_inode
+    socket_parent = CONTROLLER_SOCKET.parent
+    socket_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_info = socket_parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or socket_parent.is_symlink()
+        or parent_info.st_uid != os.geteuid()
+    ):
+        raise PermissionError("controller socket parent must be an owned real directory")
+    socket_group = None
+    try:
+        candidate = grp.getgrnam("gxauth")
+        if candidate.gr_gid in {os.getegid(), *os.getgroups()}:
+            socket_group = candidate.gr_gid
+    except KeyError:
         pass
-    _controller_server = await asyncio.start_unix_server(
-        _controller_client, path=str(CONTROLLER_SOCKET), limit=1024 * 1024
-    )
-    CONTROLLER_SOCKET.chmod(0o600)
+    if socket_group is None:
+        socket_parent.chmod(0o700)
+    else:
+        os.chown(socket_parent, os.geteuid(), socket_group)
+        socket_parent.chmod(0o710)
+    if _controller_leader_fd is None:
+        _controller_leader_fd = await asyncio.to_thread(
+            _acquire_controller_leader_lock
+        )
+    try:
+        socket_info = CONTROLLER_SOCKET.lstat()
+    except FileNotFoundError:
+        socket_info = None
+    if socket_info is not None:
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
+            raise PermissionError("refusing to replace an unsafe controller socket path")
+        CONTROLLER_SOCKET.unlink()
+    try:
+        _controller_server = await asyncio.start_unix_server(
+            _controller_client, path=str(CONTROLLER_SOCKET), limit=1024 * 1024
+        )
+    except Exception:
+        fcntl.flock(_controller_leader_fd, fcntl.LOCK_UN)
+        os.close(_controller_leader_fd)
+        _controller_leader_fd = None
+        raise
+    if socket_group is None:
+        CONTROLLER_SOCKET.chmod(0o600)
+    else:
+        os.chown(CONTROLLER_SOCKET, os.geteuid(), socket_group)
+        CONTROLLER_SOCKET.chmod(0o660)
+    _controller_socket_inode = CONTROLLER_SOCKET.lstat().st_ino
     logger.info("Controller IPC listening on %s", CONTROLLER_SOCKET)
 
 
 async def _stop_controller_socket() -> None:
-    global _controller_server
+    global _controller_server, _controller_leader_fd, _controller_socket_inode
     if _controller_server:
         _controller_server.close()
         await _controller_server.wait_closed()
         _controller_server = None
     try:
-        CONTROLLER_SOCKET.unlink()
+        if (
+            _controller_socket_inode is not None
+            and CONTROLLER_SOCKET.lstat().st_ino == _controller_socket_inode
+        ):
+            CONTROLLER_SOCKET.unlink()
     except FileNotFoundError:
         pass
+    finally:
+        _controller_socket_inode = None
+        if _controller_leader_fd is not None:
+            try:
+                fcntl.flock(_controller_leader_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(_controller_leader_fd)
+                _controller_leader_fd = None
 
 
 async def _controller_call(op: str, **fields) -> dict:
@@ -9018,13 +15086,24 @@ async def _controller_call(op: str, **fields) -> dict:
     return {"ok": False, "error": last_error}
 
 
-async def _controller_terminal_connection(session_name: str):
+async def _controller_terminal_connection(session_name: str, owner_id: str):
     if PROCESS_ROLE != "api":
         return None, None
     reader, writer = await asyncio.open_unix_connection(
         str(CONTROLLER_SOCKET), limit=32 * 1024 * 1024
     )
-    writer.write((json.dumps({"op": "terminal_subscribe", "session": session_name}) + "\n").encode())
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "op": "terminal_subscribe",
+                    "session": session_name,
+                    "owner_id": owner_id,
+                }
+            )
+            + "\n"
+        ).encode()
+    )
     await writer.drain()
     return reader, writer
 
@@ -9035,15 +15114,22 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
         await ws.close(code=1008)
         return
     user = _current_user(ws)
-    if not _user_can_access_session(user, session_name):
+    if (
+        getattr(ws.state, "_invalid_impersonation", False)
+        or not user
+        or not _user_can_access_session(user, session_name)
+    ):
         await ws.close(code=1008)
         return
     await ws.accept()
     reader = writer = None
     local_writer = None
+    local_channel_key = None
     try:
         if PROCESS_ROLE == "api":
-            reader, writer = await _controller_terminal_connection(session_name)
+            reader, writer = await _controller_terminal_connection(
+                session_name, str(user.get("id") or "")
+            )
 
             async def forward_terminal():
                 while True:
@@ -9053,12 +15139,32 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
                     await ws.send_text(line.decode("utf-8", "replace").rstrip("\n"))
         else:
             local_writer = _TerminalQueueWriter()
-            await _resume_parked_session(session_name, source="terminal-stream")
-            await _terminal_subscribe(session_name, local_writer)
+            resumed = await _resume_parked_session(
+                session_name,
+                source="terminal-stream",
+                expected_owner_id=str(user.get("id") or ""),
+            )
+            if not resumed.get("ok"):
+                await ws.send_json(
+                    _terminal_unavailable_payload(
+                        session_name, str(resumed.get("error") or "")
+                    )
+                )
+                return
+            binding = await asyncio.to_thread(
+                _terminal_binding, session_name, str(user.get("id") or "")
+            )
+            if not binding:
+                await ws.send_json(_terminal_unavailable_payload(session_name))
+                return
+            local_channel_key = binding["key"]
+            await _terminal_subscribe(binding, local_writer)
 
             async def forward_terminal():
                 while True:
                     line = await local_writer.queue.get()
+                    if not line:
+                        return
                     await ws.send_text(line.decode("utf-8", "replace").rstrip("\n"))
 
         async def watch_client():
@@ -9089,40 +15195,319 @@ async def ws_session_raw(ws: WebSocket, session_name: str):
                 await writer.wait_closed()
             except Exception:
                 pass
-        if local_writer:
-            await _terminal_unsubscribe(session_name, local_writer)
+        if local_writer and local_channel_key:
+            await _terminal_unsubscribe(local_channel_key, local_writer)
             local_writer.close()
 
 
 class CreateSession(BaseModel):
     name: str = ""
+    name_generated: bool = Field(default=False, strict=True)
+    model: str = os.environ.get("TMUX_DASH_NEW_SESSION_MODEL", "gpt-6-astra")
+    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "max")
+    no_fallback: bool = False
+
+
+def _validated_new_session_options(body: CreateSession, user: dict | None) -> dict:
+    _catalog, efforts, checked = _load_model_snapshot(_model_catalog_file_for_user(user))
+    if checked <= 0:
+        raise RuntimeError("Model catalog is unavailable. Refresh and try again.")
+    if body.model not in efforts:
+        raise ValueError("This model is unavailable for your account.")
+    if body.effort not in efforts[body.model]:
+        raise ValueError(f"{body.model} does not support {body.effort} effort.")
+    return {"model": body.model, "effort": body.effort, "no_fallback": body.no_fallback}
+
+def _session_launch_options(session_name: str, expected_owner_id: str | None = None) -> dict:
+    row = _session_lifecycle.get(session_name)
+    owner = expected_owner_id or _session_owner_id(session_name)
+    if not owner or row.get("owner_id") != owner or _session_owner_id(session_name) != owner:
+        return {}
+    return dict(row.get("launch_options") or {})
 
 
 def _is_valid_session_name(name: str) -> bool:
     return bool(name and len(name) <= 128 and re.fullmatch(r"[A-Za-z0-9_.-]+", name))
 
 
-@app.post("/api/sessions/create")
-async def api_create_session(request: Request, body: CreateSession):
-    """Create a new tmux session."""
-    user = _current_user(request)
-    name = body.name.strip()
-    if name:
-        # Validate name: alphanumeric, dash, underscore only
-        if not _is_valid_session_name(name):
-            return JSONResponse(
-                {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
-                status_code=400,
+def _durable_session_name_reserved(session_name: str) -> bool:
+    row = _session_lifecycle.get(session_name)
+    return bool(
+        _load_session_owners().get(session_name)
+        or (
+            row.get("managed")
+            and str(row.get("desired_state") or "") != "deleted"
+        )
+    )
+
+
+def _kill_exact_created_tmux(
+    session_name: str, session_id: str, create_token: str = ""
+) -> bool:
+    """Remove or quarantine only the immutable tmux created by this request."""
+    if not session_id:
+        return False
+    try:
+        state, current = _exact_tmux_session_state(session_name)
+        if state == "absent" or (state == "present" and current != session_id):
+            return True
+        if state != "present" or current != session_id:
+            # Never target a recycled tmux $N when the name-to-id binding cannot
+            # be positively proven in the current server generation.
+            return False
+        if create_token:
+            token_result = subprocess.run(
+                [
+                    "tmux", "show-options", "-t", session_id,
+                    "-v", _TMUX_CREATE_TOKEN_OPTION,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
-        existing = [s["name"] for s in get_tmux_sessions()]
-        if name in existing:
-            return JSONResponse({"error": f"Session '{name}' already exists."}, status_code=409)
-    # A stored API key is the recovery credential when a managed ChatGPT token
-    # can no longer be refreshed. Validate/switch before launching the new pane.
+            if (
+                token_result.returncode != 0
+                or (token_result.stdout or "").strip() != create_token
+            ):
+                return False
+        for _ in range(2):
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session_id],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            state, current = _exact_tmux_session_state(session_name)
+            if state == "absent" or (state == "present" and current != session_id):
+                return True
+            if state != "present" or current != session_id:
+                return False
+        state, current = _exact_tmux_session_state(session_name)
+        if state == "absent" or (state == "present" and current != session_id):
+            return True
+        if state != "present" or current != session_id:
+            return False
+        # A transient kill failure must not leave a bare shell exposed under a
+        # lifecycle-reserved or other account's name. Rename only the immutable
+        # session created by this request to the dashboard's hidden namespace.
+        quarantine = f"__failed_create_{secrets.token_hex(8)}__"
+        renamed = subprocess.run(
+            ["tmux", "rename-session", "-t", session_id, quarantine],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if renamed.returncode != 0:
+            return False
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_id],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.critical(
+            "Quarantined incomplete tmux session %s after create cleanup failed",
+            session_id,
+        )
+        # Successful immutable-id rename is enough to prove this request's
+        # shell no longer occupies the public session name. The final kill is
+        # deliberately best effort.
+        return True
+    except Exception:
+        logger.exception("Could not retire incomplete tmux session %s", session_id)
+        return False
+
+
+async def _finish_created_session(
+    user: dict | None, created: str, session_id: str, create_token: str,
+    launch_options: dict | None = None,
+) -> JSONResponse:
+    owner_id = str((user or {}).get("id") or "admin")
+    generation = ""
+    owner_recorded = False
+    try:
+        if _durable_session_name_reserved(created):
+            removed = _kill_exact_created_tmux(created, session_id, create_token)
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Session '{created}' is reserved for recovery."
+                        if removed
+                        else "Could not safely retire the generated tmux collision"
+                    ),
+                    **({"code": "name_conflict"} if removed else {}),
+                },
+                status_code=409 if removed else 503,
+            )
+        if _exact_tmux_session_id(created) != session_id:
+            raise RuntimeError("new tmux session identity changed")
+        _set_session_owner(created, owner_id)
+        owner_recorded = True
+        initial_cwd = get_session_cwd(created)
+        lifecycle = await asyncio.to_thread(
+            _session_lifecycle.register_active,
+            created,
+            cwd=initial_cwd,
+            owner_id=owner_id,
+            source="session-create",
+            launch_options=launch_options,
+        )
+        generation = str(lifecycle.get("generation") or "")
+        if not generation:
+            raise RuntimeError("Could not persist the session generation")
+        if not _mark_tmux_session_managed(
+            created, owner_id, generation, create_token
+        ):
+            raise RuntimeError("Could not persist the session owner binding")
+        reset_mode = await _controller_call(
+            "autopush_reset",
+            session=created,
+            owner_id=owner_id,
+            generation=generation,
+        )
+        if not reset_mode.get("ok"):
+            raise RuntimeError("Could not initialize the session auto-push mode")
+
+        # Admins do not receive the member global block, so keep their project
+        # handoff and Google tooling aligned before the first Codex launch.
+        if _multi_tenant_enabled() and user and not _uses_private_account_runtime(user):
+            acfg = _user_codex_config_dir(user)
+            _sync_projects_note_into(acfg / "AGENTS.md")
+            _ensure_google_mcp(acfg, user)
+            _set_team_model_effort(acfg)
+            _sync_git_rules_into(acfg / "AGENTS.md")
+
+        if not _send_session_owner_environment(created, owner_id):
+            raise RuntimeError("Could not bind the session to its account")
+        if not _session_lifecycle.matches(
+            created,
+            generation=generation,
+            owner_id=owner_id,
+            desired_states={"running"},
+            restore_on_startup=True,
+        ):
+            raise RuntimeError("new session lifecycle changed during setup")
+
+        if _uses_private_account_runtime(user):
+            _session_auth_mode[created] = _apply_member_auth(
+                _user_codex_config_dir(user)
+            )
+        else:
+            try:
+                mode = json.loads((CODEX_HOME / "auth.json").read_text()).get("auth_mode")
+            except Exception:
+                mode = ""
+            _session_auth_mode[created] = (
+                "subscription" if mode == "chatgpt"
+                else "api" if mode == "apikey"
+                else "unconfigured"
+            )
+
+        if NEW_SESSION_CMD:
+            launch = _session_launch_command(
+                created,
+                _session_launch_base(created, user),
+                pin_model=True,
+                expected_owner_id=owner_id,
+                model=(launch_options or {}).get("model"),
+                effort=(launch_options or {}).get("effort"),
+            )
+            if (
+                _exact_tmux_session_id(created) != session_id
+                or not _session_lifecycle.matches(
+                    created,
+                    generation=generation,
+                    owner_id=owner_id,
+                    desired_states={"running"},
+                )
+            ):
+                raise RuntimeError("new session identity changed before launch")
+            pane_target = f"{session_id}:"
+            written = subprocess.run(
+                ["tmux", "send-keys", "-t", pane_target, "-l", launch],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            entered = subprocess.run(
+                ["tmux", "send-keys", "-t", pane_target, "Enter"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if written.returncode != 0 or entered.returncode != 0:
+                raise RuntimeError("Could not launch Codex in the new session")
+        if not _publish_tmux_session(
+            created, owner_id, generation, create_token
+        ):
+            raise RuntimeError("Could not publish the provisioned session")
+        await asyncio.to_thread(
+            _checkpoint_active_session,
+            created,
+            source="session-create-launch",
+        )
+        logger.info(
+            "Session created: '%s' (auth_mode=%s)",
+            created,
+            _session_auth_mode.get(created, "unknown"),
+        )
+        return JSONResponse({"ok": True, "name": created})
+    except Exception as exc:
+        logger.error("Failed to finish new session '%s': %s", created, exc)
+        if generation:
+            try:
+                await asyncio.to_thread(
+                    _session_lifecycle.begin_transition,
+                    created,
+                    owner_id=owner_id,
+                    desired_state="deleting",
+                    expected_generation=generation,
+                    expected_desired_states={"running"},
+                )
+            except Exception:
+                logger.exception("Could not tombstone failed new session '%s'", created)
+        removed_tmux = _kill_exact_created_tmux(
+            created, session_id, create_token
+        )
+        if removed_tmux:
+            if generation:
+                await asyncio.to_thread(
+                    _session_lifecycle.remove,
+                    created,
+                    expected_generation=generation,
+                    owner_id=owner_id,
+                )
+            if owner_recorded and _load_session_owners().get(created) == owner_id:
+                _clear_session_owner(created)
+            _session_auth_mode.pop(created, None)
+        else:
+            logger.critical(
+                "Retaining owner/tombstone for failed live new session '%s'",
+                created,
+            )
+        return JSONResponse({"error": str(exc)}, status_code=503)
+
+
+async def _api_create_session_tmux_locked(request: Request, body: CreateSession):
+    """Create one generation-bound tmux/Codex session transactionally."""
+    user = _current_user(request)
+    display_name = body.name.strip()
+    requested_name = re.sub(r"\s+", "-", display_name)
+    if requested_name and not _is_valid_session_name(requested_name):
+        return JSONResponse(
+            {"error": "Invalid name. Use up to 128 letters, numbers, dots, dashes, or underscores."},
+            status_code=400,
+        )
+    try:
+        launch_options = _validated_new_session_options(body, user)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
     auth_home = _user_codex_config_dir(user)
-    if user and not _is_admin(user):
+    if _uses_private_account_runtime(user):
         _ensure_user_codex_config_dir(user)
-        if not (auth_home / "advisor-token").is_file():
+        if not _is_admin(user) and not _account_advisor_token_path(user).is_file():
             return JSONResponse(
                 {"error": "This account's private data connection is not provisioned"},
                 status_code=503,
@@ -9134,115 +15519,382 @@ async def api_create_session(request: Request, body: CreateSession):
             {"error": f"Codex launch blocked: {reason}", "codex": details},
             status_code=503,
         )
-    try:
-        cmd = ["tmux", "new-session", "-d"]
-        if name:
-            cmd += ["-s", name]
+
+    def create_tmux() -> tuple[subprocess.CompletedProcess, str, str, str]:
+        create_token = secrets.token_hex(16)
+        cmd = [
+            "tmux", "new-session", "-d", "-P", "-F",
+            "#{session_id}\t#{session_name}",
+        ]
+        if requested_name:
+            cmd += ["-s", requested_name]
+        if SESSION_CWD and os.path.isdir(SESSION_CWD):
+            cmd += ["-c", SESSION_CWD]
+        # Keep the shell hidden from every dashboard inventory until its owner
+        # and lifecycle generation are committed. Both provisional options are
+        # part of the same tmux command queue as new-session, so a controller
+        # crash cannot leave a visible unbound shell between commands.
+        cmd += [
+            ";", "set-option", _TMUX_QUARANTINED_OPTION, "1",
+            ";", "set-option", _TMUX_CREATE_TOKEN_OPTION, create_token,
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            return JSONResponse({"error": result.stderr.strip() or "Failed to create session"}, status_code=500)
-        # Find the new session name (if auto-named)
-        sessions = get_tmux_sessions()
-        if name:
-            created = name
-        else:
-            created = sessions[-1]["name"] if sessions else "unknown"
-        # Record session ownership. If auth is disabled, fall back to admin.
-        owner_id = user["id"] if user else "admin"
-        _set_session_owner(created, owner_id)
-        # Export project-publishing convention env vars so Codex can publish to
-        # https://dianaotech.com/<username>/<session> reliably (see global context).
-        try:
-            _owner_name = (user.get("username") if user else AUTH_USER) or "admin"
-            _proj_dir = str(PROJECTS_ROOT / _owner_name / created)
-            _pub_base = PUB_URL
-            # Per-user git identity: every member shares ONE OS user, so set the
-            # commit author/committer per session → commits are attributed to the
-            # right person. Push still uses the box's shared GitHub creds.
-            _git_email = f"{_owner_name}@{GIT_EMAIL_DOMAIN}"
-            _exports = ("export DASH_USER={} DASH_SESSION={} DASH_PROJECT_DIR={} DASH_PROJECT_URL={} "
-                        "GIT_AUTHOR_NAME={} GIT_AUTHOR_EMAIL={} GIT_COMMITTER_NAME={} GIT_COMMITTER_EMAIL={}".format(
-                shlex.quote(_owner_name), shlex.quote(created),
-                shlex.quote(_proj_dir), shlex.quote(f"{_pub_base}/{_owner_name}/{created}"),
-                shlex.quote(_owner_name), shlex.quote(_git_email),
-                shlex.quote(_owner_name), shlex.quote(_git_email)))
-            subprocess.run(["tmux", "send-keys", "-t", created, "-l", _exports], capture_output=True, text=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", created, "Enter"], capture_output=True, text=True, timeout=5)
-        except Exception:
-            logger.debug("Failed to export DASH_* project env for %s", created, exc_info=True)
-        # Admins don't receive the member global block, so give them the projects
-        # convention directly (members already have it in their global context).
-        try:
-            if _multi_tenant_enabled() and _is_admin(user):
-                acfg = _user_codex_config_dir(user)
-                _sync_projects_note_into(acfg / "AGENTS.md")
-                _ensure_google_mcp(acfg, user)
-                _set_team_model_effort(acfg)
-                _sync_git_rules_into(acfg / "AGENTS.md")
-        except Exception:
-            logger.debug("Failed to harden admin team config", exc_info=True)
-        # Bind both CODEX_HOME and the advisor identity to the session owner.
-        # An unbound member pane would inherit the admin token from the shared
-        # Unix login shell, so a failed export is a hard launch failure.
-        if not _send_session_owner_environment(created):
-            subprocess.run(
-                ["tmux", "kill-session", "-t", created],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            _clear_session_owner(created)
+        session_id, separator, created = (result.stdout or "").strip().partition("\t")
+        if (
+            result.returncode != 0
+            or not separator
+            or not re.fullmatch(r"\$[0-9]+", session_id)
+            or not _is_valid_session_name(created)
+            or (requested_name and created != requested_name)
+        ):
+            if separator and re.fullmatch(r"\$[0-9]+", session_id) and created:
+                _kill_exact_created_tmux(created, session_id, create_token)
+            return result, "", "", ""
+        return result, session_id, created, create_token
+
+    auto_created = ""
+    auto_session_id = ""
+    try:
+        if requested_name:
+            with _session_operation_lock(requested_name):
+                if (
+                    _exact_tmux_session_id(requested_name)
+                    or _durable_session_name_reserved(requested_name)
+                ):
+                    return JSONResponse(
+                        {
+                            "error": f"Session '{requested_name}' already exists.",
+                            "code": "name_conflict",
+                        },
+                        status_code=409,
+                    )
+                result, session_id, created, create_token = create_tmux()
+                if not session_id:
+                    return JSONResponse(
+                        {"error": result.stderr.strip() or "Failed to create session"},
+                        status_code=500,
+                    )
+                response = await _finish_created_session(
+                    user, created, session_id, create_token, launch_options
+                )
+                if response.status_code == 200 and display_name and not body.name_generated:
+                    def save_manual_label(data):
+                        row = data.setdefault("sessions", {}).setdefault(created, {})
+                        row.update(manual_label=display_name, owner_id=str((user or {}).get("id") or "admin"), generation=str(_session_lifecycle.get(created).get("generation") or ""))
+                    await asyncio.to_thread(_session_tab_labels.update, save_manual_label)
+                return response
+
+        result, session_id, created, create_token = create_tmux()
+        if not session_id:
             return JSONResponse(
-                {"error": "Could not bind the session to its account"},
-                status_code=503,
+                {"error": result.stderr.strip() or "Failed to create session"},
+                status_code=500,
             )
-        # Authenticate non-admin sessions from the shared Codex auth file.
-        # Admin sessions use the default ~/.codex login directly.
-        if user and not _is_admin(user):
-            _session_auth_mode[created] = _apply_member_auth(_user_codex_config_dir(user))
-        else:
-            try:
-                mode = json.loads((CODEX_HOME / "auth.json").read_text()).get("auth_mode")
-            except Exception:
-                mode = ""
-            _session_auth_mode[created] = (
-                "subscription" if mode == "chatgpt"
-                else "api" if mode == "apikey"
-                else "unconfigured"
+        auto_created, auto_session_id = created, session_id
+        try:
+            with _session_operation_lock(created):
+                response = await _finish_created_session(
+                    user, created, session_id, create_token, launch_options
+                )
+        except _SessionOperationBusy:
+            _kill_exact_created_tmux(created, session_id, create_token)
+            return JSONResponse(
+                {
+                    "error": "Generated session name is currently reserved",
+                    "code": "name_conflict",
+                },
+                status_code=409,
             )
-        # Optionally launch a command in the new session. Members pin their model
-        # in the isolated account config; admins use the dashboard default.
-        if NEW_SESSION_CMD:
-            _pin_model = not (user and not _is_admin(user))
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "-l",
-                 _session_launch_command(
-                     created, _session_launch_base(created, user), pin_model=_pin_model
-                 )],
-                capture_output=True, text=True, timeout=5
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", created, "Enter"],
-                capture_output=True, text=True, timeout=5
-            )
-        logger.info("Session created: '%s' (auth_mode=%s)", created, _session_auth_mode.get(created, "unknown"))
-        return JSONResponse({"ok": True, "name": created})
-    except Exception as e:
-        logger.error("Failed to create session '%s': %s", name, e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return response
+    except _SessionOperationBusy:
+        return JSONResponse(
+            {"error": "Session lifecycle operation is in progress"},
+            status_code=409,
+        )
+    except Exception as exc:
+        if auto_created and auto_session_id:
+            _kill_exact_created_tmux(auto_created, auto_session_id, create_token)
+        logger.error("Failed to create session '%s': %s", requested_name, exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
-@app.delete("/api/sessions/{session_name}")
-async def api_delete_session(request: Request, session_name: str):
+@app.post("/api/sessions/create")
+async def api_create_session(request: Request, body: CreateSession):
+    try:
+        async with _async_tmux_server_mutation_lock():
+            return await _api_create_session_tmux_locked(request, body)
+    except _TmuxMutationBusy:
+        return JSONResponse(
+            {"error": "Tmux lifecycle operation is in progress"},
+            status_code=409,
+        )
+
+
+class _SessionCloseError(RuntimeError):
+    """A user-safe, retryable close failure that leaves the tab intact."""
+
+
+def _session_close_rollout_path(
+    session_name: str, owner_id: str, resume_uuid: str
+) -> Path | None:
+    if (
+        _validated_session_root_thread_id(session_name, resume_uuid, owner_id)
+        != resume_uuid
+    ):
+        return None
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    if not owner_binding:
+        return None
+    sessions_root = _resolved_real_directory(
+        _user_codex_config_dir(owner_binding[1]) / "sessions"
+    )
+    if not sessions_root:
+        return None
+    try:
+        matches = list(sessions_root.rglob(f"rollout-*-{resume_uuid}.jsonl"))
+        if len(matches) != 1 or matches[0].is_symlink():
+            return None
+        rollout = matches[0].resolve(strict=True)
+        rollout.relative_to(sessions_root)
+        return rollout if rollout == matches[0] and rollout.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _open_session_close_rollout(
+    binding: dict, relative_path: str = ""
+) -> tuple[int, str, tuple[int, int, int, int]]:
+    """Open the exact rollout beneath its owner root without following links."""
+    owner = binding["owner"]
+    sessions_root = _resolved_real_directory(
+        _user_codex_config_dir(owner) / "sessions"
+    )
+    if not sessions_root:
+        raise _SessionCloseError("Could not verify the session transcript folder")
+    if relative_path:
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise _SessionCloseError("Session transcript identity is invalid")
+        if not relative.name.startswith("rollout-"):
+            raise _SessionCloseError("Session transcript identity is invalid")
+        if not relative.name.endswith(f"-{binding['resume_uuid']}.jsonl"):
+            raise _SessionCloseError("Session transcript identity changed")
+    else:
+        rollout = _session_close_rollout_path(
+            binding["session_name"], binding["owner_id"], binding["resume_uuid"]
+        )
+        if not rollout:
+            raise _SessionCloseError(
+                "The exact Codex conversation could not be opened; the tab was not closed"
+            )
+        relative = rollout.relative_to(sessions_root)
+
+    directory_fds: list[int] = []
+    try:
+        current_fd = os.open(
+            sessions_root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_fds.append(current_fd)
+        for part in relative.parts[:-1]:
+            current_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            directory_fds.append(current_fd)
+        fd = os.open(
+            relative.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=current_fd,
+        )
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            os.close(fd)
+            raise _SessionCloseError("Session transcript is not a safe regular file")
+        fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        return fd, str(relative), fingerprint
+    except (OSError, ValueError) as exc:
+        raise _SessionCloseError("Could not securely open the session transcript") from exc
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _session_generation_is_unused(
+    session_name: str, owner_id: str, lifecycle: dict
+) -> bool:
+    """Prove that this lifecycle generation has no user work to preserve."""
+    generation_scoped = "had_conversation_input" in lifecycle
+    if not generation_scoped or lifecycle.get("had_conversation_input"):
+        return False
+    label_row = _session_tab_label_rows().get(session_name) or {}
+    label_is_current = (
+        str(label_row.get("owner_id") or "") == owner_id
+        and str(label_row.get("generation") or "")
+        == str(lifecycle.get("generation") or "")
+    )
+    if (
+        label_is_current
+        and (label_row.get("pending") or label_row.get("label"))
+    ):
+        return False
+    for state in (
+        _away_mode_state.get(session_name, {}),
+        _go_nuts_state.get(session_name, {}),
+    ):
+        if state.get("enabled") or state.get("log") or state.get("started_at"):
+            return False
+    return True
+
+
+async def _api_delete_session_unlocked(
+    request: Request | None,
+    session_name: str,
+    *,
+    expected_user: dict | None = None,
+):
     """Kill a tmux session and all its child processes."""
-    user = _current_user(request)
+    user = expected_user or (_current_user(request) if request is not None else None)
     _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    if sess.get("virtual"):
-        await asyncio.to_thread(_session_lifecycle.remove, session_name)
-        _clear_session_owner(session_name)
-        return JSONResponse({"ok": True, "killed": session_name, "virtual": True})
+    owner_id = str((user or {}).get("id") or "admin")
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    if not owner_binding:
+        return JSONResponse({"error": "Session owner changed"}, status_code=409)
+    if not sess.get("virtual"):
+        await asyncio.to_thread(
+            _checkpoint_active_session, session_name, source="delete-transition"
+        )
+    lifecycle = _session_lifecycle.get(session_name)
+    generation = str(lifecycle.get("generation") or "")
+    if not generation:
+        return JSONResponse(
+            {"error": "Session lifecycle is not safely checkpointed"},
+            status_code=409,
+        )
+    # A synthesized/virtual card is a UI observation, not proof that tmux is
+    # absent: list-sessions errors are intentionally indistinguishable there.
+    tmux_state, session_id = _exact_tmux_session_state(session_name)
+    allowed_states = {"running", "parked", "parking", "deleting"}
+    try:
+        await asyncio.to_thread(
+            _session_lifecycle.begin_transition,
+            session_name,
+            owner_id=owner_id,
+            desired_state="deleting",
+            expected_generation=generation,
+            expected_desired_states=allowed_states,
+        )
+    except Exception:
+        logger.exception("Could not persist delete intent for '%s'", session_name)
+        return JSONResponse(
+            {"error": "Could not safely checkpoint session deletion"},
+            status_code=409,
+        )
+
+    def clear_runtime_state() -> None:
+        cache.pop(session_name, None)
+        _auto_approve_sent.pop(session_name, None)
+        _pane_stability.pop(session_name, None)
+        _activity_state.pop(session_name, None)
+        _session_stats_cache.pop(session_name, None)
+        _auto_respond_cooldown.pop(session_name, None)
+        _session_auth_mode.pop(session_name, None)
+        away_state = _away_mode_state.get(session_name, {})
+        away_state["enabled"] = False
+        if away_state.get("task") and not away_state["task"].done():
+            away_state["task"].cancel()
+        _away_mode_state.pop(session_name, None)
+        gn_state = _go_nuts_state.get(session_name, {})
+        gn_state["enabled"] = False
+        if gn_state.get("task") and not gn_state["task"].done():
+            gn_state["task"].cancel()
+        _go_nuts_state.pop(session_name, None)
+        _pending_autonomous_state.pop(session_name, None)
+        _autonomous_toggle_revision.pop(session_name, None)
+        _simple_watchdog_state.pop(session_name, None)
+        _simple_watchdog_log.pop(session_name, None)
+        _cache_keepalive_state.pop(session_name, None)
+        _login_watchdog_state.pop(session_name, None)
+        _codex_health_state.pop(session_name, None)
+        _watchdog_snapshots.pop(session_name, None)
+        _codex_facts_cache.pop(session_name, None)
+        _crash_recovery_state.pop(session_name, None)
+        _auto_auth_state.pop(session_name, None)
+        if _pending_auth.get("session") == session_name:
+            _pending_auth.clear()
+        _seen_claude_running.discard(session_name)
+        if session_name in _simple_watchdog_disabled:
+            _simple_watchdog_disabled.discard(session_name)
+            _save_simple_watchdog_disabled()
+
+    async def finish_delete(*, virtual: bool = False) -> JSONResponse:
+        async with _autopush_action_lock(session_name):
+            # Remove only the generation this deletion started against. Do not
+            # erase name-keyed state until that succeeds, or a same-name
+            # replacement could lose its freshly initialized mode/runtime.
+            removed = await asyncio.to_thread(
+                _session_lifecycle.remove,
+                session_name,
+                expected_generation=generation,
+                owner_id=owner_id,
+            )
+            if not removed:
+                return JSONResponse(
+                    {"error": "Session generation changed during deletion"},
+                    status_code=409,
+                )
+            clear_runtime_state()
+            autonomous_saved = await _save_autonomous_state_async()
+            async with _autopush_store_lock:
+                if autonomous_saved:
+                    changed = _autopush_mode.pop(session_name, None) is not None
+                else:
+                    # A stale autonomous record plus a future name reuse must
+                    # remain inert until creation durably resets both stores.
+                    changed = _autopush_mode.get(session_name) != "off"
+                    _autopush_mode[session_name] = "off"
+                    logger.error(
+                        "Could not persist autonomous cleanup for deleted session '%s'; retaining fail-closed Off tombstone",
+                        session_name,
+                    )
+                if changed:
+                    try:
+                        await _to_thread_drain_on_cancel(_save_autopush_mode)
+                    except Exception:
+                        logger.exception(
+                            "Could not persist auto-push cleanup for deleted session '%s'",
+                            session_name,
+                        )
+        await asyncio.to_thread(_remove_session_tab_label, session_name)
+        await asyncio.to_thread(
+            _remove_session_from_tab_order, session_name, owner_id
+        )
+        if _load_session_owners().get(session_name) == owner_id:
+            _clear_session_owner(session_name)
+        logger.info("Session deleted: '%s'", session_name)
+        payload = {"ok": True, "killed": session_name}
+        if virtual:
+            payload["virtual"] = True
+        return JSONResponse(payload)
+
+    if tmux_state == "absent":
+        return await finish_delete(virtual=bool(sess.get("virtual")))
+    if tmux_state != "present" or not session_id:
+        return JSONResponse(
+            {"error": "Could not confirm the tmux session state; deletion remains pending"},
+            status_code=503,
+        )
+    if (
+        _exact_tmux_session_id(session_name) != session_id
+        or not _tmux_session_matches_owner(session_name, owner_id, generation)
+    ):
+        return JSONResponse(
+            {"error": "Session identity changed during deletion"},
+            status_code=409,
+        )
     try:
         # First, find and kill all processes in the session's panes.
         # This ensures Codex (node) processes are terminated cleanly
@@ -9250,7 +15902,7 @@ async def api_delete_session(request: Request, session_name: str):
         try:
             # Get all pane PIDs in this session
             pane_result = subprocess.run(
-                ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+                ["tmux", "list-panes", "-t", session_id, "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5
             )
             if pane_result.returncode == 0:
@@ -9268,7 +15920,7 @@ async def api_delete_session(request: Request, session_name: str):
                     except Exception:
                         logger.debug("pkill -TERM failed for pid %s", pid_str, exc_info=True)
                 # Brief pause to let processes handle SIGTERM
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 # Force-kill any remaining children
                 for pid_str in pane_result.stdout.strip().split("\n"):
                     pid_str = pid_str.strip()
@@ -9285,47 +15937,67 @@ async def api_delete_session(request: Request, session_name: str):
             logger.debug("Process cleanup failed for session '%s' — kill-session will still clean up", session_name, exc_info=True)
 
         result = subprocess.run(
-            ["tmux", "kill-session", "-t", session_name],
+            ["tmux", "kill-session", "-t", session_id],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
+            confirmed_state, _current_id = _exact_tmux_session_state(session_name)
+            if confirmed_state == "absent":
+                return await finish_delete()
             return JSONResponse({"error": result.stderr.strip() or "Failed to kill session"}, status_code=500)
-        # Clean up all per-session state from global dicts
-        cache.pop(session_name, None)
-        _auto_approve_sent.pop(session_name, None)
-        _pane_stability.pop(session_name, None)
-        _activity_state.pop(session_name, None)
-        _session_stats_cache.pop(session_name, None)
-        _auto_respond_cooldown.pop(session_name, None)
-        _session_auth_mode.pop(session_name, None)
-        _away_mode_state.pop(session_name, None)
-        # Cancel go-nuts worker if running
-        gn_state = _go_nuts_state.get(session_name, {})
-        if gn_state.get("task") and not gn_state["task"].done():
-            gn_state["task"].cancel()
-        _go_nuts_state.pop(session_name, None)
-        _simple_watchdog_state.pop(session_name, None)
-        _simple_watchdog_log.pop(session_name, None)
-        _crash_recovery_state.pop(session_name, None)
-        _seen_claude_running.discard(session_name)
-        if session_name in _simple_watchdog_disabled:
-            _simple_watchdog_disabled.discard(session_name)
-            _save_simple_watchdog_disabled()
-        # Drop the ownership record. Messages/notes are kept on disk so they
-        # show up in the user's History tab even after the live session dies.
-        _clear_session_owner(session_name)
-        await asyncio.to_thread(_session_lifecycle.remove, session_name)
-        logger.info("Session deleted: '%s'", session_name)
-        return JSONResponse({"ok": True, "killed": session_name})
+        confirmed_state, current_id = _exact_tmux_session_state(session_name)
+        if confirmed_state == "absent":
+            return await finish_delete()
+        if confirmed_state == "present" and current_id != session_id:
+            return JSONResponse(
+                {"error": "Session name was reused while deletion was completing; ownership remains fenced"},
+                status_code=409,
+            )
+        return JSONResponse(
+            {"error": "Could not confirm deletion; ownership remains fenced"},
+            status_code=503,
+        )
     except Exception as e:
+        # The durable deleting intent deliberately remains. If tmux vanished or
+        # cleanup partially completed, a reboot must never resurrect this tab.
+        logger.exception("Session deletion failed for '%s'", session_name)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.delete("/api/sessions/{session_name}")
+async def api_delete_session(request: Request, session_name: str):
+    """Close the owner-scoped session without generating a summary or archive."""
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    _sessions, session = _find_session_for_user(session_name, user)
+    if not owner_id or not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    result = await _controller_call(
+        "session_delete", session=session_name, owner_id=owner_id
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
+
+
+def _codex_session_payload(session_name: str) -> dict:
+    """Measured cache/turn/token fields flattened onto the session payload."""
+    f = _codex_session_facts(session_name)
+    fields = (
+        "cache_ttl", "cache_min_tokens", "last_turn_end", "last_turn_seconds", "cache_last_activity",
+        "last_input_tokens", "context_tokens", "context_limit", "cache_read_tokens",
+        "cache_model", "detect_sure", "metrics_thread_id", "metrics_catching_up", "session_total_tokens",
+        "session_input_tokens", "session_output_tokens", "avg_tps",
+        "tps_active_seconds", "tps_output_tokens", "tps_completed_turns",
+    )
+    return {**{key: f.get(key) for key in fields},
+            "cache_keepalive": _cache_keepalive_active(session_name)}
 
 
 def get_session_cwd(session_name: str) -> str:
     """Get the current working directory of a tmux session's active pane."""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{pane_current_path}"],
+            ["tmux", "display-message", "-t", f"={session_name}:", "-p", "#{pane_current_path}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -9343,9 +16015,13 @@ def _session_uploads_dir(session_name: str) -> Path:
 
 
 @app.post("/api/sessions/{session_name}/upload")
-async def api_upload_file(session_name: str, file: UploadFile = File(...)):
+async def api_upload_file(
+    request: Request, session_name: str, file: UploadFile = File(...)
+):
     """Upload a file to a session-specific uploads dir; record only in this session's chat history."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
 
@@ -9354,39 +16030,62 @@ async def api_upload_file(session_name: str, file: UploadFile = File(...)):
     if not filename or filename.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
-    # Save under the owning account's data root, never another tenant's tree.
-    uploads_dir = _session_uploads_dir(session_name)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = str(uploads_dir / filename)
     try:
         content = await file.read()
         max_size = 50 * 1024 * 1024  # 50 MB
         if len(content) > max_size:
             return JSONResponse({"error": f"File too large ({len(content) / 1024 / 1024:.1f} MB). Max is 50 MB."}, status_code=413)
-        with open(dest, "wb") as f:
-            f.write(content)
-        # Per-session record only — never touch the project AGENTS.md, which is
-        # shared across every session running in the same cwd.
-        size_kb = len(content) / 1024
-        note = f"Uploaded {filename} ({size_kb:.1f} KB) to {dest}"
-        now = time.time()
-        entry = cache.setdefault(session_name, {})
-        if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
-        entry["messages"].append({"role": "user", "text": note, "ts": now})
-        _save_messages()
+        with _session_operation_lock(session_name):
+            fence = await _controller_call(
+                "session_input_check",
+                session=session_name,
+                owner_id=owner_id,
+                source="upload",
+                records_input=True,
+            )
+            if not fence.get("ok"):
+                return JSONResponse(
+                    {"error": fence.get("error", "session is closing")},
+                    status_code=int(fence.get("_status", 409)),
+                )
+            binding = await asyncio.to_thread(
+                _terminal_binding, session_name, owner_id
+            )
+            if not binding:
+                return JSONResponse(
+                    {"error": "Session identity changed; file was not saved"},
+                    status_code=409,
+                )
+            # Resolve the path from the captured request owner, never from a
+            # mutable name-to-owner lookup after the upload await.
+            uploads_dir = _user_uploads_dir(user) / session_name
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            dest = str(uploads_dir / filename)
+            with open(dest, "wb") as f:
+                f.write(content)
+            # Per-session record only — never touch the project AGENTS.md,
+            # which is shared across sessions running in the same cwd.
+            size_kb = len(content) / 1024
+            note = f"Uploaded {filename} ({size_kb:.1f} KB) to {dest}"
+            now = time.time()
+            entry = _bound_session_cache_entry(session_name, owner_id)
+            if "messages" not in entry:
+                entry["messages"] = _load_session_messages(session_name, owner_id)
+            entry["messages"].append({"role": "user", "text": note, "ts": now})
+            _save_messages()
         return JSONResponse({"ok": True, "path": dest, "size": len(content)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/sessions/{session_name}/uploads")
-async def api_list_uploads(session_name: str):
+async def api_list_uploads(request: Request, session_name: str):
     """List previously uploaded files for a session (newest first)."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    uploads_dir = _session_uploads_dir(session_name)
+    uploads_dir = _user_uploads_dir(user) / session_name
     files = []
     if uploads_dir.exists():
         for entry in uploads_dir.iterdir():
@@ -9407,15 +16106,16 @@ async def api_list_uploads(session_name: str):
 
 
 @app.delete("/api/sessions/{session_name}/uploads/{filename}")
-async def api_delete_upload(session_name: str, filename: str):
+async def api_delete_upload(request: Request, session_name: str, filename: str):
     """Remove a previously uploaded file from the session uploads dir."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     safe_name = os.path.basename(filename)
     if not safe_name or safe_name.startswith("."):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
-    target = _session_uploads_dir(session_name) / safe_name
+    target = (_user_uploads_dir(user) / session_name) / safe_name
     try:
         if target.exists() and target.is_file():
             target.unlink()
@@ -9451,7 +16151,7 @@ async def api_get_codex_md(session_name: str):
     owner = _user_for_session(session_name)
     home_md = str(
         (_user_codex_config_dir(owner) / "AGENTS.md")
-        if owner and not _is_admin(owner)
+        if _uses_private_account_runtime(owner)
         else (Path.home() / "AGENTS.md")
     )
     home_content = ""
@@ -9486,7 +16186,7 @@ async def api_save_codex_md(session_name: str, body: SaveCodexMd):
     owner = _user_for_session(session_name)
     global_path = (
         _user_codex_config_dir(owner) / "AGENTS.md"
-        if owner and not _is_admin(owner)
+        if _uses_private_account_runtime(owner)
         else Path.home() / "AGENTS.md"
     )
     allowed = {os.path.realpath(str(global_path))}
@@ -9500,7 +16200,7 @@ async def api_save_codex_md(session_name: str, body: SaveCodexMd):
         _backup_before_dashboard_write(Path(real_path))
         with open(real_path, "w") as f:
             f.write(body.content)
-        if owner and not _is_admin(owner) and real_path == os.path.realpath(str(global_path)):
+        if _uses_private_account_runtime(owner) and real_path == os.path.realpath(str(global_path)):
             _ensure_user_codex_config_dir(owner)
         return JSONResponse({"ok": True, "path": real_path})
     except Exception as e:
@@ -9527,7 +16227,7 @@ def _session_config_base(session_name: str) -> Path:
     sessions use the one standard dashboard Codex home.
     """
     owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
+    if _uses_private_account_runtime(owner):
         return _user_codex_config_dir(owner)
     return CODEX_HOME
 
@@ -9936,7 +16636,7 @@ def _is_library_link(skills_dir: Path, skill_dir_name: str) -> bool:
 
 def _skill_dir_for_session(session_name: str) -> Path:
     owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
+    if _uses_private_account_runtime(owner):
         d = _user_data_dir(owner) / "skills" / session_name
     else:
         d = SKILLS_DIR / session_name
@@ -10361,6 +17061,10 @@ class SetSessionModelBody(BaseModel):
 # rules without leaving the dashboard.
 
 _PROJECT_FILES = [
+    ("repo/lisa-app/docs/TECHNICAL_SPEC.md", "md",
+     "Canonical Lisa technical specification, updated when a session closes."),
+    ("TECHNICAL_SPEC.md", "md",
+     "Workspace technical specification used when no canonical Lisa repo is present."),
     ("AGENTS.md", "md",
      "Project rules loaded on top of the account AGENTS.md."),
     (".codex/config.toml", "toml",
@@ -10470,58 +17174,220 @@ async def api_save_session_project_file(session_name: str, body: ProjectFileBody
         return JSONResponse({"error": "Failed to save"}, status_code=500)
 
 
-def _send_session_owner_environment(session_name: str):
+def _send_session_owner_environment(
+    session_name: str, expected_owner_id: str = ""
+):
     """Bind a pane to its owner's CODEX_HOME, advisor token, and project."""
-    owner = _user_for_session(session_name)
-    if owner and not _is_admin(owner):
+    if expected_owner_id:
+        owner_binding = _strict_session_owner(session_name, expected_owner_id)
+        if not owner_binding:
+            return False
+        owner = owner_binding[1]
+    else:
+        owner = _user_for_session(session_name)
+    owner_name = ((owner or {}).get("username") or AUTH_USER or "admin")
+    project_dir = (
+        _member_session_project_dir(owner, session_name)
+        if owner
+        else PROJECTS_ROOT / owner_name / session_name
+    )
+    git_email = f"{owner_name}@{GIT_EMAIL_DOMAIN}"
+    cmd = "export " + " ".join(
+        f"{key}={shlex.quote(value)}"
+        for key, value in {
+            "DASH_USER": owner_name,
+            "DASH_SESSION": session_name,
+            "DASH_PROJECT_DIR": str(project_dir),
+            "DASH_PROJECT_URL": f"{PUB_URL}/{owner_name}/{session_name}",
+            "GIT_AUTHOR_NAME": owner_name,
+            "GIT_AUTHOR_EMAIL": git_email,
+            "GIT_COMMITTER_NAME": owner_name,
+            "GIT_COMMITTER_EMAIL": git_email,
+        }.items()
+    )
+    if _uses_private_account_runtime(owner):
         try:
             _ensure_user_codex_config_dir(owner)
             codex_home = _user_codex_config_dir(owner)
-            token_path = codex_home / "advisor-token"
-            if not token_path.is_file():
+            token_path = _account_advisor_token_path(owner)
+            if not token_path.is_file() and not _is_admin(owner):
                 logger.error(
                     "Refusing to configure member session '%s': private advisor token is missing",
                     session_name,
                 )
                 return False
-            project_dir = _member_session_project_dir(owner, session_name)
-            config_path = codex_home / "config.toml"
-            existing = config_path.read_text() if config_path.exists() else ""
-            trusted = _ensure_codex_project_trust(existing, str(project_dir))
-            if trusted != existing:
-                _backup_before_dashboard_write(config_path)
-                config_path.write_text(trusted)
-            cmd = (
-                "export CODEX_HOME="
+            initial_config = _verified_codex_config_path(codex_home)
+            with _codex_config_write_lock(initial_config):
+                config_path = _verified_codex_config_path(codex_home)
+                if config_path != initial_config:
+                    raise _UnsafeCodexConfigError(
+                        "Codex config path changed while locking"
+                    )
+                existing, existing_mode = _read_codex_config_no_follow(config_path)
+                trusted = _ensure_codex_project_trust(existing, str(project_dir))
+                if trusted != existing:
+                    _backup_and_replace_codex_config(
+                        config_path,
+                        existing,
+                        existing_mode,
+                        trusted,
+                    )
+            cmd += (
+                "; export CODEX_HOME="
                 + shlex.quote(str(codex_home))
-                + "; export ADVISOR_TOKEN=\"$(cat "
-                + shlex.quote(str(token_path))
-                + " 2>/dev/null)\""
-                + "; cd -- "
-                + shlex.quote(str(project_dir))
             )
+            if not _account_unix_user(owner):
+                # Shared-login sessions still need both here: nothing downstream
+                # will set them.
+                if token_path.is_file():
+                    cmd += (
+                        "; export ADVISOR_TOKEN=\"$(cat "
+                        + shlex.quote(str(token_path))
+                        + " 2>/dev/null)\""
+                    )
+                else:
+                    # Never inherit the primary administrator's identity into a
+                    # separate account just because this deployment has no Advisor.
+                    cmd += "; unset ADVISOR_TOKEN"
+                cmd += "; cd -- " + shlex.quote(str(project_dir))
         except Exception:
             logger.exception("Failed to prepare owner environment for '%s'", session_name)
             return False
     else:
         token_path = Path.home() / ".advisor-token"
-        cmd = (
-            "unset CODEX_HOME; export ADVISOR_TOKEN=\"$(cat "
+        cmd += (
+            "; unset CODEX_HOME; export ADVISOR_TOKEN=\"$(cat "
             + shlex.quote(str(token_path))
             + " 2>/dev/null)\""
         )
     try:
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", cmd],
-                       capture_output=True, text=True, timeout=5)
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"],
-                       capture_output=True, text=True, timeout=5)
-        return True
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            return False
+        session_id = _exact_tmux_session_id(session_name)
+        if not session_id:
+            return False
+        pane_target = f"{session_id}:"
+        written = subprocess.run(
+            ["tmux", "send-keys", "-t", pane_target, "-l", cmd],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if written.returncode != 0:
+            return False
+        if expected_owner_id and not _strict_session_owner(
+            session_name, expected_owner_id
+        ):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", pane_target, "C-u"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return False
+        if _exact_tmux_session_id(session_name) != session_id:
+            return False
+        entered = subprocess.run(
+            ["tmux", "send-keys", "-t", pane_target, "Enter"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if entered.returncode != 0:
+            return False
+        return not expected_owner_id or bool(
+            _strict_session_owner(session_name, expected_owner_id)
+        )
     except Exception:
         logger.debug("send-keys failed for owner environment", exc_info=True)
         return False
 
 
+async def _send_session_owner_environment_serialized(
+    session_name: str, expected_owner_id: str
+) -> bool:
+    """Export identity without allowing a tmux server/id replacement mid-paste."""
+    try:
+        async with _async_tmux_server_mutation_lock():
+            with _session_operation_lock(session_name):
+                owner_binding = _strict_session_owner(
+                    session_name, expected_owner_id
+                )
+                if not owner_binding:
+                    return False
+                row = _session_lifecycle.get(session_name)
+                if row.get("managed"):
+                    generation = str(row.get("generation") or "")
+                    if not generation or not await asyncio.to_thread(
+                        _tmux_session_matches_owner,
+                        session_name,
+                        expected_owner_id,
+                        generation,
+                    ):
+                        return False
+                return await asyncio.to_thread(
+                    _send_session_owner_environment,
+                    session_name,
+                    expected_owner_id,
+                )
+    except (_TmuxMutationBusy, _SessionOperationBusy):
+        return False
+
+
 # --- System stats ---
+
+def _read_proc_cpu_times() -> tuple[int, int, int]:
+    """Return Linux aggregate CPU jiffies as (total, idle, iowait)."""
+    with open("/proc/stat") as handle:
+        first = handle.readline().split()
+    if not first or first[0] != "cpu" or len(first) < 5:
+        raise ValueError("aggregate CPU counters are unavailable")
+    values = [int(value) for value in first[1:9]]
+    # Linux accounts guest time inside user/nice already. Limiting the sum to
+    # user..steal avoids double-counting the optional guest fields.
+    total = sum(values)
+    idle = values[3]
+    iowait = values[4] if len(values) > 4 else 0
+    return total, idle, iowait
+
+
+_LAST_CPU_SAMPLE: dict = {}
+# Reuse a previous reading when it is old enough to be meaningful and recent
+# enough to still describe now.
+_CPU_REUSE_MIN_AGE = 1.0
+_CPU_REUSE_MAX_AGE = 90.0
+
+
+def _sample_cpu_utilization(sample_seconds: float = 0.1) -> tuple[float, float]:
+    """Measure host CPU execution and I/O-wait time from /proc/stat.
+
+    Prefers the span since the last call: a sub-second window is mostly
+    quantisation noise (~40 jiffies on 4 cores), which is how a quiet box came
+    to show 100%. Falls back to sleeping for `sample_seconds` on the first call
+    or after a long gap."""
+    now = time.monotonic()
+    previous = _LAST_CPU_SAMPLE.get("reading")
+    age = now - float(_LAST_CPU_SAMPLE.get("at") or 0.0)
+    if previous and _CPU_REUSE_MIN_AGE <= age <= _CPU_REUSE_MAX_AGE:
+        before_total, before_idle, before_iowait = previous
+    else:
+        before_total, before_idle, before_iowait = _read_proc_cpu_times()
+        time.sleep(max(0.05, min(float(sample_seconds), 1.0)))
+    after_total, after_idle, after_iowait = _read_proc_cpu_times()
+    _LAST_CPU_SAMPLE["reading"] = (after_total, after_idle, after_iowait)
+    _LAST_CPU_SAMPLE["at"] = time.monotonic()
+    total_delta = after_total - before_total
+    if total_delta <= 0:
+        raise ValueError("CPU counters did not advance")
+    idle_delta = max(0, after_idle - before_idle)
+    iowait_delta = max(0, after_iowait - before_iowait)
+    busy_delta = max(0, total_delta - idle_delta - iowait_delta)
+    return (
+        round(min(100.0, busy_delta / total_delta * 100), 1),
+        round(min(100.0, iowait_delta / total_delta * 100), 1),
+    )
 
 @app.get("/api/stats")
 async def api_stats():
@@ -10539,15 +17405,29 @@ async def api_stats():
                 stats["threads_total"] = int(total)
     except Exception:
         stats["cpu_load"] = {}
-    # CPU count and approximate usage percent
+    # CPU count and actual utilization. Load average remains a separate field:
+    # it includes runnable and uninterruptible tasks, so load/CPU is not a CPU
+    # utilization percentage (notably when the host is waiting on disk I/O).
     try:
-        cpu_count = os.cpu_count() or 1
-        stats["cpu_count"] = cpu_count
-        load_1m = float(stats.get("cpu_load", {}).get("1m", 0))
-        stats["cpu_percent"] = min(round(load_1m / cpu_count * 100, 1), 100.0)
+        stats["cpu_count"] = os.cpu_count() or 1
     except Exception:
         stats["cpu_count"] = 1
+    try:
+        sample_ms = max(
+            50,
+            min(int(os.environ.get("TMUX_DASH_CPU_SAMPLE_MS", "100")), 1000),
+        )
+        cpu_percent, iowait_percent = await asyncio.to_thread(
+            _sample_cpu_utilization, sample_ms / 1000
+        )
+        stats["cpu_percent"] = cpu_percent
+        stats["cpu_iowait_percent"] = iowait_percent
+        stats["cpu_measurement"] = "proc_stat_delta"
+        stats["cpu_sample_ms"] = sample_ms
+    except Exception:
         stats["cpu_percent"] = 0
+        stats["cpu_iowait_percent"] = 0
+        stats["cpu_measurement"] = "unavailable"
     # Memory
     try:
         result = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
@@ -10622,12 +17502,19 @@ async def api_stats():
     return JSONResponse(stats)
 
 
-@app.get("/api/health")
-async def api_health():
-    """Lightweight health check for tmux, Codex CLI, and authentication."""
+async def _health_report() -> tuple[dict, int]:
+    """Build liveness-independent readiness without collapsing tmux errors."""
+    inventory = await asyncio.to_thread(_tmux_inventory_snapshot)
     checks = {
         "status": "ok",
-        "tmux": False,
+        "tmux": {
+            "query_ok": bool(inventory.get("authoritative")),
+            "server_running": inventory.get("state") == "ok",
+            "state": inventory.get("state", "error"),
+            "expected_durable": int(inventory.get("expected") or 0),
+            "ready_durable": int(inventory.get("ready_expected") or 0),
+            "missing_durable": len(inventory.get("missing_expected") or []),
+        },
         "openai": bool(_active_openai_key() or (CODEX_HOME / "auth.json").exists()),
         "data_dir": False,
     }
@@ -10635,21 +17522,35 @@ async def api_health():
         checks["data_dir"] = MESSAGES_DIR.is_dir() and os.access(MESSAGES_DIR, os.W_OK)
     except Exception:
         checks["data_dir"] = False
-    try:
-        result = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=3
-        )
-        checks["tmux"] = result.returncode == 0 or "no server running" in result.stderr
-    except Exception:
-        checks["tmux"] = False
     codex_ready, codex_reason, codex_details = await asyncio.to_thread(_codex_cli_readiness)
     checks["codex_cli"] = {"ready": codex_ready, "reason": codex_reason, **codex_details}
     controller = await _controller_call("ping")
-    checks["controller"] = controller
-    if not checks["tmux"] or not codex_ready or not checks["data_dir"] or not controller.get("ok"):
+    checks["controller"] = {"ok": bool(controller.get("ok"))}
+    tmux_ready = bool(inventory.get("authoritative")) and not inventory.get(
+        "missing_expected"
+    )
+    if not tmux_ready or not codex_ready or not checks["data_dir"] or not controller.get("ok"):
         checks["status"] = "degraded"
-    return JSONResponse(checks)
+    return checks, 200 if checks["status"] == "ok" else 503
+
+
+@app.get("/health/live")
+async def health_live():
+    """Public process liveness; dependency readiness is a separate signal."""
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/health/ready")
+async def health_ready():
+    checks, status_code = await _health_report()
+    return JSONResponse({"status": checks["status"]}, status_code=status_code)
+
+
+@app.get("/api/health")
+async def api_health():
+    """Detailed readiness with meaningful HTTP status semantics."""
+    checks, status_code = await _health_report()
+    return JSONResponse(checks, status_code=status_code)
 
 
 # --- Claude account identity + per-session stale-login detection ---
@@ -11518,7 +18419,8 @@ def _claim_browser_proxy_session(session: dict) -> None:
         row["session_id"] = secrets.token_hex(5)
         changed = True
     if "enabled" not in row:
-        row["enabled"] = True
+        # Residential traffic is opt-in after a direct connection fails.
+        row["enabled"] = False
         changed = True
     if changed:
         _proxy_save(conf)
@@ -11569,7 +18471,7 @@ def _ensure_user_browser_session(user: dict, *, start: bool = True) -> dict:
             return {}
         cfg_dir = _user_codex_config_dir(user)
         if cfg_dir.exists():
-            if not _is_admin(user) and (cfg_dir / "config.toml").exists():
+            if _uses_private_account_runtime(user) and (cfg_dir / "config.toml").exists():
                 _configure_member_codex_isolation(cfg_dir, user, browser)
             _sync_account_browser_context(
                 cfg_dir / "AGENTS.md",
@@ -11584,7 +18486,7 @@ def _ensure_user_browser_session(user: dict, *, start: bool = True) -> dict:
 def _ensure_all_user_browser_sessions() -> None:
     """Refresh account configuration and ensure one browser record per user."""
     for user in _load_users():
-        if not _is_admin(user):
+        if _uses_private_account_runtime(user):
             try:
                 _ensure_user_codex_config_dir(user)
             except Exception:
@@ -11986,7 +18888,8 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
             "local_port": sess.get("local_port"),
             "session_id": sess.get("session_id", ""),
             "country": sess.get("country") or conf.get("country") or "",
-            "enabled": bool(sess.get("enabled", True)) and bool(sess.get("local_port")),
+            "enabled": bool(conf.get("enabled") and sess.get("enabled", False)
+                            and sess.get("local_port")),
             "bytes": int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)),
             "conns": int(u.get("conns", 0)),
             "last_error": u.get("last_error", ""),
@@ -11997,7 +18900,7 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
     total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
     return JSONResponse({
         "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
-        "enabled": bool(conf.get("enabled")),
+        "enabled": bool(conf.get("enabled") and ((conf.get("sessions") or {}).get("default") or {}).get("enabled", False)),
         "provider": conf.get("provider", ""),
         "host": conf.get("host", ""), "port": conf.get("port", 0),
         "username": conf.get("username", ""), "zone": conf.get("zone", ""),
@@ -12010,6 +18913,7 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
 
 class BrowserProxyBody(BaseModel):
     enabled: bool | None = None
+    direct_failed: bool = Field(default=False, strict=True)
     provider: str | None = None
     host: str | None = None
     port: int | None = None
@@ -12023,7 +18927,17 @@ class BrowserProxyBody(BaseModel):
 async def api_browser_proxy_set(body: BrowserProxyBody, request: Request):
     if not _auth_admin_ok(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
+    if body.enabled is True and not body.direct_failed:
+        return JSONResponse({"error": "Try the normal IP first. Use residential only after a direct connection fails."}, status_code=400)
     conf = _proxy_conf()
+    if body.enabled is True and not conf.get("enabled"):
+        dormant_others = any(
+            sid != "default" and isinstance(row, dict)
+            and row.get("enabled", True) and row.get("local_port")
+            for sid, row in (conf.get("sessions") or {}).items()
+        )
+        if dormant_others:
+            return JSONResponse({"error": "The proxy relay is globally paused. Enabling it here would also reactivate other browsers' saved proxy routes. Keep it paused until those routes are reviewed."}, status_code=409)
     presets = _proxy_presets()
     if body.provider and body.provider in presets:
         p = presets[body.provider]
@@ -12045,13 +18959,12 @@ async def api_browser_proxy_set(body: BrowserProxyBody, request: Request):
     if body.country is not None:
         conf["country"] = body.country.strip().lower()
     if body.enabled is not None:
-        conf["enabled"] = bool(body.enabled)
-        # The cached exit-IP timezone belongs to the old route.
-        for f in (CB_ROOT / "state").glob("*.geo.json"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
+        conf.setdefault("sessions", {}).setdefault("default", {})["enabled"] = bool(body.enabled)
+        if body.enabled:
+            conf["enabled"] = True
+        # This control changes only the default account's route and timezone.
+        # Other accounts retain their own opt-in flag, sticky identity and cache.
+        (CB_ROOT / "state" / "default.geo.json").unlink(missing_ok=True)
     _proxy_save(conf)
     logger.info("Browser proxy config updated (enabled=%s provider=%s user=%s)",
                 conf.get("enabled"), conf.get("provider"), conf.get("username"))
@@ -12680,14 +19593,43 @@ def _pane_text(session_name: str, lines: int = 60) -> str:
         return ""
 
 
-async def _send_line(session_name: str, text: str):
-    await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "-l", text],
-        capture_output=True, text=True, timeout=10)
-    await asyncio.sleep(0.3)
-    await asyncio.to_thread(subprocess.run,
-        ["tmux", "send-keys", "-t", session_name, "Enter"],
-        capture_output=True, text=True, timeout=10)
+async def _send_line(
+    session_name: str,
+    text: str,
+    *,
+    automatic: bool = False,
+    expected_binding: dict | None = None,
+) -> bool:
+    try:
+        with _session_operation_lock(session_name):
+            async with _autopush_write_scope(session_name, automatic) as allowed:
+                if not allowed:
+                    return False
+                target = session_name
+                if expected_binding:
+                    if await asyncio.to_thread(
+                        _terminal_binding_state, expected_binding
+                    ) != "current":
+                        return False
+                    target = str(expected_binding.get("session_id") or "")
+                    if not target:
+                        return False
+                await asyncio.to_thread(
+                    _session_lifecycle.touch,
+                    session_name,
+                    source="codex-auth-input",
+                    records_input=True,
+                )
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "send-keys", "-t", target, "-l", text],
+                    capture_output=True, text=True, timeout=10)
+                await asyncio.sleep(0.3)
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    capture_output=True, text=True, timeout=10)
+        return True
+    except _SessionOperationBusy as exc:
+        raise _SessionCloseError("Session lifecycle operation is in progress") from exc
 
 
 def _code_from_urls(urls: list) -> str:
@@ -12758,8 +19700,18 @@ async def _extract_oauth_code(tab, authorize_url: str) -> dict:
                      "(its consent page stalls when driven automatically)"}
 
 
-async def _auto_fix_login(session_name: str) -> dict:
+async def _auto_fix_login(
+    session_name: str,
+    *,
+    respect_autopush: bool = False,
+    expected_binding: dict | None = None,
+) -> dict:
     """Validate Codex auth, activate the API fallback, and relaunch the pane."""
+    binding = expected_binding
+    if respect_autopush and not binding:
+        binding = await _autopush_terminal_binding(session_name)
+        if not binding:
+            return {"ok": False, "error": "session identity changed"}
     alog = logging.getLogger("auto-auth")
     config_home = _session_config_base(session_name)
     auth_state = await asyncio.to_thread(
@@ -12770,17 +19722,51 @@ async def _auto_fix_login(session_name: str) -> dict:
             "ok": False,
             "error": "no valid ChatGPT credential or stored OpenAI API key is available",
         }
-    # Clear a stranded interactive login before restarting Codex.
-    for _ in range(3):
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Escape"],
-            capture_output=True, text=True, timeout=5)
-        await asyncio.sleep(0.4)
-    _exported, restarted = await _restart_codex_for_session(session_name)
+    # Auth validation above can take seconds. Fence only each actual key batch,
+    # not the full restart, so Off remains responsive throughout recovery.
+    if respect_autopush:
+        for _ in range(3):
+            if not await _autopush_tmux_batch(
+                session_name,
+                [(["tmux", "send-keys", "-t", session_name, "Escape"], 5)],
+                expected_binding=binding,
+            ):
+                return {
+                    "ok": False,
+                    "error": (
+                        "auto-push is Off"
+                        if _get_autopush_mode(session_name) == "off"
+                        else "session identity changed"
+                    ),
+                }
+            await asyncio.sleep(0.4)
+    else:
+        try:
+            with _session_operation_lock(session_name):
+                for _ in range(3):
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "send-keys", "-t", session_name, "Escape"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    await asyncio.sleep(0.4)
+        except _SessionOperationBusy:
+            return {"ok": False, "error": "session lifecycle operation is in progress"}
+    _exported, restarted = await _restart_codex_for_session(
+        session_name,
+        str((binding or {}).get("owner_id") or "") or None,
+        str((binding or {}).get("generation") or ""),
+        autopush_guard=respect_autopush,
+        expected_binding=binding,
+    )
     if not restarted:
         return {"ok": False, "error": "Codex could not be relaunched after auth recovery"}
     for _ in range(20):
         await asyncio.sleep(1)
+        if binding and await asyncio.to_thread(
+            _terminal_binding_state, binding
+        ) != "current":
+            return {"ok": False, "error": "session identity changed"}
         pane = await asyncio.to_thread(_pane_text, session_name, 25)
         if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
             continue
@@ -12792,9 +19778,21 @@ async def _auto_fix_login(session_name: str) -> dict:
     return {"ok": False, "error": "relaunched but the session still looks logged out"}
 
 
-async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
+async def _auto_auth_session(
+    session_name: str,
+    reason: str = "",
+    *,
+    expected_binding: dict | None = None,
+) -> dict:
     """Log `session_name` back in using the designated login browser."""
     alog = logging.getLogger("auto-auth")
+    automatic = reason != "manual"
+    binding = expected_binding
+    if automatic and not binding:
+        binding = await _autopush_terminal_binding(session_name)
+        if not binding:
+            return {"ok": False, "error": "session identity changed"}
+    pane_target = str((binding or {}).get("session_id") or session_name)
     st = _auto_auth_state.setdefault(session_name, {})
     if time.time() - st.get("ts", 0) < _AUTO_AUTH_COOLDOWN and st.get("running"):
         return {"ok": False, "error": "auto-auth already running for this session"}
@@ -12817,7 +19815,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
             #    If a login flow is mid-flight but hasn't produced a URL yet, a
             #    human is very likely typing it — sending another /login would
             #    interrupt them, so back off instead.
-            pane = await asyncio.to_thread(_pane_text, session_name)
+            pane = await asyncio.to_thread(_pane_text, pane_target)
             if not _scrape_authorize_url(pane):
                 low = pane.lower()
                 if "select login method" in low or "paste code here" in low:
@@ -12826,19 +19824,35 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                             "error": "a login is already in progress in this session — "
                                      "finish it, or press Esc first"}
                 st["status"] = "running /login"
-                await _send_line(session_name, "/login")
+                if not await _send_line(
+                    session_name, "/login", automatic=automatic,
+                    expected_binding=binding,
+                ):
+                    return {"ok": False, "error": "auto-push is Off"}
                 await asyncio.sleep(2.5)
                 # Claude asks which method first — pick the subscription option.
-                pane = await asyncio.to_thread(_pane_text, session_name)
+                pane = await asyncio.to_thread(_pane_text, pane_target)
                 if re.search(r"select login method|subscription", pane, re.I):
-                    await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "Enter"],
-                        capture_output=True, text=True, timeout=10)
+                    if automatic:
+                        if not await _autopush_tmux_batch(session_name, [
+                            (["tmux", "send-keys", "-t", session_name, "Enter"], 10),
+                        ], expected_binding=binding):
+                            return {"ok": False, "error": "auto-push is Off"}
+                    else:
+                        try:
+                            with _session_operation_lock(session_name):
+                                await asyncio.to_thread(subprocess.run,
+                                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                                    capture_output=True, text=True, timeout=10)
+                        except _SessionOperationBusy as exc:
+                            raise _SessionCloseError(
+                                "Session lifecycle operation is in progress"
+                            ) from exc
                     await asyncio.sleep(2.5)
             # 2. Scrape the authorize URL.
             url = ""
             for _ in range(20):
-                pane = await asyncio.to_thread(_pane_text, session_name)
+                pane = await asyncio.to_thread(_pane_text, pane_target)
                 url = _scrape_authorize_url(pane)
                 if url:
                     break
@@ -12864,7 +19878,11 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                 return {"ok": False, "error": res["error"], "authorize_url": url}
             # 4. Paste the code back into the waiting prompt.
             st["status"] = "submitting code"
-            await _send_line(session_name, res["code"])
+            if not await _send_line(
+                session_name, res["code"], automatic=automatic,
+                expected_binding=binding,
+            ):
+                return {"ok": False, "error": "auto-push is Off"}
             # Success = the paste prompt goes away with no error, not merely the
             # absence of a "login required" string (which is briefly true while
             # the CLI is still exchanging the code).
@@ -12872,7 +19890,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
             ok, why = False, "timed out waiting for the login to settle"
             for _ in range(12):
                 await asyncio.sleep(2)
-                pane = await asyncio.to_thread(_pane_text, session_name)
+                pane = await asyncio.to_thread(_pane_text, pane_target)
                 low = pane.lower()
                 if "invalid code" in low or "oauth error" in low or "authentication failed" in low:
                     ok, why = False, "Claude rejected the code"
@@ -13073,7 +20091,7 @@ async def api_session_relogin(session_name: str, request: Request):
 @app.post("/api/transcribe")
 async def api_transcribe(audio: UploadFile = File(...)):
     """Transcribe a recorded voice clip to text (for the composer mic button)."""
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = _managed_openai_key()
     if not key:
         return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
     try:
@@ -13603,7 +20621,7 @@ def _codex_session_dirs() -> list[Path]:
         homes.update(
             _user_codex_config_dir(user)
             for user in _load_users()
-            if user and not _is_admin(user)
+            if _uses_private_account_runtime(user)
         )
     except Exception:
         pass
@@ -14217,6 +21235,42 @@ async def api_admin_codex_alerts_clear(request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.post("/api/admin/sessions/recover")
+async def api_admin_recover_sessions(request: Request):
+    """Start an idempotent durable recovery pass for this admin's tabs."""
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    # SameSite cookies already block ordinary cross-site form POSTs. Requiring
+    # a non-simple fetch header adds an explicit CSRF boundary for this server
+    # mutation and keeps the endpoint bodyless: targets always come from the
+    # controller's durable registry, never caller-supplied lifecycle data.
+    if request.headers.get("X-Tmux-Recovery") != "1":
+        return JSONResponse({"error": "Recovery confirmation header required"}, status_code=400)
+    result = await _controller_call(
+        "durable_reconcile_start", owner_id=str(user.get("id") or "")
+    )
+    payload = dict(result or {})
+    status = int(payload.pop("_status", 202 if payload.get("ok") else 503))
+    return JSONResponse(payload, status_code=status)
+
+
+@app.get("/api/admin/sessions/recover/{job_id}")
+async def api_admin_recover_sessions_status(request: Request, job_id: str):
+    """Poll a manual durable recovery job without exposing lifecycle secrets."""
+    user = _current_user(request)
+    if not _is_admin(user):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    result = await _controller_call(
+        "durable_reconcile_status",
+        owner_id=str(user.get("id") or ""),
+        job_id=job_id,
+    )
+    payload = dict(result or {})
+    status = int(payload.pop("_status", 200 if payload.get("ok") else 503))
+    return JSONResponse(payload, status_code=status)
+
+
 @app.get("/api/stats/usage")
 async def api_stats_usage():
     """Aggregated token usage across all codex sessions: 5h window + this week."""
@@ -14235,6 +21289,22 @@ async def api_stats_usage():
 
     # Build mapping: cwd -> list of (timestamp, inp, out, cr, reasoning, model)
     cwd_entries: dict = {}
+    resume_cwd_overrides: dict[str, str] = {}
+    try:
+        lifecycle_rows = (
+            _session_lifecycle.snapshot().get("sessions", {}) or {}
+        )
+        for session_name, row in lifecycle_rows.items():
+            thread_id = _validated_session_root_thread_id(
+                session_name, (row or {}).get("resume_uuid")
+            )
+            current_cwd = get_session_cwd(session_name) or str(
+                (row or {}).get("cwd") or ""
+            )
+            if thread_id and current_cwd:
+                resume_cwd_overrides[thread_id] = current_cwd.rstrip("/")
+    except Exception:
+        logger.debug("Failed to build persisted Codex usage aliases", exc_info=True)
 
     for fpath in all_files:
         try:
@@ -14250,7 +21320,12 @@ async def api_stats_usage():
                     except Exception:
                         continue
                     if d.get("type") == "session_meta":
-                        session_cwd = d.get("payload", {}).get("cwd", "") or session_cwd
+                        payload = d.get("payload", {}) or {}
+                        recorded_cwd = payload.get("cwd", "") or session_cwd
+                        thread_id = _validated_codex_thread_id(payload.get("id"))
+                        session_cwd = resume_cwd_overrides.get(
+                            thread_id or "", recorded_cwd
+                        )
                     elif d.get("type") == "turn_context":
                         m = d.get("payload", {}).get("model")
                         if m:
@@ -14349,63 +21424,90 @@ async def api_stats_usage():
 
 _session_stats_cache: dict[str, dict] = {}
 _session_model_cache: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
-# Model switches requested via the header dropdown, not yet confirmed by the
-# transcript (the JSONL only shows the new model on the NEXT assistant reply).
-_session_model_pending: dict[str, dict] = {}  # {session_name: {"model": str, "ts": float}}
+
+
+def _session_derived_cache_identity(session_name: str) -> str:
+    owner_id = _session_owner_id(session_name)
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    return _session_incarnation(
+        owner_id, generation, "logical" if generation else "legacy"
+    )
 
 
 def _session_model_fields(session_name: str) -> dict:
-    """Model, effort, and pending model for session API payloads. Clears pending once
-    the transcript confirms the switch, or after 15 min (request abandoned)."""
-    model = _get_session_model(session_name)
-    pend = _session_model_pending.get(session_name)
-    if pend:
-        base = pend.get("model", "").split("[", 1)[0]
-        confirmed = bool(model and base and (model == base or model.startswith(base + "-")))
-        if confirmed or time.time() - pend.get("ts", 0) > 900:
-            _session_model_pending.pop(session_name, None)
-            pend = None
+    """Report the live model and any account setting awaiting a session restart."""
+    live_model = _get_session_model(session_name, fallback_config=False)
     effort = _CODEX_DEFAULT_REASONING_EFFORT
+    configured_model = ""
     try:
-        cfg = (_session_config_base(session_name) / "config.toml").read_text()
-        match = re.search(
-            r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"',
-            cfg,
-            re.MULTILINE,
+        cfg = tomllib.loads(
+            (_session_config_base(session_name) / "config.toml").read_text()
         )
-        if match:
-            effort = match.group(1)
+        configured_model = str(cfg.get("model") or "").strip()
+        configured_effort = _normalize_reasoning_effort(
+            str(cfg.get("model_reasoning_effort") or "")
+        )
+        if configured_effort:
+            effort = configured_effort
     except Exception:
         pass
+    options = _session_launch_options(session_name)
+    if options:
+        configured_model, effort = options["model"], options["effort"]
+    model = live_model or configured_model
+    configured_base = configured_model.split("[", 1)[0]
+    confirmed = bool(
+        live_model
+        and configured_base
+        and (
+            live_model == configured_base
+            or live_model.startswith(configured_base + "-")
+        )
+    )
     return {
         "model": model,
-        "model_pending": (pend or {}).get("model", ""),
+        "model_pending": configured_model if configured_model and not confirmed else "",
         "effort": effort,
+        "session_model_settings": bool(options),
+        "no_fallback": options.get("no_fallback", True),
+        "fallback_status": (options.get("fallback") or {}).get("status", ""),
     }
 
 
-def _get_session_model(session_name: str) -> str:
+def _get_session_model(
+    session_name: str, *, fallback_config: bool = True
+) -> str:
     """Detect the current model for a session by reading its latest codex rollout."""
     now = time.time()
+    identity = _session_derived_cache_identity(session_name)
     cached = _session_model_cache.get(session_name)
-    if cached and now - cached.get("ts", 0) < 30:
-        return cached.get("model", "")
+    if cached and cached.get("_identity") == identity and now - cached.get("ts", 0) < 30:
+        if fallback_config or cached.get("source") == "transcript":
+            return cached.get("model", "")
+        return ""
     files = _find_session_jsonl_files(session_name)
     if not files:
-        # Fall back to the model from codex config.toml
-        try:
-            cfg = (_session_config_base(session_name) / "config.toml").read_text()
-            m = re.search(r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE)
-            if m:
-                _session_model_cache[session_name] = {"model": m.group(1), "ts": now}
-                return m.group(1)
-        except Exception:
-            pass
-        _session_model_cache[session_name] = {"model": "", "ts": now}
+        if fallback_config:
+            try:
+                cfg = (_session_config_base(session_name) / "config.toml").read_text()
+                m = re.search(r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE)
+                if m:
+                    _session_model_cache[session_name] = {
+                        "model": m.group(1), "ts": now,
+                        "_identity": identity, "source": "config",
+                    }
+                    return m.group(1)
+            except Exception:
+                pass
+        _session_model_cache[session_name] = {
+            "model": "", "ts": now, "_identity": identity, "source": "none",
+        }
         return ""
     newest = max(files, key=lambda f: os.path.getmtime(f), default=None)
     if not newest:
-        _session_model_cache[session_name] = {"model": "", "ts": now}
+        _session_model_cache[session_name] = {
+            "model": "", "ts": now, "_identity": identity, "source": "none",
+        }
         return ""
     model = ""
     try:
@@ -14428,7 +21530,25 @@ def _get_session_model(session_name: str) -> str:
                 continue
     except Exception:
         logger.debug("Failed to detect model for '%s'", session_name, exc_info=True)
-    _session_model_cache[session_name] = {"model": model, "ts": now}
+    source = "transcript" if model else "none"
+    if not model and fallback_config:
+        try:
+            cfg = (_session_config_base(session_name) / "config.toml").read_text()
+            configured = re.search(
+                r'^\s*model\s*=\s*"([^"]+)"', cfg, re.MULTILINE
+            )
+            if configured:
+                model = configured.group(1)
+                source = "config"
+        except Exception:
+            logger.debug(
+                "Failed to use configured model fallback for '%s'",
+                session_name,
+                exc_info=True,
+            )
+    _session_model_cache[session_name] = {
+        "model": model, "ts": now, "_identity": identity, "source": source,
+    }
     return model
 
 
@@ -14439,9 +21559,17 @@ def _find_session_jsonl_files(session_name: str) -> list:
     and the cwd is recorded in the session_meta event at line 1.
     """
     cwd = get_session_cwd(session_name)
-    if not cwd:
+    try:
+        resume_uuid = _find_session_transcript_uuid(session_name)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid rollout mapping while reading stats for '%s'",
+            session_name,
+        )
+        resume_uuid = None
+    if not cwd and not resume_uuid:
         return []
-    cwd_norm = cwd.rstrip("/")
+    cwd_norm = cwd.rstrip("/") if cwd else ""
     sessions_home = _session_config_base(session_name)
     sessions_dir = sessions_home / "sessions"
     if not sessions_dir.exists():
@@ -14463,8 +21591,12 @@ def _find_session_jsonl_files(session_name: str) -> list:
                 continue
             if meta.get("type") != "session_meta":
                 continue
-            mcwd = (meta.get("payload", {}) or {}).get("cwd", "").rstrip("/")
-            if mcwd == cwd_norm:
+            payload = meta.get("payload", {}) or {}
+            mcwd = payload.get("cwd", "").rstrip("/")
+            thread_id = _validated_codex_thread_id(payload.get("id"))
+            if (cwd_norm and mcwd == cwd_norm) or (
+                resume_uuid and thread_id == resume_uuid
+            ):
                 matches.append(str(fpath))
         except Exception:
             logger.debug("Failed to peek rollout %s", fpath, exc_info=True)
@@ -14474,13 +21606,14 @@ def _find_session_jsonl_files(session_name: str) -> list:
 def _parse_session_stats(session_name: str) -> dict:
     """Parse JSONL files and compute per-session token stats with rate tracking."""
     now = time.time()
+    identity = _session_derived_cache_identity(session_name)
     cached = _session_stats_cache.get(session_name)
-    if cached and now - cached.get("_ts", 0) < 15:
+    if cached and cached.get("_identity") == identity and now - cached.get("_ts", 0) < 15:
         return cached
 
     files = _find_session_jsonl_files(session_name)
     if not files:
-        result = {"available": False, "_ts": now}
+        result = {"available": False, "_ts": now, "_identity": identity}
         _session_stats_cache[session_name] = result
         return result
 
@@ -14558,7 +21691,7 @@ def _parse_session_stats(session_name: str) -> dict:
             logger.debug("Failed to read stats JSONL for '%s'", session_name, exc_info=True)
 
     if not entries:
-        result = {"available": False, "_ts": now}
+        result = {"available": False, "_ts": now, "_identity": identity}
         _session_stats_cache[session_name] = result
         return result
 
@@ -14571,7 +21704,7 @@ def _parse_session_stats(session_name: str) -> dict:
     # Rate calculation: bucket into 1-minute windows
     # Only consider windows with meaningful output (> 10 output tokens = actually streaming)
     buckets = {}  # minute_epoch -> {input, output, total}
-    for epoch, inp, out, cr, cc in entries:
+    for epoch, inp, out, _cr, _cc in entries:
         minute = int(epoch // 60) * 60
         b = buckets.setdefault(minute, {"input": 0, "output": 0, "total": 0})
         b["input"] += inp
@@ -14649,6 +21782,7 @@ def _parse_session_stats(session_name: str) -> dict:
         "lastInputTokens": latest_input_tokens,
         "ctxWindowSize": latest_context_window,
         "_ts": now,
+        "_identity": identity,
     }
     _session_stats_cache[session_name] = result
     return result
@@ -14658,7 +21792,7 @@ def _parse_session_stats(session_name: str) -> dict:
 async def api_session_stats(session_name: str):
     """Per-session token usage, cost, and rate limit detection."""
     stats = await asyncio.to_thread(_parse_session_stats, session_name)
-    return JSONResponse(stats)
+    return JSONResponse({key: value for key, value in stats.items() if key != "_identity"})
 
 
 class SendCommand(BaseModel):
@@ -14673,29 +21807,216 @@ class AuthModeBody(BaseModel):
 
 class AwayModeBody(BaseModel):
     enabled: bool
+    incarnation: str = ""
 
 class GoNutsModeBody(BaseModel):
     enabled: bool
+    incarnation: str = ""
 
 
 @app.post("/api/sessions/{session_name}/resume")
-async def api_resume_session(session_name: str):
+async def api_resume_session(request: Request, session_name: str):
     if not _find_session(session_name)[1]:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     result = await _controller_call(
-        "session_resume", session=session_name, source="explicit-resume"
+        "session_resume",
+        session=session_name,
+        source="explicit-resume",
+        owner_id=str((_current_user(request) or {}).get("id") or ""),
     )
     return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+
+
+_CODEX_COMPOSER_FOOTER_RE = re.compile(
+    r"^\s{0,6}(?![-*+•]\s)[A-Za-z][\w.\-]*\d[\w.\-]*"
+    r"(?:\s+[\w.\-]+)*\s+[·•]\s+[~/](?:\S(?:.*\S)?)?"
+    r"(?:\s+[·•]\s+.*)?\s*$"
+)
+_CODEX_COMPOSER_LINE_RE = re.compile(r"^\s*[❯›»]\s*(.*)$")
+_CODEX_COMPOSER_BOUNDARY_RE = re.compile(
+    r"^\s*(?:[●⏺•◦■]|[╭╰┌└┐┘│]|[─━═]{3,})"
+)
+_CODEX_COMPOSER_PLACEHOLDERS = {
+    "ask codex to do anything",
+    "ask codex anything",
+    "use /skills to list available skills",
+}
+_CODEX_COMPOSER_UNKNOWN = "\0"
+_CODEX_COMPOSER_MAX_ROWS = 200
+_CODEX_PASTE_PREVIEW_RE = re.compile(
+    r"\[Pasted\s+(?:text\s+\+\d+\s+lines?|Content\s+\d+\s+chars?)\](?:\s*#\d+)?",
+    re.I,
+)
+
+
+def _codex_composer_matches_prompt(composer: str, text: str) -> bool:
+    """Match this submission, including collapsed paste chips and wrapped text."""
+    if not composer or composer == _CODEX_COMPOSER_UNKNOWN:
+        return False
+    composer = " ".join(composer.split())
+    expected = " ".join(text.split())
+    if composer == expected:
+        return True
+    if not _CODEX_PASTE_PREVIEW_RE.search(composer):
+        return False
+    # Only the chips are opaque. Any visible prefix/suffix must still belong
+    # to the prompt being delivered, rather than an unrelated live draft.
+    parts = _CODEX_PASTE_PREVIEW_RE.split(composer)
+    pattern = ".*?".join(re.escape(part) for part in parts)
+    return re.fullmatch(pattern, expected) is not None
+
+
+def _active_codex_composer_state(visible: str) -> tuple[str, bool]:
+    """Return live composer text and whether it is a numbered option menu.
+
+    Codex renders the live composer immediately above its model/cwd footer.
+    Submitted messages use the same leading glyph in scrollback, so a substring
+    search across the pane cannot distinguish them.
+    """
+    lines = (visible or "").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if not _CODEX_COMPOSER_FOOTER_RE.match(lines[index]):
+            continue
+        # A draft can wrap onto indented continuation lines. Walk only a small,
+        # structurally bounded block above the footer so a submitted turn in
+        # scrollback can never be mistaken for the live composer.
+        fragments: list[str] = []
+        scanned = 0
+        for prompt_index in range(index - 1, -1, -1):
+            line = lines[prompt_index]
+            if not line.strip():
+                continue
+            if _CODEX_COMPOSER_FOOTER_RE.match(line):
+                return "", False
+            match = _CODEX_COMPOSER_LINE_RE.match(line)
+            if match:
+                first = match.group(1).strip()
+                text = " ".join(
+                    part for part in [first, *reversed(fragments)] if part
+                )
+                if text.casefold() in _CODEX_COMPOSER_PLACEHOLDERS:
+                    return "", False
+                # Anything tied to the footer is the composer, even if a user
+                # draft happens to start with a numbered-list prefix. Pickers
+                # replace this footer block and are detected separately.
+                return text, False
+            if _CODEX_COMPOSER_BOUNDARY_RE.match(line):
+                return _CODEX_COMPOSER_UNKNOWN, False
+            if scanned >= _CODEX_COMPOSER_MAX_ROWS:
+                # Fail closed. This is structurally still the footer's live
+                # composer, but it is too large to reconstruct safely.
+                return _CODEX_COMPOSER_UNKNOWN, False
+            fragments.append(line.strip().rstrip("│").strip())
+            scanned += 1
+        if fragments:
+            # The first cursor row may have scrolled above a short pane. Any
+            # footer-adjacent continuation text is still a live draft.
+            return _CODEX_COMPOSER_UNKNOWN, False
+    return "", False
+
+
+def _active_codex_composer_text(visible: str) -> str:
+    """Return text in the live Codex composer, never an echoed user turn."""
+    return _active_codex_composer_state(visible)[0]
+
+
+async def _ensure_codex_submitted(
+    session_name: str, text: str, session_target: str = ""
+) -> str:
+    """Confirm a prompt actually left the composer; rescue it if not.
+
+    Codex refuses to submit on Enter while a turn is running and offers to queue instead, so a
+    message sent mid-turn stays parked in the input box and is silently lost when the turn ends.
+    Returns "submitted", "queued", "resent" or "stranded" (for the log).
+    """
+    probe = (text or "").strip().splitlines()[0][:40] if (text or "").strip() else ""
+    if not probe:
+        return "submitted"
+    # Slash commands commonly replace the composer with a picker.  The initial
+    # explicit C-m has already been sent by the caller; a delayed retry can only
+    # race the resulting picker and select its highlighted option.
+    if (text or "").lstrip().startswith("/"):
+        return "submitted"
+    for attempt in range(3):
+        await asyncio.sleep(0.6 if attempt == 0 else 1.2)
+        try:
+            tail = await asyncio.to_thread(
+                capture_pane_recent,
+                session_target or session_name,
+                _CODEX_COMPOSER_MAX_ROWS + 10,
+            )
+        except Exception:
+            logger.debug("submit verification: could not read pane", exc_info=True)
+            return "submitted"
+        composer_text = _active_codex_composer_text(tail)
+        if composer_text == _CODEX_COMPOSER_UNKNOWN:
+            return "stranded"
+        # Gone from the live composer => it was accepted.  Echoed transcript
+        # text and historical pickers do not count as positive evidence that a
+        # retry is needed.  A current picker replaces the composer, so it also
+        # lands on this safe submitted path.
+        if not _codex_composer_matches_prompt(composer_text, text):
+            return "submitted"
+        # Codex is mid-turn and offering its own queue. Use it: the message runs when the
+        # current turn finishes, instead of sitting there until someone notices.
+        if "to queue message" in tail:
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", session_target or session_name, "Tab"],
+                capture_output=True, text=True, timeout=5)
+            return "queued"
+        # Still parked with no queue offer: the Enter did not land. Press it again.
+        await asyncio.to_thread(subprocess.run,
+            ["tmux", "send-keys", "-t", session_target or session_name, "C-m"],
+            capture_output=True, text=True, timeout=5)
+    # The final retry needs the same acknowledgement check as earlier ones.
+    await asyncio.sleep(0.6)
+    tail = await asyncio.to_thread(
+        capture_pane_recent, session_target or session_name,
+        _CODEX_COMPOSER_MAX_ROWS + 10,
+    )
+    composer_text = _active_codex_composer_text(tail)
+    return "stranded" if (composer_text == _CODEX_COMPOSER_UNKNOWN or
+        _codex_composer_matches_prompt(composer_text, text)) else "submitted"
+
+
+async def _voice_submission_state(session_name: str, text: str, session_target: str = "") -> str:
+    """Observe a one-use Voice submission without retrying or queueing input."""
+    await asyncio.sleep(0.6)
+    try:
+        tail = await asyncio.to_thread(capture_pane_recent,
+            session_target or session_name, _CODEX_COMPOSER_MAX_ROWS + 10)
+        if not any(_CODEX_COMPOSER_FOOTER_RE.match(line) for line in (tail or "").splitlines()):
+            return "uncertain"
+        composer = _active_codex_composer_text(tail)
+        if composer == _CODEX_COMPOSER_UNKNOWN:
+            return "uncertain"
+        return "stranded" if _codex_composer_matches_prompt(composer, text) else "submitted"
+    except Exception:
+        logger.debug("Voice submit verification could not read the composer", exc_info=True)
+        return "uncertain"
 
 
 @app.post("/api/sessions/{session_name}/send")
 async def api_send_command(request: Request, session_name: str, body: SendCommand):
     """Send keystrokes to a tmux session, as if typed at the terminal."""
-    _, sess = _find_session_for_user(session_name, _current_user(request))
+    timed_voice = (getattr(request.state, "voice_checkin", False) is True or
+                   getattr(request.state, "voice_target_binding", None) is not None)
+    def timed_voice_current():
+        return not timed_voice or voice_mode.request_target_matches(sys.modules[__name__], request, session_name)
+    def cancelled_voice_response():
+        return JSONResponse({"error": "Voice action was cancelled. No further submit key was sent; review any remaining terminal input."}, status_code=409)
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+        return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
     resumed = await _controller_call(
-        "session_resume", session=session_name, source="send-command"
+        "session_resume",
+        session=session_name,
+        source="send-command",
+        owner_id=owner_id,
     )
     if not resumed.get("ok"):
         return JSONResponse({"error": resumed.get("error", "session resume failed")}, status_code=503)
@@ -14709,85 +22030,183 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             },
             status_code=503,
         )
+    operation_guard = _session_operation_lock(session_name)
     try:
-        cmd_text = body.command
-        if len(cmd_text) > 200:
-            # For long messages, use tmux load-buffer + paste-buffer.
-            # Codex's bracketed paste mode shows "[Pasted text +N lines]"
-            # as a preview and often swallows the Enter that follows, leaving
-            # the paste stuck until the user sends a second message. We defeat
-            # this by sending the \e[?2004l escape sequence first (disables
-            # bracketed paste), then pasting, then waiting long enough for
-            # the terminal to render before pressing Enter.
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-H",
-                 "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
-                capture_output=True, text=True, timeout=5
+        operation_guard.__enter__()
+    except _SessionOperationBusy:
+        return JSONResponse(
+            {"error": "Session lifecycle operation is in progress"},
+            status_code=409,
+        )
+    try:
+        if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+            return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
+        fence = await _controller_call(
+            "session_input_check",
+            session=session_name,
+            owner_id=owner_id,
+            source="send-command",
+            records_input=True,
+        )
+        if not fence.get("ok"):
+            return JSONResponse(
+                {"error": fence.get("error", "session is closing")},
+                status_code=int(fence.get("_status", 409)),
             )
-            await asyncio.sleep(0.15)
+        binding = await asyncio.to_thread(
+            _terminal_binding, session_name, owner_id
+        )
+        if not binding:
+            return JSONResponse(
+                {"error": "Session identity changed; message was not sent"},
+                status_code=409,
+            )
+        session_target = binding["session_id"]
+        if not timed_voice:
+            voice_mode.note_prompt(MESSAGES_DIR, session_name, owner_id)
+        cmd_text, instruction_marker = await asyncio.to_thread(
+            _account_instruction_refresh_for_prompt,
+            session_name,
+            body.command,
+        )
+        if not timed_voice_current():
+            return cancelled_voice_response()
+        if len(cmd_text) > 200 or "\n" in cmd_text or "\r" in cmd_text:
+            # For long messages, use tmux load-buffer + paste-buffer.
+            # Bracket the whole payload so embedded newlines and tmux's input
+            # chunks are one paste. Terminal mode escapes sent as INPUT do not
+            # disable bracketed paste and can corrupt the composer's contents.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
                 tmp.write(cmd_text)
                 tmp_path = tmp.name
+            buffer_name = f"dashboard-{secrets.token_hex(12)}"
             try:
                 await asyncio.to_thread(subprocess.run,
-                    ["tmux", "load-buffer", tmp_path],
-                    capture_output=True, text=True, timeout=5
+                    ["tmux", "load-buffer", "-b", buffer_name, tmp_path],
+                    capture_output=True, text=True, timeout=5, check=True
                 )
-                await asyncio.to_thread(subprocess.run,
-                    ["tmux", "paste-buffer", "-t", session_name],
-                    capture_output=True, text=True, timeout=5
+                if not timed_voice_current():
+                    return cancelled_voice_response()
+                pasted = await asyncio.to_thread(_voice_input_run, request, session_name,
+                    ["tmux", "paste-buffer", "-p", "-r", "-b", buffer_name, "-d", "-t", session_target],
+                    capture_output=True, text=True, timeout=5, check=True
                 )
+                if pasted is None:
+                    return cancelled_voice_response()
             finally:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "delete-buffer", "-b", buffer_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
                 os.unlink(tmp_path)
             # Wait long enough for Codex to render the pasted content
             # before pressing Enter. Scale with length; cap at 5s.
             wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
             await asyncio.sleep(wait_secs)
+            if not timed_voice_current():
+                return cancelled_voice_response()
             # C-m is an explicit carriage return, which Codex treats as submit.
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-m"],
+            submitted = await asyncio.to_thread(_voice_input_run, request, session_name,
+                ["tmux", "send-keys", "-t", session_target, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
-            # Belt-and-braces: if a bracketed paste preview is still showing
-            # (because the escape sequence arrived too late, or bracketed paste
-            # was re-enabled mid-flight), a second Enter usually dismisses the
-            # preview and submits. Check the pane, only re-press Enter if we
-            # still see paste preview markers.
-            await asyncio.sleep(0.4)
-            try:
-                tail = await asyncio.to_thread(capture_pane_recent, session_name, 6)
-                if "Pasted text" in tail or "[Pasted" in tail:
-                    await asyncio.to_thread(subprocess.run,
-                        ["tmux", "send-keys", "-t", session_name, "C-m"],
-                        capture_output=True, text=True, timeout=5
-                    )
-            except Exception:
-                logger.debug("Post-paste verification failed", exc_info=True)
+            if submitted is None:
+                return cancelled_voice_response()
+            # Verification below inspects only the footer-bound live composer.
+            # Historical paste chips must never send Enter into a later picker.
         else:
             # Short messages: send-keys -l is fine, but Codex's TUI needs one
             # render tick before Enter. Sending text and Enter back-to-back can
             # leave the text visibly parked in the input box without submitting.
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
+            pasted = await asyncio.to_thread(_voice_input_run, request, session_name,
+                ["tmux", "send-keys", "-t", session_target, "-l", cmd_text],
                 capture_output=True, text=True, timeout=5
             )
+            if pasted is None:
+                return cancelled_voice_response()
             await asyncio.sleep(0.25)
+            if not timed_voice_current():
+                return cancelled_voice_response()
             # Submit as a separate, explicit carriage-return key event.
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-m"],
+            submitted = await asyncio.to_thread(_voice_input_run, request, session_name,
+                ["tmux", "send-keys", "-t", session_target, "C-m"],
                 capture_output=True, text=True, timeout=5
             )
+            if submitted is None:
+                return cancelled_voice_response()
+        # A prompt typed while Codex is mid-turn does not submit on Enter — it gets parked in
+        # the composer and quietly lost. Confirm it left, and rescue it if it did not.
+        _submit_state = "uncertain" if timed_voice else ""
+        try:
+            if timed_voice:
+                # All Voice authority is one-shot. Observe delivery but never
+                # rescue, queue or retry after the final guarded carriage return.
+                _submit_state = await _voice_submission_state(session_name, cmd_text, session_target)
+                if _submit_state == "submitted":
+                    voice_mode.note_prompt(MESSAGES_DIR, session_name, owner_id,
+                        expected=getattr(request.state, "voice_target_guard", None))
+            else:
+                _submit_state = await _ensure_codex_submitted(
+                    session_name, cmd_text, session_target
+                )
+            if _submit_state in ("queued", "resent", "stranded"):
+                logger.info("send to '%s': prompt %s", session_name, _submit_state)
+        except Exception:
+            logger.debug("submit verification failed", exc_info=True)
+        if _submit_state == "uncertain":
+            return JSONResponse({
+                "error": "Voice could not confirm delivery. Check the terminal before sending this instruction again.",
+                "delivery": "uncertain",
+            }, status_code=409)
+        if _submit_state == "stranded":
+            return JSONResponse({
+                "error": "Codex still has this message in its terminal input. It has not been submitted.",
+                "delivery": "stranded",
+            }, status_code=409)
+        if instruction_marker and _submit_state in ("submitted", "queued", "resent"):
+            try:
+                await asyncio.to_thread(
+                    _mark_session_account_instructions,
+                    session_name,
+                    instruction_marker[0],
+                    instruction_marker[1],
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to mark account instructions delivered to '%s'",
+                    session_name,
+                    exc_info=True,
+                )
+
         # Record user message in chat history
         now = time.time()
-        entry = cache.setdefault(session_name, {})
+        entry = _bound_session_cache_entry(
+            session_name,
+            owner_id,
+            _session_incarnation(
+                owner_id,
+                str(binding.get("generation") or ""),
+                "logical" if binding.get("generation") else binding["session_id"],
+            ),
+        )
         if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
+            entry["messages"] = _load_session_messages(session_name, owner_id)
         entry["messages"].append({
             "role": "user", "text": body.command, "ts": now
         })
         _save_messages()
+        prompt_user = _current_user(request) or _user_for_session(session_name)
+        await asyncio.to_thread(
+            _queue_session_tab_label,
+            session_name,
+            str((prompt_user or {}).get("id") or _session_owner_id(session_name)),
+            body.command,
+            started_at=now,
+        )
         try:
-            prompt_user = _current_user(request) or _user_for_session(session_name)
             if prompt_user:
                 impersonator = getattr(request.state, "_impersonator", None)
                 original = request.cookies.get("tmux_imp_orig")
@@ -14810,22 +22229,212 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
         return JSONResponse({"ok": True, "sent": body.command})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        operation_guard.__exit__(None, None, None)
+
+
+_BUG_HANDOFF_TTL_SECONDS = 600
+_BUG_HANDOFF_MAX_PENDING = 200
+_BUG_HANDOFF_LISA_REDEEM_URL = os.environ.get(
+    "TMUX_DASH_BUG_HANDOFF_REDEEM_URL",
+    "https://lisa.my/app/internal/bug-handoff/redeem",
+)
+_BUG_HANDOFF_BROWSER_COOKIE = "tmux_bug_handoff"
+_pending_bug_handoffs: dict[str, dict] = {}
+_pending_bug_handoffs_lock = threading.Lock()
+
+
+def _bug_handoff_redirect(session_name: str) -> str:
+    root = ROOT_PATH.rstrip("/") + "/"
+    return root + "?bug_session=" + urllib.parse.quote(session_name, safe="")
+
+
+def _store_pending_bug_handoff(payload: dict, browser_nonce: str = "") -> tuple[str, str]:
+    now = time.time()
+    pending = secrets.token_urlsafe(32)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,80}", browser_nonce or ""):
+        browser_nonce = secrets.token_urlsafe(32)
+    with _pending_bug_handoffs_lock:
+        for key, item in list(_pending_bug_handoffs.items()):
+            if now - item["created_at"] > _BUG_HANDOFF_TTL_SECONDS:
+                _pending_bug_handoffs.pop(key, None)
+        while len(_pending_bug_handoffs) >= _BUG_HANDOFF_MAX_PENDING:
+            oldest = min(_pending_bug_handoffs, key=lambda key: _pending_bug_handoffs[key]["created_at"])
+            _pending_bug_handoffs.pop(oldest, None)
+        _pending_bug_handoffs[pending] = {
+            "created_at": now,
+            "report_id": payload["report_id"],
+            "prompt": payload["prompt"],
+            "owner_id": None,
+            "status": "pending",
+            "session_name": "",
+            "browser_nonce_hash": hashlib.sha256(browser_nonce.encode()).hexdigest(),
+        }
+    return pending, browser_nonce
+
+
+async def _redeem_lisa_bug_ticket(ticket: str) -> dict | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,80}", ticket or ""):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            response = await client.post(_BUG_HANDOFF_LISA_REDEEM_URL, json={"ticket": ticket})
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        logger.exception("Could not redeem Lisa bug handoff")
+        return None
+    prompt = payload.get("prompt") if isinstance(payload, dict) else None
+    report_id = payload.get("report_id") if isinstance(payload, dict) else None
+    if not isinstance(prompt, str) or not prompt or len(prompt) > 12_000:
+        return None
+    if not isinstance(report_id, str) or not re.fullmatch(r"[a-f0-9]{24}", report_id):
+        return None
+    return {"prompt": prompt, "report_id": report_id}
+
+
+@app.get("/bug-handoff")
+async def bug_handoff(request: Request):
+    """Redeem Lisa's one-time ticket, preserve it through login, then submit exactly once."""
+    ticket = (request.query_params.get("ticket") or "").strip()
+    pending = (request.query_params.get("pending") or "").strip()
+    if ticket:
+        payload = await _redeem_lisa_bug_ticket(ticket)
+        if not payload:
+            return HTMLResponse("This bug report link is invalid or expired.", status_code=410)
+        pending, browser_nonce = _store_pending_bug_handoff(
+            payload, request.cookies.get(_BUG_HANDOFF_BROWSER_COOKIE) or "",
+        )
+        response = RedirectResponse(
+            ROOT_PATH.rstrip("/") + "/bug-handoff?pending=" + urllib.parse.quote(pending, safe=""),
+            status_code=303,
+        )
+        is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+        response.set_cookie(
+            _BUG_HANDOFF_BROWSER_COOKIE, browser_nonce,
+            max_age=_BUG_HANDOFF_TTL_SECONDS, httponly=True, samesite="lax", secure=is_https,
+            path=ROOT_PATH.rstrip("/") + "/bug-handoff",
+        )
+        return response
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,80}", pending):
+        return HTMLResponse("This bug report link is invalid or expired.", status_code=410)
+    user = _current_user(request)
+    if not user:
+        return HTMLResponse(_login_page())
+
+    owner_id = str(user.get("id") or "")
+    now = time.time()
+    with _pending_bug_handoffs_lock:
+        item = _pending_bug_handoffs.get(pending)
+        if not item or now - item["created_at"] > _BUG_HANDOFF_TTL_SECONDS:
+            _pending_bug_handoffs.pop(pending, None)
+            return HTMLResponse("This bug report link is invalid or expired.", status_code=410)
+        browser_nonce = request.cookies.get(_BUG_HANDOFF_BROWSER_COOKIE) or ""
+        supplied_hash = hashlib.sha256(browser_nonce.encode()).hexdigest()
+        if not browser_nonce or not hmac.compare_digest(supplied_hash, item["browser_nonce_hash"]):
+            return HTMLResponse("This bug report belongs to a different browser.", status_code=404)
+        if item["owner_id"] not in (None, owner_id):
+            return HTMLResponse("This bug report belongs to a different dashboard account.", status_code=404)
+        if item["session_name"]:
+            suffix = "&bug_send=uncertain" if item["status"] == "uncertain" else ""
+            return RedirectResponse(_bug_handoff_redirect(item["session_name"]) + suffix, status_code=303)
+        if item["status"] == "creating":
+            return HTMLResponse("The Codex session is being created. Refresh in a moment.", status_code=409)
+        item["owner_id"] = owner_id
+        item["status"] = "creating"
+        prompt = item["prompt"]
+
+    created_name = ""
+    for _ in range(5):
+        candidate = "lisa-bug-" + datetime.now(timezone.utc).strftime("%m%d-%H%M") + "-" + secrets.token_hex(2)
+        created = await api_create_session(request, CreateSession(name=candidate))
+        try:
+            created_data = json.loads(bytes(created.body).decode("utf-8"))
+        except (AttributeError, TypeError, ValueError):
+            created_data = {}
+        if created.status_code == 409 and created_data.get("code") == "name_conflict":
+            continue
+        if created.status_code >= 400 or created_data.get("ok") is not True:
+            with _pending_bug_handoffs_lock:
+                item["status"] = "pending"
+            message = _html_escape(str(created_data.get("error") or "Could not create a Codex session"))
+            return HTMLResponse("<h1>Could not open Codex</h1><p>" + message + "</p>", status_code=503)
+        created_name = str(created_data.get("name") or "")
+        break
+    if not created_name:
+        with _pending_bug_handoffs_lock:
+            item["status"] = "pending"
+        return HTMLResponse("Could not allocate a Codex session", status_code=503)
+
+    with _pending_bug_handoffs_lock:
+        item["session_name"] = created_name
+    sent = await api_send_command(request, created_name, SendCommand(command=prompt))
+    if sent.status_code >= 400:
+        with _pending_bug_handoffs_lock:
+            item["status"] = "uncertain"
+        return RedirectResponse(_bug_handoff_redirect(created_name) + "&bug_send=uncertain", status_code=303)
+    with _pending_bug_handoffs_lock:
+        item["status"] = "sent"
+    return RedirectResponse(_bug_handoff_redirect(created_name), status_code=303)
 
 
 
 @app.post("/api/sessions/{session_name}/interrupt")
-async def api_interrupt_session(session_name: str):
+async def api_interrupt_session(request: Request, session_name: str):
     """Send Escape key to interrupt a running Codex session."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
-    await _controller_call("session_touch", session=session_name, source="interrupt")
-    try:
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Escape"],
-            capture_output=True, text=True, timeout=5
+    owner_id = str((_current_user(request) or {}).get("id") or "")
+    if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+        return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
+    touched = await _controller_call(
+        "session_touch",
+        session=session_name,
+        source="interrupt",
+        owner_id=owner_id,
+    )
+    if not touched.get("ok"):
+        return JSONResponse(
+            {"error": touched.get("error", "session is unavailable")},
+            status_code=int(touched.get("_status", 409)),
         )
+    try:
+        with _session_operation_lock(session_name):
+            if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+                return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
+            fence = await _controller_call(
+                "session_input_check",
+                session=session_name,
+                owner_id=owner_id,
+                source="interrupt",
+                records_input=True,
+            )
+            if not fence.get("ok"):
+                return JSONResponse(
+                    {"error": fence.get("error", "session is closing")},
+                    status_code=int(fence.get("_status", 409)),
+                )
+            binding = await asyncio.to_thread(
+                _terminal_binding, session_name, owner_id
+            )
+            if not binding:
+                return JSONResponse(
+                    {"error": "Session identity changed"}, status_code=409
+                )
+            interrupted = await asyncio.to_thread(_voice_input_run, request, session_name,
+                ["tmux", "send-keys", "-t", binding["session_id"], "Escape"],
+                capture_output=True, text=True, timeout=5
+            )
+            if interrupted is None:
+                return JSONResponse({"error": "Voice action was revoked before interruption"}, status_code=409)
         return JSONResponse({"ok": True, "action": "interrupt"})
+    except _SessionOperationBusy:
+        return JSONResponse(
+            {"error": "Session lifecycle operation is in progress"},
+            status_code=409,
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -14839,7 +22448,7 @@ ALLOWED_TMUX_KEYS = {
 }
 
 @app.post("/api/sessions/{session_name}/send-keys")
-async def api_send_keys(session_name: str, body: SendKeys):
+async def api_send_keys(request: Request, session_name: str, body: SendKeys):
     """Send raw key sequences to a tmux session (Escape, C-c, Enter, q, etc.).
 
     Unlike /send, this does NOT wrap text in -l (literal) mode and does NOT
@@ -14848,17 +22457,48 @@ async def api_send_keys(session_name: str, body: SendKeys):
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    owner_id = str((_current_user(request) or {}).get("id") or "")
     resumed = await _controller_call(
-        "session_resume", session=session_name, source="send-keys"
+        "session_resume",
+        session=session_name,
+        source="send-keys",
+        owner_id=owner_id,
     )
     if not resumed.get("ok"):
         return JSONResponse({"error": resumed.get("error", "session resume failed")}, status_code=503)
+    operation_guard = _session_operation_lock(session_name)
     try:
+        operation_guard.__enter__()
+    except _SessionOperationBusy:
+        return JSONResponse(
+            {"error": "Session lifecycle operation is in progress"},
+            status_code=409,
+        )
+    try:
+        fence = await _controller_call(
+            "session_input_check",
+            session=session_name,
+            owner_id=owner_id,
+            source="send-keys",
+            records_input=True,
+        )
+        if not fence.get("ok"):
+            return JSONResponse(
+                {"error": fence.get("error", "session is closing")},
+                status_code=int(fence.get("_status", 409)),
+            )
+        binding = await asyncio.to_thread(
+            _terminal_binding, session_name, owner_id
+        )
+        if not binding:
+            return JSONResponse(
+                {"error": "Session identity changed"}, status_code=409
+            )
         for key in body.keys:
             # Allow single printable characters (q, y, n, etc.) and known tmux key names
             if key in ALLOWED_TMUX_KEYS or (len(key) == 1 and key.isprintable()):
                 await asyncio.to_thread(subprocess.run,
-                    ["tmux", "send-keys", "-t", session_name, key],
+                    ["tmux", "send-keys", "-t", binding["session_id"], key],
                     capture_output=True, text=True, timeout=5
                 )
             else:
@@ -14866,31 +22506,58 @@ async def api_send_keys(session_name: str, body: SendKeys):
         return JSONResponse({"ok": True, "keys_sent": body.keys})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        operation_guard.__exit__(None, None, None)
 
 
 class BracketedPasteBody(BaseModel):
     enabled: bool
 
 @app.post("/api/sessions/{session_name}/bracketed-paste")
-async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody):
+async def api_bracketed_paste_toggle(
+    request: Request, session_name: str, body: BracketedPasteBody
+):
     """Toggle bracketed paste mode for a tmux session.
     Sends the ANSI escape sequence to enable/disable bracketed paste in the terminal.
     """
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    owner_id = str((user or {}).get("id") or "")
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
-        if body.enabled:
-            # \e[?2004h — enable bracketed paste
-            hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "68"]
-        else:
-            # \e[?2004l — disable bracketed paste
-            hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "6c"]
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H"] + hex_seq,
-            capture_output=True, text=True, timeout=5,
-        )
+        with _session_operation_lock(session_name):
+            fence = await _controller_call(
+                "session_input_check", session=session_name, owner_id=owner_id
+            )
+            if not fence.get("ok"):
+                return JSONResponse(
+                    {"error": fence.get("error", "session is closing")},
+                    status_code=int(fence.get("_status", 409)),
+                )
+            binding = await asyncio.to_thread(
+                _terminal_binding, session_name, owner_id
+            )
+            if not binding:
+                return JSONResponse(
+                    {"error": "Session identity changed"}, status_code=409
+                )
+            if body.enabled:
+                # \e[?2004h — enable bracketed paste
+                hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "68"]
+            else:
+                # \e[?2004l — disable bracketed paste
+                hex_seq = ["1b", "5b", "3f", "32", "30", "30", "34", "6c"]
+            await asyncio.to_thread(subprocess.run,
+                ["tmux", "send-keys", "-t", binding["session_id"], "-H"] + hex_seq,
+                capture_output=True, text=True, timeout=5,
+            )
         return JSONResponse({"ok": True, "bracketed_paste": body.enabled})
+    except _SessionOperationBusy:
+        return JSONResponse(
+            {"error": "Session lifecycle operation is in progress"},
+            status_code=409,
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -14922,15 +22589,22 @@ async def api_set_auth_mode(session_name: str, body: AuthModeBody):
 
 
 @app.get("/api/models")
-async def api_models():
+async def api_models(request: Request):
     """The model dropdown catalog ([id, label] rows) + the launch default. Kept
     current by the 24h auto-detect; the frontend fetches this on load so newly
     released models appear without a redeploy."""
+    user = _current_user(request)
+    await _refresh_model_catalog(user=user)
+    catalog, model_efforts, _last_check = _load_model_snapshot(
+        _model_catalog_file_for_user(user)
+    )
     return JSONResponse({
-        "models": MODEL_CATALOG,
+        "models": catalog,
+        "model_efforts": model_efforts,
         "default": DEFAULT_MODEL,
         "efforts": list(_CODEX_REASONING_EFFORTS),
         "default_effort": _CODEX_DEFAULT_REASONING_EFFORT,
+        "new_session_defaults": CreateSession().model_dump(exclude={"name", "name_generated"}),
     })
 
 
@@ -14940,136 +22614,762 @@ async def api_models_refresh(request: Request):
     user = _current_user(request)
     if not (user and _is_admin(user)):
         return JSONResponse({"error": "admin only"}, status_code=403)
-    changed = await _refresh_model_catalog(force=True)
-    return JSONResponse({"ok": True, "changed": changed, "models": MODEL_CATALOG})
+    changed = await _refresh_model_catalog(force=True, user=user)
+    catalog, _model_efforts, _last_check = _load_model_snapshot(
+        _model_catalog_file_for_user(user)
+    )
+    return JSONResponse({"ok": True, "changed": changed, "models": catalog})
 
 
-async def _restart_codex_for_session(session_name: str) -> tuple[bool, bool]:
-    """Exit Codex, restore the owner's environment, and resume the thread."""
-    exported = False
+class _SessionOwnershipChangedError(RuntimeError):
+    pass
+
+
+class _UnsafeCodexConfigError(RuntimeError):
+    pass
+
+
+class _UnsupportedModelEffortError(ValueError):
+    pass
+
+
+def _session_owner_matches(session_name: str, expected_owner_id: str | None) -> bool:
+    return not expected_owner_id or _session_owner_id(session_name) == expected_owner_id
+
+
+def _saved_session_model_effort(
+    session_name: str, expected_owner_id: str | None = None
+) -> tuple[str, str]:
+    """Prefer this session's choices when resuming, then legacy account settings."""
+    options = _session_launch_options(session_name, expected_owner_id)
+    if options:
+        return options["model"], options["effort"]
+    model = DEFAULT_MODEL
+    effort = _CODEX_DEFAULT_REASONING_EFFORT
+    initial_config = _verified_session_codex_config_path(
+        session_name, expected_owner_id
+    )
+    with _codex_config_write_lock(initial_config):
+        config_path = _verified_session_codex_config_path(
+            session_name, expected_owner_id
+        )
+        if config_path != initial_config:
+            raise _UnsafeCodexConfigError("Codex config path changed while locking")
+        existing, _ = _read_codex_config_no_follow(config_path)
     try:
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        config = tomllib.loads(existing)
+        saved_model = str(config.get("model") or "").strip()
+        saved_effort = _normalize_reasoning_effort(
+            str(config.get("model_reasoning_effort") or "")
         )
-        await asyncio.sleep(0.25)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        if saved_model:
+            model = saved_model
+        if saved_effort:
+            effort = saved_effort
+    except tomllib.TOMLDecodeError:
+        logger.debug(
+            "Failed to read saved model settings for '%s'", session_name, exc_info=True
         )
-        for _ in range(15):
-            await asyncio.sleep(1)
-            if not await _async_is_codex_running(session_name):
-                break
-        if await _async_is_codex_running(session_name):
-            # An idle composer can retain partial text. Clear it once, then
-            # retry the literal slash command. Never paste shell exports or a
-            # launch command while the old Codex process is still alive.
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "C-c"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+    return model, effort
+
+
+async def _restart_codex_for_session_tmux_locked(
+    session_name: str,
+    expected_owner_id: str | None = None,
+    expected_generation: str = "",
+    *,
+    autopush_guard: bool = False,
+    expected_binding: dict | None = None,
+    voice_request: Request | None = None,
+) -> tuple[bool, bool]:
+    """Exit Codex and resume the generation-bound root under one mutation lock."""
+    try:
+        with _session_operation_lock(session_name):
+            if voice_request is not None:
+                if not voice_mode.request_target_matches(sys.modules[__name__], voice_request, session_name):
+                    return False, False
+                action_id = getattr(voice_request.state, "voice_action_id", "")
+                def consume_voice_restart(rows):
+                    voice_row = rows.get(session_name, {})
+                    consumed = voice_row.get("restart_actions", [])
+                    if (not action_id or not isinstance(consumed, list)
+                            or action_id in consumed or len(consumed) >= 8):
+                        return False
+                    voice_row["restart_actions"] = consumed + [action_id]
+                    return True
+                if not voice_mode.store(MESSAGES_DIR).update(consume_voice_restart)[1]:
+                    return False, False
+            owner_binding = _strict_session_owner(
+                session_name, str(expected_owner_id or "")
             )
-            await asyncio.sleep(0.5)
+            if not owner_binding:
+                return False, False
+            owner_id, owner = owner_binding
             await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "-l", "/quit"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+                _checkpoint_active_session,
+                session_name,
+                source="settings-restart",
             )
-            await asyncio.sleep(0.25)
-            await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            row = _session_lifecycle.get(session_name)
+            generation = str(row.get("generation") or "")
+            if expected_generation and not hmac.compare_digest(
+                generation, expected_generation
+            ):
+                return False, False
+            resume_uuid = str(row.get("resume_uuid") or "")
+            resume_cwd = _durable_session_cwd(session_name, row, owner)
+            active_resume_uuid = _active_session_root_thread_id(
+                session_name, owner_id
+            ) or ""
+            recorded_resume_uuid = (
+                _validated_session_root_thread_id(
+                    session_name, resume_uuid, owner_id
+                )
+                if resume_uuid
+                else ""
+            ) or ""
+            unused_generation = _session_generation_is_unused(
+                session_name, owner_id, row
             )
-            for _ in range(10):
+            # A brand-new Codex can create and then close its bootstrap rollout
+            # before the picker runs. If the generation's monotonic input
+            # ledgers prove it unused, discarding that empty root is safe and
+            # avoids making model changes depend on a transient open file.
+            fresh_restart = not resume_uuid or (
+                unused_generation
+                and (
+                    recorded_resume_uuid != resume_uuid
+                    or active_resume_uuid != resume_uuid
+                )
+            )
+            if fresh_restart:
+                resume_uuid = ""
+                if row.get("resume_uuid"):
+                    row = await asyncio.to_thread(
+                        _session_lifecycle.clear_resume_uuid,
+                        session_name,
+                        owner_id=owner_id,
+                        expected_generation=generation,
+                    )
+                    if row.get("resume_uuid"):
+                        return False, False
+            live_cwd = _resolved_real_directory(Path(get_session_cwd(session_name)))
+            if (
+                not generation
+                or not resume_cwd
+                or not live_cwd
+                or str(live_cwd) != resume_cwd
+                or (
+                    not fresh_restart
+                    and (
+                        recorded_resume_uuid != resume_uuid
+                        or active_resume_uuid != resume_uuid
+                    )
+                )
+                or (
+                    fresh_restart
+                    and not unused_generation
+                )
+                or not _session_lifecycle.matches(
+                    session_name,
+                    generation=generation,
+                    owner_id=owner_id,
+                    desired_states={"running"},
+                    resume_uuid=resume_uuid,
+                    restore_on_startup=True,
+                )
+            ):
+                return False, False
+            session_id = await asyncio.to_thread(
+                _exact_tmux_session_id, session_name
+            )
+            if not session_id or not await asyncio.to_thread(
+                _tmux_session_matches_owner,
+                session_name,
+                owner_id,
+                generation,
+            ):
+                return False, False
+            pane_target = f"{session_id}:"
+
+            async def restart_tmux(command: list[str]):
+                if voice_request is not None:
+                    return await asyncio.to_thread(_voice_input_run, voice_request, session_name, command,
+                        capture_output=True, text=True, timeout=5)
+                if voice_request is not None and not voice_mode.request_target_matches(
+                        sys.modules[__name__], voice_request, session_name):
+                    return None
+                if not autopush_guard:
+                    return await asyncio.to_thread(
+                        subprocess.run, command,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                async with _autopush_action_lock(session_name):
+                    if (
+                        _get_autopush_mode(session_name) == "off"
+                        or expected_binding and await _to_thread_drain_on_cancel(
+                            _terminal_binding_state, expected_binding
+                        ) != "current"
+                    ):
+                        return None
+                    return await _to_thread_drain_on_cancel(
+                        subprocess.run, command,
+                        capture_output=True, text=True, timeout=5,
+                    )
+
+            async def restart_tmux_sequence(
+                commands: list[list[str]], *, delay_before_last: float = 0
+            ) -> bool:
+                async def run_commands(*, cancellation_safe: bool) -> bool:
+                    for index, command in enumerate(commands):
+                        if delay_before_last and index == len(commands) - 1:
+                            await asyncio.sleep(delay_before_last)
+                        if voice_request is not None and not voice_mode.request_target_matches(
+                                sys.modules[__name__], voice_request, session_name):
+                            return False
+                        runner = (
+                            _to_thread_drain_on_cancel
+                            if cancellation_safe
+                            else asyncio.to_thread
+                        )
+                        if voice_request is not None:
+                            result = await runner(_voice_input_run, voice_request, session_name, command,
+                                capture_output=True, text=True, timeout=5)
+                        else:
+                            result = await runner(subprocess.run, command,
+                                capture_output=True, text=True, timeout=5)
+                        if result is None or result.returncode != 0:
+                            return False
+                    return True
+
+                if not autopush_guard:
+                    return await run_commands(cancellation_safe=False)
+                async with _autopush_action_lock(session_name):
+                    if (
+                        _get_autopush_mode(session_name) == "off"
+                        or expected_binding and await _to_thread_drain_on_cancel(
+                            _terminal_binding_state, expected_binding
+                        ) != "current"
+                    ):
+                        return False
+                    return await run_commands(cancellation_safe=True)
+
+            async def request_quit(*, interrupt: bool = False) -> bool:
+                if interrupt:
+                    interrupted = await restart_tmux(
+                        ["tmux", "send-keys", "-t", pane_target, "C-c"]
+                    )
+                    if interrupted is None or interrupted.returncode != 0:
+                        return False
+                    await asyncio.sleep(0.5)
+                # Hold the Off barrier across the literal slash command, its
+                # render delay, and Enter. Off can never leave `/quit` stranded.
+                return await restart_tmux_sequence(
+                    [
+                        ["tmux", "send-keys", "-t", pane_target, "-l", "/quit"],
+                        ["tmux", "send-keys", "-t", pane_target, "Enter"],
+                    ],
+                    delay_before_last=1.0,
+                )
+
+            if not await request_quit():
+                return False, False
+            for _ in range(15):
                 await asyncio.sleep(1)
                 if not await _async_is_codex_running(session_name):
                     break
-        if await _async_is_codex_running(session_name):
-            logger.error(
-                "Refusing to inject owner environment while Codex is still running in '%s'",
-                session_name,
-            )
-            return False, False
-        exported = _send_session_owner_environment(session_name)
-        if not exported:
-            return False, False
-        await asyncio.sleep(0.3)
-        launch = _session_launch_command(
-            session_name,
-            _session_launch_base(session_name),
-            pin_model=False,
-            resume=True,
-        )
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", launch],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for _ in range(15):
-            await asyncio.sleep(1)
             if await _async_is_codex_running(session_name):
-                return exported, True
+                if not await request_quit(interrupt=True):
+                    return False, False
+                for _ in range(10):
+                    await asyncio.sleep(1)
+                    if not await _async_is_codex_running(session_name):
+                        break
+            if await _async_is_codex_running(session_name):
+                logger.error("Codex did not exit cleanly in '%s'", session_name)
+                return False, False
+            if (
+                await asyncio.to_thread(_exact_tmux_session_id, session_name)
+                != session_id
+            ):
+                return False, False
+            if voice_request is not None and not voice_mode.request_target_matches(
+                    sys.modules[__name__], voice_request, session_name):
+                return False, False
+            restarted = await _ensure_codex_running(
+                session_name,
+                resume_uuid=resume_uuid,
+                resume_cwd=resume_cwd,
+                expected_owner_id=owner_id,
+                expected_generation=generation,
+                expected_desired_states={"running"},
+                allow_fresh=fresh_restart,
+                operation_locked=True,
+                tmux_locked=True,
+                autopush_guard=autopush_guard,
+                expected_binding=expected_binding,
+                **({"voice_request": voice_request} if voice_request is not None else {}),
+            )
+            return restarted, restarted
+    except _SessionOperationBusy:
+        logger.info("Settings restart skipped while '%s' is being mutated", session_name)
     except Exception:
         logger.exception("Failed to restart Codex in '%s'", session_name)
-    return exported, False
+    return False, False
 
 
-def _write_session_codex_settings(session_name: str, managed: dict) -> Path:
-    """Merge model settings into the session owner's standard config."""
-    base = _session_config_base(session_name)
-    base.mkdir(parents=True, exist_ok=True)
-    config_path = base / "config.toml"
-    existing = config_path.read_text() if config_path.exists() else ""
-    merged = _merge_top_level_toml_keys(existing, managed)
-    if merged != existing:
-        _backup_before_dashboard_write(config_path)
-        config_path.write_text(merged)
+async def _restart_codex_for_session(
+    session_name: str,
+    expected_owner_id: str | None = None,
+    expected_generation: str = "",
+    *,
+    autopush_guard: bool = False,
+    expected_binding: dict | None = None,
+    voice_request: Request | None = None,
+) -> tuple[bool, bool]:
+    try:
+        async with _async_tmux_server_mutation_lock():
+            return await _restart_codex_for_session_tmux_locked(
+                session_name,
+                expected_owner_id,
+                expected_generation,
+                autopush_guard=autopush_guard,
+                expected_binding=expected_binding,
+                **({"voice_request": voice_request} if voice_request is not None else {}),
+            )
+    except _TmuxMutationBusy:
+        logger.info("Settings restart skipped while tmux is being mutated")
+        return False, False
+
+
+def _voice_input_run(request: Request, session_name: str, command: list[str], **kwargs):
+    """Final synchronous permission check immediately beside the tmux write."""
+    if not voice_mode.request_target_matches(sys.modules[__name__], request, session_name):
+        return None
+    return subprocess.run(command, **kwargs)
+
+
+def _voice_supervision_available(session_name: str) -> bool:
+    """Only the trusted system-managed hook registration enables this control."""
+    config = Path("/etc/codex/requirements.toml")
+    hook = Path("/usr/local/libexec/tmux-dashboard-voice/voice_hook.py")
+    command = "/usr/bin/python3 " + str(hook)
+    try:
+        for path in (config, hook):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                    or path.resolve(strict=True) != path):
+                return False
+        requirements = tomllib.loads(config.read_text())
+        hooks = requirements.get("hooks", {})
+        if (requirements.get("features", {}).get("hooks") is not True
+                or hooks.get("managed_dir") != str(hook.parent)):
+            return False
+        return all(any(handler.get("type") == "command" and handler.get("command") == command
+                       and handler.get("async") is not True and group.get("matcher", "*") in ("*", ".*", "")
+                       for group in hooks.get(event, []) for handler in group.get("hooks", []))
+                   for event in ("SessionStart", "PreToolUse"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+async def _voice_enable_supervision(request: Request, session_name: str) -> bool:
+    """One explicit, identity-bound restart; IPC retries reuse a consumed action id."""
+    if not voice_mode.request_target_matches(sys.modules[__name__], request, session_name):
+        return False
+    state = {key: getattr(request.state, key, None) for key in
+             ("voice_target_binding", "voice_target_guard", "voice_source_guard")}
+    state["voice_action_id"] = secrets.token_hex(16)
+    result = await _controller_call("voice_supervision", session=session_name,
+        cookie=request.headers.get("cookie", ""), state=state)
+    return bool(result.get("ok"))
+
+
+def _verified_codex_config_path(configured_base: Path) -> Path:
+    """Resolve a real CODEX_HOME without accepting a symlinked escape."""
+    configured_base = Path(configured_base).expanduser()
+    absolute_base = Path(os.path.abspath(os.fspath(configured_base)))
+    if absolute_base.is_symlink():
+        raise _UnsafeCodexConfigError("Codex home must not be a symlink")
+    if not absolute_base.exists():
+        try:
+            resolved_parent = absolute_base.parent.resolve(strict=True)
+        except OSError as exc:
+            raise _UnsafeCodexConfigError("Codex home parent could not be verified") from exc
+        if resolved_parent != absolute_base.parent:
+            raise _UnsafeCodexConfigError("Codex home parent must be a real directory")
+        absolute_base.mkdir(mode=0o700)
+    try:
+        resolved_base = absolute_base.resolve(strict=True)
+    except OSError as exc:
+        raise _UnsafeCodexConfigError("Codex home could not be verified") from exc
+    if resolved_base != absolute_base or not resolved_base.is_dir():
+        raise _UnsafeCodexConfigError("Codex home must be a real directory")
+    return resolved_base / "config.toml"
+
+
+def _verified_session_codex_config_path(
+    session_name: str, expected_owner_id: str | None
+) -> Path:
+    """Resolve a session owner's verified config and bind it to that owner."""
+    if expected_owner_id:
+        binding = _strict_session_owner(session_name, expected_owner_id)
+        if not binding:
+            raise _SessionOwnershipChangedError("Session owner changed")
+        owner = binding[1]
+        base = (
+            _user_codex_config_dir(owner)
+            if _uses_private_account_runtime(owner)
+            else CODEX_HOME
+        )
+    else:
+        if not _session_owner_matches(session_name, expected_owner_id):
+            raise _SessionOwnershipChangedError("Session owner changed")
+        base = _session_config_base(session_name)
+    config_path = _verified_codex_config_path(base)
+    if expected_owner_id:
+        if not _strict_session_owner(session_name, expected_owner_id):
+            raise _SessionOwnershipChangedError("Session owner changed")
+    elif not _session_owner_matches(session_name, expected_owner_id):
+        raise _SessionOwnershipChangedError("Session owner changed")
     return config_path
 
 
+_CODEX_CONFIG_MAX_BYTES = 1024 * 1024
+
+
+def _read_codex_config_no_follow(path: Path) -> tuple[str, int | None]:
+    """Read a regular config file without following a user-controlled symlink."""
+    if path.is_symlink():
+        raise _UnsafeCodexConfigError("Refusing a symlinked Codex config")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return "", None
+    except OSError as exc:
+        raise _UnsafeCodexConfigError("Codex config could not be opened safely") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _UnsafeCodexConfigError("Codex config must be a regular file")
+        if info.st_size > _CODEX_CONFIG_MAX_BYTES:
+            raise _UnsafeCodexConfigError("Codex config exceeds the safe size limit")
+        mode = stat.S_IMODE(info.st_mode)
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            content = stream.read(_CODEX_CONFIG_MAX_BYTES + 1)
+        if len(content) > _CODEX_CONFIG_MAX_BYTES:
+            raise _UnsafeCodexConfigError("Codex config exceeds the safe size limit")
+        try:
+            return content.decode("utf-8"), mode
+        except UnicodeDecodeError as exc:
+            raise _UnsafeCodexConfigError("Codex config must be valid UTF-8") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+@contextmanager
+def _codex_config_write_lock(config_path: Path):
+    """Serialize config updates using a lock tenants cannot unlink or replace."""
+    state_dir = _protected_codex_config_io_dir()
+    config_key = hashlib.sha256(os.fsencode(str(config_path))).hexdigest()
+    lock_path = state_dir / f"{config_key}.lock"
+    if lock_path.is_symlink():
+        raise _UnsafeCodexConfigError("Refusing a symlinked Codex config lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise _UnsafeCodexConfigError("Codex config lock could not be opened safely") from exc
+    try:
+        lock_info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_info.st_mode) & 0o077
+            or lock_info.st_nlink != 1
+        ):
+            raise _UnsafeCodexConfigError("Codex config lock must be a regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _protected_codex_config_io_dir() -> Path:
+    """Return the dashboard-owned lock/staging directory for Codex configs."""
+    state_dir = MESSAGES_DIR / ".codex-config-io"
+    if state_dir.is_symlink():
+        raise _UnsafeCodexConfigError("Codex config I/O directory must not be a symlink")
+    try:
+        state_dir.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(state_dir)
+    except OSError as exc:
+        raise _UnsafeCodexConfigError(
+            "Codex config I/O directory could not be prepared safely"
+        ) from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise _UnsafeCodexConfigError(
+            "Codex config I/O directory is not dashboard-owned and private"
+        )
+    return state_dir
+
+
+def _atomic_write_codex_config(path: Path, content: str, mode: int) -> None:
+    """Atomically replace config.toml without ever opening its target for writing."""
+    if path.is_symlink():
+        raise _UnsafeCodexConfigError("Refusing a symlinked Codex config")
+    staging_dir = _protected_codex_config_io_dir()
+    path_key = hashlib.sha256(os.fsencode(str(path))).hexdigest()[:20]
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path_key}.", suffix=".tmp", dir=str(staging_dir)
+    )
+    try:
+        temp_info = os.fstat(fd)
+        temp_identity = (temp_info.st_dev, temp_info.st_ino)
+        try:
+            parent_info = path.parent.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise _UnsafeCodexConfigError(
+                "Codex config parent could not be verified before replace"
+            ) from exc
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise _UnsafeCodexConfigError(
+                "Codex config parent must remain a real directory"
+            )
+        try:
+            os.fchown(fd, -1, parent_info.st_gid)
+            os.fchmod(fd, mode)
+        except OSError as exc:
+            raise _UnsafeCodexConfigError(
+                "Codex config staging permissions could not be applied safely"
+            ) from exc
+        with os.fdopen(fd, "w") as stream:
+            fd = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # A swap after the first check is still harmless to os.replace, but reject
+        # it explicitly rather than silently replacing a hostile link.
+        if path.is_symlink():
+            raise _UnsafeCodexConfigError("Refusing a symlinked Codex config")
+        try:
+            current_temp = os.stat(temp_name, follow_symlinks=False)
+        except OSError as exc:
+            raise _UnsafeCodexConfigError(
+                "Codex config temporary file changed before replace"
+            ) from exc
+        if (
+            not stat.S_ISREG(current_temp.st_mode)
+            or (current_temp.st_dev, current_temp.st_ino) != temp_identity
+        ):
+            raise _UnsafeCodexConfigError(
+                "Codex config temporary file changed before replace"
+            )
+        try:
+            os.replace(temp_name, path)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise _UnsafeCodexConfigError(
+                    "Codex config staging directory is on a different filesystem"
+                ) from exc
+            raise _UnsafeCodexConfigError(
+                "Codex config could not be replaced safely"
+            ) from exc
+        temp_name = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def _backup_and_replace_codex_config(
+    config_path: Path,
+    existing: str,
+    existing_mode: int | None,
+    updated: str,
+) -> None:
+    """Back up and replace a config while its protected write lock is held."""
+    mode = existing_mode if existing_mode is not None else 0o600
+    if existing_mode is not None:
+        backup = config_path.with_name(
+            f"{config_path.name}.bak-dashboard-{time.time_ns()}-{secrets.token_hex(4)}"
+        )
+        _atomic_write_codex_config(backup, existing, mode)
+    _atomic_write_codex_config(config_path, updated, mode)
+
+
+def _write_session_codex_settings(
+    session_name: str,
+    managed: dict,
+    expected_owner_id: str | None = None,
+) -> Path:
+    """Safely merge model settings into the session owner's standard config."""
+    initial_path = _verified_session_codex_config_path(
+        session_name, expected_owner_id
+    )
+    with _codex_config_write_lock(initial_path):
+        config_path = _verified_session_codex_config_path(
+            session_name, expected_owner_id
+        )
+        if config_path != initial_path:
+            raise _UnsafeCodexConfigError("Codex config path changed while locking")
+        existing, existing_mode = _read_codex_config_no_follow(config_path)
+        merged = _merge_top_level_toml_keys(existing, managed)
+        if merged != existing:
+            if not _session_owner_matches(session_name, expected_owner_id):
+                raise _SessionOwnershipChangedError("Session owner changed")
+            _backup_and_replace_codex_config(
+                config_path, existing, existing_mode, merged
+            )
+        return config_path
+
+
+def _write_validated_session_codex_settings(
+    session_name: str,
+    *,
+    model_efforts: dict[str, list[str]],
+    requested_model: str | None = None,
+    requested_effort: str | None = None,
+    expected_owner_id: str | None = None,
+) -> tuple[str, str]:
+    """Write scoped session choices, or legacy account settings, atomically."""
+    row = _session_lifecycle.get(session_name)
+    options = _session_launch_options(session_name, expected_owner_id)
+    if options:
+        from session_model_policy import compatible_effort, update_options
+        target_model = requested_model or options["model"]
+        target_effort = requested_effort or options["effort"]
+        supported = model_efforts.get(target_model, [])
+        if requested_model and target_effort not in supported:
+            target_effort = compatible_effort(target_effort, supported)
+        if not target_effort or target_effort not in supported:
+            raise _UnsupportedModelEffortError("This model does not support the requested effort.")
+        try:
+            update_options(_session_lifecycle, session_name, str(row.get("owner_id")),
+                           str(row.get("generation")),
+                           {"model": target_model, "effort": target_effort, "fallback": {}}, expected=options)
+        except ValueError as exc:
+            raise _SessionOwnershipChangedError(str(exc)) from exc
+        return target_model, target_effort
+    initial_path = _verified_session_codex_config_path(
+        session_name, expected_owner_id
+    )
+    with _codex_config_write_lock(initial_path):
+        config_path = _verified_session_codex_config_path(
+            session_name, expected_owner_id
+        )
+        if config_path != initial_path:
+            raise _UnsafeCodexConfigError("Codex config path changed while locking")
+        existing, existing_mode = _read_codex_config_no_follow(config_path)
+        try:
+            parsed = tomllib.loads(existing) if existing.strip() else {}
+        except tomllib.TOMLDecodeError as exc:
+            raise _UnsafeCodexConfigError("Codex config is invalid") from exc
+
+        current_model = str(parsed.get("model") or DEFAULT_MODEL).strip()
+        current_effort = _normalize_reasoning_effort(
+            str(parsed.get("model_reasoning_effort") or "")
+        ) or _CODEX_DEFAULT_REASONING_EFFORT
+        target_model = requested_model or current_model
+        target_effort = requested_effort or current_effort
+        supported = model_efforts.get(target_model, [])
+        if not supported:
+            raise _UnsupportedModelEffortError(
+                f"Reasoning levels are unavailable for {target_model}; refresh the model catalog."
+            )
+        if requested_effort and target_effort not in supported:
+            raise _UnsupportedModelEffortError(
+                f"{target_model} does not support {target_effort}. Use "
+                + ", ".join(supported)
+                + "."
+            )
+        if requested_model and supported and target_effort not in supported:
+            target_effort = (
+                _CODEX_DEFAULT_REASONING_EFFORT
+                if _CODEX_DEFAULT_REASONING_EFFORT in supported
+                else supported[-1]
+            )
+
+        managed = {}
+        if requested_model:
+            managed["model"] = target_model
+        if requested_effort or target_effort != current_effort:
+            managed["model_reasoning_effort"] = target_effort
+        merged = _merge_top_level_toml_keys(existing, managed)
+        if merged != existing:
+            if not _session_owner_matches(session_name, expected_owner_id):
+                raise _SessionOwnershipChangedError("Session owner changed")
+            _backup_and_replace_codex_config(
+                config_path, existing, existing_mode, merged
+            )
+        return target_model, target_effort
+
+
 @app.post("/api/sessions/{session_name}/effort")
-async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
-    _, sess = _find_session(session_name)
+async def api_set_session_effort(
+    request: Request, session_name: str, body: SetSessionEffortBody
+):
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    expected_owner_id = str((user or {}).get("id") or "")
     effort = _normalize_reasoning_effort(body.effort)
     if effort is None or effort == "":
         allowed = ", ".join(_CODEX_REASONING_EFFORTS)
         return JSONResponse({"error": f"Invalid effort. Use {allowed}."}, status_code=400)
-    await asyncio.to_thread(
-        _write_session_codex_settings,
-        session_name,
-        {"model_reasoning_effort": effort},
-    )
+    try:
+        _catalog, model_efforts, _last_check = _load_model_snapshot(
+            _model_catalog_file_for_user(user)
+        )
+        if _last_check <= 0:
+            return JSONResponse(
+                {"error": "Model catalog is unavailable; refresh and try again."},
+                status_code=503,
+            )
+        await asyncio.to_thread(
+            _write_validated_session_codex_settings,
+            session_name,
+            model_efforts=model_efforts,
+            requested_effort=effort,
+            expected_owner_id=expected_owner_id,
+        )
+    except _UnsupportedModelEffortError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except _SessionOwnershipChangedError:
+        return JSONResponse({"error": "Session owner changed"}, status_code=409)
+    except _UnsafeCodexConfigError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not _session_owner_matches(session_name, expected_owner_id):
+        return JSONResponse({"error": "Session owner changed"}, status_code=409)
     running = await _async_is_codex_running(session_name)
     exported = restarted = False
     if not running:
-        exported = _send_session_owner_environment(session_name)
+        if not _session_owner_matches(session_name, expected_owner_id):
+            return JSONResponse({"error": "Session owner changed"}, status_code=409)
+        exported = await _send_session_owner_environment_serialized(
+            session_name, expected_owner_id
+        )
     elif body.restart:
-        exported, restarted = await _restart_codex_for_session(session_name)
+        exported, restarted = await _restart_codex_for_session(
+            session_name, expected_owner_id
+        )
+        if not _session_owner_matches(session_name, expected_owner_id):
+            return JSONResponse({"error": "Session owner changed"}, status_code=409)
     return JSONResponse({
         "ok": True,
         "effort": effort,
@@ -15080,33 +23380,64 @@ async def api_set_session_effort(session_name: str, body: SetSessionEffortBody):
 
 
 @app.post("/api/sessions/{session_name}/model")
-async def api_set_session_model(session_name: str, body: SetSessionModelBody):
+async def api_set_session_model(
+    request: Request, session_name: str, body: SetSessionModelBody
+):
     """Persist the account's Codex model and optionally restart the live pane."""
-    _, sess = _find_session(session_name)
+    user = _current_user(request)
+    _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    expected_owner_id = str((user or {}).get("id") or "")
     model = (body.model or "").strip()
-    if not re.match(r"^[A-Za-z0-9._:/-]{2,80}$", model):
+    if not _MODEL_ID_RE.fullmatch(model):
         return JSONResponse({"error": "Invalid model id."}, status_code=400)
-    await asyncio.to_thread(
-        _write_session_codex_settings,
-        session_name,
-        {"model": model},
+    catalog, model_efforts, _last_check = _load_model_snapshot(
+        _model_catalog_file_for_user(user)
     )
+    if _last_check <= 0:
+        return JSONResponse(
+            {"error": "Model catalog is unavailable; refresh and try again."},
+            status_code=503,
+        )
+    allowed_models = {str(row[0]) for row in catalog}
+    if model not in allowed_models:
+        return JSONResponse({"error": "Model is not available for this account."}, status_code=400)
+    try:
+        _selected_model, selected_effort = await asyncio.to_thread(
+            _write_validated_session_codex_settings,
+            session_name,
+            model_efforts=model_efforts,
+            requested_model=model,
+            expected_owner_id=expected_owner_id,
+        )
+    except _UnsupportedModelEffortError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except _SessionOwnershipChangedError:
+        return JSONResponse({"error": "Session owner changed"}, status_code=409)
+    except _UnsafeCodexConfigError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if not _session_owner_matches(session_name, expected_owner_id):
+        return JSONResponse({"error": "Session owner changed"}, status_code=409)
     _session_model_cache.pop(session_name, None)
     running = await _async_is_codex_running(session_name)
     exported = restarted = False
     if not running:
-        exported = _send_session_owner_environment(session_name)
+        if not _session_owner_matches(session_name, expected_owner_id):
+            return JSONResponse({"error": "Session owner changed"}, status_code=409)
+        exported = await _send_session_owner_environment_serialized(
+            session_name, expected_owner_id
+        )
     elif body.restart:
-        exported, restarted = await _restart_codex_for_session(session_name)
-    if running and not restarted:
-        _session_model_pending[session_name] = {"model": model, "ts": time.time()}
-    else:
-        _session_model_pending.pop(session_name, None)
+        exported, restarted = await _restart_codex_for_session(
+            session_name, expected_owner_id
+        )
+        if not _session_owner_matches(session_name, expected_owner_id):
+            return JSONResponse({"error": "Session owner changed"}, status_code=409)
     return JSONResponse({
         "ok": True,
         "model": model,
+        "effort": selected_effort,
         "codex_was_running": running,
         "exported": exported,
         "restarted": restarted,
@@ -15129,9 +23460,9 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
 
     Returns a description of the detected prompt, or None.
 
-    SAFETY: We require the ❯ cursor to sit DIRECTLY on a numbered option
-    line (e.g. "❯ 1. Yes"). If ❯ is followed by free text (e.g.
-    "❯ test it in the browser") that is the user input prompt, not a
+    SAFETY: We require a Codex cursor to sit DIRECTLY on a numbered option
+    line (e.g. "› 1. Yes"). If it is followed by free text (e.g.
+    "› test it in the browser") that is the user input prompt, not a
     selection — Enter would submit that text instead of selecting an option,
     which is the "phantom message" bug we must avoid.
     """
@@ -15139,23 +23470,42 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
     last_25 = lines[-25:]
     text = "\n".join(last_25)
 
-    # Must have the ❯ selection cursor
-    if "\u276f" not in text and "❯" not in text:
+    # A live draft wins over any selector still visible in scrollback. Without
+    # this footer-anchored veto, an old menu can make Enter submit the draft.
+    recent_lines = visible_text.splitlines()[-25:]
+    last_footer = max(
+        (i for i, line in enumerate(recent_lines)
+         if _CODEX_COMPOSER_FOOTER_RE.match(line)),
+        default=-1,
+    )
+    last_menu_selector = max(
+        (i for i, line in enumerate(recent_lines)
+         if re.match(r"^\s*[❯›»]\s*\d+\.\s+", line)),
+        default=-1,
+    )
+    has_composer_footer = last_footer > last_menu_selector
+    composer, composer_is_menu = _active_codex_composer_state(visible_text)
+    if has_composer_footer and not composer_is_menu:
         return None
 
-    # Count lines that look like numbered options: "  1. text" or "❯ 1. text"
-    numbered = 0
-    has_selector_on_option = False
+    # Codex versions/themes use any of these visually similar cursors.
+    selector = r"[❯›»]"
+    if not re.search(selector, text):
+        return None
+
+    # Only the contiguous numbered block around the newest selector is the live
+    # picker. Numbered lists in assistant scrollback must not affect navigation.
+    current_options, _current_selected = _parse_menu_options(visible_text)
+    numbered = len(current_options)
+    has_selector_on_option = bool(current_options)
     selector_followed_by_text = False
     for line in last_25:
         stripped = line.strip()
-        if re.match(r"^[❯\u276f\s]*\d+\.\s", stripped):
-            numbered += 1
-        if re.match(r"^❯\s*\d+\.", stripped) or re.match(r"^\u276f\s*\d+\.", stripped):
-            has_selector_on_option = True
-        # ❯ followed by non-numeric text = user input prompt with text waiting.
+        # Cursor followed by non-numeric text = user input prompt with text waiting.
         # Enter on this would submit that text — never auto-fire here.
-        if re.match(r"^[❯\u276f]\s+\S", stripped) and not re.match(r"^[❯\u276f]\s*\d+\.", stripped):
+        if re.match(rf"^{selector}\s+\S", stripped) and not re.match(
+            rf"^{selector}\s*\d+\.", stripped
+        ):
             selector_followed_by_text = True
 
     # Bail if cursor is in the user input box with text waiting.
@@ -15202,18 +23552,32 @@ _MENU_PICK_SYSTEM_PROMPT = (
 def _parse_menu_options(visible_text: str):
     """Parse a Codex numbered menu. Returns (options, selected_idx) where
     options = [(number, label), ...] in visual order and selected_idx is the
-    0-based position of the ❯-highlighted option (0 if none found)."""
+    0-based position of the highlighted option (0 if none found)."""
+    lines = visible_text.splitlines()
+    option_re = re.compile(r"^([❯›»])?\s*(\d+)\.\s+(\S.*)$")
+    selected_line = next(
+        (
+            index for index in range(len(lines) - 1, -1, -1)
+            if (match := option_re.match(lines[index].strip())) and match.group(1)
+        ),
+        None,
+    )
+    if selected_line is None:
+        return [], 0
+    start = selected_line
+    while start > 0 and option_re.match(lines[start - 1].strip()):
+        start -= 1
+    end = selected_line + 1
+    while end < len(lines) and option_re.match(lines[end].strip()):
+        end += 1
     options = []
-    selected = None
-    for line in visible_text.split("\n"):
-        s = line.strip()
-        m = re.match(r"^(❯|❯)?\s*(\d+)\.\s+(\S.*)$", s)
-        if not m:
-            continue
-        if m.group(1):
+    selected = 0
+    for index in range(start, end):
+        match = option_re.match(lines[index].strip())
+        if match.group(1):
             selected = len(options)
-        options.append((int(m.group(2)), m.group(3).strip()))
-    return options, (selected if selected is not None else 0)
+        options.append((int(match.group(2)), match.group(3).strip()))
+    return options, selected
 
 
 async def _llm_pick_menu_option(name: str, visible: str, options: list):
@@ -15276,11 +23640,17 @@ async def _auto_responder_loop():
                 last = _auto_respond_cooldown.get(name, 0)
                 if now - last < _AUTO_RESPOND_COOLDOWN:
                     continue
+                owner_id = str(sess.get("owner_id") or _session_owner_id(name))
+                binding = await asyncio.to_thread(
+                    _terminal_binding, name, owner_id
+                )
+                if not binding:
+                    continue
                 # Capture visible pane (not history — just what's on screen)
                 try:
                     result = await asyncio.to_thread(
                         subprocess.run,
-                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        ["tmux", "capture-pane", "-t", binding["session_id"], "-p"],
                         capture_output=True, text=True, timeout=3,
                     )
                     if result.returncode != 0 or not result.stdout.strip():
@@ -15290,6 +23660,9 @@ async def _auto_responder_loop():
 
                 prompt_type = _detect_interactive_prompt(result.stdout)
                 if prompt_type:
+                    picker_frame_hash = hashlib.sha256(
+                        result.stdout.encode()
+                    ).digest()
                     # Safety backstop: don't auto-approve a clearly destructive /
                     # irreversible action — leave it for a human. (Back off ~60s to
                     # avoid re-logging every poll.)
@@ -15304,15 +23677,69 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
-                    if target is not None:
-                        chosen = await _select_menu_option(name, options, selected_idx, target)
-                    else:
-                        await asyncio.to_thread(
-                            subprocess.run,
-                            ["tmux", "send-keys", "-t", name, "Enter"],
-                            capture_output=True, text=True, timeout=3,
-                        )
-                        chosen = "default option (Enter)"
+                    try:
+                        # The mode may have changed while the menu picker awaited
+                        # its LLM.  Serialize the final decision with mode updates
+                        # and re-check inside the boundary that owns the keys.
+                        with _session_operation_lock(name):
+                            async with _autopush_action_lock(name):
+                                if _get_autopush_mode(name) == "off":
+                                    continue
+                                binding_state = await asyncio.to_thread(
+                                    _terminal_binding_state, binding
+                                )
+                                if binding_state != "current":
+                                    continue
+                                # The LLM decision was made against an earlier
+                                # frame. A human can answer or move the picker
+                                # while that call is in flight, so prove the
+                                # same menu and highlight are still current at
+                                # the exact key boundary.
+                                fresh = await asyncio.to_thread(
+                                    subprocess.run,
+                                    ["tmux", "capture-pane", "-t",
+                                     binding["session_id"], "-p"],
+                                    capture_output=True, text=True, timeout=3,
+                                )
+                                fresh_options, fresh_selected = (
+                                    _parse_menu_options(fresh.stdout)
+                                    if fresh.returncode == 0 else ([], 0)
+                                )
+                                if (
+                                    fresh.returncode != 0
+                                    or not hmac.compare_digest(
+                                        hashlib.sha256(
+                                            fresh.stdout.encode()
+                                        ).digest(),
+                                        picker_frame_hash,
+                                    )
+                                    or _detect_interactive_prompt(fresh.stdout)
+                                    != prompt_type
+                                    or fresh_options != options
+                                    or fresh_selected != selected_idx
+                                    or _looks_destructive(fresh.stdout)
+                                ):
+                                    continue
+                                await asyncio.to_thread(
+                                    _session_lifecycle.touch,
+                                    name,
+                                    source="auto-responder",
+                                    records_input=True,
+                                )
+                                if target is not None:
+                                    chosen = await _select_menu_option(
+                                        binding["session_id"], options,
+                                        selected_idx, target
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        subprocess.run,
+                                        ["tmux", "send-keys", "-t", binding["session_id"], "Enter"],
+                                        capture_output=True, text=True, timeout=3,
+                                    )
+                                    chosen = "default option (Enter)"
+                    except _SessionOperationBusy:
+                        continue
                     _auto_respond_cooldown[name] = now
                     event = {"session": name, "type": prompt_type, "choice": chosen, "ts": now}
                     _auto_respond_log.append(event)
@@ -15496,30 +23923,180 @@ def _simple_watchdog_record(session_name: str, action: str):
 
 async def _simple_watchdog_send_continue(session_name: str) -> bool:
     """Send 'continue' to the session's Codex prompt. Returns True on send."""
-    return await _simple_watchdog_send_text(session_name, "continue")
+    return await _simple_watchdog_send_text(
+        session_name, "continue", required_modes={"full"}
+    )
 
 
-async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
+# ── Basic+ : keep the prompt cache warm ─────────────────────────────────────
+# One cheap turn, sent shortly before the cached prefix would stop being
+# reusable, so a session left alone over lunch is still warm when its owner
+# comes back. Deliberately NOT the autopilot: that one screenshots the pane and
+# lets a model compose an instruction. This sends ONE fixed sentence and never
+# composes anything, so the worst case is a redundant verification pass.
+_CACHE_KEEPALIVE_INTERVAL = 30
+_cache_keepalive_state: dict[str, dict] = {}
+
+
+def _cache_keepalive_active(session_name: str) -> bool:
+    """Is this session mid-run because the keep-alive pushed it?
+
+    True from the moment the nudge is sent until the turn it started finishes,
+    which is what the amber session colour means.
+    """
+    return bool((_cache_keepalive_state.get(session_name) or {}).get("fired_for"))
+
+
+async def _cache_keepalive_loop():
+    """Push one continue into an idle Basic+ session before its cache goes cold."""
+    log = logging.getLogger("cache-keepalive")
+    await asyncio.sleep(12)
+    while True:
+        try:
+            await asyncio.sleep(_CACHE_KEEPALIVE_INTERVAL)
+            now = time.time()
+            for sess in await asyncio.to_thread(get_tmux_sessions):
+                name = sess["name"]
+                if _get_autopush_mode(name) != "basicplus":
+                    _cache_keepalive_state.pop(name, None)
+                    continue
+                binding = await _autopush_terminal_binding(
+                    name, str(sess.get("owner_id") or "")
+                )
+                if not binding:
+                    continue
+                try:
+                    f = await asyncio.to_thread(_codex_session_facts, name)
+                except Exception:
+                    continue
+                ttl = int(f.get("cache_ttl") or 0)
+                deadline = _cache_deadline(f)
+                cache_activity = float(f.get("cache_last_activity") or 0)
+                if not deadline or ttl < CACHE_KEEPALIVE_MIN_TTL:
+                    continue
+                # Metrics must belong to this tab's validated root transcript.
+                if not f.get("detect_sure", True):
+                    continue
+                st = _cache_keepalive_state.setdefault(name, {})
+                if st.get("fired_for") and cache_activity > st["fired_for"] + 1:
+                    st.clear()
+                remaining = deadline - now
+                if remaining <= 0 or remaining > CACHE_WARN_LEAD:
+                    continue
+                if st.get("fired_for"):
+                    continue
+                # Busy is the point of the exercise: a working session is issuing
+                # requests, and every one of them refreshes the cache.
+                try:
+                    activity = await async_detect_activity(name)
+                except Exception:
+                    continue
+                if activity.get("status") != "idle":
+                    continue
+                if not await _async_is_claude_running(name):
+                    continue
+                try:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", binding["session_id"], "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if vis.returncode != 0:
+                        continue
+                    visible = vis.stdout
+                except Exception:
+                    continue
+                if _detect_interactive_prompt(visible) or _has_pending_user_input(visible):
+                    continue
+                ok = await _simple_watchdog_send_text(
+                    name, CACHE_KEEPALIVE_PROMPT,
+                    required_modes={"basicplus"}, require_codex=True,
+                    expected_binding=binding,
+                    expected_visible_hash=hashlib.md5(
+                        visible.encode()
+                    ).hexdigest(),
+                )
+                if ok:
+                    st["fired_for"] = cache_activity
+                    st["at"] = now
+                    log.info("Cache keep-alive pushed to '%s' (%ds before cold)",
+                             name, int(deadline - now))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("cache keep-alive iteration failed", exc_info=True)
+
+
+async def _simple_watchdog_send_text(
+    session_name: str,
+    text: str,
+    required_modes: set[str] | None = None,
+    require_codex: bool = False,
+    expected_binding: dict | None = None,
+    expected_visible_hash: str = "",
+) -> bool:
     """Type a composed reply into the session's Codex input box and submit.
     Collapses to a single line so Enter submits the whole message at once."""
     text = " ".join((text or "").split())
     if not text:
         return False
     try:
-        # -l sends the text literally (so it isn't interpreted as tmux key names);
-        # a separate Enter then submits it to Codex.
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-l", text],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.sleep(0.1)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
+        # Session mutation before action is the global lock order used by
+        # delete/restart. The action lock is held only around the two key sends.
+        with _session_operation_lock(session_name):
+            async with _autopush_action_lock(session_name):
+                allowed = required_modes or set(AUTOPUSH_MODES) - {"off"}
+                if _get_autopush_mode(session_name) not in allowed:
+                    return False
+                target = session_name
+                if expected_binding:
+                    if await asyncio.to_thread(
+                        _terminal_binding_state, expected_binding
+                    ) != "current":
+                        return False
+                    target = str(expected_binding.get("session_id") or "")
+                    if not target:
+                        return False
+                if expected_visible_hash:
+                    current = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", target, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if (
+                        current.returncode != 0
+                        or hashlib.md5(current.stdout.encode()).hexdigest()
+                        != expected_visible_hash
+                        or _detect_interactive_prompt(current.stdout)
+                        or _has_pending_user_input(current.stdout)
+                        or _looks_like_bare_shell(current.stdout)
+                        or _looks_destructive(current.stdout)
+                    ):
+                        return False
+                if require_codex and not await _async_is_claude_running(session_name):
+                    return False
+                await asyncio.to_thread(
+                    _session_lifecycle.touch,
+                    session_name,
+                    source="autopilot-watchdog",
+                    records_input=True,
+                )
+                # -l sends the text literally (so it isn't interpreted as tmux key names);
+                # a separate Enter then submits it to Codex.
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "send-keys", "-t", target, "-l", text],
+                    capture_output=True, text=True, timeout=5,
+                )
+                await asyncio.sleep(0.1)
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    capture_output=True, text=True, timeout=5,
+                )
         return True
+    except _SessionOperationBusy:
+        return False
     except Exception as e:
         logger.debug("autopilot: failed to send reply to '%s': %s", session_name, e)
         return False
@@ -15541,6 +24118,11 @@ async def _simple_watchdog_loop():
                 # gets option-picking + prompt confirms via the auto-responder.)
                 if _get_autopush_mode(name) != "full":
                     _simple_watchdog_state.pop(name, None)
+                    continue
+                binding = await _autopush_terminal_binding(
+                    name, str(sess.get("owner_id") or "")
+                )
+                if not binding:
                     continue
                 # Don't fight the autonomous-mode watchdog — those modes have their own loop
                 if _away_mode_state.get(name, {}).get("enabled"):
@@ -15568,7 +24150,7 @@ async def _simple_watchdog_loop():
                 try:
                     vis = await asyncio.to_thread(
                         subprocess.run,
-                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        ["tmux", "capture-pane", "-t", binding["session_id"], "-p"],
                         capture_output=True, text=True, timeout=3,
                     )
                     if vis.returncode != 0:
@@ -15616,7 +24198,9 @@ async def _simple_watchdog_loop():
                     state["same_stall"] = 0
                     state["backed_off"] = False
                 # Read the screen and let the LLM compose the reply that keeps it moving.
-                recent = await asyncio.to_thread(capture_pane_recent, name, 80)
+                recent = await asyncio.to_thread(
+                    capture_pane_recent, binding["session_id"], 80
+                )
                 if not recent.strip():
                     continue
                 # Safety backstop: never auto-drive a clearly destructive/irreversible
@@ -15656,7 +24240,11 @@ async def _simple_watchdog_loop():
                 # One more guard: re-check Codex is still running before sending
                 if not await _async_is_claude_running(name):
                     continue
-                ok = await _simple_watchdog_send_text(name, msg)
+                ok = await _simple_watchdog_send_text(
+                    name, msg, required_modes={"full"},
+                    expected_binding=binding,
+                    expected_visible_hash=content_hash,
+                )
                 if ok:
                     state["last_action"] = now
                     state["idle_since"] = now
@@ -15703,13 +24291,20 @@ async def _login_watchdog_loop():
                 # Auto-push "off" means fully hands-off — don't even auto /login.
                 if _get_autopush_mode(name) == "off":
                     continue
+                binding = await _autopush_terminal_binding(
+                    name, str(sess.get("owner_id") or "")
+                )
+                if not binding:
+                    continue
                 state = _login_watchdog_state.setdefault(name, {})
                 if now - state.get("last_action", 0) < _LOGIN_WATCHDOG_COOLDOWN:
                     continue
                 if not await _async_is_claude_running(name):
                     continue
                 try:
-                    recent = await asyncio.to_thread(capture_pane_recent, name, 40)
+                    recent = await asyncio.to_thread(
+                        capture_pane_recent, binding["session_id"], 40
+                    )
                 except Exception:
                     continue
                 low = (recent or "").lower()
@@ -15733,7 +24328,9 @@ async def _login_watchdog_loop():
                         continue
                     state["last_action"] = now
                     state.pop("flow_since", None)
-                    res = await _auto_fix_login(name)
+                    res = await _auto_fix_login(
+                        name, respect_autopush=True, expected_binding=binding
+                    )
                     if res.get("ok"):
                         llog.warning(
                             "Session '%s' recovered automatically (via %s)",
@@ -15768,7 +24365,9 @@ async def _login_watchdog_loop():
                 state.pop("flow_since", None)
                 llog.warning("Auto-fixing login for '%s' (%s)", name,
                              "stale login prompt" if login_flow_open else "login required")
-                res = await _auto_fix_login(name)
+                res = await _auto_fix_login(
+                    name, respect_autopush=True, expected_binding=binding
+                )
                 if res.get("ok"):
                     llog.warning("Session '%s' logged back in automatically (via %s)",
                                  name, res.get("via"))
@@ -15778,7 +24377,9 @@ async def _login_watchdog_loop():
                 # Optional fallback: drive the OAuth consent in the signed-in
                 # browser. Off by default — claude.ai blocks it.
                 if AUTO_AUTH_ENABLED and _pick_login_browser():
-                    res = await _auto_auth_session(name, reason="watchdog")
+                    res = await _auto_auth_session(
+                        name, reason="watchdog", expected_binding=binding
+                    )
                     llog.warning("Auto-auth for '%s': %s", name,
                                  "ok" if res.get("ok") else res.get("error"))
                 continue
@@ -16059,7 +24660,7 @@ def _repair_member_codex_auth() -> int:
         if not _multi_tenant_enabled():
             return 0
         for user in _load_users():
-            if not user or _is_admin(user):
+            if not _uses_private_account_runtime(user):
                 continue
             try:
                 _apply_member_auth(_user_codex_config_dir(user))
@@ -16157,8 +24758,27 @@ def _project_dir_for_cwd(cwd: str) -> Path | None:
 
 
 def _find_session_transcript_uuid(session_name: str) -> str | None:
-    """Codex recovery uses `resume --last`; no Claude transcript UUID lookup."""
-    return None
+    """Return the validated root Codex thread recorded for a dashboard tab.
+
+    A stable mapping is deliberately preferred over guessing from recency:
+    root and subagent rollouts can share both CODEX_HOME and cwd.
+    """
+    recorded = _session_lifecycle.get(session_name).get("resume_uuid")
+    if not recorded:
+        return None
+    owner_binding = _strict_session_owner(session_name)
+    if not owner_binding:
+        raise ValueError(
+            f"recorded Codex root for '{session_name}' has no explicit owner"
+        )
+    validated = _validated_session_root_thread_id(
+        session_name, recorded, owner_binding[0]
+    )
+    if not validated:
+        raise ValueError(
+            f"recorded Codex root for '{session_name}' is missing or invalid"
+        )
+    return validated
 
 
 async def _crash_recovery_loop():
@@ -16173,7 +24793,12 @@ async def _crash_recovery_loop():
             owners = _load_session_owners()
             for sess in sessions_list:
                 name = sess["name"]
-                if _session_lifecycle.get(name).get("parked"):
+                lifecycle = _session_lifecycle.get(name)
+                if (
+                    lifecycle.get("parked")
+                    or str(lifecycle.get("desired_state") or "")
+                    in {"parking", "parked", "deleting", "deleted"}
+                ):
                     continue
                 if await _async_is_claude_running(name):
                     _seen_claude_running.add(name)
@@ -16291,6 +24916,208 @@ async def _codex_auth_health(force: bool = False) -> dict:
     return dict(_codex_health_auth)
 
 
+def _model_recovery_event(session_name: str, owner_id: str) -> dict | None:
+    from session_model_policy import latest_turn
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    row = _session_lifecycle.get(session_name)
+    root = str(row.get("resume_uuid") or "")
+    if not owner_binding or not root or _validated_session_root_thread_id(session_name, root, owner_id) != root:
+        return None
+    fd, _relative, fingerprint = _open_session_close_rollout({
+        "session_name": session_name, "owner_id": owner_id,
+        "owner": owner_binding[1], "resume_uuid": root,
+    })
+    with os.fdopen(fd, "rb") as stream:
+        # No old error may survive a newer lifecycle event. Truncated leading
+        # rows are discarded; a tail without a lifecycle event fails closed.
+        offset = max(0, fingerprint[2] - 1_000_000)
+        stream.seek(offset)
+        if offset:
+            stream.readline()
+        return latest_turn(stream.read(1_000_000).splitlines())
+
+def _model_recovery_composer_ready(visible: str) -> bool:
+    lines = visible.splitlines()[-25:]
+    return bool(
+        any(_CODEX_COMPOSER_FOOTER_RE.match(line) for line in lines)
+        and any(_CODEX_COMPOSER_LINE_RE.match(line) for line in lines)
+        and not re.search(r"esc to interrupt|tab to queue", visible, re.I)
+        and not _has_pending_user_input(visible)
+        and not _detect_interactive_prompt(visible)
+        and not _looks_like_bare_shell(visible)
+    )
+
+async def _model_fallback_once(session_name: str) -> bool:
+    """Recover a terminal service failure once, on the same owner-bound root."""
+    from session_model_policy import fallback_candidate, recoverable_error, update_options
+    row = _session_lifecycle.get(session_name)
+    options = row.get("launch_options") or {}
+    owner_id = str(row.get("owner_id") or "")
+    generation = str(row.get("generation") or "")
+    if (not options or options.get("no_fallback", True) or row.get("desired_state") != "running"
+            or _session_auth_mode.get(session_name) != "subscription"):
+        return False
+    owner_binding = _strict_session_owner(session_name, owner_id)
+    if not owner_binding or not await _async_is_codex_running(session_name):
+        return False
+    if not row.get("resume_uuid"):
+        with _session_operation_lock(session_name):
+            await asyncio.to_thread(_checkpoint_active_session, session_name, source="model-recovery-probe")
+        row = _session_lifecycle.get(session_name)
+        if row.get("generation") != generation or row.get("owner_id") != owner_id:
+            return False
+    event = await asyncio.to_thread(_model_recovery_event, session_name, owner_id)
+    if not event or event.get("type") != "task_complete":
+        return False
+    if not event.get("error"):
+        previous = options.get("fallback") or {}
+        if previous.get("attempts") and event.get("turn_id") != previous.get("turn_id"):
+            # A completed turn ends the outage episode. Keep its visible audit.
+            update_options(_session_lifecycle, session_name, owner_id, generation,
+                           {"fallback": {**previous, "attempts": 0, "tried": []}}, expected=options)
+        return False
+    completed = event.get("completed_at")
+    if not isinstance(completed, (int, float)) or not 20 <= time.time() - completed <= 3600:
+        return False
+    facts = await asyncio.to_thread(_codex_session_facts, session_name)
+    if (facts.get("metrics_thread_id") != row.get("resume_uuid")
+            or facts.get("model") != options.get("model") or facts.get("metrics_catching_up")):
+        return False
+    _catalog, efforts, checked = _load_model_snapshot(_model_catalog_file_for_user(owner_binding[1]))
+    if checked <= 0:
+        return False
+    chain = [m.strip() for m in os.environ.get(
+        "TMUX_DASH_FALLBACK_MODELS", "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"
+    ).split(",") if m.strip()]
+    candidate = fallback_candidate(options, event, efforts, chain)
+    if not candidate:
+        previous = options.get("fallback") or {}
+        if recoverable_error(event.get("error")) and previous.get("turn_id") != event.get("turn_id"):
+            update_options(_session_lifecycle, session_name, owner_id, generation,
+                           {"fallback": {**previous, "turn_id": event.get("turn_id"),
+                            "status": "Automatic fallback stopped. Select a model to retry."}}, expected=options)
+        return False
+    model, effort = candidate
+    async with _async_tmux_server_mutation_lock():
+        with _session_operation_lock(session_name):
+            binding = await _autopush_terminal_binding(session_name, owner_id)
+            if not binding or binding.get("generation") != generation:
+                return False
+            target = str(binding["session_id"])
+            expected_options = options
+
+            async def current() -> bool:
+                return bool(
+                    _session_auth_mode.get(session_name) == "subscription"
+                    and _session_launch_options(session_name, owner_id) == expected_options
+                    and _session_lifecycle.matches(session_name, generation=generation,
+                        owner_id=owner_id, desired_states={"running"}, resume_uuid=row.get("resume_uuid"), restore_on_startup=True)
+                    and await asyncio.to_thread(_terminal_binding_state, binding) == "current"
+                )
+
+            async def capture() -> str:
+                result = await asyncio.to_thread(subprocess.run,
+                    ["tmux", "capture-pane", "-t", target, "-p"], capture_output=True, text=True, timeout=3)
+                return result.stdout if result.returncode == 0 else ""
+
+            async def send(text: str) -> bool:
+                async with _autopush_action_lock(session_name):
+                    if not await current():
+                        return False
+                    result = await _to_thread_drain_on_cancel(subprocess.run,
+                        ["tmux", "send-keys", "-t", target, "-l", text], capture_output=True, text=True, timeout=5)
+                    if result.returncode != 0:
+                        return False
+                    await asyncio.sleep(0.3)
+                    if not await current():
+                        return False
+                    result = await _to_thread_drain_on_cancel(subprocess.run,
+                        ["tmux", "send-keys", "-t", target, "Enter"], capture_output=True, text=True, timeout=5)
+                    return result.returncode == 0
+
+            if (not await current() or _session_launch_options(session_name, owner_id) != options
+                    or await asyncio.to_thread(_model_recovery_event, session_name, owner_id) != event
+                    or not _model_recovery_composer_ready(await capture())):
+                return False
+            previous = options.get("fallback") or {}
+            state = {"turn_id": event["turn_id"], "attempts": int(previous.get("attempts") or 0) + 1,
+                     "tried": [*(previous.get("tried") or []), options["model"], model],
+                     "from_model": options["model"], "to_model": model, "at": time.time(),
+                     "status": f"Service error: switching from {options['model']} to {model} ({effort})."}
+            updated = update_options(_session_lifecycle, session_name, owner_id, generation,
+                                     {"model": model, "effort": effort, "fallback": state}, expected=options)
+            expected_options = updated
+
+            def status(message):
+                nonlocal updated, expected_options
+                updated = update_options(_session_lifecycle, session_name, owner_id, generation,
+                    {"fallback": {**state, "status": message}}, expected=updated)
+                expected_options = updated
+
+            # A failed turn must already be idle. Never interrupt a turn or an
+            # approval prompt to force a model change, even if quitting fails.
+            if not await send("/quit"):
+                status("Model fallback could not restart this session. Retry manually.")
+                return False
+            for _ in range(15):
+                await asyncio.sleep(1)
+                if not await _async_is_codex_running(session_name):
+                    break
+            if await _async_is_codex_running(session_name) or not await current():
+                status("Model fallback stopped because Codex did not exit. Retry manually.")
+                return False
+            restarted = await _ensure_codex_running(session_name,
+                resume_uuid=row["resume_uuid"], resume_cwd=row["cwd"],
+                expected_owner_id=owner_id, expected_generation=generation,
+                expected_desired_states={"running"}, allow_fresh=False,
+                operation_locked=True, tmux_locked=True)
+            if not restarted:
+                status("Fallback model saved. Session recovery is pending; retry when ready.")
+                return False
+            ready = False
+            for _ in range(20):
+                await asyncio.sleep(1)
+                if not await current() or _session_launch_options(session_name, owner_id) != updated:
+                    return False
+                # No duplicate continuation after a new user turn or a retry.
+                if await asyncio.to_thread(_model_recovery_event, session_name, owner_id) != event:
+                    status(f"Switched to {model} ({effort}). A newer turn already exists.")
+                    return False
+                if _model_recovery_composer_ready(await capture()):
+                    ready = True
+                    break
+            if not ready:
+                status(f"Switched to {model} ({effort}). Continue when the session is ready.")
+                return False
+            prompt = "Continue the interrupted task after the model service error. Preserve all prior instructions, safety decisions and permission boundaries."
+            if not await send(prompt):
+                status(f"Switched to {model} ({effort}). Continue manually.")
+                return False
+            submitted = await _ensure_codex_submitted(session_name, prompt, target)
+            if submitted not in {"submitted", "queued", "resent"}:
+                status(f"Switched to {model} ({effort}). Continue manually; submission was not confirmed.")
+                return False
+            _session_lifecycle.touch(session_name, source="model-service-recovery", records_input=True)
+            status(f"Service recovery: {options['model']} switched to {model} ({effort}); continuing the same session.")
+            logger.info("Model service recovery in %s: %s to %s, effort %s", session_name, options["model"], model, effort)
+            _session_model_cache.pop(session_name, None)
+            return True
+
+async def _model_fallback_loop():
+    await asyncio.sleep(30)
+    while True:
+        for session in await asyncio.to_thread(get_tmux_sessions):
+            try:
+                await _model_fallback_once(session["name"])
+            except asyncio.CancelledError:
+                raise
+            except (_SessionOperationBusy, _TmuxMutationBusy, ValueError):
+                pass
+            except Exception:
+                logger.debug("Model service recovery deferred", exc_info=True)
+        await asyncio.sleep(10)
+
+
 async def _codex_health_watchdog_loop():
     """Alert on, and recover from, sessions that dropped out of Codex."""
     hlog = logging.getLogger("codex-health")
@@ -16305,7 +25132,12 @@ async def _codex_health_watchdog_loop():
             down: list[tuple[str, str]] = []
             for sess in sessions_list:
                 name = sess["name"]
-                if _session_lifecycle.get(name).get("parked"):
+                lifecycle = _session_lifecycle.get(name)
+                if (
+                    lifecycle.get("parked")
+                    or str(lifecycle.get("desired_state") or "")
+                    in {"parking", "parked", "deleting", "deleted"}
+                ):
                     continue
                 # Only sessions this dashboard owns or has seen running Codex.
                 if name not in owners and name not in _seen_claude_running:
@@ -16391,14 +25223,22 @@ async def _codex_health_watchdog_loop():
 
 
 def _has_pending_user_input(visible: str) -> bool:
-    """True if the visible pane shows the ❯ user-input box with text already typed.
+    """True if the visible pane shows a user-input box with text already typed.
 
     Pattern: a line like '❯ some text the user is typing'. We must NOT send
     'continue' in that case — it would concatenate or submit the user's draft.
     Empty input (just '❯' or '❯ ') is fine.
     """
+    composer, composer_is_menu = _active_codex_composer_state(visible)
+    if any(
+        _CODEX_COMPOSER_FOOTER_RE.match(line)
+        for line in visible.splitlines()[-25:]
+    ):
+        return bool(composer) and not composer_is_menu
+    if composer:
+        return not composer_is_menu
     for line in visible.split("\n")[-20:]:
-        m = re.search(r"❯\s+(\S.*)", line)
+        m = re.search(r"[❯›»]\s+(\S.*)", line)
         if not m:
             continue
         tail = m.group(1).strip()
@@ -16439,32 +25279,67 @@ def _looks_like_fresh_claude_session(visible: str) -> bool:
 
 
 @app.get("/api/sessions/{session_name}/autopush")
-async def api_autopush_status(session_name: str):
+async def api_autopush_status(request: Request, session_name: str):
     """Return the per-session auto-push mode ('off'|'basic'|'full') + recent log."""
-    result = await _controller_call("watchdog_status", session=session_name)
-    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+    if not _find_session_for_user(session_name, _current_user(request))[1]:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    owner_id = str((_current_user(request) or {}).get("id") or "")
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    result = await _controller_call(
+        "watchdog_status", session=session_name, owner_id=owner_id,
+        generation=generation,
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 class AutopushBody(BaseModel):
     mode: str
+    incarnation: str
 
 
 @app.post("/api/sessions/{session_name}/autopush")
-async def api_autopush_set(session_name: str, body: AutopushBody):
+async def api_autopush_set(request: Request, session_name: str, body: AutopushBody):
     """Set the per-session auto-push mode.
 
-    off   — the dashboard never types into this terminal.
+    off   — no automatic option picking, prompt confirmation, autonomous
+            prompts, login prompts, or keep-going nudges.
     basic — auto-pick option menus + confirm permission/plan prompts + keep the
             session logged in (no free-form messages).
+    basicplus — everything in basic, plus a fixed cache-warming continuation
+                shortly before an eligible Codex prompt cache goes cold.
     full  — everything in basic, plus auto-compose a "keep going" nudge when
             Codex pauses waiting on the user before a task is finished.
     """
+    _sessions, session = _find_session_for_user(
+        session_name, _current_user(request)
+    )
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
     mode = (body.mode or "").strip().lower()
     if mode not in AUTOPUSH_MODES:
         return JSONResponse(
             {"error": f"mode must be one of {list(AUTOPUSH_MODES)}"}, status_code=400
         )
-    result = await _controller_call("autopush_set", session=session_name, mode=mode)
+    owner_id = str((_current_user(request) or {}).get("id") or "")
+    current_incarnation = str(session.get("logical_incarnation") or "")
+    if (
+        not body.incarnation
+        or not current_incarnation
+        or not hmac.compare_digest(body.incarnation, current_incarnation)
+    ):
+        return JSONResponse(
+            {"error": "Session identity changed; Auto-push was not changed"},
+            status_code=409,
+        )
+    # Capture the generation from the same inventory row whose opaque client
+    # incarnation was checked. The controller rejects it if replacement occurs
+    # after this point.
+    generation = str(session.get("generation") or "")
+    result = await _controller_call(
+        "autopush_set", session=session_name, mode=mode, owner_id=owner_id,
+        generation=generation, incarnation=body.incarnation,
+    )
     status = int(result.pop("_status", 200 if result.get("ok") else 503))
     return JSONResponse(result, status_code=status)
 
@@ -16472,22 +25347,53 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
 # --- Legacy simple-watchdog endpoints. Kept for back-compat and now mapped onto
 # the auto-push mode: "enabled" == full, "disabled" == basic. ---
 @app.get("/api/sessions/{session_name}/simple-watchdog")
-async def api_simple_watchdog_status(session_name: str):
+async def api_simple_watchdog_status(request: Request, session_name: str):
     """Return per-session simple-watchdog state (legacy shape)."""
-    result = await _controller_call("watchdog_status", session=session_name)
+    if not _find_session_for_user(session_name, _current_user(request))[1]:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    owner_id = str((_current_user(request) or {}).get("id") or "")
+    generation = str(_session_lifecycle.get(session_name).get("generation") or "")
+    result = await _controller_call(
+        "watchdog_status", session=session_name, owner_id=owner_id,
+        generation=generation,
+    )
     result["enabled"] = result.get("mode") == "full"
-    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 class SimpleWatchdogBody(BaseModel):
     enabled: bool
+    incarnation: str = ""
 
 
 @app.post("/api/sessions/{session_name}/simple-watchdog")
-async def api_simple_watchdog_toggle(session_name: str, body: SimpleWatchdogBody):
+async def api_simple_watchdog_toggle(
+    request: Request, session_name: str, body: SimpleWatchdogBody
+):
     """Enable/disable the free-form watchdog (legacy). Maps to auto-push full/basic."""
+    _sessions, session = _find_session_for_user(
+        session_name, _current_user(request)
+    )
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    current_incarnation = str(session.get("logical_incarnation") or "")
+    if (
+        not body.incarnation
+        or not current_incarnation
+        or not hmac.compare_digest(body.incarnation, current_incarnation)
+    ):
+        return JSONResponse(
+            {"error": "Session identity changed; Auto-push was not changed"},
+            status_code=409,
+        )
     mode = "full" if body.enabled else "basic"
-    result = await _controller_call("autopush_set", session=session_name, mode=mode)
+    owner_id = str((_current_user(request) or {}).get("id") or "")
+    generation = str(session.get("generation") or "")
+    result = await _controller_call(
+        "autopush_set", session=session_name, mode=mode, owner_id=owner_id,
+        generation=generation, incarnation=body.incarnation,
+    )
     status = int(result.pop("_status", 200 if result.get("ok") else 503))
     return JSONResponse(result, status_code=status)
 
@@ -16539,6 +25445,86 @@ Available skills are at: {skills_dir}/
 Read a SKILL.md file and execute its tasks. Build something NOW."""
 
 
+def _autonomous_state_is_current(
+    session_name: str, state: dict, mode: str
+) -> bool:
+    registry = _away_mode_state if mode == "away" else _go_nuts_state
+    return (
+        registry.get(session_name) is state
+        and bool(state.get("enabled"))
+        and _autopush_identity_matches(
+            session_name,
+            str(state.get("owner_id") or ""),
+            str(state.get("generation") or ""),
+        )
+    )
+
+
+def _autonomous_cancel_is_watchdog_restart(state: dict) -> bool:
+    """Distinguish a watchdog worker swap from a user/Off cancellation."""
+    return state.get("_watchdog_restart_cancel_task") is asyncio.current_task()
+
+
+def _autonomous_state_matches_identity(
+    state: dict, expected_owner_id: str, expected_generation: str
+) -> bool:
+    """Keep name-keyed autonomous reports bound to their original tenant."""
+    if not state:
+        return False
+    state_owner = str(state.get("owner_id") or "")
+    state_generation = str(state.get("generation") or "")
+    return (
+        (not expected_owner_id or hmac.compare_digest(
+            state_owner, expected_owner_id
+        ))
+        and (not expected_generation or hmac.compare_digest(
+            state_generation, expected_generation
+        ))
+    )
+
+
+def _discard_stale_autonomous_states(
+    session_name: str, expected_owner_id: str, expected_generation: str
+) -> None:
+    """Remove autonomous state inherited through an abnormal name reuse."""
+    for registry in (_away_mode_state, _go_nuts_state):
+        state = registry.get(session_name)
+        if not state or _autonomous_state_matches_identity(
+            state, expected_owner_id, expected_generation
+        ):
+            continue
+        state["enabled"] = False
+        task = state.get("task")
+        if task and not task.done():
+            task.cancel()
+        registry.pop(session_name, None)
+
+
+async def _autonomous_ensure_codex(
+    session_name: str,
+    log_fn,
+    state: dict,
+    mode: str,
+    *,
+    expected_binding: dict | None = None,
+) -> bool:
+    binding = expected_binding or await _autopush_terminal_binding(
+        session_name, str(state.get("owner_id") or "")
+    )
+    if not binding:
+        return False
+    return await _ensure_codex_running(
+        session_name,
+        log_fn,
+        state,
+        expected_owner_id=str(binding.get("owner_id") or ""),
+        expected_generation=str(binding.get("generation") or ""),
+        autopush_guard=True,
+        expected_binding=binding,
+        autonomous_mode=mode,
+    )
+
+
 async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
     """Restore an autonomous mode after server restart: wait for session, send prompt, launch loop."""
     rlog = logging.getLogger("restore")
@@ -16546,19 +25532,38 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
     log_fn = _away_log if mode == "away" else _go_nuts_log
 
     try:
-        # Give tmux and Codex a moment to settle after server restart
+        # Give tmux and Codex a moment to settle after server restart. Durable
+        # session recovery is independently retried, so keep the mode intent
+        # while a valid running lifecycle row is temporarily unavailable.
         await asyncio.sleep(15)
+        while state.get("enabled"):
+            try:
+                activity = await async_detect_activity(session_name)
+            except Exception:
+                if _durable_running_intent_exists(session_name):
+                    log_fn(state, "Waiting for the durable session to return")
+                    await asyncio.sleep(_DURABLE_SESSION_REHYDRATE_INTERVAL)
+                    continue
+                log_fn(state, "Session no longer exists — stopping")
+                state["enabled"] = False
+                await _save_autonomous_state_async()
+                return
 
-        if not state.get("enabled"):
+            codex_ok = await _autonomous_ensure_codex(
+                session_name, log_fn, state, mode
+            )
+            if codex_ok:
+                break
+            if _durable_running_intent_exists(session_name):
+                log_fn(state, "Codex recovery is pending — keeping autonomous mode enabled")
+                await asyncio.sleep(_DURABLE_SESSION_REHYDRATE_INTERVAL)
+                continue
+            log_fn(state, "Could not restart Codex during restore — stopping")
+            state["enabled"] = False
+            await _save_autonomous_state_async()
             return
 
-        # Check the session still exists
-        try:
-            activity = await async_detect_activity(session_name)
-        except Exception:
-            log_fn(state, "Session not found during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
+        if not _autonomous_state_is_current(session_name, state, mode):
             return
 
         # Wait for session to be idle before sending prompt (max 10 min)
@@ -16566,22 +25571,25 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
             log_fn(state, "Session is busy — waiting for it to finish current task")
             await _away_wait_for_idle(session_name, timeout=600)
 
-        if not state.get("enabled"):
-            return
-
-        # Ensure Codex is actually running (handles OOM/crash during server downtime)
-        codex_ok = await _ensure_codex_running(session_name, log_fn, state)
-        if not codex_ok:
-            log_fn(state, "Could not restart Codex during restore — stopping")
-            state["enabled"] = False
-            _save_autonomous_state()
+        if not _autonomous_state_is_current(session_name, state, mode):
             return
 
         # Send the appropriate unstick/resume prompt (with project isolation)
         skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
         unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
         log_fn(state, "Sending resume prompt to session")
-        await _away_send_prompt(session_name, unstick_prompt)
+        binding = await _autopush_terminal_binding(
+            session_name, str(state.get("owner_id") or "")
+        )
+        if not binding:
+            return
+        await _away_send_prompt(
+            session_name,
+            unstick_prompt,
+            expected_binding=binding,
+            expected_autonomous_state=state,
+            autonomous_mode=mode,
+        )
         await asyncio.sleep(2)
 
         # Now enter the continuous monitoring loop
@@ -16593,17 +25601,20 @@ async def _restore_autonomous_mode(session_name: str, state: dict, mode: str):
     except asyncio.CancelledError:
         if _shutting_down:
             log_fn(state, f"{mode} restore cancelled (server shutdown — will restore)")
+        elif _autonomous_cancel_is_watchdog_restart(state):
+            log_fn(state, f"{mode} restore cancelled for watchdog restart")
         else:
             log_fn(state, f"{mode} restore cancelled")
             state["enabled"] = False
-            _save_autonomous_state()
+            await _save_autonomous_state_async()
         raise
     except Exception as e:
         log_fn(state, f"{mode} restore error: {e}")
         rlog.error(f"Restore {mode} for '{session_name}' failed: {e}")
         # Don't set enabled=False — watchdog zombie detection will restart us
     finally:
-        state["task"] = None
+        if state.get("task") in (None, asyncio.current_task()):
+            state["task"] = None
 
 
 _TMP_WATCHDOG_INTERVAL = 120            # poll /tmp every 2 minutes
@@ -16779,10 +25790,22 @@ async def _watchdog_loop():
 async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlog):
     """Check a single session for stalls."""
     import hashlib
+    if (
+        not _autonomous_state_is_current(session_name, state, mode)
+        or _get_autopush_mode(session_name) == "off"
+    ):
+        return
+    binding = await _autopush_terminal_binding(
+        session_name, str(state.get("owner_id") or "")
+    )
+    if not binding:
+        return
     now = time.time()
 
     # Capture recent terminal content (non-blocking)
-    recent = await asyncio.to_thread(capture_pane_recent, session_name, 50)
+    recent = await asyncio.to_thread(
+        capture_pane_recent, binding["session_id"], 50
+    )
     if not recent.strip():
         return  # Empty pane, can't assess
 
@@ -16810,10 +25833,17 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
 
     # Check if Codex has crashed (OOM, etc) — if so, restart immediately
     if not await _async_is_codex_running(session_name):
+        if (
+            not _autonomous_state_is_current(session_name, state, mode)
+            or _get_autopush_mode(session_name) == "off"
+        ):
+            return
         wlog.warning(f"Codex not running in '{session_name}' — OOM/crash detected, restarting")
         log_fn(state, "Watchdog: Codex crashed (OOM?) — restarting")
         _watchdog_snapshots.pop(session_name, None)
-        await _watchdog_restart_mode(session_name, state, mode, wlog)
+        await _watchdog_restart_mode(
+            session_name, state, mode, wlog, expected_binding=binding
+        )
         return
 
     # First stall detection — use LLM to check if it's a legitimate long operation
@@ -16846,6 +25876,12 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
 
         wlog.info(f"Session '{session_name}' assessed as STUCK — will nudge")
 
+    if (
+        not _autonomous_state_is_current(session_name, state, mode)
+        or _get_autopush_mode(session_name) == "off"
+    ):
+        return
+
     # Session is stuck. Try nudging.
     if now - snap["last_nudge"] < _NUDGE_COOLDOWN:
         return  # Wait for cooldown between nudges
@@ -16862,7 +25898,9 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
             wlog.warning(f"Codex not running in '{session_name}' during nudge — restarting mode")
             log_fn(state, "Watchdog: Codex not running during nudge — restarting")
             _watchdog_snapshots.pop(session_name, None)
-            await _watchdog_restart_mode(session_name, state, mode, wlog)
+            await _watchdog_restart_mode(
+                session_name, state, mode, wlog, expected_binding=binding
+            )
             return
 
         # If session appears to be waiting for input or truly idle, just send the nudge
@@ -16875,48 +25913,100 @@ async def _watchdog_check_session(session_name: str, state: dict, mode: str, wlo
             # Session claims busy but terminal hasn't changed — might be truly stuck
             # Send Ctrl+C first to break out of whatever it's doing
             log_fn(state, "Watchdog: session reports busy but no terminal change — sending Ctrl+C")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+            if not await _autopush_tmux_batch(session_name, [
+                (["tmux", "send-keys", "-t", session_name, "C-c"], 3),
+            ], expected_binding=binding,
+                expected_autonomous_state=state,
+                autonomous_mode=mode):
+                return
             await asyncio.sleep(5)
 
-        await _away_send_prompt(session_name, _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT)
+        await _away_send_prompt(
+            session_name,
+            _build_project_isolation_preamble(session_name) + _NUDGE_PROMPT,
+            expected_binding=binding,
+            expected_autonomous_state=state,
+            autonomous_mode=mode,
+        )
         return
 
     # Nudges exhausted — hard restart
     log_fn(state, f"Watchdog: {_MAX_NUDGES_BEFORE_RESTART} nudges failed — restarting {mode} mode")
     wlog.warning(f"Restarting {mode} mode for '{session_name}' after {snap['nudge_count']} failed nudges")
-    await _watchdog_restart_mode(session_name, state, mode, wlog)
+    await _watchdog_restart_mode(
+        session_name, state, mode, wlog, expected_binding=binding
+    )
     # Reset snapshot
     _watchdog_snapshots.pop(session_name, None)
 
 
-async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog):
+async def _watchdog_restart_mode(
+    session_name: str,
+    state: dict,
+    mode: str,
+    wlog,
+    *,
+    expected_binding: dict | None = None,
+):
     """Gracefully restart an autonomous mode session, preserving history."""
     log_fn = _away_log if mode == "away" else _go_nuts_log
+    if (
+        not _autonomous_state_is_current(session_name, state, mode)
+        or _get_autopush_mode(session_name) == "off"
+    ):
+        return
 
     # 1. Cancel existing task
     old_task = state.get("task")
     if old_task and not old_task.done():
+        state["_watchdog_restart_cancel_task"] = old_task
+
+        def clear_restart_marker(done_task):
+            if state.get("_watchdog_restart_cancel_task") is done_task:
+                state.pop("_watchdog_restart_cancel_task", None)
+
+        old_task.add_done_callback(clear_restart_marker)
         old_task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(old_task), timeout=5)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
 
-    # 2. Send Ctrl+C to break any stuck process in the terminal
-    try:
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(3)
-        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
-        await asyncio.sleep(2)
-    except Exception:
-        pass
+    # 2. Send Ctrl+C to break any stuck process in the terminal. Each key is a
+    # separate Off-fenced batch, so the waits between them never delay Off.
+    binding = expected_binding or await _autopush_terminal_binding(
+        session_name, str(state.get("owner_id") or "")
+    )
+    if not binding:
+        return
+    if not await _autopush_tmux_batch(session_name, [
+        (["tmux", "send-keys", "-t", session_name, "C-c"], 3),
+    ], expected_binding=binding,
+        expected_autonomous_state=state,
+        autonomous_mode=mode):
+        return
+    await asyncio.sleep(3)
+    if not await _autopush_tmux_batch(session_name, [
+        (["tmux", "send-keys", "-t", session_name, "C-c"], 3),
+    ], expected_binding=binding,
+        expected_autonomous_state=state,
+        autonomous_mode=mode):
+        return
+    await asyncio.sleep(2)
+
+    if _get_autopush_mode(session_name) == "off":
+        return
 
     # 2b. Ensure Codex is actually running (handles OOM/crash recovery)
-    codex_ok = await _ensure_codex_running(session_name, log_fn, state)
+    codex_ok = await _autonomous_ensure_codex(
+        session_name, log_fn, state, mode, expected_binding=binding
+    )
     if not codex_ok:
+        if not _autonomous_state_is_current(session_name, state, mode):
+            return
         log_fn(state, "Watchdog: could not restart Codex — aborting restart")
         state["enabled"] = False
-        _save_autonomous_state()
+        await _save_autonomous_state_async()
         return
 
     # 3. Preserve the log history, reset state for fresh loop
@@ -16927,32 +26017,72 @@ async def _watchdog_restart_mode(session_name: str, state: dict, mode: str, wlog
     log_fn(state, "Watchdog: restarting mode — skipping initial phases, jumping to continuous loop")
 
     # 4. Re-initialize state
-    state.update({
-        "enabled": True,
-        "phase": 4,
-        "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
-        "step": old_step,
-        "step_name": "Watchdog restart",
-        "started_at": old_started,  # Keep original start time
-        "log": old_log,  # Keep full log history
-        "task": None,
-    })
-    _save_autonomous_state()
+    try:
+        with _session_operation_lock(session_name):
+            async with _autopush_action_lock(session_name):
+                if (
+                    _get_autopush_mode(session_name) == "off"
+                    or not _autonomous_state_is_current(
+                        session_name, state, mode
+                    )
+                    or await asyncio.to_thread(
+                        _terminal_binding_state, binding
+                    ) != "current"
+                ):
+                    return
+                state.update({
+                    "enabled": True,
+                    "phase": 4,
+                    "phase_name": "Continuous (restarted)" if mode == "away" else "Continuous Build (restarted)",
+                    "step": old_step,
+                    "step_name": "Watchdog restart",
+                    "started_at": old_started,  # Keep original start time
+                    "log": old_log,  # Keep full log history
+                    "task": None,
+                })
+        await _save_autonomous_state_async()
+    except _SessionOperationBusy:
+        return
 
     # 5. Send an unstick prompt directly instead of re-running initial phases (with project isolation)
     skills_dir = _SKILLS_DIR if mode == "away" else _GO_NUTS_SKILLS_DIR
     unstick_prompt = _build_project_isolation_preamble(session_name) + (_UNSTICK_PROMPT_AWAY if mode == "away" else _UNSTICK_PROMPT_GONUTS).format(skills_dir=skills_dir)
 
-    await _away_send_prompt(session_name, unstick_prompt)
+    await _away_send_prompt(
+        session_name,
+        unstick_prompt,
+        expected_binding=binding,
+        expected_autonomous_state=state,
+        autonomous_mode=mode,
+    )
     await asyncio.sleep(2)
 
     # 6. Launch fresh worker that skips to continuous loop
-    if mode == "away":
-        task = asyncio.create_task(_away_mode_continuous_loop(session_name))
-        state["task"] = task
-    else:
-        task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
-        state["task"] = task
+    try:
+        with _session_operation_lock(session_name):
+            async with _autopush_action_lock(session_name):
+                if (
+                    _get_autopush_mode(session_name) == "off"
+                    or not _autonomous_state_is_current(
+                        session_name, state, mode
+                    )
+                    or await asyncio.to_thread(
+                        _terminal_binding_state, binding
+                    ) != "current"
+                ):
+                    state["enabled"] = False
+                    await _save_autonomous_state_async()
+                    return
+                if mode == "away":
+                    task = asyncio.create_task(_away_mode_continuous_loop(session_name))
+                    state["task"] = task
+                else:
+                    task = asyncio.create_task(_go_nuts_continuous_loop(session_name))
+                    state["task"] = task
+    except _SessionOperationBusy:
+        state["enabled"] = False
+        await _save_autonomous_state_async()
+        return
 
     wlog.info(f"Restarted {mode} mode for '{session_name}' — continuous loop relaunched")
 
@@ -16989,11 +26119,13 @@ async def _away_mode_continuous_loop(session_name: str):
                     return
 
                 # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
+                codex_ok = await _autonomous_ensure_codex(
+                    session_name, _away_log, state, "away"
+                )
                 if not codex_ok:
                     _away_log(state, "Codex dead and couldn't restart — stopping away mode")
                     state["enabled"] = False
-                    _save_autonomous_state()
+                    await _save_autonomous_state_async()
                     return
 
                 state["step"] = cycle
@@ -17003,7 +26135,7 @@ async def _away_mode_continuous_loop(session_name: str):
                                            f"Task ping cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
+                await _save_autonomous_state_async()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -17021,18 +26153,21 @@ async def _away_mode_continuous_loop(session_name: str):
     except asyncio.CancelledError:
         if _shutting_down:
             _away_log(state, "Away mode (restarted) cancelled (server shutdown — will restore)")
+        elif _autonomous_cancel_is_watchdog_restart(state):
+            _away_log(state, "Away mode worker cancelled for watchdog restart")
         else:
             _away_log(state, "Away mode (restarted) cancelled")
             state["enabled"] = False
-            _save_autonomous_state()
+            await _save_autonomous_state_async()
         raise
     except Exception as e:
         _away_log(state, f"Away mode (restarted) error: {e}")
         log.error(f"Away mode restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
+        await _save_autonomous_state_async()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
-        state["task"] = None
+        if state.get("task") in (None, asyncio.current_task()):
+            state["task"] = None
 
 
 async def _go_nuts_continuous_loop(session_name: str):
@@ -17066,11 +26201,13 @@ async def _go_nuts_continuous_loop(session_name: str):
                     return
 
                 # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
+                codex_ok = await _autonomous_ensure_codex(
+                    session_name, _go_nuts_log, state, "gonuts"
+                )
                 if not codex_ok:
                     _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
                     state["enabled"] = False
-                    _save_autonomous_state()
+                    await _save_autonomous_state_async()
                     return
 
                 state["step"] = cycle
@@ -17080,7 +26217,7 @@ async def _go_nuts_continuous_loop(session_name: str):
                                               f"Build cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
+                await _save_autonomous_state_async()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -17098,18 +26235,21 @@ async def _go_nuts_continuous_loop(session_name: str):
     except asyncio.CancelledError:
         if _shutting_down:
             _go_nuts_log(state, "Go Nuts mode (restarted) cancelled (server shutdown — will restore)")
+        elif _autonomous_cancel_is_watchdog_restart(state):
+            _go_nuts_log(state, "Go Nuts worker cancelled for watchdog restart")
         else:
             _go_nuts_log(state, "Go Nuts mode (restarted) cancelled")
             state["enabled"] = False
-            _save_autonomous_state()
+            await _save_autonomous_state_async()
         raise
     except Exception as e:
         _go_nuts_log(state, f"Go Nuts mode (restarted) error: {e}")
         log.error(f"Go Nuts restarted loop error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
+        await _save_autonomous_state_async()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
-        state["task"] = None
+        if state.get("task") in (None, asyncio.current_task()):
+            state["task"] = None
 
 
 # --- Away Mode ---
@@ -17138,7 +26278,76 @@ def _away_state_summary(state: dict) -> dict:
     }
 
 
-async def _away_send_prompt(session_name: str, prompt: str):
+async def _autopush_tmux_batch(
+    session_name: str,
+    commands: list[tuple[list[str], int]],
+    *,
+    expected_binding: dict | None = None,
+    required_modes: set[str] | None = None,
+    expected_autonomous_state: dict | None = None,
+    autonomous_mode: str = "",
+    delay_before_last: float = 0,
+) -> bool:
+    """Run one short autonomous tmux batch behind the Off barrier."""
+    try:
+        with _session_operation_lock(session_name):
+            async with _autopush_action_lock(session_name):
+                allowed = required_modes or set(AUTOPUSH_MODES) - {"off"}
+                if _get_autopush_mode(session_name) not in allowed:
+                    return False
+                if expected_autonomous_state is not None and (
+                    not autonomous_mode
+                    or not _autonomous_state_is_current(
+                        session_name,
+                        expected_autonomous_state,
+                        autonomous_mode,
+                    )
+                ):
+                    return False
+                if expected_binding and await _to_thread_drain_on_cancel(
+                    _terminal_binding_state, expected_binding
+                ) != "current":
+                    return False
+                async def run_commands() -> bool:
+                    await _to_thread_drain_on_cancel(
+                        _session_lifecycle.touch,
+                        session_name,
+                        source="autonomous-mode",
+                        records_input=True,
+                    )
+                    for index, (command, timeout) in enumerate(commands):
+                        if delay_before_last and index == len(commands) - 1:
+                            await asyncio.sleep(delay_before_last)
+                        resolved = _tmux_command_for_binding(
+                            command, session_name, expected_binding
+                        )
+                        result = await _to_thread_drain_on_cancel(
+                            subprocess.run,
+                            resolved,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                        if result.returncode != 0:
+                            return False
+                    return True
+
+                return await _await_task_drain_on_cancel(
+                    asyncio.create_task(run_commands())
+                )
+        return True
+    except _SessionOperationBusy:
+        return False
+
+
+async def _away_send_prompt_unlocked(
+    session_name: str,
+    prompt: str,
+    *,
+    expected_binding: dict | None = None,
+    expected_autonomous_state: dict | None = None,
+    autonomous_mode: str = "",
+):
     """Send a long prompt to a Codex session via tmux paste-buffer.
 
     Two-phase approach to defeat the bracketed paste "[Pasted text +N lines]" hang:
@@ -17151,43 +26360,44 @@ async def _away_send_prompt(session_name: str, prompt: str):
     log = logging.getLogger("away-mode")
     prompt_text = prompt.rstrip("\n\r ")  # Strip trailing whitespace/newlines
     prompt_file = None
+    buffer_names: list[str] = []
     try:
+        pane_target = (
+            str(expected_binding.get("session_id") or "")
+            if expected_binding else session_name
+        )
+        if not pane_target:
+            return
         fd, prompt_file = tempfile.mkstemp(prefix=f"away-prompt-{session_name}-", suffix=".md")
         os.close(fd)
         Path(prompt_file).write_text(prompt_text)
 
-        # Capture terminal state before paste to detect changes later
-        pre_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-
         # --- Strategy: Disable bracketed paste, then paste raw ---
         # Send \e[?2004l escape sequence directly to the terminal to disable
         # bracketed paste mode. tmux send-keys -H sends raw hex bytes.
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "-H",
-             "1b", "5b", "3f", "32", "30", "30", "34", "6c"],  # \e[?2004l
-            capture_output=True, text=True, timeout=5,
-        )
+        if not await _autopush_tmux_batch(session_name, [
+            (["tmux", "send-keys", "-t", session_name, "-H",
+              "1b", "5b", "3f", "32", "30", "30", "34", "6c"], 5),
+        ], expected_binding=expected_binding,
+            expected_autonomous_state=expected_autonomous_state,
+            autonomous_mode=autonomous_mode):
+            return
         await asyncio.sleep(0.2)
 
-        # Load file into tmux buffer and paste
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "load-buffer", prompt_file],
-            capture_output=True, text=True, timeout=5,
-        )
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "paste-buffer", "-t", session_name],
-            capture_output=True, text=True, timeout=10,
-        )
-
-        # Scale wait time with prompt size
+        # Use a named one-shot buffer so another tenant cannot replace this
+        # prompt between load-buffer and paste-buffer.
+        buffer_name = f"away-{secrets.token_hex(12)}"
+        buffer_names.append(buffer_name)
         wait_secs = max(2.0, min(8.0, len(prompt_text) / 1500))
-        await asyncio.sleep(wait_secs)
-
-        # Send Enter to submit
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5,
-        )
+        if not await _autopush_tmux_batch(session_name, [
+            (["tmux", "load-buffer", "-b", buffer_name, prompt_file], 5),
+            (["tmux", "paste-buffer", "-b", buffer_name, "-d", "-t", session_name], 10),
+            (["tmux", "send-keys", "-t", session_name, "Enter"], 5),
+        ], expected_binding=expected_binding,
+            expected_autonomous_state=expected_autonomous_state,
+            autonomous_mode=autonomous_mode,
+            delay_before_last=wait_secs):
+            return
         log.info(f"Sent prompt to '{session_name}' ({len(prompt_text)} chars, waited {wait_secs:.1f}s)")
 
         # Note: we do NOT re-enable bracketed paste (\e[?2004h) here.
@@ -17206,43 +26416,136 @@ async def _away_send_prompt(session_name: str, prompt: str):
                 log.info(f"Session '{session_name}' is busy — prompt accepted")
                 return  # Success — session started processing
 
-            # Check if terminal output changed (even if still "idle" per detection)
-            post_snapshot = await asyncio.to_thread(capture_pane_recent, session_name, 5)
-            if post_snapshot != pre_snapshot:
-                log.info(f"Session '{session_name}' terminal changed — prompt likely accepted")
-                return  # Terminal content changed, prompt was received
-
-            # Still showing the same content — try Enter again
-            log.warning(f"Session '{session_name}' still idle after paste (attempt {attempt+1}/3) — retrying Enter")
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5,
+            # Retry only when the footer-anchored live composer proves this
+            # autonomous prompt is still parked. Scrollback matches and generic
+            # pane changes are not evidence that another Enter is safe.
+            recent = await asyncio.to_thread(
+                capture_pane_recent,
+                pane_target,
+                _CODEX_COMPOSER_MAX_ROWS + 10,
             )
+            composer = _active_codex_composer_text(recent)
+            expected_composer = " ".join(prompt_text.split())
+            composer_text = " ".join(composer.split())
+            prompt_stuck = composer_text == expected_composer
+            preview_stuck = bool(re.fullmatch(
+                r"\[Pasted text \+\d+ lines?\]",
+                composer.strip(),
+                re.I,
+            ))
+            if composer == _CODEX_COMPOSER_UNKNOWN:
+                log.warning(
+                    "Session '%s' composer is ambiguous after autonomous paste; "
+                    "not retrying Enter", session_name,
+                )
+                return
+            if not prompt_stuck and not preview_stuck:
+                log.info(f"Session '{session_name}' prompt left the live composer")
+                return
+
+            log.warning(
+                "Session '%s' exact autonomous prompt is still parked "
+                "(attempt %d/3); retrying Enter",
+                session_name, attempt + 1,
+            )
+            if not await _autopush_tmux_batch(session_name, [
+                (["tmux", "send-keys", "-t", session_name, "Enter"], 5),
+            ], expected_binding=expected_binding,
+                expected_autonomous_state=expected_autonomous_state,
+                autonomous_mode=autonomous_mode):
+                return
 
         # All Enter retries failed. Check if there's a bracketed paste preview stuck.
-        recent = await asyncio.to_thread(capture_pane_recent, session_name, 10)
-        if "Pasted text" in recent or "pasted" in recent.lower():
+        recent = await asyncio.to_thread(
+            capture_pane_recent,
+            pane_target,
+            _CODEX_COMPOSER_MAX_ROWS + 10,
+        )
+        composer = _active_codex_composer_text(recent)
+        if (
+            composer != _CODEX_COMPOSER_UNKNOWN
+            and re.fullmatch(
+                r"\[Pasted text \+\d+ lines?\]",
+                composer.strip(),
+                re.I,
+            )
+        ):
             # Bracketed paste preview is stuck — Escape to cancel it, then re-send
             log.warning(f"Session '{session_name}' has stuck paste preview — clearing and retrying")
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Escape"], timeout=3, capture_output=True)
+            if not await _autopush_tmux_batch(session_name, [
+                (["tmux", "send-keys", "-t", session_name, "Escape"], 3),
+            ], expected_binding=expected_binding,
+                expected_autonomous_state=expected_autonomous_state,
+                autonomous_mode=autonomous_mode):
+                return
             await asyncio.sleep(0.5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3, capture_output=True)
+            if not await _autopush_tmux_batch(session_name, [
+                (["tmux", "send-keys", "-t", session_name, "C-c"], 3),
+            ], expected_binding=expected_binding,
+                expected_autonomous_state=expected_autonomous_state,
+                autonomous_mode=autonomous_mode):
+                return
             await asyncio.sleep(1)
             # Re-send the prompt, this time relying on bracketed paste disabled earlier
-            await asyncio.to_thread(subprocess.run, ["tmux", "load-buffer", prompt_file], capture_output=True, text=True, timeout=5)
-            await asyncio.to_thread(subprocess.run, ["tmux", "paste-buffer", "-t", session_name], capture_output=True, text=True, timeout=10)
-            await asyncio.sleep(wait_secs)
-            await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", session_name, "Enter"], capture_output=True, text=True, timeout=5)
+            retry_buffer_name = f"away-{secrets.token_hex(12)}"
+            buffer_names.append(retry_buffer_name)
+            if not await _autopush_tmux_batch(session_name, [
+                (["tmux", "load-buffer", "-b", retry_buffer_name, prompt_file], 5),
+                (["tmux", "paste-buffer", "-b", retry_buffer_name, "-d", "-t", session_name], 10),
+                (["tmux", "send-keys", "-t", session_name, "Enter"], 5),
+            ], expected_binding=expected_binding,
+                expected_autonomous_state=expected_autonomous_state,
+                autonomous_mode=autonomous_mode,
+                delay_before_last=wait_secs):
+                return
             log.info(f"Re-sent prompt to '{session_name}' after clearing stuck paste")
 
     except Exception as e:
         log.error(f"Failed to send prompt to '{session_name}': {e}")
     finally:
+        for buffer_name in buffer_names:
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "delete-buffer", "-b", buffer_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+            except Exception:
+                pass
         if prompt_file:
             try:
                 os.unlink(prompt_file)
             except (OSError, UnboundLocalError):
                 pass
+        pass
+
+
+async def _away_send_prompt(
+    session_name: str,
+    prompt: str,
+    *,
+    expected_binding: dict | None = None,
+    expected_autonomous_state: dict | None = None,
+    autonomous_mode: str = "",
+):
+    """Send an autonomous prompt only while the session permits auto-push."""
+    if _get_autopush_mode(session_name) == "off":
+        logging.getLogger("away-mode").info(
+            "Skipped autonomous prompt for '%s': auto-push is Off", session_name
+        )
+        return
+    binding = expected_binding or await _autopush_terminal_binding(session_name)
+    if not binding:
+        return
+    await _away_send_prompt_unlocked(
+        session_name,
+        prompt,
+        expected_binding=binding,
+        expected_autonomous_state=expected_autonomous_state,
+        autonomous_mode=autonomous_mode,
+    )
 
 
 async def _away_wait_for_idle(session_name: str, timeout: int = 900) -> bool:
@@ -17301,21 +26604,40 @@ STRICT RULES:
 async def _away_send_and_wait(session_name: str, prompt: str, state: dict,
                                step_name: str, timeout: int = 900) -> str:
     """Send prompt, wait for completion, capture and summarize output."""
+    if not _autonomous_state_is_current(session_name, state, "away"):
+        return ""
+    binding = await _autopush_terminal_binding(
+        session_name, str(state.get("owner_id") or "")
+    )
+    if not binding:
+        return ""
     state["step_name"] = step_name
     _away_log(state, f"Sending: {step_name}")
 
     prompt = _build_project_isolation_preamble(session_name) + prompt
-    await _away_send_prompt(session_name, prompt)
+    await _away_send_prompt(
+        session_name,
+        prompt,
+        expected_binding=binding,
+        expected_autonomous_state=state,
+        autonomous_mode="away",
+    )
     completed = await _away_wait_for_idle(session_name, timeout=timeout)
 
     if not completed:
         _away_log(state, f"Timeout on: {step_name}")
         # Send Ctrl+C to unstick if needed
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
+        await _autopush_tmux_batch(
+            session_name,
+            [(["tmux", "send-keys", "-t", session_name, "C-c"], 3)],
+            expected_binding=binding,
+            expected_autonomous_state=state,
+            autonomous_mode="away",
+        )
         await asyncio.sleep(2)
 
     # Capture output and summarize
-    output = capture_pane_full(session_name)
+    output = capture_pane_full(binding["session_id"])
     try:
         summary = await llm_call(
             system_prompt=(
@@ -17599,11 +26921,13 @@ async def _away_mode_worker(session_name: str):
                     return
 
                 # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _away_log, state)
+                codex_ok = await _autonomous_ensure_codex(
+                    session_name, _away_log, state, "away"
+                )
                 if not codex_ok:
                     _away_log(state, "Codex dead and couldn't restart — stopping away mode")
                     state["enabled"] = False
-                    _save_autonomous_state()
+                    await _save_autonomous_state_async()
                     return
 
                 # Session has been idle for 90s — send ping prompt
@@ -17614,7 +26938,7 @@ async def _away_mode_worker(session_name: str):
                                            f"Task ping cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
+                await _save_autonomous_state_async()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -17633,28 +26957,57 @@ async def _away_mode_worker(session_name: str):
     except asyncio.CancelledError:
         if _shutting_down:
             _away_log(state, "Away mode cancelled (server shutdown — will restore)")
+        elif _autonomous_cancel_is_watchdog_restart(state):
+            _away_log(state, "Away mode worker cancelled for watchdog restart")
         else:
             _away_log(state, "Away mode cancelled by user")
             state["enabled"] = False
-            _save_autonomous_state()
+            await _save_autonomous_state_async()
         log.info(f"Away mode cancelled for '{session_name}'")
         raise
     except Exception as e:
         _away_log(state, f"Away mode fatal error: {e}")
         log.error(f"Away mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
+        await _save_autonomous_state_async()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
-        state["task"] = None
+        if state.get("task") in (None, asyncio.current_task()):
+            state["task"] = None
         log.info(f"Away mode finished for '{session_name}'")
 
 
-async def _away_toggle_local(session_name: str, enabled: bool) -> dict:
+async def _away_toggle_local(
+    session_name: str,
+    enabled: bool,
+    *,
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_incarnation: str = "",
+) -> dict:
     _, sess = _find_session(session_name)
     if not sess:
         return {"ok": False, "error": "Session not found", "_status": 404}
+    if not _autopush_identity_matches(
+        session_name,
+        expected_owner_id,
+        expected_generation,
+        expected_incarnation,
+    ):
+        return {"ok": False, "error": "Session not found", "_status": 404}
+    async with _autopush_action_lock(session_name):
+        request_revision = _autonomous_toggle_revision.get(session_name, 0) + 1
+        _autonomous_toggle_revision[session_name] = request_revision
+        _discard_stale_autonomous_states(
+            session_name, expected_owner_id, expected_generation
+        )
 
     if enabled:
+        if _get_autopush_mode(session_name) == "off":
+            return {
+                "ok": False,
+                "error": "Auto-push is Off. Choose Basic, Basic +, or Full first.",
+                "_status": 409,
+            }
         # Don't allow both away mode and go-nuts mode at the same time on same session
         if _go_nuts_state.get(session_name, {}).get("enabled"):
             return {"ok": False, "error": "Go Nuts Mode is active on this session. Disable it first.", "_status": 409}
@@ -17663,55 +27016,150 @@ async def _away_toggle_local(session_name: str, enabled: bool) -> dict:
         if _away_mode_state.get(session_name, {}).get("enabled"):
             return {"ok": True, **_away_state_summary(_away_mode_state[session_name])}
 
-        resumed = await _resume_parked_session(session_name, source="away-mode")
+        resumed = await _resume_parked_session(
+            session_name,
+            source="away-mode",
+            expected_owner_id=expected_owner_id,
+            expected_generation=expected_generation,
+            expected_incarnation=expected_incarnation,
+            autopush_guard=True,
+        )
         if not resumed.get("ok"):
             return {"ok": False, "error": resumed.get("error", "session resume failed"), "_status": 503}
 
-        # Initialize and launch
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _away_mode_state[session_name] = state
-        _away_log(state, "Away mode enabled")
-        task = asyncio.create_task(_away_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return {"ok": True, **_away_state_summary(state)}
+        async with _autopush_action_lock(session_name):
+            if _autonomous_toggle_revision.get(session_name) != request_revision:
+                return {
+                    "ok": False,
+                    "error": "Away Mode request was superseded.",
+                    "_status": 409,
+                }
+            if not _autopush_identity_matches(
+                session_name,
+                expected_owner_id,
+                expected_generation,
+                expected_incarnation,
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            if _get_autopush_mode(session_name) == "off":
+                return {
+                    "ok": False,
+                    "error": "Auto-push was switched Off while Away Mode was starting.",
+                    "_status": 409,
+                }
+            if _go_nuts_state.get(session_name, {}).get("enabled"):
+                return {"ok": False, "error": "Go Nuts Mode is active on this session. Disable it first.", "_status": 409}
+            if _away_mode_state.get(session_name, {}).get("enabled"):
+                return {"ok": True, **_away_state_summary(
+                    _away_mode_state[session_name]
+                )}
+            _pending_autonomous_state.pop(session_name, None)
+            # Publish the state and worker under the same barrier as the final
+            # mode check, so Off cannot slip into the gap and miss the task.
+            state = {
+                "enabled": True,
+                "owner_id": expected_owner_id,
+                "generation": expected_generation,
+                "phase": 0,
+                "phase_name": "Initializing",
+                "step": 0,
+                "step_name": "",
+                "started_at": time.time(),
+                "log": [],
+                "report": "",
+                "task": None,
+            }
+            _away_mode_state[session_name] = state
+            _away_log(state, "Away mode enabled")
+            task = asyncio.create_task(_away_mode_worker(session_name))
+            state["task"] = task
+            if not await _save_autonomous_state_async():
+                state["enabled"] = False
+                state["task"] = None
+                task.cancel()
+                if not await _save_autonomous_state_async():
+                    await _fail_closed_after_autonomous_enable_rollback(
+                        session_name
+                    )
+                return {
+                    "ok": False,
+                    "error": "Could not persist Away Mode; it was not enabled.",
+                    "_status": 503,
+                }
+            return {"ok": True, **_away_state_summary(state)}
     else:
-        # Disable
-        state = _away_mode_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _away_log(state, "Away mode disabled by user")
-        _save_autonomous_state()
-        return {"ok": True, **_away_state_summary(state)}
+        async with _autopush_action_lock(session_name):
+            if _autonomous_toggle_revision.get(session_name) != request_revision:
+                return {
+                    "ok": False,
+                    "error": "Away Mode request was superseded.",
+                    "_status": 409,
+                }
+            if not _autopush_identity_matches(
+                session_name,
+                expected_owner_id,
+                expected_generation,
+                expected_incarnation,
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            _pending_autonomous_state.pop(session_name, None)
+            state = _away_mode_state.get(session_name, {})
+            if state.get("task") and not state["task"].done():
+                state["task"].cancel()
+            state["enabled"] = False
+            state["task"] = None
+            _away_log(state, "Away mode disabled by user")
+            if not await _save_autonomous_state_async():
+                return {
+                    "ok": False,
+                    "error": "Away Mode stopped locally but its durable state could not be updated.",
+                    "_status": 503,
+                }
+            return {"ok": True, **_away_state_summary(state)}
 
 
 @app.post("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_toggle(session_name: str, body: AwayModeBody):
+async def api_away_mode_toggle(
+    request: Request, session_name: str, body: AwayModeBody
+):
     """Toggle controller-owned away mode on or off for a session."""
+    user = _current_user(request)
+    _sessions, session = _find_session_for_user(session_name, user)
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    current_incarnation = str(session.get("logical_incarnation") or "")
+    if (
+        not body.incarnation
+        or not current_incarnation
+        or not hmac.compare_digest(body.incarnation, current_incarnation)
+    ):
+        return JSONResponse(
+            {"error": "Session identity changed; Away Mode was not changed"},
+            status_code=409,
+        )
     result = await _controller_call(
-        "away_toggle", session=session_name, enabled=body.enabled
+        "away_toggle", session=session_name, enabled=body.enabled,
+        owner_id=str((user or {}).get("id") or ""),
+        generation=str(session.get("generation") or ""),
+        incarnation=body.incarnation,
     )
     status = int(result.pop("_status", 200 if result.get("ok") else 503))
     return JSONResponse(result, status_code=status)
 
 
 @app.get("/api/sessions/{session_name}/away-mode")
-async def api_away_mode_status(session_name: str):
+async def api_away_mode_status(request: Request, session_name: str):
     """Get current away-mode state for a session."""
-    result = await _controller_call("away_status", session=session_name)
-    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+    user = _current_user(request)
+    if not _find_session_for_user(session_name, user)[1]:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    result = await _controller_call(
+        "away_status", session=session_name,
+        owner_id=str((user or {}).get("id") or ""),
+        generation=str(_session_lifecycle.get(session_name).get("generation") or ""),
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 # --- Go Nuts Mode ---
@@ -17746,20 +27194,39 @@ def _go_nuts_state_summary(state: dict) -> dict:
 async def _go_nuts_send_and_wait(session_name: str, prompt: str, state: dict,
                                   step_name: str, timeout: int = 900) -> str:
     """Send prompt, wait for completion, capture and summarize output."""
+    if not _autonomous_state_is_current(session_name, state, "gonuts"):
+        return ""
+    binding = await _autopush_terminal_binding(
+        session_name, str(state.get("owner_id") or "")
+    )
+    if not binding:
+        return ""
     state["step_name"] = step_name
     _go_nuts_log(state, f"Sending: {step_name}")
 
     prompt = _build_project_isolation_preamble(session_name) + prompt
     # Reuse the same send/wait infrastructure as away mode
-    await _away_send_prompt(session_name, prompt)
+    await _away_send_prompt(
+        session_name,
+        prompt,
+        expected_binding=binding,
+        expected_autonomous_state=state,
+        autonomous_mode="gonuts",
+    )
     completed = await _away_wait_for_idle(session_name, timeout=timeout)
 
     if not completed:
         _go_nuts_log(state, f"Timeout on: {step_name}")
-        subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=3)
+        await _autopush_tmux_batch(
+            session_name,
+            [(["tmux", "send-keys", "-t", session_name, "C-c"], 3)],
+            expected_binding=binding,
+            expected_autonomous_state=state,
+            autonomous_mode="gonuts",
+        )
         await asyncio.sleep(2)
 
-    output = capture_pane_full(session_name)
+    output = capture_pane_full(binding["session_id"])
     try:
         summary = await llm_call(
             system_prompt=(
@@ -17995,11 +27462,13 @@ async def _go_nuts_mode_worker(session_name: str):
                     return
 
                 # Ensure Codex is running before sending prompt (OOM recovery)
-                codex_ok = await _ensure_codex_running(session_name, _go_nuts_log, state)
+                codex_ok = await _autonomous_ensure_codex(
+                    session_name, _go_nuts_log, state, "gonuts"
+                )
                 if not codex_ok:
                     _go_nuts_log(state, "Codex dead and couldn't restart — stopping go nuts mode")
                     state["enabled"] = False
-                    _save_autonomous_state()
+                    await _save_autonomous_state_async()
                     return
 
                 state["step"] = cycle
@@ -18009,7 +27478,7 @@ async def _go_nuts_mode_worker(session_name: str):
                                               f"Build cycle {cycle}", timeout=900)
                 cycle += 1
                 consecutive_errors = 0
-                _save_autonomous_state()  # Periodic save after each successful cycle
+                await _save_autonomous_state_async()  # Periodic save after each successful cycle
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
@@ -18028,28 +27497,57 @@ async def _go_nuts_mode_worker(session_name: str):
     except asyncio.CancelledError:
         if _shutting_down:
             _go_nuts_log(state, "Go Nuts mode cancelled (server shutdown — will restore)")
+        elif _autonomous_cancel_is_watchdog_restart(state):
+            _go_nuts_log(state, "Go Nuts worker cancelled for watchdog restart")
         else:
             _go_nuts_log(state, "Go Nuts mode cancelled by user")
             state["enabled"] = False
-            _save_autonomous_state()
+            await _save_autonomous_state_async()
         log.info(f"Go Nuts mode cancelled for '{session_name}'")
         raise
     except Exception as e:
         _go_nuts_log(state, f"Go Nuts mode fatal error: {e}")
         log.error(f"Go Nuts mode fatal error for '{session_name}': {e}")
-        _save_autonomous_state()  # Save state so watchdog can recover
+        await _save_autonomous_state_async()  # Save state so watchdog can recover
         # Don't set enabled=False — let watchdog zombie detection restart us
     finally:
-        state["task"] = None
+        if state.get("task") in (None, asyncio.current_task()):
+            state["task"] = None
         log.info(f"Go Nuts mode finished for '{session_name}'")
 
 
-async def _go_nuts_toggle_local(session_name: str, enabled: bool) -> dict:
+async def _go_nuts_toggle_local(
+    session_name: str,
+    enabled: bool,
+    *,
+    expected_owner_id: str = "",
+    expected_generation: str = "",
+    expected_incarnation: str = "",
+) -> dict:
     _, sess = _find_session(session_name)
     if not sess:
         return {"ok": False, "error": "Session not found", "_status": 404}
+    if not _autopush_identity_matches(
+        session_name,
+        expected_owner_id,
+        expected_generation,
+        expected_incarnation,
+    ):
+        return {"ok": False, "error": "Session not found", "_status": 404}
+    async with _autopush_action_lock(session_name):
+        request_revision = _autonomous_toggle_revision.get(session_name, 0) + 1
+        _autonomous_toggle_revision[session_name] = request_revision
+        _discard_stale_autonomous_states(
+            session_name, expected_owner_id, expected_generation
+        )
 
     if enabled:
+        if _get_autopush_mode(session_name) == "off":
+            return {
+                "ok": False,
+                "error": "Auto-push is Off. Choose Basic, Basic +, or Full first.",
+                "_status": 409,
+            }
         # Don't allow both away mode and go-nuts mode at the same time on same session
         if _away_mode_state.get(session_name, {}).get("enabled"):
             return {"ok": False, "error": "Away Mode is active on this session. Disable it first.", "_status": 409}
@@ -18057,53 +27555,148 @@ async def _go_nuts_toggle_local(session_name: str, enabled: bool) -> dict:
         if _go_nuts_state.get(session_name, {}).get("enabled"):
             return {"ok": True, **_go_nuts_state_summary(_go_nuts_state[session_name])}
 
-        resumed = await _resume_parked_session(session_name, source="go-nuts-mode")
+        resumed = await _resume_parked_session(
+            session_name,
+            source="go-nuts-mode",
+            expected_owner_id=expected_owner_id,
+            expected_generation=expected_generation,
+            expected_incarnation=expected_incarnation,
+            autopush_guard=True,
+        )
         if not resumed.get("ok"):
             return {"ok": False, "error": resumed.get("error", "session resume failed"), "_status": 503}
 
-        state = {
-            "enabled": True,
-            "phase": 0,
-            "phase_name": "Initializing",
-            "step": 0,
-            "step_name": "",
-            "started_at": time.time(),
-            "log": [],
-            "report": "",
-            "task": None,
-        }
-        _go_nuts_state[session_name] = state
-        _go_nuts_log(state, "Go Nuts mode enabled")
-        task = asyncio.create_task(_go_nuts_mode_worker(session_name))
-        state["task"] = task
-        _save_autonomous_state()
-        return {"ok": True, **_go_nuts_state_summary(state)}
+        async with _autopush_action_lock(session_name):
+            if _autonomous_toggle_revision.get(session_name) != request_revision:
+                return {
+                    "ok": False,
+                    "error": "Go Nuts Mode request was superseded.",
+                    "_status": 409,
+                }
+            if not _autopush_identity_matches(
+                session_name,
+                expected_owner_id,
+                expected_generation,
+                expected_incarnation,
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            if _get_autopush_mode(session_name) == "off":
+                return {
+                    "ok": False,
+                    "error": "Auto-push was switched Off while Go Nuts Mode was starting.",
+                    "_status": 409,
+                }
+            if _away_mode_state.get(session_name, {}).get("enabled"):
+                return {"ok": False, "error": "Away Mode is active on this session. Disable it first.", "_status": 409}
+            if _go_nuts_state.get(session_name, {}).get("enabled"):
+                return {"ok": True, **_go_nuts_state_summary(
+                    _go_nuts_state[session_name]
+                )}
+            _pending_autonomous_state.pop(session_name, None)
+            state = {
+                "enabled": True,
+                "owner_id": expected_owner_id,
+                "generation": expected_generation,
+                "phase": 0,
+                "phase_name": "Initializing",
+                "step": 0,
+                "step_name": "",
+                "started_at": time.time(),
+                "log": [],
+                "report": "",
+                "task": None,
+            }
+            _go_nuts_state[session_name] = state
+            _go_nuts_log(state, "Go Nuts mode enabled")
+            task = asyncio.create_task(_go_nuts_mode_worker(session_name))
+            state["task"] = task
+            if not await _save_autonomous_state_async():
+                state["enabled"] = False
+                state["task"] = None
+                task.cancel()
+                if not await _save_autonomous_state_async():
+                    await _fail_closed_after_autonomous_enable_rollback(
+                        session_name
+                    )
+                return {
+                    "ok": False,
+                    "error": "Could not persist Go Nuts Mode; it was not enabled.",
+                    "_status": 503,
+                }
+            return {"ok": True, **_go_nuts_state_summary(state)}
     else:
-        state = _go_nuts_state.get(session_name, {})
-        if state.get("task") and not state["task"].done():
-            state["task"].cancel()
-        state["enabled"] = False
-        state["task"] = None
-        _go_nuts_log(state, "Go Nuts mode disabled by user")
-        _save_autonomous_state()
-        return {"ok": True, **_go_nuts_state_summary(state)}
+        async with _autopush_action_lock(session_name):
+            if _autonomous_toggle_revision.get(session_name) != request_revision:
+                return {
+                    "ok": False,
+                    "error": "Go Nuts Mode request was superseded.",
+                    "_status": 409,
+                }
+            if not _autopush_identity_matches(
+                session_name,
+                expected_owner_id,
+                expected_generation,
+                expected_incarnation,
+            ):
+                return {"ok": False, "error": "Session not found", "_status": 404}
+            _pending_autonomous_state.pop(session_name, None)
+            state = _go_nuts_state.get(session_name, {})
+            if state.get("task") and not state["task"].done():
+                state["task"].cancel()
+            state["enabled"] = False
+            state["task"] = None
+            _go_nuts_log(state, "Go Nuts mode disabled by user")
+            if not await _save_autonomous_state_async():
+                return {
+                    "ok": False,
+                    "error": "Go Nuts Mode stopped locally but its durable state could not be updated.",
+                    "_status": 503,
+                }
+            return {"ok": True, **_go_nuts_state_summary(state)}
 
 
 @app.post("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_toggle(session_name: str, body: GoNutsModeBody):
+async def api_go_nuts_mode_toggle(
+    request: Request, session_name: str, body: GoNutsModeBody
+):
     """Toggle controller-owned go-nuts mode on or off for a session."""
+    user = _current_user(request)
+    _sessions, session = _find_session_for_user(session_name, user)
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    current_incarnation = str(session.get("logical_incarnation") or "")
+    if (
+        not body.incarnation
+        or not current_incarnation
+        or not hmac.compare_digest(body.incarnation, current_incarnation)
+    ):
+        return JSONResponse(
+            {"error": "Session identity changed; Go Nuts Mode was not changed"},
+            status_code=409,
+        )
     result = await _controller_call(
-        "go_nuts_toggle", session=session_name, enabled=body.enabled
+        "go_nuts_toggle", session=session_name, enabled=body.enabled,
+        owner_id=str((user or {}).get("id") or ""),
+        generation=str(session.get("generation") or ""),
+        incarnation=body.incarnation,
     )
     status = int(result.pop("_status", 200 if result.get("ok") else 503))
     return JSONResponse(result, status_code=status)
 
 
 @app.get("/api/sessions/{session_name}/go-nuts-mode")
-async def api_go_nuts_mode_status(session_name: str):
+async def api_go_nuts_mode_status(request: Request, session_name: str):
     """Get current go-nuts-mode state for a session."""
-    result = await _controller_call("go_nuts_status", session=session_name)
-    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
+    user = _current_user(request)
+    if not _find_session_for_user(session_name, user)[1]:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    result = await _controller_call(
+        "go_nuts_status", session=session_name,
+        owner_id=str((user or {}).get("id") or ""),
+        generation=str(_session_lifecycle.get(session_name).get("generation") or ""),
+    )
+    status = int(result.pop("_status", 200 if result.get("ok") else 503))
+    return JSONResponse(result, status_code=status)
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -18115,18 +27708,22 @@ HTML_PAGE = r"""<!doctype html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e1e4e8;min-height:100vh;display:flex;flex-direction:column}
 
-/* Nav wrapper — keeps right-side items pinned while tabs scroll */
-.nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0}
+/* Nav wrapper — stays visible while the page scrolls and keeps right-side items
+   pinned while the session tabs scroll horizontally. */
+.nav-wrapper{background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;flex-shrink:0;
+  position:sticky;top:0;z-index:1000}
 /* Nav bar — scrollable session tabs area */
 .top-nav{padding:0 0 0 24px;display:flex;align-items:center;gap:0;overflow-x:auto;flex:1;min-width:0}
 .top-nav::-webkit-scrollbar{height:0}
 /* Pinned right section */
 .nav-right{display:flex;align-items:center;flex-shrink:0;padding-right:24px}
 .nav-brand{font-size:.85rem;font-weight:700;color:#58a6ff;padding:12px 16px 12px 0;border-right:1px solid #30363d;margin-right:4px;white-space:nowrap;user-select:none}
-.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;transition:background .15s,border-color .15s;white-space:nowrap;user-select:none}
+.nav-item{display:flex;align-items:center;gap:8px;padding:10px 16px;cursor:grab;border-bottom:2px solid transparent;transition:background .15s,border-color .15s,opacity .15s;white-space:nowrap;user-select:none}
 .nav-item:hover{background:#1c2128}
 .nav-item.active{border-bottom-color:#58a6ff;background:#1c2128}
-.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;text-align:center}
+.nav-item.dragging{opacity:.48;background:#263044;cursor:grabbing}
+body.tab-order-dragging{cursor:grabbing;user-select:none}
+.nav-session-id{font-size:.75rem;font-weight:700;color:#8b949e;background:#21262d;padding:1px 6px;border-radius:4px;min-width:20px;max-width:148px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center}
 .nav-item.active .nav-session-id{color:#58a6ff;background:#1c2333}
 .nav-session-owner{font-size:.62rem;color:#6e7681;max-width:100px;overflow:hidden;text-overflow:ellipsis}
 .nav-title{font-size:.8rem;color:#c9d1d9;max-width:180px;overflow:hidden;text-overflow:ellipsis}
@@ -18134,13 +27731,47 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:all .3s ease}
 .nav-dot.busy{width:10px;height:10px;background:#f85149;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #f8514988}
 .nav-dot.idle{background:#3fb950}
+.nav-dot.idle.completed-unread{width:10px;height:10px;animation:pulse-glow 1.5s ease-in-out infinite;box-shadow:0 0 6px #3fb95088}
 .nav-dot.parked{background:#6e7681}
 .nav-dot.unknown{background:#d2a8ff}
 .nav-attached{font-size:.6rem;padding:0 5px;border-radius:8px;font-weight:600;line-height:1.5}
 .nav-attached.yes{background:#238636;color:#fff}
 .nav-attached.no{background:#6e768155;color:#8b949e}
 .nav-spacer{flex:1}
-.nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;padding-right:10px;display:flex;align-items:center;gap:8px;border-right:1px solid #30363d;margin-right:10px;padding:4px 10px 4px 0;transition:color .15s}
+.nav-compact-status{display:flex;flex-direction:column;justify-content:center;gap:2px;margin-right:10px;padding-right:12px;border-right:1px solid #30363d;white-space:nowrap;flex-shrink:0}
+.nav-compact-stat{font-size:.72rem;color:#8b949e;font-variant-numeric:tabular-nums}
+.nav-compact-stat .stat-val{color:#e6edf3;font-weight:700}
+.nav-compact-stat .stat-val.warn{color:#d29922}
+.nav-compact-stat .stat-val.crit{color:#f85149}
+.nav-stat-item{display:flex;align-items:center;gap:5px;line-height:1;cursor:help}
+.nav-stat-label{color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
+.nav-stat-bar{position:relative;width:22px;height:4px;background:#21262d;border-radius:2px;overflow:hidden}
+.nav-stat-fill{position:absolute;top:0;left:0;bottom:0;width:0;background:#3fb950;border-radius:2px;transition:width .3s,background .15s}
+.nav-stat-fill.warn{background:#d29922}
+.nav-stat-fill.crit{background:#f85149}
+.nav-compact-status .stat-val{color:#c9d1d9;font-size:.6rem;font-weight:600;width:26px;text-align:right;font-variant-numeric:tabular-nums}
+.nav-compact-status #nav-cpu-summary-value{width:auto;min-width:26px}
+.nav-compact-status .stat-val.warn{color:#d29922}
+.nav-compact-status .stat-val.crit{color:#f85149}
+.nav-status-wrap{position:relative;flex-shrink:0;margin-right:4px}
+.nav-status-toggle{background:none;border:1px solid transparent;color:#8b949e;cursor:pointer;padding:6px 8px;border-radius:6px;font-size:.78rem;display:flex;align-items:center;gap:5px;transition:all .15s}
+.nav-status-toggle:hover,.nav-status-toggle[aria-expanded="true"]{background:#1c2128;border-color:#30363d;color:#c9d1d9}
+.nav-status-chevron{font-size:.62rem;color:#6e7681;transition:transform .15s}
+.nav-status-toggle[aria-expanded="true"] .nav-status-chevron{transform:rotate(180deg)}
+.nav-status-menu{display:none;position:absolute;top:100%;right:0;background:#161b22;border:1px solid #30363d;border-radius:9px;min-width:350px;max-width:min(420px,calc(100vw - 16px));max-height:calc(100vh - 58px);overflow:auto;padding:10px 0 5px;z-index:160;box-shadow:0 8px 24px rgba(0,0,0,.45);margin-top:4px}
+.nav-status-menu.open{display:block}
+.nav-status-menu-title{padding:3px 14px 6px;color:#6e7681;font-size:.62rem;text-transform:uppercase;letter-spacing:.055em;font-weight:700}
+.nav-status-menu-section{padding:4px 14px 8px}
+.nav-status-divider{height:1px;background:#21262d;margin:4px 0 8px}
+.nav-status-control{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;color:#8b949e;font-size:.76rem}
+.nav-status-empty{font-size:.7rem;color:#6e7681;padding:3px 0}
+.nav-status-action{padding:8px 14px;font-size:.82rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
+.nav-status-action:hover{background:#1c2128}
+.nav-status-menu .nav-codex-alert{margin-right:0}
+.nav-status-menu .nav-browser-badge{margin-left:auto}
+.nav-status-menu .codex-auth{margin:3px 0 0;padding:8px 0;width:100%}
+.nav-status-menu .codex-auth:hover{background:#1c2128}
+.nav-server-stats{font-size:.7rem;color:#8b949e;white-space:nowrap;display:flex;align-items:center;gap:8px;padding:3px 0;transition:color .15s}
 .nav-server-stats:hover{color:#c9d1d9}
 .nav-codex-alert{font-size:.7rem;font-weight:600;color:#f85149;background:rgba(248,81,73,.12);
   border:1px solid rgba(248,81,73,.4);border-radius:10px;padding:2px 8px;margin-right:8px;
@@ -18150,7 +27781,7 @@ body.member-simple .nav-codex-alert{display:none !important}
 .nav-server-stats .stat-val{color:#c9d1d9;font-weight:600}
 .nav-server-stats .stat-val.warn{color:#d29922}
 .nav-server-stats .stat-val.crit{color:#f85149}
-.nav-usage{display:none;flex-direction:column;justify-content:center;gap:3px;white-space:nowrap;padding:0 12px 0 4px;margin-right:10px;border-right:1px solid #30363d;flex-shrink:0}
+.nav-usage{display:none;flex-direction:column;justify-content:center;gap:7px;white-space:nowrap;padding:2px 0 3px;flex-shrink:0}
 .nav-usage.has-data{display:flex}
 .nav-usage-item{display:flex;align-items:center;gap:5px;cursor:default;line-height:1}
 .nav-usage-label{color:#8b949e;font-weight:700;font-size:.58rem;letter-spacing:.04em;width:16px;text-transform:uppercase}
@@ -18161,19 +27792,14 @@ body.member-simple .nav-codex-alert{display:none !important}
 .nav-usage-pct{color:#e6edf3;font-size:.62rem;font-weight:700;font-family:'SF Mono','Fira Code',Consolas,monospace;width:34px;text-align:right}
 .nav-usage-meta{color:#6e7681;font-size:.58rem;font-family:'SF Mono','Fira Code',Consolas,monospace;min-width:92px}
 .nav-usage.disabled{display:none}
-/* Usage bars mirrored into tools dropdown (mobile only) */
-.nav-tools-usage{display:none;padding:8px 14px 4px 14px}
-.nav-tools-usage-title{color:#6e7681;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
-.nav-tools-usage-row{display:flex;align-items:center;gap:8px;margin-top:6px}
-.nav-tools-usage-label{color:#8b949e;font-weight:600;font-size:.7rem;letter-spacing:.04em;width:22px;text-transform:uppercase}
-.nav-tools-usage-bar{flex:1;height:5px;background:#21262d;border-radius:3px;overflow:hidden;position:relative}
-.nav-tools-usage-pct{color:#8b949e;font-size:.7rem;width:38px;text-align:right;font-variant-numeric:tabular-nums}
-.nav-tools-usage-divider{height:1px;background:#21262d;margin:8px 0 0 0}
 .nav-status-text{display:none}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
 .nav-new-btn:hover{background:#2ea043}
+.nav-new-mobile-btn{display:none;background:#238636;color:#fff;border:none;width:44px;height:44px;border-radius:6px;cursor:pointer;font-size:1.4rem;font-weight:700;line-height:1;flex-shrink:0;align-items:center;justify-content:center;margin-right:4px}
+.nav-new-mobile-btn:hover{background:#2ea043}
+.nav-new-mobile-btn:focus-visible{outline:2px solid #7ee787;outline-offset:2px}
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;padding:16px 24px;max-width:1200px;width:100%;margin:0 auto}
 
@@ -18192,16 +27818,19 @@ body.member-simple .nav-codex-alert{display:none !important}
 .badge{font-size:.7rem;padding:2px 8px;border-radius:12px;font-weight:500}
 .badge.attached{background:#238636;color:#fff}
 .badge.detached{background:#6e7681;color:#fff}
-.badge.model-badge{background:#30363d;color:#c9d1d9;font-size:.65rem;font-weight:500;cursor:pointer;user-select:none}
+.badge.model-badge{background:#30363d;color:#c9d1d9;border:0;font-family:inherit;font-size:.65rem;font-weight:500;cursor:pointer;user-select:none}
 .badge.model-badge:hover{background:#3c444d;color:#e6edf3}
+.badge.model-badge:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}
 .badge.model-badge .caret{opacity:.55;font-size:.55rem;margin-left:1px}
 .badge.model-badge.pending{opacity:.75;font-style:italic}
 .model-menu{position:fixed;z-index:3000;background:#161b22;border:1px solid #30363d;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.55);padding:4px;min-width:172px}
 .model-menu .mm-title{padding:4px 10px 3px;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;color:#6e7681}
-.model-menu .mm-item{padding:6px 10px;border-radius:6px;font-size:.78rem;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
+.model-menu .mm-item{width:100%;padding:6px 10px;border:0;border-radius:6px;background:transparent;font-family:inherit;font-size:.78rem;text-align:left;color:#c9d1d9;cursor:pointer;white-space:nowrap;display:flex;justify-content:space-between;gap:10px}
 .model-menu .mm-item:hover{background:#21262d}
+.model-menu .mm-item:focus-visible{outline:2px solid #58a6ff;outline-offset:-2px}
 .model-menu .mm-item.sel{color:#58a6ff;font-weight:600}
-.tab-more-model-value{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+.tab-more-model-value{padding:0;border:0;background:transparent;font:inherit;cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+.tab-more-model-value:focus-visible,.tab-more-trigger:focus-visible{outline:2px solid #58a6ff;outline-offset:-2px}
 .btn-danger{background:#21262d;color:#f85149;border:1px solid #f8514944}
 .btn-danger:hover{background:#3d1214}
 
@@ -18212,13 +27841,14 @@ body.member-simple .nav-codex-alert{display:none !important}
 .tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
 /* Tab-more dropdown (Chat/Skills/Info) */
 .tab-more-wrap{position:relative}
-.tab-more-trigger{display:flex;align-items:center;gap:4px}
+.tab-more-trigger{display:flex;align-items:center;gap:4px;background:transparent;border-top:0;border-right:0;border-left:0;font-family:inherit;text-align:left}
 .tab-more-icon{display:none;font-size:1.1rem;line-height:1}
 .tab-more-menu{display:none;position:absolute;top:100%;left:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:120px;padding:4px 0;z-index:100;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .tab-more-menu.open{display:block}
 .tab-more-item{padding:8px 16px;font-size:.85rem;color:#8b949e;cursor:pointer;transition:background .15s,color .15s}
 .tab-more-item:hover{background:#1c2128;color:#c9d1d9}
 .tab-more-item.active{color:#58a6ff}
+.tab-more-project-link{display:block;max-width:min(240px,60vw);text-decoration:none;white-space:normal;overflow-wrap:anywhere}
 .tab-more-hint{display:block;color:#6e7681;font-size:.68rem;margin-top:1px}
 /* View switcher (Terminal ⇄ Chat) — a tab that is also a dropdown, matching the
    More/Info trigger beside it. */
@@ -18242,23 +27872,26 @@ body.member-simple .nav-codex-alert{display:none !important}
 .chat-messages::-webkit-scrollbar{width:6px}
 .chat-messages::-webkit-scrollbar-track{background:transparent}
 .chat-messages::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
-.chat-msg{max-width:85%;padding:12px 16px;border-radius:12px;font-size:1.05rem;line-height:1.6;position:relative}
-.chat-msg.user{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:4px}
-/* An assistant bubble holds the whole reply now, so it gets room: wider than a
-   user bubble, and no clamp — nothing here is cut. */
-.chat-msg.assistant{align-self:flex-start;max-width:94%;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
+.chat-msg{max-width:85%;padding:10px 14px;border-radius:12px;font-size:1rem;line-height:1.5;position:relative;min-width:0}
+.chat-msg.user{align-self:flex-end;background:#075e54;color:#fff;border-bottom-right-radius:4px}
+.chat-msg.assistant{align-self:flex-start;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-bottom-left-radius:4px}
+.chat-kind{font-size:.7rem;color:#8b949e;margin-bottom:5px}
+.chat-kind.progress{color:#7ee2b8}
+.chat-read-more{display:block;border:0;background:none;color:#7ee2b8;padding:8px 0 4px;font:inherit;font-size:.85rem;cursor:pointer;min-height:36px}
+.chat-read-more:focus-visible{outline:2px solid #7ee2b8;outline-offset:3px;border-radius:3px}
+.chat-body[hidden]{display:none}
 .chat-meta{font-size:.7rem;color:#6e7681;margin-top:4px}
 .chat-msg.user .chat-meta{text-align:right;color:#ffffffaa}
 /* Newlines are the agent's paragraphing — keep them, wrap long tokens. */
 .chat-body{white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-body code{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:1px 5px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85em}
-.chat-msg.user .chat-body code{background:#0b4ec2;border-color:#ffffff33;color:#fff}
+.chat-msg.user .chat-body code{background:#064a42;border-color:#ffffff33;color:#fff}
 .chat-body .chat-h{display:block;margin:10px 0 2px;color:#e6edf3;font-size:.95em;letter-spacing:.01em}
 .chat-body .chat-h:first-child{margin-top:0}
 .chat-lead{white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:10px;padding:8px 12px;border-left:2px solid #58a6ff;background:#0d1117;border-radius:0 6px 6px 0;color:#8b949e;font-size:.88rem;line-height:1.5}
 .chat-link{color:#58a6ff;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
 .chat-link:hover{color:#79c0ff}
-.chat-msg.user .chat-link{color:#cfe3ff}
+.chat-msg.user .chat-link{color:#d1ffe6}
 /* Deliverables. The reader is remote — a path is only useful as a link this
    dashboard can serve, so these open through /file behind the same login. */
 .chat-links{margin-top:12px;padding-top:10px;border-top:1px solid #21262d}
@@ -18269,9 +27902,9 @@ body.member-simple .nav-codex-alert{display:none !important}
 .chat-chip-ico{filter:grayscale(1) opacity(.8);flex:0 0 auto}
 .chat-chip:hover .chat-chip-ico{filter:none}
 .chat-empty{align-self:center;margin:auto 0;max-width:80%;text-align:center;color:#6e7681;font-size:.9rem;line-height:1.6}
-.chat-typing{align-self:flex-start;padding:16px 24px;background:#f8514918;border:2px solid #f8514955;border-radius:12px;border-bottom-left-radius:4px;color:#f85149;font-size:1.15rem;font-weight:600;display:flex;align-items:center;gap:10px;animation:pulse-busy 2s ease-in-out infinite}
+.chat-typing{align-self:flex-start;padding:10px 14px;background:#161b22;border:1px solid #30363d;border-radius:12px;border-bottom-left-radius:4px;color:#8b949e;font-size:.85rem;display:flex;align-items:center;gap:10px}
 .chat-typing .typing-dot-group{display:flex;gap:4px;align-items:center}
-.chat-typing .typing-dot{width:8px;height:8px;border-radius:50%;background:#f85149;animation:typing-bounce 1.4s ease-in-out infinite}
+.chat-typing .typing-dot{width:6px;height:6px;border-radius:50%;background:#7ee2b8;animation:typing-bounce 1.4s ease-in-out infinite}
 .chat-typing .typing-dot:nth-child(2){animation-delay:.2s}
 .chat-typing .typing-dot:nth-child(3){animation-delay:.4s}
 @keyframes typing-bounce{0%,80%,100%{opacity:.3;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
@@ -18280,9 +27913,21 @@ body.member-simple .nav-codex-alert{display:none !important}
 /* Command bar */
 .cmd-bar{display:flex;align-items:flex-end;gap:0;margin-top:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;overflow:visible;flex-shrink:0}
 .cmd-prompt{padding:12px 0 12px 14px;color:#3fb950;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;font-weight:600;user-select:none}
-.cmd-input{flex:1;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
+.cmd-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:#e6edf3;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:1rem;padding:12px;resize:vertical;min-height:80px;max-height:400px;line-height:1.4;overflow-y:auto}
+.session-composer{flex-shrink:0;min-width:0;width:100%}
+.session-composer[hidden]{display:none}
+.session-composer .terminal-read-controls{width:100%;min-width:0}
 .cmd-input.expanded{max-height:none;min-height:200px}
 .cmd-input::placeholder{color:#484f58}
+.composer-attachments{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;flex-shrink:0}
+.composer-attachments.has-files{display:flex}
+.composer-attachment{display:flex;align-items:center;gap:8px;max-width:100%;padding:5px 7px 5px 5px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9}
+.composer-attachment-preview{width:48px;height:48px;flex:0 0 48px;object-fit:cover;border-radius:4px;background:#21262d}
+.composer-attachment-meta{min-width:0;max-width:260px}
+.composer-attachment-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace}
+.composer-attachment-status{margin-top:2px;color:#8b949e;font-size:.65rem}
+.composer-attachment-remove{flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #30363d;border-radius:50%;background:#21262d;color:#8b949e;cursor:pointer;font-size:.8rem;line-height:1}
+.composer-attachment-remove:hover{background:#da3633;border-color:#da3633;color:#fff}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}
 .cmd-send:hover{background:#30363d}
@@ -18294,6 +27939,14 @@ body.member-simple .nav-codex-alert{display:none !important}
 .composer-action.is-recording{background:#da3633;color:#fff;animation:composer-recording 1.2s ease-in-out infinite}
 .composer-action.is-recording:hover{background:#f85149}
 .composer-action.is-transcribing{background:#30363d;color:#c9d1d9;cursor:wait}
+.composer-action:disabled{opacity:.75;cursor:wait}
+.composer-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto;margin:0 8px 8px 4px}
+.composer-actions .btn.composer-action{width:44px;height:44px;flex-basis:44px;margin:0}
+.btn.composer-voice{width:44px;height:44px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:50%;background:#e6edf3;color:#161b22;cursor:pointer}
+.btn.composer-voice:hover{background:#fff}
+.composer-voice svg{display:block;width:22px;height:22px}
+.composer-voice[aria-expanded=true]{box-shadow:0 0 0 2px #7ee2b8}
+.composer-voice:focus-visible,.composer-action:focus-visible{outline:2px solid #7ee2b8;outline-offset:3px}
 .composer-spin{width:18px;height:18px;border:2px solid #8b949e;border-top-color:#f0f6fc;border-radius:50%;animation:composer-spin .8s linear infinite}
 @keyframes composer-recording{0%,100%{box-shadow:0 0 0 0 #da363355}50%{box-shadow:0 0 0 7px #da363300}}
 @keyframes composer-spin{to{transform:rotate(360deg)}}
@@ -18323,6 +27976,14 @@ body.member-simple .nav-codex-alert{display:none !important}
    browser's own guess fights it. */
 .raw-output{position:relative;background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;font-size:13px;line-height:1.5;color:#c9d1d9;flex:1;min-height:120px;max-height:calc(100vh - 306px);overflow-y:auto;overflow-x:hidden;overflow-anchor:none}
 .raw-output .tl{white-space:pre-wrap;overflow-wrap:anywhere;min-height:1.5em}
+.raw-output .tl-user-prompt{color:#3fb950;font-weight:600}
+.terminal-history-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:4px 0 12px}
+.terminal-history-note,.terminal-history-label{color:#8b949e;font-size:12px}
+.terminal-history-entry{margin:0 0 18px;overflow-wrap:anywhere}
+.terminal-history-label{margin-bottom:5px;font-weight:600}
+.terminal-history-user .terminal-history-label{color:#3fb950}
+.terminal-history-text{white-space:pre-wrap;font-weight:400;color:#c9d1d9}
+.terminal-history-divider{border-top:1px solid #30363d;padding:12px 0;color:#8b949e;font-size:12px}
 /* Exact mode (clean view off) — the terminal grid, character for character. The
    font size is fitted to the pane width (fitTerminalFont) so all of it fits the
    column that is there: a phone stops scrolling sideways, a wide desktop stops
@@ -18359,7 +28020,7 @@ body.member-simple .nav-codex-alert{display:none !important}
    reader was fighting, so those rows are cut off (splitLiveTail) and redrawn
    here instead: outside the scroll area, off a locally ticking clock. Time
    passing now moves nothing. */
-.term-live{display:none;align-items:center;gap:8px;padding:6px 11px;margin-top:-1px;border:1px solid #21262d;border-top:none;border-radius:0 0 8px 8px;background:#0d1117;font-size:.72rem;color:#8b949e;flex-shrink:0;min-height:16px}
+.term-live{display:none;align-items:center;flex-wrap:wrap;gap:5px 10px;padding:6px 11px;margin-top:-1px;border:1px solid #21262d;border-top:none;border-radius:0 0 8px 8px;background:#0d1117;font-size:.72rem;color:#8b949e;flex-shrink:0;min-height:16px}
 .term-live.on{display:flex}
 .tl-dots{display:inline-flex;gap:3px;flex-shrink:0}
 .tl-dots i{width:5px;height:5px;border-radius:50%;background:#58a6ff;display:block;animation:tl-pulse 1.25s ease-in-out infinite}
@@ -18368,11 +28029,43 @@ body.member-simple .nav-codex-alert{display:none !important}
 @keyframes tl-pulse{0%,75%,100%{opacity:.22;transform:scale(.75)}35%{opacity:1;transform:scale(1)}}
 .term-live.idle .tl-dots i{animation:none;opacity:.3;background:#484f58}
 .tl-verb{color:#c9d1d9;font-weight:600;white-space:nowrap}
+.term-live.idle .tl-verb{color:#3fb950}
 .tl-time{font-variant-numeric:tabular-nums;white-space:nowrap}
 .tl-tok{color:#6e7681;white-space:nowrap}
+.tl-total,.tl-tps{color:#8b949e;white-space:nowrap;font-variant-numeric:tabular-nums}
 .tl-sep{color:#30363d}
 .tl-spacer{flex:1}
 .tl-note{color:#6e7681;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Silence since the last reply, coloured by how much of the prompt cache is
+   left, and the prompt the last turn carried. */
+.tl-since{white-space:nowrap;font-variant-numeric:tabular-nums;color:#6e7681}
+.tl-since.warm{color:#3fb950}
+.tl-since.cooling{color:#d29922}
+.tl-since.cold{color:#6e7681}
+.tl-since.unsure,.tl-ctx.unsure{opacity:.6;font-style:italic}
+.tl-ctx{white-space:nowrap;color:#6e7681;font-variant-numeric:tabular-nums}
+.tl-ctx.high{color:#d29922}
+.tl-ctx.crit{color:#f85149}
+/* Approaching cold: the GREEN idle state, blinking fast, so it is caught from
+   across the room. Green deliberately. Amber below means "it is handling it",
+   and one colour for both would defeat the point of having two states. */
+@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
+.status-pill.idle.expiring{background:#3fb95033;color:#56d364;border-color:#3fb950aa;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.status-pill.idle.expiring .status-dot{background:#56d364;
+  animation:cache-expiring .7s steps(1,end) infinite}
+.tl-since.expiring{color:#56d364;font-weight:600}
+.term-live.idle.cache-expiring .tl-verb{color:#56d364;animation:cache-expiring .7s steps(1,end) infinite}
+@media (prefers-reduced-motion:reduce){
+  .status-pill.idle.expiring,.status-pill.idle.expiring .status-dot,
+  .term-live.idle.cache-expiring .tl-verb{animation:none}
+  .status-pill.idle.expiring,.term-live.idle.cache-expiring .tl-verb{outline:1px solid #56d364;outline-offset:2px}
+  .tl-dots i{animation:none;opacity:.7}
+}
+/* Working, but only to hold the cache. Amber and NOT blinking. */
+.status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
+.status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
+.autopush-seg button.ap-basicplus.active{background:#9e6a03}
 
 /* Terminal key bar */
 .key-bar{display:none;align-items:center;gap:6px;padding:6px 8px;background:#161b22;border:1px solid #21262d;border-radius:0 0 6px 6px;flex-wrap:wrap;border-top:none}
@@ -18503,17 +28196,20 @@ body.member-simple .nav-codex-alert{display:none !important}
 .watchdog-log{margin-top:8px;font-size:.78rem;color:#6e7681;max-height:120px;overflow-y:auto;scrollbar-width:thin}
 .watchdog-log-entry{padding:2px 0;border-bottom:1px solid #161b22}
 .watchdog-log-entry .watchdog-ts{color:#56d364}
-/* Auto-push 3-way segmented control (off / basic / full) */
-.autopush-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
-.autopush-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
-.autopush-seg button:last-child{border-right:none}
-.autopush-seg button:hover{background:#161b22;color:#c9d1d9}
-.autopush-seg button.active{color:#fff;font-weight:600}
+/* Three-way segmented controls */
+.autopush-seg,.idle-nudge-seg{display:inline-flex;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#0d1117;vertical-align:middle}
+.autopush-seg button,.idle-nudge-seg button{background:transparent;color:#8b949e;border:none;border-right:1px solid #30363d;padding:5px 13px;font-size:.78rem;cursor:pointer;transition:background .15s,color .15s;font-family:inherit;line-height:1.2}
+.autopush-seg button:last-child,.idle-nudge-seg button:last-child{border-right:none}
+.autopush-seg button:hover,.idle-nudge-seg button:hover{background:#161b22;color:#c9d1d9}
+.autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
 .autopush-seg button.ap-full.active{background:#238636}
-.tab-more-menu .autopush-seg{margin:2px 16px 4px}
-.tab-more-menu .autopush-seg button{padding:4px 11px;font-size:.72rem}
+.idle-nudge-seg button.in-off.active{background:#484f58}
+.idle-nudge-seg button.in-light.active{background:#1f6feb}
+.idle-nudge-seg button.in-adhd.active{background:#da3633}
+.tab-more-menu .autopush-seg,.tab-more-menu .idle-nudge-seg{margin:2px 16px 4px}
+.tab-more-menu .autopush-seg button,.tab-more-menu .idle-nudge-seg button{padding:4px 11px;font-size:.72rem}
 
 /* Footer */
 .detail-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #21262d;padding-top:12px;margin-top:12px;flex-shrink:0}
@@ -18588,16 +28284,18 @@ body.member-simple .nav-codex-alert{display:none !important}
 .nav-tools-wrap{position:relative;flex-shrink:0}
 .nav-tools-menu{display:none;position:absolute;top:100%;right:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:4px 0;z-index:150;box-shadow:0 8px 24px rgba(0,0,0,.4);margin-top:4px}
 .nav-tools-menu.open{display:block}
-.nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
+.nav-tools-item{appearance:none;background:transparent;border:0;padding:8px 14px;width:100%;font:inherit;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;text-align:left;transition:background .15s}
 .nav-tools-item:hover{background:#1c2128}
 .nav-tools-item .icon{font-size:.9rem}
+.nav-tools-mobile,.nav-tools-mobile-member,.nav-tools-mobile-divider{display:none}
+.nav-tools-divider{height:1px;background:#21262d;margin:4px 0}
 /* --- Team (simplified member) mode --- */
 .member-only{display:none}
 body.member-simple .member-only{display:inline-flex;align-items:center;justify-content:center}
 body.member-simple .nav-tools-wrap{display:none}
 body.member-simple .codex-auth{display:none}
-body.member-simple .nav-server-stats{display:none}
-body.member-simple .nav-usage{display:none}
+body.member-simple .nav-compact-status{display:none}
+body.member-simple .nav-status-wrap{display:none}
 body.member-simple .hide-in-simple{display:none!important}
 .conn-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border:1px solid #30363d;border-radius:8px;margin-bottom:10px;background:#0d1117}
 .conn-row .conn-name{display:flex;align-items:center;gap:10px;font-size:.9rem;color:#c9d1d9}
@@ -18940,43 +28638,38 @@ body.member-simple .hide-in-simple{display:none!important}
 .codexmd-extras .extras-editor textarea{min-height:160px;width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:8px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:.85rem;line-height:1.5;resize:vertical;outline:none}
 .codexmd-extras .extras-editor textarea:focus{border-color:#58a6ff}
 
-/* Mobile bottom strip. Empty and hidden on a wide screen — syncMobileBottomBar()
-   MOVES the browser badge, the usage bars and the CPU/RAM readout in here on a
-   narrow one so the header keeps its width for session tabs. */
-.mobile-bottom-bar{display:none}
-
 /* Mobile */
 @media(max-width:768px){
+  /* Keep long shared drafts inside four lines, leaving room for chat and status. */
+  .cmd-input,.cmd-input.expanded{min-height:80px;max-height:calc(5.6em + 24px);resize:none;overflow-y:auto;overscroll-behavior-y:contain}
   .top-nav{padding:0 0 0 8px}
-  .nav-right{padding-right:8px}
+  .nav-right{padding-right:4px}
   /* The wordmark is the widest fixed thing in a phone header and it says the
      same thing on every load; the session tabs need the room more. */
   .nav-brand{display:none}
-  .nav-item{padding:8px 10px;gap:5px}
+  .nav-item{padding:8px 7px;gap:4px}
+  .nav-session-id{max-width:92px}
   .nav-title{display:none}
   .nav-attached{display:none}
-  .nav-status-text{display:none}
-  /* The browser badge, the usage bars and the CPU/RAM readout are moved out of
-     the header entirely (syncMobileBottomBar) — they are glanceable, not
-     interactive. They now render at the very bottom of the page, under the
-     terminal and the upload area. The copies that used to stand in for them
-     inside the Tools menu are gone with them. */
-  .nav-server-stats,.nav-usage.has-data,.nav-tools-usage.has-data{display:none}
-  .mobile-bottom-bar.has-items{display:flex;align-items:center;flex-wrap:wrap;gap:14px;
-    padding:12px 14px calc(14px + env(safe-area-inset-bottom,0px));margin-top:10px;
-    border-top:1px solid #21262d;background:#0d1117}
-  body:not(.member-simple) .mobile-bottom-bar .nav-usage:not(.disabled){
-    display:flex;flex-direction:row;gap:16px;border:none;margin:0;padding:0}
-  body:not(.member-simple) .mobile-bottom-bar .nav-server-stats{
-    display:flex;border:none;margin:0;padding:0}
-  .mobile-bottom-bar .nav-usage-bar{width:96px;height:5px}
-  .mobile-bottom-bar .nav-browser-badge{padding:4px 9px}
+  /* Keep session creation and settings pinned beside the scrolling tabs.
+     The desktop create button remains the tab-order anchor, hidden on phones. */
+  .nav-new-btn,.nav-compact-status,.nav-status-toggle,.nav-status-text,
+  .nav-right>.member-only{display:none!important}
+  .nav-new-mobile-btn{display:flex}
+  .nav-status-wrap{margin:0;width:0}
+  body.member-simple .nav-tools-wrap{display:block}
+  .nav-tools-mobile{display:flex}
+  body.member-simple .nav-tools-mobile-member{display:flex}
+  .nav-tools-mobile-divider{display:block}
+  .nav-tools-menu{position:fixed;top:48px;left:8px;right:8px;min-width:0;max-height:calc(100vh - 56px);overflow:auto}
+  .nav-status-menu{position:fixed;top:48px;left:8px;right:8px;min-width:0;max-width:none;max-height:calc(100vh - 56px)}
   .codex-auth-label{display:none}
   .codex-auth{padding:8px 10px}
   .codex-auth .status-dot{width:10px;height:10px}
+  .nav-status-menu .codex-auth-label{display:inline}
+  .nav-status-menu .codex-auth{padding:8px 0}
   .auth-dropdown{right:8px;min-width:270px;max-width:calc(100vw - 16px)}
   .nav-refresh-btn{padding:5px 10px;font-size:.75rem}
-  .nav-new-btn{width:28px;height:28px;font-size:1rem;margin-right:4px}
   .main{padding:12px}
   .detail-header{flex-direction:column;align-items:flex-start;gap:8px}
   .detail-title-text{font-size:1.1rem}
@@ -19001,87 +28694,129 @@ body.member-simple .hide-in-simple{display:none!important}
   .tab-more-icon{display:inline-block}
   .tab-more-model-block{display:block}
 }
+.terminal-read-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 0;flex-shrink:0}
+.terminal-read-controls .key-btn{padding:6px 10px}
+.nav-browser-badge.working .nbb-dot{background:#d29922;box-shadow:0 0 6px #d2992299;animation:nbb-blink 1s ease-in-out infinite}
+.nav-browser-badge.working{border-color:#d29922}
+.nav-browser-badge.working .nbb-glyph{filter:none}
+.nav-plan-bars{display:flex;flex-direction:column;justify-content:center;gap:2px;font-size:10px;flex-shrink:0}
+.nav-plan-window{display:flex;align-items:center;gap:5px;white-space:nowrap;line-height:1}
+.nav-plan-window>span:first-child{min-width:22px;color:#6e7681;font-weight:600;font-size:.55rem;letter-spacing:.04em;text-transform:uppercase}
+.nav-plan-window>span:last-child{width:26px;text-align:right;color:#c9d1d9;font-size:.6rem;font-weight:600;font-variant-numeric:tabular-nums}
+.nav-plan-window .nav-usage-bar{display:inline-block;width:22px;height:4px}
+.message-jumped{background:#263f28;border-radius:4px;outline:1px solid #3fb950}
+@media(max-width:600px){.nav-plan-bars{font-size:9px}.nav-plan-window .nav-usage-bar,.nav-stat-bar{width:20px}}
+
+@media(max-width:768px){.nav-plan-bars{display:none}.nav-right>.nav-browser-badge{min-width:36px;min-height:44px;padding:4px}.nav-right{gap:0;min-width:0}.top-nav{min-width:0}.nav-new-mobile-btn{margin-right:2px}}
+@media(prefers-reduced-motion:reduce){.message-jumped,.nav-browser-badge.working .nbb-dot{animation:none}}
 </style></head>
 <body>
 <div id="imp-banner" style="display:none"></div>
 <div class="nav-wrapper">
 <nav class="top-nav" id="top-nav">
   <span class="nav-brand">__BRAND__</span>
-  <button class="nav-new-btn" onclick="showCreateModal()" title="New session">+</button>
+  <button class="nav-new-btn" onclick="createSessionAuto()" title="New session">+</button>
   <span class="nav-spacer"></span>
 </nav>
 <div class="nav-right">
-  <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
-  <span class="nav-usage" id="nav-usage">
-    <span class="nav-usage-item" id="nav-usage-primary-wrap" title="">
-      <span class="nav-usage-label" id="nav-usage-primary-label">plan</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-primary-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-primary-pct">--</span>
-      <span class="nav-usage-meta" id="nav-usage-primary-meta">no data</span>
-    </span>
-    <span class="nav-usage-item" id="nav-usage-secondary-wrap" title="">
-      <span class="nav-usage-label" id="nav-usage-secondary-label">plan</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-secondary-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-secondary-pct">--</span>
-      <span class="nav-usage-meta" id="nav-usage-secondary-meta">no data</span>
-    </span>
+  <button class="nav-new-mobile-btn" type="button" onclick="createSessionAuto()" title="New session" aria-label="New session"><span aria-hidden="true">+</span></button>
+  <span class="nav-compact-status" aria-label="System status summary">
+    <span class="nav-stat-item" id="nav-cpu-summary" title="CPU usage">
+      <span class="nav-stat-label">CPU</span>
+      <span class="nav-stat-bar"><span class="nav-stat-fill" id="nav-cpu-summary-fill"></span></span>
+      <span class="stat-val" id="nav-cpu-summary-value">loading...</span></span>
+    <span class="nav-stat-item" id="nav-ram-summary" title="Memory in use">
+      <span class="nav-stat-label">RAM</span>
+      <span class="nav-stat-bar"><span class="nav-stat-fill" id="nav-ram-summary-fill"></span></span>
+      <span class="stat-val" id="nav-ram-summary-value">&mdash;</span></span>
+    <span class="nav-compact-stat" id="nav-usage-cap-summary" style="display:none" title="Codex plan usage cap">Usage cap: <span class="stat-val" id="nav-usage-cap-value">&mdash;</span></span>
   </span>
-  <span class="nav-status-text" id="status-info">Watching for changes...</span>
-  <!-- Open Codex health alerts. An alert nobody sees is not an alert, so the
-       watchdog's findings surface here rather than only inside Stats. -->
-  <span class="nav-codex-alert" id="nav-codex-alert" style="display:none"
-        title="Codex health alerts — click for details" onclick="openStats()"></span>
-  <!-- Generic browser-session status. Codex auto-auth is retired. -->
-  <span class="nav-browser-badge unknown" id="nav-browser-badge" style="display:none"
-        title="Browser sign-in status" onclick="onBrowserBadgeClick()">
+  <span class="nav-plan-bars" aria-label="Codex plan usage">
+    <span id="plan-primary" class="nav-plan-window" style="display:none"><span id="plan-primary-label"></span><span class="nav-usage-bar" id="plan-primary-meter" role="progressbar" aria-label="Primary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-primary-fill"></span></span><span id="plan-primary-value"></span></span>
+    <span id="plan-secondary" class="nav-plan-window" style="display:none"><span id="plan-secondary-label"></span><span class="nav-usage-bar" id="plan-secondary-meter" role="progressbar" aria-label="Secondary plan usage" aria-valuemin="0" aria-valuemax="100"><span class="nav-usage-fill" id="plan-secondary-fill"></span></span><span id="plan-secondary-value"></span></span>
+  </span>
+  <button class="nav-browser-badge bad" id="nav-browser-badge" type="button" title="Browser not connected" aria-label="Browser not connected" onclick="onBrowserBadgeClick()">
     <span class="nbb-dot"></span><span class="nbb-glyph">&#x1F310;</span>
-  </span>
-  <div class="nav-tools-wrap">
-    <button class="nav-icon-btn" onclick="toggleToolsMenu(event)" title="Tools"><span class="icon">&#x2699;</span></button>
-    <div class="nav-tools-menu" id="nav-tools-menu">
-      <div class="nav-tools-usage" id="nav-tools-usage">
-        <div class="nav-tools-usage-title">Codex plan limits</div>
-        <div class="nav-tools-usage-row" id="tools-usage-primary-wrap" title="">
-          <span class="nav-tools-usage-label" id="tools-usage-primary-label">plan</span>
-          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-primary-fill" style="width:0%"></span></span>
-          <span class="nav-tools-usage-pct" id="tools-usage-primary-pct">&mdash;</span>
-          <span class="nav-tools-usage-pct" id="tools-usage-primary-meta">&mdash;</span>
-        </div>
-        <div class="nav-tools-usage-row" id="tools-usage-secondary-wrap" title="">
-          <span class="nav-tools-usage-label" id="tools-usage-secondary-label">plan</span>
-          <span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="tools-usage-secondary-fill" style="width:0%"></span></span>
-          <span class="nav-tools-usage-pct" id="tools-usage-secondary-pct">&mdash;</span>
-          <span class="nav-tools-usage-pct" id="tools-usage-secondary-meta">&mdash;</span>
-        </div>
-        <div class="nav-tools-usage-divider"></div>
+  </button>
+  <div class="nav-status-wrap">
+    <button class="nav-status-toggle" id="nav-status-toggle" type="button"
+            aria-expanded="false" aria-haspopup="menu" aria-controls="nav-status-menu"
+            onclick="toggleStatusMenu(event)">Status <span class="nav-status-chevron">&#x25BE;</span></button>
+    <div class="nav-status-menu" id="nav-status-menu" role="menu" onclick="event.stopPropagation()">
+      <div class="nav-status-menu-title">Server</div>
+      <div class="nav-status-menu-section">
+        <span class="nav-server-stats" id="nav-server-stats" title="Open full system stats"
+              onclick="openStats();closeStatusMenu()" style="cursor:pointer"></span>
       </div>
+      <div class="nav-status-divider"></div>
+      <div class="nav-status-menu-title">Codex plan limits</div>
+      <div class="nav-status-menu-section">
+        <span class="nav-usage" id="nav-usage">
+          <span class="nav-usage-item" id="nav-usage-primary-wrap" title="">
+            <span class="nav-usage-label" id="nav-usage-primary-label">plan</span>
+            <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-primary-fill" style="width:0%"></span></span>
+            <span class="nav-usage-pct" id="nav-usage-primary-pct">--</span>
+            <span class="nav-usage-meta" id="nav-usage-primary-meta">no data</span>
+          </span>
+          <span class="nav-usage-item" id="nav-usage-secondary-wrap" title="">
+            <span class="nav-usage-label" id="nav-usage-secondary-label">plan</span>
+            <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-secondary-fill" style="width:0%"></span></span>
+            <span class="nav-usage-pct" id="nav-usage-secondary-pct">--</span>
+            <span class="nav-usage-meta" id="nav-usage-secondary-meta">no data</span>
+          </span>
+        </span>
+        <div class="nav-status-empty" id="nav-status-usage-empty">Loading usage limits&hellip;</div>
+      </div>
+      <div class="nav-status-divider"></div>
+      <div class="nav-status-menu-title">Connections &amp; alerts</div>
+      <div class="nav-status-menu-section">
+        <div class="nav-status-control" id="nav-codex-alert-row" style="display:none">
+          <span>Codex alerts</span>
+          <span class="nav-codex-alert" id="nav-codex-alert"
+                title="Codex health alerts — click for details"
+                onclick="openStats();closeStatusMenu()"></span>
+        </div>
+        <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
+          <span class="status-dot unknown" id="codex-auth-dot"></span>
+          <span class="codex-auth-label" id="codex-auth-label">...</span>
+        </div>
+        <div class="nav-status-empty" id="nav-status-whoami">Loading dashboard account&hellip;</div>
+      </div>
+      <div class="nav-status-divider"></div>
+      <div class="nav-status-action" onclick="openStats();closeStatusMenu()"><span>&#x1F4CA;</span> Full system stats</div>
+      <div class="nav-status-action" onclick="doLogout();closeStatusMenu()"><span>&#x21AA;</span> Log out</div>
+    </div>
+  </div>
+  <span class="nav-status-text" id="status-info">Watching for changes...</span>
+  <div class="nav-tools-wrap">
+    <button class="nav-icon-btn" id="nav-tools-toggle" type="button"
+            onclick="toggleToolsMenu(event)" title="Settings" aria-label="Settings and tools"
+            aria-expanded="false" aria-haspopup="menu" aria-controls="nav-tools-menu"><span class="icon">&#x2699;</span></button>
+    <div class="nav-tools-menu" id="nav-tools-menu" role="menu">
+      <button class="nav-tools-item nav-tools-mobile" type="button" role="menuitem" onclick="createSessionAuto();closeToolsMenu()"><span class="icon">&#x2B;</span> New session</button>
+      <button class="nav-tools-item nav-tools-mobile nav-tools-admin" type="button" role="menuitem" onclick="toggleStatusMenu(event)"><span class="icon">&#x1F4CA;</span> Status &amp; usage</button>
+      <div class="nav-tools-divider nav-tools-mobile-divider" role="separator"></div>
       <!-- Settings owns all configuration editors, including Context Files. -->
-      <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openUsers();closeToolsMenu()"><span class="icon">&#x1F464;</span> Users</div>
-      <div class="nav-tools-item nav-tools-admin" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</div>
-      <div class="nav-tools-item" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</div>
-      <div class="nav-tools-divider"></div>
-      <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
-      <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
+      <button class="nav-tools-item nav-tools-admin" type="button" role="menuitem" onclick="openUsers();closeToolsMenu()"><span class="icon">&#x1F464;</span> Users</button>
+      <button class="nav-tools-item nav-tools-admin" type="button" role="menuitem" onclick="openSettings('global');closeToolsMenu()"><span class="icon">&#x1F310;</span> Global Instructions</button>
+      <button class="nav-tools-item nav-tools-admin" type="button" role="menuitem" onclick="recoverTabs();closeToolsMenu()"><span class="icon">&#x21BB;</span> Recover tabs</button>
+      <button class="nav-tools-item" type="button" role="menuitem" onclick="openSettings();closeToolsMenu()"><span class="icon">&#x2699;</span> Settings</button>
+      <button class="nav-tools-item nav-tools-mobile-member" type="button" role="menuitem" onclick="openSettings('browser');closeToolsMenu()"><span class="icon">&#x1F310;</span> My private browser</button>
+      <button class="nav-tools-item nav-tools-mobile-member" type="button" role="menuitem" onclick="openConnections();closeToolsMenu()"><span class="icon">&#x1F517;</span> Connections</button>
+      <div class="nav-tools-divider nav-tools-mobile-divider" role="separator"></div>
+      <button class="nav-tools-item nav-tools-mobile" type="button" role="menuitem" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</button>
     </div>
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
   <button class="nav-icon-btn member-only" id="nav-my-browser-btn" onclick="openSettings('browser')" title="My private browser"><span class="icon">&#x1F310;</span></button>
   <button class="nav-icon-btn member-only" id="nav-conn-btn" onclick="openConnections()" title="Connect Drive / Gmail / Calendar"><span class="icon">&#x1F517;</span></button>
   <button class="nav-icon-btn member-only" id="nav-logout-btn" onclick="doLogout()" title="Log out"><span class="icon">&#x21AA;</span></button>
-  <div class="codex-auth" id="codex-auth" onclick="toggleAuthPanel(event)">
-    <span class="status-dot unknown" id="codex-auth-dot"></span>
-    <span class="codex-auth-label" id="codex-auth-label">...</span>
-  </div>
 </div>
 </div>
 <div class="auth-dropdown" id="auth-dropdown">
   <div id="auth-dropdown-content"></div>
 </div>
 <div class="main" id="main"></div>
-<!-- Phone-only strip, filled by syncMobileBottomBar() with the real header
-     nodes (never copies, so every poller that writes to them keeps working). -->
-<div class="mobile-bottom-bar" id="mobile-bottom-bar"></div>
 <div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal-content"></div>
 </div>
@@ -19150,6 +28885,10 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
+// Seconds before the cache goes cold that a session starts blinking, and that
+// Basic+ pushes. Substituted from the server so the warning and the action can
+// never drift apart.
+const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
 const _nativeFetch=window.fetch.bind(window);
 function _storedImpersonationToken(){
   try{return sessionStorage.getItem('tmuxImpersonationToken')||'';}catch(e){return '';}
@@ -19193,8 +28932,20 @@ async function bootstrapImpersonation(){
 }
 let MEMBER_SIMPLE=('__SIMPLE__'==='true');  // server-injected per-user so it's correct before the first fetch
 let sessions=[];
+const _autopushPending=new Set();
+const _autopushRevision=new Map();
+const _autopushSetRequests={};
 let selectedSession=null;
 let pollTimer=null;
+let tabLabelPollTimer=null;
+let _sessionRosterGeneration='';
+let _sessionRosterRequest=0;
+let _sessionRosterPromise=null;
+let _tabOrderDragging=false;
+let _tabOrderSuppressClick=false;
+let _tabOrderSaveSequence=0;
+let _tabTouchCandidate=null;
+const _sessionClientEpoch={};
 const activeTabs={};
 const rawState={};
 // `frozen`/`frozenAtLines` back the Freeze toggle: streaming and st.fullText carry
@@ -19204,6 +28955,10 @@ const rawState={};
 // the live counter already stripped, so a repaint of the counter alone is a
 // no-op. `live` is what that counter said, redrawn by us in the status strip.
 function getRawState(n){if(!rawState[n])rawState[n]={polling:false,socket:null,reconnectTimer:null,backoff:500,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+function _sessionLogicalIncarnation(name){
+  const session=sessions.find(row=>row.name===name);
+  return session?String(session.logical_incarnation||session.incarnation||''):'';
+}
 // --- "Clean view" terminal filter ---
 // One switch. On, the terminal shows only what the agent SAID to you and drops
 // everything that is plumbing: tool-call headers (Claude's `Bash(…)`, Codex's
@@ -19284,18 +29039,38 @@ const _ANY_DECORATION_RE=/^[\s●⏺•·■□▶▸→↳⎼└├│>*\-​]+
 // with a word like "Read"/"Write"/"Update"/"Add"/"Task" is never swallowed.
 const _TOOL_PAREN_RE=/^(?:(?:Bash|BashOutput|Fetch|WebFetch|Read|Edit|MultiEdit|Write|NotebookEdit|Update|Grep|Glob|Task|Search|WebSearch|TodoWrite|Kill|Add|Agent|Artifact|Skill|Workflow|ToolSearch)\s*\(|mcp__[^(\s]+\s*\()/i;
 // Codex verbs that are only ever emitted as a tool header, never as prose.
-const _CODEX_VERB_RE=/^(?:Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
+const _CODEX_VERB_RE=/^(?:Wait(?:ed|ing) for background terminal|Ran|Explored|Called|Searched|Listed|Viewed|Applied patch|Proposed patch|Reviewed|Running|Exploring|Reading|Editing|Writing)\b/;
 // Codex file ops carry a diff stat: "Edited app.py (+12 -3)", "Added x.md (+40)".
 // The stat is what tells them apart from prose ("Added swap and a monitor").
-const _CODEX_FILEOP_RE=/^(?:Edited|Added|Created|Wrote|Updated|Deleted|Removed|Renamed|Moved|Read|Patched)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
-function _isToolHeader(line,followerIsMarker){
+const _CODEX_FILEOP_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\b.*\([+-]?\d+(?:\s+[+-]\d+)?\)\s*$/;
+const _CODEX_FILEOP_TARGET_RE=/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+(?:\d+\s+files?|\S+)\s*$/;
+const _CODEX_DIFF_ROW_RE=/^\s+\d+(?:\s+[+-]|[+-]\s|[ \t]{2,}\S)/;
+function _isToolHeader(line,followerIsMarker,followerIsDiff=false){
   const stripped=line.replace(_ANY_DECORATION_RE,'');
   if(_TOOL_PAREN_RE.test(stripped))return true;
   if(_CODEX_VERB_RE.test(stripped))return true;
   if(_CODEX_FILEOP_RE.test(stripped))return true;
+  if(followerIsDiff&&_CODEX_FILEOP_TARGET_RE.test(stripped))return true;
   // Structural fallback: a bullet whose next non-empty row is a `│`/`└`/`⎿`
   // marker is a tool block whatever the verb is. Prose bullets never are.
   return !!followerIsMarker;
+}
+function _wrappedFileOpHeader(lines,start){
+  let header=lines[start].replace(_ANY_DECORATION_RE,'');
+  const target=header.replace(/^(?:Edit(?:ed)?|Add(?:ed)?|Create(?:d)?|Write|Wrote|Update(?:d)?|Delete(?:d)?|Remove(?:d)?|Rename(?:d)?|Move(?:d)?|Read|Patch(?:ed)?)\s+/,'');
+  // A wrapped file target or unfinished diff stat, never an action sentence.
+  if(target===header||! /^(?:\S*[^:\s]|\d+\s+files?)(?:\s+\([+-]?\d+(?:\s+[+-]?\d*)?)?\s*$/.test(target))return false;
+  for(let j=start+1;j<Math.min(lines.length,start+8);j++){
+    const row=lines[j];
+    if(!row.trim()||_LEADING_BULLET_RE.test(row)||/^\s*(?:[›❯»>]|`{3,}|~{3,})/.test(row)||_CODEX_DIFF_ROW_RE.test(row))break;
+    header+=' '+row.trim();
+    if(_CODEX_FILEOP_RE.test(header)){
+      let next=j+1;
+      while(next<lines.length&&!lines[next].trim())next++;
+      return next<lines.length&&_CODEX_DIFF_ROW_RE.test(lines[next]);
+    }
+  }
+  return false;
 }
 // Kept for compatibility with the old two-toggle helper name.
 function _isBashFetchHeader(line){return _isToolHeader(line,false)}
@@ -19323,14 +29098,31 @@ const _NOISE_RES=[
   /^context (left|remaining|window):/i,
   /^esc to interrupt\b/i,
   /^shell cwd was reset\b/i,
-  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,
+  /\(ctrl ?\+ ?[to] to (view transcript|expand)\)/i,   // but see _HOOK_HEADER_RE
   /^made \d+\s+\S+.*\b(edit|change)/i,
   /^⏵/,
   /\bnew task\?\s*\/clear to save\b/i,
   /^shift\+tab to cycle\b/i,
 ];
+// A hook that blocked or spoke: "Ran 2 stop hooks (ctrl+o to expand)" and the
+// `⎿` block under it. The CLI hands that text back to the model in the USER
+// role, so it is an instruction the session is acting on, not chatter, and it
+// is the one thing that explains why a turn carried on after it looked done.
+// Clean view used to swallow it twice over: the header matched the
+// "(ctrl+o to expand)" noise rule, and the body matched the tool-output rule.
+// The echo markers are in the optional group so one regex matches the row both
+// before the rewrite (`● Ran 2 stop hooks …`) and after it (`> Ran 2 stop hooks …`).
+const _HOOK_HEADER_RE=/^\s*(?:[●⏺•·❯›»>]\s*)?Ran \d+ [A-Za-z]+ hooks?\b/;
+// `>`, the way a message from you is written. The highlight does NOT come from
+// this character: _markUserRows keys the row off _isHookHeader, so the marker is
+// free to be whatever reads best. _PANE_STRUCTURE_RE also matches a leading `>`
+// but its one caller tests the INPUT row, never what we emit here, so nothing
+// downstream mistakes this for pane furniture.
+const _HOOK_ECHO_PREFIX='> ';
+function _isHookHeader(line){return !!line&&_HOOK_HEADER_RE.test(line)}
 function _isNoise(line){
   if(!line)return false;
+  if(_isHookHeader(line))return false;
   const s=line.replace(/^[\s⎿●⏺•·│└├>*\-]+/,'').trim();
   if(!s)return false;
   for(let i=0;i<_NOISE_RES.length;i++){if(_NOISE_RES[i].test(s))return true;}
@@ -19446,7 +29238,7 @@ function _isPaneChrome(line){
 // ` · ` between a model name and a path, with a digit required somewhere in that
 // name (every model has one) and list markers excluded, so a markdown bullet
 // like "- Ops · /var/log" is never taken for it.
-const _CODEX_FOOTER_RE=/^\s{0,6}(?![-*+•]\s)[A-Za-z][\w.\-]*\d[\w.\-]*(?:\s+[\w.\-]+)*\s+[·•]\s+[~\/][^\s]*\s*$/;
+const _CODEX_FOOTER_RE=/^\s{0,6}(?![-*+•]\s)[A-Za-z][\w.\-]*\d[\w.\-]*(?:\s+[\w.\-]+)*\s+[·•]\s+[~\/](?:\S(?:.*\S)?)?\s*$/;
 // The composer's placeholder ("› Use /skills to list available skills"), which
 // Codex rotates through a set of suggestions. It cannot be told from a real user
 // message by content — Codex echoes those with the same `›` — so it is found by
@@ -19467,6 +29259,40 @@ function _stripPaneFooter(lines){
     if(j>=0&&/^\s*[❯›»]/.test(lines[j]))cut[j]=1;
   }
   return lines.filter((l,idx)=>!cut[idx]);
+}
+// Submitted messages are echoed into the transcript with a ›/❯/» marker. The
+// live composer uses the same marker, so exclude the prompt immediately above
+// Codex's model/cwd footer. Keep wrapped continuation rows in the same block so
+// a long user message is one green visual unit rather than a green first line
+// followed by white text.
+const _USER_PROMPT_RE=/^\s*[❯›»]\s+\S/;
+function _userPromptLineFlags(rows){
+  const flags=new Array(rows.length).fill(false);
+  const composer={};
+  for(let i=0;i<rows.length;i++){
+    if(!_CODEX_FOOTER_RE.test(rows[i]))continue;
+    let j=i-1;
+    while(j>=0&&rows[j].trim()==='')j--;
+    if(j>=0&&_USER_PROMPT_RE.test(rows[j]))composer[j]=true;
+  }
+  let inPrompt=false;
+  for(let i=0;i<rows.length;i++){
+    const line=rows[i];
+    if(_USER_PROMPT_RE.test(line)){
+      inPrompt=!composer[i];
+      flags[i]=inPrompt;
+      continue;
+    }
+    if(!inPrompt)continue;
+    if(line.trim()==='')continue;
+    if(_LEADING_BULLET_RE.test(line)||_CODEX_FOOTER_RE.test(line)||
+       _isPaneChrome(line)||_PANE_STRUCTURE_RE.test(line)){
+      inPrompt=false;
+      continue;
+    }
+    flags[i]=true;
+  }
+  return flags;
 }
 // Pull the live status out of the buffer and read it. Runs in both views, and
 // runs before anything else, so a repaint of the counter alone never reaches the
@@ -19550,10 +29376,93 @@ function _stripStartupBanner(lines){
   if(box!==null&&!box.hit)for(const r of box.rows)out.push(r);
   return out;
 }
+// The reset notice is CLI chrome, but its bullet looks like an assistant reply.
+// Match the whole notice across terminal wraps and remove only those rows: a
+// generic noise block would also eat any indented prose immediately after it.
+function _stripUsageResetNotices(lines){
+  const out=[];
+  let fence=null;
+  const plain=line=>line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'').replace(/\r/g,'');
+  for(let i=0;i<lines.length;i++){
+    const row=plain(lines[i]);
+    const mark=/^\s*(`{3,}|~{3,})/.exec(row);
+    if(mark){
+      if(!fence)fence=mark[1];
+      else if(mark[1][0]===fence[0]&&mark[1].length>=fence.length)fence=null;
+      out.push(lines[i]);continue;
+    }
+    if(!fence&&/^ {0,6}•[ \t]+You(?:[ \t]|$)/.test(row)){
+      let compact='',end=-1;
+      for(let j=i;j<Math.min(lines.length,i+12);j++){
+        const part=plain(lines[j]);
+        if(!part.trim()||(j>i&&/^\s*[•●⏺❯›»>`~]/.test(part)))break;
+        compact+=part.replace(/\s/g,'');
+        if(/^•Youhave\d+usagelimitresets?available\.Run\/usagetouseone\.$/.test(compact)){
+          end=j;break;
+        }
+      }
+      if(end>=0){i=end;continue;}
+    }
+    out.push(lines[i]);
+  }
+  return out;
+}
+function _plainTerminalRow(line){
+  return line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'').replace(/\r/g,'');
+}
+// This history hint can be inserted in front of a clipped tool result. Remove
+// only its exact rows, including terminal wraps, without hiding following prose.
+function _transcriptHintEnd(lines,start){
+  const first=_plainTerminalRow(lines[start]);
+  if(!/^\s*Earlier(?:\s|$)/.test(first))return -1;
+  let compact='';
+  for(let j=start;j<Math.min(lines.length,start+12);j++){
+    const part=_plainTerminalRow(lines[j]);
+    if(!part.trim()||(j>start&&/^\s*[•●⏺❯›»>`~]/.test(part)))break;
+    compact+=part.replace(/\s/g,'');
+    if(/^Earliermessagesareavailable[—–-]pressctrl\+ttoviewthefulltranscript[.!]?$/i.test(compact))return j;
+  }
+  return -1;
+}
+// Only a history-clipped block gets this recovery heuristic. Two independent
+// pytest markers are required; isolated code, error discussion and quotes are
+// otherwise content, even when they resemble terminal output.
+function _clippedPytestOutput(lines,start){
+  let source=false,error=false,location=false,separator=false;
+  for(let j=start;j>=0&&j<Math.min(lines.length,start+16);j++){
+    const line=_plainTerminalRow(lines[j]);
+    if(/^\s*[•●⏺❯›»]|^\s*(?:`{3,}|~{3,})/.test(line))break;
+    if(!line.trim())continue;
+    const isSource=/^\s*>\s+\S/.test(line);
+    const isError=/^\s*E\s+(?:assert\b|[\w.]+(?:Error|Exception)\b)/.test(line);
+    const isLocation=/^\s*\S+\.py:\d+:\s*\w+(?:Error|Exception)\b/.test(line);
+    const isSeparator=/^\s*_{3,}.*\btest_\w+/.test(line);
+    if(!isSource&&!isError&&!isLocation&&!isSeparator)return false;
+    source=source||isSource;error=error||isError;
+    location=location||isLocation;separator=separator||isSeparator;
+    if((source&&error)||(error&&location)||(location&&separator))return true;
+  }
+  return false;
+}
+function _clippedFileDiff(lines,start){
+  // A capture can begin inside an edit preview, after its header is gone.
+  // Require two numbered change rows, keeping ordinary numbered prose intact.
+  let changes=0;
+  for(let j=start;j>=0&&j<Math.min(lines.length,start+20);j++){
+    const row=_plainTerminalRow(lines[j]);
+    if(/^\s*[•●⏺❯›»>`~]/.test(row))break;
+    if(/^\s*\d+\s+[+-]/.test(row)){
+      if(++changes===2)return true;
+    }else if(row.trim()&&!/^\s/.test(row)&&!changes)break;
+  }
+  return false;
+}
 function applyRawFilter(text){
   if(!getCleanViewPref())return text;
   if(!text)return text;
-  let lines=text.split('\n');
+  let lines=_stripUsageResetNotices(text.split('\n').map(_plainTerminalRow));
   // Decided on the ORIGINAL text: the start-up banner is one of the tells, and
   // we are about to delete it.
   const agentPane=_looksLikeAgentPane(text);
@@ -19575,18 +29484,63 @@ function applyRawFilter(text){
   //   'output' — a hidden ⎿/└ result block and its indented continuation rows.
   //   'noise'  — a hidden bookkeeping/update line and its wrapped rows.
   //   'shell'  — a hidden shell command and its wrapped rows.
-  // Suppression ends at a bullet, at pane structure, or at a blank row that is
-  // followed by something starting at column 0 — so the agent's spoken text and
-  // its paragraph breaks always survive.
-  let mode='';
+  // Tool suppression ends at a new conversation boundary. Blank rows and
+  // pytest's column-zero source markers still belong to the tool result.
+  let mode='',fence=null,inUserMessage=false;
   for(let i=0;i<lines.length;i++){
     const line=lines[i];
+    const plain=_plainTerminalRow(line);
+    const fenceMark=/^\s*(`{3,}|~{3,})/.exec(plain);
+    if(fence){
+      out.push(line);
+      if(fenceMark&&fenceMark[1][0]===fence[0]&&fenceMark[1].length>=fence.length)fence=null;
+      continue;
+    }
+    if(_USER_PROMPT_RE.test(plain)){
+      mode='';inUserMessage=true;out.push(line);continue;
+    }
+    if(!mode&&fenceMark){fence=fenceMark[1];out.push(line);continue;}
+    if(inUserMessage){
+      const startsTool=_TOOL_PAREN_RE.test(plain.replace(_ANY_DECORATION_RE,''))||
+        _OUTPUT_MARKER_RE.test(plain)||_CALL_CONT_RE.test(plain)||_isHookHeader(plain);
+      if(!_LEADING_BULLET_RE.test(plain)&&!startsTool){out.push(line);continue;}
+      inUserMessage=false;
+    }
+    const hintEnd=mode==='hook'?-1:_transcriptHintEnd(lines,i);
+    if(hintEnd>=i){
+      if(!mode&&(_clippedPytestOutput(lines,nextNonEmpty[hintEnd])||
+         _clippedFileDiff(lines,nextNonEmpty[hintEnd])))mode='output';
+      i=hintEnd;continue;
+    }
+    if(!mode&&/^\s*\d+\s+[+-]/.test(plain)&&!out.some(row=>row.trim())&&
+       _clippedFileDiff(lines,i)){mode='output';continue;}
+    // A quote in visible conversation stays visible. Inside established tool
+    // output, pytest's `> assert ...` source marker is part of that output.
+    if(!mode&&!_isHookHeader(line)&&/^\s*>/.test(plain)){out.push(line);continue;}
     // Table rows are content, and they end any block that was being hidden —
     // tested before the marker rules, which would otherwise claim them. Two
     // blocks still win: a `⎿`/`└` result (a table printed BY a command is tool
     // output, and breaking out would leak the rest of the block) and the
     // launch-command block (whose tail is Claude Code's own `╭…│…╰` banner).
-    if(mode!=='output'&&mode!=='shell'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    if(mode!=='output'&&mode!=='shell'&&mode!=='hook'&&_isTableRow(line)){mode='';out.push(line);continue;}
+    // 'hook' is the one mode that EMITS. A hook that blocked is an instruction
+    // the session then obeyed, so hiding it leaves the next few minutes of work
+    // looking unprompted. The header is re-stamped with the pane's own user
+    // marker so it reads, highlights and jumps like the turn it actually is.
+    if(_isHookHeader(line)){
+      mode='hook';
+      out.push(_HOOK_ECHO_PREFIX+line.replace(_ANY_DECORATION_RE,'').trim());
+      continue;
+    }
+    if(mode==='hook'){
+      // Ends on what this row IS: a bullet, or anything at column 0. A blank
+      // row does NOT end it, because the hook's own text has paragraph breaks
+      // in it and stopping at the first one truncates the instruction. Decided
+      // from the row alone, which keeps this filter backwards-only in a
+      // renderer that is append-only.
+      if(!(_LEADING_BULLET_RE.test(line)||/^\S/.test(line))){out.push(line);continue;}
+      mode='';   // and fall through, so this row is judged on its own merits
+    }
     if(_isNoise(line)){mode='noise';continue;}
     if(_CALL_CONT_RE.test(line)){mode='call';continue;}
     if(_OUTPUT_MARKER_RE.test(line)){mode='output';continue;}
@@ -19598,7 +29552,8 @@ function applyRawFilter(text){
     if(_LEADING_BULLET_RE.test(line)){
       const nx=nextNonEmpty[i];
       const followerIsMarker=nx>=0&&(_OUTPUT_MARKER_RE.test(lines[nx])||_CALL_CONT_RE.test(lines[nx]));
-      if(_isToolHeader(line,followerIsMarker)){mode='call';continue;}
+      const followerIsDiff=nx>=0&&_CODEX_DIFF_ROW_RE.test(lines[nx]);
+      if(_isToolHeader(line,followerIsMarker,followerIsDiff)||_wrappedFileOpHeader(lines,i)){mode='call';continue;}
       mode='';out.push(line);continue;   // prose bullet
     }
     if(agentPane&&_SHELL_PROMPT_RE.test(line)){mode='shell';continue;}
@@ -19608,10 +29563,13 @@ function applyRawFilter(text){
       // ends when the block does — when the next real row is a bullet or
       // starts at column 0.
       const nx=nextNonEmpty[i];
+      if((mode==='call'||mode==='output')&&nx>=0&&
+         !_LEADING_BULLET_RE.test(lines[nx])&&!/^[›❯»](?:\s|$)/.test(lines[nx]))continue;
       if(mode&&nx>=0&&/^\s/.test(lines[nx])&&!_LEADING_BULLET_RE.test(lines[nx]))continue;
       mode='';out.push(line);continue;
     }
     if(/^\S/.test(line)){
+      if(mode==='call'||mode==='output')continue;
       // Column-0 non-space. Inside an agent pane every spoken word sits inside
       // a `•` bullet at an indent, so a column-0 row reached while a block is
       // being hidden is that block's wrapped tail, not prose — drop it. Pane
@@ -20086,14 +30044,108 @@ function _setRawScroll(el,target){
   if(Math.abs(el.scrollTop-target)<1)return;
   el.scrollTop=target;
 }
-// A very long scrollback is bounded, with hysteresis so the window does not
-// crawl forward a line at a time (which would repaint everything, every poll).
-const RAW_MAX_LINES=5000;
+// Saved history has its own stable nodes above the live tmux output. Paging
+// grows toward the beginning; a live resync never deletes those earlier rows.
+function _terminalHistoryState(st){
+  const tools=!getCleanViewPref();
+  if(!st.history||st.history.tools!==tools)st.history={tools,entries:[],cursor:'',loaded:false,loading:false,atStart:false,error:''};
+  return st.history;
+}
+function _historyEntryNode(entry){
+  const node=document.createElement('div');
+  node.className='terminal-history-entry terminal-history-'+entry.kind;
+  if(entry.kind==='user')node.classList.add('tl-user-prompt');
+  const label=entry.label||(entry.kind==='user'?'You':'Codex');
+  const heading=document.createElement('div');
+  heading.className='terminal-history-label';
+  heading.textContent=label+(entry.continued_before?' (continued)':'');
+  const body=document.createElement('div');
+  body.className='terminal-history-text';
+  body.innerHTML=_linkifyTerminalText(entry.text,1000000);
+  node.append(heading,body);
+  return node;
+}
+function _paintHistoryControl(name,parts,h){
+  parts.button.disabled=h.loading||h.atStart;
+  parts.button.textContent=h.loading?'Loading earlier history…':h.atStart?'Beginning of session':h.error?'Retry earlier history':'Load earlier history';
+  parts.note.textContent=h.error||(!h.loaded?'Scroll up to load the saved conversation from its beginning.':h.atStart&&!h.entries.length?'No saved conversation messages yet.':'Saved session history');
+  parts.divider.hidden=!h.loaded;
+}
+function _terminalParts(name){
+  const scroll=document.getElementById('raw-'+name);
+  if(!scroll)return null;
+  const st=getRawState(name),h=_terminalHistoryState(st);
+  let parts=scroll._terminalParts;
+  if(!parts||!scroll.contains(parts.live)){
+    scroll.textContent='';
+    const history=document.createElement('div'),control=document.createElement('div');
+    const button=document.createElement('button'),note=document.createElement('span');
+    const entries=document.createElement('div'),divider=document.createElement('div'),live=document.createElement('div');
+    history.className='terminal-history';control.className='terminal-history-controls';
+    button.type='button';button.className='key-btn';note.className='terminal-history-note';
+    button.addEventListener('click',()=>loadTerminalHistory(name));
+    divider.className='terminal-history-divider';divider.textContent='Live terminal · recent output';
+    live.id='raw-live-'+name;
+    control.append(button,note);history.append(control,entries,divider);scroll.append(history,live);
+    parts={scroll,history,button,note,entries,divider,live};scroll._terminalParts=parts;
+  }
+  if(parts.state!==h){
+    parts.entries.textContent='';
+    const fragment=document.createDocumentFragment();
+    h.entries.forEach(entry=>fragment.appendChild(_historyEntryNode(entry)));
+    parts.entries.appendChild(fragment);parts.state=h;
+  }
+  _paintHistoryControl(name,parts,h);
+  return parts;
+}
+async function loadTerminalHistory(name){
+  const st=getRawState(name),h=_terminalHistoryState(st),parts=_terminalParts(name);
+  if(!parts||h.loading||h.atStart)return;
+  const incarnation=_sessionLogicalIncarnation(name);
+  h.loading=true;h.error='';_paintHistoryControl(name,parts,h);
+  try{
+    let data;
+    // Tool/reasoning-only pages advance the source cursor without adding a
+    // single visible row. Keep paging: no new scroll event can occur at the top.
+    do{
+      const url=BASE+'/api/sessions/'+encodeURIComponent(name)+'/terminal-history?tools='+h.tools+(h.cursor?'&cursor='+encodeURIComponent(h.cursor):'');
+      const response=await fetch(url,{cache:'no-store'});
+      data=await response.json();
+      if(getRawState(name)!==st||st.history!==h||_sessionLogicalIncarnation(name)!==incarnation||!document.getElementById('raw-'+name))return;
+      if(!response.ok){
+        if(response.status===409){h.cursor='';h.loaded=false;h.entries=[];parts.state=null;}
+        throw Error(data.error||'Could not load earlier history');
+      }
+      if(data.at_start||(Array.isArray(data.entries)&&data.entries.length))break;
+      if(!data.cursor||data.cursor===h.cursor)throw Error('Earlier history did not advance. Retry loading it.');
+      h.cursor=data.cursor;
+    }while(true);
+    const current=_terminalParts(name);
+    if(!current)return;
+    const top=current.scroll.scrollTop,height=current.scroll.scrollHeight;
+    const incoming=Array.isArray(data.entries)?data.entries:[];
+    const fragment=document.createDocumentFragment();
+    incoming.forEach(entry=>fragment.appendChild(_historyEntryNode(entry)));
+    current.entries.insertBefore(fragment,current.entries.firstChild);
+    h.entries=incoming.concat(h.entries);h.cursor=data.cursor||'';h.loaded=true;h.atStart=!!data.at_start;
+    _paintHistoryControl(name,current,h);
+    // Keep the same line under the reader while older pages appear above it.
+    st.userScrolledUp=true;
+    _setRawScroll(current.scroll,top+current.scroll.scrollHeight-height);
+    if(h.atStart&&incoming.length===0&&h.entries.length===0)current.note.textContent='No saved conversation messages yet.';
+  }catch(error){h.error=error.message||'Could not load earlier history';}
+  finally{
+    h.loading=false;
+    const current=document.getElementById('raw-'+name)?_terminalParts(name):null;
+    if(current&&st.history===h)_paintHistoryControl(name,current,h);
+  }
+}
 
 function renderRawText(name,force){
   const st=getRawState(name);
-  const rawEl=document.getElementById('raw-'+name);
-  if(!rawEl)return;
+  const parts=_terminalParts(name);
+  if(!parts)return;
+  const rawEl=parts.live,scrollEl=parts.scroll;
   // The live counter comes off FIRST, in both views. It changes every second,
   // and everything below this line would otherwise re-run every second.
   const split=splitLiveTail((st.fullText||'').split('\n'));
@@ -20112,7 +30164,7 @@ function renderRawText(name,force){
   // the old node. Drop the memo BEFORE the no-change short-circuit below, or the
   // new element stays stuck on "Loading Codex…" until the text changes.
   if(rawEl._lineMode!==true){rawEl.textContent='';rawEl._lineMode=true;st.painted=null;st._bodyText=null}
-  const bodyText=split.body.join('\n');
+  const bodyText=(st.frozen?splitLiveTail(_rawVisibleText(st).split('\n')).body:split.body).join('\n');
   if(!force&&bodyText===st._bodyText&&flow===st._flowMode&&st.painted){st._pendingRender=false;return;}
 
   let body=applyRawFilter(bodyText);
@@ -20126,8 +30178,8 @@ function renderRawText(name,force){
     // otherwise fits exactly.
     rows=rows.map(l=>l.replace(/\s+$/,''));
   }
-  if(rows.length>RAW_MAX_LINES+400)rows=rows.slice(rows.length-RAW_MAX_LINES);
   let htmlLines;
+  let userRows=[];
   if(!rows.length||!rows.join('').trim()){
     htmlLines=(st.fullText||'').trim()
       ? ['<span style="color:#6e7681">Clean view is hiding everything on this screen. Turn it off in the &hellip; menu to see the raw terminal.</span>']
@@ -20137,8 +30189,15 @@ function renderRawText(name,force){
     // split across rows still works; neither renderer ever emits a tag that
     // straddles a newline, so splitting the result back per line is safe.
     htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+    const userPromptFlags=_userPromptLineFlags(rows);
+    userRows=rows.map((line,i)=>userPromptFlags[i]&&_USER_PROMPT_RE.test(line)?i:-1).filter(i=>i>=0);
+    htmlLines=htmlLines.map(function(html,i){
+      return userPromptFlags[i]?'<span class="tl-user-prompt">'+html+'</span>':html;
+    });
   }
 
+  if(JSON.stringify(st.userRows)!==JSON.stringify(userRows))st._jumpAt=undefined;
+  st.userRows=userRows;
   const prev=st.painted||[];
   const d=_lineDiff(prev,htmlLines);
   if(!d.remove&&!d.insert){
@@ -20148,32 +30207,67 @@ function renderRawText(name,force){
   // Hold the paint only if it would actually rip out what the reader is holding:
   // a drag in progress here, or a selection that reaches into the lines about to
   // be rewritten. A highlight further up is left alone and the update goes ahead.
-  if(!force&&(_rawDragEl===rawEl||_selectionBelow(rawEl,d.from))){st._pendingRender=true;return;}
+  if(!force&&(_rawDragEl===scrollEl||_selectionBelow(rawEl,d.from))){st._pendingRender=true;return;}
 
-  rawEl.classList.toggle('flow',flow);
-  rawEl.classList.toggle('exact',!flow);
+  scrollEl.classList.toggle('flow',flow);
+  scrollEl.classList.toggle('exact',!flow);
   if(st._flowMode!==flow||rawEl._fitW!==rawEl.clientWidth||rawEl._fitPw!==st.paneWidth){
     fitTerminalFont(rawEl,st.paneWidth,flow);
     rawEl._fitW=rawEl.clientWidth;rawEl._fitPw=st.paneWidth;
   }
 
   const atBottom=!st.userScrolledUp;
-  const beforeH=rawEl.scrollHeight,beforeTop=rawEl.scrollTop;
+  const beforeH=scrollEl.scrollHeight,beforeTop=scrollEl.scrollTop;
   const anchor=rawEl.children[d.from];
   const anchorTop=anchor?anchor.offsetTop:beforeH;
   _applyLineDiff(rawEl,d,htmlLines);
   st.painted=htmlLines;st._bodyText=bodyText;st._flowMode=flow;st._pendingRender=false;
   if(atBottom){
-    _setRawScroll(rawEl,rawEl.scrollHeight);
+    _setRawScroll(scrollEl,scrollEl.scrollHeight);
   }else if(anchorTop<beforeTop){
-    // Something above the fold moved (a resync, or the scrollback cap trimming
-    // the head). Give the reader back the line they were on.
-    const delta=rawEl.scrollHeight-beforeH;
-    if(delta)_setRawScroll(rawEl,beforeTop+delta);
+    // Give the reader back the line they were on after a live resync.
+    const delta=scrollEl.scrollHeight-beforeH;
+    if(delta)_setRawScroll(scrollEl,beforeTop+delta);
   }
   // Scrolled up and the change was at or below the top of the viewport: nothing
   // the reader can see has moved, so scrollTop is not touched at all.
   updateFreezeUi(name);
+}
+function jumpToLastUserMessage(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  const rows=st.userRows||[];
+  const live=document.getElementById('raw-live-'+name)||rawEl;
+  const saved=rawEl?Array.from(rawEl.querySelectorAll('.terminal-history-user')):[];
+  const messages=saved.concat(live?rows.map(index=>live.children[index]).filter(Boolean):[]);
+  if(!rawEl||!messages.length){
+    if(statusInfoEl)statusInfoEl.textContent='No submitted messages in this scrollback yet';
+    return;
+  }
+  let at=(typeof st._jumpAt==='number'?Math.min(st._jumpAt,messages.length):messages.length)-1;
+  if(at<0)at=messages.length-1;
+  st._jumpAt=at;
+  const el=messages[at];
+  if(!el)return;
+  st.userScrolledUp=true;
+  const top=el.getBoundingClientRect&&rawEl.getBoundingClientRect
+    ? rawEl.scrollTop+el.getBoundingClientRect().top-rawEl.getBoundingClientRect().top:el.offsetTop;
+  _setRawScroll(rawEl,Math.max(0,top-10));
+  el.classList.remove('message-jumped');
+  void el.offsetWidth;
+  el.classList.add('message-jumped');
+  setTimeout(()=>el.classList.remove('message-jumped'),1700);
+  if(statusInfoEl)statusInfoEl.textContent='Your message '+(at+1)+' of '+messages.length+'. Click again for the previous message.';
+}
+function jumpToLive(name){
+  const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
+  if(!rawEl)return;
+  st._jumpAt=undefined;
+  st.userScrolledUp=false;
+  if(st.frozen){st.frozen=false;delete st.frozenText;renderRawText(name,true);updateFreezeUi(name)}
+  _setRawScroll(rawEl,rawEl.scrollHeight);
+  if(statusInfoEl)statusInfoEl.textContent='Following the latest output';
 }
 function rerenderAllRaw(){
   // Called after the filter preference changes — re-render every cached buffer
@@ -20207,7 +30301,7 @@ function _nowMs(){return (window.performance&&performance.now)?performance.now()
 function _fmtElapsed(sec){
   sec=Math.max(0,Math.floor(sec||0));
   const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
-  if(h)return h+'h '+String(m).padStart(2,'0')+'m';
+  if(h)return h+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';
   if(m)return m+'m '+String(s).padStart(2,'0')+'s';
   return s+'s';
 }
@@ -20225,13 +30319,213 @@ let _liveTicker=null;
 function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
+    // Keep alerts for all visible account sessions, including background tabs.
+    sessions.forEach(s=>_maybePlayCacheWarning(s.name));
     if(!selectedSession)return;
+    // The silence counter and the cache state are functions of elapsed time, not
+    // of anything the server pushes, so they run on every tick regardless of the
+    // busy state. Without this an already-idle session never starts blinking.
+    _paintIdleCounter(selectedSession);
+    _paintCacheNotice(selectedSession);
+    _paintPillCache(selectedSession);
     const st=rawState[selectedSession];
     if(!st||!st.live||!st.live.seen||st.live.done||!_sessionBusy(selectedSession))return;
     const e=document.getElementById('tl-time-'+selectedSession);
     const secs=_liveSeconds(st,true);
     if(e&&secs!==null)e.textContent=_fmtElapsed(secs);
   },1000);
+}
+// Short "3m"/"2h 5m" for a duration, and "12.3k" for a token count. Defined here
+// because this dashboard generation has neither helper.
+function _fmtAgo(s){
+  s=Math.max(0,Math.round(s));
+  if(s<60)return s+'s';
+  const m=Math.floor(s/60);
+  if(m<60)return m+'m';
+  const h=Math.floor(m/60);
+  return h+'h'+(m%60?' '+(m%60)+'m':'');
+}
+function _fmtTokens(n){
+  n=n||0;
+  if(n<1000)return String(n);
+  if(n<1000000)return (n/1000).toFixed(n<10000?1:0)+'k';
+  return (n/1000000).toFixed(1)+'M';
+}
+function _metricNumber(value){
+  if(value===null||value===undefined||value==='')return null;
+  const n=Number(value);
+  return Number.isFinite(n)&&n>=0?n:null;
+}
+// Providers expose cache hits, not current eviction state. This is an estimate
+// from the latest metered request, which can precede the end of a tool-heavy turn.
+function _cacheTelemetryState(s,now=Date.now()/1000){
+  const ttl=_metricNumber(s.cache_ttl),at=_metricNumber(s.cache_last_activity);
+  const cached=_metricNumber(s.cache_read_tokens)||0;
+  const input=_metricNumber(s.last_input_tokens);
+  const version=String(s.cache_model||'').match(/^gpt-(\d+)(?:\.(\d+))?/i);
+  const modern=version&&(Number(version[1])>5||(Number(version[1])===5&&Number(version[2]||0)>=6));
+  const minimum=_metricNumber(s.cache_min_tokens)||(modern?1024:version?2048:null);
+  const cacheable=cached>0||(minimum!==null&&input!==null&&input>=minimum);
+  const end=_metricNumber(s.last_turn_end);
+  const idle=end?Math.max(0,now-end):null;
+  const base={phase:'unknown',left:null,idle,epoch:''};
+  if(s.activity_status==='busy')return {...base,phase:'busy',idle:null};
+  if(s.activity_status!=='idle'||!ttl||!at||!cacheable||s.detect_sure===false)return base;
+  const left=Math.max(0,ttl-Math.max(0,now-at));
+  const epoch=[s.metrics_thread_id||s.logical_incarnation||'',at,ttl].join(':');
+  return {phase:left===0?'cold':left<=CACHE_WARN_LEAD?'warning':'warm',left,idle,epoch};
+}
+function _cacheSecondsLeft(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  return _cacheTelemetryState(s).left;
+}
+const _cacheWarningPlayed={};
+const _cacheWarningPending=new Set();
+function _cacheWarningStorageKey(s){
+  const owner=typeof _currentUser==='undefined'?'':(_currentUser&&(_currentUser.id||_currentUser.username))||'';
+  return 'cacheWarning:v1:'+JSON.stringify([owner,s.owner||'',s.name,s.logical_incarnation||'',s.metrics_thread_id||'']);
+}
+function _cacheWarningWasPlayed(key,epoch){
+  if(_cacheWarningPlayed[key]===epoch)return true;
+  try{return localStorage.getItem(key)===epoch}catch(e){return false}
+}
+function _playCacheDoubleBeep(){
+  // Never create/resume an audio context from a timer: wait for the existing
+  // interaction handler to unlock audio, then a later tick may play the warning.
+  const ctx=_completionAudioCtx;
+  if(!_completionAudioPrimed||!ctx||ctx.state!=='running')return false;
+  try{
+    const now=ctx.currentTime+0.015;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.5,now);
+    master.connect(ctx.destination);
+    [0,0.24].forEach(offset=>_glassPartial(ctx,master,880,now+offset,0.13,0.18));
+    setTimeout(function(){try{master.disconnect()}catch(e){}},550);
+    return true;
+  }catch(e){return false}
+}
+function _maybePlayCacheWarning(name){
+  const s=sessions.find(x=>x.name===name);
+  if(!s)return;
+  const state=_cacheTelemetryState(s),key=_cacheWarningStorageKey(s);
+  if(state.phase!=='warning'||_cacheWarningWasPlayed(key,state.epoch)||_cacheWarningPending.has(key))return;
+  const play=function(){
+    // Recheck after a cross-tab lock: a new turn may have begun while waiting.
+    const current=sessions.find(x=>x.name===name);
+    if(!current||_cacheWarningStorageKey(current)!==key)return;
+    const next=_cacheTelemetryState(current);
+    if(next.phase!=='warning'||next.epoch!==state.epoch||_cacheWarningWasPlayed(key,next.epoch))return;
+    if(!_playCacheDoubleBeep())return;
+    _cacheWarningPlayed[key]=next.epoch;
+    try{localStorage.setItem(key,next.epoch)}catch(e){}
+  };
+  if(typeof navigator!=='undefined'&&navigator.locks&&navigator.locks.request){
+    _cacheWarningPending.add(key);
+    navigator.locks.request(key,play).catch(()=>{}).finally(()=>_cacheWarningPending.delete(key));
+  }else{
+    play();
+  }
+}
+function _pillCacheClasses(name,status){
+  const s=sessions.find(x=>x.name===name)||{};
+  let extra='';
+  if(status==='busy'&&s.cache_keepalive)extra+=' keepcache';
+  if(status==='idle'){
+    const left=_cacheSecondsLeft(name);
+    if(left!==null&&left>0&&left<=CACHE_WARN_LEAD)extra+=' expiring';
+  }
+  return extra;
+}
+function _paintPillCache(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  const pill=document.getElementById('status-'+name);
+  const want='status-pill '+(s.activity_status||'unknown')+_pillCacheClasses(name,s.activity_status);
+  if(pill&&pill.className!==want)pill.className=want;
+  const bar=document.getElementById('term-live-'+name);
+  if(bar)bar.classList.toggle('cache-expiring',_cacheTelemetryState(s).phase==='warning');
+}
+// The status is the only elapsed-idle counter; a completed duration never ticks.
+function _paintIdleCounter(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  const el=document.getElementById('tl-verb-'+name);
+  if(!el||s.activity_status!=='idle')return;
+  const end=_metricNumber(s.last_turn_end);
+  const txt='Idle '+(end?_fmtElapsed(Math.max(0,Date.now()/1000-end)):'—');
+  if(el.textContent!==txt)el.textContent=txt;
+  el.title=end?'Time since the last completed turn. Updates every second.':
+    'Last turn completion time is unavailable.';
+}
+// Cache notices are independent of both the idle clock and completed duration.
+function _paintCacheNotice(name){
+  const el=document.getElementById('tl-since-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const state=_cacheTelemetryState(s);
+  if(s.activity_status!=='idle'||!['warning','cold'].includes(state.phase)){
+    if(el.textContent!==''){el.textContent='';el.className='tl-since';el.title='';}
+    return;
+  }
+  let cls='tl-since',hint='';
+  if(state.left!==null){
+    cls+=state.phase==='cold'?' cold':state.phase==='warning'?' cooling expiring':' warm';
+    const read=s.cache_read_tokens||0;
+    hint='Cache timing is estimated from the latest metered request on '+(s.cache_model||'this model')+
+         ', using a '+Math.round(s.cache_ttl/60)+' minute retention window. '+
+         'The provider exposes no eviction signal; cached prefixes may remain reusable longer. '+
+         'A new request restarts this estimate. '+
+         (read?' The last turn reused '+read.toLocaleString()+' cached tokens.'
+             :' The last turn reused nothing from cache.');
+  }
+  if(s.detect_sure===false)cls+=' unsure';
+  const txt=state.phase==='cold'?'cache is cold (estimated)':
+    'cache may cool in '+_fmtAgo(state.left);
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+// Latest reported context includes both prompt and response tokens.
+function _paintContext(name){
+  const el=document.getElementById('tl-ctx-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const tok=_metricNumber(s.context_tokens),lim=_metricNumber(s.context_limit);
+  if(tok===null||!lim){
+    const txt=tok===null?'ctx —':'ctx '+_fmtTokens(tok)+' / ?';
+    if(el.textContent!==txt)el.textContent=txt;
+    el.className='tl-ctx';el.title='Context usage or model window has not been reported for this session.';
+    return;
+  }
+  const pct=lim?Math.round(tok/lim*100):0;
+  let cls='tl-ctx';
+  if(lim&&pct>=90)cls+=' crit';else if(lim&&pct>=75)cls+=' high';
+  if(s.detect_sure===false)cls+=' unsure';
+  const txt='ctx '+_fmtTokens(tok)+' / '+_fmtTokens(lim)+' · '+pct+'%';
+  const hint=tok.toLocaleString()+' context tokens (prompt and response) out of '+
+    lim.toLocaleString()+' tokens reported by Codex ('+pct+'%). Compaction can reduce this independently of cumulative session usage.';
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+function _paintSessionMetrics(name){
+  const s=sessions.find(x=>x.name===name)||{};
+  const total=_metricNumber(s.session_total_tokens);
+  const totalEl=document.getElementById('tl-total-'+name);
+  if(totalEl){
+    totalEl.textContent='session '+(total===null?'—':_fmtTokens(total))+' tokens';
+    const input=_metricNumber(s.session_input_tokens),output=_metricNumber(s.session_output_tokens);
+    totalEl.title=total===null?'Cumulative tokens have not been reported for this session.':
+      total.toLocaleString()+' cumulative input + output tokens for this Codex thread'+
+      (input!==null&&output!==null?' ('+input.toLocaleString()+' input, '+output.toLocaleString()+' output)':'')+
+      '. Separate subagent threads are excluded. Includes reused input tokens; cache hits and reasoning subsets are not added twice.';
+  }
+  const tps=_metricNumber(s.avg_tps),tpsEl=document.getElementById('tl-tps-'+name);
+  if(tpsEl){
+    tpsEl.textContent='avg '+(tps===null?'—':tps.toFixed(1))+' tps';
+    tpsEl.title=tps===null?'Average output tokens per second requires a completed, timed turn.':
+      'Average output tokens per second across '+(s.tps_completed_turns||0)+' completed turns and all models used in this thread: '+
+      (s.tps_output_tokens||0).toLocaleString()+' output tokens / '+
+      Number(s.tps_active_seconds||0).toFixed(1)+' seconds. Includes tool execution and waiting, so low TPS alone does not establish rate limiting.';
+  }
 }
 function updateLiveBar(name){
   const bar=document.getElementById('term-live-'+name);
@@ -20240,10 +30534,13 @@ function updateLiveBar(name){
   const st=getRawState(name);
   const live=st.live||{};
   const busy=_sessionBusy(name);
-  const show=busy||!!live.seen;
-  bar.classList.toggle('on',show);
-  if(!show)return;
-  bar.classList.toggle('idle',!busy);
+  // An idle session has no spinner row left in its pane, and that is exactly
+  // when the silence counter and the cache countdown are worth having.
+  const sess=sessions.find(x=>x.name===name)||{};
+  // The shared footer is useful even before telemetry arrives: unknown values
+  // stay explicit instead of making the entire status strip disappear.
+  bar.classList.add('on');
+  bar.classList.toggle('idle',sess.activity_status==='idle');
   const set=function(id,txt){
     const e=document.getElementById(id+name);
     if(e&&e.textContent!==txt)e.textContent=txt;
@@ -20252,10 +30549,24 @@ function updateLiveBar(name){
   // only means anything while the turn is running. Once it is over the useful
   // fact is how long the turn took, not what it was called.
   const verb=(live.verb||'').replace(/[.…]+$/,'');
-  set('tl-verb-',busy?(verb||'Working'):'Idle');
-  const secs=_liveSeconds(st,busy);
-  set('tl-time-',secs===null?'':((busy&&!live.done)?'':'last turn ')+_fmtElapsed(secs));
+  set('tl-verb-',busy?(verb||'Working'):sess.activity_status==='idle'?'Idle':'Status unknown');
+  const verbEl=document.getElementById('tl-verb-'+name);
+  if(verbEl&&sess.activity_status!=='idle')verbEl.title=busy?'Current turn activity.':'Session activity is unavailable.';
+  const measuredSecs=_metricNumber(sess.last_turn_seconds);
+  const secs=busy&&!live.done?_liveSeconds(st,true):null;
+  set('tl-time-',busy?(secs===null?'elapsed —':_fmtElapsed(secs)):
+    'last turn '+(measuredSecs===null?'—':_fmtElapsed(measuredSecs)));
+  const timeEl=document.getElementById('tl-time-'+name);
+  if(timeEl)timeEl.title=busy?'Elapsed time in the current turn.':
+    measuredSecs===null?'Duration of the last completed turn is unavailable.':
+    'Fixed duration of the last completed turn.';
   set('tl-tok-',live.tok?((live.dir?live.dir+' ':'')+live.tok+' tokens'):'');
+  _paintIdleCounter(name);
+  _paintCacheNotice(name);
+  _paintContext(name);
+  _paintSessionMetrics(name);
+  _paintPillCache(name);
+  _maybePlayCacheWarning(name);
   const note=document.getElementById('tl-note-'+name);
   if(note){
     // Codex's own note first ("1 background terminal running") — it is the only
@@ -20269,9 +30580,28 @@ function updateLiveBar(name){
 // "Stop moving so I can read this." Freezing holds the PAINT only: polling keeps
 // running, st.fullText keeps growing, and the agent never notices. Unfreezing
 // renders everything that arrived in between in one go.
+function readTerminal(action,name){
+  if(!sessions.some(s=>s.name===name)||!['last','freeze','latest'].includes(action))return;
+  if((activeTabs[name]||'chat')!=='raw')switchTab(name,'raw');
+  const st=getRawState(name);
+  if(st.firstLoad&&!st.fullText){
+    st.pendingReadAction=action;
+    startRawPolling(name);
+    if(statusInfoEl)statusInfoEl.textContent='Loading terminal for reading…';
+    return;
+  }
+  delete st.pendingReadAction;
+  if(action==='last')jumpToLastUserMessage(name);
+  else if(action==='freeze')toggleRawFreeze(name);
+  else jumpToLive(name);
+}
+function _rawVisibleText(st){
+  return st.frozen&&typeof st.frozenText==='string'?st.frozenText:(st.fullText||'');
+}
 function toggleRawFreeze(name){
   const st=getRawState(name);
   st.frozen=!st.frozen;
+  if(st.frozen)st.frozenText=st.fullText||'';else delete st.frozenText;
   st.frozenAtLines=st.frozen?(st.fullText||'').split('\n').length:0;
   if(st.frozen){
     updateFreezeUi(name);
@@ -20318,12 +30648,340 @@ function toggleCleanView(name,checked){
   rerenderAllRaw();
 }
 const lastStatus={};
+const _completedUnread={};
+const IDLE_NUDGE_INTERVAL_MS=20000;
+const IDLE_NUDGE_TITLES={
+  off:'Off — only play the normal completion chime once',
+  light:'Light — chime every 20 seconds until every completed tab is viewed',
+  adhd:'ADHD — chime every 20 seconds until every completed tab is given new work'
+};
+const _idleNudgeAdhdPending={};
+let _idleNudgeTimer=null;
+let _idleNudgeModeCache=null;
+
+function getIdleNudgeMode(){
+  if(_idleNudgeModeCache)return _idleNudgeModeCache;
+  try{
+    const saved=localStorage.getItem('idleNudgeMode');
+    _idleNudgeModeCache=['off','light','adhd'].includes(saved)?saved:'off';
+  }catch(e){_idleNudgeModeCache='off'}
+  return _idleNudgeModeCache;
+}
+
+function idleNudgeSeg(){
+  const mode=getIdleNudgeMode();
+  const b=(m,label)=>'<button type="button" class="in-'+m+(mode===m?' active':'')+
+    '" aria-pressed="'+(mode===m?'true':'false')+'" title="'+esc(IDLE_NUDGE_TITLES[m])+
+    '" onclick="event.stopPropagation();setIdleNudgeMode(\''+m+'\')">'+label+'</button>';
+  return '<div class="idle-nudge-seg" role="group" aria-label="Idle nudge mode">'+
+    b('off','Off')+b('light','Light')+b('adhd','ADHD')+'</div>';
+}
+
+function syncIdleNudgeUI(mode){
+  mode=['off','light','adhd'].includes(mode)?mode:'off';
+  document.querySelectorAll('.idle-nudge-seg').forEach(seg=>{
+    seg.querySelectorAll('button').forEach(btn=>{
+      const active=btn.classList.contains('in-'+mode);
+      btn.classList.toggle('active',active);
+      btn.setAttribute('aria-pressed',active?'true':'false');
+    });
+  });
+}
+
+function _idleNudgeNames(mode){
+  const pending=mode==='adhd'?_idleNudgeAdhdPending:_completedUnread;
+  const current=new Set(sessions.map(s=>s.name));
+  return Object.keys(pending).filter(name=>current.has(name));
+}
+
+function _stopIdleNudgeTimer(){
+  if(_idleNudgeTimer!==null)clearTimeout(_idleNudgeTimer);
+  _idleNudgeTimer=null;
+}
+
+function _syncIdleNudgeTimer(restart){
+  if(restart)_stopIdleNudgeTimer();
+  const mode=getIdleNudgeMode();
+  if(mode==='off'||!_idleNudgeNames(mode).length){
+    _stopIdleNudgeTimer();
+    return;
+  }
+  if(_idleNudgeTimer!==null)return;
+  _idleNudgeTimer=setTimeout(function(){
+    _idleNudgeTimer=null;
+    const currentMode=getIdleNudgeMode();
+    if(currentMode==='off'||!_idleNudgeNames(currentMode).length)return;
+    playCompletionChime();
+    _syncIdleNudgeTimer();
+  },IDLE_NUDGE_INTERVAL_MS);
+}
+
+function setIdleNudgeMode(mode){
+  if(!['off','light','adhd'].includes(mode))return;
+  const previous=getIdleNudgeMode();
+  _idleNudgeModeCache=mode;
+  try{localStorage.setItem('idleNudgeMode',mode)}catch(e){}
+  if(mode==='adhd'&&previous!=='adhd'){
+    Object.keys(_completedUnread).forEach(name=>{_idleNudgeAdhdPending[name]=true});
+  }else if(mode!=='adhd'){
+    Object.keys(_idleNudgeAdhdPending).forEach(name=>delete _idleNudgeAdhdPending[name]);
+  }
+  syncIdleNudgeUI(mode);
+  unlockCompletionAudio();
+  _syncIdleNudgeTimer(true);
+}
+
+function _navDotClass(name,status){
+  const state=status||'unknown';
+  return 'nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
+}
+
+function _paintNavDot(name,status){
+  const navDot=document.getElementById('nav-dot-'+name);
+  if(navDot)navDot.className=_navDotClass(name,status);
+}
+
+function _markCompletionUnread(name){
+  _completedUnread[name]=true;
+  _paintNavDot(name,lastStatus[name]);
+  _syncIdleNudgeTimer();
+}
+
+function _acknowledgeCompletion(name){
+  if(!_completedUnread[name])return false;
+  delete _completedUnread[name];
+  const session=sessions.find(s=>s.name===name);
+  _paintNavDot(name,lastStatus[name]||(session&&session.activity_status));
+  _syncIdleNudgeTimer();
+  return true;
+}
+
+function _clearIdleNudgeForNewWork(name){
+  const wasPending=!!(_completedUnread[name]||_idleNudgeAdhdPending[name]);
+  delete _completedUnread[name];
+  delete _idleNudgeAdhdPending[name];
+  if(wasPending)_syncIdleNudgeTimer();
+  return wasPending;
+}
+
+// ── Completion chime ───────────────────────────────────────────────────────
+// Browser autoplay rules allow sound only after a real user interaction. Prime
+// one AudioContext on the first pointer/key/touch event, then reuse it when a
+// request that was sent from this page makes the confirmed busy -> idle move.
+// The sound is synthesized locally (no Apple asset or network request): two
+// short notes with bright overtones make an original, glass-like alert.
+const _completionWatch={};
+let _completionAudioCtx=null;
+let _completionAudioPrimed=false;
+
+function _getCompletionAudioContext(){
+  const AudioContextCtor=window.AudioContext||window.webkitAudioContext;
+  if(!AudioContextCtor)return null;
+  if(!_completionAudioCtx)_completionAudioCtx=new AudioContextCtor();
+  return _completionAudioCtx;
+}
+
+function unlockCompletionAudio(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const prime=function(){
+    if(_completionAudioPrimed||ctx.state!=='running')return;
+    // A silent one-frame source unlocks Web Audio on Safari/iOS as well as
+    // Chromium without making a noise merely because the page was clicked.
+    const src=ctx.createBufferSource();
+    src.buffer=ctx.createBuffer(1,1,ctx.sampleRate);
+    src.connect(ctx.destination);
+    src.start();
+    _completionAudioPrimed=true;
+  };
+  if(ctx.state==='suspended'){
+    Promise.resolve(ctx.resume()).then(prime).catch(()=>{});
+  }else{
+    prime();
+  }
+}
+
+function armCompletionChime(name){
+  _completionWatch[name]=true;
+  unlockCompletionAudio();
+}
+
+function _glassPartial(ctx,destination,frequency,start,duration,level){
+  const osc=ctx.createOscillator();
+  const gain=ctx.createGain();
+  osc.type='sine';
+  osc.frequency.setValueAtTime(frequency,start);
+  gain.gain.setValueAtTime(0.0001,start);
+  gain.gain.exponentialRampToValueAtTime(level,start+0.008);
+  gain.gain.exponentialRampToValueAtTime(0.0001,start+duration);
+  osc.connect(gain);
+  gain.connect(destination);
+  osc.start(start);
+  osc.stop(start+duration+0.02);
+  osc.onended=function(){try{osc.disconnect();gain.disconnect()}catch(e){}};
+}
+
+function playCompletionChime(){
+  const ctx=_getCompletionAudioContext();
+  if(!ctx)return;
+  const play=function(){
+    if(ctx.state!=='running')return;
+    const now=ctx.currentTime+0.015;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.84,now);
+    master.gain.exponentialRampToValueAtTime(0.0001,now+0.8);
+    master.connect(ctx.destination);
+    [
+      [1046.5,0.000,0.52,0.16],
+      [2093.0,0.002,0.38,0.055],
+      [3139.5,0.004,0.26,0.024],
+      [1318.5,0.075,0.60,0.12],
+      [2637.0,0.078,0.41,0.040],
+      [3955.5,0.080,0.25,0.018],
+    ].forEach(function(t){_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3])});
+    setTimeout(function(){try{master.disconnect()}catch(e){}},900);
+  };
+  if(ctx.state==='suspended'){
+    Promise.resolve(ctx.resume()).then(play).catch(()=>{});
+  }else{
+    play();
+  }
+}
+
+function trackSessionStatus(name,status,interrupted){
+  const prev=lastStatus[name];
+  lastStatus[name]=status;
+  const completed=prev==='busy'&&status==='idle';
+  // ADHD mode deliberately ignores merely viewing the completed tab. Its
+  // reminder for that tab clears only once the session is working again.
+  if(status==='busy'&&_idleNudgeAdhdPending[name]){
+    delete _idleNudgeAdhdPending[name];
+    _syncIdleNudgeTimer();
+  }
+  // Once a turn finishes normally there is nothing left to interrupt/edit,
+  // and pasted-image previews can be large, so release the retained draft.
+  if(completed)delete lastSubmittedDraft[name];
+  // A green pulse means "completed, but not yet acknowledged". Merely having
+  // the page selected is not proof that a person saw the result: always mark
+  // the completion, then clear it on a post-completion tab/view action.
+  if(completed&&!interrupted){
+    _markCompletionUnread(name);
+    if(getIdleNudgeMode()==='adhd'){
+      _idleNudgeAdhdPending[name]=true;
+      _syncIdleNudgeTimer();
+    }
+  }
+  if(prev==='busy'&&status==='idle'&&_completionWatch[name]&&!interrupted){
+    delete _completionWatch[name];
+    playCompletionChime();
+    return true;
+  }
+  return false;
+}
+
+['pointerdown','keydown','touchstart'].forEach(function(eventName){
+  document.addEventListener(eventName,unlockCompletionAudio,{capture:true,passive:true});
+});
 // Local chat messages mirror (kept in sync with server)
 const chatMessages={};
 // Preserve textarea drafts across re-renders
 const draftText={};
+// The most recent successfully submitted draft per session. Stop restores this
+// into whichever composer the user is looking at so revising a mistaken prompt
+// never requires selecting it out of the terminal transcript.
+const lastSubmittedDraft={};
 // Cache terminal content + scroll position across session switches
 const rawCache={}; // name -> {text, scrollTop, scrollHeight}
+// One physical composer per session. Caching the node preserves caret, pending
+// sends, recording UI and attachments through a view switch or detail rebuild.
+const _sessionComposerNodes={};
+function _sessionComposerKey(name,source='chat'){
+  return (_sessionComposerNodes[name]||document.getElementById('session-composer-'+name)?'chat':source)+'-'+name;
+}
+function _sessionComposerView(name){
+  const node=_sessionComposerNodes[name]||document.getElementById('session-composer-'+name);
+  return (node&&node.dataset.view)||activeTabs[name]||'chat';
+}
+function _composerElement(id,key){
+  const live=document.getElementById(id);
+  if(live)return live;
+  const name=key.replace(/^(chat|raw)-/,'');
+  const node=_sessionComposerNodes[name];
+  return node?Array.from(node.querySelectorAll('[id]')).find(el=>el.id===id)||null:null;
+}
+function _saveSessionComposerNodes(){
+  for(const s of sessions){
+    const node=document.getElementById('session-composer-'+s.name);
+    if(node)_sessionComposerNodes[s.name]=node;
+  }
+}
+function _updateSessionComposerView(name,tab){
+  const node=document.getElementById('session-composer-'+name);
+  if(!node)return;
+  node.hidden=!['chat','raw'].includes(tab);
+  node.dataset.view=tab;
+  const prompt=document.getElementById('composer-prompt-'+name);
+  if(prompt)prompt.textContent=tab==='raw'?'$':'›';
+  const input=document.getElementById('cmd-chat-'+name);
+  if(input){
+    input.placeholder=tab==='raw'?'Type a command or paste an image...':'Send a message or paste an image...';
+    if(input.dataset.needsGrow){autoGrow(input);delete input.dataset.needsGrow;}
+  }
+  updateLiveBar(name);
+  updateFreezeUi(name);
+  updateComposerBtn('chat-'+name);
+  if(typeof _syncVoiceModeButtons==='function')_syncVoiceModeButtons();
+}
+function _mountSessionComposer(name,tab){
+  const fresh=document.getElementById('session-composer-'+name);
+  const cached=_sessionComposerNodes[name];
+  const reused=!!(fresh&&cached&&fresh!==cached);
+  if(reused)fresh.replaceWith(cached);
+  if(fresh)_sessionComposerNodes[name]=cached||fresh;
+  _updateSessionComposerView(name,tab);
+  return reused;
+}
+
+function _copyComposerAttachments(attachments){
+  return (attachments||[]).map(function(attachment){
+    return {
+      name:attachment.name,path:attachment.path,size:attachment.size,
+      type:attachment.type,previewUrl:attachment.previewUrl
+    };
+  });
+}
+function _rememberSubmittedDraft(name,text,attachments){
+  lastSubmittedDraft[name]={
+    text:text||'',attachments:_copyComposerAttachments(attachments)
+  };
+}
+function _restoreSubmittedDraft(name,source){
+  const submitted=lastSubmittedDraft[name];
+  const key=_sessionComposerKey(name,source==='chat'?'chat':'raw');
+  const tab=key.startsWith('chat-')?'chat':'raw';
+  const input=_composerElement('cmd-'+key,key);
+  if(!submitted||!input)return false;
+  // Never overwrite something the user started composing while Codex worked.
+  if(input.value.length||(_composerAttachments[key]||[]).length){
+    input.focus();
+    return false;
+  }
+  input.value=submitted.text;
+  if(submitted.text)draftText[key]=submitted.text;
+  else delete draftText[key];
+  const attachments=_copyComposerAttachments(submitted.attachments);
+  if(attachments.length)_composerAttachments[key]=attachments;
+  else delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+  autoGrow(input);
+  updateComposerBtn(key);
+  try{input.focus({preventScroll:true})}catch(e){input.focus()}
+  if(typeof input.setSelectionRange==='function'){
+    input.setSelectionRange(input.value.length,input.value.length);
+  }
+  delete lastSubmittedDraft[name];
+  return true;
+}
 
 function captureComposerFocus(){
   const el=document.activeElement;
@@ -20398,17 +31056,33 @@ function formatModelName(model){
   if(!model)return'';
   return model.replace(/-\d{8}$/,'');
 }
+function catalogModelId(model){
+  if(!model)return'';
+  if(Object.prototype.hasOwnProperty.call(MODEL_EFFORTS,model))return model;
+  return formatModelName(model);
+}
 // Seed list; refreshed from the installed Codex CLI through /api/models.
 let MODEL_CHOICES=[
+  ['gpt-6-astra','GPT-6 Astra'],
   ['gpt-5.6-sol','GPT-5.6 Sol'],
-  ['gpt-5.6','GPT-5.6 (Sol alias)'],
   ['gpt-5.6-terra','GPT-5.6 Terra'],
   ['gpt-5.6-luna','GPT-5.6 Luna'],
   ['gpt-5.5','GPT-5.5'],
-  ['gpt-5.4','GPT-5.4'],
+  ['gpt-5.4-mini','GPT-5.4 Mini'],
+  ['gpt-5.3-codex-spark','GPT-5.3 Codex Spark'],
 ];
-let EFFORT_CHOICES=['none','low','medium','high','xhigh','max'];
-let DEFAULT_EFFORT='max';
+let EFFORT_CHOICES=['none','low','medium','high','xhigh','max','ultra'];
+let MODEL_EFFORTS={
+  'gpt-6-astra':['low','medium','high','xhigh','max','ultra'],
+  'gpt-5.6-sol':['low','medium','high','xhigh','max','ultra'],
+  'gpt-5.6-terra':['low','medium','high','xhigh','max','ultra'],
+  'gpt-5.6-luna':['low','medium','high','xhigh','max'],
+  'gpt-5.5':['low','medium','high','xhigh'],
+  'gpt-5.4-mini':['low','medium','high','xhigh'],
+  'gpt-5.3-codex-spark':['low','medium','high','xhigh'],
+};
+let DEFAULT_EFFORT='xhigh';
+let NEW_SESSION_DEFAULTS={model:'gpt-6-astra',effort:'max',no_fallback:false};
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
@@ -20416,7 +31090,9 @@ let DEFAULT_EFFORT='max';
         MODEL_CHOICES=d.models.filter(m=>Array.isArray(m)&&m.length===2);
       }
       if(d&&Array.isArray(d.efforts)&&d.efforts.length)EFFORT_CHOICES=d.efforts;
+      if(d&&d.model_efforts&&typeof d.model_efforts==='object')MODEL_EFFORTS=d.model_efforts;
       if(d&&d.default_effort)DEFAULT_EFFORT=d.default_effort;
+      if(d&&d.new_session_defaults)NEW_SESSION_DEFAULTS=d.new_session_defaults;
     }).catch(()=>{});
   }catch(e){}
 })();
@@ -20429,6 +31105,9 @@ function modelBadgeLabel(s){
   if(s&&s.model)return formatModelName(s.model);
   return'model';
 }
+function effortBadgeLabel(s){
+  return String((s&&s.effort)||DEFAULT_EFFORT).toLowerCase();
+}
 let _modelMenuEl=null;
 function closeModelMenu(){
   if(_modelMenuEl){_modelMenuEl.remove();_modelMenuEl=null;
@@ -20439,35 +31118,61 @@ function _modelMenuDocClose(e){
 }
 function openModelMenu(name,anchor,ev){
   if(ev){ev.stopPropagation();ev.preventDefault();}
-  if(_modelMenuEl){closeModelMenu();return;}
+  if(_modelMenuEl&&_modelMenuEl.dataset.kind==='model'&&_modelMenuEl.dataset.session===name){closeModelMenu();return;}
+  closeModelMenu();
   const s=sessions.find(x=>x.name===name)||{};
-  const cur=s.model_pending||s.model||'';
-  const menu=document.createElement('div');
-  menu.className='model-menu';
-  let html='<div class="mm-title">Codex model · applies after restart</div>';
+  const cur=catalogModelId(s.model_pending||s.model||'');
+  let html='<div class="mm-title">'+(s.session_model_settings?'Session model':'Codex account model')+' · applies after restart</div>';
   MODEL_CHOICES.forEach(([id,label])=>{
     const sel=cur&&id===cur;
-    html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
-      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
+    html+='<button type="button" class="mm-item'+(sel?' sel':'')+'" onclick="setSessionModel(\''+esc(name)+'\',\''+id+'\')">'
+      +'<span>'+esc(label)+'</span>'+(sel?'<span>✓</span>':'')+'</button>';
   });
-  const effort=(s.effort||DEFAULT_EFFORT).toLowerCase();
-  html+='<div class="mm-title" style="border-top:1px solid #30363d;margin-top:4px">Reasoning effort</div>';
-  EFFORT_CHOICES.forEach(id=>{
+  _showSessionSettingsMenu(name,'model',anchor,html);
+}
+function openEffortMenu(name,anchor,ev){
+  if(ev){ev.stopPropagation();ev.preventDefault();}
+  if(_modelMenuEl&&_modelMenuEl.dataset.kind==='effort'&&_modelMenuEl.dataset.session===name){closeModelMenu();return;}
+  closeModelMenu();
+  const s=sessions.find(x=>x.name===name)||{};
+  const cur=s.model_pending||s.model||'';
+  const effort=effortBadgeLabel(s);
+  let html='<div class="mm-title">Reasoning effort · applies after restart</div>';
+  const effortModel=catalogModelId(cur);
+  const modelEfforts=MODEL_EFFORTS[effortModel]||[];
+  if(!modelEfforts.length){
+    html+='<div class="mm-title">Reasoning levels unavailable. Refresh the model catalog.</div>';
+  }
+  modelEfforts.forEach(id=>{
     const sel=id===effort;
     const label=id==='xhigh'?'Extra high':id.charAt(0).toUpperCase()+id.slice(1);
-    html+='<div class="mm-item'+(sel?' sel':'')+'" onclick="setSessionEffort(\''+esc(name)+'\',\''+id+'\')">'
-      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</div>';
+    html+='<button type="button" class="mm-item'+(sel?' sel':'')+'" onclick="setSessionEffort(\''+esc(name)+'\',\''+id+'\')">'
+      +'<span>'+label+'</span>'+(sel?'<span>✓</span>':'')+'</button>';
   });
+  _showSessionSettingsMenu(name,'effort',anchor,html);
+}
+function _showSessionSettingsMenu(name,kind,anchor,html){
+  const menu=document.createElement('div');
+  menu.className='model-menu';
+  menu.dataset.kind=kind;
+  menu.dataset.session=name;
   menu.innerHTML=html;
+  menu.addEventListener('keydown',function(e){
+    if(e.key==='Escape'){e.stopPropagation();closeModelMenu();anchor.focus();}
+  });
   document.body.appendChild(menu);
   const r=anchor.getBoundingClientRect();
-  menu.style.top=Math.min(window.innerHeight-menu.offsetHeight-8,r.bottom+6)+'px';
+  menu.style.top=Math.max(8,Math.min(window.innerHeight-menu.offsetHeight-8,r.bottom+6))+'px';
   menu.style.left=Math.max(8,Math.min(window.innerWidth-menu.offsetWidth-8,r.right-menu.offsetWidth))+'px';
   _modelMenuEl=menu;
+  const selected=menu.querySelector('.mm-item.sel')||menu.querySelector('.mm-item');
+  if(selected)selected.focus();
   setTimeout(()=>document.addEventListener('click',_modelMenuDocClose,true),0);
 }
 function _paintModelBadge(name){
   const s=sessions.find(x=>x.name===name);
+  const notice=document.getElementById('model-fallback-'+name);
+  if(notice){notice.textContent=s?.fallback_status||'';notice.style.display=s?.fallback_status?'':'none';}
   const lbl=modelBadgeLabel(s);
   const mb=document.getElementById('model-badge-'+name);
   if(mb){
@@ -20476,11 +31181,18 @@ function _paintModelBadge(name){
   }
   const mm=document.getElementById('more-model-'+name);
   if(mm)mm.textContent=lbl+' ▾';
+  const effort=effortBadgeLabel(s);
+  const eb=document.getElementById('effort-badge-'+name);
+  if(eb)eb.innerHTML='Effort '+esc(effort)+' <span class="caret">▾</span>';
+  const me=document.getElementById('more-effort-'+name);
+  if(me)me.textContent=effort+' ▾';
 }
 async function setSessionModel(name,model){
   closeModelMenu();
   const si=sessions.findIndex(s=>s.name===name);
   const prev=si>=0?(sessions[si].model_pending||''):'';
+  let saved=false;
+  let savedEffort='';
   if(si>=0)sessions[si].model_pending=model;
   _paintModelBadge(name);
   try{
@@ -20489,6 +31201,9 @@ async function setSessionModel(name,model){
       body:JSON.stringify({model,restart:false})});
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    saved=true;
+    savedEffort=d.effort||'';
+    if(si>=0&&savedEffort)sessions[si].effort=savedEffort;
     if(d.codex_was_running){
       const restart=confirm('Model saved as "'+model+'". Restart Codex now and resume the latest conversation?');
       if(restart){
@@ -20503,9 +31218,12 @@ async function setSessionModel(name,model){
     _paintModelBadge(name);
     if(statusInfoEl)statusInfoEl.textContent='Model → '+modelChoiceLabel(model)+(d.restarted?' · restarted':' · saved');
   }catch(e){
-    if(si>=0)sessions[si].model_pending=prev;
+    if(si>=0){
+      sessions[si].model_pending=saved?model:prev;
+      if(savedEffort)sessions[si].effort=savedEffort;
+    }
     _paintModelBadge(name);
-    alert('Model switch failed: '+(e&&e.message?e.message:e));
+    alert((saved?'Model saved, but restart failed: ':'Model switch failed: ')+(e&&e.message?e.message:e));
   }
 }
 
@@ -20513,24 +31231,30 @@ async function setSessionEffort(name,effort){
   closeModelMenu();
   const s=sessions.find(x=>x.name===name);
   const previous=s?s.effort:'';
+  let saved=false;
   try{
     let r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({effort,restart:false})});
     let d=await r.json().catch(()=>({}));
     if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+    saved=true;
     if(s)s.effort=effort;
+    _paintModelBadge(name);
     if(d.codex_was_running&&confirm('Reasoning effort saved as "'+effort+'". Restart Codex now and resume the latest conversation?')){
       r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/effort',{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({effort,restart:true})});
       d=await r.json().catch(()=>({}));
       if(!r.ok||d.error||!d.restarted)throw new Error(d.error||'Codex did not restart');
+      if(s&&s.model_pending){s.model=s.model_pending;s.model_pending='';}
     }
+    _paintModelBadge(name);
     if(statusInfoEl)statusInfoEl.textContent='Reasoning effort → '+effort+(d.restarted?' · restarted':' · saved');
   }catch(e){
-    if(s)s.effort=previous;
-    alert('Effort switch failed: '+(e&&e.message?e.message:e));
+    if(s)s.effort=saved?effort:previous;
+    _paintModelBadge(name);
+    alert((saved?'Effort saved, but restart failed: ':'Effort switch failed: ')+(e&&e.message?e.message:e));
   }
 }
 function statusLabel(s){
@@ -20540,31 +31264,204 @@ function statusLabel(s){
   return'...';
 }
 
+function sessionTabLabel(session){
+  return ((session&&session.tab_label)||(session&&session.name)||'').trim();
+}
+
+function showRenameSession(name){
+  const session=sessions.find(s=>s.name===name);
+  if(!session)return;
+  const modal=document.getElementById('modal-content');
+  modal.classList.remove('modal-wide');
+  modal.innerHTML=`<h3>Rename session</h3>
+    <label for="session-rename-input">Session name</label>
+    <input id="session-rename-input" type="text" maxlength="128" value="${_escTermHtml(sessionTabLabel(session))}" style="width:100%;margin:10px 0;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px" onkeydown="if(event.key==='Enter'){event.preventDefault();renameSession('${esc(name)}')}">
+    <p id="session-rename-error" role="alert" style="color:#f85149"></p>
+    <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
+    <button id="session-rename-save" class="modal-confirm-create" onclick="renameSession('${esc(name)}')">Save name</button></div>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  setTimeout(()=>{const input=document.getElementById('session-rename-input');if(input){input.focus();input.select()}},50);
+}
+async function renameSession(name){
+  const input=document.getElementById('session-rename-input');
+  const save=document.getElementById('session-rename-save');
+  const error=document.getElementById('session-rename-error');
+  if(!input||!save||save.disabled)return;
+  if(!input.value.trim()){error.textContent='Enter a session name.';input.focus();return}
+  save.disabled=true;
+  const epoch=_sessionClientEpoch[name]||0,incarnation=_sessionLogicalIncarnation(name);
+  try{
+    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/name',{
+      method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:input.value.trim()})
+    });
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||'Could not rename the session.');
+    if((_sessionClientEpoch[name]||0)!==epoch||_sessionLogicalIncarnation(name)!==incarnation)return;
+    const session=sessions.find(s=>s.name===name);
+    if(session){session.tab_label=data.tab_label;_paintSessionTabLabel(name)}
+    if(document.getElementById('session-rename-input')===input)closeModal();
+  }catch(failure){if(document.getElementById('session-rename-error')===error)error.textContent=failure.message}
+  finally{save.disabled=false}
+}
+
+function _paintSessionTabLabel(name){
+  const session=sessions.find(s=>s.name===name);
+  const label=document.getElementById('nav-label-'+name);
+  if(!session||!label)return;
+  label.textContent=sessionTabLabel(session);
+  label.title=session.tab_label
+    ? session.tab_label+' · tmux session: '+session.name
+    : 'tmux session: '+session.name;
+}
+
+function _visibleTabOrder(){
+  return Array.from(navEl.querySelectorAll('.nav-item[data-session]'))
+    .map(item=>item.dataset.session);
+}
+
+function _reorderSessionRows(names){
+  const rows=new Map(sessions.map(row=>[row.name,row]));
+  const ordered=[];
+  names.forEach(name=>{const row=rows.get(name);if(row){ordered.push(row);rows.delete(name)}});
+  sessions=ordered.concat(Array.from(rows.values()));
+}
+
+async function _persistTabOrder(names){
+  const sequence=++_tabOrderSaveSequence;
+  try{
+    const resp=await fetch(BASE+'/api/session-tab-order',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Tmux-Tab-Order':'1'},
+      body:JSON.stringify({sessions:names}),
+    });
+    if(!resp.ok)throw new Error('save failed');
+  }catch(e){
+    if(sequence!==_tabOrderSaveSequence)return;
+    await reconcileSessionRoster(true);
+    alert('The tab order could not be saved, so the previous order was restored.');
+  }
+}
+
+function _moveDraggedTab(clientX){
+  const dragged=navEl.querySelector('.nav-item.dragging');
+  if(!dragged)return;
+  const candidates=Array.from(navEl.querySelectorAll('.nav-item[data-session]:not(.dragging)'));
+  const before=candidates.find(item=>clientX<item.getBoundingClientRect().left+item.getBoundingClientRect().width/2);
+  if(before)navEl.insertBefore(dragged,before);
+  else{
+    const anchor=navEl.querySelector('.nav-new-btn')||navEl.querySelector('.nav-spacer');
+    navEl.insertBefore(dragged,anchor||null);
+  }
+  const bounds=navEl.getBoundingClientRect();
+  if(clientX<bounds.left+44)navEl.scrollLeft-=18;
+  else if(clientX>bounds.right-44)navEl.scrollLeft+=18;
+}
+
+function _startTabOrderDrag(item){
+  if(_tabOrderDragging)return;
+  _tabOrderDragging=true;
+  item.classList.add('dragging');
+  document.body.classList.add('tab-order-dragging');
+}
+
+function _finishTabOrderDrag(){
+  if(!_tabOrderDragging)return;
+  const previous=sessions.map(row=>row.name);
+  const names=_visibleTabOrder();
+  navEl.querySelectorAll('.nav-item.dragging').forEach(item=>item.classList.remove('dragging'));
+  document.body.classList.remove('tab-order-dragging');
+  _tabOrderDragging=false;
+  _tabOrderSuppressClick=true;
+  setTimeout(()=>{_tabOrderSuppressClick=false},0);
+  if(names.length===previous.length&&names.some((name,index)=>name!==previous[index])){
+    _reorderSessionRows(names);
+    _persistTabOrder(names);
+  }
+}
+
+function _cancelTabTouchCandidate(){
+  if(!_tabTouchCandidate)return;
+  clearTimeout(_tabTouchCandidate.timer);
+  _tabTouchCandidate=null;
+}
+
+function _installTabTouchDrag(item,name){
+  item.addEventListener('pointerdown',event=>{
+    if(event.pointerType==='mouse'||event.button!==0)return;
+    _cancelTabTouchCandidate();
+    const candidate={item,name,pointerId:event.pointerId,startX:event.clientX,startY:event.clientY,active:false,timer:null};
+    candidate.timer=setTimeout(()=>{
+      if(_tabTouchCandidate!==candidate)return;
+      candidate.active=true;
+      try{item.setPointerCapture(candidate.pointerId)}catch(e){}
+      _startTabOrderDrag(item);
+    },260);
+    _tabTouchCandidate=candidate;
+  });
+  item.addEventListener('pointermove',event=>{
+    const candidate=_tabTouchCandidate;
+    if(!candidate||candidate.item!==item||candidate.pointerId!==event.pointerId)return;
+    if(!candidate.active){
+      if(Math.hypot(event.clientX-candidate.startX,event.clientY-candidate.startY)>9)_cancelTabTouchCandidate();
+      return;
+    }
+    event.preventDefault();
+    _moveDraggedTab(event.clientX);
+  });
+  const finish=event=>{
+    const candidate=_tabTouchCandidate;
+    if(!candidate||candidate.item!==item||candidate.pointerId!==event.pointerId)return;
+    clearTimeout(candidate.timer);
+    if(candidate.active)_finishTabOrderDrag();
+    _tabTouchCandidate=null;
+  };
+  item.addEventListener('pointerup',finish);
+  item.addEventListener('pointercancel',finish);
+}
+
 function renderNav(){
   navEl.querySelectorAll('.nav-item').forEach(el=>el.remove());
-  const brand=navEl.querySelector('.nav-brand');
+  const anchor=navEl.querySelector('.nav-new-btn')||navEl.querySelector('.nav-spacer');
   sessions.forEach(s=>{
     const item=document.createElement('div');
     item.className='nav-item'+(s.name===selectedSession?' active':'');
     item.id='nav-'+s.name;
-    item.onclick=()=>selectSession(s.name);
+    item.dataset.session=s.name;
+    item.draggable=true;
+    item.onclick=()=>{if(!_tabOrderSuppressClick)selectSession(s.name)};
+    item.addEventListener('dragstart',event=>{
+      _startTabOrderDrag(item);
+      event.dataTransfer.effectAllowed='move';
+      event.dataTransfer.setData('text/plain',s.name);
+    });
+    item.addEventListener('dragend',_finishTabOrderDrag);
+    _installTabTouchDrag(item,s.name);
     item.innerHTML=`
-      <span class="nav-session-id">${esc(s.name)}</span>
+      <span class="nav-session-id" id="nav-label-${esc(s.name)}" title="${s.tab_label?esc(s.tab_label)+' · ':''}tmux session: ${esc(s.name)}">${esc(sessionTabLabel(s))}</span>
       <span class="nav-indicators">
-        <span class="nav-dot ${esc(s.activity_status)}" id="nav-dot-${s.name}"></span>
+        <span class="${esc(_navDotClass(s.name,lastStatus[s.name]||s.activity_status))}" id="nav-dot-${s.name}"></span>
         ${s.away_mode?'<span class="nav-away">AW</span>':''}
         ${s.go_nuts_mode?'<span class="nav-gonuts">GN</span>':''}
       </span>`;
-    brand.after(item);
+    navEl.insertBefore(item,anchor||null);
   });
-  const items=Array.from(navEl.querySelectorAll('.nav-item'));
-  items.reverse().forEach(item=>brand.after(item));
 }
 
+navEl.addEventListener('dragover',event=>{
+  if(!_tabOrderDragging)return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect='move';
+  _moveDraggedTab(event.clientX);
+});
+navEl.addEventListener('drop',event=>{
+  if(!_tabOrderDragging)return;
+  event.preventDefault();
+  _finishTabOrderDrag();
+});
+
 /* ── Chat bubbles ────────────────────────────────────────────────────────────
-   A bubble carries the agent's reply IN FULL, not a truncated recap. The recap
-   the server still generates is kept as a lead line on long answers only, where
-   a headline earns its space.
+   Short, plain-language recaps are the default. Longer prose is available with
+   Read more; terminal code stays in Terminal, including for older saved turns.
 
    Everything is linkified on the way in. That matters more here than anywhere
    else in the app: the reader is remote, so "I wrote /home/nimo/REPORT.md" is
@@ -20639,11 +31536,12 @@ function _chatRich(text,sessionName){
   return out;
 }
 function _chatLinksHtml(links,sessionName){
-  if(!links||!links.length)return'';
+  if(!Array.isArray(links)||!links.length)return'';
   const chips=links.map(l=>{
+    if(!l||typeof l!=='object')return'';
     const isFile=l.kind==='file';
     const target=isFile?l.path:l.href;
-    if(!target)return'';
+    if(typeof target!=='string'||!target||!(isFile?/^(~\/|\/)/.test(target):/^https?:\/\//i.test(target)))return'';
     const ico=isFile?(l.dir?'&#128193;':'&#128196;'):'&#128279;';
     return '<a class="chat-chip" href="'+_escTermHtml(_chatHref(target,sessionName))+'" target="_blank" rel="noopener"'
       +' title="'+_escTermHtml(target)+'"><span class="chat-chip-ico">'+ico+'</span>'
@@ -20654,33 +31552,113 @@ function _chatLinksHtml(links,sessionName){
     +'<div class="chat-chips">'+chips+'</div></div>';
 }
 function _normLoose(s){return (s||'').replace(/\s+/g,' ').trim().toLowerCase()}
-// When the recap LLM is unavailable the server falls back to the reply's own
-// opening 600 characters. Showing that as a lead above the same reply is just
-// the first paragraph printed twice, so a prefix never earns the slot.
-function _isRecapWorthShowing(summary,full){
-  if(!summary||!full)return false;
-  const s=_normLoose(summary).replace(/[…\.]+$/,'').trim();
-  const f=_normLoose(full);
-  return !!s && s!==f && !f.startsWith(s);
+const _chatExpanded=new Set();
+const _chatScrollState={};
+function _chatMessageKey(name,m){
+  return JSON.stringify([name,m.id||[m.role,m.turn_id||'',m.kind||'',m.ts||0]]);
+}
+function _chatPlainProse(text){
+  // The server sanitizes new recaps. This also protects the no-code Chat view
+  // when a saved pre-recap message still contains the complete terminal reply.
+  const rows=String(text||'').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g,'').split('\n');
+  const kept=[];let fence='';
+  for(const row of rows){
+    const mark=row.match(/^\s*(`{3,}|~{3,})/);
+    if(mark){if(!fence)fence=mark[1][0];else if(mark[1][0]===fence)fence='';continue;}
+    if(fence)continue;
+    if(/^\s*(?:diff --git|@@\s|[+\-]{3}\s|[+\-]\s*\d+\s|\d+\s+[+\-])/.test(row))continue;
+    if(/^\s{4,}(?:return|raise|assert|pass|break|continue)\b/.test(row))continue;
+    if(/^\s*<\/?[a-z][\w-]*(?:\s[^>]*|\/?)>.*$/i.test(row))continue;
+    if(/^\s*(?:(?:async\s+)?(?:def|function)\s+\w+\s*\(|class\s+\w+\s*[:({]|(?:const|let|var)\s+\w+\s*=|(?:from\s+[\w.]+\s+)?import\s+|(?:return|raise|assert)\s+.*[=();]|(?:if|for|while|with|except)\s+.*[:{]\s*$|[{}\[\]]+[;,]?\s*$)/.test(row))continue;
+    if(/^\s*(?:\$\s+|(?:python3?|node|npm|pip3?|pytest|git|curl|sudo)\s+[-\w./])/.test(row))continue;
+    if(/^\s*(?:[A-Za-z_$][\w.$]*\([^\n]*\);?|["'][^"']+["']\s*:\s*.*[,}]|[A-Za-z_$][\w.$]*\s*(?:=|=>)\s*.+)\s*$/.test(row))continue;
+    kept.push(row.replace(/`([^`\n]+)`/g,'$1').replace(/^\s{0,3}#{1,6}\s+/,'').replace(/\*\*([^*]+)\*\*/g,'$1'));
+  }
+  return kept.join('\n').replace(/\n{3,}/g,'\n\n').trim();
+}
+function _chatBrief(text){
+  const plain=_chatPlainProse(text).replace(/\s+/g,' ').trim();
+  if(!plain)return'';
+  const sentences=plain.match(/.+?(?:[.!?]+(?=\s|$)|$)/g)||[plain];
+  let brief=sentences.slice(0,3).join('').trim();
+  const words=brief.split(/\s+/);
+  if(words.length>55)brief=words.slice(0,55).join(' ');
+  if(brief.length>360){brief=brief.slice(0,360);const space=brief.lastIndexOf(' ');if(space>240)brief=brief.slice(0,space);}
+  return brief.length<plain.length?brief.replace(/[,. ;:]+$/,'')+'…':brief;
+}
+function toggleChatMessage(button){
+  const bubble=button.closest('.chat-msg');
+  if(!bubble)return;
+  const key=bubble.dataset.messageKey;
+  const expanded=button.getAttribute('aria-expanded')!=='true';
+  if(expanded)_chatExpanded.add(key);else _chatExpanded.delete(key);
+  bubble.querySelector('.chat-preview').hidden=expanded;
+  bubble.querySelector('.chat-expanded').hidden=!expanded;
+  button.setAttribute('aria-expanded',String(expanded));
+  button.textContent=expanded?'Read less':'Read more';
 }
 function chatBubbleInner(m,sessionName){
   const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
   if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'',sessionName)+'</div>'+ts;
-  const full=(m.full||'').trim();
-  const summary=(m.text||'').trim();
-  let html='';
-  if(full.length>700&&_isRecapWorthShowing(summary,full))
-    html+='<div class="chat-lead">'+_chatRich(summary,sessionName)+'</div>';
-  html+='<div class="chat-body">'+_chatRich(full||summary,sessionName)+'</div>';
+  const full=_chatPlainProse(m.full||m.text||'');
+  const summary=_chatBrief(m.text||full)||'Reply ready. Open Terminal for technical details.';
+  const details=full.length>summary.length?full:_chatPlainProse(m.text||'');
+  const hasMore=details.length>summary.length&&_normLoose(details)!==_normLoose(summary);
+  const expanded=hasMore&&_chatExpanded.has(_chatMessageKey(sessionName,m));
+  const progress=m.kind==='progress';
+  let html='<div class="chat-kind'+(progress?' progress':'')+'">'+(progress?'Still working':'Reply')+'</div>';
+  html+='<div class="chat-body chat-preview"'+(expanded?' hidden':'')+'>'+_chatRich(summary,sessionName)+'</div>';
+  if(hasMore){
+    html+='<div class="chat-body chat-expanded"'+(expanded?'':' hidden')+'>'+_chatRich(details,sessionName)+'</div>';
+    html+='<button type="button" class="chat-read-more" aria-expanded="'+expanded+'" onclick="toggleChatMessage(this)">'+(expanded?'Read less':'Read more')+'</button>';
+  }
   html+=_chatLinksHtml(m.links,sessionName);
   return html+ts;
 }
 function renderChatBubbles(name){
   const msgs=chatMessages[name]||[];
   if(!msgs.length){
-    return '<div class="chat-empty">No messages yet. Type below to talk to Codex — every reply shows up here in full, with links to anything it produced.</div>';
+    return '<div class="chat-empty">Your messages and short replies appear here. Longer tasks get a brief update about every 20 minutes when there is something useful to share.</div>';
   }
-  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m,name)}</div>`).join('');
+  return msgs.map(m=>'<div class="chat-msg '+(m.role==='assistant'?'assistant':'user')+'" data-message-key="'+_escTermHtml(_chatMessageKey(name,m))+'">'+chatBubbleInner(m,name)+'</div>').join('');
+}
+function _chatFocusedMessage(chatEl){
+  const active=document.activeElement;
+  if(!active||!chatEl.contains(active)||!active.classList.contains('chat-read-more'))return'';
+  const bubble=active.closest('.chat-msg');
+  return bubble?bubble.dataset.messageKey:'';
+}
+function _restoreChatFocus(chatEl,key){
+  if(!key)return;
+  const button=Array.from(chatEl.querySelectorAll('.chat-read-more')).find(el=>el.closest('.chat-msg').dataset.messageKey===key);
+  if(button)button.focus({preventScroll:true});
+}
+function _captureChatViewport(chatEl){
+  const state={top:chatEl.scrollTop,bottom:isChatAtBottom(chatEl),focus:_chatFocusedMessage(chatEl)};
+  if(!state.bottom&&chatEl.getBoundingClientRect){
+    const top=chatEl.getBoundingClientRect().top;
+    const bubble=Array.from(chatEl.querySelectorAll('.chat-msg')).find(el=>el.getBoundingClientRect().bottom>top);
+    if(bubble)state.anchor={key:bubble.dataset.messageKey,offset:bubble.getBoundingClientRect().top-top};
+  }
+  return state;
+}
+function _restoreChatViewport(chatEl,state){
+  chatEl.scrollTop=!state||state.bottom?chatEl.scrollHeight:state.top;
+  if(state&&state.anchor&&chatEl.getBoundingClientRect){
+    const bubble=Array.from(chatEl.querySelectorAll('.chat-msg')).find(el=>el.dataset.messageKey===state.anchor.key);
+    if(bubble)chatEl.scrollTop+=bubble.getBoundingClientRect().top-chatEl.getBoundingClientRect().top-state.anchor.offset;
+  }
+  if(state)_restoreChatFocus(chatEl,state.focus);
+}
+function saveChatViewState(){
+  for(const s of sessions){
+    const chatEl=document.getElementById('chat-'+s.name),pane=document.getElementById('tab-chat-'+s.name);
+    if(chatEl&&pane&&pane.classList.contains('active'))
+      _chatScrollState[s.name]=_captureChatViewport(chatEl);
+  }
+}
+function restoreChatViewState(name,chatEl){
+  _restoreChatViewport(chatEl,_chatScrollState[name]);
 }
 
 function saveRawCache(){
@@ -20700,11 +31678,19 @@ function saveRawCache(){
 function renderDetail(){
   const composerFocus=captureComposerFocus();
   saveDrafts();
+  _saveSessionComposerNodes();
   saveRawCache();
+  saveChatViewState();
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
-  // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
-  const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
+  if(s.runtime_state==='recovering'){
+    stopRawPolling(s.name);
+    updateFavicon('unknown');
+    mainEl.innerHTML='<div class="empty"><strong>Restoring '+esc(sessionTabLabel(s))+'…</strong><br><span>The tab will reconnect automatically when its terminal is ready.</span></div>';
+    return;
+  }
+  // Everyone starts in Chat; retain an explicitly selected view for this session.
+  const tab=activeTabs[s.name]||'chat';
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -20725,15 +31711,18 @@ function renderDetail(){
         </div>
       </div>
       <div class="tab-more-wrap">
-        <div class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" onclick="toggleTabMore(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-label="More">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></div>
-        <div class="tab-more-menu" id="tab-more-menu">
-          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><span class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</span></div><div class="tab-more-model-sep"></div></div>
+        <button type="button" class="tab tab-more-trigger ${['skills','info'].includes(tab)?'active':''}" id="tab-more-toggle" aria-label="More session options" aria-expanded="false" aria-controls="tab-more-menu" onclick="toggleTabMore(event)" onkeydown="handleTabMoreKeydown(event)"><span class="tab-more-label">${{'skills':'Skills','info':'Info'}[tab]||'More'}</span><span class="tab-more-icon" aria-hidden="true">&#x22EF;</span><span class="tab-more-arrow"> &#9662;</span></button>
+        <div class="tab-more-menu" id="tab-more-menu" onkeydown="handleTabMoreKeydown(event)">
+          <div class="tab-more-model-block"><div class="tab-more-model-row"><span class="tab-more-model-label">Model</span><button type="button" class="tab-more-model-value" id="more-model-${esc(s.name)}" title="Click to switch model" aria-label="Select Codex model" aria-haspopup="true" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} &#9662;</button></div><div class="tab-more-model-row"><span class="tab-more-model-label">Effort</span><button type="button" class="tab-more-model-value" id="more-effort-${esc(s.name)}" title="Click to switch reasoning effort" aria-label="Select reasoning effort" aria-haspopup="true" onclick="openEffortMenu('${esc(s.name)}',this,event)">${esc(effortBadgeLabel(s))} &#9662;</button></div><div class="tab-more-model-sep"></div></div>
+          ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="tab-more-item tab-more-project-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab" onclick="closeTabMore()">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
+          <button type="button" class="tab-more-item" style="background:none;border:0;width:100%;text-align:left" onclick="closeTabMore();showRenameSession('${esc(s.name)}')">Rename session</button>
           <div style="padding:4px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Auto-push</div>
           ${autopushSeg(s.name, s.autopush_mode, true)}
-          <!-- Clean view sits right under Auto-push because it is the other
-               switch people flip several times a day, and it used to be reachable
-               only by opening the whole Info tab. Same pref, same handler as the
-               copy in Info — toggleCleanView keeps every copy in step. -->
+          <div style="padding:8px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Idle nudge</div>
+          ${idleNudgeSeg()}
+          <!-- Clean view remains in this quick-settings menu because people
+               flip it several times a day. Same pref and handler as the copy
+               in Info — toggleCleanView keeps every copy in step. -->
           <div style="padding:8px 16px 2px;color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Terminal: Clean view</div>
           <label class="tab-more-switch" onclick="event.stopPropagation()">
             <span class="watchdog-toggle">
@@ -20764,37 +31753,24 @@ function renderDetail(){
           <span class="status-label">${statusLabel(s.activity_status)}</span>
           ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
-        <span class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model and reasoning effort — click to configure" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
+        <button type="button" class="badge model-badge${s.model_pending?' pending':''}" id="model-badge-${s.name}" title="Codex model. Saved changes apply after restart." aria-label="Select Codex model" aria-haspopup="true" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></button>
+        <button type="button" class="badge model-badge effort-badge" id="effort-badge-${s.name}" title="Reasoning effort. Saved changes apply after restart." aria-label="Select reasoning effort" aria-haspopup="true" onclick="openEffortMenu('${esc(s.name)}',this,event)">Effort ${esc(effortBadgeLabel(s))} <span class="caret">&#9662;</span></button>
         ${s.attached?'<span class="badge attached">attached</span>':''}
-        ${(_currentUser&&_currentUser.username&&_currentUser.team_mode)?`<a class="proj-link" href="${location.origin}/${encodeURIComponent(s.owner||_currentUser.username)}/${encodeURIComponent(s.name)}" target="_blank" rel="noopener" title="Open this session's published project in a new tab (Codex publishes here)">&#x1F517; /${esc(s.owner||_currentUser.username)}/${esc(s.name)} &#8599;</a>`:''}
         <button class="btn" onclick="loadRaw('${s.name}')" title="Reload terminal output">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
     </div>
 
+    <div id="model-fallback-${s.name}" role="status" style="padding:8px 16px;color:#d29922;${s.fallback_status?'':'display:none'}">${esc(s.fallback_status||'')}</div>
     <div class="tab-content ${tab==='chat'?'active':''}" id="tab-chat-${s.name}">
       <div class="chat-wrap">
         <div class="chat-controls">
-          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+          <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-chat-${s.name}" onclick="interruptSession('${s.name}','chat')" title="Stop Codex and edit your last message">Stop</button>
         </div>
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
-        <div class="cmd-bar" style="position:relative">
-          <span class="cmd-prompt">&gt;</span>
-          <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
-            placeholder="Send a message..."
-            onkeydown="handleChatKey(event,'${s.name}')"
-            oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
-            autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-send composer-action is-mic"
-            id="cmd-send-chat-${s.name}"
-            onclick="composerAction('chat-${s.name}')"
-            aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
-          <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
-        </div>
-        ${buildKeyBar(s.name,'chat')}
       </div>
     </div>
 
@@ -20802,39 +31778,50 @@ function renderDetail(){
       <div class="raw-controls">
         <span class="raw-info" id="raw-info-${s.name}">Loading terminal...</span>
         <span class="raw-title" id="raw-title-${s.name}">${esc(s.title)||''}</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}')" title="Interrupt Codex (Esc)">Stop</button>
+        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-raw-${s.name}" onclick="interruptSession('${s.name}','raw')" title="Stop Codex and edit your last message">Stop</button>
       </div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Codex...</div>
-      <!-- The spinner, the seconds counter and the token tally the CLI paints
-           into the pane are cut out of the transcript and redrawn here, outside
-           the scroll area, off a clock that ticks locally. See updateLiveBar. -->
+      <!-- Freeze belongs only to the terminal output, not the shared footer. -->
+      <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
+      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
+    </div>
+
+    <!-- Chat and Terminal are two views of this session, with ONE persistent
+         status strip, draft, attachment tray, recorder and Keys & Commands. -->
+    <div class="session-composer" id="session-composer-${s.name}" data-view="${tab}" ${['chat','raw'].includes(tab)?'':'hidden'}>
       <div class="term-live" id="term-live-${s.name}">
         <span class="tl-dots"><i></i><i></i><i></i></span>
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
+        <span class="tl-since" id="tl-since-${s.name}"></span>
+        <span class="tl-total" id="tl-total-${s.name}"></span>
+        <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
+        <span class="tl-tps" id="tl-tps-${s.name}"></span>
         <span class="tl-spacer"></span>
         <span class="tl-note" id="tl-note-${s.name}"></span>
       </div>
-      <!-- Only visible while frozen. The Freeze button lives in Keys & Commands,
-           which is collapsed by default, so the frozen state needs to announce
-           itself (and undo itself) from on top of the terminal. -->
-      <div class="raw-frozen-pill" id="raw-frozen-${s.name}" onclick="toggleRawFreeze('${esc(s.name)}')" title="Resume live updates"></div>
-      <div class="raw-resize-handle" onmousedown="startResize(event,'${s.name}')"></div>
+      <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
       <div class="cmd-bar" style="position:relative">
-        <span class="cmd-prompt">$</span>
-        <textarea class="cmd-input" id="cmd-raw-${s.name}" rows="1"
-          placeholder="Type a command and press Enter..."
-          onkeydown="handleRawKey(event,'${s.name}')"
-          oninput="autoGrow(this);updateComposerBtn('raw-${s.name}')"
+        <span class="cmd-prompt" id="composer-prompt-${s.name}">›</span>
+        <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
+          placeholder="Send a message or paste an image..."
+          onkeydown="handleSessionComposerKey(event,'${s.name}')"
+          onpaste="handleComposerPaste(event,'${s.name}','chat')"
+          oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send composer-action is-mic"
-          id="cmd-send-raw-${s.name}"
-          onclick="composerAction('raw-${s.name}')"
+        <div class="composer-actions">
+        <button type="button" class="btn cmd-send composer-action is-mic"
+          id="cmd-send-chat-${s.name}"
+          onclick="composerAction('chat-${s.name}')"
           aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
-        <input type="file" id="upload-raw-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
+        <button type="button" class="btn composer-voice" id="voice-mode-open-${s.name}"
+          onclick="openVoiceMode('${esc(s.name)}')" aria-label="Start Voice Mode" title="Start Voice Mode"
+          aria-haspopup="dialog" aria-expanded="false">${_COMPOSER_VOICE_SVG}</button>
+        </div>
+        <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
-      ${buildKeyBar(s.name,'raw')}
+      ${buildKeyBar(s.name,'chat')}
     </div>
 
     <div class="tab-content ${tab==='skills'?'active':''}" id="tab-skills-${s.name}">
@@ -20957,18 +31944,25 @@ function renderDetail(){
       </div>
     </div>`;
 
-  // Restore draft text in textareas
-  restoreDrafts();
+  // Reattach the actual composer before restoring focus. Pending sends and
+  // recording callbacks keep their original nodes; never overwrite them with
+  // an older saved draft when a roster update rebuilds the surrounding view.
+  const composerReused=_mountSessionComposer(s.name,tab);
+  if(!composerReused)restoreDrafts();
   // Status/role refreshes rebuild the detail DOM. Keep the active composer and
   // caret attached so Enter still reaches its key handler after that rebuild.
   restoreComposerFocus(composerFocus);
+  // A clipboard image is a draft attachment until the next message is sent.
+  // Repaint its preview after status refreshes rebuild the composer DOM.
+  renderComposerAttachments(s.name,'chat');
   // Populate the uploaded-files list under the upload area
   refreshUploadedFiles(s.name);
   // Populate the saved keys/URLs/files list inside the Keys & Commands drawer
   renderSavedKeys(s.name, s);
-  // Scroll chat to bottom
+  refreshSavedProjectItems(s.name);
+  // Keep a reader in an expanded older reply through roster/status rebuilds.
   const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl)chatEl.scrollTop=chatEl.scrollHeight;
+  if(chatEl)restoreChatViewState(s.name,chatEl);
   // Start/stop raw polling based on active tab
   stopAllRawPolling();
   stopStatsPolling();
@@ -20985,7 +31979,7 @@ function renderDetail(){
         st.fullText=cached.text;
         st.userScrolledUp=false;
         st.painted=null;st._bodyText=null;
-        if(st.frozen)st.frozenAtLines=(st.fullText||'').split('\n').length;
+        if(st.frozen&&typeof st.frozenText!=='string')st.frozenText=st.fullText||'';
         renderRawText(s.name,true);
         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
         startRawPolling(s.name);
@@ -21002,11 +31996,29 @@ function renderDetail(){
     else loadWatchdogStatus(s.name);
   }
   if(tab==='skills')loadAccountSkills(s.name);
+  if(tab==='chat')refreshActiveChat();
 }
 
+function _sessionRouteName(){
+  const match=(location.hash||'').match(/^#\/session\/([^/]+)$/);
+  if(!match)return '';
+  try{return decodeURIComponent(match[1])}catch(error){return ''}
+}
+function _restoreSessionRoute(){
+  const name=_sessionRouteName();
+  if(name&&sessions.some(s=>s.name===name))selectSession(name);
+}
+window.addEventListener('hashchange',_restoreSessionRoute);
+window.addEventListener('popstate',_restoreSessionRoute);
 function selectSession(name){
+  if(_sessionRouteName()!==name){
+    history.pushState(null,'',location.pathname+location.search+'#/session/'+encodeURIComponent(name));
+  }
   stopAllRawPolling();
   selectedSession=name;
+  // This function is only reached from a deliberate nav click, so selecting
+  // the completed session is the acknowledgement that stops its green pulse.
+  _acknowledgeCompletion(name);
   navEl.querySelectorAll('.nav-item').forEach(el=>el.classList.remove('active'));
   const navItem=document.getElementById('nav-'+name);
   if(navItem)navItem.classList.add('active');
@@ -21014,6 +32026,8 @@ function selectSession(name){
 }
 
 function switchTab(name,tab){
+  const composerFocus=captureComposerFocus();
+  saveChatViewState();
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
   allTabs.forEach(t=>t.classList.remove('active'));
@@ -21038,6 +32052,7 @@ function switchTab(name,tab){
   }
   const target=document.getElementById('tab-'+tab+'-'+name);
   if(target)target.classList.add('active');
+  _updateSessionComposerView(name,tab);
   stopAllRawPolling();
   stopStatsPolling();
   // Neither of these has ever been DEFINED in this file — away mode and go-nuts
@@ -21049,7 +32064,17 @@ function switchTab(name,tab){
   if(typeof stopAllAwayPolling==='function')stopAllAwayPolling();
   if(typeof stopAllGoNutsPolling==='function')stopAllGoNutsPolling();
   stopAllWatchdogPolling();
-  if(tab==='raw'){startRawPolling(name);updateFreezeUi(name);}
+  if(tab==='raw'){
+    const st=getRawState(name),live=document.getElementById('raw-live-'+name);
+    // Returning through Chat can rebuild an empty raw pane while Freeze is on.
+    // Paint the retained snapshot once before streaming resumes behind it.
+    if(st.frozen&&(!live||live._lineMode!==true)){
+      renderRawText(name,true);
+      const rawEl=document.getElementById('raw-'+name),cached=rawCache[name];
+      if(rawEl&&cached)_setRawScroll(rawEl,cached.scrollTop||0);
+    }
+    startRawPolling(name);updateFreezeUi(name);
+  }
   if(tab==='info'){
     startStatsPolling(name);
     const s=sessions.find(x=>x.name===name);
@@ -21070,9 +32095,11 @@ function switchTab(name,tab){
         typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
         chatEl.appendChild(typing);
       }
-      chatEl.scrollTop=chatEl.scrollHeight;
+      restoreChatViewState(name,chatEl);
     }
+    refreshActiveChat(true);
   }
+  if(['chat','raw'].includes(tab))restoreComposerFocus(composerFocus);
 }
 
 // ── Tab-more dropdown ──
@@ -21080,11 +32107,27 @@ function toggleTabMore(e){
   e.stopPropagation();
   closeViewMenu();
   const menu=document.getElementById('tab-more-menu');
-  if(menu)menu.classList.toggle('open');
+  const button=document.getElementById('tab-more-toggle');
+  if(!menu||!button)return;
+  const open=!menu.classList.contains('open');
+  menu.classList.toggle('open',open);
+  button.setAttribute('aria-expanded',open?'true':'false');
 }
 function closeTabMore(){
   const menu=document.getElementById('tab-more-menu');
   if(menu)menu.classList.remove('open');
+  const button=document.getElementById('tab-more-toggle');
+  if(button)button.setAttribute('aria-expanded','false');
+}
+function handleTabMoreKeydown(e){
+  if(e.key!=='Escape')return;
+  const menu=document.getElementById('tab-more-menu');
+  if(!menu||!menu.classList.contains('open'))return;
+  e.preventDefault();
+  e.stopPropagation();
+  closeTabMore();
+  const button=document.getElementById('tab-more-toggle');
+  if(button)button.focus();
 }
 
 // ── View dropdown (Terminal ⇄ Chat) ──
@@ -21099,41 +32142,61 @@ function closeViewMenu(){
   if(menu)menu.classList.remove('open');
 }
 
-// ── Nav tools dropdown ──
+// ── Header dropdowns ──
+function toggleStatusMenu(e){
+  e.stopPropagation();
+  closeToolsMenu();
+  const auth=document.getElementById('auth-dropdown');
+  if(auth)auth.classList.remove('active');
+  const menu=document.getElementById('nav-status-menu');
+  const button=document.getElementById('nav-status-toggle');
+  if(!menu||!button)return;
+  const open=!menu.classList.contains('open');
+  menu.classList.toggle('open',open);
+  button.setAttribute('aria-expanded',open?'true':'false');
+}
+function closeStatusMenu(){
+  const menu=document.getElementById('nav-status-menu');
+  const button=document.getElementById('nav-status-toggle');
+  if(menu)menu.classList.remove('open');
+  if(button)button.setAttribute('aria-expanded','false');
+}
+
 function toggleToolsMenu(e){
   e.stopPropagation();
+  closeStatusMenu();
   const menu=document.getElementById('nav-tools-menu');
-  if(menu)menu.classList.toggle('open');
+  const button=document.getElementById('nav-tools-toggle');
+  if(!menu||!button)return;
+  const open=!menu.classList.contains('open');
+  menu.classList.toggle('open',open);
+  button.setAttribute('aria-expanded',open?'true':'false');
 }
 function closeToolsMenu(){
   const menu=document.getElementById('nav-tools-menu');
+  const button=document.getElementById('nav-tools-toggle');
   if(menu)menu.classList.remove('open');
+  if(button)button.setAttribute('aria-expanded','false');
 }
 
 // Close dropdowns on outside click
-document.addEventListener('click',function(){closeTabMore();closeViewMenu();closeToolsMenu()});
+document.addEventListener('click',function(){closeTabMore();closeViewMenu();closeStatusMenu();closeToolsMenu()});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeStatusMenu();closeToolsMenu()}});
 
 function mergeChatMessages(name, serverMsgs){
-  // Merge server messages with local messages, preserving any locally-added
-  // messages (e.g. from raw tab) that the server hasn't echoed back yet.
+  // Assistant history is server-owned: each progress checkpoint and final reply
+  // has its own ID. Only pending local user posts may outlive a server snapshot.
   const local=chatMessages[name]||[];
-  if(!local.length){chatMessages[name]=[...serverMsgs];return}
-  // Build a set of server message signatures for dedup
-  const serverSet=new Set(serverMsgs.map(m=>m.role+':'+m.text+':'+Math.floor(m.ts)));
-  // Find local-only messages (user messages added via appendChatBubble that
-  // the server already recorded but with slightly different timestamp)
-  const localOnly=[];
-  for(const m of local){
-    const sig=m.role+':'+m.text+':'+Math.floor(m.ts);
-    if(!serverSet.has(sig)){
-      // Check if server has same role+text with close timestamp (within 5s)
-      const dup=serverMsgs.some(s=>s.role===m.role&&s.text===m.text&&Math.abs(s.ts-m.ts)<5);
-      if(!dup)localOnly.push(m);
-    }
+  const seen=new Set(),server=[];
+  for(const m of serverMsgs){
+    if(!m||!['user','assistant'].includes(m.role))continue;
+    const key=m.id||JSON.stringify([m.role,m.kind||'',m.ts,m.text]);
+    if(seen.has(key))continue;
+    seen.add(key);server.push({...m});
   }
-  // Merge: server messages + any local-only messages, sorted by timestamp
-  const merged=[...serverMsgs,...localOnly].sort((a,b)=>a.ts-b.ts);
-  chatMessages[name]=merged;
+  const pending=local.filter(m=>(m._localNotice||(m.role==='user'&&m._optimistic))&&!server.some(s=>
+    s.role===m.role&&((m.id&&m.id===s.id)||(s.text===m.text&&Math.abs((s.ts||0)-(m.ts||0))<10))));
+  chatMessages[name]=[...server,...pending].sort((a,b)=>(a.ts||0)-(b.ts||0));
 }
 
 function isChatAtBottom(chatEl){
@@ -21142,18 +32205,10 @@ function isChatAtBottom(chatEl){
 
 function appendChatBubble(name,role,text,ts,extra){
   if(!chatMessages[name])chatMessages[name]=[];
-  // Avoid duplicate assistant messages
-  if(role==='assistant'){
-    const msgs=chatMessages[name];
-    for(let i=msgs.length-1;i>=0;i--){
-      if(msgs[i].role==='assistant'){
-        if(msgs[i].text===text&&(msgs[i].full||'')===((extra&&extra.full)||''))return;
-        break;
-      }
-    }
-  }
-  const msg={role,text,ts};
-  if(extra){msg.full=extra.full||'';msg.links=extra.links||[];}
+  const msg={role,text,ts,...(extra||{})};
+  if(role==='user')msg._optimistic=true;
+  else if(!msg.id)msg._localNotice=true;
+  if(msg.id&&chatMessages[name].some(m=>m.id===msg.id))return;
   chatMessages[name].push(msg);
   // If this session's chat is visible, append to DOM
   if(name===selectedSession && (activeTabs[name]||'chat')==='chat'){
@@ -21166,7 +32221,8 @@ function appendChatBubble(name,role,text,ts,extra){
       const typing=chatEl.querySelector('.chat-typing');
       if(typing)typing.remove();
       const bubble=document.createElement('div');
-      bubble.className='chat-msg '+role;
+      bubble.className='chat-msg '+(role==='assistant'?'assistant':'user');
+      bubble.dataset.messageKey=_chatMessageKey(name,msg);
       bubble.innerHTML=chatBubbleInner(msg,name);
       chatEl.appendChild(bubble);
       // Only auto-scroll if user was at bottom or this is their own message
@@ -21175,43 +32231,20 @@ function appendChatBubble(name,role,text,ts,extra){
   }
 }
 
-// Mirror the server's "one assistant summary per turn" model into the local
-// chat + DOM: update the latest assistant bubble in place when its text changes,
-// append it when the turn is new. Prevents duplicate summary bubbles.
+// Reconcile the complete timeline, not just the last assistant. A background
+// hour-long run may deliver two checkpoints plus a final reply in one poll.
 function reconcileAssistantSummary(name, serverMsgs){
-  // The server's latest assistant message within the current turn.
-  let srv=null;
-  for(let i=serverMsgs.length-1;i>=0;i--){
-    if(serverMsgs[i].role==='assistant'){srv=serverMsgs[i];break;}
-    if(serverMsgs[i].role==='user')break;
-  }
-  if(!srv||!(srv.text||srv.full))return;
-  const local=chatMessages[name]||(chatMessages[name]=[]);
-  // Latest local assistant message after the last local user message.
-  let lu=-1;for(let i=local.length-1;i>=0;i--){if(local[i].role==='user'){lu=i;break;}}
-  let la=-1;for(let i=local.length-1;i>lu;i--){if(local[i].role==='assistant'){la=i;break;}}
-  if(la>=0){
-    // The full reply and the deliverables grow as the turn settles even when the
-    // recap wording lands the same, so all three decide whether to repaint.
-    const changed=local[la].text!==srv.text
-      ||(local[la].full||'')!==(srv.full||'')
-      ||JSON.stringify(local[la].links||[])!==JSON.stringify(srv.links||[]);
-    if(changed){
-      local[la].text=srv.text;local[la].ts=srv.ts;
-      local[la].full=srv.full||'';local[la].links=srv.links||[];
-      updateLastAssistantBubble(name,local[la]);
-    }
-  }else{
-    appendChatBubble(name,'assistant',srv.text,srv.ts,{full:srv.full,links:srv.links});
-  }
-}
-function updateLastAssistantBubble(name,msg){
+  const before=JSON.stringify(chatMessages[name]||[]);
+  mergeChatMessages(name,serverMsgs);
+  if(before===JSON.stringify(chatMessages[name]))return;
   if(name!==selectedSession||(activeTabs[name]||'chat')!=='chat')return;
   const chatEl=document.getElementById('chat-'+name);
   if(!chatEl)return;
-  const bubbles=chatEl.querySelectorAll('.chat-msg.assistant');
-  const el=bubbles[bubbles.length-1];
-  if(el)el.innerHTML=chatBubbleInner(msg,name);
+  const viewport=_captureChatViewport(chatEl);
+  const typing=chatEl.querySelector('.chat-typing');
+  chatEl.innerHTML=renderChatBubbles(name);
+  if(typing)chatEl.appendChild(typing);
+  _restoreChatViewport(chatEl,viewport);
 }
 
 function autoGrow(el){
@@ -21240,49 +32273,129 @@ function handleRawKey(e,name){
   if(_composerEnterSends(e)){e.preventDefault();sendCmd(name,'raw');}
   // Otherwise Enter inserts a newline; send via the button (mobile) or Enter (desktop).
 }
+function handleSessionComposerKey(e,name){
+  if(_sessionComposerView(name)==='raw')handleRawKey(e,name);
+  else handleChatKey(e,name);
+}
 
-// --- WhatsApp-style composer: mic icon when empty, paper-plane when typing ---
-const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3.3 20.7l18-8a.8.8 0 0 0 0-1.4l-18-8a.8.8 0 0 0-1.1.9L4 11l9 1-9 1-1.8 6.8a.8.8 0 0 0 1.1.9z"/></svg>';
+// --- WhatsApp-style composer: mic when empty, upward send arrow when typing ---
+const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>';
 const _COMPOSER_MIC_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg>';
 const _COMPOSER_STOP_SVG='<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
-const _recording={},_mediaRec={},_audioChunks={};
+const _COMPOSER_VOICE_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M4 10v4m4-8v12m4-15v18m4-15v12m4-8v4"/></svg>';
+// One microphone owner, including the permission prompt. A late permission
+// result cannot revive a closed dialog or a same-name replacement session.
+window.dashboardMicrophone={
+  current:null,
+  reserve(mode,session){
+    if(this.current)return null;
+    const lease={mode,session,epoch:_sessionClientEpoch[session]||0,
+      incarnation:_sessionLogicalIncarnation(session),stream:null,cancelled:false};
+    this.current=lease;return lease;
+  },
+  valid(lease){return !!lease&&this.current===lease&&!lease.cancelled
+    &&(_sessionClientEpoch[lease.session]||0)===lease.epoch
+    &&_sessionLogicalIncarnation(lease.session)===lease.incarnation;},
+  accept(lease,stream){
+    if(!this.valid(lease)){stream.getTracks().forEach(track=>track.stop());this.release(lease);return false;}
+    lease.stream=stream;return true;
+  },
+  release(lease){
+    if(!lease)return;lease.cancelled=true;
+    if(lease.stream){lease.stream.getTracks().forEach(track=>track.stop());lease.stream=null;}
+    if(this.current===lease)this.current=null;
+  },
+  cancelSession(name){if(this.current&&this.current.session===name)this.release(this.current);},
+  busy(){return !!this.current;},
+  state(){return this.current;},
+};
+if(window.addEventListener)window.addEventListener('pagehide',()=>{
+  const lease=window.dashboardMicrophone.state();
+  if(lease&&lease.mode==='dictation'){
+    const key=_sessionComposerKey(lease.session,'chat'),recorder=_mediaRec[key];
+    if(recorder){recorder.ondataavailable=null;recorder.onstop=null;try{if(recorder.state!=='inactive')recorder.stop()}catch(e){}}
+    delete _recording[key];delete _voiceTranscribing[key];
+    window.dashboardMicrophone.release(lease);updateComposerBtn(key);
+  }
+});
+function openVoiceMode(name){
+  if(window.voiceMode)window.voiceMode.open(name);
+  else alert('Voice Mode is still loading. Please try again.');
+}
+function _syncVoiceModeButtons(){
+  const state=window.voiceMode?window.voiceMode.state():{};
+  for(const session of sessions){
+    const button=_composerElement('voice-mode-open-'+session.name,'chat-'+session.name);
+    if(button)button.setAttribute('aria-expanded',String(!!state.open&&state.session===session.name));
+  }
+}
+const _recording={},_mediaRec={},_audioChunks={},_voiceTranscribing={};
 // `key` is 'chat-<name>' or 'raw-<name>'. Input id = cmd-<key>, button id = cmd-send-<key>.
 function updateComposerBtn(key){
-  const inp=document.getElementById('cmd-'+key),btn=document.getElementById('cmd-send-'+key);
+  const inp=_composerElement('cmd-'+key,key),btn=_composerElement('cmd-send-'+key,key);
   if(!inp||!btn||_recording[key])return;
-  const hasText=inp.value.trim().length>0;
-  btn.classList.toggle('is-send',hasText);
-  btn.classList.toggle('is-mic',!hasText);
-  btn.innerHTML=hasText?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
-  const label=hasText?'Send message':'Record voice message';
+  if(inp.disabled){btn.disabled=true;return;}
+  if(_voiceTranscribing[key]){
+    btn.disabled=true;btn.classList.add('is-transcribing');
+    btn.innerHTML='<span class="composer-spin"></span>';
+    btn.title='Transcribing voice message…';btn.setAttribute('aria-label','Transcribing voice message');
+    return;
+  }
+  if(_composerUploadTasks[key]){
+    btn.disabled=true;
+    btn.classList.remove('is-mic','is-send');
+    btn.classList.add('is-transcribing');
+    btn.innerHTML='<span class="composer-spin"></span>';
+    btn.title='Attaching pasted image…';
+    btn.setAttribute('aria-label','Attaching pasted image');
+    return;
+  }
+  btn.disabled=false;
+  btn.classList.remove('is-transcribing');
+  const hasContent=inp.value.trim().length>0||(_composerAttachments[key]||[]).length>0;
+  btn.classList.toggle('is-send',hasContent);
+  btn.classList.toggle('is-mic',!hasContent);
+  btn.innerHTML=hasContent?_COMPOSER_SEND_SVG:_COMPOSER_MIC_SVG;
+  const label=hasContent?'Send message':'Record voice message';
   btn.title=label;
   btn.setAttribute('aria-label',label);
 }
 function composerAction(key){
-  const inp=document.getElementById('cmd-'+key);
-  if(inp&&inp.value.trim().length>0){
+  const inp=_composerElement('cmd-'+key,key);
+  if((inp&&inp.disabled)||_voiceTranscribing[key])return;
+  if(inp&&(inp.value.trim().length>0||(_composerAttachments[key]||[]).length>0)){
     if(key.indexOf('raw-')===0)sendCmd(key.slice(4),'raw');
+    else if(_sessionComposerView(key.slice(5))==='raw')sendCmd(key.slice(5),'raw');
     else sendChat(key.slice(5));
   }else{toggleRecording(key);}
 }
 async function toggleRecording(key){
+  if(_voiceTranscribing[key])return;
   if(_recording[key]){const m=_mediaRec[key];if(m&&m.state!=='inactive')m.stop();return;}
+  const sessionName=key.indexOf('raw-')===0?key.slice(4):key.slice(5);
+  const epoch=_sessionClientEpoch[sessionName]||0;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('Microphone is not available in this browser.');return;}
+  const lease=window.dashboardMicrophone.reserve('dictation',sessionName);
+  if(!lease){alert('Finish the current voice conversation or recording before dictating.');return;}
   let stream;
   try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
-  catch(e){alert('Microphone permission denied or unavailable.');return;}
+  catch(e){const current=window.dashboardMicrophone.valid(lease);window.dashboardMicrophone.release(lease);if(current)alert('Microphone permission denied or unavailable.');return;}
+  if(!window.dashboardMicrophone.accept(lease,stream))return;
   let mr;
-  try{mr=new MediaRecorder(stream);}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Recording is not supported in this browser.');return;}
+  try{mr=new MediaRecorder(stream);}catch(e){window.dashboardMicrophone.release(lease);alert('Recording is not supported in this browser.');return;}
   _mediaRec[key]=mr;_audioChunks[key]=[];
   mr.ondataavailable=ev=>{if(ev.data&&ev.data.size>0)_audioChunks[key].push(ev.data);};
   mr.onstop=async()=>{
     stream.getTracks().forEach(t=>t.stop());
+    if(!window.dashboardMicrophone.valid(lease)){window.dashboardMicrophone.release(lease);return;}
     _recording[key]=false;
     const blob=new Blob(_audioChunks[key],{type:(mr.mimeType||'audio/webm')});
-    const btn=document.getElementById('cmd-send-'+key);
+    const btn=_composerElement('cmd-send-'+key,key);
     if(btn)btn.classList.remove('is-recording');
-    if(!blob.size){updateComposerBtn(key);return;}
+    if(!blob.size){window.dashboardMicrophone.release(lease);updateComposerBtn(key);return;}
+    _voiceTranscribing[key]=true;
     if(btn){
+      btn.disabled=true;
       btn.classList.add('is-transcribing');
       btn.innerHTML='<span class="composer-spin"></span>';
       btn.title='Transcribing voice message…';
@@ -21292,17 +32405,25 @@ async function toggleRecording(key){
       const fd=new FormData();fd.append('audio',blob,'voice.webm');
       const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
       const j=await resp.json().catch(()=>({}));
-      const inp=document.getElementById('cmd-'+key);
+      if(!window.dashboardMicrophone.valid(lease)){window.dashboardMicrophone.release(lease);return;}
+      const inp=_composerElement('cmd-'+key,key);
       if(resp.ok&&j.text){
-        if(inp){inp.value=(inp.value.trim()?inp.value.replace(/\s*$/,'')+' ':'')+j.text;autoGrow(inp);inp.focus();updateComposerBtn(key);}
+        if(inp){
+          inp.value=(inp.value.trim()?inp.value.replace(/\s*$/,'')+' ':'')+j.text;
+          if(inp.isConnected){autoGrow(inp);inp.focus();}else inp.dataset.needsGrow='true';
+        }
       }else{alert((j&&j.error)||'Transcription failed.');}
     }catch(e){alert('Transcription failed.');}
-    if(btn)btn.classList.remove('is-transcribing');
-    updateComposerBtn(key);
+    window.dashboardMicrophone.release(lease);
+    if((_sessionClientEpoch[sessionName]||0)===epoch){
+      delete _voiceTranscribing[key];
+      if(btn)btn.classList.remove('is-transcribing');
+      updateComposerBtn(key);
+    }
   };
-  try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
+  try{mr.start();}catch(e){window.dashboardMicrophone.release(lease);alert('Could not start recording.');return;}
   _recording[key]=true;
-  const btn=document.getElementById('cmd-send-'+key);
+  const btn=_composerElement('cmd-send-'+key,key);
   if(btn){
     btn.classList.remove('is-mic','is-send');
     btn.classList.add('is-recording');
@@ -21313,13 +32434,18 @@ async function toggleRecording(key){
 }
 
 async function sendChat(name){
-  const input=document.getElementById('cmd-chat-'+name);
-  if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
+  const input=_composerElement('cmd-chat-'+name,'chat-'+name);
+  if(!input||input.disabled)return;
+  const logicalIncarnation=_sessionLogicalIncarnation(name);
   input.disabled=true;
   let sent=false;
   try{
+    await _awaitComposerUploads('chat-'+name);
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
+    const typed=input.value.trim();
+    const attachments=_composerAttachments['chat-'+name]||[];
+    const cmd=_commandWithComposerAttachments(typed,attachments);
+    if(!cmd){input.disabled=false;input.focus();return;}
     const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -21327,23 +32453,34 @@ async function sendChat(name){
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
+    _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';
+    _clearComposerAttachments(name,'chat');
+    delete draftText['chat-'+name];
     updateComposerBtn('chat-'+name);
     sent=true;
   }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
-  input.focus();
+  updateComposerBtn('chat-'+name);
+  if(input.isConnected)input.focus();
   // After a delay, verify the busy state from the actual terminal
   if(sent)scheduleBusyVerification(name);
 }
 
 function setOptimisticBusy(name){
+  // This transition follows a request successfully sent by this browser, so
+  // its matching return to idle is the one that should make a sound.
+  // Sending new work also acknowledges the prior result for this tab in both
+  // Light and ADHD modes. Reminders for every other tab remain untouched.
+  _clearIdleNudgeForNewWork(name);
+  armCompletionChime(name);
   // Update local session state
   const idx=sessions.findIndex(s=>s.name===name);
   if(idx>=0){sessions[idx].activity_status='busy';sessions[idx].activity_detail='Processing...'}
-  lastStatus[name]='busy';
+  trackSessionStatus(name,'busy');
   // Update status pill and nav dot
   updateStatusPill(name,'busy','Processing...');
   if(name===selectedSession)updateFavicon('busy');
@@ -21372,7 +32509,7 @@ function scheduleBusyVerification(name){
       if(st.activity_status==='busy'){
         // Confirmed busy — update detail from server
         updateStatusPill(name,st.activity_status,st.activity_detail);
-        lastStatus[name]=st.activity_status;
+        trackSessionStatus(name,st.activity_status);
         return;
       }
       // Server says idle — but might be a brief gap.  Check once more after 3s.
@@ -21383,7 +32520,7 @@ function scheduleBusyVerification(name){
           const st2=statuses2.find(s=>s.name===name);
           if(!st2)return;
           // Now accept whatever the server says
-          lastStatus[name]=st2.activity_status;
+          trackSessionStatus(name,st2.activity_status);
           updateStatusPill(name,st2.activity_status,st2.activity_detail);
           if(name===selectedSession)updateFavicon(st2.activity_status);
           // Update typing indicator
@@ -21410,6 +32547,10 @@ function scheduleBusyVerification(name){
 
 // Track which tab triggered the upload so progress shows in the right key bar
 let _uploadTab={};
+const _composerAttachments={};
+const _composerUploadTasks={};
+const _uploadRequests={};
+let _clipboardImageSeq=0;
 
 function _formatSize(bytes){
   if(bytes<1024)return bytes+' B';
@@ -21419,6 +32560,7 @@ function _formatSize(bytes){
 
 function _uploadOneFile(name,tab,file){
   return new Promise(function(resolve){
+    const epoch=_sessionClientEpoch[name]||0;
     const progWrap=['chat','raw'].map(function(t){return document.getElementById('upload-progress-'+t+'-'+name)});
     const progName=['chat','raw'].map(function(t){return document.getElementById('upload-progress-name-'+t+'-'+name)});
     const progFill=['chat','raw'].map(function(t){return document.getElementById('upload-progress-fill-'+t+'-'+name)});
@@ -21429,7 +32571,13 @@ function _uploadOneFile(name,tab,file){
     const fd=new FormData();
     fd.append('file',file);
     const xhr=new XMLHttpRequest();
+    (_uploadRequests[name]||(_uploadRequests[name]=new Set())).add(xhr);
+    const finish=function(){
+      const requests=_uploadRequests[name];
+      if(requests){requests.delete(xhr);if(!requests.size)delete _uploadRequests[name]}
+    };
     xhr.upload.addEventListener('progress',function(e){
+      if((_sessionClientEpoch[name]||0)!==epoch)return;
       if(e.lengthComputable){
         const pct=Math.round(e.loaded/e.total*100);
         progFill.forEach(function(el){if(el)el.style.width=pct+'%'});
@@ -21437,6 +32585,10 @@ function _uploadOneFile(name,tab,file){
       }
     });
     xhr.addEventListener('load',function(){
+      finish();
+      if((_sessionClientEpoch[name]||0)!==epoch){resolve(null);return}
+      let data={};
+      try{data=JSON.parse(xhr.responseText||'{}')}catch(e){}
       if(xhr.status>=200&&xhr.status<300){
         progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('done')}});
         progName.forEach(function(el){if(el)el.textContent=file.name+' uploaded'});
@@ -21450,15 +32602,20 @@ function _uploadOneFile(name,tab,file){
         appendChatBubble(name,'assistant',msg,Date.now()/1000);
       }
       setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
-      resolve();
+      resolve(xhr.status>=200&&xhr.status<300?{
+        ok:true,path:data.path||'',name:file.name,size:file.size,type:file.type||''
+      }:null);
     });
     xhr.addEventListener('error',function(){
+      finish();
+      if((_sessionClientEpoch[name]||0)!==epoch){resolve(null);return}
       progFill.forEach(function(el){if(el){el.style.width='100%';el.classList.add('error')}});
       progName.forEach(function(el){if(el)el.textContent='Upload failed: network error'});
       appendChatBubble(name,'assistant','Upload failed: network error',Date.now()/1000);
       setTimeout(function(){progWrap.forEach(function(el){if(el)el.classList.remove('active')})},2000);
-      resolve();
+      resolve(null);
     });
+    xhr.addEventListener('abort',function(){finish();resolve(null)});
     xhr.open('POST',BASE+'/api/sessions/'+name+'/upload');
     xhr.send(fd);
   });
@@ -21473,6 +32630,173 @@ async function uploadFile(name,input){
   if(input.value!==undefined)input.value='';
 }
 
+function _clipboardImageExtension(type){
+  const extensions={
+    'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp',
+    'image/heic':'heic','image/heif':'heif','image/tiff':'tiff','image/bmp':'bmp',
+    'image/avif':'avif','image/svg+xml':'svg'
+  };
+  return extensions[(type||'').toLowerCase()]||'png';
+}
+
+function _clipboardImageFile(blob){
+  const type=(blob.type||'image/png').toLowerCase();
+  const filename='pasted-image-'+Date.now()+'-'+(++_clipboardImageSeq)+'.'+_clipboardImageExtension(type);
+  return new File([blob],filename,{type:type,lastModified:Date.now()});
+}
+
+function _clipboardImagePreview(file){
+  // The dashboard CSP deliberately permits data: images but not blob: URLs.
+  // FileReader keeps the thumbnail CSP-compliant without widening img-src.
+  return new Promise(function(resolve){
+    const reader=new FileReader();
+    reader.addEventListener('load',function(){
+      resolve(typeof reader.result==='string'?reader.result:'');
+    });
+    reader.addEventListener('error',function(){resolve('')});
+    reader.readAsDataURL(file);
+  });
+}
+
+function _clipboardImages(event){
+  const data=event&&event.clipboardData;
+  if(!data)return [];
+  const images=[];
+  const items=data.items||[];
+  for(let i=0;i<items.length;i++){
+    const item=items[i];
+    if(item&&item.kind==='file'&&String(item.type||'').toLowerCase().startsWith('image/')){
+      const file=item.getAsFile();
+      if(file)images.push(file);
+    }
+  }
+  // Safari versions that omit image DataTransferItems still expose the file
+  // list on the paste event. Only use this fallback when items found nothing,
+  // so the same screenshot is never attached twice.
+  if(!images.length&&data.files){
+    for(let i=0;i<data.files.length;i++){
+      const file=data.files[i];
+      if(file&&String(file.type||'').toLowerCase().startsWith('image/'))images.push(file);
+    }
+  }
+  return images;
+}
+
+function renderComposerAttachments(name,tab){
+  const key=tab+'-'+name;
+  const tray=_composerElement('composer-attachments-'+key,key);
+  if(!tray)return;
+  const attachments=_composerAttachments[key]||[];
+  tray.replaceChildren();
+  tray.classList.toggle('has-files',attachments.length>0);
+  attachments.forEach(function(attachment,index){
+    const item=document.createElement('div');
+    item.className='composer-attachment';
+
+    const preview=document.createElement('img');
+    preview.className='composer-attachment-preview';
+    preview.src=attachment.previewUrl;
+    preview.alt='Preview of '+attachment.name;
+    item.appendChild(preview);
+
+    const meta=document.createElement('div');
+    meta.className='composer-attachment-meta';
+    const filename=document.createElement('div');
+    filename.className='composer-attachment-name';
+    filename.textContent=attachment.name;
+    const status=document.createElement('div');
+    status.className='composer-attachment-status';
+    status.textContent='Pasted image · '+_formatSize(attachment.size);
+    meta.appendChild(filename);
+    meta.appendChild(status);
+    item.appendChild(meta);
+
+    const remove=document.createElement('button');
+    remove.type='button';
+    remove.className='composer-attachment-remove';
+    remove.textContent='✕';
+    remove.title='Remove pasted image';
+    remove.setAttribute('aria-label','Remove '+attachment.name);
+    remove.addEventListener('click',function(){removeComposerAttachment(name,tab,index)});
+    item.appendChild(remove);
+    tray.appendChild(item);
+  });
+}
+
+function removeComposerAttachment(name,tab,index){
+  const key=tab+'-'+name;
+  const attachments=_composerAttachments[key]||[];
+  const removed=attachments.splice(index,1)[0];
+  if(!attachments.length)delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+  updateComposerBtn(key);
+  if(removed&&removed.name)deleteUploadedFile(name,encodeURIComponent(removed.name));
+}
+
+function _clearComposerAttachments(name,tab){
+  const key=tab+'-'+name;
+  delete _composerAttachments[key];
+  renderComposerAttachments(name,tab);
+}
+
+async function _awaitComposerUploads(key){
+  // Another paste can be queued while an earlier image is uploading. Always
+  // wait for the latest chain before building the outgoing message.
+  while(_composerUploadTasks[key])await _composerUploadTasks[key];
+}
+
+function _commandWithComposerAttachments(text,attachments){
+  const paths=(attachments||[]).map(function(a){return a.path}).filter(Boolean);
+  if(!paths.length)return text;
+  const refs=paths.length===1
+    ?'Attached image: '+paths[0]
+    :'Attached images:\n'+paths.map(function(path){return '- '+path}).join('\n');
+  if(text)return text+'\n\n'+refs;
+  return 'Please inspect '+(paths.length===1?'the attached image.':'the attached images.')+'\n\n'+refs;
+}
+
+function handleComposerPaste(event,name,tab){
+  const blobs=_clipboardImages(event);
+  // Do not interfere with ordinary text/URL paste. preventDefault is reached
+  // only when the clipboard actually contains one or more image files.
+  if(!blobs.length)return;
+  event.preventDefault();
+  const key=tab+'-'+name;
+  const epoch=_sessionClientEpoch[name]||0;
+  const previous=_composerUploadTasks[key]||Promise.resolve();
+  const task=previous.then(async function(){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
+    _uploadTab[name]=tab;
+    for(let i=0;i<blobs.length;i++){
+      const file=_clipboardImageFile(blobs[i]);
+      const uploaded=await _uploadOneFile(name,tab,file);
+      if((_sessionClientEpoch[name]||0)!==epoch)return;
+      if(!uploaded||!uploaded.path)continue;
+      const attachment={
+        name:file.name,path:uploaded.path,size:file.size,type:file.type,
+        previewUrl:await _clipboardImagePreview(file)
+      };
+      if((_sessionClientEpoch[name]||0)!==epoch)return;
+      (_composerAttachments[key]||(_composerAttachments[key]=[])).push(attachment);
+      renderComposerAttachments(name,tab);
+    }
+  }).catch(function(error){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
+    console.warn('clipboard image upload failed:',error);
+    appendChatBubble(name,'assistant','Could not attach the pasted image.',Date.now()/1000);
+  });
+  _composerUploadTasks[key]=task;
+  updateComposerBtn(key);
+  task.finally(function(){
+    if((_sessionClientEpoch[name]||0)!==epoch)return;
+    if(_composerUploadTasks[key]===task)delete _composerUploadTasks[key];
+    renderComposerAttachments(name,tab);
+    updateComposerBtn(key);
+    const input=_composerElement('cmd-'+key,key);
+    if(input&&input.isConnected)input.focus();
+  });
+}
+
 function handleDrop(event,name,tab){
   event.preventDefault();
   const zone=document.getElementById('dropzone-'+tab+'-'+name);
@@ -21484,14 +32808,21 @@ function handleDrop(event,name,tab){
 }
 
 async function sendCmd(name,source){
-  const inputId='cmd-'+source+'-'+name;
-  const input=document.getElementById(inputId);
-  if(!input)return;
-  const cmd=input.value.trim();
-  if(!cmd)return;
+  const key=_sessionComposerKey(name,source);
+  const tab=key.startsWith('chat-')?'chat':'raw';
+  const inputId='cmd-'+key;
+  const input=_composerElement(inputId,key);
+  if(!input||input.disabled)return;
+  const logicalIncarnation=_sessionLogicalIncarnation(name);
   input.disabled=true;
   let sent=false;
   try{
+    await _awaitComposerUploads(key);
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
+    const typed=input.value.trim();
+    const attachments=_composerAttachments[key]||[];
+    const cmd=_commandWithComposerAttachments(typed,attachments);
+    if(!cmd){input.disabled=false;input.focus();return;}
     const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -21499,11 +32830,14 @@ async function sendCmd(name,source){
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed before send completed.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
+    _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';
-    updateComposerBtn(source+'-'+name);
-    delete draftText[source+'-'+name];
+    _clearComposerAttachments(name,tab);
+    updateComposerBtn(key);
+    delete draftText[key];
     if(source==='raw'){
       // User just sent a command — they want to see the output, reset scroll lock
       const st=getRawState(name);
@@ -21513,13 +32847,16 @@ async function sendCmd(name,source){
     sent=true;
   }catch(e){alert(e&&e.message?e.message:'Failed to send.')}
   input.disabled=false;
-  input.focus();
+  updateComposerBtn(key);
+  if(input.isConnected)input.focus();
   if(sent)scheduleBusyVerification(name);
 }
 
 // ── Raw Output Streaming ──
 function startRawPolling(name){
   const st=getRawState(name);
+  const session=sessions.find(s=>s.name===name);
+  if(!session||session.runtime_state==='recovering'){st.polling=false;return}
   const pane=document.getElementById('tab-raw-'+name);
   if(document.hidden||!pane||!pane.classList.contains('active'))return;
   st.polling=true;
@@ -21528,12 +32865,21 @@ function startRawPolling(name){
   const scheme=location.protocol==='https:'?'wss://':'ws://';
   const socket=new WebSocket(scheme+location.host+BASE+'/ws/sessions/'+encodeURIComponent(name)+'/raw');
   st.socket=socket;
-  socket.onopen=()=>{st.backoff=500};
   socket.onmessage=(event)=>{
-    try{applyRawPayload(name,JSON.parse(event.data))}catch(e){console.debug('terminal stream payload error',e)}
+    if(st.socket!==socket)return;
+    try{
+      const data=JSON.parse(event.data);
+      if(['full','delta','ping'].includes(data.mode))st.backoff=500;
+      applyRawPayload(name,data);
+    }catch(e){console.debug('terminal stream payload error',e)}
   };
-  socket.onclose=()=>{
+  socket.onclose=(event)=>{
     if(st.socket===socket)st.socket=null;
+    if(event.code===1008||(event.code>=4400&&event.code<4500)){
+      st.polling=false;
+      reconcileSessionRoster();
+      return;
+    }
     if(!st.polling||document.hidden)return;
     const active=document.getElementById('tab-raw-'+name);
     if(!active||!active.classList.contains('active'))return;
@@ -21556,11 +32902,18 @@ function stopAllRawPolling(){
 
 document.addEventListener('visibilitychange',()=>{
   if(document.hidden){stopAllRawPolling();return}
+  if(selectedSession)_acknowledgeCompletion(selectedSession);
+  reconcileSessionRoster();
+  pollTabLabels();
+  refreshActiveChat(true);
   const pane=selectedSession&&document.getElementById('tab-raw-'+selectedSession);
   if(pane&&pane.classList.contains('active'))startRawPolling(selectedSession);
 });
+window.addEventListener('focus',()=>{
+  if(!document.hidden&&selectedSession)_acknowledgeCompletion(selectedSession);
+});
 
-function _ensureRawScrollTracking(rawEl,st){
+function _ensureRawScrollTracking(rawEl,st,name){
   if(rawEl._scrollTracked)return;
   rawEl._scrollTracked=true;
   // Follow-the-tail is decided by WHERE the pane is, never by who scrolled it.
@@ -21573,7 +32926,19 @@ function _ensureRawScrollTracking(rawEl,st){
   // itself; our own compensation lands away from it and does not.
   rawEl.addEventListener('scroll',()=>{
     st.userScrolledUp=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)>24;
+    if(name&&st.userScrolledUp&&rawEl.scrollTop<100&&!st.frozen)loadTerminalHistory(name);
   },{passive:true});
+  // A short/filtered terminal has no overflow, so scrolling upward generates
+  // no scroll event. Wheel and touch intent must also be able to request history.
+  const earlier=()=>{if(name&&rawEl.scrollTop<100&&!st.frozen)loadTerminalHistory(name);};
+  rawEl.addEventListener('wheel',event=>{if(event.deltaY<0)earlier();},{passive:true});
+  let touchY=null;
+  rawEl.addEventListener('touchstart',event=>{touchY=event.touches[0]?.clientY??null;},{passive:true});
+  rawEl.addEventListener('touchmove',event=>{
+    const y=event.touches[0]?.clientY;
+    if(touchY!==null&&y>touchY+8){earlier();touchY=y;}
+  },{passive:true});
+  rawEl.addEventListener('touchend',()=>{touchY=null;},{passive:true});
 }
 
 function applyRawPayload(name,data){
@@ -21581,7 +32946,7 @@ function applyRawPayload(name,data){
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
   if(!rawEl)return;
-  _ensureRawScrollTracking(rawEl,st);
+  _ensureRawScrollTracking(rawEl,st,name);
   try{
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
@@ -21620,9 +32985,19 @@ function applyRawPayload(name,data){
         const lineCount=(st.fullText||'').split('\n').length;
         infoEl.textContent=lineCount+' lines';
       }
-    }else if(data.mode==='error'&&infoEl){
-      infoEl.textContent='Terminal stream reconnecting…';
+    }else if(data.mode==='error'){
+      if(data.retryable===false){
+        st.polling=false;
+        if(st.reconnectTimer){clearTimeout(st.reconnectTimer);st.reconnectTimer=null}
+        if(infoEl)infoEl.textContent='Terminal unavailable — session no longer exists.';
+        const socket=st.socket;st.socket=null;
+        if(socket)try{socket.close(1000,'terminal unavailable')}catch(e){}
+        reconcileSessionRoster();
+      }else if(infoEl){
+        infoEl.textContent='Terminal stream reconnecting…';
+      }
     }
+    if(st.pendingReadAction&&!st.firstLoad&&(activeTabs[name]||'chat')==='raw')readTerminal(st.pendingReadAction,name);
   }catch(e){}
 }
 
@@ -21636,7 +33011,7 @@ async function loadRaw(name){
   st.painted=null;st._bodyText=null;st.live=null;
   // Reload is an explicit "show me the terminal as it is now", which is the
   // opposite of a freeze — so it lifts one.
-  st.frozen=false;st.frozenAtLines=0;
+  st.frozen=false;st.frozenAtLines=0;delete st.frozenText;delete st.pendingReadAction;
   updateFreezeUi(name);
   const rawEl=document.getElementById('raw-'+name);
   // Wiping to a text node takes the line elements with it — tell the renderer to
@@ -21651,23 +33026,23 @@ async function loadRaw(name){
 function updateStatusPill(name,status,detail){
   const pill=document.getElementById('status-'+name);
   if(pill){
-    pill.className='status-pill '+(status||'unknown');
+    // Amber steady = working only to hold the cache. Green blinking = idle with
+  // the cache about to lapse, which is the one that wants you at the keyboard.
+  pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status);
     pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
       +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
   toggleInterruptButtons(name,status==='busy');
-  const navDot=document.getElementById('nav-dot-'+name);
-  if(navDot)navDot.className='nav-dot '+(status||'unknown');
+  _paintNavDot(name,status);
 }
 
 function updateCard(s){
-  // Sync messages from server. The server keeps ONE assistant summary per turn,
-  // updated in place as Codex's output settles, so mirror that: refresh the
-  // latest assistant bubble when its text changes, append it when it's new —
-  // never duplicate it.
-  if(s.messages&&s.messages.length){
+  // Include every progress checkpoint and final reply, even after reconnecting.
+  if(Array.isArray(s.messages)){
     reconcileAssistantSummary(s.name, s.messages);
   }
+
+  _paintSessionTabLabel(s.name);
 
   if(s.name!==selectedSession)return;
   const rawTitle=document.getElementById('raw-title-'+s.name);
@@ -21679,6 +33054,7 @@ function updateCard(s){
   if(prog)prog.textContent=s.progress||'';
   if(notesEl&&s.notes)notesEl.textContent=s.notes;
   renderSavedKeys(s.name, s);
+  refreshSavedProjectItems(s.name);
   const tsDesc=document.getElementById('ts-desc-'+s.name);
   const tsProg=document.getElementById('ts-prog-'+s.name);
   const tsNotes=document.getElementById('ts-notes-'+s.name);
@@ -21696,63 +33072,211 @@ function updateCard(s){
   if(chatEl){
     const existing=chatEl.querySelector('.chat-typing');
     if(s.activity_status==='busy'&&!existing){
+      const atBottom=isChatAtBottom(chatEl);
       const typing=document.createElement('div');
       typing.className='chat-typing';
       typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
       chatEl.appendChild(typing);
-      chatEl.scrollTop=chatEl.scrollHeight;
+      if(atBottom)chatEl.scrollTop=chatEl.scrollHeight;
     }else if(s.activity_status!=='busy'&&existing){
       existing.remove();
     }
   }
 }
 
-async function loadAll(){
+function _resetSessionRuntimeState(name){
+  stopRawPolling(name);
+  delete rawState[name];
+  delete rawCache[name];
+  if(typeof stopWatchdogPolling==='function')stopWatchdogPolling(name);
+}
+
+function _discardSessionClientState(name){
+  _sessionClientEpoch[name]=(_sessionClientEpoch[name]||0)+1;
+  if(typeof _clearSavedProjectState==='function')_clearSavedProjectState(name);
+  if(typeof window!=='undefined'){
+    if(window.voiceMode)window.voiceMode.invalidate(name);
+    if(window.dashboardMicrophone)window.dashboardMicrophone.cancelSession(name);
+  }
+  _autopushSetRequests[name]=(_autopushSetRequests[name]||0)+1;
+  setAutopushPending(name,false);
+  _resetSessionRuntimeState(name);
+  delete chatMessages[name];
+  delete _sessionComposerNodes[name];
+  delete _chatRefreshState[name];
+  delete _chatScrollState[name];
+  for(const key of _chatExpanded){try{if(JSON.parse(key)[0]===name)_chatExpanded.delete(key)}catch(e){}}
+  delete lastStatus[name];
+  delete activeTabs[name];
+  delete lastSubmittedDraft[name];
+  delete _completionWatch[name];
+  delete _completedUnread[name];
+  delete _idleNudgeAdhdPending[name];
+  delete _uploadTab[name];
+  delete _bracketedPaste[name];
+  const requests=_uploadRequests[name];
+  if(requests){for(const xhr of Array.from(requests))try{xhr.abort()}catch(e){};delete _uploadRequests[name]}
+  for(const tab of ['chat','raw']){
+    const key=tab+'-'+name;
+    const recorder=_mediaRec[key];
+    if(recorder){
+      recorder.ondataavailable=null;recorder.onstop=null;
+      try{if(recorder.state!=='inactive')recorder.stop()}catch(e){}
+      try{if(recorder.stream)recorder.stream.getTracks().forEach(track=>track.stop())}catch(e){}
+    }
+    delete _recording[key];
+    delete _mediaRec[key];
+    delete _audioChunks[key];
+    delete _voiceTranscribing[key];
+    delete draftText[key];
+    delete _composerAttachments[key];
+    delete _composerUploadTasks[key];
+  }
+}
+
+function _applySessionRoster(envelope,force,autopushVersions){
+  if(!envelope||envelope.authoritative!==true||!Array.isArray(envelope.sessions))return false;
+  if(typeof _tabOrderDragging!=='undefined'&&_tabOrderDragging)return false;
+  const generation=String(envelope.generation||'');
+  if(!force&&generation&&generation===_sessionRosterGeneration)return true;
+  saveDrafts();
+  saveRawCache();
+  const previous=sessions;
+  for(const row of envelope.sessions){
+    const oldRow=previous.find(old=>old.name===row.name);
+    const requestedVersion=autopushVersions&&autopushVersions.get(row.name)||0;
+    const currentVersion=_autopushRevision.get(row.name)||0;
+    const sameLogical=oldRow&&String(row.logical_incarnation||row.incarnation||'')===String(oldRow.logical_incarnation||oldRow.incarnation||'');
+    // An optimistic mode belongs to one logical terminal. Never copy it onto a
+    // same-name replacement while the old terminal's POST is still in flight.
+    if(sameLogical&&(_autopushPending.has(row.name)||currentVersion!==requestedVersion)){
+      row.autopush_mode=oldRow.autopush_mode;
+      row.simple_watchdog=oldRow.simple_watchdog;
+    }
+  }
+  const nextByName=new Map(envelope.sessions.map(row=>[row.name,row]));
+  const previousSelectedIndex=Math.max(0,previous.findIndex(row=>row.name===selectedSession));
+  let discarded=false;
+  for(const oldRow of previous){
+    const nextRow=nextByName.get(oldRow.name);
+    const logicalChanged=nextRow&&String(nextRow.logical_incarnation||nextRow.incarnation||'')!==String(oldRow.logical_incarnation||oldRow.incarnation||'');
+    if(!nextRow||logicalChanged){
+      _discardSessionClientState(oldRow.name);
+      discarded=true;
+    }else if(String(nextRow.incarnation||'')!==String(oldRow.incarnation||'')){
+      _resetSessionRuntimeState(oldRow.name);
+      discarded=true;
+    }
+  }
+  // The old DOM is itself cached state. Remove it before renderDetail can copy
+  // same-name terminal text or composer content into a replacement incarnation.
+  if(discarded)mainEl.replaceChildren();
+  sessions=envelope.sessions;
+  sessions.forEach(s=>{
+    lastStatus[s.name]=s.activity_status;
+    if(s.messages&&s.messages.length)mergeChatMessages(s.name,s.messages);
+  });
+  if(!selectedSession||!nextByName.has(selectedSession)){
+    selectedSession=sessions.length
+      ? sessions[Math.min(previousSelectedIndex,sessions.length-1)].name
+      : null;
+  }
+  _sessionRosterGeneration=generation;
+  renderNav();
+  renderDetail();
+  _syncIdleNudgeTimer(true);
+  return true;
+}
+
+async function reconcileSessionRoster(force=false){
+  if(_sessionRosterPromise&&!force)return _sessionRosterPromise;
+  const request=++_sessionRosterRequest;
+  const autopushVersions=new Map(
+    sessions.map(row=>[row.name,_autopushRevision.get(row.name)||0])
+  );
+  const pending=(async()=>{
+    try{
+      const resp=await fetch(BASE+'/api/session-roster',{cache:'no-store'});
+      const envelope=await resp.json().catch(()=>null);
+      if(request!==_sessionRosterRequest)return false;
+      if(!resp.ok||!envelope||envelope.authoritative!==true)return false;
+      return _applySessionRoster(envelope,force,autopushVersions);
+    }catch(e){return false}
+  })();
+  _sessionRosterPromise=pending;
+  try{return await pending}
+  finally{if(_sessionRosterPromise===pending)_sessionRosterPromise=null}
+}
+
+async function loadAll(preferredSession){
   try{
     // Resolve simple-mode before the first render so member toggles don't flash.
     await loadCurrentUser();
     MEMBER_SIMPLE=!!(_currentUser&&_currentUser.simple);
     document.body.classList.toggle('member-simple',MEMBER_SIMPLE);
-    // Phase 1: Fast load — cached data + activity status, no LLM calls
-    const resp=await fetch(BASE+'/api/sessions-fast');
-    sessions=await resp.json();
-    sessions.forEach(s=>{
-      lastStatus[s.name]=s.activity_status;
-      if(s.messages&&s.messages.length)mergeChatMessages(s.name, s.messages);
-    });
-    if(!selectedSession&&sessions.length>0)selectedSession=sessions[0].name;
-    renderNav();
-    renderDetail();
+    const loaded=await reconcileSessionRoster(true);
+    if(loaded&&preferredSession&&sessions.some(function(row){return row.name===preferredSession})){
+      selectedSession=preferredSession;
+      renderNav();
+      renderDetail();
+    }
+    if(!loaded&&!sessions.length)mainEl.innerHTML='<div class="empty">Could not verify the session list. Retrying…</div>';
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
+  startTabLabelPolling();
   // Phase 2: Background LLM refresh for each session
   lazyRefreshAll();
 }
 
 async function lazyRefreshAll(){
-  await Promise.all(sessions.map(async s=>{
+  await Promise.all(sessions.filter(s=>s.runtime_state!=='recovering').map(async s=>{
     try{
+      const logicalIncarnation=String(s.logical_incarnation||s.incarnation||'');
       const resp=await fetch(BASE+'/api/sessions/'+s.name+'/refresh',{method:'POST'});
       const data=await resp.json();
       const idx=sessions.findIndex(x=>x.name===s.name);
-      if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
+      if(idx>=0&&_sessionLogicalIncarnation(s.name)===logicalIncarnation){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
     }catch(e){}
   }));
 }
 
 async function refreshOne(name){
+  const logicalIncarnation=_sessionLogicalIncarnation(name);
   const btn=document.getElementById('btn-'+name);
   if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>'}
   try{
     const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh',{method:'POST'});
     const data=await resp.json();
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed during refresh.');
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
   }catch(e){}
   if(btn){btn.disabled=false;btn.textContent='Update'}
 }
 
+// Chat does not depend on observing a busy -> idle edge. That edge may happen
+// while the phone is asleep, and checkpoints arrive while status stays busy.
+const _chatRefreshState={};
+async function refreshActiveChat(force=false){
+  const name=selectedSession;
+  if(!name||document.hidden||(activeTabs[name]||'chat')!=='chat')return;
+  const now=Date.now(),state=_chatRefreshState[name]||(_chatRefreshState[name]={at:0,pending:false});
+  if(state.pending||(!force&&now-state.at<30000))return;
+  state.at=now;state.pending=true;
+  const incarnation=_sessionLogicalIncarnation(name);
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/refresh',{method:'POST'});
+    if(!resp.ok)return;
+    const data=await resp.json();
+    if(_sessionLogicalIncarnation(name)!==incarnation||_chatRefreshState[name]!==state)return;
+    const idx=sessions.findIndex(s=>s.name===name);
+    if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx]);}
+  }catch(e){}
+  finally{state.pending=false;}
+}
+
 async function refreshFull(name){
+  const logicalIncarnation=_sessionLogicalIncarnation(name);
   const btn=document.getElementById('btn-full-'+name);
   const desc=document.getElementById('desc-'+name);
   const prog=document.getElementById('prog-'+name);
@@ -21762,6 +33286,7 @@ async function refreshFull(name){
   try{
     const resp=await fetch(BASE+'/api/sessions/'+name+'/refresh-all',{method:'POST'});
     const data=await resp.json();
+    if(_sessionLogicalIncarnation(name)!==logicalIncarnation)throw new Error('Session changed during refresh.');
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx]={...sessions[idx],...data};updateCard(sessions[idx])}
   }catch(e){}
@@ -21774,8 +33299,41 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
-async function pollStatus(){
+function startTabLabelPolling(){
+  if(tabLabelPollTimer)clearInterval(tabLabelPollTimer);
+  tabLabelPollTimer=setInterval(pollTabLabels,2000);
+}
+
+async function pollTabLabels(){
   if(document.hidden)return;
+  try{
+    const resp=await fetch(BASE+'/api/tab-labels',{cache:'no-store'});
+    if(!resp.ok)return;
+    const labels=await resp.json();
+    for(const row of labels){
+      const session=sessions.find(s=>s.name===row.name);
+      if(!session)continue;
+      const next=row.tab_label||'';
+      if((session.tab_label||'')===next)continue;
+      session.tab_label=next;
+      _paintSessionTabLabel(row.name);
+    }
+  }catch(e){}
+}
+
+async function pollStatus(){
+  await reconcileSessionRoster();
+  refreshActiveChat();
+  // A hidden tab normally rests, but a tab waiting to announce a request must
+  // keep the cheap status poll alive. Keep watching any known-busy session too,
+  // so work begun outside this page still becomes an unread completion. Raw
+  // terminal streaming remains paused.
+  const hasBusySession=Object.values(lastStatus).some(status=>status==='busy');
+  // An ADHD reminder also keeps this lightweight poll alive so work started
+  // from another window/device can turn the reminder off as soon as it is busy.
+  const needsIdleNudgeStatus=getIdleNudgeMode()==='adhd'&&_idleNudgeNames('adhd').length>0;
+  const needsCacheStatus=sessions.some(s=>['warm','warning'].includes(_cacheTelemetryState(s).phase));
+  if(document.hidden&&!Object.keys(_completionWatch).length&&!hasBusySession&&!needsIdleNudgeStatus&&!needsCacheStatus)return;
   try{
     const resp=await fetch(BASE+'/api/status');
     const statuses=await resp.json();
@@ -21784,22 +33342,44 @@ async function pollStatus(){
       const prev=lastStatus[st.name];
       if(prev&&prev!==st.activity_status){
         changed=true;
-        lastStatus[st.name]=st.activity_status;
+        trackSessionStatus(st.name,st.activity_status);
         statusInfoEl.textContent='Session '+st.name+' changed...';
         refreshOne(st.name);
       }else{
-        lastStatus[st.name]=st.activity_status;
+        trackSessionStatus(st.name,st.activity_status);
       }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
-      // Update away_mode, go_nuts_mode, and model badges in nav
+      // Update the dynamic tab label and model badges without rebuilding the
+      // nav (which would disturb an open menu or the user's current focus).
       const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
+        // Metrics change during a turn even if the busy/idle label stays put.
+        // Keep the bar and warning epoch fresh without rebuilding the terminal.
+        sessions[si].activity_status=st.activity_status;
+        sessions[si].activity_detail=st.activity_detail;
+        for(const field of ['last_turn_end','last_turn_seconds','cache_last_activity',
+          'cache_ttl','cache_min_tokens','cache_read_tokens','cache_model','cache_keepalive','detect_sure',
+          'context_tokens','context_limit','last_input_tokens','metrics_thread_id',
+          'session_total_tokens','session_input_tokens','session_output_tokens',
+          'avg_tps','tps_active_seconds','tps_output_tokens','tps_completed_turns']){
+          if(Object.prototype.hasOwnProperty.call(st,field))sessions[si][field]=st[field];
+        }
+        if(st.name===selectedSession)updateLiveBar(st.name);
         let navChanged=false;
         let badgeChanged=false;
+        const nextTabLabel=st.tab_label||'';
+        if((sessions[si].tab_label||'')!==nextTabLabel){
+          sessions[si].tab_label=nextTabLabel;
+          _paintSessionTabLabel(st.name);
+        }
         const pend=st.model_pending||'';
         if((sessions[si].model_pending||'')!==pend){sessions[si].model_pending=pend;badgeChanged=true;}
         if(st.model&&sessions[si].model!==st.model){sessions[si].model=st.model;navChanged=true;badgeChanged=true;}
+        if(st.effort&&sessions[si].effort!==st.effort){sessions[si].effort=st.effort;badgeChanged=true;}
+        for(const field of ['fallback_status','no_fallback','session_model_settings']){
+          if(Object.prototype.hasOwnProperty.call(st,field)&&sessions[si][field]!==st[field]){sessions[si][field]=st[field];badgeChanged=true;}
+        }
         if(badgeChanged)_paintModelBadge(st.name);
         if(navChanged)renderNav();
       }
@@ -21814,20 +33394,83 @@ async function pollStatus(){
 
 // --- Inline server stats in nav header ---
 const navStatsEl=document.getElementById('nav-server-stats');
+function _setNavStatBar(id,pct,cls){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.style.width=Math.min(100,Math.max(0,pct||0))+'%';
+  el.className='nav-stat-fill'+(cls?' '+cls:'');
+}
+const navRamSummaryEl=document.getElementById('nav-ram-summary');
+const navRamSummaryValueEl=document.getElementById('nav-ram-summary-value');
+const navCpuSummaryEl=document.getElementById('nav-cpu-summary');
+const navCpuSummaryValueEl=document.getElementById('nav-cpu-summary-value');
+let _navStatsInFlight=false;
+let _navStatsRetry=null;
+let _navStatsRetryDelay=5000;
+let _navCpuLastValue=null;
+let _navCpuSampleAt='';
 async function refreshNavStats(){
-  if(MEMBER_SIMPLE)return;
+  if(MEMBER_SIMPLE||document.hidden||_navStatsInFlight)return;
+  _navStatsInFlight=true;
+  clearTimeout(_navStatsRetry);
+  _navStatsRetry=null;
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),8000);
   try{
-    const resp=await fetch(BASE+'/api/stats');
+    const resp=await fetch(BASE+'/api/stats',{signal:controller.signal,cache:'no-store'});
+    if(!resp.ok)throw new Error('Stats request failed');
     const s=await resp.json();
-    const cpuPct=s.cpu_percent!=null?s.cpu_percent:0;
+    if(!s||!Number.isFinite(s.cpu_percent)||s.cpu_percent<0||s.cpu_percent>100||s.cpu_measurement==='unavailable'){
+      throw new Error('CPU measurement unavailable');
+    }
+    const cpuPct=s.cpu_percent;
+    const ioWaitPct=s.cpu_iowait_percent!=null?s.cpu_iowait_percent:0;
     const threads=s.threads_running!=null?s.threads_running:'?';
     const cpuCount=s.cpu_count||1;
     const cpuClass=cpuPct>=80?'crit':cpuPct>=50?'warn':'';
-    const memPct=s.memory&&s.memory.total_mb?Math.round(s.memory.used_mb/s.memory.total_mb*100):0;
-    const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
     const leases=s.capacity?s.capacity.active_browser_leases:0;
-    navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span> &middot; browsers <span class="stat-val">'+leases+'</span></span>';
-  }catch(e){navStatsEl.innerHTML=''}
+    if(navStatsEl)navStatsEl.innerHTML='<span>CPU <span class="stat-val '+cpuClass+'">'+cpuPct+'%</span> <span style="color:#6e7681">'+threads+'/'+cpuCount+'t</span> &middot; browsers <span class="stat-val">'+leases+'</span></span>';
+    _navCpuLastValue=cpuPct;
+    _navCpuSampleAt=new Date().toLocaleTimeString();
+    _navStatsRetryDelay=5000;
+    if(navCpuSummaryValueEl){
+      navCpuSummaryValueEl.textContent=cpuPct+'%';
+      navCpuSummaryValueEl.className='stat-val'+(cpuClass?' '+cpuClass:'');
+    }
+    _setNavStatBar('nav-cpu-summary-fill',cpuPct,cpuClass);
+    // RAM was not shown anywhere in the header at all, on a 7.8GB box that
+    // spends half its swap. /api/stats has carried it the whole time.
+    const memTotal=(s.memory&&s.memory.total_mb)||0;
+    const memPct=memTotal?Math.round(s.memory.used_mb/memTotal*100):0;
+    const memClass=memPct>=80?'crit':memPct>=60?'warn':'';
+    _setNavStatBar('nav-ram-summary-fill',memTotal?memPct:0,memClass);
+    if(navRamSummaryValueEl){
+      navRamSummaryValueEl.textContent=memTotal?(memPct+'%'):'\u2014';
+      navRamSummaryValueEl.className='stat-val'+(memClass?' '+memClass:'');
+    }
+    if(navRamSummaryEl)navRamSummaryEl.title=memTotal
+      ? ('RAM '+memPct+'% \u00b7 '+(s.memory.used_mb/1024).toFixed(1)+'G of '+(memTotal/1024).toFixed(1)+'G used')
+      : 'Memory usage unavailable';
+    if(navCpuSummaryEl)navCpuSummaryEl.title='CPU '+cpuPct+'% · I/O wait '+ioWaitPct+'% · '+threads+'/'+cpuCount+' threads · '+leases+' active browser lease'+(leases===1?'':'s');
+  }catch(e){
+    if(navRamSummaryValueEl){navRamSummaryValueEl.textContent='\u2014';navRamSummaryValueEl.className='stat-val'}
+    _setNavStatBar('nav-ram-summary-fill',0,'');
+    // Preserve an identified last reading while a temporary interruption recovers.
+    const stale=_navCpuLastValue!==null;
+    _setNavStatBar('nav-cpu-summary-fill',_navCpuLastValue||0,'warn');
+    const label=stale?_navCpuLastValue+'% (stale)':'unavailable';
+    if(navStatsEl)navStatsEl.textContent='CPU '+label;
+    if(navCpuSummaryValueEl){
+      navCpuSummaryValueEl.textContent=label;
+      navCpuSummaryValueEl.className='stat-val warn'+(stale?' stale':'');
+    }
+    if(navCpuSummaryEl)navCpuSummaryEl.title=(stale?'Last CPU reading at '+_navCpuSampleAt:'CPU usage unavailable')+'. Retrying in '+(_navStatsRetryDelay/1000)+' seconds.';
+    _navStatsRetry=setTimeout(refreshNavStats,_navStatsRetryDelay);
+    _navStatsRetryDelay=Math.min(_navStatsRetryDelay*2,30000);
+  }finally{
+    clearTimeout(timeout);
+    _navStatsInFlight=false;
+  }
   refreshCodexAlertBadge();
 }
 refreshNavStats();
@@ -21837,19 +33480,22 @@ refreshNavStats();
 // fleet-wide Codex fault anyway.
 async function refreshCodexAlertBadge(){
   const el=document.getElementById('nav-codex-alert');
+  const row=document.getElementById('nav-codex-alert-row');
   if(!el)return;
-  if(MEMBER_SIMPLE||!(_currentUser&&_currentUser.role==='admin')){el.style.display='none';return}
+  const hide=()=>{el.style.display='none';if(row)row.style.display='none'};
+  if(MEMBER_SIMPLE||!(_currentUser&&_currentUser.role==='admin')){hide();return}
   try{
     const resp=await fetch(BASE+'/api/admin/codex-alerts?include_resolved=0');
-    if(!resp.ok){el.style.display='none';return}
+    if(!resp.ok){hide();return}
     const d=await resp.json();
     const open=d.open||0;
-    if(!open){el.style.display='none';return}
+    if(!open){hide();return}
     const sessions=[...new Set((d.alerts||[]).map(a=>a.session_name==='*'?'all accounts':a.session_name))];
     el.textContent='⚠ '+open+' Codex alert'+(open===1?'':'s');
     el.title='Codex health: '+sessions.slice(0,4).join(', ')+(sessions.length>4?'…':'')+' — click for details';
     el.style.display='';
-  }catch(e){el.style.display='none'}
+    if(row)row.style.display='flex';
+  }catch(e){hide()}
 }
 
 // --- Authoritative ChatGPT-plan usage windows in the nav header ---
@@ -21878,59 +33524,95 @@ function _applyUsageStyle(fillEl,pctNum){
 }
 function _setUsageWindow(slot,windowData){
   const navWrap=document.getElementById('nav-usage-'+slot+'-wrap');
-  const toolsWrap=document.getElementById('tools-usage-'+slot+'-wrap');
   const visible=!!windowData;
+  const top=document.getElementById('plan-'+slot);
+  if(top)top.style.display=visible?'':'none';
   if(navWrap)navWrap.style.display=visible?'':'none';
-  if(toolsWrap)toolsWrap.style.display=visible?'':'none';
   if(!visible)return;
   const label=windowData.label||slot;
   const pct=Math.round(Number(windowData.utilization)||0);
   const reset=windowData.resets_at?_fmtResetTime(windowData.resets_at):'';
   const meta=reset?('resets '+reset):'reset unavailable';
-  for(const prefix of ['nav-usage-','tools-usage-']){
-    const labelEl=document.getElementById(prefix+slot+'-label');
-    const pctEl=document.getElementById(prefix+slot+'-pct');
-    const metaEl=document.getElementById(prefix+slot+'-meta');
-    if(labelEl)labelEl.textContent=label;
-    if(pctEl)pctEl.textContent=pct+'%';
-    if(metaEl)metaEl.textContent=meta;
-    _applyUsageStyle(document.getElementById(prefix+slot+'-fill'),pct);
-  }
+  const labelEl=document.getElementById('nav-usage-'+slot+'-label');
+  const pctEl=document.getElementById('nav-usage-'+slot+'-pct');
+  const metaEl=document.getElementById('nav-usage-'+slot+'-meta');
+  if(labelEl)labelEl.textContent=label;
+  if(pctEl)pctEl.textContent=pct+'%';
+  if(metaEl)metaEl.textContent=meta;
+  _applyUsageStyle(document.getElementById('nav-usage-'+slot+'-fill'),pct);
   const title='Codex '+label+' plan window · '+pct+'% used · '+meta;
   if(navWrap)navWrap.title=title;
-  if(toolsWrap)toolsWrap.title=title;
+  if(top){
+    top.title=title;
+    document.getElementById('plan-'+slot+'-label').textContent=label;
+    document.getElementById('plan-'+slot+'-value').textContent=pct+'%';
+    const meter=document.getElementById('plan-'+slot+'-meter');
+    meter.setAttribute('aria-valuenow',String(Math.min(100,Math.max(0,pct))));
+    meter.setAttribute('aria-valuetext',title);
+    _applyUsageStyle(document.getElementById('plan-'+slot+'-fill'),pct);
+  }
+}
+function _selectUsageCapWindow(windows){
+  return (windows||[]).reduce((longest,current)=>{
+    if(!longest)return current;
+    const currentMinutes=Number(current&&current.duration_minutes)||0;
+    const longestMinutes=Number(longest&&longest.duration_minutes)||0;
+    return currentMinutes>=longestMinutes?current:longest;
+  },null);
+}
+function _setUsageCapSummary(windowData){
+  const wrap=document.getElementById('nav-usage-cap-summary');
+  const value=document.getElementById('nav-usage-cap-value');
+  if(!wrap||!value)return;
+  if(!windowData){
+    value.textContent='—';
+    value.className='stat-val';
+    wrap.title='Codex plan usage cap unavailable';
+    return;
+  }
+  const pct=Math.round(Number(windowData.utilization)||0);
+  const cls=pct>=90?'crit':pct>=70?'warn':'';
+  const reset=windowData.resets_at?_fmtResetTime(windowData.resets_at):'';
+  value.textContent=pct+'%';
+  value.className='stat-val'+(cls?' '+cls:'');
+  wrap.title='Codex '+(windowData.label||'plan')+' cap · '+pct+'% used'+(reset?' · resets '+reset:'');
 }
 async function refreshUsageLimits(){
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
-  const toolsWrap=document.getElementById('nav-tools-usage');
+  const empty=document.getElementById('nav-status-usage-empty');
   if(!wrap)return;
-  const setHasData=(has)=>{
+  const setHasData=(has,message)=>{
     wrap.classList.toggle('has-data',has);
-    if(toolsWrap)toolsWrap.classList.toggle('has-data',has);
+    if(empty){empty.style.display=has?'none':'';if(message)empty.textContent=message}
   };
   try{
     const resp=await fetch(BASE+'/api/usage/limits');
     // Only blank the bars if we have never had data. Once they are showing,
     // a transient failure should leave the last known values on screen.
-    if(!resp.ok){if(!wrap.classList.contains('has-data'))setHasData(false);_scheduleUsageRetry();return}
+    if(!resp.ok){
+      if(!wrap.classList.contains('has-data')){setHasData(false,'Usage limits unavailable.');_setUsageCapSummary(null)}
+      _scheduleUsageRetry();return
+    }
     const data=await resp.json();
     // Platform API keys are pay-as-you-go and do not have ChatGPT plan
     // windows. Hiding the plan bars is intentional; never synthesize quotas.
     if(!data||data.auth_mode!=='chatgpt'){
-      setHasData(false);
+      setHasData(false,'No ChatGPT plan limits available.');
       _setUsageWindow('primary',null);
       _setUsageWindow('secondary',null);
+      _setUsageCapSummary(null);
       return;
     }
     const windows=Array.isArray(data.windows)?data.windows:[];
-    if(!windows.length){setHasData(false);_scheduleUsageRetry();return}
+    if(!windows.length){setHasData(false,'Usage limits unavailable.');_setUsageCapSummary(null);_scheduleUsageRetry();return}
     setHasData(true);
     if(data.stale)_scheduleUsageRetry();
     _setUsageWindow('primary',windows[0]||null);
     _setUsageWindow('secondary',windows[1]||null);
+    _setUsageCapSummary(_selectUsageCapWindow(windows));
   }catch(e){
-    /* keep last known display */
+    if(!wrap.classList.contains('has-data')){setHasData(false,'Usage limits unavailable.');_setUsageCapSummary(null)}
   }
 }
 // When the backend has no fresh number (upstream down or rate-limited) retry in
@@ -21996,73 +33678,195 @@ function startLoginHealthPolling(){
 }
 startLoginHealthPolling();
 
-function closeModal(){document.getElementById('modal-overlay').classList.remove('active');const c=document.getElementById('modal-content');if(c)c.classList.remove('modal-wide')}
+let _recoverTabsRun=0;
+let _sessionCreateRun=0;
+let _closeSessionRun=0;
+function closeModal(){_recoverTabsRun++;_sessionCreateRun++;_closeSessionRun++;document.getElementById('modal-overlay').classList.remove('active');const c=document.getElementById('modal-content');if(c)c.classList.remove('modal-wide')}
 
-function showCreateModal(){
-  const modal=document.getElementById('modal-content');
-  // Members get a name pre-filled with 5 random chars (overridable); admins blank.
-  const pre = MEMBER_SIMPLE ? _randName(5) : '';
-  modal.innerHTML=`
-    <h3>New __BRAND__ session</h3>
-    <p>${MEMBER_SIMPLE ? 'A name is pre-filled — keep it or type your own.' : 'Leave blank for an auto-assigned name, or enter a custom name.'}</p>
-    <input type="text" class="modal-input" id="new-session-name" value="${pre}"
-      placeholder="e.g. my-project" autocomplete="off" spellcheck="false"
-      onkeydown="if(event.key==='Enter')createSession()">
-    <div class="modal-actions">
-      <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-create" id="create-session-btn" onclick="createSession()">Create</button>
-    </div>`;
-  document.getElementById('modal-overlay').classList.add('active');
-  setTimeout(()=>{const i=document.getElementById('new-session-name');if(i){i.focus();i.select();}},50);
+function _recoveryModalOwns(run){
+  return run===_recoverTabsRun&&!!document.getElementById('tab-recovery-job-'+run);
 }
 
-async function createSession(){
-  const input=document.getElementById('new-session-name');
-  const name=input?input.value.trim():'';
+function _recoveryNames(label,names){
+  if(!Array.isArray(names)||!names.length)return'';
+  return '<p class="conn-note"><b>'+esc(label)+':</b> '+names.map(esc).join(', ')+'</p>';
+}
+
+async function recoverTabs(){
+  const run=++_recoverTabsRun;
+  const overlay=document.getElementById('modal-overlay');
   const modal=document.getElementById('modal-content');
-  // Immediately show a loading state so it never looks frozen (the first session
-  // for a member can take a few seconds to provision).
-  if(modal){
-    modal.innerHTML=`<h3>Creating session…</h3>
-      <p class="conn-note">Setting up${name?(' "'+esc(name)+'"'):' your session'}. The first one can take a few seconds — hang tight.</p>
-      <div class="create-spinner"></div>`;
-  }
+  modal.innerHTML='<div id="tab-recovery-job-'+run+'"><h3>Recovering tabs…</h3><p class="conn-note">Checking every saved tab and resuming exact conversations. This can take about a minute. You can close this window; recovery will continue.</p><div class="create-spinner"></div></div>';
+  overlay.classList.add('active');
   try{
-    const resp=await fetch(BASE+'/api/sessions/create',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
+    const started=await fetch(BASE+'/api/admin/sessions/recover',{
+      method:'POST',headers:{'X-Tmux-Recovery':'1'}
     });
-    const data=await resp.json();
-    if(!resp.ok){
-      if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
-        <p class="conn-note">${esc(data.error||'Failed')}</p>
-        <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button>
-        <button class="modal-confirm-create" onclick="showCreateModal()">Try again</button></div>`;}
-      return;
+    const initial=await started.json().catch(()=>({}));
+    if(!started.ok||!initial.job||!initial.job.id)throw new Error(initial.error||'Could not start recovery');
+    let job=initial.job;
+    let transientFailures=0;
+    for(let attempt=0;attempt<240&&['queued','running'].includes(job.status);attempt++){
+      await new Promise(resolve=>setTimeout(resolve,1000));
+      try{
+        const polled=await fetch(BASE+'/api/admin/sessions/recover/'+encodeURIComponent(job.id),{cache:'no-store'});
+        const data=await polled.json().catch(()=>({}));
+        if(polled.status===403||polled.status===404){
+          const error=new Error(data.error||'Recovery status is no longer available');
+          error.permanent=true;
+          throw error;
+        }
+        if(!polled.ok||!data.job)throw new Error(data.error||'Could not read recovery status');
+        job=data.job;
+        transientFailures=0;
+      }catch(error){
+        if(error.permanent)throw error;
+        transientFailures++;
+        if(transientFailures>5)throw new Error('Could not read recovery status after several retries');
+        await new Promise(resolve=>setTimeout(resolve,Math.min(4000,500*transientFailures)));
+      }
     }
-    selectedSession=data.name;
-    closeModal();
+    if(['queued','running'].includes(job.status))throw new Error('Recovery is still running. Close this window and try again shortly.');
+    if(job.status==='failed')throw new Error(job.error||'Tab recovery failed');
+    const ready=Array.isArray(job.ready)?job.ready:[];
+    const pending=Array.isArray(job.pending)?job.pending:[];
+    const recovered=[...new Set([...(job.restored||[]),...(job.restarted||[])])];
+    if(_recoveryModalOwns(run)){
+      modal.innerHTML='<h3>'+(pending.length?'Recovery needs attention':'Tabs are ready')+'</h3>'
+        +'<p class="conn-note">'+ready.length+' saved tab'+(ready.length===1?' is':'s are')+' running.</p>'
+        +_recoveryNames('Recovered',recovered)
+        +_recoveryNames('Already healthy',job.already_ready||[])
+        +_recoveryNames('Still pending',pending)
+        +'<div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button>'
+        +(pending.length?'<button class="modal-confirm-create" onclick="recoverTabs()">Try again</button>':'')+'</div>';
+    }
     await loadAll();
-  }catch(e){
-    if(modal){modal.innerHTML=`<h3>Couldn't create session</h3>
-      <p class="conn-note">Network error — please try again.</p>
-      <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button></div>`;}
+  }catch(error){
+    if(!_recoveryModalOwns(run))return;
+    modal.innerHTML='<h3>Could not recover tabs</h3><p class="conn-note">'+esc(error&&error.message?error.message:'Recovery failed')+'</p>'
+      +'<div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Close</button>'
+      +'<button class="modal-confirm-create" onclick="recoverTabs()">Try again</button></div>';
   }
 }
 
-function _randName(n){const c='abcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;}
-async function createSessionAuto(){
-  for(let attempt=0;attempt<5;attempt++){
-    const name=_randName(5);
+let _sessionCreatePending=false;
+function _autoSessionName(){
+  const chars='abcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes=crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes,b=>chars[b%chars.length]).join('');
+}
+function _sessionCreateModalOwns(run){
+  return run===_sessionCreateRun&&!!document.getElementById('session-create-progress-'+run);
+}
+async function _waitForCreatedSession(name){
+  for(let attempt=0;attempt<30;attempt++){
     try{
-      const resp=await fetch(BASE+'/api/sessions/create',{
-        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-      const data=await resp.json();
-      if(resp.ok){selectedSession=data.name;await loadAll();return}
-      if(resp.status!==409){alert(data.error||'Failed');return}  // collision -> retry
-    }catch(e){alert('Failed to create session.');return}
+      const resp=await fetch(BASE+'/api/session-roster',{cache:'no-store'});
+      const envelope=await resp.json().catch(()=>null);
+      const rows=envelope&&Array.isArray(envelope.sessions)?envelope.sessions:[];
+      if(resp.ok&&envelope&&envelope.authoritative===true&&rows.some(row=>row.name===name&&row.runtime_state!=='recovering')){
+        const ready=await fetch(
+          BASE+'/api/sessions/'+encodeURIComponent(name)+'/uploads',
+          {cache:'no-store'}
+        );
+        if(ready.ok)return true;
+      }
+    }catch(error){}
+    await new Promise(resolve=>setTimeout(resolve,500));
   }
-  alert('Could not create a session — please try again.');
+  return false;
+}
+function showCreateModal(prefill='',choices=null){
+  if(_sessionCreatePending)return;
+  const modal=document.getElementById('modal-content');
+  modal.classList.remove('modal-wide');
+  const selected=choices||NEW_SESSION_DEFAULTS;
+  modal.innerHTML=`<h3>New session</h3>
+    <label for="new-session-name">Session name</label>
+    <input id="new-session-name" type="text" maxlength="128" autocomplete="off" placeholder="e.g. Website updates" value="${esc(prefill)}" style="width:100%;margin:10px 0;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px" onkeydown="if(event.key==='Enter'){event.preventDefault();createSession()}">
+    <p class="conn-note">Leave empty to generate a random name. Automatic naming is optional in Settings.</p>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin:16px 0">
+      <label style="flex:1;min-width:150px" for="new-session-model">Model
+        <select id="new-session-model" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark" onchange="updateNewSessionEfforts()">${MODEL_CHOICES.map(([id,label])=>`<option value="${esc(id)}" ${id===selected.model?'selected':''}>${esc(label)}</option>`).join('')}</select>
+      </label>
+      <label style="flex:1;min-width:110px" for="new-session-effort">Effort
+        <select id="new-session-effort" style="display:block;width:100%;margin-top:6px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;color-scheme:dark"></select>
+      </label>
+    </div>
+    <label style="display:flex;align-items:flex-start;gap:8px" for="new-session-nofb"><input id="new-session-nofb" type="checkbox" ${selected.no_fallback?'checked':''} style="width:auto;margin-top:3px">Refuse automatic model fallback</label>
+    <p class="conn-note">When unchecked, service errors can switch subscription sessions to another available model and continue. Safety, permission and usage limits still stop the request.</p>
+    <p id="session-create-error" role="alert" style="color:#f85149"></p>
+    <div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Cancel</button>
+    <button class="modal-confirm-create" onclick="createSession()">Create</button></div>`;
+  document.getElementById('modal-overlay').classList.add('active');
+  updateNewSessionEfforts(selected.effort);
+  setTimeout(()=>document.getElementById('new-session-name')?.focus(),50);
+}
+function updateNewSessionEfforts(preferred){
+  const model=document.getElementById('new-session-model');
+  const select=document.getElementById('new-session-effort');
+  if(!model||!select)return;
+  const requested=preferred||select.value||'max';
+  const supported=MODEL_EFFORTS[model.value]||[];
+  const ceiling=EFFORT_CHOICES.indexOf(requested);
+  const chosen=supported.includes(requested)?requested:EFFORT_CHOICES.slice(0,ceiling>=0?ceiling+1:6).reverse().find(e=>supported.includes(e));
+  select.innerHTML=supported.map(e=>`<option value="${esc(e)}" ${e===chosen?'selected':''}>${esc(e==='xhigh'?'Extra high':e.charAt(0).toUpperCase()+e.slice(1))}</option>`).join('');
+}
+function createSessionAuto(){showCreateModal()}
+async function createSession(){
+  if(_sessionCreatePending)return;
+  const requested=(document.getElementById('new-session-name')?.value||'').trim();
+  const choices={model:document.getElementById('new-session-model')?.value||NEW_SESSION_DEFAULTS.model,
+    effort:document.getElementById('new-session-effort')?.value||NEW_SESSION_DEFAULTS.effort,
+    no_fallback:!!document.getElementById('new-session-nofb')?.checked};
+  _sessionCreatePending=true;
+  const run=++_sessionCreateRun;
+  const overlay=document.getElementById('modal-overlay');
+  const modal=document.getElementById('modal-content');
+  modal.classList.remove('modal-wide');
+  modal.innerHTML=`<div id="session-create-progress-${run}"><h3>Creating session...</h3>
+    <p class="conn-note">Setting up your session. It will open automatically.</p>
+    <div class="create-spinner"></div></div>`;
+  overlay.classList.add('active');
+  try{
+    let created=null;
+    for(let attempt=0;attempt<5;attempt++){
+      const resp=await fetch(BASE+'/api/sessions/create',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:requested||_autoSessionName(),name_generated:!requested,...choices})
+      });
+      const data=await resp.json().catch(()=>({}));
+      if(!requested&&resp.status===409&&data.code==='name_conflict')continue;
+      if(!resp.ok)throw new Error(data.error||'Failed to create the session.');
+      if(data.ok!==true||typeof data.name!=='string'||!data.name){
+        throw new Error('The server returned an invalid session response. Please log in again.');
+      }
+      created=data;
+      break;
+    }
+    if(!created)throw new Error('Could not allocate a session name. Please try again.');
+    // Select after reconciliation, which may otherwise restore the previous tab.
+    const ready=await _waitForCreatedSession(created.name);
+    await loadAll(created.name);
+    if(_sessionCreateModalOwns(run)){
+      if(!sessions.some(s=>s.name===created.name)){
+        // Creation is authoritative even when the roster is still warming up.
+        sessions.push({name:created.name,status:'idle',messages:[],notes:'',runtime_state:'recovering'});
+        renderNav();
+      }
+      selectSession(created.name);
+      closeModal();
+      if(!ready&&statusInfoEl)statusInfoEl.textContent='Session created. Waiting for Codex to finish starting.';
+    }
+  }catch(error){
+    if(!_sessionCreateModalOwns(run))return;
+    _sessionCreatePending=false;
+    showCreateModal(requested,choices);
+    const errorEl=document.getElementById('session-create-error');
+    if(errorEl)errorEl.textContent=error&&error.message?error.message:'Network error. Please try again.';
+  }finally{
+    _sessionCreatePending=false;
+  }
 }
 
 // ── Connections (Drive / Gmail / Calendar) ──
@@ -22146,25 +33950,40 @@ async function saveGlobalContext(){ return saveGlobalInstructions(); }
 function showDeleteModal(name){
   const modal=document.getElementById('modal-content');
   modal.innerHTML=`
-    <h3>Kill session ${esc(name)}?</h3>
-    <p>This will terminate all processes in this tmux session. Cannot be undone.</p>
+    <h3>Close session ${esc(name)}?</h3>
+    <p>Running work will stop. Saved conversations and project files are kept.</p>
     <div class="modal-actions">
       <button class="modal-cancel" onclick="closeModal()">Cancel</button>
-      <button class="modal-confirm-delete" onclick="deleteSession('${esc(name)}')">Kill Session</button>
+      <button class="modal-confirm-delete" onclick="deleteSession('${esc(name)}')">Close session</button>
     </div>`;
   document.getElementById('modal-overlay').classList.add('active');
 }
 
+function _closeModalOwns(run){
+  return run===_closeSessionRun&&!!document.getElementById('session-close-job-'+run);
+}
+
 async function deleteSession(name){
-  closeModal();
+  const run=++_closeSessionRun;
+  const overlay=document.getElementById('modal-overlay');
+  const modal=document.getElementById('modal-content');
+  modal.innerHTML='<div id="session-close-job-'+run+'"><h3>Closing session…</h3><div class="create-spinner"></div></div>';
+  overlay.classList.add('active');
   try{
-    const resp=await fetch(BASE+'/api/sessions/'+name,{method:'DELETE'});
-    const data=await resp.json();
-    if(!resp.ok){alert(data.error||'Failed');return}
+    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name),{method:'DELETE'});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok||result.ok!==true||result.killed!==name){
+      throw new Error(result.error||'Could not confirm that the session closed.');
+    }
     if(selectedSession===name)selectedSession=null;
     delete chatMessages[name];
-    await loadAll();
-  }catch(e){alert('Failed to kill session.')}
+    if(_closeModalOwns(run))closeModal();
+  }catch(error){
+    if(_closeModalOwns(run)){
+      modal.innerHTML='<h3>Could not confirm session close</h3><p class="conn-note">'+esc(error.message||'Connection interrupted.')+'</p><div class="modal-actions"><button class="modal-cancel" onclick="closeModal()">Dismiss</button><button class="modal-confirm-delete" onclick="loadAll();closeModal()">Refresh tabs</button></div>';
+    }
+  }
+  await loadAll();
 }
 
 // ── Codex Auth ──
@@ -22216,6 +34035,7 @@ function renderAuthIndicator(){
 
 function toggleAuthPanel(event){
   event.stopPropagation();
+  closeStatusMenu();
   const dd=document.getElementById('auth-dropdown');
   dd.classList.toggle('active');
   if(dd.classList.contains('active'))renderAuthPanel();
@@ -22346,21 +34166,29 @@ document.addEventListener('click',function(e){
 });
 
 // ── Interrupt Session ──
-async function interruptSession(name){
+async function interruptSession(name,source){
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/interrupt',{method:'POST'});
+    const resp=await fetch(BASE+'/api/sessions/'+name+'/interrupt',{method:'POST'});
+    if(!resp.ok){
+      const data=await resp.json().catch(()=>({}));
+      throw new Error(data.error||'Failed to stop Codex.');
+    }
+    const target=source==='chat'?'chat':'raw';
+    _restoreSubmittedDraft(name,target);
     appendChatBubble(name,'user','[interrupted]',Date.now()/1000);
+    // An interrupt is not a completed reply and should never ring the bell.
+    delete _completionWatch[name];
     // Clear busy state
     const idx=sessions.findIndex(s=>s.name===name);
     if(idx>=0){sessions[idx].activity_status='idle';sessions[idx].activity_detail=''}
-    lastStatus[name]='idle';
+    trackSessionStatus(name,'idle',true);
     updateStatusPill(name,'idle','');
     toggleInterruptButtons(name,false);
     if(name===selectedSession)updateFavicon('idle');
     // Remove typing indicator
     const chatEl=document.getElementById('chat-'+name);
     if(chatEl){const t=chatEl.querySelector('.chat-typing');if(t)t.remove()}
-  }catch(e){alert('Failed to interrupt session.')}
+  }catch(e){alert(e&&e.message?e.message:'Failed to interrupt session.')}
   // Verify state after a moment
   setTimeout(()=>refreshOne(name),2000);
 }
@@ -22520,24 +34348,27 @@ function stopStatsPolling(){
 
 // ── Auto-push (auto-responder + autopilot watchdog) ──
 let _watchdogTimers={};
+const _watchdogRequests={};
 const AUTOPUSH_TITLES={
-  off:'Off — the dashboard never types into this terminal',
+  off:'Off — no option picking, prompt confirmation, autonomous prompts, or nudges',
   basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
+  basicplus:'Basic + — Basic, plus a fixed keep-alive shortly before the prompt cache goes cold',
   full:'Full — Basic, plus write a "keep going" instruction when Codex pauses before finishing'
 };
 function autopushDesc(mode){
   return ({off:'Off — no auto-typing',
            basic:'Basic — picks options + confirms prompts',
+           basicplus:'Basic + — Basic plus prompt-cache keep-alive',
            full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
 }
-// Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
+// Build the segmented control. `compact` shrinks it for the More dropdown.
 function autopushSeg(name,mode,compact){
   mode=mode||'basic';
   const b=(m,label)=>'<button type="button" class="ap-'+m+(mode===m?' active':'')+'" title="'+
     esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
     esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
-    b('off','Off')+b('basic','Basic')+b('full','Full')+'</div>';
+    b('off','Off')+b('basic','Basic')+b('basicplus','Basic +')+b('full','Full')+'</div>';
 }
 // Reflect a mode across every rendered control for this session (More menu + Info tab).
 function syncAutopushUI(name,mode){
@@ -22551,31 +34382,63 @@ function syncAutopushUI(name,mode){
   const st=document.getElementById('autopush-status-'+name);
   if(st)st.textContent=autopushDesc(mode);
 }
+function setAutopushPending(name,pending){
+  if(pending)_autopushPending.add(name);else _autopushPending.delete(name);
+  document.querySelectorAll('.autopush-seg').forEach(seg=>{
+    if(seg.dataset.name===name)seg.querySelectorAll('button').forEach(btn=>btn.disabled=pending);
+  });
+}
+function setLocalAutopushMode(name,mode){
+  const row=sessions.find(session=>session.name===name);
+  if(row){row.autopush_mode=mode;row.simple_watchdog=mode==='full';}
+}
 async function setAutopush(name,mode){
+  if(_autopushPending.has(name))return;
   const idx=sessions.findIndex(s=>s.name===name);
   const prev=(idx>=0?sessions[idx].autopush_mode:'basic')||'basic';
   if(mode===prev){syncAutopushUI(name,mode);return;}
-  if(idx>=0)sessions[idx].autopush_mode=mode;   // optimistic
+  const clientEpoch=_sessionClientEpoch[name]||0;
+  const request=(_autopushSetRequests[name]||0)+1;
+  _autopushSetRequests[name]=request;
+  const incarnation=_sessionLogicalIncarnation(name);
+  if(!incarnation)return;
+  _autopushRevision.set(name,(_autopushRevision.get(name)||0)+1);
+  setLocalAutopushMode(name,mode);   // optimistic
   syncAutopushUI(name,mode);
+  if(mode!=='full')stopWatchdogPolling(name);
+  setAutopushPending(name,true);
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/autopush',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({mode:mode})
+      body:JSON.stringify({mode:mode,incarnation:incarnation})
     });
     const data=await resp.json();
+    // The response is scoped to the terminal that initiated it. A roster can
+    // replace that terminal under the same display name while the request waits.
+    if((_sessionClientEpoch[name]||0)!==clientEpoch)return;
     if(resp.ok&&data.mode){
-      if(idx>=0)sessions[idx].autopush_mode=data.mode;
+      setLocalAutopushMode(name,data.mode);
       syncAutopushUI(name,data.mode);
       renderWatchdogLog(name,data.log);
       if(data.mode==='full')startWatchdogPolling(name);
       else stopWatchdogPolling(name);
     }else{
-      if(idx>=0)sessions[idx].autopush_mode=prev;
+      setLocalAutopushMode(name,prev);
       syncAutopushUI(name,prev);
     }
   }catch(e){
-    if(idx>=0)sessions[idx].autopush_mode=prev;
-    syncAutopushUI(name,prev);
+    if((_sessionClientEpoch[name]||0)===clientEpoch){
+      setLocalAutopushMode(name,prev);
+      syncAutopushUI(name,prev);
+    }
+  }finally{
+    // A stale request for an old same-name terminal must not unlock or bump a
+    // newer terminal's control while its own POST is still in flight.
+    if((_sessionClientEpoch[name]||0)===clientEpoch&&
+       _autopushSetRequests[name]===request){
+      _autopushRevision.set(name,(_autopushRevision.get(name)||0)+1);
+      setAutopushPending(name,false);
+    }
   }
 }
 function renderWatchdogLog(name,log){
@@ -22599,11 +34462,15 @@ function stopAllWatchdogPolling(){
   Object.keys(_watchdogTimers).forEach(n=>stopWatchdogPolling(n));
 }
 async function loadWatchdogStatus(name){
+  const revision=_autopushRevision.get(name)||0;
+  const clientEpoch=_sessionClientEpoch[name]||0;
+  const request=(_watchdogRequests[name]||0)+1;
+  _watchdogRequests[name]=request;
   try{
     const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/autopush');
     const data=await resp.json();
-    const idx=sessions.findIndex(s=>s.name===name);
-    if(idx>=0)sessions[idx].autopush_mode=data.mode;
+    if(!resp.ok||request!==_watchdogRequests[name]||_autopushPending.has(name)||revision!==(_autopushRevision.get(name)||0)||clientEpoch!==(_sessionClientEpoch[name]||0))return;
+    setLocalAutopushMode(name,data.mode);
     syncAutopushUI(name,data.mode);
     renderWatchdogLog(name,data.log);
   }catch(e){}
@@ -22611,21 +34478,27 @@ async function loadWatchdogStatus(name){
 
 // ── Key Bar + Slash Commands ──
 function buildKeyBar(name,tab){
+  const readingControls=`<div class="terminal-read-controls" aria-label="Terminal reading controls">
+    <button class="key-btn" onclick="readTerminal('last','${esc(name)}')" title="Switch to Terminal and jump to your last message. Click again for earlier messages.">&#8613; My last message</button>
+    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="readTerminal('freeze','${esc(name)}')" title="Switch to Terminal and hold its output still while the session keeps working.">&#10052; Freeze</button>
+    <button class="key-btn" onclick="readTerminal('latest','${esc(name)}')" title="Switch to Terminal and follow the latest output.">&#8595; Latest output</button>
+  </div>`;
   // Simplified team members: no keys/commands — a COMPACT single-row upload
   // control. Keeping the footer short means the terminal gets full height and the
   // page doesn't overflow (page overflow would steal the terminal's scroll).
   if(MEMBER_SIMPLE){
-    return `<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
+    return readingControls+`<div class="key-bar expanded upload-bar" id="keybar-${tab}-${name}" style="border-top:none">
     <div class="upload-drop" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
       ondragleave="this.classList.remove('drag-over')"
       ondrop="handleDrop(event,'${name}','${tab}')"
-      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">Drop files here or click to upload</div>
+      onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">Drop files, paste an image, or click to upload</div>
     <div class="upload-progress" id="upload-progress-${tab}-${name}">
       <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
       <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
     </div>
     <div class="uploaded-files" id="uploaded-files-${tab}-${name}"></div>
+    <div class="key-saved" id="keysaved-${tab}-${name}"></div>
   </div>`;
   }
   const id='keybar-'+tab+'-'+name;
@@ -22646,13 +34519,13 @@ function buildKeyBar(name,tab){
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-d'])" title="Ctrl+D — EOF">Ctrl+D</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['C-l'])" title="Ctrl+L — clear">Ctrl+L</button>
-    ${tab==='raw'?`<span class="key-bar-sep"></span>
-    <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>`:''}
+    ${readingControls}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/new')" title="New conversation">/new</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/status')" title="Session status & usage">/status</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/plan')" title="Switch to Plan mode">/plan</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/model gpt-5.4-mini')" title="Switch to GPT-5.4-mini">/model mini</button>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
@@ -22660,7 +34533,7 @@ function buildKeyBar(name,tab){
       ondrop="handleDrop(event,'${name}','${tab}')"
       onclick="_uploadTab['${name}']='${tab}';document.getElementById('upload-${tab==='raw'?'raw-':''}${name}').click()">
       <div class="drop-zone-icon">&#x1F4C2;</div>
-      <div class="drop-zone-text">Drop files here or click to upload</div>
+      <div class="drop-zone-text">Drop files, paste an image, or click to upload</div>
       <div class="upload-progress" id="upload-progress-${tab}-${name}">
         <div class="upload-progress-filename" id="upload-progress-name-${tab}-${name}"></div>
         <div class="upload-progress-bar"><div class="upload-progress-fill" id="upload-progress-fill-${tab}-${name}"></div></div>
@@ -22820,9 +34693,64 @@ function _savedFileRow(p,disambiguate,sessionName){
   r.appendChild(_savedCopyBtn(p));
   return r;
 }
+const _savedProjectItems={};
+const _savedProjectRequests={};
+const _savedProjectFetchedAt={};
+const _savedProjectRetryTimers={};
+function _savedProjectOwnerMatches(name,request){
+  return sessions.some(s=>s.name===name)
+    &&(_sessionClientEpoch[name]||0)===request.epoch
+    &&_sessionLogicalIncarnation(name)===request.incarnation;
+}
+function _clearSavedProjectState(name){
+  const request=_savedProjectRequests[name];
+  delete _savedProjectRequests[name];
+  if(request)request.controller.abort();
+  clearTimeout(_savedProjectRetryTimers[name]);
+  delete _savedProjectRetryTimers[name];
+  delete _savedProjectItems[name];
+  delete _savedProjectFetchedAt[name];
+}
+async function refreshSavedProjectItems(name,force=false){
+  if(!name||document.hidden||!sessions.some(s=>s.name===name)||_savedProjectRequests[name]
+    ||(!force&&Date.now()-(_savedProjectFetchedAt[name]||0)<14000))return;
+  const request={epoch:_sessionClientEpoch[name]||0,incarnation:_sessionLogicalIncarnation(name),controller:new AbortController()};
+  _savedProjectRequests[name]=request;
+  clearTimeout(_savedProjectRetryTimers[name]);
+  delete _savedProjectRetryTimers[name];
+  const timeout=setTimeout(()=>request.controller.abort(),8000);
+  try{
+    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/saved-items',{
+      cache:'no-store',signal:request.controller.signal});
+    if(!response.ok)return;
+    const data=await response.json();
+    if(_savedProjectRequests[name]!==request||!_savedProjectOwnerMatches(name,request))return;
+    const strings=value=>Array.isArray(value)?value.filter(item=>typeof item==='string').slice(0,500):[];
+    _savedProjectFetchedAt[name]=Date.now();
+    _savedProjectItems[name]={
+      urls:strings(data.urls).filter(url=>/^https?:\/\//i.test(url)),
+      creds:Array.isArray(data.creds)?data.creds.filter(item=>item&&typeof item.value==='string')
+        .slice(0,500).map(item=>({label:typeof item.label==='string'?item.label:'',value:item.value})):[],
+      files:strings(data.files).filter(path=>/^(\/|~\/)/.test(path)),
+    };
+    renderSavedKeys(name);
+    if(data.catching_up){
+      _savedProjectRetryTimers[name]=setTimeout(()=>{
+        delete _savedProjectRetryTimers[name];
+        if(_savedProjectOwnerMatches(name,request)&&selectedSession===name)refreshSavedProjectItems(name,true);
+      },1000);
+    }
+  }catch(error){}
+  finally{
+    clearTimeout(timeout);
+    if(_savedProjectRequests[name]===request)delete _savedProjectRequests[name];
+  }
+}
+setInterval(()=>{if(!document.hidden&&selectedSession)refreshSavedProjectItems(selectedSession)},15000);
 function renderSavedKeys(name,sessionObj){
   const s=sessionObj||sessions.find(x=>x.name===name);
-  const info=s?parseKeyInfo(s.notes||'',s):{urls:[],creds:[],files:[]};
+  // The server owns durable saved items; never replace them with a partial note recap.
+  const info=_savedProjectItems[name]||{urls:[],creds:[],files:[]};
   // Basenames that collide across kept files → show the parent dir to tell apart.
   const baseCount={};
   info.files.forEach(p=>{const b=p.replace(/\/+$/,'').split('/').pop();baseCount[b]=(baseCount[b]||0)+1});
@@ -22851,7 +34779,7 @@ function renderSavedKeys(name,sessionObj){
     if(!total){
       const empty=document.createElement('div');
       empty.className='key-saved-empty';
-      empty.textContent='No project URLs, credentials or files captured yet — press "Full" on the Info tab to extract them.';
+      empty.textContent='Links, usernames, passwords and files shared in this session are saved here automatically.';
       body.appendChild(empty);
     }else{
       if(info.urls.length)body.appendChild(_savedGroup('URLs',info.urls.map(u=>_savedLinkRow(u,u))));
@@ -23191,7 +35119,7 @@ async function applyRoleVisibility(){
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
-  const whoamiEl = document.getElementById('nav-tools-whoami');
+  const whoamiEl = document.getElementById('nav-status-whoami');
   if(whoamiEl && _currentUser){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
     whoamiEl.textContent = 'Signed in as ' + (_currentUser.username||'?') + role;
@@ -23199,9 +35127,7 @@ async function applyRoleVisibility(){
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
-  // Which widgets the phone strip can show depends on the role we just learned.
-  syncMobileBottomBar();
-  if(isAdmin) startBrowserAuthPolling();
+  if(_currentUser) startBrowserAuthPolling();
 }
 
 async function doLogout(){
@@ -23240,6 +35166,7 @@ function renderSettingsTabs(){
   const tabsEl = document.getElementById('settings-tabs');
   const isAdmin = !!(_currentUser && _currentUser.role === 'admin');
   const tabs = [
+    {id:'preferences', label:'Preferences'},
     {id:'mycontext', label:'My Context'},
     {id:'history',   label:'History'},
     {id:'browser',   label:'Browser'},
@@ -23260,9 +35187,40 @@ function switchSettingsTab(tab){
   renderSettingsContent();
 }
 
+let _preferencesRevision=0;
+async function loadPreferences(){
+  const revision=++_preferencesRevision,owner=String(_currentUser?.id||'');
+  const el=document.getElementById('settings-content');
+  el.innerHTML='<div class="settings-section">Loading preferences...</div>';
+  try{
+    const response=await fetch(BASE+'/api/preferences',{cache:'no-store'});
+    if(!response.ok)throw new Error('Could not load preferences');
+    const data=await response.json();
+    if(revision!==_preferencesRevision||owner!==String(_currentUser?.id||'')||_settingsActiveTab!=='preferences')return;
+    el.innerHTML=`<div class="settings-section"><label><input type="checkbox" id="auto-session-names" ${data.auto_session_names?'checked':''} onchange="saveNamingPreference(this)"> Automatically name sessions based on their content</label>
+      <p class="conn-note">When enabled, longer requests can update automatic tab labels. Names you choose manually are kept. Turn this off to keep the session’s original name.</p>
+      <p id="naming-preference-status" role="status"></p></div>`;
+  }catch(error){if(revision===_preferencesRevision&&owner===String(_currentUser?.id||'')&&_settingsActiveTab==='preferences')el.textContent=error.message}
+}
+async function saveNamingPreference(input){
+  const checked=input.checked,owner=String(_currentUser?.id||'');
+  input.disabled=true;
+  const status=document.getElementById('naming-preference-status');
+  try{
+    const response=await fetch(BASE+'/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_session_names:checked})});
+    if(!response.ok)throw new Error('Could not save. Please try again.');
+    if(owner!==String(_currentUser?.id||''))return;
+    if(status&&document.getElementById('auto-session-names')===input)status.textContent='Saved for your account.';
+    await loadAll();
+  }catch(error){input.checked=!checked;if(status)status.textContent=error.message}
+  finally{input.disabled=false}
+}
+
 function renderSettingsContent(){
   const el = document.getElementById('settings-content');
-  if(_settingsActiveTab === 'mycontext'){
+  if(_settingsActiveTab === 'preferences'){
+    loadPreferences();
+  }else if(_settingsActiveTab === 'mycontext'){
     el.innerHTML = '<div class="settings-section"><div class="pf-banner">Loading...</div></div>';
     loadMyContext();
   }else if(_settingsActiveTab === 'global'){
@@ -23296,29 +35254,43 @@ function renderSettingsContent(){
 // --- Header browser-session badge ------------------------------------------
 let _browserAuth = null;
 let _browserAuthTimer = null;
+let _browserBadgeRequest = null;
 
 async function refreshBrowserAuthBadge(){
   if(document.hidden)return;
-  const el = document.getElementById('nav-browser-badge');
-  if(!el) return;
-  if(!(_currentUser && _currentUser.role === 'admin')){ el.style.display='none'; return; }
-  let d;
+  const el=document.getElementById('nav-browser-badge');
+  if(!el)return;
+  if(_browserBadgeRequest)_browserBadgeRequest.controller.abort();
+  const request={owner:String(_currentUser?.id||''),controller:new AbortController()};
+  _browserBadgeRequest=request;
+  const current=()=>_browserBadgeRequest===request&&request.owner===String(_currentUser?.id||'');
+  const timeout=setTimeout(()=>request.controller.abort(),8000);
+  el.style.display='inline-flex';
+  let browser=null,unavailable=false;
   try{
-    const r = await fetch(BASE+'/api/browser/sessions');
-    if(!r.ok){ el.style.display='none'; return; }
-    d = await r.json();
-  }catch(e){ return; }
-  _browserAuth = d;
-  el.style.display = 'inline-flex';
-  el.classList.remove('ok','bad','active','unknown');
-  const running=(d.sessions||[]).filter(s=>s.running).length;
-  el.classList.add(running?'ok':'unknown');
-  el.title=running
-    ? running+' browser session'+(running===1?' is':'s are')+' running. Click to manage.'
-    : 'No browser sessions are running. Click to manage.';
+    const admin=!!(_currentUser&&_currentUser.role==='admin');
+    const response=await fetch(BASE+(admin?'/api/browser/sessions':'/api/my/browser'),{
+      cache:'no-store',signal:request.controller.signal});
+    if(!response.ok)throw new Error('Browser status unavailable');
+    const data=await response.json();
+    if(!current())return;
+    _browserAuth=data;
+    const rows=Array.isArray(data.sessions)?data.sessions:[];
+    browser=data.browser||rows.find(s=>s.id==='default')||rows.find(s=>s.account_browser)||rows[0]||null;
+  }catch(error){unavailable=true}
+  finally{clearTimeout(timeout)}
+  if(!current())return;
+  _browserBadgeRequest=null;
+  const connected=!!(browser&&(browser.connected??browser.running));
+  const working=connected&&Number(browser.active_leases)>0;
+  el.classList.remove('ok','bad','warn','active','unknown','busy','working');
+  el.classList.add(unavailable?'unknown':working?'working':connected?'ok':'bad');
+  el.title=unavailable?'Browser status unavailable':working?'Browser working now':connected?'Browser connected':'Browser not connected';
+  el.setAttribute('aria-label',el.title);
 }
 
 function onBrowserBadgeClick(){
+  closeStatusMenu();
   openSettings('browser');
 }
 
@@ -23540,9 +35512,10 @@ async function saveBrowserProxy(){
 }
 
 async function toggleBrowserProxy(on){
+  if(on&&!confirm('Has a direct connection failed? Enable the proxy only after a direct attempt has failed.'))return;
   try{
     const r = await fetch(BASE+'/api/browser/proxy',{method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:!!on})});
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:!!on,direct_failed:!!on})});
     const d = await r.json();
     if(!r.ok){ alert(d.error||'Failed'); return; }
   }catch(e){ alert('Failed: '+e.message); return; }
@@ -24215,6 +36188,9 @@ const USERS_ROUTE='#/users';
 let _groupsCache=[];
 let _usersCache=[];
 let _usersSearch='';
+let _usersUsagePeriod='all';
+let _usersLoadRevision=0;
+const USER_USAGE_OPTIONS=[['today','Today'],['2','Last 2 days'],['5','Last 5 days'],['7','Last 7 days'],['all','All time']];
 let _usersDetailData=null;
 let _usersDetailTab='overview';
 let _usersHistoryTranscript=null;
@@ -24296,24 +36272,33 @@ function backToUsers(){
 }
 
 async function loadUsersAdmin(){
+  const revision=++_usersLoadRevision;
   const content=document.getElementById('users-content');
   if(!content)return;
   content.innerHTML='<div class="history-empty">Loading users...</div>';
   try{
     const [usersResp,groupsResp]=await Promise.all([
-      fetch(BASE+'/api/admin/users'),
+      fetch(BASE+'/api/admin/users?usage_period='+encodeURIComponent(_usersUsagePeriod)),
       fetch(BASE+'/api/admin/groups'),
     ]);
     const usersData=await usersResp.json();
     const groupsData=await groupsResp.json();
+    if(revision!==_usersLoadRevision)return;
     if(!usersResp.ok)throw new Error(usersData.error||'Failed to load users');
     if(!groupsResp.ok)throw new Error(groupsData.error||'Failed to load permission groups');
     _usersCache=usersData.users||[];
     _groupsCache=groupsData.groups||[];
     renderUsersAdmin();
   }catch(e){
+    if(revision!==_usersLoadRevision)return;
     content.innerHTML='<div class="history-empty" style="color:#f85149">Failed to load users: '+esc(e.message||e)+'</div>';
   }
+}
+
+function setUsersUsagePeriod(value){
+  if(!USER_USAGE_OPTIONS.some(([key])=>key===value))return;
+  _usersUsagePeriod=value;
+  return loadUsersAdmin();
 }
 
 function filterUsers(value){
@@ -24394,6 +36379,8 @@ function renderUsersAdmin(){
     </div>
     <div class="users-toolbar">
       <input type="search" value="${esc(_usersSearch)}" placeholder="Search users, email, role, or group" oninput="filterUsers(this.value)">
+      <label for="users-usage-period">Usage</label>
+      <select id="users-usage-period" aria-label="Usage period" onchange="setUsersUsagePeriod(this.value)">${USER_USAGE_OPTIONS.map(([key,label])=>`<option value="${key}" ${key===_usersUsagePeriod?'selected':''}>${label}</option>`).join('')}</select>
       <span class="users-count">${users.length} of ${_usersCache.length} users</span>
       <button class="users-plain-btn" onclick="loadUsersAdmin()">Refresh</button>
       <div class="users-column-wrap">
@@ -24401,6 +36388,7 @@ function renderUsersAdmin(){
         <div class="users-column-menu" id="users-column-menu" onclick="event.stopPropagation()">${columnChecks}</div>
       </div>
     </div>
+    <div class="panel-hint">Prompt and token totals: ${USER_USAGE_OPTIONS.find(([key])=>key===_usersUsagePeriod)[1]}. Today starts at midnight UTC; other day ranges cover the preceding days.</div>
     <div class="users-table-shell">
       <div class="users-top-scroll" id="users-top-scroll"><div class="users-top-scroll-inner" id="users-top-scroll-inner"></div></div>
       <div class="users-table-scroll" id="users-table-scroll">
@@ -25042,6 +37030,7 @@ function closeClaudeMd(){
 
 // ── Stats Window ──
 async function openStats(){
+  closeStatusMenu();
   const overlay=document.getElementById('stats-overlay');
   overlay.classList.add('active');
   document.getElementById('stats-content').innerHTML='<div style="text-align:center;color:#8b949e;padding:20px"><span class="spinner"></span> Loading stats...</div>';
@@ -25106,6 +37095,9 @@ function renderStats(s,usage,byUser,alerts){
   }
   if(s.cpu_percent!=null){
     html+='<div class="stats-row"><span class="stats-row-label">CPU Usage</span><span class="stats-row-value">'+s.cpu_percent+'% ('+s.cpu_count+' CPUs)</span></div>';
+  }
+  if(s.cpu_iowait_percent!=null){
+    html+='<div class="stats-row"><span class="stats-row-label">CPU I/O Wait</span><span class="stats-row-value">'+s.cpu_iowait_percent+'%</span></div>';
   }
   if(s.threads_running!=null){
     html+='<div class="stats-row"><span class="stats-row-label">Threads</span><span class="stats-row-value">'+s.threads_running+' running / '+s.threads_total+' total</span></div>';
@@ -25211,72 +37203,38 @@ function renderStats(s,usage,byUser,alerts){
 function closeStats(){
   document.getElementById('stats-overlay').classList.remove('active');
 }
-
-// ── Phone layout: header status widgets move to the bottom ──────────────────
-// On a phone the header has room for the project switcher and about two session
-// tabs, and the tabs are the thing you actually navigate with. The browser
-// badge, the 5h/7d usage bars and the CPU/RAM readout are all glance-only, so on
-// a narrow screen they move to a strip at the very bottom of the page — below
-// the terminal and the upload area.
-//
-// The ELEMENTS are moved, not cloned. Every poller writes by id
-// (#nav-usage-5h-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
-// have meant either dead widgets or a second set of updaters to keep in step.
-const _BOTTOM_BAR_IDS=['nav-browser-badge','nav-usage','nav-server-stats'];
-function syncMobileBottomBar(){
-  const bar=document.getElementById('mobile-bottom-bar');
-  const right=document.querySelector('.nav-right');
-  if(!bar||!right)return;
-  // The header's original child order, captured once before anything moves.
-  // Restoring by replaying this list is deterministic; restoring with
-  // insertBefore(el, el.nextSibling) is not — an anchor can still be sitting in
-  // the bar when the element that needs it comes back, and the two widgets end
-  // up swapped after a rotate-and-rotate-back.
-  if(!right._navOrder)right._navOrder=[].slice.call(right.children);
-  const narrow=window.matchMedia?window.matchMedia('(max-width:768px)').matches:(innerWidth<=768);
-  _BOTTOM_BAR_IDS.forEach(id=>{
-    const el=document.getElementById(id);
-    if(!el)return;
-    if(narrow){
-      if(el.parentNode!==bar)bar.appendChild(el);
-    }else if(el.parentNode===bar){
-      right.appendChild(el);
-    }
-  });
-  // appendChild on a node already in the parent MOVES it, so replaying the
-  // recorded order puts everything back exactly where it started.
-  if(!narrow)right._navOrder.forEach(c=>{if(c.parentNode===right)right.appendChild(c)});
-  // A simplified team member sees none of these three, and an empty strip is
-  // still a bordered 40px band at the foot of the page. Show the bar with the
-  // class on, measure, then keep the class only if something actually rendered.
-  bar.classList.add('has-items');
-  if(!narrow||![].some.call(bar.children,c=>c.getBoundingClientRect().width>0))
-    bar.classList.remove('has-items');
-}
-if(window.matchMedia){
-  const _mq=window.matchMedia('(max-width:768px)');
-  if(_mq.addEventListener)_mq.addEventListener('change',syncMobileBottomBar);
-  else if(_mq.addListener)_mq.addListener(syncMobileBottomBar);
-}
-window.addEventListener('resize',syncMobileBottomBar);
-window.addEventListener('orientationchange',syncMobileBottomBar);
-
-syncMobileBottomBar();
 async function bootstrapDashboard(){
   await bootstrapImpersonation();
   await loadCurrentUser();
   await applyRoleVisibility();
   await handleAppRoute();
-  loadAll();
+  let bugSession='';
+  try{
+    const url=new URL(window.location.href);
+    bugSession=url.searchParams.get('bug_session')||'';
+    const sendUncertain=url.searchParams.get('bug_send')==='uncertain';
+    if(bugSession){
+      url.searchParams.delete('bug_session');url.searchParams.delete('bug_send');
+      history.replaceState(null,'',url.pathname+url.search+url.hash);
+      if(sendUncertain)setTimeout(function(){alert('The Codex session was created, but submission could not be confirmed. Inspect this session before retrying the report.');},250);
+    }
+  }catch(e){}
+  await loadAll(bugSession||_sessionRouteName());
+  if(!location.hash&&selectedSession){
+    history.replaceState(null,'',location.pathname+location.search+'#/session/'+encodeURIComponent(selectedSession));
+  }
   checkCodexAuth();
 }
 bootstrapDashboard();
 </script>
+<script src="__ROOT_PATH__/voice-mode.js" defer></script>
 </body></html>
 """
 
 # Inject the actual ROOT_PATH into the JS BASE variable
 HTML_PAGE = HTML_PAGE.replace("__ROOT_PATH__", ROOT_PATH)
+# One definition of "approaching cold", shared by the page and the loop.
+HTML_PAGE = HTML_PAGE.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
 HTML_PAGE = HTML_PAGE.replace("__BRAND__", BRAND_NAME)
 LOGIN_PAGE = LOGIN_PAGE.replace("__ROOT_PATH__", ROOT_PATH) if "__ROOT_PATH__" in LOGIN_PAGE else LOGIN_PAGE
 LOGIN_PAGE = LOGIN_PAGE.replace("__BRAND__", BRAND_NAME)
@@ -25395,6 +37353,16 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
     return FileResponse(str(target), media_type=mime)
 
 
+async def _watch_trusted_main(stop: asyncio.Event) -> None:
+    """Stop an orphaned controller promptly if its combined main process dies."""
+    while not stop.is_set():
+        if not _trusted_main_alive():
+            logger.error("Trusted dashboard main process exited; stopping controller")
+            stop.set()
+            return
+        await asyncio.sleep(1)
+
+
 async def _controller_forever() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -25403,8 +37371,17 @@ async def _controller_forever() -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
-    async with lifespan(app):
-        await stop.wait()
+
+    parent_watch = None
+    if TRUSTED_MAIN_PID > 1:
+        parent_watch = asyncio.create_task(_watch_trusted_main(stop))
+    try:
+        async with lifespan(app):
+            await stop.wait()
+    finally:
+        if parent_watch is not None:
+            parent_watch.cancel()
+            await asyncio.gather(parent_watch, return_exceptions=True)
 
 
 def _run_api_server(workers: int) -> None:
@@ -25418,14 +37395,95 @@ def _run_api_server(workers: int) -> None:
     # so a Ping/Pong flows every 25s and every hop keeps the tunnel open. The
     # generous ping_timeout avoids killing a healthy viewer over one late pong.
     try:
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers,
+        uvicorn.run("app:app", host=API_HOST, port=PORT, workers=workers,
                     ws="websockets", ws_ping_interval=25, ws_ping_timeout=120)
     except (ValueError, ImportError, KeyError):
         # The legacy implementation is deprecated upstream; if a future uvicorn
         # drops it, fall back to the default rather than failing to boot.
         logger.warning("uvicorn ws='websockets' unavailable — falling back to the default "
                        "implementation (WebSocket keepalive pings will be disabled)")
-        uvicorn.run("app:app", host="0.0.0.0", port=PORT, workers=workers)
+        uvicorn.run("app:app", host=API_HOST, port=PORT, workers=workers)
+
+
+def _configured_web_workers() -> int:
+    try:
+        configured = int(os.environ.get("TMUX_DASH_WEB_WORKERS", "2"))
+    except ValueError:
+        logger.warning("Invalid TMUX_DASH_WEB_WORKERS; using 2")
+        configured = 2
+    return max(2, min(8, configured))
+
+
+def _wait_for_controller_ready(controller, timeout: float = 30.0) -> None:
+    """Wait for an authenticated ping before exposing API workers."""
+    deadline = time.monotonic() + max(1.0, timeout)
+    last_error = "controller did not become ready"
+    while time.monotonic() < deadline:
+        if controller.poll() is not None:
+            raise RuntimeError("lifecycle controller exited during startup")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.settimeout(0.5)
+                client_socket.connect(str(CONTROLLER_SOCKET))
+                client_socket.sendall(b'{"op":"ping"}\n')
+                response = json.loads(client_socket.recv(4096).decode("utf-8", "replace"))
+                if (
+                    response.get("ok")
+                    and int(response.get("pid") or 0) == int(controller.pid)
+                    and response.get("role") == "controller"
+                ):
+                    return
+                last_error = str(
+                    response.get("error")
+                    or "controller socket belongs to a different process"
+                )
+        except (OSError, ValueError) as exc:
+            last_error = str(exc)
+        time.sleep(0.1)
+    raise RuntimeError("lifecycle controller readiness timed out: " + last_error)
+
+
+def _run_combined_server() -> None:
+    """Run one lifecycle controller beside the configurable API worker pool."""
+    workers = _configured_web_workers()
+    main_pid = os.getpid()
+    try:
+        _parent, main_start = _proc_parent_and_start(main_pid)
+    except (OSError, ValueError):
+        main_start = ""
+    controller_env = os.environ.copy()
+    controller_env["TMUX_DASH_PROCESS_ROLE"] = "controller"
+    controller_env["TMUX_DASH_TRUSTED_MAIN_PID"] = str(main_pid)
+    controller_env["TMUX_DASH_TRUSTED_MAIN_START"] = main_start
+    controller = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve())],
+        env=controller_env,
+        start_new_session=True,
+    )
+    os.environ["TMUX_DASH_PROCESS_ROLE"] = "api"
+    os.environ["TMUX_DASH_TRUSTED_MAIN_PID"] = str(main_pid)
+    os.environ["TMUX_DASH_TRUSTED_MAIN_START"] = main_start
+    controller_stopping = threading.Event()
+
+    def watch_controller() -> None:
+        code = controller.wait()
+        if not controller_stopping.is_set():
+            logger.error("Lifecycle controller exited unexpectedly with code %s", code)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        _wait_for_controller_ready(controller)
+        threading.Thread(target=watch_controller, daemon=True).start()
+        _run_api_server(workers)
+    finally:
+        controller_stopping.set()
+        if controller.poll() is None:
+            controller.terminate()
+            try:
+                controller.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                controller.kill()
+                controller.wait(timeout=5)
 
 
 if __name__ == "__main__":
@@ -25434,34 +37492,4 @@ if __name__ == "__main__":
     elif PROCESS_ROLE == "api":
         _run_api_server(1)
     else:
-        # One controller owns watchdogs, lifecycle and tmux readers. Uvicorn's
-        # workers are stateless HTTP/WebSocket relays and can scale independently.
-        workers = max(2, min(8, int(os.environ.get("TMUX_DASH_WEB_WORKERS", "2"))))
-        controller_env = os.environ.copy()
-        controller_env["TMUX_DASH_PROCESS_ROLE"] = "controller"
-        controller = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve())],
-            env=controller_env,
-            start_new_session=True,
-        )
-        os.environ["TMUX_DASH_PROCESS_ROLE"] = "api"
-        controller_stopping = threading.Event()
-
-        def watch_controller() -> None:
-            code = controller.wait()
-            if not controller_stopping.is_set():
-                logger.error("Lifecycle controller exited unexpectedly with code %s", code)
-                os.kill(os.getpid(), signal.SIGTERM)
-
-        threading.Thread(target=watch_controller, daemon=True).start()
-        try:
-            _run_api_server(workers)
-        finally:
-            controller_stopping.set()
-            if controller.poll() is None:
-                controller.terminate()
-                try:
-                    controller.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    controller.kill()
-                    controller.wait(timeout=5)
+        _run_combined_server()

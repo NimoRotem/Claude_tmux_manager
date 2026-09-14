@@ -1,6 +1,6 @@
 # Claude tmux Manager
 
-A single-file FastAPI web app that turns every `tmux` session on your box into a fully manageable workspace in the browser — built specifically for orchestrating multiple concurrent **Claude Code** sessions.
+A FastAPI web app that turns owner-scoped `tmux` coding sessions into manageable browser workspaces for **Codex and Claude Code**.
 
 ![Claude tmux Manager dashboard](screenshots/tmux-screenshot.png)
 
@@ -8,14 +8,52 @@ A single-file FastAPI web app that turns every `tmux` session on your box into a
 
 Claude Code runs beautifully inside a `tmux` session, but once you start juggling five or ten of them across different projects, the terminal stops scaling. This dashboard gives you:
 
-- A **tabbed view of every session** with live terminal output and a parallel chat transcript
+- A **tabbed view of every session** with live terminal output and a compact, two-sided chat
+- A pinned green **New session** button on phones, beside settings and outside the scrolling tabs
+- A shared Chat/Terminal composer with dictation and a separate **Voice Mode** icon
+- Persistent session labels, account naming preferences, and a private **Saved for this project** drawer for links, credentials, and files
 - **AI-generated titles, descriptions, and progress summaries** (OpenAI) so you know what each session is doing at a glance
 - **System stats**, per-session cost, token usage, idle detection, context-window warnings, and activity sparklines
 - **Keyboard-first navigation** — rename, snooze, duplicate, reorder, mark-done, send-to-all, interrupt, cycle sessions, and more
 - **File upload**, **CLAUDE.md viewer/editor** (home-dir-scoped, path-traversal protected), **sticky notes**, **message bookmarks**, **quick-reply templates**, toast notifications, and sound alerts
 - **Hardened auth** — HMAC session cookie, rate-limited login, CSP/HSTS/Permissions-Policy headers, session-name validation before any shell call
 
-It's a single Python file with no database — everything persists as JSON under `~/.tmux-dashboard/`.
+The application uses Python modules and browser-native JavaScript, with no frontend build step. Dashboard state persists in private JSON files.
+
+## Chat view
+
+Chat is the default view for everyone, including admins. Switch to Terminal any time.
+Both views share the same message input, including unsent text and attachments.
+A common bottom status bar shows activity, last-turn duration, cumulative session
+tokens, and context usage. Missing measurements appear as unavailable, not zero.
+Chat shows your messages on the right and short assistant replies on the left.
+Replies use a few plain-language sentences, without code or tool logs. Longer
+explanations stay collapsed behind **Read more**; use Terminal for technical output.
+
+During long tasks, new useful assistant output produces a separate progress
+message about every 20 minutes. Unchanged output does not create repeated updates.
+The completed turn gets its own final reply, preserving earlier progress messages.
+Progress collection continues while the browser is closed, and saved chat history
+is restored when you return. If the summarizer is unavailable, concise excerpts of
+the assistant's own prose keep replies visible without inventing results.
+
+## Voice and session controls
+
+The composer microphone records dictation and becomes Send when text or attachments
+are present. The adjacent waveform opens live, two-way Voice Mode. Connecting voice
+does not restart or resume coding work. Microphone permission is explicit, and
+dictation and live voice cannot capture simultaneously.
+
+Managed supervision and the three-minute pre-test check-in are separate advanced
+options, disabled by default. Supervision requires explicit restart acknowledgement.
+The optional check-in never grants deployment consent or bypasses project approvals.
+An explicit tool hold survives End and disconnect. Reconnect and select **Release
+existing tool hold** to release it without restarting or sending new work.
+
+Close session directly stops that session's running work. The tab disappears only
+after the server confirms deletion; closing does not generate an archive or rewrite
+project documentation. See [the technical specification](TECHNICAL_SPEC.md) for
+identity, persistence, privacy, and browser-routing contracts.
 
 ## Prerequisites
 
