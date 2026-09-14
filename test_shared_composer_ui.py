@@ -277,7 +277,7 @@ const context=vm.createContext({
   autopushSeg:()=>'',autopushDesc:()=>'',idleNudgeSeg:()=>'',getCleanViewPref:()=>true,
   CLEAN_VIEW_ON:'On',CLEAN_VIEW_OFF:'Off',statusLabel:()=> 'Idle',
   renderChatBubbles:()=>'',getTerminalHeight:()=>'',buildKeyBar:()=>'',timeAgo:()=>'',
-  _COMPOSER_MIC_SVG:'',
+  _COMPOSER_MIC_SVG:'',_COMPOSER_VOICE_SVG:'',
 });
 if(start<0||end<0)throw new Error('Missing renderDetail template boundary');
 vm.runInContext(js.slice(start,end),context);

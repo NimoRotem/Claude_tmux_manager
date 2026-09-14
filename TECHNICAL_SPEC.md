@@ -30,3 +30,12 @@ If capture, archive, spec persistence, verification, or identity checks fail, th
 ## Session knowledge log
 
 Entries below are managed by the dashboard when sessions close. Existing entries are never removed; a retry for the same lifecycle generation replaces only its matching marker block.
+
+## Voice conversation
+
+- Chat and Terminal share one composer and status strip. Dictation uses the microphone icon when the composer is empty; typed text or attachments change it to Send. An adjacent waveform icon opens live, two-way Voice Mode without replacing the draft.
+- Voice connects only after an explicit user action and microphone permission. Dictation and Voice Mode cannot hold the microphone simultaneously, including while a permission request is pending. Closing voice, removing its session, or leaving the page releases media and connections. Switching Chat and Terminal preserves the shared composer.
+- Browser audio travels over WebRTC. Session creation and delegated application controls use authenticated, same-origin server routes. The OpenAI credential remains server-side. Audio and voice transcripts are not persisted by the dashboard; approved instructions become ordinary messages in the coding conversation. Diagnostic storage contains bounded transport metadata only.
+- Voice history and actions are bound to the signed-in owner and the exact session generation and conversation root. Mutations revalidate that binding under the existing session operation lock. Passive progress information does not grant permission to send instructions or interrupt work.
+- Connecting or ending voice does not restart the coding worker, send setup or continuation prompts, change autonomous modes, or create testing or deployment permissions. Explicit voice directions follow the same delivery and approval rules as typed directions. An interruption is reported according to the server's observed result, not as a durable hold on future work.
+- Voice supports continuous listening and push-to-talk, mute, and opt-in updates from other sessions belonging to the same owner. Disconnection stops voice transport, not the coding task. A fresh connection must revalidate the session before resuming voice.

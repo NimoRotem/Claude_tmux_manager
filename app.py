@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 
 import google_policy
 import chat_summaries
+import voice_mode
 from runtime_control import (
     BrowserLeaseStore,
     LockedJsonStore,
@@ -2364,6 +2365,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+voice_mode.install(app, sys.modules[__name__])
 
 
 @app.exception_handler(RequestValidationError)
@@ -3627,6 +3629,7 @@ def _apply_security_headers(request: Request, response: Response) -> Response:
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
+        "media-src 'self' blob:; "
         "font-src 'self' data:; "
         "frame-ancestors 'self'"
     )
@@ -21637,6 +21640,8 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
     _, sess = _find_session_for_user(session_name, user)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+        return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
     resumed = await _controller_call(
         "session_resume",
         session=session_name,
@@ -21664,6 +21669,8 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
             status_code=409,
         )
     try:
+        if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+            return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
         fence = await _controller_call(
             "session_input_check",
             session=session_name,
@@ -21685,6 +21692,7 @@ async def api_send_command(request: Request, session_name: str, body: SendComman
                 status_code=409,
             )
         session_target = binding["session_id"]
+        voice_mode.note_prompt(MESSAGES_DIR, session_name, owner_id)
         cmd_text, instruction_marker = await asyncio.to_thread(
             _account_instruction_refresh_for_prompt,
             session_name,
@@ -21996,6 +22004,8 @@ async def api_interrupt_session(request: Request, session_name: str):
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     owner_id = str((_current_user(request) or {}).get("id") or "")
+    if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+        return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
     touched = await _controller_call(
         "session_touch",
         session=session_name,
@@ -22009,6 +22019,8 @@ async def api_interrupt_session(request: Request, session_name: str):
         )
     try:
         with _session_operation_lock(session_name):
+            if not await asyncio.to_thread(voice_mode.request_target_matches, sys.modules[__name__], request, session_name):
+                return JSONResponse({"error": "Voice target changed; reconnect voice mode"}, status_code=409)
             fence = await _controller_call(
                 "session_input_check",
                 session=session_name,
@@ -27461,6 +27473,13 @@ body.member-simple .nav-codex-alert{display:none !important}
 .composer-action.is-recording:hover{background:#f85149}
 .composer-action.is-transcribing{background:#30363d;color:#c9d1d9;cursor:wait}
 .composer-action:disabled{opacity:.75;cursor:wait}
+.composer-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto;margin:0 8px 8px 4px}
+.composer-actions .btn.composer-action{width:44px;height:44px;flex-basis:44px;margin:0}
+.btn.composer-voice{width:44px;height:44px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:50%;background:#e6edf3;color:#161b22;cursor:pointer}
+.btn.composer-voice:hover{background:#fff}
+.composer-voice svg{display:block;width:22px;height:22px}
+.composer-voice[aria-expanded=true]{box-shadow:0 0 0 2px #7ee2b8}
+.composer-voice:focus-visible,.composer-action:focus-visible{outline:2px solid #7ee2b8;outline-offset:3px}
 .composer-spin{width:18px;height:18px;border:2px solid #8b949e;border-top-color:#f0f6fc;border-radius:50%;animation:composer-spin .8s linear infinite}
 @keyframes composer-recording{0%,100%{box-shadow:0 0 0 0 #da363355}50%{box-shadow:0 0 0 7px #da363300}}
 @keyframes composer-spin{to{transform:rotate(360deg)}}
@@ -30337,6 +30356,7 @@ function _updateSessionComposerView(name,tab){
   updateLiveBar(name);
   updateFreezeUi(name);
   updateComposerBtn('chat-'+name);
+  if(typeof _syncVoiceModeButtons==='function')_syncVoiceModeButtons();
 }
 function _mountSessionComposer(name,tab){
   const fresh=document.getElementById('session-composer-'+name);
@@ -31179,10 +31199,15 @@ function renderDetail(){
           onpaste="handleComposerPaste(event,'${s.name}','chat')"
           oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
           autocomplete="off" spellcheck="true" lang="en"></textarea>
-        <button class="btn cmd-send composer-action is-mic"
+        <div class="composer-actions">
+        <button type="button" class="btn cmd-send composer-action is-mic"
           id="cmd-send-chat-${s.name}"
           onclick="composerAction('chat-${s.name}')"
           aria-label="Record voice message" title="Record voice message">${_COMPOSER_MIC_SVG}</button>
+        <button type="button" class="btn composer-voice" id="voice-mode-open-${s.name}"
+          onclick="openVoiceMode('${esc(s.name)}')" aria-label="Start Voice Mode" title="Start Voice Mode"
+          aria-haspopup="dialog" aria-expanded="false">${_COMPOSER_VOICE_SVG}</button>
+        </div>
         <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
       </div>
       ${buildKeyBar(s.name,'chat')}
@@ -31631,10 +31656,57 @@ function handleSessionComposerKey(e,name){
   else handleChatKey(e,name);
 }
 
-// --- WhatsApp-style composer: mic icon when empty, paper-plane when typing ---
-const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M3.3 20.7l18-8a.8.8 0 0 0 0-1.4l-18-8a.8.8 0 0 0-1.1.9L4 11l9 1-9 1-1.8 6.8a.8.8 0 0 0 1.1.9z"/></svg>';
+// --- WhatsApp-style composer: mic when empty, upward send arrow when typing ---
+const _COMPOSER_SEND_SVG='<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>';
 const _COMPOSER_MIC_SVG='<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg>';
 const _COMPOSER_STOP_SVG='<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+const _COMPOSER_VOICE_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M4 10v4m4-8v12m4-15v18m4-15v12m4-8v4"/></svg>';
+// One microphone owner, including the permission prompt. A late permission
+// result cannot revive a closed dialog or a same-name replacement session.
+window.dashboardMicrophone={
+  current:null,
+  reserve(mode,session){
+    if(this.current)return null;
+    const lease={mode,session,epoch:_sessionClientEpoch[session]||0,
+      incarnation:_sessionLogicalIncarnation(session),stream:null,cancelled:false};
+    this.current=lease;return lease;
+  },
+  valid(lease){return !!lease&&this.current===lease&&!lease.cancelled
+    &&(_sessionClientEpoch[lease.session]||0)===lease.epoch
+    &&_sessionLogicalIncarnation(lease.session)===lease.incarnation;},
+  accept(lease,stream){
+    if(!this.valid(lease)){stream.getTracks().forEach(track=>track.stop());this.release(lease);return false;}
+    lease.stream=stream;return true;
+  },
+  release(lease){
+    if(!lease)return;lease.cancelled=true;
+    if(lease.stream){lease.stream.getTracks().forEach(track=>track.stop());lease.stream=null;}
+    if(this.current===lease)this.current=null;
+  },
+  cancelSession(name){if(this.current&&this.current.session===name)this.release(this.current);},
+  busy(){return !!this.current;},
+  state(){return this.current;},
+};
+if(window.addEventListener)window.addEventListener('pagehide',()=>{
+  const lease=window.dashboardMicrophone.state();
+  if(lease&&lease.mode==='dictation'){
+    const key=_sessionComposerKey(lease.session,'chat'),recorder=_mediaRec[key];
+    if(recorder){recorder.ondataavailable=null;recorder.onstop=null;try{if(recorder.state!=='inactive')recorder.stop()}catch(e){}}
+    delete _recording[key];delete _voiceTranscribing[key];
+    window.dashboardMicrophone.release(lease);updateComposerBtn(key);
+  }
+});
+function openVoiceMode(name){
+  if(window.voiceMode)window.voiceMode.open(name);
+  else alert('Voice Mode is still loading. Please try again.');
+}
+function _syncVoiceModeButtons(){
+  const state=window.voiceMode?window.voiceMode.state():{};
+  for(const session of sessions){
+    const button=_composerElement('voice-mode-open-'+session.name,'chat-'+session.name);
+    if(button)button.setAttribute('aria-expanded',String(!!state.open&&state.session===session.name));
+  }
+}
 const _recording={},_mediaRec={},_audioChunks={},_voiceTranscribing={};
 // `key` is 'chat-<name>' or 'raw-<name>'. Input id = cmd-<key>, button id = cmd-send-<key>.
 function updateComposerBtn(key){
@@ -31681,22 +31753,24 @@ async function toggleRecording(key){
   const sessionName=key.indexOf('raw-')===0?key.slice(4):key.slice(5);
   const epoch=_sessionClientEpoch[sessionName]||0;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){alert('Microphone is not available in this browser.');return;}
+  const lease=window.dashboardMicrophone.reserve('dictation',sessionName);
+  if(!lease){alert('Finish the current voice conversation or recording before dictating.');return;}
   let stream;
   try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
-  catch(e){alert('Microphone permission denied or unavailable.');return;}
-  if((_sessionClientEpoch[sessionName]||0)!==epoch){stream.getTracks().forEach(t=>t.stop());return}
+  catch(e){const current=window.dashboardMicrophone.valid(lease);window.dashboardMicrophone.release(lease);if(current)alert('Microphone permission denied or unavailable.');return;}
+  if(!window.dashboardMicrophone.accept(lease,stream))return;
   let mr;
-  try{mr=new MediaRecorder(stream);}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Recording is not supported in this browser.');return;}
+  try{mr=new MediaRecorder(stream);}catch(e){window.dashboardMicrophone.release(lease);alert('Recording is not supported in this browser.');return;}
   _mediaRec[key]=mr;_audioChunks[key]=[];
   mr.ondataavailable=ev=>{if(ev.data&&ev.data.size>0)_audioChunks[key].push(ev.data);};
   mr.onstop=async()=>{
     stream.getTracks().forEach(t=>t.stop());
-    if((_sessionClientEpoch[sessionName]||0)!==epoch)return;
+    if(!window.dashboardMicrophone.valid(lease)){window.dashboardMicrophone.release(lease);return;}
     _recording[key]=false;
     const blob=new Blob(_audioChunks[key],{type:(mr.mimeType||'audio/webm')});
     const btn=_composerElement('cmd-send-'+key,key);
     if(btn)btn.classList.remove('is-recording');
-    if(!blob.size){updateComposerBtn(key);return;}
+    if(!blob.size){window.dashboardMicrophone.release(lease);updateComposerBtn(key);return;}
     _voiceTranscribing[key]=true;
     if(btn){
       btn.disabled=true;
@@ -31709,7 +31783,7 @@ async function toggleRecording(key){
       const fd=new FormData();fd.append('audio',blob,'voice.webm');
       const resp=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
       const j=await resp.json().catch(()=>({}));
-      if((_sessionClientEpoch[sessionName]||0)!==epoch)return;
+      if(!window.dashboardMicrophone.valid(lease)){window.dashboardMicrophone.release(lease);return;}
       const inp=_composerElement('cmd-'+key,key);
       if(resp.ok&&j.text){
         if(inp){
@@ -31718,13 +31792,14 @@ async function toggleRecording(key){
         }
       }else{alert((j&&j.error)||'Transcription failed.');}
     }catch(e){alert('Transcription failed.');}
+    window.dashboardMicrophone.release(lease);
     if((_sessionClientEpoch[sessionName]||0)===epoch){
       delete _voiceTranscribing[key];
       if(btn)btn.classList.remove('is-transcribing');
       updateComposerBtn(key);
     }
   };
-  try{mr.start();}catch(e){stream.getTracks().forEach(t=>t.stop());alert('Could not start recording.');return;}
+  try{mr.start();}catch(e){window.dashboardMicrophone.release(lease);alert('Could not start recording.');return;}
   _recording[key]=true;
   const btn=_composerElement('cmd-send-'+key,key);
   if(btn){
@@ -32383,6 +32458,10 @@ function _resetSessionRuntimeState(name){
 
 function _discardSessionClientState(name){
   _sessionClientEpoch[name]=(_sessionClientEpoch[name]||0)+1;
+  if(typeof window!=='undefined'){
+    if(window.voiceMode)window.voiceMode.invalidate(name);
+    if(window.dashboardMicrophone)window.dashboardMicrophone.cancelSession(name);
+  }
   _autopushSetRequests[name]=(_autopushSetRequests[name]||0)+1;
   setAutopushPending(name,false);
   _resetSessionRuntimeState(name);
@@ -36320,6 +36399,7 @@ async function bootstrapDashboard(){
 }
 bootstrapDashboard();
 </script>
+<script src="__ROOT_PATH__/voice-mode.js" defer></script>
 </body></html>
 """
 
