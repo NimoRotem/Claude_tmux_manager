@@ -7,6 +7,7 @@ The dashboard manages owner-scoped coding conversations running in tmux. It pres
 ## Session identity and close
 
 - Every managed tab is bound to an explicit owner, lifecycle generation, project working directory, and, once available, an exact user-root Codex rollout UUID.
+- New Codex sessions default to high reasoning effort. A user or deployment may still explicitly select another supported effort level.
 - Create, restore, park, resume, and delete operations revalidate owner and generation under per-session and tmux-server mutation fences.
 - Interactive Close warns that running work will stop, then directly requests the owner-scoped session DELETE operation. It does not launch an asynchronous archival or summarization job, wait for work to become idle, or write a project specification.
 - The controller durably records deletion intent before terminating the exact tmux session and its child processes. It confirms that the intended tmux identity is absent before reporting completion. Ambiguous tmux state or reuse of the same session name fails closed; retained deletion intent prevents automatic resurrection after a partial failure.

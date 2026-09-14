@@ -15204,7 +15204,7 @@ class CreateSession(BaseModel):
     name: str = ""
     name_generated: bool = Field(default=False, strict=True)
     model: str = os.environ.get("TMUX_DASH_NEW_SESSION_MODEL", "gpt-6-astra")
-    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "max")
+    effort: str = os.environ.get("TMUX_DASH_NEW_SESSION_EFFORT", "high")
     no_fallback: bool = False
 
 
@@ -31135,7 +31135,7 @@ let MODEL_EFFORTS={
   'gpt-5.3-codex-spark':['low','medium','high','xhigh'],
 };
 let DEFAULT_EFFORT='xhigh';
-let NEW_SESSION_DEFAULTS={model:'gpt-6-astra',effort:'max',no_fallback:false};
+let NEW_SESSION_DEFAULTS={model:'gpt-6-astra',effort:'high',no_fallback:false};
 (function loadModelChoices(){
   try{
     fetch(BASE+'/api/models').then(r=>r.ok?r.json():null).then(d=>{
@@ -33859,7 +33859,7 @@ function updateNewSessionEfforts(preferred){
   const model=document.getElementById('new-session-model');
   const select=document.getElementById('new-session-effort');
   if(!model||!select)return;
-  const requested=preferred||select.value||'max';
+  const requested=preferred||select.value||'high';
   const supported=MODEL_EFFORTS[model.value]||[];
   const ceiling=EFFORT_CHOICES.indexOf(requested);
   const chosen=supported.includes(requested)?requested:EFFORT_CHOICES.slice(0,ceiling>=0?ceiling+1:6).reverse().find(e=>supported.includes(e));
