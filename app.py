@@ -13310,6 +13310,13 @@ def _browser_viewer_url(s: dict, prefix: Optional[str] = None) -> str:
             "&reconnect=true&reconnect_delay=2000")
 
 
+def _browser_view_url(s: dict, prefix: Optional[str] = None) -> str:
+    """The lite live view (browser_view.py): the page over Chrome's own screencast,
+    real X input, the X clipboard. Needs no stream started first, unlike noVNC."""
+    base = ROOT_PATH if prefix is None else prefix
+    return f"{base}/browser/{s.get('id')}/view"
+
+
 # ── Android device viewers ───────────────────────────────────────────────────
 # These are NOT noVNC. redroid has no X display, so the Xvfb + x11vnc +
 # websockify + noVNC stack the Chrome sessions above rely on has nothing to
@@ -13483,6 +13490,7 @@ async def api_browser_sessions(request: Request):
         row["live_autostop"] = _live_autostop_enabled(s)
         row["live_viewers"] = int(_live_viewers.get(str(s.get("id") or ""), 0))
         row["viewer_url"] = _browser_viewer_url(s, prefix)
+        row["view_url"] = _browser_view_url(s, prefix)
         shot = await asyncio.to_thread(_latest_shot, str(s.get("id") or ""))
         row["shot_at"] = shot.stat().st_mtime if shot else 0
         st = _monitor_state.get(str(s.get("id") or "")) or {}
@@ -14470,6 +14478,23 @@ def _visible_page(pages: list) -> dict:
     return pages[0] if pages else {}
 
 
+def _shrink_jpeg(raw: bytes, scale: float, quality: int) -> bytes:
+    """A thumbnail of a full-size capture. Returns the original if Pillow is missing."""
+    if scale >= 1:
+        return raw
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+        img.draft("RGB", size)            # decode at a reduced size where JPEG allows
+        out = io.BytesIO()
+        img.convert("RGB").resize(size, Image.BILINEAR).save(out, "JPEG", quality=int(quality))
+        return out.getvalue()
+    except Exception:
+        return raw
+
+
 async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
                                 page: dict = None) -> dict:
     """Thumbnail the visible tab over CDP and write one audit row for it."""
@@ -14489,18 +14514,15 @@ async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
         return {"ok": False, "error": f"Browser is unreachable: {exc}"[:200]}
     try:
         tab = _CdpTab(ws)
-        try:
-            metrics = await tab.call("Page.getLayoutMetrics", {}, timeout=10)
-            vp = metrics.get("cssVisualViewport") or metrics.get("layoutViewport") or {}
-            w = int(vp.get("clientWidth") or vp.get("width") or 1280)
-            h = int(vp.get("clientHeight") or vp.get("height") or 720)
-            clip = {"x": 0, "y": 0, "width": w, "height": h, "scale": SHOT_SCALE}
-        except Exception:
-            clip = None
-        params = {"format": "jpeg", "quality": SHOT_QUALITY}
-        if clip:
-            params["clip"] = clip
-        shot = await tab.call("Page.captureScreenshot", params, timeout=25)
+        # Full size, shrunk here, never a `clip` with a `scale`. Chrome does a scaled
+        # capture by resizing the PAGE for its duration, and when the connection
+        # closes mid-capture (this call's timeout, a busy page) the resize is never
+        # undone. Measured 2026-09-13: the account browser on builder2 had sat at a
+        # 749x395 viewport, exactly 0.4 of its window, for days; an agent there got
+        # a phone layout. A new session's clearDeviceMetricsOverride does not
+        # restore it; resizing the window does.
+        shot = await tab.call("Page.captureScreenshot",
+                              {"format": "jpeg", "quality": SHOT_QUALITY}, timeout=25)
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
     finally:
@@ -14514,7 +14536,8 @@ async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
     ts = time.time()
     name = f"{int(ts * 1000)}.jpg"
     try:
-        (_shots_dir(sid) / name).write_bytes(base64.b64decode(data))
+        (_shots_dir(sid) / name).write_bytes(
+            await asyncio.to_thread(_shrink_jpeg, base64.b64decode(data), SHOT_SCALE, SHOT_QUALITY))
     except Exception as exc:
         return {"ok": False, "error": f"Could not store screenshot: {exc}"[:200]}
     _prune_shots(sid)
@@ -14715,6 +14738,7 @@ async def _member_browser_status(user: dict, prefix: Optional[str] = None) -> di
             "name": session.get("name", "") or "Browser",
             "running": running,
             "viewer_url": _browser_viewer_url(session, prefix),
+            "view_url": _browser_view_url(session, prefix),
         },
         "connected": connected,
         "signed_in": signed_in,
@@ -14896,6 +14920,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     row = dict(entry)
     row["running"] = ok
     row["viewer_url"] = _browser_viewer_url(entry, _req_prefix(request))
+    row["view_url"] = _browser_view_url(entry, _req_prefix(request))
     logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
                 sid, disp, vnc, cdp, ok)
     return JSONResponse({"ok": True, "session": row, "started": ok})
@@ -14987,6 +15012,7 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     row["live_running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
     row["live_autostop"] = _live_autostop_enabled(target)
     row["viewer_url"] = _browser_viewer_url(target, _req_prefix(request))
+    row["view_url"] = _browser_view_url(target, _req_prefix(request))
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
@@ -16917,6 +16943,34 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
     finally:
         _live_viewers[sid] = max(0, _live_viewers.get(sid, 1) - 1)
         _live_last_seen[sid] = time.time()
+
+
+# The lite live view, /browser/<sid>/view. Registered HERE, above the noVNC asset
+# proxy right below: that route's {path:path} matches /view too, and would hand the
+# request to websockify, which 404s it. Both the page and its websocket check the
+# viewer themselves, because HTTP middleware does not run for websockets.
+def _browser_view_allowed(conn, s: dict) -> bool:
+    if AUTH_PASS and not _check_token(conn.cookies.get(AUTH_COOKIE)):
+        return False
+    user = _current_user(conn)
+    if not user:
+        return False
+    return (not TEAM_MODE) or _is_admin(user) or _browser_owner_id(s) == str(user.get("id", ""))
+
+
+try:
+    import browser_view
+    browser_view.mount(
+        app,
+        session=_browser_session_by_id,
+        can_view=_browser_view_allowed,
+        prefix=_req_prefix,
+        proxy_conf=lambda: _proxy_conf(),
+        extras=lambda s, pre: {"vnc_url": _browser_viewer_url(s, pre),
+                               "live_api": f"{pre}/api/browser/live/{s.get('id')}"},
+    )
+except Exception:
+    logger.exception("lite browser view not mounted")
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
@@ -28560,8 +28614,11 @@ function renderBrowserTab(data){
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')"'+
-        ' title="Start the VNC stream if it is not up and open it in a new tab. The stream'+
-        ' stops on its own once nobody is watching.">View live&nbsp;↗</button>'+
+        ' title="Watch and use this browser in a new tab. Light: it streams the page only'+
+        ' when it changes, types with a real keyboard, and ctrl-C / ctrl-V work.">View live&nbsp;↗</button>'+
+      ' <button class="btn btn-ghost" onclick="openBrowserVnc(\''+id+'\')"'+
+        ' title="The full noVNC desktop. Heavier; use it only when View live is not enough.'+
+        ' The stream stops on its own once nobody is watching.">VNC</button>'+
       (s.live_running? ' <button class="btn btn-ghost" onclick="stopBrowserLive(\''+id+'\')"'+
         ' title="Stop the VNC stream now. The browser, its tabs and anything driving it'+
         ' carry on untouched.">Stop stream</button>':'')+
@@ -28719,8 +28776,10 @@ function renderBrowserTab(data){
       '<div class="pf-banner">Independent browsers you (or Claude) can drive. Each card shows the '+
         '<b>last screenshot</b>, not a live stream: shots are taken over the browser\'s own control '+
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
-        'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
-        'once nobody is watching. <b>History</b> is the audit trail.</div>'+
+        'nothing to watch. <b>View live ↗</b> opens the browser in a new tab: the page is sent only '+
+        'when it changes, typing and clicks arrive as a real keyboard and mouse, and ctrl-C / ctrl-V '+
+        'copy and paste with your own computer. <b>VNC</b> is the full desktop, heavier, for the '+
+        'rare thing View live cannot show. <b>History</b> is the audit trail.</div>'+
       // Signing in by hand is a different job from watching an agent work, and
       // VNC is the wrong transport for it. The console browser streams one tab
       // over CDP instead, goes out DIRECT rather than through the residential
@@ -29253,14 +29312,21 @@ function _bsHost(url){
   return m ? m[1] : (url||'').slice(0, 40);
 }
 
-// Open the live view: start the stream first (it is normally not running), then
+// Open the lite live view. Nothing to start first: it attaches to the browser's
+// own control port when the tab opens and lets go when it closes.
+function openBrowserSession(id){
+  const s=_bsFind(id);
+  // Not every card is a Chrome. The Android device viewers (builder) proxy an adb
+  // screen over plain HTTP and have no lite view.
+  if(s && (!s.kind || s.kind === 'browser') && s.view_url){ window.open(s.view_url, '_blank'); return; }
+  return openBrowserVnc(id);
+}
+
+// The noVNC desktop: start the stream first (it is normally not running), then
 // open the viewer tab. Opening the tab first would race the bridge coming up.
-async function openBrowserSession(id){
+async function openBrowserVnc(id){
   const s=_bsFind(id);
   if(!s) return;
-  // Not every card is a VNC-backed Chrome. The Android device viewers (builder)
-  // proxy an adb screen over plain HTTP: there is no stream to start, and the
-  // live endpoint would 404 on an id that is not a browser session.
   if(s.kind && s.kind !== 'browser'){ window.open(s.viewer_url, '_blank'); return; }
   if(!s.live_running){
     showToast('Starting the live stream…');
