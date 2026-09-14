@@ -357,6 +357,9 @@ class ViewCast(console_browser.InteractiveCast):
         self.mode = "page"            # "page" or "screen" (the whole X screen)
         self.source = "cast"          # in page mode: "cast" or "poll"
         self._changes = []            # times of changed frames forwarded while idle
+        self._src_lock = None         # serialises every start and stop of the stream
+        self._last_input_at = 0.0
+        self._restarted_at = 0.0
         self._front_at = 0.0
         self._origin = None
         self._origin_at = 0.0
@@ -411,17 +414,49 @@ class ViewCast(console_browser.InteractiveCast):
         if self.mode == "page" and self.source == "cast":
             await super()._start()
 
+    def _lock(self) -> asyncio.Lock:
+        if self._src_lock is None:
+            self._src_lock = asyncio.Lock()
+        return self._src_lock
+
     def _poke(self) -> None:
         super()._poke()
+        self._last_input_at = time.time()
         self._changes.clear()
         if self.source == "poll":
             self.source = "cast"
             asyncio.ensure_future(self._restart_cast())
 
     async def _restart_cast(self):
-        self._shown_digest = ""
-        with contextlib.suppress(Exception):
-            await self._start()
+        """Back to the live stream. Under the lock, so it lands AFTER any one-shot
+        capture that is still waiting for its frame, never before that capture's stop."""
+        async with self._lock():
+            if self.mode != "page" or self.source != "cast":
+                return
+            self._shown_digest = ""
+            self._restarted_at = time.time()
+            with contextlib.suppress(Exception):
+                await self._start()
+
+    async def _enter_poll(self):
+        async with self._lock():
+            if self.source == "poll":
+                with contextlib.suppress(Exception):
+                    await self._send("Page.stopScreencast")
+
+    async def unstick(self):
+        """Restart a stream that went quiet while the person is using it.
+
+        Whatever stopped it (a race, a lost ack, Chrome dropping the screencast on
+        some navigation it does not report), the symptom is the same and the worst
+        one this viewer has: clicks reach the page and the picture never changes, so
+        it looks as if clicking does nothing. One restart costs one capture."""
+        now = time.time()
+        if (self.mode == "page" and self.source == "cast"
+                and now - self._last_input_at < 4.0
+                and now - max(self._last_frame_at, self._last_input_at) > 1.5
+                and now - self._restarted_at > 3.0):
+            await self._restart_cast()
 
     def note_forwarded(self) -> None:
         """Called for each changed screencast frame sent to the viewer."""
@@ -434,7 +469,7 @@ class ViewCast(console_browser.InteractiveCast):
         if len(self._changes) >= self.ANIMATING_FRAMES:
             self._changes.clear()
             self.source = "poll"
-            asyncio.ensure_future(self._send("Page.stopScreencast"))
+            asyncio.ensure_future(self._enter_poll())
 
     async def poll_loop(self):
         """While polling, one frame per idle interval: start the screencast, take
@@ -454,16 +489,26 @@ class ViewCast(console_browser.InteractiveCast):
         while True:
             if self.mode != "page" or self.source != "poll":
                 still = 0
+                with contextlib.suppress(Exception):
+                    await self.unstick()
                 await asyncio.sleep(0.25)
                 continue
             started = time.time()
             frames, shown = self._frames, self._shown_digest
-            with contextlib.suppress(Exception):
-                await browser_live.Screencast._start(self)
-                deadline = time.time() + 5
-                while self._frames == frames and time.time() < deadline:
-                    await asyncio.sleep(0.03)
-                await self._send("Page.stopScreencast")
+            async with self._lock():
+                if self.mode != "page" or self.source != "poll":
+                    continue
+                with contextlib.suppress(Exception):
+                    await browser_live.Screencast._start(self)
+                    deadline = time.time() + 3
+                    while (self._frames == frames and time.time() < deadline
+                           and self.source == "poll"):
+                        await asyncio.sleep(0.03)
+                    # Stop only a stream this capture still owns. If the person
+                    # touched the page meanwhile, the live stream is theirs now:
+                    # stopping it here is what froze the picture.
+                    if self.source == "poll":
+                        await self._send("Page.stopScreencast")
             await asyncio.sleep(0.1)          # let the sender take the frame
             if self.source != "poll":
                 continue

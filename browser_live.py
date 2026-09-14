@@ -362,6 +362,7 @@ class Screencast:
         self._waiters = {}
         self._pending_ack = None
         self._was_hidden = False
+        self._last_frame_at = 0.0
 
     async def __aenter__(self):
         self._cdp = await ws_connect(self.ws_url, max_size=None, open_timeout=15)
@@ -525,6 +526,7 @@ class Screencast:
                 params = msg["params"]
                 self._meta = params.get("metadata") or {}
                 self._frames += 1
+                self._last_frame_at = time.time()
                 if self.PACE_ACKS:
                     self._pending_ack = params["sessionId"]
                 else:

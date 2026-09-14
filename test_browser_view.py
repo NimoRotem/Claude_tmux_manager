@@ -309,3 +309,52 @@ def test_the_ladder_hands_a_person_the_lite_view():
 
 def test_helper_rejects_an_unknown_op_without_touching_x():
     assert bvx._dispatch(None, {"op": "nope"})["ok"] is False
+
+
+# --- the frozen picture ------------------------------------------------------------
+def test_input_during_a_one_shot_capture_does_not_leave_the_stream_stopped():
+    """2026-09-14, reported as "clicking does nothing, it only navigates". A page that
+    keeps changing drops to one frame a second: start the screencast, wait for a
+    frame, stop it. A mouse move inside that wait restarted the live stream and the
+    one-shot's stop then killed it. Input still reached the page; the picture never
+    changed again until a navigation restarted the stream."""
+    async def go():
+        cast = _cast_with_stub_send()
+        sent = cast.sent
+
+        async def send(method, params=None):
+            sent.append(method)
+        cast._send = send
+        cast.source = "poll"
+        cast._slow = 0.05
+        loop = asyncio.ensure_future(cast.poll_loop())
+        for _ in range(20):                       # wait for the one-shot to start
+            await asyncio.sleep(0.01)
+            if "Page.startScreencast" in sent:
+                break
+        cast._poke()                               # the person moves the mouse
+        await asyncio.sleep(0.05)
+        cast._frames += 1                          # the one-shot's frame arrives late
+        await asyncio.sleep(0.5)
+        loop.cancel()
+        return cast, sent
+    cast, sent = asyncio.run(go())
+    starts = [i for i, m in enumerate(sent) if m == "Page.startScreencast"]
+    stops = [i for i, m in enumerate(sent) if m == "Page.stopScreencast"]
+    assert cast.source == "cast"
+    assert starts and (not stops or starts[-1] > stops[-1]), sent
+
+
+def test_a_stalled_stream_is_restarted_while_the_person_is_using_it():
+    """Belt and braces for any other way the stream can stop: no frame for a while
+    right after input means restart it, it costs one capture."""
+    async def go():
+        cast = _cast_with_stub_send()
+        cast._last_frame_at = 0.0
+        cast._poke()
+        await asyncio.sleep(0)
+        cast.sent.clear()
+        cast._last_input_at -= 2.0
+        await cast.unstick()
+        return cast.sent
+    assert "Page.startScreencast" in asyncio.run(go())
