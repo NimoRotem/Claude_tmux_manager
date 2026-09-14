@@ -274,6 +274,16 @@ def test_the_page_renders_with_nothing_left_to_substitute():
     assert "Main &lt;browser&gt; live" in html
 
 
+def test_frames_are_not_shown_as_blob_images():
+    """The dashboard's CSP is img-src 'self' data:. A blob: image is refused
+    silently and the viewer shows a broken picture while frames arrive."""
+    app_src = (HERE / "app.py").read_text(encoding="utf-8")
+    csp = re.search(r'"img-src ([^;"]*)', app_src)
+    assert csp and "blob:" not in csp.group(1)
+    assert "createObjectURL" not in bv.PAGE
+    assert "createImageBitmap" in bv.PAGE and '<canvas id="screen"' in bv.PAGE
+
+
 def test_a_cross_site_websocket_is_refused():
     class WS:
         def __init__(self, headers):

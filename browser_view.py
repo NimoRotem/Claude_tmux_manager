@@ -918,7 +918,7 @@ PAGE = r"""<!doctype html>
 </div>
 
 <div id="stage">
-  <img id="screen" alt="remote browser">
+  <canvas id="screen" aria-label="remote browser"></canvas>
   <textarea id="kb" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
   <div id="veil"><div><b>Connecting</b>one moment</div></div>
 </div>
@@ -1082,7 +1082,27 @@ $("qual").onchange = () => { try { localStorage.setItem("liteview.q", preset());
   connect(false); };
 
 // ---- the stream
-let lastBlobUrl = "";
+// Frames are drawn on a canvas from createImageBitmap, not put in an <img> as
+// blob: URLs. The dashboard's Content-Security-Policy allows images from 'self' and
+// data: only, so a blob: image is refused and the viewer showed a broken picture
+// while frames were arriving. createImageBitmap is not an image load, and it
+// decodes off the main thread as well.
+const ctx = S.getContext("2d", {alpha: false});
+let drawSeq = 0;
+function paint(blob){
+  const seq = ++drawSeq;
+  const done = img => {
+    if (seq === drawSeq) {
+      if (S.width !== img.width || S.height !== img.height) { S.width = img.width; S.height = img.height; }
+      ctx.drawImage(img, 0, 0); veil.classList.add("hide");
+    }
+    if (img.close) img.close();
+  };
+  if (window.createImageBitmap) { createImageBitmap(blob).then(done, () => {}); return; }
+  const r = new FileReader();
+  r.onload = () => { const im = new Image(); im.onload = () => done(im); im.src = r.result; };
+  r.readAsDataURL(blob);
+}
 // `front` only when the person picked the tab. Every other connect watches the tab
 // without bringing it forward, so a guess can never steal the front from an agent.
 function connect(front){
@@ -1094,10 +1114,7 @@ function connect(front){
   sock.binaryType = "blob"; ws = sock;
   sock.onmessage = ev => {
     if (typeof ev.data !== "string") {
-      frames++; bytes += ev.data.size;
-      const u = URL.createObjectURL(ev.data);
-      S.onload = () => { if (lastBlobUrl && lastBlobUrl !== u) URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = u; };
-      S.src = u; veil.classList.add("hide"); return;
+      frames++; bytes += ev.data.size; paint(ev.data); return;
     }
     const m = JSON.parse(ev.data);
     if (m.t === "hello") { xInput = !!m.input && m.input === "x";
