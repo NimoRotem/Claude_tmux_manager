@@ -17689,6 +17689,71 @@ async def api_transcribe(audio: UploadFile = File(...)):
     return JSONResponse({"text": text})
 
 
+# ── Live voice mode: reading a reply out loud ───────────────────────────────
+# The mic button next to the composer has always been one-way: record, whisper,
+# text in the box. Live voice closes the loop on a phone: it listens, sends what
+# you said, and reads the reply back, so a session can be driven with the screen
+# in a pocket. The page handles the listening; this is the other half.
+TTS_MODEL = os.environ.get("TMUX_DASH_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.environ.get("TMUX_DASH_TTS_VOICE", "alloy")
+_TTS_MAX_CHARS = 2000
+
+_SPEECH_STRIP_RE = [
+    (re.compile(r"```.*?```", re.S), " code block. "),   # never read code aloud
+    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),
+    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),    # a link reads as its words
+    (re.compile(r"^[ \t]*[#>]+[ \t]*", re.M), ""),
+    (re.compile(r"^[ \t]*[-*+][ \t]+", re.M), ""),
+    (re.compile(r"\*\*|__|\*|~~"), ""),
+    (re.compile(r"https?://\S+"), " a link "),
+    (re.compile(r"[ \t]+"), " "),
+    (re.compile(r"\n{2,}"), ". "),
+    (re.compile(r"\n"), ". "),
+]
+
+
+def _plain_for_speech(text: str) -> str:
+    """Markdown as something worth hearing: no backticks, no URLs read letter by
+    letter, no code blocks."""
+    out = str(text or "")
+    for rx, rep in _SPEECH_STRIP_RE:
+        out = rx.sub(rep, out)
+    out = re.sub(r"(?:\.\s*){2,}", ". ", out).strip()
+    return out[:_TTS_MAX_CHARS]
+
+
+class TTSBody(BaseModel):
+    text: str
+    voice: str = ""
+
+
+@app.post("/api/tts")
+async def api_tts(body: TTSBody):
+    """Speak a reply for live voice mode. Returns MP3 bytes."""
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        return JSONResponse({"error": "Speech is not configured."}, status_code=503)
+    text = _plain_for_speech(body.text)
+    if not text:
+        return JSONResponse({"error": "Nothing to say."}, status_code=400)
+    voice = body.voice if re.fullmatch(r"[a-z]{3,20}", body.voice or "") else TTS_VOICE
+
+    def _do():
+        c = openai.OpenAI(api_key=key)
+        r = c.audio.speech.create(model=TTS_MODEL, voice=voice, input=text,
+                                  response_format="mp3")
+        return r.read() if hasattr(r, "read") else r.content
+
+    try:
+        audio = await asyncio.to_thread(_do)
+    except Exception as e:
+        logger.warning("tts failed: %s", e)
+        return JSONResponse({"error": "Speech failed."}, status_code=502)
+    return Response(content=audio, media_type="audio/mpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
 # --- Claude Code auth management ---
 
 _claude_auth_cache: dict = {"ts": 0, "data": {}}
@@ -22401,6 +22466,21 @@ body.member-admin .more-member-only{display:none}
 .composer-attachment-remove{flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #30363d;border-radius:50%;background:#21262d;color:#8b949e;cursor:pointer;font-size:.8rem;line-height:1}
 .composer-attachment-remove:hover{background:#da3633;border-color:#da3633;color:#fff}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
+/* Live voice mode: the toggle beside the mic, and the status strip above the
+   composer. The dot says which half of the loop it is in without reading. */
+.cmd-voice{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;background:#21262d;color:#8b949e;cursor:pointer;display:flex;align-items:center;justify-content:center;align-self:flex-end;transition:background .15s,color .15s}
+.cmd-voice:hover{background:#2d333b;color:#c9d1d9}
+.cmd-voice.active{background:#1f6feb;color:#fff}
+.voice-bar{display:none;align-items:center;gap:10px;margin:0 0 8px;padding:8px 12px;border:1px solid #30363d;border-radius:8px;background:#0d1117;font-size:.84rem;color:#c9d1d9}
+.voice-bar.on{display:flex}
+.voice-dot{width:11px;height:11px;border-radius:50%;background:#3fb950;flex-shrink:0}
+.voice-bar.listening .voice-dot{animation:voice-pulse 1.2s ease-in-out infinite}
+.voice-bar.hearing .voice-dot{background:#58a6ff;animation:voice-pulse .45s ease-in-out infinite}
+.voice-bar.sending .voice-dot{background:#58a6ff}
+.voice-bar.speaking .voice-dot{background:#e3b341;animation:voice-pulse .8s ease-in-out infinite}
+@keyframes voice-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.65)}}
+.voice-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.voice-bar .btn{padding:5px 11px;font-size:.78rem}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
 .cmd-send:hover{background:#30363d}
 .cmd-send.is-mic{color:#8b949e}
@@ -26494,6 +26574,13 @@ function renderDetail(){
           ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
         <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
+        <!-- Live voice: hands free. Hidden until it is switched on. -->
+        <div class="voice-bar" id="voice-bar-${s.name}">
+          <span class="voice-dot"></span>
+          <span class="voice-text" id="voice-text-${s.name}">Live voice</span>
+          <button class="btn" id="voice-skip-${s.name}" style="display:none" onclick="voiceSkipSpeech()" title="Stop reading this reply out">Skip</button>
+          <button class="btn btn-danger" onclick="stopLiveVoice('Live voice off')">End</button>
+        </div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
@@ -26502,6 +26589,7 @@ function renderDetail(){
             onpaste="handleComposerPaste(event,'${s.name}','chat')"
             oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
+          <button class="btn cmd-voice" id="cmd-voice-${s.name}" onclick="toggleLiveVoice('${s.name}')" title="Live voice: talk to this session hands free. It listens, sends what you say, and reads the reply out loud." aria-label="Live voice mode"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 10v4M8 6v12M12 3v18M16 6v12M20 10v4"/></svg></button>
           <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
@@ -26695,6 +26783,7 @@ function renderDetail(){
 }
 
 function selectSession(name,updateRoute=true){
+  if(voiceActive()&&name!==_voice.name)stopLiveVoice('Live voice off');
   stopAllRawPolling();
   selectedSession=name;
   _acknowledgeCompletion(name);
@@ -26707,6 +26796,9 @@ function selectSession(name,updateRoute=true){
 
 function switchTab(name,tab,updateRoute=true){
   _acknowledgeCompletion(name);
+  // Live voice belongs to one session's Chat tab: leaving it turns the mic off
+  // rather than leaving it open on a screen that no longer shows it.
+  if(voiceActive()&&(name!==_voice.name||tab!=='chat'))stopLiveVoice('Live voice off');
   tab=_allowedSessionTab(tab);
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
@@ -27008,6 +27100,246 @@ async function toggleRecording(key){
   _recording[key]=true;
   const btn=document.getElementById('cmd-send-'+key);
   if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
+}
+
+// ── Live voice mode ─────────────────────────────────────────────────────────
+// The mic button records one clip and puts the text in the box. Live voice is
+// the hands-free version, for a phone in a pocket: it listens, sends what you
+// said when you stop talking, reads the reply out loud, and listens again. It
+// keeps listening while the agent works, so you can add something mid-run.
+//
+// Voice detection is done here rather than by a timer: an analyser on the mic
+// stream, with a noise floor that follows the room, so a silent office and a
+// moving car both work without a setting. Nothing is uploaded until speech has
+// actually been heard, so a long quiet stretch costs nothing.
+const VOICE_SILENCE_MS=1400;        // quiet this long after speech = your turn ended
+const VOICE_MAX_CLIP_MS=90000;      // never record longer than this in one go
+const VOICE_IDLE_RESTART_MS=30000;  // heard nothing: throw the clip away and re-arm
+const VOICE_MIN_RMS=0.012;          // absolute floor, so hiss alone is never speech
+const _voice={name:'',phase:'off',stream:null,ctx:null,srcNode:null,analyser:null,data:null,
+              rec:null,chunks:[],heard:false,startedAt:0,speechAt:0,floor:0.005,dropClip:false,
+              timer:null,replyTimer:null,awaiting:false,sentAt:0,lastSpokenTs:0,pending:null,
+              audio:null,wake:null,lastPull:0};
+function voiceActive(name){return _voice.phase!=='off'&&(!name||_voice.name===name)}
+function _voiceBarEl(){return document.getElementById('voice-bar-'+_voice.name)}
+function _voiceSet(phase,text){
+  if(phase)_voice.phase=phase;
+  const bar=_voiceBarEl();
+  if(bar){
+    bar.className='voice-bar on '+_voice.phase;
+    const t=document.getElementById('voice-text-'+_voice.name);
+    if(t&&text)t.textContent=text;
+    const skip=document.getElementById('voice-skip-'+_voice.name);
+    if(skip)skip.style.display=_voice.phase==='speaking'?'':'none';
+  }
+}
+function renderVoiceBar(){
+  document.querySelectorAll('.voice-bar').forEach(b=>{
+    const on=voiceActive()&&b.id==='voice-bar-'+_voice.name;
+    b.className='voice-bar'+(on?' on '+_voice.phase:'');
+  });
+  document.querySelectorAll('.cmd-voice').forEach(b=>{
+    b.classList.toggle('active',voiceActive()&&b.id==='cmd-voice-'+_voice.name);
+  });
+}
+async function toggleLiveVoice(name){
+  if(voiceActive(name)){stopLiveVoice('Live voice off');return}
+  await startLiveVoice(name);
+}
+async function startLiveVoice(name){
+  if(_voice.phase!=='off')stopLiveVoice('');
+  unlockCompletionAudio();                       // this click is the audio unlock
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    showToast('This browser has no microphone access.');return;
+  }
+  let stream;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia(
+      {audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  }catch(e){showToast('Microphone permission denied or unavailable.');return}
+  _voice.name=name;_voice.stream=stream;_voice.awaiting=false;_voice.pending=null;
+  _voice.floor=0.005;_voice.lastPull=0;
+  // Whatever the agent said BEFORE you started is not read out.
+  const msgs=chatMessages[name]||[];
+  _voice.lastSpokenTs=0;
+  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){_voice.lastSpokenTs=msgs[i].ts||0;break}}
+  const ctx=_getCompletionAudioContext();
+  _voice.ctx=ctx;
+  if(ctx){
+    if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
+    try{
+      _voice.srcNode=ctx.createMediaStreamSource(stream);
+      const an=ctx.createAnalyser();an.fftSize=1024;
+      _voice.srcNode.connect(an);
+      _voice.analyser=an;_voice.data=new Float32Array(an.fftSize);
+    }catch(e){_voice.analyser=null}
+  }
+  try{if(navigator.wakeLock&&navigator.wakeLock.request)_voice.wake=await navigator.wakeLock.request('screen')}catch(e){}
+  _voice.phase='listening';
+  renderVoiceBar();
+  _voiceListen();
+  if(_voice.replyTimer)clearInterval(_voice.replyTimer);
+  _voice.replyTimer=setInterval(_voiceCheckReply,2500);
+}
+function stopLiveVoice(msg){
+  _voice.phase='off';
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  if(_voice.replyTimer){clearInterval(_voice.replyTimer);_voice.replyTimer=null}
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+  try{if(_voice.stream)_voice.stream.getTracks().forEach(t=>t.stop())}catch(e){}
+  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
+  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
+  try{if(_voice.srcNode)_voice.srcNode.disconnect()}catch(e){}
+  try{if(_voice.wake&&_voice.wake.release)_voice.wake.release()}catch(e){}
+  _voice.rec=null;_voice.stream=null;_voice.analyser=null;_voice.srcNode=null;
+  _voice.wake=null;_voice.awaiting=false;_voice.pending=null;_voice.audio=null;
+  renderVoiceBar();
+  if(msg)showToast(msg);
+}
+function _voiceListen(){
+  if(_voice.phase==='off'||!_voice.stream)return;
+  _voice.phase='listening';_voice.heard=false;_voice.chunks=[];
+  _voice.startedAt=Date.now();_voice.speechAt=0;_voice.dropClip=false;
+  let mr;
+  try{mr=new MediaRecorder(_voice.stream)}catch(e){stopLiveVoice('Recording is not supported in this browser.');return}
+  _voice.rec=mr;
+  mr.ondataavailable=e=>{if(e.data&&e.data.size)_voice.chunks.push(e.data)};
+  mr.onstop=()=>{
+    const drop=_voice.dropClip;_voice.dropClip=false;
+    if(_voice.phase==='off'||_voice.phase==='speaking')return;
+    if(drop){if(_voice.phase==='listening')_voiceListen();return}
+    _voiceSend(new Blob(_voice.chunks,{type:mr.mimeType||'audio/webm'}));
+  };
+  try{mr.start(250)}catch(e){stopLiveVoice('Could not start recording.');return}
+  _voiceSet('listening',_voice.awaiting?'Listening. Claude is still working.':'Listening. Just talk.');
+  if(_voice.timer)clearInterval(_voice.timer);
+  _voice.timer=setInterval(_voiceTick,100);
+}
+function _voiceLevel(){
+  if(!_voice.analyser)return 0;
+  _voice.analyser.getFloatTimeDomainData(_voice.data);
+  let sum=0;
+  for(let i=0;i<_voice.data.length;i++)sum+=_voice.data[i]*_voice.data[i];
+  return Math.sqrt(sum/_voice.data.length);
+}
+function _voiceTick(){
+  if(_voice.phase!=='listening')return;
+  const now=Date.now();
+  const level=_voiceLevel();
+  // The floor drops to the quietest thing heard and creeps back up, so it
+  // follows the room rather than a number someone guessed.
+  _voice.floor=level<_voice.floor?level:(_voice.floor*0.999+level*0.001);
+  const speaking=_voice.analyser?level>Math.max(VOICE_MIN_RMS,_voice.floor*3.5):false;
+  if(speaking){
+    if(!_voice.heard){_voice.heard=true;_voiceSet('hearing','Hearing you.')}
+    _voice.speechAt=now;
+  }
+  if(_voice.heard&&_voice.speechAt&&now-_voice.speechAt>VOICE_SILENCE_MS){_voiceStopClip(false);return}
+  if(_voice.heard&&now-_voice.startedAt>VOICE_MAX_CLIP_MS){_voiceStopClip(false);return}
+  // No analyser (an old browser): fall back to fixed 12-second turns.
+  if(!_voice.analyser&&now-_voice.startedAt>12000){_voiceStopClip(false);return}
+  if(!_voice.heard&&now-_voice.startedAt>VOICE_IDLE_RESTART_MS){_voiceStopClip(true);return}
+}
+function _voiceStopClip(drop){
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  _voice.dropClip=!!drop;
+  if(!drop)_voiceSet('sending','Sending what you said.');
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+}
+async function _voiceSend(blob){
+  if(_voice.phase==='off')return;
+  if(!blob||!blob.size){_voiceListen();return}
+  const type=blob.type||'';
+  const ext=type.indexOf('mp4')>=0?'m4a':(type.indexOf('ogg')>=0?'ogg':'webm');
+  let text='';
+  try{
+    const fd=new FormData();fd.append('audio',blob,'voice.'+ext);
+    const r=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
+    const j=await r.json().catch(()=>({}));
+    text=(r.ok&&j.text)?String(j.text).trim():'';
+  }catch(e){}
+  if(_voice.phase==='off')return;
+  if(!text||text.replace(/[^A-Za-z0-9]/g,'').length<2){_voiceListen();return}
+  if(/^(stop|end|exit|quit|turn off)\s*(the\s+)?(live\s+)?voice(\s+mode)?\s*[.!]?$/i.test(text)){
+    stopLiveVoice('Live voice off');return;
+  }
+  const name=_voice.name;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/send',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command:text})});
+    if(!resp.ok)throw new Error('send failed');
+    appendChatBubble(name,'user',text,Date.now()/1000);
+    setOptimisticBusy(name);
+    _voice.awaiting=true;_voice.sentAt=Date.now()/1000;_voice.pending=null;
+  }catch(e){showToast('Could not send that message.')}
+  _voiceListen();
+}
+// The reply is the Chat tab's own recap of the turn, which is the short version
+// written to be read out. Speak it only once it has settled: the server updates
+// the same bubble as the turn finishes, and reading a half-written recap aloud
+// is worse than waiting two seconds.
+async function _voiceCheckReply(){
+  if(_voice.phase==='off'||!_voice.awaiting)return;
+  const name=_voice.name;
+  const busy=(lastStatus[name]||'')==='busy';
+  if(!busy&&Date.now()/1000-_voice.sentAt>4&&Date.now()-_voice.lastPull>6000){
+    _voice.lastPull=Date.now();
+    try{await refreshOne(name)}catch(e){}
+  }
+  if(_voice.phase==='off'||busy)return;
+  const msgs=chatMessages[name]||[];
+  let latest=null;
+  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){latest=msgs[i];break}}
+  if(!latest||!(latest.ts>_voice.sentAt)||!(latest.ts>_voice.lastSpokenTs))return;
+  const txt=String(latest.text||latest.full||'').trim();
+  if(!txt)return;
+  if(_voice.pending&&_voice.pending===txt){
+    _voice.pending=null;_voice.awaiting=false;_voice.lastSpokenTs=latest.ts;
+    _voiceSpeak(txt);
+  }else{
+    _voice.pending=txt;
+  }
+}
+function voiceSkipSpeech(){
+  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
+  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
+}
+async function _voiceSpeak(text){
+  if(_voice.phase==='off')return;
+  // Stop listening first: an open mic would hear the reply and answer it.
+  _voice.dropClip=true;
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  _voiceSet('speaking','Speaking the reply.');
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+  let played=false;
+  try{
+    const r=await fetch(BASE+'/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:text})});
+    if(r.ok&&_voice.ctx){
+      const buf=await r.arrayBuffer();
+      const decoded=await _voice.ctx.decodeAudioData(buf);
+      if(_voice.phase!=='speaking')return;
+      await new Promise(res=>{
+        const src=_voice.ctx.createBufferSource();
+        src.buffer=decoded;src.connect(_voice.ctx.destination);
+        _voice.audio=src;
+        src.onended=()=>{_voice.audio=null;res()};
+        src.start();
+      });
+      played=true;
+    }
+  }catch(e){}
+  if(!played&&window.speechSynthesis&&_voice.phase==='speaking'){
+    // No server voice (offline, no key): the browser's own voice still works.
+    await new Promise(res=>{
+      try{
+        const u=new SpeechSynthesisUtterance(text.slice(0,1500));
+        u.onend=res;u.onerror=res;speechSynthesis.speak(u);
+      }catch(e){res()}
+    });
+  }
+  if(_voice.phase==='speaking')_voiceListen();
 }
 
 async function sendChat(name){
@@ -27831,6 +28163,7 @@ function _safeToReload(){
     // _recording is a per-session map, not a flag: it is always truthy, so ask
     // whether any session is actually recording.
     if(typeof _recording==='object'&&_recording&&Object.values(_recording).some(Boolean))return false;
+    if(typeof _voice==='object'&&_voice&&_voice.phase!=='off')return false;   // mid-conversation
   }catch(e){return false}
   return true;
 }
