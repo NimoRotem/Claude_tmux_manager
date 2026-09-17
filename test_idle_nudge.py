@@ -53,12 +53,14 @@ const fireNext=()=>{
   return timer.delay;
 };
 
-// LIGHT: one chime per finished session, and nothing scheduled to repeat.
+// LIGHT: one chime for a session you asked something, silence for the rest,
+// and nothing scheduled to repeat.
 context.setIdleNudgeMode('light');
+context.armCompletionChime('alpha');
 finish('alpha');
-const lightOnce={chimes,timers:timers.size};
-finish('beta');
-const lightTwoSessions={chimes,timers:timers.size};
+const lightAsked={chimes,timers:timers.size};
+finish('beta');                       // nobody asked beta anything
+const lightUnasked={chimes,timers:timers.size};
 
 // HIGH: the same chime, plus a repeat every 20s until the session is given work.
 chimes=0;
@@ -74,14 +76,15 @@ const highAfterNewMessage={timers:timers.size,names:names('high')};
 context._acknowledgeCompletion('alpha');
 const highAfterView={timers:timers.size,names:names('high')};
 
-// OFF: silent, and still nothing scheduled.
+// OFF: silent, and still nothing scheduled, even for a session you asked.
 chimes=0;
 context.setIdleNudgeMode('off');
+context.armCompletionChime('beta');
 finish('beta');
 const offSilent={chimes,timers:timers.size};
 
 process.stdout.write(JSON.stringify({
-  lightOnce,lightTwoSessions,highStart,highDelay,highRepeated,
+  lightAsked,lightUnasked,highStart,highDelay,highRepeated,
   highAfterNewMessage,highAfterView,offSilent,savedMode:storage.get('idleNudgeMode'),
 }));
 """
@@ -121,9 +124,10 @@ def test_light_chimes_once_and_only_high_repeats():
 
     assert result.returncode == 0, result.stderr
     state = json.loads(result.stdout)
-    # Light: one sound per finished session, nothing queued to say it again.
-    assert state["lightOnce"] == {"chimes": 1, "timers": 0}
-    assert state["lightTwoSessions"] == {"chimes": 2, "timers": 0}
+    # Light: one sound for the session you asked, nothing for the others, and
+    # nothing queued to say it again.
+    assert state["lightAsked"] == {"chimes": 1, "timers": 0}
+    assert state["lightUnasked"] == {"chimes": 1, "timers": 0}
     # High: the same chime, then a repeat every 20 seconds.
     assert state["highStart"] == {"chimes": 1, "timers": 1, "names": ["alpha"]}
     assert state["highDelay"] == 20_000

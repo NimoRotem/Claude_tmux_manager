@@ -25419,18 +25419,20 @@ const lastStatus={};
 const _completedUnread={};
 const IDLE_NUDGE_INTERVAL_MS=20000;
 // off: silent, no chime of any kind.
-// light (the default): ONE chime when a session finishes, and 4 beeps when a
-//   prompt cache is 15 minutes from cold. Nothing repeats. It used to chime
-//   every 20 seconds until each finished tab had been looked at, which on a box
-//   running six sessions is what "it keeps beeping at me" was.
-// high (called ADHD until 2026-09-17): the repeat, every 20 seconds until each
-//   finished session is given new work, and 8 beeps instead of 4.
+// light (the default): ONE chime when a session YOU SENT SOMETHING TO finishes,
+//   and 4 beeps when a prompt cache is 15 minutes from cold. Nothing repeats and
+//   nothing sounds for the other sessions: on a box running six agents, a chime
+//   per finished turn is what "it keeps beeping at me" was made of. The header
+//   dot still pulses for every finished session, silently.
+// high (called ADHD until 2026-09-17): a chime for EVERY session that finishes,
+//   then again every 20 seconds until each one is given new work, and 8 beeps
+//   instead of 4.
 const IDLE_NUDGE_MODES=['off','light','high'];
 const IDLE_NUDGE_DEFAULT='light';
 const IDLE_NUDGE_TITLES={
   off:'Off: no sounds at all, not even the prompt-cache warning',
-  light:'Light: ONE chime when a session finishes, and 4 quick beeps 15 minutes before a prompt cache goes cold. Nothing repeats.',
-  high:'High: everything Light does, plus a chime every 20 seconds until each finished session is given new work, and 8 beeps instead of 4'
+  light:'Light: one chime when a session you asked something finishes, and 4 quick beeps 15 minutes before a prompt cache goes cold. Nothing repeats.',
+  high:'High: a chime for every session that finishes, then again every 20 seconds until each one is given new work, and 8 beeps instead of 4'
 };
 const _idleNudgeAdhdPending={};
 let _idleNudgeTimer=null;
@@ -25713,21 +25715,22 @@ function trackSessionStatus(name,status,interrupted){
     delete _idleNudgeAdhdPending[name];
     _syncIdleNudgeTimer();
   }
+  const mode=getIdleNudgeMode();
   if(completed&&!interrupted){
     _markCompletionUnread(name);
-    if(getIdleNudgeMode()==='high'){
+    if(mode==='high'){
       _idleNudgeAdhdPending[name]=true;
       _syncIdleNudgeTimer();
     }
-    // One chime, for the session that just finished, in Light and High alike.
     // The status the server reports is a CONFIRMED idle (the pane looked idle
-    // for long enough and the transcript stopped growing), so this no longer
-    // fires on a gap between tool calls or on a turn waiting for its own
-    // sub-agents.
-    if(getIdleNudgeMode()!=='off')playCompletionChime();
+    // for long enough and the session's transcript stopped growing), so a chime
+    // here is a finished turn, not a gap between tool calls. High chimes for
+    // every session; Light only for one you asked something.
+    if(mode==='high')playCompletionChime();
   }
   if(completed&&_completionWatch[name]&&!interrupted){
     delete _completionWatch[name];
+    if(mode==='light')playCompletionChime();
     return true;
   }
   return false;
