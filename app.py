@@ -1123,6 +1123,21 @@ AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
 
+# When a PERSON last typed into each session through the dashboard (a message,
+# or a key from the key bar). Everything that types on its own reads this first:
+# a login prompt a human opened a minute ago is theirs, not a stranded one, and
+# a keep-alive chain restarts its count the moment somebody is back.
+_human_input_at: Dict[str, float] = {}
+
+
+def _note_human_input(session_name: str) -> None:
+    _human_input_at[session_name] = time.time()
+
+
+def _seconds_since_human_input(session_name: str) -> float:
+    at = _human_input_at.get(session_name)
+    return time.time() - at if at else float("inf")
+
 # ── Prompt cache expiry ─────────────────────────────────────────────────────
 # Anthropic's prompt cache is ephemeral with one of two lifetimes: 5 minutes by
 # default, or 1 hour when the request asks for `ttl: "1h"`. Claude Code buys the
@@ -1270,15 +1285,73 @@ def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
     dropping the pane to a bare shell — which then reads as "Claude isn't
     running" to every action. The relaunch paths check this so they can start
     fresh with the SAME id instead of killing the session."""
-    if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
+    return _conversation_state(session_name, convo_uuid) == "saved"
+
+
+# A transcript that holds no turn at all. `/exit` on a session that never got a
+# message still writes `<id>.jsonl` with two bookkeeping lines (mode and
+# permission-mode) and nothing else. Both relaunch flags then fail on it: the CLI
+# answers `--resume` with "No conversation found" and `--session-id` with
+# "Session ID ... is already in use" (it only stats the file). That pair is what
+# left calandar and lisa-solver at a bare shell on 2026-09-17.
+_TRANSCRIPT_TURN_TYPES = ("user", "assistant")
+
+
+def _transcript_has_turns(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"type"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("type") in _TRANSCRIPT_TURN_TYPES:
+                    return True
+    except OSError:
         return False
+    return False
+
+
+def _conversation_state(session_name: str, convo_uuid: str) -> str:
+    """'saved' (resumable), 'stub' (file with no turns), or 'missing'."""
+    if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
+        return "missing"
     try:
         target = convo_uuid + ".jsonl"
-        return any(os.path.basename(f) == target
-                   for f in _find_session_jsonl_files(session_name))
+        for f in _find_session_jsonl_files(session_name):
+            if os.path.basename(f) == target:
+                return "saved" if _transcript_has_turns(f) else "stub"
     except Exception:
         logger.debug("conversation existence check failed for %s", session_name, exc_info=True)
-        return False
+    return "missing"
+
+
+def _set_aside_stub_transcript(session_name: str, convo_uuid: str) -> None:
+    """Rename an empty `<id>.jsonl` so `--session-id <id>` can start on it.
+
+    Renamed rather than deleted: it holds nothing but two mode lines, but it is
+    not ours to destroy, and the suffix says exactly why it moved."""
+    try:
+        target = convo_uuid + ".jsonl"
+        for f in _find_session_jsonl_files(session_name):
+            if os.path.basename(f) == target and not _transcript_has_turns(f):
+                os.replace(f, f + ".no-turns-%d" % int(time.time()))
+                logger.info("Set aside empty transcript %s for '%s' so it can relaunch",
+                            target, session_name)
+    except Exception:
+        logger.debug("could not set aside stub transcript for %s", session_name, exc_info=True)
+
+
+def _fresh_or_resume_flag(session_name: str, convo_uuid: str) -> str:
+    """`--resume` on a saved conversation, else `--session-id` on the same id."""
+    state = _conversation_state(session_name, convo_uuid)
+    if state == "saved":
+        return "--resume " + convo_uuid
+    if state == "stub":
+        _set_aside_stub_transcript(session_name, convo_uuid)
+    return "--session-id " + convo_uuid
 
 
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
@@ -1297,9 +1370,7 @@ def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """
     uuid_s = resume_uuid or _session_convo(session_name)
     if uuid_s and _UUID_RE.fullmatch(uuid_s):
-        if _conversation_exists(session_name, uuid_s):
-            return "--resume " + uuid_s
-        return "--session-id " + uuid_s
+        return _fresh_or_resume_flag(session_name, uuid_s)
     guessed = _find_session_transcript_uuid(session_name)
     if guessed:
         _set_session_convo(session_name, guessed)
@@ -8355,9 +8426,7 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     # with this id but relaunched before its first saved turn has no transcript,
     # and `--resume` on it exits with "No conversation found", leaving a dead
     # shell. Start fresh on the same id in that case so the session stays alive.
-    resume_or_new = ("--resume " + resume_uuid
-                     if _conversation_exists(session_name, resume_uuid)
-                     else "--session-id " + resume_uuid)
+    resume_or_new = _fresh_or_resume_flag(session_name, resume_uuid)
     command = (command.strip()
                + _model_flag_for_relaunch(session_name)
                + _effort_flag_for_relaunch(session_name)
@@ -17245,7 +17314,7 @@ async def _auto_fix_login(session_name: str) -> dict:
     for _ in range(20):
         await asyncio.sleep(2)
         pane = await asyncio.to_thread(_pane_text, session_name, 25)
-        if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
+        if _screen_needs_login(pane) or "paste code here" in pane.lower():
             continue
         if await _async_is_claude_running(session_name):
             _account_ident_cache.clear()
@@ -17343,7 +17412,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                 if "login successful" in low or "logged in as" in low:
                     ok, why = True, ""
                     break
-                if "paste code here" not in low and not _LOGIN_NEEDED_RE.search(pane):
+                if "paste code here" not in low and not _screen_needs_login(pane):
                     ok, why = True, ""
                     break
             st.update({"running": False, "status": "logged in" if ok else why,
@@ -19945,6 +20014,7 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
                 capture_output=True, text=True, timeout=5
             )
+        _note_human_input(session_name)
         # Record user message in chat history
         now = time.time()
         entry = cache.setdefault(session_name, {})
@@ -20025,6 +20095,7 @@ async def api_send_keys(session_name: str, body: SendKeys):
                 )
             else:
                 return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
+        _note_human_input(session_name)
         return JSONResponse({"ok": True, "keys_sent": body.keys})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -20409,9 +20480,57 @@ _MENU_PICK_SYSTEM_PROMPT = (
     "to the user (e.g. 'no', 'let me decide', 'I'll do it myself', 'ask me later').\n"
     "- If several options proceed, pick the one that makes the MOST progress with the fewest "
     "future interruptions.\n"
-    "- If genuinely unsure, pick 1.\n"
+    "- NEVER pick an option that exits or quits Claude Code, logs out or signs out, ends the "
+    "session, or spends money (upgrade, buy, add funds, extra usage). Pick the other option.\n"
+    "- If genuinely unsure, pick the safest option that keeps the session running.\n"
     "Reply with ONLY the option number, nothing else."
 )
+
+# ── Options the dashboard never picks on a person's behalf ───────────────────
+# The model is told to avoid these, and it is not trusted to: a failed LLM call
+# falls back to Enter on whatever is highlighted, and Claude Code highlights
+# "No, exit" by default on its bypass-permissions warning. So the pick is checked
+# here, deterministically, whoever made it. Ending the session loses the work in
+# the pane; spending money is not a keystroke to make for someone who is away.
+_MENU_ENDS_SESSION_RE = re.compile(
+    r"\b(?:exit|quit|log\s*-?\s*out|sign\s*-?\s*out|end\s+(?:the\s+|this\s+)?session|"
+    r"close\s+(?:claude|the\s+session)|uninstall|abort)\b",
+    re.I,
+)
+_MENU_SPENDS_MONEY_RE = re.compile(
+    r"\b(?:upgrade|purchase|buy|add\s+(?:funds|credits?)|extra\s+usage|overage|pay\b|billing)",
+    re.I,
+)
+_MENU_PROCEED_RE = re.compile(
+    r"\b(?:yes|proceed|continue|accept|allow|approve|resume|retry|try\s+again|keep\s+going|"
+    r"i\s+accept|trust|confirm|ok)\b",
+    re.I,
+)
+
+
+def _menu_option_forbidden(label: str) -> bool:
+    """True for a menu option the auto-responder must never choose."""
+    label = label or ""
+    return bool(_MENU_ENDS_SESSION_RE.search(label) or _MENU_SPENDS_MONEY_RE.search(label))
+
+
+def _safe_menu_choice(options: list, proposed):
+    """The option number to press, or None to leave the menu for a human.
+
+    `proposed` is the model's pick, or None when it had none (the old fallback
+    pressed Enter on the highlighted row). A forbidden or missing pick is
+    replaced by the best allowed option: one that proceeds, else the first one
+    left. When every option would end the session or spend money, nothing is
+    pressed at all."""
+    allowed = [(n, l) for n, l in options if not _menu_option_forbidden(l)]
+    if not allowed:
+        return None
+    if proposed is not None and any(n == proposed for n, _ in allowed):
+        return proposed
+    for n, l in allowed:
+        if _MENU_PROCEED_RE.search(l):
+            return n
+    return allowed[0][0]
 
 
 def _parse_menu_options(visible_text: str):
@@ -20519,6 +20638,31 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
+                    if len(options) >= 2:
+                        # No pick means the highlighted row, which is exactly the
+                        # row that has to pass the same check as any other.
+                        proposed = target if target is not None else options[selected_idx][0]
+                        safe = _safe_menu_choice(options, proposed)
+                        if safe is None:
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': every option exits, logs "
+                                        "out or spends money (%s)", name,
+                                        "; ".join(l[:30] for _, l in options))
+                            continue
+                        if safe != proposed:
+                            log.warning("Auto-responder in '%s' refused option %s (%s) and chose "
+                                        "%s instead", name, proposed,
+                                        next((l[:40] for n, l in options if n == proposed), ""),
+                                        safe)
+                        target = safe
+                    else:
+                        cursor_row = next((ln for ln in result.stdout.splitlines()[::-1]
+                                           if ln.strip().startswith("❯")), "")
+                        if _menu_option_forbidden(cursor_row):
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': the highlighted option "
+                                        "exits, logs out or spends money", name)
+                            continue
                     if target is not None:
                         chosen = await _select_menu_option(name, options, selected_idx, target)
                     else:
@@ -20714,11 +20858,26 @@ async def _simple_watchdog_send_continue(session_name: str) -> bool:
     return await _simple_watchdog_send_text(session_name, "continue")
 
 
+# Slash commands that end the session, sign it out or throw its context away.
+# Nothing that types on the user's behalf (Full's autopilot, Cache's keep-alive)
+# may send one, whatever composed it.
+_SESSION_ENDING_COMMAND_RE = re.compile(
+    r"^\s*/(?:exit|quit|logout|login|clear|reset|new|resume|rewind|compact|kill)\b", re.I)
+
+
+def _ends_session(text: str) -> bool:
+    return bool(_SESSION_ENDING_COMMAND_RE.search(text or ""))
+
+
 async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
     """Type a composed reply into the session's Claude Code input box and submit.
     Collapses to a single line so Enter submits the whole message at once."""
     text = " ".join((text or "").split())
     if not text:
+        return False
+    if _ends_session(text):
+        logger.warning("Refused to type %r into '%s': it would end or reset the session",
+                       text[:40], session_name)
         return False
     try:
         # -l sends the text literally (so it isn't interpreted as tmux key names);
@@ -20916,6 +21075,30 @@ async def _simple_watchdog_loop():
 
 # --- Auto /login watchdog: re-authenticate a session when Claude asks for login ---
 
+# Claude Code prints a SOFT notice days before a login lapses, on every launch:
+#   "⚠ Your login expires in 2 days · run /login to renew"
+# The session is signed in and working. "run /login" in that line matched the
+# regex below, so the watchdog took every freshly launched session for a logged
+# out one, pressed Escape, typed /exit and relaunched it: on 2026-09-17 that
+# killed calandar, phonelinebob and lisa-solver on builder2 inside an hour. The
+# notice is stripped before any login test, so it can never trigger a relaunch.
+_LOGIN_RENEWAL_NOTICE_RE = re.compile(
+    r"^.*(?:login|sign[- ]?in|token|credentials?)\s+(?:expires|will expire)\b.*$"
+    r"|^.*/login\s+to\s+renew\b.*$",
+    re.I | re.M,
+)
+
+
+def _strip_login_renewal_notice(text: str) -> str:
+    """The pane text without Claude Code's advance "login expires" notice."""
+    return _LOGIN_RENEWAL_NOTICE_RE.sub("", text or "")
+
+
+def _screen_needs_login(text: str) -> bool:
+    """True only for a real logged-out message, never for the renewal notice."""
+    return bool(_LOGIN_NEEDED_RE.search(_strip_login_renewal_notice(text)))
+
+
 _LOGIN_NEEDED_RE = re.compile(
     r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
     # "oauth <anything> invalid" matched any line mentioning a third-party OAuth
@@ -21050,8 +21233,13 @@ async def _cache_keepalive_loop():
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
-# clear it — otherwise we'd interrupt someone typing /login by hand.
-_LOGIN_FLOW_STALE_AFTER = 45
+# clear it — otherwise we'd interrupt someone typing /login by hand. 45 seconds
+# was far too short for a person: opening the link, signing in and copying the
+# code back leaves the pane byte-for-byte still for minutes, and the watchdog
+# pressed Escape on them ("Login interrupted"). And a login somebody opened from
+# the dashboard is theirs for _LOGIN_FLOW_HUMAN_GRACE, however still it sits.
+_LOGIN_FLOW_STALE_AFTER = 600
+_LOGIN_FLOW_HUMAN_GRACE = 1800
 _login_watchdog_state: Dict[str, dict] = {}
 
 
@@ -21080,7 +21268,7 @@ def _classify_login_watchdog_screen(screen: str) -> tuple[bool, bool]:
         or ("select login method" in low)
         or ("press enter to retry" in low and "esc to cancel" in low)
     )
-    needs_login = bool(_LOGIN_NEEDED_RE.search(prompt_tail))
+    needs_login = _screen_needs_login(prompt_tail)
     return needs_login, login_flow_open
 
 
@@ -21159,6 +21347,10 @@ async def _login_watchdog_loop():
                 # /exit'd every few minutes. A live session's pane keeps changing,
                 # so a digest of it tells the two apart — an abandoned prompt is
                 # byte-for-byte static.
+                if login_flow_open and _seconds_since_human_input(name) < _LOGIN_FLOW_HUMAN_GRACE:
+                    state.pop("flow_since", None)
+                    state.pop("flow_sig", None)
+                    continue
                 if login_flow_open:
                     sig = hashlib.sha1((recent or "").encode("utf-8", "replace")).hexdigest()
                     since = state.get("flow_since")
