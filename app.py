@@ -6831,8 +6831,8 @@ _activity_state: Dict[str, dict] = {}
 # The transcript is what catches work the pane does not show: a sub-agent writing
 # into the same conversation, or a tool that takes a minute and prints nothing.
 IDLE_CONFIRM_COUNT = 3
-IDLE_CONFIRM_SECONDS = 12
-IDLE_TRANSCRIPT_QUIET = 20
+IDLE_CONFIRM_SECONDS = 10
+IDLE_TRANSCRIPT_QUIET = 15
 
 # Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
 _SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
