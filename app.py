@@ -114,6 +114,23 @@ MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
 _MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
 _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
+# ANTHROPIC_BASE_URL pointed anywhere but Anthropic means this box runs its
+# agents against a gateway (builder2a -> LunaRoute), and the Claude line-up below
+# is not what it can serve. A gateway publishes its own catalogue at /v1/models
+# in the same shape, so on a gateway box the catalogue is REPLACED by what the
+# gateway offers rather than merged into this seed: a Claude id is unroutable
+# there, and choosing one from the dropdown types a /model command that fails.
+_ANTHROPIC_API_HOST = "api.anthropic.com"
+
+
+def _model_gateway_base() -> str:
+    """The gateway's base URL, or "" when this box talks to Anthropic itself."""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+    if not base or _ANTHROPIC_API_HOST in base:
+        return ""
+    return base
+
+
 _SEED_MODEL_CATALOG = [
     ["claude-opus-5[1m]", "Opus 5 · 1M"],
     ["claude-opus-5", "Opus 5"],
@@ -228,9 +245,17 @@ def _load_model_catalog() -> list:
             rows = data.get("models") if isinstance(data, dict) else data
             rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
             if rows:
-                return _merge_seed_rows(rows)
+                # _merge_seed_rows exists to carry a newly-seeded Claude model
+                # onto a box whose models.json predates it. On a gateway that is
+                # exactly wrong: it would put the Claude line-up back every boot.
+                return rows if _model_gateway_base() else _merge_seed_rows(rows)
     except Exception:
         logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
+    if _model_gateway_base():
+        # Nothing persisted yet. Offer only what this box actually launches with
+        # until the first refresh lands, rather than a Claude list the gateway
+        # would refuse. The id is its own label: the gateway names its models.
+        return [[DEFAULT_MODEL, DEFAULT_MODEL]] if DEFAULT_MODEL else []
     return [list(r) for r in _SEED_MODEL_CATALOG]
 
 
@@ -265,6 +290,15 @@ for _dm in (DEFAULT_MODEL, _model_base_id(DEFAULT_MODEL)):
 def _anthropic_api_key() -> str:
     """A usable Anthropic API key for the model-catalog check: env first, then
     the API registry, then ~/CLAUDE_API_KEYS.md."""
+    # On a gateway the token is whatever that gateway issued (LunaRoute's is
+    # `lr_…`) and Claude Code is handed it as ANTHROPIC_AUTH_TOKEN, so neither
+    # the `sk-ant-` prefix test nor the Anthropic key stores below apply.
+    if _model_gateway_base():
+        for _var in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            _v = os.environ.get(_var, "").strip()
+            if _v:
+                return _v
+        return ""
     k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if k.startswith("sk-ant-"):
         return k
@@ -305,6 +339,45 @@ def _fetch_anthropic_model_ids() -> list:
     return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
+def _fetch_gateway_model_rows() -> list:
+    """The gateway's own catalogue as [id, label] rows, chat models only.
+
+    A gateway lists more than chat models — LunaRoute publishes embeddings,
+    rerankers and image generators alongside them — and none of those can back a
+    session, so offering them would put a dead entry in the dropdown. They are
+    told apart by `capabilities.messages.supported`; a gateway that publishes no
+    capabilities at all gets everything it lists offered, which is the only
+    honest default when it will not say.
+
+    Both auth headers go out: LunaRoute accepts either, another gateway may want
+    one or the other, and sending both costs nothing."""
+    import urllib.request
+    base = _model_gateway_base()
+    key = _anthropic_api_key()
+    if not base or not key:
+        return []
+    req = urllib.request.Request(
+        base + "/v1/models?limit=1000",
+        headers={"x-api-key": key, "authorization": "Bearer " + key,
+                 "anthropic-version": "2023-06-01"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    items = [m for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+    publishes_caps = any(
+        isinstance((m.get("capabilities") or {}).get("messages"), dict) for m in items)
+    rows = []
+    for m in items:
+        if publishes_caps:
+            msgs = (m.get("capabilities") or {}).get("messages") or {}
+            if not msgs.get("supported"):
+                continue
+        label = (m.get("display_name") or "").strip() or m["id"]
+        rows.append([m["id"], label])
+    rows.sort(key=lambda row: row[1].lower())
+    return rows
+
+
 MODEL_CHECK_INTERVAL = 24 * 3600  # once per 24h
 
 
@@ -322,6 +395,19 @@ async def _refresh_model_catalog(force: bool = False) -> bool:
         now = time.time()
         if not force and now - last < MODEL_CHECK_INTERVAL:
             return False
+        if _model_gateway_base():
+            # REPLACE: the Claude seed is unroutable through a gateway, so
+            # merging would leave every one of those ids in the dropdown.
+            rows = await asyncio.to_thread(_fetch_gateway_model_rows)
+            if not rows:
+                logger.info("Model auto-detect: gateway listed no chat models "
+                            "(auth/network?) — will retry")
+                return False
+            changed = [r[0] for r in rows] != [r[0] for r in MODEL_CATALOG]
+            MODEL_CATALOG = rows
+            ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+            _save_model_catalog(MODEL_CATALOG, now)
+            return changed
         api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
         if not api_ids:
             # Couldn't reach the API — don't stamp last_check, so we retry sooner.
@@ -342,10 +428,17 @@ async def _model_refresh_loop():
     """Background: keep the model dropdown current. Re-checks hourly whether a
     24h refresh is due, so a long-lived process still picks up new models daily."""
     await asyncio.sleep(20)  # let startup settle
+    # A gateway box forces the FIRST check: its persisted models.json was very
+    # likely written by the Anthropic path (or by a build with no gateway support
+    # at all), and the 24h timer would hold that wrong list for a day. Cleared
+    # after the call, not inside the `if`, so an unchanged catalogue stops
+    # forcing too and only an outright failure is retried.
+    force_first = bool(_model_gateway_base())
     while True:
         try:
-            if await _refresh_model_catalog():
+            if await _refresh_model_catalog(force=force_first):
                 logger.info("Model catalog updated: %s", [r[0] for r in MODEL_CATALOG])
+            force_first = False
         except Exception:
             logger.debug("model refresh loop iteration failed", exc_info=True)
         await asyncio.sleep(3600)
@@ -24750,6 +24843,22 @@ function esc(str){
 }
 function formatModelName(model){
   if(!model)return'';
+  // A gateway's ids are not Claude-shaped (deepseek-4.1-flash, glm-5.3-vision),
+  // and the family/version derivation below renders them "deepseek 4.1.flash".
+  // On those boxes the catalogue carries the gateway's own display name, so
+  // prefer it for anything that is not a claude- id. Claude ids fall through to
+  // the derivation and read exactly as they always have.
+  if(!/^claude-/.test(model)){
+    // A session's recorded model can carry the `[1m]` suffix while the
+    // catalogue lists the bare id, so try both and put the suffix back.
+    const gwOneM=/\[1m\]$/.test(model);
+    const gwBase=model.replace(/\[1m\]$/,'');
+    const fromCatalog=MODEL_CHOICES.find(c=>c[0]===model)
+      ||MODEL_CHOICES.find(c=>c[0]===gwBase);
+    if(fromCatalog){
+      return fromCatalog[1]+(gwOneM&&!/·\s*1M$/.test(fromCatalog[1])?' · 1M':'');
+    }
+  }
   const oneM=/\[1m\]$/.test(model);
   // Strip [1m] context suffix, claude- prefix, date suffix like -20251001
   let m=model.replace(/\[1m\]$/,'').replace(/^claude-/,'');
