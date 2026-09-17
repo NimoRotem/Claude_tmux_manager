@@ -354,6 +354,74 @@ def test_the_strip_says_nothing_about_cache_without_a_measured_ttl():
     assert "cold" not in txt
 
 
+# ── "Cache hot" / "Cache cold", said in words in the status row ─────────────
+
+def run_chip(sess, busy=False):
+    script = (
+        "const sessions=[" + json.dumps(sess) + "];\n"
+        "sessions[0].last_turn_end=Date.now()/1000-(" + str(sess.pop("_ago", 0)) + ");\n"
+        "const el={className:'',textContent:'',title:''};\n"
+        "const document={getElementById:function(){return el}};\n"
+        + _js(["_paintCacheChip"]) + "\n"
+        # after the lifted source, so this declaration is the one that wins
+        "function _sessionBusy(){return " + ("true" if busy else "false") + "}\n"
+        "_paintCacheChip('s');\n"
+        "console.log(JSON.stringify([el.className,el.textContent,el.title]));")
+    p = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_warm_cache_says_hot_in_orange():
+    cls, txt, title = run_chip({"name": "s", "cache_ttl": 3600, "_ago": 10 * 60})
+    assert txt == "Cache hot"
+    assert "hot" in cls and "expiring" not in cls
+    assert "cache-read price" in title
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_lapsed_cache_says_cold():
+    cls, txt, title = run_chip({"name": "s", "cache_ttl": 3600, "_ago": 70 * 60})
+    assert txt == "Cache cold"
+    assert "cold" in cls and "hot" not in cls
+    assert "pays to write the whole prompt again" in title
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_the_chip_flashes_with_everything_else_inside_the_alert_window():
+    cls, txt, _ = run_chip({"name": "s", "cache_ttl": 3600, "_ago": 50 * 60})
+    assert txt == "Cache hot" and "expiring" in cls
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_working_session_is_hot_and_never_flashing():
+    cls, txt, _ = run_chip({"name": "s", "cache_ttl": 3600, "_ago": 50 * 60}, busy=True)
+    assert txt == "Cache hot" and "expiring" not in cls
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_no_measured_ttl_says_nothing_at_all():
+    cls, txt, title = run_chip({"name": "s", "cache_ttl": 0, "_ago": 50 * 60})
+    assert (cls, txt, title) == ("", "", ""), "nothing written, so the row keeps its own class"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_the_two_words_do_not_share_a_colour():
+    src = APP.read_text()
+    hot = src[src.index(".tl-cache.hot{"):src.index(".tl-cache.cold{")]
+    cold = src[src.index(".tl-cache.cold{"):src.index(".tl-cache.expiring{")]
+    assert "#e3b341" in hot, "hot is the amber the rest of the cache UI uses"
+    assert "#79c0ff" in cold, "cold is blue"
+
+
+def test_the_row_carries_the_chip_next_to_the_idle_counter():
+    src = APP.read_text()
+    row = src[src.index('<div class="term-live" id="term-live-'):]
+    row = row[:row.index("</div>")]
+    assert row.index('id="tl-since-') < row.index('id="tl-cache-') < row.index('id="tl-ctx-')
+
+
 def test_the_keepalive_refuses_a_transcript_it_cannot_prove_is_ours():
     """Several sessions in one working directory share a transcript, and
     detect_sure says so. Showing a neighbour's countdown is cosmetic; typing on

@@ -6821,9 +6821,18 @@ _pane_stability: Dict[str, tuple] = {}
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
 # Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
 _activity_state: Dict[str, dict] = {}
-# Require N consecutive idle readings before switching from busy → idle.
-# At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
+# Going busy → idle needs ALL THREE of these, because a session that merely LOOKS
+# finished is the thing that makes the page chime at you for no reason:
+#   * N consecutive idle readings (it was a count alone, and the count was the
+#     bug: several callers poll this, so three readings could land inside a few
+#     seconds of one gap between tool calls),
+#   * IDLE_CONFIRM_SECONDS of wall clock since the first of them, and
+#   * IDLE_TRANSCRIPT_QUIET seconds since the session's own transcript last grew.
+# The transcript is what catches work the pane does not show: a sub-agent writing
+# into the same conversation, or a tool that takes a minute and prints nothing.
 IDLE_CONFIRM_COUNT = 3
+IDLE_CONFIRM_SECONDS = 12
+IDLE_TRANSCRIPT_QUIET = 20
 
 # Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
 _SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
@@ -6843,6 +6852,18 @@ _AGENTS_RUNNING_RE = re.compile(
     r'(?:^|[\s⎿│>])\d+\s+(?:local\s+|background\s+)?(?:agents?|tasks?|tools?)\b[^.]{0,40}?'
     r'\b(?:still\s+running|running|in\s+progress)\b'
     r'|waiting\s+for\s+completion\s+of\s+\d+',
+    re.I)
+# The live status line while the turn is blocked on work of its own:
+#   "✻ Waiting for 4 background agents to finish"
+#   "· Waiting for the remaining tasks"
+# It carries no "…" so the spinner patterns above miss it, and no count in the
+# place _AGENTS_RUNNING_RE looks for one. A leading ● is EXCLUDED on purpose:
+# that is the agent's own prose ("● Waiting for the four search agents to finish
+# scanning…"), which stays on screen long after the work is done.
+_RE_WAITING_ON_WORK = re.compile(
+    r'^\s*(?:[✶✽✻☆◆⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢·•]\s+)?'
+    r'waiting\s+(?:for|on)\b[^\n]{0,60}?'
+    r'\b(?:agents?|subagents?|tasks?|forks?|workers?|jobs?|tool\s+calls?|completion|results?)\b',
     re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
@@ -7125,6 +7146,13 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = "Agents running"
                 return info
+            # "✻ Waiting for 4 background agents to finish": the turn is not over,
+            # it is blocked on its own sub-agents. Only while the pane is alive —
+            # a waiting spinner animates, so a frozen one is a leftover.
+            if _RE_WAITING_ON_WORK.match(stripped) and spinner_is_live:
+                info["status"] = "busy"
+                info["detail"] = "Waiting for agents"
+                return info
 
         # --- Step 4: (stability was measured above, before the spinner scan) ---
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
@@ -7170,14 +7198,58 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
     return info
 
 
+_transcript_path_cache: Dict[str, tuple] = {}   # name -> (path, resolved_at)
+
+
+def _own_transcript_path(session_name: str) -> str:
+    """This session's OWN transcript file, by the conversation id it was launched
+    on. '' when the id is unknown or the file is not there yet.
+
+    Deliberately not the heuristic match: a neighbour's transcript in the same
+    working directory would report their work as this session's."""
+    hit = _transcript_path_cache.get(session_name)
+    if hit and time.time() - hit[1] < 60:
+        return hit[0]
+    path = ""
+    try:
+        convo = _session_convo(session_name)
+        if convo and _UUID_RE.fullmatch(convo):
+            target = convo + ".jsonl"
+            for f in _find_session_jsonl_files(session_name):
+                if os.path.basename(f) == target:
+                    path = f
+                    break
+    except Exception:
+        logger.debug("transcript path lookup failed for %s", session_name, exc_info=True)
+    _transcript_path_cache[session_name] = (path, time.time())
+    return path
+
+
+def _transcript_quiet_seconds(session_name: str) -> Optional[float]:
+    """How long since this session's transcript last grew, or None if unknown.
+
+    A sub-agent writes into the conversation it was spawned from, and a long tool
+    call appends its result when it lands, so a growing file means the turn is
+    still going even when the pane has nothing new to show."""
+    path = _own_transcript_path(session_name)
+    if not path:
+        return None
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        _transcript_path_cache.pop(session_name, None)
+        return None
+
+
 def detect_activity(session_name: str) -> dict:
     """Debounced activity detection with asymmetric hysteresis.
 
-    - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
-    - idle → busy: immediate (1 reading)
-
-    This prevents flickering when Claude Code briefly shows no spinner
-    between tool calls or streaming chunks.
+    - idle → busy: immediate (one reading).
+    - busy → idle: only once the pane has read idle IDLE_CONFIRM_COUNT times in a
+      row AND for IDLE_CONFIRM_SECONDS, AND this session's transcript has been
+      quiet for IDLE_TRANSCRIPT_QUIET. Anything less calls a gap between tool
+      calls, or a turn waiting on its sub-agents, "finished" — which is what put
+      a completion chime and a cache warning on sessions that were still working.
     """
     raw = _detect_activity_raw(session_name)
     now = time.time()
@@ -7189,6 +7261,7 @@ def detect_activity(session_name: str) -> dict:
             "status": raw["status"],
             "since": now,
             "consecutive_idle": 1 if raw["status"] == "idle" else 0,
+            "idle_since": now if raw["status"] == "idle" else 0,
             "raw": raw,
         }
         return raw
@@ -7199,38 +7272,50 @@ def detect_activity(session_name: str) -> dict:
             "status": "busy",
             "since": now if prev["status"] != "busy" else prev["since"],
             "consecutive_idle": 0,
+            "idle_since": 0,
             "raw": raw,
         }
         return raw
 
     if raw["status"] in ("idle", "unknown"):
         if prev["status"] == "busy":
-            # Trying to transition busy → idle: increment counter but hold busy
+            # Trying to transition busy → idle: hold busy until it has looked
+            # idle for long enough AND nothing is still being written.
             idle_count = prev["consecutive_idle"] + 1
-            if idle_count >= IDLE_CONFIRM_COUNT:
-                # Enough consecutive idle readings — confirm transition
+            idle_since = prev.get("idle_since") or now
+            quiet = _transcript_quiet_seconds(session_name)
+            settled = (idle_count >= IDLE_CONFIRM_COUNT
+                       and now - idle_since >= IDLE_CONFIRM_SECONDS
+                       and (quiet is None or quiet >= IDLE_TRANSCRIPT_QUIET))
+            if settled:
                 _activity_state[session_name] = {
                     "status": raw["status"],
                     "since": now,
                     "consecutive_idle": idle_count,
+                    "idle_since": idle_since,
                     "raw": raw,
                 }
                 return raw
-            else:
-                # Not enough yet — stay busy but record the idle reading
-                _activity_state[session_name] = {
-                    "status": "busy",
-                    "since": prev["since"],
-                    "consecutive_idle": idle_count,
-                    "raw": prev["raw"],  # keep last busy details
-                }
-                return prev["raw"]
+            # Not settled — stay busy but record the idle reading. A transcript
+            # that grew again means work restarted, so the clock starts over.
+            if quiet is not None and quiet < 2:
+                idle_since = now
+                idle_count = 0
+            _activity_state[session_name] = {
+                "status": "busy",
+                "since": prev["since"],
+                "consecutive_idle": idle_count,
+                "idle_since": idle_since,
+                "raw": prev["raw"],  # keep last busy details
+            }
+            return prev["raw"]
         else:
             # Already idle/unknown — stay idle, keep counting
             _activity_state[session_name] = {
                 "status": raw["status"],
                 "since": prev["since"],
                 "consecutive_idle": prev["consecutive_idle"] + 1,
+                "idle_since": prev.get("idle_since") or now,
                 "raw": raw,
             }
             return raw
@@ -7240,6 +7325,7 @@ def detect_activity(session_name: str) -> dict:
         "status": raw["status"],
         "since": now,
         "consecutive_idle": 0,
+        "idle_since": 0,
         "raw": raw,
     }
     return raw
@@ -22599,6 +22685,14 @@ body.member-admin .more-member-only{display:none}
 .term-live .tl-tok:not(:empty)::before,
 .term-live .tl-since:not(:empty)::before,
 .term-live .tl-ctx:not(:empty)::before{content:'· ';color:#30363d}
+/* Hot or cold, in words, because "idle 47m" only answers the question if you
+   remember the TTL. Orange = still cached, so the next message is cheap.
+   Blue = lapsed, so it pays to write the whole prompt again. */
+.tl-cache{white-space:nowrap;font-weight:600}
+.term-live .tl-cache:not(:empty)::before{content:'· ';color:#30363d;font-weight:400}
+.tl-cache.hot{color:#e3b341}
+.tl-cache.cold{color:#79c0ff}
+.tl-cache.expiring{animation:cache-expiring .36s steps(1,end) infinite}
 .tl-since.warm{color:#3fb950}
 .tl-since.cooling{color:#d29922}
 .tl-since.cold{color:#8b949e}
@@ -24962,6 +25056,7 @@ function startLiveTicker(){
     // of the busy state. It only rewrites the span when the rendered text
     // actually changes, which past a minute is once a minute.
     _paintIdleSince(selectedSession);
+    _paintCacheChip(selectedSession);
     // The pill's cache state is a function of elapsed time, not of anything the
     // server pushes, so it has to be re-evaluated on the tick as well. Without
     // this a session that is already idle never starts blinking, because the
@@ -25031,6 +25126,32 @@ function _paintIdleSince(name){
   if(s.detect_sure===false)cls+=' unsure';
   const txt='idle '+_fmtAgo(ago)+
     (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_ALERT_LEAD?' · cold in '+_fmtAgo(left):'')):'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+// Hot or cold, said outright. The row already carried the countdown, but only a
+// reader who remembers this session's TTL could turn "idle 47m" into "the next
+// message is about to cost full price".
+function _paintCacheChip(name){
+  const el=document.getElementById('tl-cache-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const ttl=s.cache_ttl||0,end=s.last_turn_end||0;
+  if(!ttl||!end){
+    if(el.textContent!==''){el.textContent='';el.className='tl-cache';el.title='';}
+    return;
+  }
+  const busy=_sessionBusy(name);
+  const left=Math.max(0,ttl-(Date.now()/1000-end));
+  const hot=busy||left>0;
+  let cls='tl-cache '+(hot?'hot':'cold');
+  if(hot&&!busy&&left<=CACHE_ALERT_LEAD)cls+=' expiring';
+  const txt=hot?'Cache hot':'Cache cold';
+  const hint=hot
+    ? ('The transcript is still cached, so the next message re-reads it at cache-read price'+
+       (busy?', and every request this turn makes restarts the clock.':'. Cold in '+_fmtAgo(left)+'.'))
+    : 'The cache has lapsed: the next message pays to write the whole prompt again.';
   if(el.textContent!==txt)el.textContent=txt;
   if(el.className!==cls)el.className=cls;
   if(el.title!==hint)el.title=hint;
@@ -25297,16 +25418,19 @@ function toggleCleanView(name,checked){
 const lastStatus={};
 const _completedUnread={};
 const IDLE_NUDGE_INTERVAL_MS=20000;
-// off: silent, no chime of any kind. light (the default): chime every 20 seconds
-// until each finished tab has been looked at, and 4 beeps when a prompt cache is
-// 15 minutes from cold. high (called ADHD until 2026-09-17): chime every 20
-// seconds until each finished tab is given new work, and 8 beeps.
+// off: silent, no chime of any kind.
+// light (the default): ONE chime when a session finishes, and 4 beeps when a
+//   prompt cache is 15 minutes from cold. Nothing repeats. It used to chime
+//   every 20 seconds until each finished tab had been looked at, which on a box
+//   running six sessions is what "it keeps beeping at me" was.
+// high (called ADHD until 2026-09-17): the repeat, every 20 seconds until each
+//   finished session is given new work, and 8 beeps instead of 4.
 const IDLE_NUDGE_MODES=['off','light','high'];
 const IDLE_NUDGE_DEFAULT='light';
 const IDLE_NUDGE_TITLES={
   off:'Off: no sounds at all, not even the prompt-cache warning',
-  light:'Light: chime every 20 seconds until every finished tab is viewed, and 4 quick beeps 15 minutes before a prompt cache goes cold',
-  high:'High: chime every 20 seconds until every finished tab is given new work, and 8 quick beeps 15 minutes before a prompt cache goes cold'
+  light:'Light: ONE chime when a session finishes, and 4 quick beeps 15 minutes before a prompt cache goes cold. Nothing repeats.',
+  high:'High: everything Light does, plus a chime every 20 seconds until each finished session is given new work, and 8 beeps instead of 4'
 };
 const _idleNudgeAdhdPending={};
 let _idleNudgeTimer=null;
@@ -25357,18 +25481,17 @@ function _stopIdleNudgeTimer(){
   _idleNudgeTimer=null;
 }
 
+// ONLY High repeats. Light and Off never schedule this timer at all.
 function _syncIdleNudgeTimer(restart){
   if(restart)_stopIdleNudgeTimer();
-  const mode=getIdleNudgeMode();
-  if(mode==='off'||!_idleNudgeNames(mode).length){
+  if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length){
     _stopIdleNudgeTimer();
     return;
   }
   if(_idleNudgeTimer!==null)return;
   _idleNudgeTimer=setTimeout(function(){
     _idleNudgeTimer=null;
-    const currentMode=getIdleNudgeMode();
-    if(currentMode==='off'||!_idleNudgeNames(currentMode).length)return;
+    if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length)return;
     playCompletionChime();
     _syncIdleNudgeTimer();
   },IDLE_NUDGE_INTERVAL_MS);
@@ -25596,10 +25719,15 @@ function trackSessionStatus(name,status,interrupted){
       _idleNudgeAdhdPending[name]=true;
       _syncIdleNudgeTimer();
     }
+    // One chime, for the session that just finished, in Light and High alike.
+    // The status the server reports is a CONFIRMED idle (the pane looked idle
+    // for long enough and the transcript stopped growing), so this no longer
+    // fires on a gap between tool calls or on a turn waiting for its own
+    // sub-agents.
+    if(getIdleNudgeMode()!=='off')playCompletionChime();
   }
   if(completed&&_completionWatch[name]&&!interrupted){
     delete _completionWatch[name];
-    if(getIdleNudgeMode()!=='off')playCompletionChime();   // Off means silent
     return true;
   }
   return false;
@@ -25677,12 +25805,14 @@ function _paintFavicon(){
 // mid-flash and hold the beep back. A timer inside a worker is not throttled
 // that way, so the clock ticks there and only posts the tick back.
 let _attentionClock=null;
+let _attentionLastTick=0;
 function _attentionTick(){
+  _attentionLastTick=Date.now();
   try{
     _checkCacheExpiry();
     _paintAllNavDots();
     _paintFavicon();
-    if(selectedSession){_paintPillCache(selectedSession);_paintIdleSince(selectedSession);}
+    if(selectedSession){_paintPillCache(selectedSession);_paintIdleSince(selectedSession);_paintCacheChip(selectedSession);}
   }catch(e){}
 }
 function startAttentionClock(){
@@ -25692,6 +25822,13 @@ function startAttentionClock(){
     const w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
     w.onmessage=_attentionTick;
     _attentionClock=w;
+    // A worker that never reports — blocked by a policy, or a browser that
+    // refuses the blob — must not take the flashing down with it.
+    setTimeout(function(){
+      if(Date.now()-_attentionLastTick<2000)return;
+      try{w.terminate()}catch(e){}
+      _attentionClock=setInterval(_attentionTick,420);
+    },3000);
   }catch(e){
     _attentionClock=setInterval(_attentionTick,420);
   }
@@ -26613,6 +26750,7 @@ function renderDetail(){
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
         <span class="tl-since" id="tl-since-${s.name}"></span>
+        <span class="tl-cache" id="tl-cache-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
         <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>

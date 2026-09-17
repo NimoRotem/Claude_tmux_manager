@@ -43,6 +43,7 @@ const context=vm.createContext({
 vm.runInContext(region,context);
 context.playCompletionChime=()=>{chimes++};
 const names=mode=>vm.runInContext(`_idleNudgeNames('${mode}')`,context);
+const finish=name=>{context.trackSessionStatus(name,'busy');context.trackSessionStatus(name,'idle')};
 const fireNext=()=>{
   const next=timers.entries().next().value;
   if(!next)throw new Error('expected a pending idle-nudge timer');
@@ -52,43 +53,39 @@ const fireNext=()=>{
   return timer.delay;
 };
 
+// LIGHT: one chime per finished session, and nothing scheduled to repeat.
 context.setIdleNudgeMode('light');
-context.trackSessionStatus('alpha','busy');
-context.trackSessionStatus('alpha','idle');
-const lightScheduled=timers.size;
-const lightDelay=fireNext();
-const lightRepeated=timers.size;
-context._acknowledgeCompletion('alpha');
-const lightAfterView={timers:timers.size,names:names('light')};
+finish('alpha');
+const lightOnce={chimes,timers:timers.size};
+finish('beta');
+const lightTwoSessions={chimes,timers:timers.size};
 
-context.trackSessionStatus('alpha','busy');
-context.trackSessionStatus('alpha','idle');
-context.trackSessionStatus('beta','busy');
-context.trackSessionStatus('beta','idle');
+// HIGH: the same chime, plus a repeat every 20s until the session is given work.
+chimes=0;
 context._clearIdleNudgeForNewWork('alpha');
-const lightAfterNewMessage={timers:timers.size,names:names('light')};
 context._clearIdleNudgeForNewWork('beta');
-const lightAfterAllMessages={timers:timers.size,names:names('light')};
-
 context.setIdleNudgeMode('high');
-context.trackSessionStatus('beta','busy');
-context.trackSessionStatus('beta','idle');
-context._acknowledgeCompletion('beta');
-const highAfterView={timers:timers.size,names:names('high')};
-context._clearIdleNudgeForNewWork('beta');
+finish('alpha');
+const highStart={chimes,timers:timers.size,names:names('high')};
+const highDelay=fireNext();
+const highRepeated={chimes,timers:timers.size};
+context._clearIdleNudgeForNewWork('alpha');
 const highAfterNewMessage={timers:timers.size,names:names('high')};
-context.trackSessionStatus('beta','busy');
-context.trackSessionStatus('beta','idle');
-context._acknowledgeCompletion('beta');
-context.trackSessionStatus('beta','busy');
-const highAfterWork={timers:timers.size,names:names('high')};
+context._acknowledgeCompletion('alpha');
+const highAfterView={timers:timers.size,names:names('high')};
+
+// OFF: silent, and still nothing scheduled.
+chimes=0;
+context.setIdleNudgeMode('off');
+finish('beta');
+const offSilent={chimes,timers:timers.size};
 
 process.stdout.write(JSON.stringify({
-  lightScheduled,lightDelay,lightRepeated,chimes,lightAfterView,
-  lightAfterNewMessage,lightAfterAllMessages,highAfterView,
-  highAfterNewMessage,highAfterWork,savedMode:storage.get('idleNudgeMode'),
+  lightOnce,lightTwoSessions,highStart,highDelay,highRepeated,
+  highAfterNewMessage,highAfterView,offSilent,savedMode:storage.get('idleNudgeMode'),
 }));
 """
+
 
 PARSE_DRIVER = r"""
 const fs=require('fs'),vm=require('vm');
@@ -114,7 +111,7 @@ def test_dashboard_inline_javascript_parses():
     assert result.stdout == "1"
 
 
-def test_light_and_high_clear_on_their_distinct_conditions():
+def test_light_chimes_once_and_only_high_repeats():
     result = subprocess.run(
         [NODE, "-e", DRIVER, str(APP)],
         capture_output=True,
@@ -124,17 +121,19 @@ def test_light_and_high_clear_on_their_distinct_conditions():
 
     assert result.returncode == 0, result.stderr
     state = json.loads(result.stdout)
-    assert state["lightScheduled"] == 1
-    assert state["lightDelay"] == 20_000
-    assert state["lightRepeated"] == 1
-    assert state["chimes"] == 1
-    assert state["lightAfterView"] == {"timers": 0, "names": []}
-    assert state["lightAfterNewMessage"] == {"timers": 1, "names": ["beta"]}
-    assert state["lightAfterAllMessages"] == {"timers": 0, "names": []}
-    assert state["highAfterView"] == {"timers": 1, "names": ["beta"]}
+    # Light: one sound per finished session, nothing queued to say it again.
+    assert state["lightOnce"] == {"chimes": 1, "timers": 0}
+    assert state["lightTwoSessions"] == {"chimes": 2, "timers": 0}
+    # High: the same chime, then a repeat every 20 seconds.
+    assert state["highStart"] == {"chimes": 1, "timers": 1, "names": ["alpha"]}
+    assert state["highDelay"] == 20_000
+    assert state["highRepeated"] == {"chimes": 2, "timers": 1}
+    # Giving it new work is what stops High; merely looking at it is not.
     assert state["highAfterNewMessage"] == {"timers": 0, "names": []}
-    assert state["highAfterWork"] == {"timers": 0, "names": []}
-    assert state["savedMode"] == "high"
+    assert state["highAfterView"] == {"timers": 0, "names": []}
+    # Off is silent.
+    assert state["offSilent"] == {"chimes": 0, "timers": 0}
+    assert state["savedMode"] == "off"
 
 
 MODES_DRIVER = r"""
