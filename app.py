@@ -25,9 +25,12 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
+import contextlib
 import glob as globmod
 
 import browser_ladder
+import browser_fleet
+import browser_live
 import browser_resource_guard
 from runtime_control import (
     LockedJsonStore,
@@ -108,6 +111,15 @@ DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "xhigh")
 # a redeploy. Persisted to models.json; the backend validation allowlist
 # (ALLOWED_SESSION_MODELS) and the frontend dropdown both derive from it.
 MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
+# Gateway mode (builder2A / LunaRoute and friends): when TMUX_DASH_MODEL_GATEWAY
+# is set, the model dropdown is sourced from an OpenAI/Anthropic-compatible
+# gateway's /v1/models (chat models only) instead of the built-in Anthropic seed
+# catalog, and it re-syncs on the 24h loop so new models the gateway adds show up
+# on their own. Default off, so every other box behaves exactly as before.
+MODEL_GATEWAY = os.environ.get("TMUX_DASH_MODEL_GATEWAY", "").lower() in ("1", "true", "yes")
+_MODEL_GATEWAY_BASE = (os.environ.get("ANTHROPIC_BASE_URL", "") or "").rstrip("/")
+_MODEL_GATEWAY_TOKEN = (os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+                        or os.environ.get("ANTHROPIC_API_KEY", ""))
 _MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
 _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
@@ -217,8 +229,72 @@ def _merge_seed_rows(rows: list) -> list:
     return out
 
 
+def _gateway_model_label(mid: str) -> str:
+    """Readable dropdown label for a gateway model id. deepseek-4.1-flash ->
+    'DeepSeek 4.1 Flash'; glm-5.3-flash-background -> 'GLM 5.3 Flash (background)'."""
+    suffix = ""
+    for tag in ("-background", "-flex"):
+        if mid.endswith(tag):
+            suffix = " (" + tag[1:] + ")"
+            mid = mid[: -len(tag)]
+            break
+    pretty = {"glm": "GLM", "deepseek": "DeepSeek", "qwen": "Qwen", "kimi": "Kimi",
+              "minimax": "MiniMax"}
+    words = [pretty.get(p, p.capitalize() if p[:1].isalpha() else p)
+             for p in mid.split("-") if p]
+    return " ".join(words) + suffix
+
+
+def _fetch_gateway_model_catalog():
+    """Chat-capable models from the gateway's /v1/models as [id, label] rows.
+    Keeps only models that speak the Anthropic Messages API (what Claude Code
+    drives); drops embeddings, rerankers and image models. Returns None on any
+    failure so the caller can fall back to the last cache."""
+    if not (MODEL_GATEWAY and _MODEL_GATEWAY_BASE and _MODEL_GATEWAY_TOKEN):
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            _MODEL_GATEWAY_BASE + "/v1/models",
+            headers={"Authorization": "Bearer " + _MODEL_GATEWAY_TOKEN},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        logger.debug("Gateway model fetch failed", exc_info=True)
+        return None
+    rows = []
+    for m in data.get("data", []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        caps = m.get("capabilities") or {}
+        if not mid or not caps.get("anthropic_messages"):
+            continue
+        rows.append([mid, _gateway_model_label(mid)])
+    rows.sort(key=lambda row: (2 if row[0].endswith("-background")
+                               else 1 if row[0].endswith("-flex") else 0, row[0]))
+    return rows or None
+
+
 def _load_model_catalog() -> list:
     """Load the persisted catalog, or seed it. Always returns a non-empty list."""
+    if MODEL_GATEWAY:
+        gw = _fetch_gateway_model_catalog()
+        if gw:
+            _save_model_catalog(gw, time.time())
+            return gw
+        # Gateway unreachable at boot: reuse the last good cache, but never fold
+        # in the Anthropic seed models — they are not served here.
+        try:
+            if MODELS_FILE.exists():
+                rows = [list(r) for r in (json.loads(MODELS_FILE.read_text()).get("models") or [])
+                        if isinstance(r, (list, tuple)) and len(r) == 2]
+                if rows:
+                    return rows
+        except Exception:
+            logger.debug("Failed to load cached gateway catalog", exc_info=True)
+        return [[DEFAULT_MODEL, _gateway_model_label(DEFAULT_MODEL)]]
     try:
         if MODELS_FILE.exists():
             data = json.loads(MODELS_FILE.read_text())
@@ -319,6 +395,16 @@ async def _refresh_model_catalog(force: bool = False) -> bool:
         now = time.time()
         if not force and now - last < MODEL_CHECK_INTERVAL:
             return False
+        if MODEL_GATEWAY:
+            gw = await asyncio.to_thread(_fetch_gateway_model_catalog)
+            if not gw:
+                logger.info("Gateway model refresh: none returned — will retry")
+                return False
+            changed = [r[0] for r in gw] != [r[0] for r in MODEL_CATALOG]
+            MODEL_CATALOG = gw
+            ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+            _save_model_catalog(gw, now)
+            return changed
         api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
         if not api_ids:
             # Couldn't reach the API — don't stamp last_check, so we retry sooner.
@@ -1174,12 +1260,34 @@ def _neighbours_sharing_cwd(session_name: str) -> list:
     return out
 
 
+def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
+    """True if Claude Code has a saved transcript for this conversation id in the
+    session's project dir.
+
+    `--resume <id>` on a conversation that was never written (a session created
+    with `--session-id` but relaunched before its first turn ever saved a
+    transcript) makes the CLI exit immediately with "No conversation found",
+    dropping the pane to a bare shell — which then reads as "Claude isn't
+    running" to every action. The relaunch paths check this so they can start
+    fresh with the SAME id instead of killing the session."""
+    if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
+        return False
+    try:
+        target = convo_uuid + ".jsonl"
+        return any(os.path.basename(f) == target
+                   for f in _find_session_jsonl_files(session_name))
+    except Exception:
+        logger.debug("conversation existence check failed for %s", session_name, exc_info=True)
+        return False
+
+
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """The resume flag for relaunching this pane's Claude, in order of trust.
 
     1. `--resume <uuid>` for the conversation we launched this pane on, or that
        a caller identified. Exact, and the only option that cannot pick up a
-       neighbour's work.
+       neighbour's work. If that id has no saved transcript yet, `--session-id
+       <uuid>` starts fresh on the same id rather than exiting on --resume.
     2. The scrollback-matching heuristic, for panes that predate (1).
     3. `--continue` — ONLY when no other live session shares this cwd. It means
        "the most recent conversation here", which on a box where every session
@@ -1189,7 +1297,9 @@ def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """
     uuid_s = resume_uuid or _session_convo(session_name)
     if uuid_s and _UUID_RE.fullmatch(uuid_s):
-        return "--resume " + uuid_s
+        if _conversation_exists(session_name, uuid_s):
+            return "--resume " + uuid_s
+        return "--session-id " + uuid_s
     guessed = _find_session_transcript_uuid(session_name)
     if guessed:
         _set_session_convo(session_name, guessed)
@@ -1466,6 +1576,63 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+
+# ── Which build of this dashboard is running, and which kind ────────────────
+# There is no single "the dashboard". Nine deployments run five generations of
+# this file, on two different agents (claude and codex), and several of them are
+# not git checkouts at all, so "I'm looking at the dashboard and X is wrong" is a
+# report about nothing until you know WHICH one. The tools menu prints this line
+# so the answer is on screen rather than in an ssh session.
+#
+# The date comes from the running file, not from git: the tree a box serves is
+# routinely ahead of (or behind) its branch, and a mtime cannot lie about which
+# bytes are loaded. The sha is added when there is one, as a courtesy.
+_BUILD_INFO: dict = {}
+
+
+def _dashboard_build() -> dict:
+    """`{version, flavour, host, sha}` for the app.py this process is running."""
+    if _BUILD_INFO:
+        return _BUILD_INFO
+    import socket
+    here = Path(__file__).resolve()
+    try:
+        stamp = time.strftime("%Y.%m.%d", time.localtime(here.stat().st_mtime))
+    except Exception:
+        stamp = "unknown"
+    sha = ""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=str(here.parent), capture_output=True,
+                             text=True, timeout=5)
+        if out.returncode == 0:
+            sha = (out.stdout or "").strip()
+            dirty = subprocess.run(["git", "status", "--porcelain", "--", str(here)],
+                                   cwd=str(here.parent), capture_output=True,
+                                   text=True, timeout=5)
+            if dirty.returncode == 0 and (dirty.stdout or "").strip():
+                sha += "+"
+    except Exception:
+        sha = ""
+    # Which agent a new session spawns is what makes a box "a codex box"; the env
+    # var is the same one supervisor sets, so it cannot drift from reality.
+    cmd = (globals().get("NEW_SESSION_CMD") or "").lower()
+    flavour = "Codex" if "codex" in cmd else "Claude"
+    _BUILD_INFO.update({
+        "version": stamp + ("-" + sha if sha else ""),
+        "flavour": flavour,
+        "host": socket.gethostname(),
+        "sha": sha,
+    })
+    return _BUILD_INFO
+
+
+@app.get("/api/build")
+async def api_dashboard_build():
+    """Open on purpose: it names a build, not a secret, and the login page is one
+    of the places you want to know which box answered."""
+    return JSONResponse(_dashboard_build())
+
 
 # The USPTO filing panel MOVED OUT on 2026-09-01. It is its own service now
 # (supervisor `patent-filing`, its own sessions, browser, login and data) served at
@@ -8184,10 +8351,17 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     )
     command = re.sub(r"\s+--effort(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)", "", command)
     command = re.sub(r"\s+--continue\b", "", command)
+    # Resume the conversation only if it was actually written. A session created
+    # with this id but relaunched before its first saved turn has no transcript,
+    # and `--resume` on it exits with "No conversation found", leaving a dead
+    # shell. Start fresh on the same id in that case so the session stays alive.
+    resume_or_new = ("--resume " + resume_uuid
+                     if _conversation_exists(session_name, resume_uuid)
+                     else "--session-id " + resume_uuid)
     command = (command.strip()
                + _model_flag_for_relaunch(session_name)
                + _effort_flag_for_relaunch(session_name)
-               + " --resume " + resume_uuid)
+               + " " + resume_or_new)
     return _managed_agent_command(session_name, command)
 
 
@@ -15959,6 +16133,101 @@ async def _cdp_tab_list(cdp_port: int) -> list:
     return tabs
 
 
+# How long an agent-started browser nobody is using may sit here before the
+# dashboard stops it. Two of them had been up 45 days and 10 days when this was
+# written, holding ~800 MB between them, with no client attached and no service
+# claiming either: "a process outside the dashboard started it" is a description,
+# not an owner. The existing orphan reaper below only sees Chromes whose profile
+# is inside a Claude session scratchpad, which neither of those was.
+UNMANAGED_BROWSER_MAX_IDLE_H = float(os.environ.get("CB_UNMANAGED_MAX_IDLE_H") or 72)
+# What each one was doing when we stopped it, so a reap is never a silent loss:
+# the tabs that were open are written here before the process is signalled.
+UNMANAGED_REAPED_LOG = CB_ROOT / "reaped_browsers.json"
+
+
+def _unmanaged_why(profile: str, pid: int, cdp: int, claims: Dict[int, str],
+                   owner_session: str) -> str:
+    """One sentence on why this browser exists, for a card that otherwise reads
+    'started by a process outside the dashboard' and leaves you no wiser.
+
+    Every part of the answer is read off the machine — the profile path names the
+    project and conversation that opened it, the console state files say which
+    service still claims the port — so it cannot drift the way a note someone
+    typed once would."""
+    bits = []
+    claimed = claims.get(cdp) if cdp else None
+    if claimed:
+        bits.append("claimed by " + claimed)
+    try:
+        who = browser_fleet.owner_of(profile or "")
+    except Exception:
+        who = ""
+    if who:
+        bits.append("opened by " + who)
+    elif owner_session:
+        bits.append("opened by " + owner_session)
+    if not bits:
+        kind = ""
+        try:
+            kind = browser_fleet.classify_profile(profile or "")
+        except Exception:
+            kind = ""
+        if kind == "disposable":
+            bits.append("a throwaway profile from a one-off automation run "
+                        "(%s)" % Path(profile or "").name)
+        elif profile:
+            bits.append("nothing on this box claims it; its profile is " + profile)
+        else:
+            bits.append("nothing on this box claims it, and it has no profile path")
+    return "; ".join(bits)
+
+
+# Watching one through the CDP viewer below counts as using it, or the reaper
+# would stop a browser out from under the person looking at it.
+_unmanaged_viewed: Dict[int, float] = {}
+
+
+def _unmanaged_idle_s(profile: str, started: float, attached: bool,
+                      cdp_port: int = 0) -> float:
+    """Seconds since anything last used this browser.
+
+    `Default/History` is the signal, and picking it took a measurement. The
+    obvious choice, the profile directory's own mtime, reads 30 seconds old on
+    a browser nobody has touched since August: Chrome rewrites Preferences,
+    component caches and revocation lists on a timer for as long as it is
+    running, so by that measure no browser is ever idle and the reaper would
+    never fire on the exact case it exists for. History and Cookies are written
+    when a page is actually loaded. Measured on builder 2026-09-15: root dir
+    30s, Preferences 2h, History and Cookies both 20 days, and 20 days is the
+    true answer.
+
+    Falls back to a shallow scan when a profile has no History file at all (a
+    fresh Playwright run has only Default/<caches>), and never claims a browser
+    has been idle for longer than it has existed.
+    """
+    if attached:
+        return 0.0
+    now = time.time()
+    newest = _unmanaged_viewed.get(cdp_port, 0.0) if cdp_port else 0.0
+    root = Path(profile) if profile else None
+    for name in ("Default/History", "Default/Cookies"):
+        try:
+            newest = max(newest, (root / name).stat().st_mtime)
+        except Exception:
+            continue
+    if not newest and root:
+        for base in (root, root / "Default"):
+            try:
+                for entry in list(base.iterdir())[:200]:
+                    newest = max(newest, entry.stat().st_mtime)
+            except Exception:
+                continue
+    idle = now - (newest or started or now)
+    if started:
+        idle = min(idle, now - started)     # it cannot be idler than it is old
+    return max(0.0, idle)
+
+
 async def _unmanaged_browser_rows(clients: Dict[int, list] = None) -> list:
     """Chromes running on this host that are not in browser_sessions.json.
 
@@ -15970,6 +16239,10 @@ async def _unmanaged_browser_rows(clients: Dict[int, list] = None) -> list:
     known = {s.get("cdp_port") for s in _load_browser_sessions()}
     if clients is None:
         clients = await asyncio.to_thread(_cdp_clients)
+    try:
+        claims = await asyncio.to_thread(browser_fleet.read_claims)
+    except Exception:
+        claims = {}
     rows = []
     for p in await asyncio.to_thread(_chrome_processes):
         cdp = p["cdp_port"]
@@ -15981,6 +16254,11 @@ async def _unmanaged_browser_rows(clients: Dict[int, list] = None) -> list:
                  or await asyncio.to_thread(_owning_tmux_session, p["pid"])
                  or _profile_owner_hint(p["profile"]))
         owner_user = await asyncio.to_thread(_proc_owner, p["pid"])
+        idle_s = await asyncio.to_thread(_unmanaged_idle_s, p["profile"],
+                                         p.get("started") or 0, bool(att), cdp or 0)
+        controllable = (owner_user in ("", os.environ.get("USER", "")
+                                       or Path.home().name)
+                        or browser_resource_guard.can_control_privileged_processes())
         rows.append({
             "id": sid, "cdp_port": cdp, "pid": p["pid"], "profile": p["profile"],
             "started": p["started"], "unmanaged": True, "headless": p.get("headless"),
@@ -15991,10 +16269,16 @@ async def _unmanaged_browser_rows(clients: Dict[int, list] = None) -> list:
             "parked_ago": (round(time.time() - _browser_parked[sid])
                            if sid in _browser_parked else None),
             "proc_user": owner_user,
-            "controllable": (owner_user in ("", os.environ.get("USER", "")
-                                            or Path.home().name)
-                             or browser_resource_guard.can_control_privileged_processes()),
+            "controllable": controllable,
             "resource_limited": browser_resource_guard.is_limited(p["pid"]),
+            "why": _unmanaged_why(p["profile"], p["pid"], cdp, claims, owner),
+            "claimed_by": claims.get(cdp) if cdp else None,
+            "idle_s": round(idle_s),
+            # Seconds until the reaper stops it, or None when something still
+            # wants it. The card counts this down so a stop is never a surprise.
+            "reap_in_s": (None if (att or (claims.get(cdp) if cdp else None)
+                                   or not controllable)
+                          else round(max(0.0, UNMANAGED_BROWSER_MAX_IDLE_H * 3600 - idle_s))),
         })
     return sorted(rows, key=lambda r: -r["cpu_pct"])
 
@@ -16059,6 +16343,153 @@ async def api_browser_unmanaged_action(ident: str, action: str, request: Request
     else:
         return JSONResponse({"error": "action must be park, freeze or kill"}, status_code=400)
     return JSONResponse(res, status_code=200 if res.get("ok") else 502)
+
+
+# ── Watching an agent's own browser ─────────────────────────────────────────
+# A managed browser is watched over noVNC, because the dashboard started its X
+# display and knows the port. An agent's own browser has no display we own — it
+# is often headless — so there is nothing for VNC to attach to, and until now
+# there was no way to see what one was doing beyond a list of tab titles. CDP
+# has its own answer: Page.startScreencast hands back a JPEG whenever the page
+# changes, and Input.dispatch* sends clicks and keys back. That is a window on
+# the same terms as any other card here, and it works for a headless Chrome too.
+_CDP_VIEW_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>Agent browser __LABEL__</title>
+<style>
+ html,body{margin:0;background:#0d1117;color:#c9d1d9;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+ header{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid #21262d;flex-wrap:wrap}
+ input{flex:1;min-width:180px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px 8px;font-size:.8rem}
+ button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px 10px;cursor:pointer;font-size:.78rem}
+ button:hover{background:#30363d}
+ select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px;font-size:.78rem;max-width:40vw}
+ .stat{color:#6e7681;font-size:.72rem}
+ #wrap{padding:10px;display:flex;justify-content:center}
+ img{max-width:100%;border:1px solid #21262d;border-radius:6px;background:#161b22}
+</style></head><body>
+<header>
+  <select id="tab"></select>
+  <input id="url" placeholder="https://..." >
+  <button id="go">Go</button>
+  <label class="stat"><input type="checkbox" id="rw" checked> clickable</label>
+  <span class="stat" id="stat">connecting...</span>
+</header>
+<div id="wrap"><img id="screen" alt="Live view of this browser"></div>
+<script>
+const PORT=__PORT__, BASE=__BASE__;
+const $=i=>document.getElementById(i);
+let ws=null, frames=0, retries=0;
+async function loadTabs(){
+  const r=await fetch(BASE+'/api/browser/cdp/'+PORT+'/tabs');
+  const d=await r.json();
+  const keep=$('tab').value;
+  $('tab').innerHTML=(d.tabs||[]).map(t=>'<option value="'+t.id+'">'+
+    ((t.title||t.url||'(blank)').replace(/[<>&]/g,''))+'</option>').join('');
+  if(keep) $('tab').value=keep;
+  return (d.tabs||[]).length;
+}
+function attach(){
+  if(ws){try{ws.close();}catch(e){} ws=null;}
+  const t=$('tab').value; if(!t) return;
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(proto+'://'+location.host+BASE+'/browser/cdp/'+PORT+'/ws?target='+
+    encodeURIComponent(t)+'&ro='+($('rw').checked?'0':'1'));
+  ws.onmessage=e=>{const m=JSON.parse(e.data);
+    if(m.t==='frame'){frames++;$('screen').src='data:image/jpeg;base64,'+m.d;
+      $('stat').textContent=frames+' frames';}
+    else if(m.t==='nav'){$('url').value=m.url;}
+    else if(m.t==='hello'){$('url').value=m.url;retries=0;$('stat').textContent='attached';}
+    else if(m.t==='error'){$('stat').textContent=m.m;}};
+  // A cross-process navigation destroys the CDP target and the socket with it.
+  // That is normal mid-flow, so re-resolve the tab list and come back rather
+  // than leaving a dead picture on screen.
+  ws.onclose=()=>{ws=null;
+    if(retries>=8){$('stat').textContent='detached';return;}
+    retries++;$('stat').textContent='reattaching ('+retries+')...';
+    setTimeout(()=>loadTabs().then(n=>{if(n)attach();}),1800);};
+}
+$('tab').onchange=attach; $('rw').onchange=attach;
+$('go').onclick=()=>ws&&ws.send(JSON.stringify({t:'nav',v:$('url').value}));
+$('screen').onclick=e=>{if(!ws||!$('rw').checked)return;
+  const r=e.target.getBoundingClientRect();
+  ws.send(JSON.stringify({t:'click',x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height}));};
+$('screen').onwheel=e=>{if(!ws||!$('rw').checked)return;e.preventDefault();
+  ws.send(JSON.stringify({t:'scroll',x:.5,y:.5,dy:e.deltaY}));};
+document.addEventListener('keydown',e=>{
+  if(!ws||!$('rw').checked)return;
+  if(document.activeElement&&['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;
+  if(e.key.length===1){ws.send(JSON.stringify({t:'text',v:e.key}));e.preventDefault();}
+  else if(['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)){
+    ws.send(JSON.stringify({t:'key',v:e.key}));e.preventDefault();}});
+loadTabs().then(n=>{if(n)attach();else $('stat').textContent='no page open in this browser';});
+</script></body></html>"""
+
+
+def _unmanaged_cdp_port_ok(port: int) -> bool:
+    """Only a CDP port belonging to a Chrome actually running on this box, and
+    not one of our own managed sessions (those have their own viewer). Without
+    this the route is an open proxy to any local port the process can reach."""
+    if port <= 0:
+        return False
+    if port in {s.get("cdp_port") for s in _load_browser_sessions()}:
+        return False
+    return any(p.get("cdp_port") == port for p in _chrome_processes())
+
+
+@app.get("/browser/cdp/{port}/view")
+async def browser_cdp_view(port: int, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if not await asyncio.to_thread(_unmanaged_cdp_port_ok, port):
+        return HTMLResponse("<p>No agent browser is listening on that port.</p>",
+                            status_code=404)
+    page = (_CDP_VIEW_PAGE.replace("__PORT__", str(port))
+            .replace("__LABEL__", "on CDP %d" % port)
+            .replace("__BASE__", json.dumps(_req_prefix(request))))
+    return HTMLResponse(page)
+
+
+@app.get("/api/browser/cdp/{port}/tabs")
+async def api_browser_cdp_tabs(port: int, request: Request):
+    if not _auth_admin_ok(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    if not await asyncio.to_thread(_unmanaged_cdp_port_ok, port):
+        return JSONResponse({"error": "no agent browser on that port"}, status_code=404)
+    tabs = await asyncio.to_thread(browser_live.targets, port)
+    return JSONResponse({"tabs": [{"id": t["id"], "title": t["title"], "url": t["url"]}
+                                  for t in tabs]})
+
+
+@app.websocket("/browser/cdp/{port}/ws")
+async def browser_cdp_ws(ws: WebSocket, port: int):
+    """Screencast one tab of an agent-started browser. The HTTP auth middleware
+    does not run for websockets, so the cookie is checked by hand here."""
+    if AUTH_PASS and not _check_token(ws.cookies.get(AUTH_COOKIE)):
+        await ws.close(code=1008)
+        return
+    if not await asyncio.to_thread(_unmanaged_cdp_port_ok, port):
+        await ws.close(code=1011)
+        return
+    await ws.accept()
+    _unmanaged_viewed[port] = time.time()   # somebody is watching: not idle
+    target = ws.query_params.get("target") or ""
+    interactive = ws.query_params.get("ro") != "1"
+    tabs = await asyncio.to_thread(browser_live.targets, port)
+    tab = next((t for t in tabs if t["id"] == target), tabs[0] if tabs else None)
+    if not tab:
+        with contextlib.suppress(Exception):
+            await ws.send_text(json.dumps({"t": "error", "m": "no page open on CDP %d" % port}))
+        await ws.close()
+        return
+    with contextlib.suppress(Exception):
+        await ws.send_text(json.dumps({"t": "hello", "url": tab["url"], "title": tab["title"]}))
+    try:
+        await browser_live.bridge(ws, tab["ws"], interactive=interactive)
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            await ws.send_text(json.dumps({"t": "error", "m": str(exc)[:200]}))
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 @app.post("/api/browser/{sid}/park")
@@ -16423,6 +16854,87 @@ def _reap_orphan_browsers() -> tuple:
     return niced, len({sid for _pid, sid in doomed})
 
 
+# pid -> the last refusal we logged for it, so a browser the guard will not stop
+# does not write the same warning every five minutes for ever.
+_reap_failed_once: Dict[int, str] = {}
+
+
+async def _reap_idle_unmanaged_browsers() -> list:
+    """Stop agent-started browsers nobody has touched for days.
+
+    The reaper above only fires on a Chrome whose profile sits in a Claude
+    session scratchpad AND whose session is provably dead. Everything else stays
+    up for ever: measured on builder, one browser had been running 45 days and
+    another 10, neither with a client attached, neither claimed by any service,
+    ~800 MB between them. Nothing was ever going to close them, because the
+    thing that opened them had exited long before.
+
+    FOUR SIGNALS, ALL OF THEM, before anything is signalled. Each one alone has
+    a false positive: an anti-bot flow detaches CDP for a minute (see the
+    watchdog above), a long download leaves a profile untouched, a service can
+    be restarting. Together they mean the window is abandoned:
+      · nothing attached over CDP,
+      · no console state file claims its port,
+      · its profile has not been written to in UNMANAGED_BROWSER_MAX_IDLE_H,
+      · we can actually control the process.
+    The open tabs are written to UNMANAGED_REAPED_LOG first, so a page somebody
+    did want is recoverable from its URL rather than gone.
+    """
+    if UNMANAGED_BROWSER_MAX_IDLE_H <= 0:
+        return []
+    rows = await _unmanaged_browser_rows()
+    live = {r["pid"] for r in rows}
+    for pid in [p for p in _reap_failed_once if p not in live]:
+        _reap_failed_once.pop(pid, None)
+    stopped = []
+    for b in rows:
+        if b.get("reap_in_s") is None or b["reap_in_s"] > 0:
+            continue
+        note = {"at": time.time(), "pid": b["pid"], "cdp_port": b["cdp_port"],
+                "profile": b["profile"], "why": b.get("why", ""),
+                "idle_h": round(b["idle_s"] / 3600, 1),
+                "tabs": [{"title": t.get("title"), "url": t.get("url")}
+                         for t in (b.get("tabs") or [])]}
+        try:
+            # allow_protected: a profile in a dashboard SLOT that the dashboard no
+            # longer lists. The guard protects the browsers we are using; one we
+            # abandoned is exactly what this reaper is for, and refusing it is how
+            # a slot browser stayed up 45 days with nothing attached.
+            res = await asyncio.to_thread(
+                browser_resource_guard.stop_browser_workload, b["pid"],
+                expected_started=b.get("started", 0), allow_protected=True)
+        except Exception as exc:
+            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if res.get("ok"):
+            _chrome_procs_cache["ts"] = 0
+            _browser_cpu_sample.pop(b["id"], None)
+            stopped.append(note)
+            # Written AFTER the stop, not before: a refusal that retries every five
+            # minutes wrote the same browser into the record 9 times in an hour.
+            try:
+                prev = json.loads(UNMANAGED_REAPED_LOG.read_text("utf-8")) or []
+            except Exception:
+                prev = []
+            try:
+                UNMANAGED_REAPED_LOG.parent.mkdir(parents=True, exist_ok=True)
+                UNMANAGED_REAPED_LOG.write_text(
+                    json.dumps(([note] + prev)[:100], indent=1), "utf-8")
+            except Exception:
+                logger.debug("Could not record the reaped browser's tabs", exc_info=True)
+            logger.warning("Stopped an unmanaged browser nobody had used for %.0f days "
+                           "(pid %d, CDP %s, %s). Its %d open tab(s) are recorded in %s",
+                           note["idle_h"] / 24, b["pid"], b["cdp_port"] or "none",
+                           note["why"] or "no owner found", len(note["tabs"]),
+                           UNMANAGED_REAPED_LOG)
+        elif _reap_failed_once.get(b["pid"]) != res.get("error"):
+            # Once per browser per reason. The loop runs every five minutes and a
+            # browser it cannot stop is still there on the next pass.
+            _reap_failed_once[b["pid"]] = res.get("error")
+            logger.warning("Could not stop idle unmanaged browser pid %d: %s",
+                           b["pid"], res.get("error"))
+    return stopped
+
+
 async def orphan_browser_reaper():
     """Periodically renice, and reap, agent-spawned scratchpad Chrome trees."""
     await asyncio.sleep(90)
@@ -16435,6 +16947,10 @@ async def orphan_browser_reaper():
                                niced, BROWSER_NICE, sessions)
         except Exception:
             logger.debug("orphan_browser_reaper cycle failed", exc_info=True)
+        try:
+            await _reap_idle_unmanaged_browsers()
+        except Exception:
+            logger.debug("idle unmanaged browser reaper cycle failed", exc_info=True)
         await asyncio.sleep(300)
 
 
@@ -16503,6 +17019,7 @@ async def api_browser_auth_status(request: Request, refresh: int = 0):
         # Chromes running outside our list — an agent's own browser counts against
         # the same 4 vCPUs, so it belongs on the same screen.
         "unmanaged": await _unmanaged_browser_rows(clients),
+        "unmanaged_max_idle_h": UNMANAGED_BROWSER_MAX_IDLE_H,
         "resource_guard": browser_resource_guard.guard_status(),
         "any_logged_in": any(x["logged_in"] for x in out),
         "any_can_authorize": any(x["can_authorize"] for x in out),
@@ -19652,7 +20169,8 @@ async def api_set_session_model(session_name: str, body: ModelBody):
         try:
             tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
             low = tail.lower()
-            if "unknown model" in low or "not a valid model" in low or "invalid model" in low:
+            if ("unknown model" in low or "not a valid model" in low
+                    or "invalid model" in low or "not found" in low):
                 return JSONResponse(
                     {"error": f"Claude rejected the model id '{mid}' — it may not be "
                               "available on this plan or CLI version"},
@@ -20718,7 +21236,11 @@ _seen_claude_running: set = set()       # sessions observed running Claude this 
 # "aborted"/"killed" sitting in prose above the shell.
 _CRASH_SIGNATURE_RE = re.compile(
     r"Aborted|Killed|Segmentation fault|Bus error|"
-    r"Trace/breakpoint trap|Floating point exception|core dumped"
+    r"Trace/breakpoint trap|Floating point exception|core dumped|"
+    # A relaunch whose --resume pointed at a conversation that was never written
+    # exits with this and drops to a bare shell. Treat it as recoverable: the
+    # fixed relaunch path starts fresh on the same id, so it cannot recur.
+    r"No conversation found with session ID"
 )
 # V8 / out-of-memory death throes (case-insensitive).
 _CRASH_OOM_RE = re.compile(
@@ -22130,6 +22652,9 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-actions{display:flex;gap:6px;padding:8px 10px;flex-wrap:wrap}
 .bs-notes{padding:8px 10px;font-size:.76rem;color:#c9d1d9;white-space:pre-wrap;word-break:break-word;border-bottom:1px solid #21262d;background:#0b1017}
 .bs-notes.empty{color:#6e7681;font-style:italic}
+/* The note IS the edit button now that the row of five ghost buttons is gone. */
+.bs-notes-edit{cursor:text}
+.bs-notes-edit:hover{background:#111823;color:#f0f6fc}
 .bs-edit{padding:10px;display:flex;flex-direction:column;gap:6px}
 .bs-edit label{font-size:.66rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600}
 .bs-edit input,.bs-edit textarea{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:7px 9px;font-size:.82rem;outline:none;font-family:inherit;width:100%;box-sizing:border-box}
@@ -22325,6 +22850,8 @@ body.member-simple .hide-in-simple{display:none!important}
 .api-edit-grid .api-edit-wide{grid-column:1 / -1}
 .api-edit-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
 .nav-tools-divider{height:1px;background:#21262d;margin:4px 0}
+.nav-tools-build{padding:6px 14px 8px;font-size:.66rem;color:#6e7681;border-top:1px solid #21262d;
+  margin-top:4px;user-select:text;cursor:text;letter-spacing:.02em;white-space:nowrap}
 
 .claudemd-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:200;align-items:flex-start;justify-content:center;padding-top:40px}
 .claudemd-overlay.active{display:flex}
@@ -22498,6 +23025,10 @@ body.member-simple .hide-in-simple{display:none!important}
       <div class="nav-tools-divider"></div>
       <div class="nav-tools-item" id="nav-tools-whoami" style="color:#6e7681;font-size:.7rem;pointer-events:none">Loading...</div>
       <div class="nav-tools-item" onclick="doLogout();closeToolsMenu()"><span class="icon">&#x21AA;</span> Log out</div>
+      <!-- Which build, on which box, for which agent. There are nine of these
+           dashboards on several generations of the same file; without this line
+           nothing on screen says which one you are looking at. -->
+      <div class="nav-tools-build" id="nav-tools-build" title="This dashboard's build">&nbsp;</div>
     </div>
   </div>
   <!-- Member-only nav controls (shown only in simplified team mode) -->
@@ -27595,16 +28126,13 @@ function buildKeyBar(name,tab){
     <button class="key-btn key-ctrlc" onclick="sendRawKeys('${name}',['C-c'])" title="Ctrl+C — interrupt">Ctrl+C</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Enter'])" title="Enter">Enter</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['y'])" title="y — yes">y</button>
-    <button class="key-btn" onclick="sendRawKeys('${name}',['n'])" title="n — no">n</button>
     <span class="key-bar-sep"></span>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Up'])" title="Arrow up">&#x2191;</button>
     <button class="key-btn" onclick="sendRawKeys('${name}',['Down'])" title="Arrow down">&#x2193;</button>
     ${tab==='raw'?`<span class="key-bar-sep"></span>
     <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>
     <button class="key-btn key-jump" id="jump-btn-${name}" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to the last thing YOU wrote. Click again to step back through earlier messages; from the oldest it returns to the newest.">&#8613; My last message</button>
-    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>
-    <button class="key-btn key-jump" onclick="loadEarlierHistory('${esc(name)}')" title="Pull back output older than tmux still holds, from the dashboard's own archive of this session. Click again for another chunk.">&#8676; Earlier history</button>`:''}
+    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
@@ -28359,6 +28887,7 @@ async function applyRoleVisibility(){
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
+  renderBuildLine();
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
@@ -28370,6 +28899,24 @@ async function applyRoleVisibility(){
   // Which widgets the phone strip can show depends on the role we just learned.
   syncMobileBottomBar();
   if(isAdmin) startBrowserAuthPolling();
+}
+
+// The build line at the foot of the tools menu: box, agent, version. Selectable
+// so it can be pasted into a bug report, which is the whole reason it is here.
+let _buildInfo = null;
+async function renderBuildLine(){
+  const el = document.getElementById('nav-tools-build');
+  if(!el) return;
+  if(!_buildInfo){
+    try{ const r = await fetch(BASE+'/api/build'); if(r.ok) _buildInfo = await r.json(); }
+    catch(e){ return; }
+  }
+  const b = _buildInfo;
+  if(!b || !b.version){ el.textContent = ''; return; }
+  el.textContent = [b.host, b.flavour, 'v'+b.version].filter(Boolean).join(' \u00b7 ');
+  el.title = 'This dashboard: ' + (b.host||'?') + ', ' + (b.flavour||'?') +
+    ' sessions, build ' + b.version +
+    (b.sha && b.sha.endsWith('+') ? ' (working tree has uncommitted changes)' : '');
 }
 
 async function doLogout(){
@@ -28627,14 +29174,7 @@ function renderBrowserTab(data){
       ' <button class="btn btn-ghost" onclick="toggleBrowserHistory(\''+id+'\')"'+
         ' title="What this browser has been doing: navigations, tab changes, park/freeze,'+
         ' with the screenshot taken at the time.">History</button>'+
-      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'')+
-      (s.running? ' <button class="btn btn-ghost" onclick="freezeBrowser(\''+id+'\')"'+
-        ' title="Suspend this browser\'s background tabs so they stop rendering. Reversible —'+
-        ' a tab resumes when it is shown or navigated, and nothing is closed.">Freeze</button>':'')+
-      (s.running? ' <button class="btn btn-ghost" onclick="parkBrowser(\''+id+'\')"'+
-        ' title="Close this browser\'s tabs to stop it burning CPU. The profile — cookies, the'+
-        ' claude.ai session, extension state — is untouched, so nothing signs in again.">Park</button>':'');
-    const editBtn = ' <button class="btn btn-ghost" onclick="startEditBrowser(\''+id+'\')">Edit</button>';
+      (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
     const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
     // A still, never a stream. The card used to hold a live noVNC <iframe> per
     // browser, which is a full VNC session rendered for as long as this tab is
@@ -28657,8 +29197,10 @@ function renderBrowserTab(data){
     const histBlock = (_bsHistOpen===s.id) ? renderBrowserHistory(s.id) : '';
     const notes = (s.notes||'').trim();
     const notesBlock = notes
-      ? '<div class="bs-notes">'+esc(notes)+'</div>'
-      : '<div class="bs-notes empty">No note — use Edit to say what this browser is for.</div>';
+      ? '<div class="bs-notes bs-notes-edit" onclick="startEditBrowser(\''+id+'\')"'+
+        ' title="Click to change the name or the note.">'+esc(notes)+'</div>'
+      : '<div class="bs-notes empty bs-notes-edit" onclick="startEditBrowser(\''+id+'\')"'+
+        ' title="Click to say what this browser is for.">No note - click to say what this browser is for.</div>';
     // Sign-in state for this browser (from /api/browser/auth-status).
     const a = ((_browserAuth&&_browserAuth.sessions)||[]).find(x=>x.id===s.id) || {};
     let badges = '';
@@ -28745,9 +29287,6 @@ function renderBrowserTab(data){
           '</div>'+
         '</div>'
       : '<div class="bs-preview">'+preview+'</div>'+shotMeta+histBlock+badgeRow+fpBlock+notesBlock;
-    const fpBtn = s.running ? ' <button class="btn btn-ghost" onclick="checkBrowserFingerprint(\''+id+'\')">Fingerprint</button>' : '';
-    const ipBtn = (_bsProxy&&_bsProxy.enabled)
-      ? ' <button class="btn btn-ghost" onclick="rotateBrowserIp(\''+id+'\')">New IP</button>' : '';
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
         '<span class="bs-meta">'+status+' · headed, display :'+s.display+' · CDP '+s.cdp_port+
@@ -28757,7 +29296,7 @@ function renderBrowserTab(data){
           '">live '+(s.live_viewers||0)+'&#128065;</b>' : ' · no stream')+
         (s.managed?'':' · systemd')+'</span></div>'+
       body+
-      '<div class="bs-actions">'+openBtns+editBtn+fpBtn+ipBtn+rm+'</div>'+
+      '<div class="bs-actions">'+openBtns+rm+'</div>'+
     '</div>';
   }).join('');
   const addRow = atLimit
@@ -29078,14 +29617,35 @@ function renderUnmanagedBrowsers(){
       '<div class="bs-tab" title="'+esc(t.url)+'">'+esc(t.title||t.url||'(blank)')+
       ' <span class="u">'+esc((t.url||'').replace(/^https?:\/\//,'').slice(0,42))+'</span></div>').join('');
     const more = (b.tabs||[]).length>6 ? '<div class="bs-tab u">+'+((b.tabs||[]).length-6)+' more…</div>' : '';
+    // How long it has been left open with nobody near it, and when the reaper
+    // will stop it. Shown before it happens: a window that vanishes with no
+    // warning is the same surprise as one that never closes.
+    if(b.idle_s != null && b.idle_s > 86400){
+      badges += '<span class="bs-badge warn" title="Nothing has written to its profile in that '+
+        'time, so nobody has been using this window.">unused '+_fmtDur(b.idle_s)+'</span>';
+    }
+    if(b.reap_in_s != null){
+      badges += b.reap_in_s > 0
+        ? '<span class="bs-badge" title="Nothing is attached to it and no service claims it, so '+
+          'the dashboard will stop it once it has been unused this long. Attach to it, or claim '+
+          'it, and the countdown stops.">stops in '+_fmtDur(b.reap_in_s)+'</span>'
+        : '<span class="bs-badge warn">stopping on the next sweep</span>';
+    }
+    // Watch it over CDP: these browsers have no X display of ours to stream, and
+    // some are headless, so the screencast is the only window onto them.
+    // Watch it over CDP: these browsers have no X display of ours to stream, and
+    // some are headless, so the screencast is the only window onto them.
     const ctl = b.cdp_port
-      ? '<button class="btn btn-ghost" onclick="unmanagedBrowserAction(\''+ident+'\',\'freeze\')" title="Suspend its background tabs so they stop rendering. Reversible — they resume when shown or navigated.">Freeze</button> '+
-        '<button class="btn btn-ghost" onclick="unmanagedBrowserAction(\''+ident+'\',\'park\')" title="Close its tabs. The profile stays on disk, so nothing signs in again.">Park</button> '
+      ? '<button class="btn" onclick="window.open(BASE+\'/browser/cdp/'+b.cdp_port+'/view\',\'_blank\')"'+
+        ' title="Watch this browser and click around in it, the same as any other browser here.'+
+        ' It is a CDP screencast rather than VNC, so it works even when the browser is headless.">Open&nbsp;\u2197</button> '
       : '';
     return '<div class="bs-card unmanaged">'+
       '<div class="bs-head"><span class="bs-dot on"></span><span class="bs-name">Agent browser</span>'+
         '<span class="bs-meta">'+(b.cdp_port?'CDP '+b.cdp_port+' · ':'')+'pid '+b.pid+' · up '+_fmtAge(b.started)+'</span></div>'+
       '<div class="bs-sub">Started by '+(b.owner_session? esc(b.owner_session) : 'a process outside the dashboard')+'.</div>'+
+      '<div class="bs-notes'+(b.why?'':' empty')+'">'+
+        (b.why? 'Why it is open: '+esc(b.why) : 'Nothing on this box says why it was started.')+'</div>'+
       '<div class="bs-badges">'+badges+'</div>'+
       (tabList? '<div class="bs-tabs">'+tabList+more+'</div>':'')+
       '<div class="bs-path">'+esc(b.profile||'')+'</div>'+
@@ -29098,11 +29658,22 @@ function renderUnmanagedBrowsers(){
   const cap = guard.active
     ? ' Together they are kernel-capped at '+Number(guard.cpu_cores||0).toFixed(1)+' CPU cores.'
     : ' Resource cap is not active; check the dashboard logs.';
+  const maxIdle = (_browserAuth&&_browserAuth.unmanaged_max_idle_h)||72;
   return '<div class="bs-section-title">Also running on this server ('+rows.length+')</div>'+
     '<div class="pf-banner">Chrome instances the dashboard did not start — normally an agent\'s '+
     'own browser tool. They share this server\'s CPU, so the same guards apply: anything over '+
-    busyAt+'% of a core with no client attached gets its background tabs frozen, then parked.'+cap+'</div>'+
+    busyAt+'% of a core with no client attached gets its background tabs frozen, then parked.'+cap+
+    ' One that nothing is attached to, nothing claims, and nobody has touched for '+
+    Math.round(maxIdle/24)+' days is stopped altogether, with its open tabs written down first.'+
+    ' <b>Open ↗</b> watches one over its own control port, headless or not.</div>'+
     '<div class="bs-grid">'+cards+'</div>';
+}
+
+function _fmtDur(s){
+  s = Math.max(0, s||0);
+  if(s < 3600) return Math.round(s/60)+'m';
+  if(s < 172800) return Math.round(s/3600)+'h';
+  return Math.round(s/86400)+'d';
 }
 
 function _fmtAge(ts){
@@ -32346,6 +32917,7 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     return FileResponse(str(target), media_type=mime)
+
 
 
 if __name__ == "__main__":
