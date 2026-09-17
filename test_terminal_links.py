@@ -156,7 +156,8 @@ def test_both_views_join_links_before_anything_else():
 # ── header: time until each usage window resets ─────────────────────────────
 
 @pytest.mark.parametrize("secs,want", [
-    (4 * 86400 + 3600, "4D"), (23 * 3600 + 1800, "23H"), (90 * 60, "1H"), (40 * 60, "40M"),
+    (4 * 86400 + 3600, "4D"), (23 * 3600 + 1800, "23H"), (90 * 60, "1H"),
+    (40 * 60 + 30, "40M"),   # + 30s: whole minutes, so the clock must not tick past one
     (20, "1M"), (-5, ""),
 ])
 def test_reset_countdown_reads_like_4D_or_23H(secs, want):
