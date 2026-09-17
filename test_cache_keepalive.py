@@ -38,17 +38,30 @@ NODE = shutil.which("node")
 # ── the server's view ───────────────────────────────────────────────────────
 
 def test_the_four_autopush_modes_in_order():
-    assert app.AUTOPUSH_MODES == ("off", "basic", "basicplus", "full")
-    assert app.AUTOPUSH_DEFAULT == "basic", "Basic+ must not become the default"
+    assert app.AUTOPUSH_MODES == ("off", "basic", "cache", "full")
+    assert app.AUTOPUSH_DEFAULT == "basic", "Cache must not become the default"
 
 
-def test_basicplus_is_not_off_and_not_full():
-    """The existing gates are `== "off"` and `!= "full"`, so Basic+ has to fall
+@pytest.mark.parametrize("stored,read", [
+    ("basicplus", "cache"), ("Basic+", "cache"), ("cache", "cache"), ("FULL", "full"),
+    ("nonsense", ""), (None, ""),
+])
+def test_the_old_basic_plus_name_still_reads_as_cache(stored, read):
+    """autopush-mode.json on every box still says "basicplus"."""
+    assert app._normalize_autopush_mode(stored) == read
+
+
+def test_a_stored_basicplus_session_is_in_cache_mode(monkeypatch):
+    monkeypatch.setitem(app._autopush_mode, "legacy", "basicplus")
+    assert app._get_autopush_mode("legacy") == "cache"
+
+
+def test_cache_is_not_off_and_not_full():
+    """The existing gates are `== "off"` and `!= "full"`, so Cache has to fall
     through to Basic's behaviour and must not arm the composing autopilot."""
-    assert "basicplus" != "off"
     src = APP.read_text()
     assert 'if _get_autopush_mode(name) != "full":' in src, (
-        "the autopilot gate changed shape; re-check that Basic+ does not arm it")
+        "the autopilot gate changed shape; re-check that Cache does not arm it")
 
 
 def test_deadline_is_last_turn_plus_ttl():
@@ -69,22 +82,25 @@ def test_an_unknown_deadline_is_zero_not_a_guess(sess):
     assert app._cache_deadline(sess) == 0.0
 
 
-def test_the_warning_lead_is_ten_minutes_and_the_prompt_is_fixed():
-    assert app.CACHE_WARN_LEAD == 600
+def test_it_alerts_at_fifteen_minutes_and_pushes_at_ten():
+    assert app.CACHE_ALERT_LEAD == 900
+    assert app.CACHE_PUSH_LEAD == 600
+    assert app.CACHE_ALERT_LEAD > app.CACHE_PUSH_LEAD, "a person who hears the beep gets first go"
     assert app.CACHE_KEEPALIVE_PROMPT == (
         "Continue. re-verify your own work end to end, then finish whatever is still left.")
 
 
-def test_the_keepalive_never_composes_a_message():
-    """The whole safety argument for Basic+ over Full is that it sends one fixed
-    sentence. If the loop ever reaches the model, that argument is gone."""
+def test_the_keepalive_drafts_from_the_conversation_not_the_screen():
+    """Cache drafts the next step from the chat history, through its own vetted
+    composer. It must not borrow Full's screenshot-driven autopilot."""
     src = APP.read_text()
     start = src.index("async def _cache_keepalive_loop")
     end = src.index("\ndef ", start)
     body = src[start:end]
-    for banned in ("llm_call", "_SIMPLE_WATCHDOG_SYSTEM_PROMPT", "_parse_autopilot_decision"):
+    for banned in ("_SIMPLE_WATCHDOG_SYSTEM_PROMPT", "_parse_autopilot_decision"):
         assert banned not in body, f"the keep-alive loop must not use {banned}"
-    assert "CACHE_KEEPALIVE_PROMPT" in body
+    assert "_compose_cache_prompt" in body
+    assert "CACHE_KEEPALIVE_MAX_CHAIN" in body
 
 
 def test_the_keepalive_reuses_every_auto_typing_guard():
@@ -102,7 +118,7 @@ def test_the_keepalive_reuses_every_auto_typing_guard():
 def test_a_short_cache_is_left_alone():
     """On a 5-minute cache a 10-minute lead is already past, so the nudge would
     be continuous. Those sessions are skipped rather than hammered."""
-    assert app.CACHE_KEEPALIVE_MIN_TTL > app.CACHE_WARN_LEAD - 1
+    assert app.CACHE_KEEPALIVE_MIN_TTL > app.CACHE_PUSH_LEAD - 1
     assert 300 < app.CACHE_KEEPALIVE_MIN_TTL
 
 
@@ -200,7 +216,8 @@ def _js(seeds):
             if ident in bodies and ident not in seen:
                 need.append(ident)
     src = "\n".join(bodies[n] for n in sorted(seen, key=lambda n: starts[n]))
-    return src.replace("__CACHE_WARN_LEAD__", str(app.CACHE_WARN_LEAD))
+    return (src.replace("__CACHE_ALERT_LEAD__", str(app.CACHE_ALERT_LEAD))
+               .replace("__CACHE_PUSH_LEAD__", str(app.CACHE_PUSH_LEAD)))
 
 
 def run_js(sessions, expr, pre=""):
@@ -224,15 +241,16 @@ def _sess(name="s", **kw):
 def test_the_page_and_the_server_share_one_definition_of_the_lead():
     """Substituted, not duplicated: if these drift the blink stops matching the push."""
     src = APP.read_text()
-    assert "__CACHE_WARN_LEAD__" in src
-    assert 'out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))' in src
+    assert "__CACHE_ALERT_LEAD__" in src and "__CACHE_PUSH_LEAD__" in src
+    assert 'out.replace("__CACHE_ALERT_LEAD__", str(CACHE_ALERT_LEAD))' in src
+    assert 'out.replace("__CACHE_PUSH_LEAD__", str(CACHE_PUSH_LEAD))' in src
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 @pytest.mark.parametrize("mins_idle,blinks", [
-    (0, False), (30, False), (49, False), (51, True), (59, True), (61, False),
+    (0, False), (30, False), (44, False), (46, True), (59, True), (61, False),
 ])
-def test_it_blinks_only_inside_the_last_ten_minutes(mins_idle, blinks):
+def test_it_flashes_only_inside_the_last_fifteen_minutes(mins_idle, blinks):
     """Not before (nothing to hurry for) and not after (nothing left to save)."""
     s = _sess(last_turn_end=None)          # filled in by node against its own clock
     got = run_js([s], "_pillCacheClasses('s','idle')",
@@ -278,13 +296,14 @@ def test_seconds_left_is_null_when_unknown_and_zero_when_cold():
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
-def test_the_fourth_button_exists_and_is_labelled_basic_plus():
+def test_the_third_button_is_labelled_cache():
     src = APP.read_text()
-    assert "b('basicplus','Basic +')" in src
-    assert ".autopush-seg button.ap-basicplus.active" in src, "no active style for the 4th segment"
+    assert "b('cache','Cache')" in src
+    assert "Basic +" not in src[src.index("const AUTOPUSH_TITLES"):src.index("function syncAutopushUI")]
+    assert ".autopush-seg button.ap-cache.active" in src, "no active style for the Cache segment"
     seg = src[src.index("'<div class=\"autopush-seg'"):]
     seg = seg[:seg.index("</div>")]
-    assert seg.index("basicplus") < seg.index("'Full'"), "Basic + must sit between Basic and Full"
+    assert seg.index("'cache'") < seg.index("'Full'"), "Cache must sit between Basic and Full"
 
 
 # ── the idle strip's own blink (a second, independent code path) ────────────
@@ -311,7 +330,7 @@ def run_paint(sess, expr="[el.className,el.textContent]"):
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 @pytest.mark.parametrize("mins,blinks", [
-    (10, False), (49, False), (51, True), (59, True), (61, False),
+    (10, False), (44, False), (46, True), (59, True), (61, False),
 ])
 def test_the_idle_strip_blinks_on_the_same_window_as_the_pill(mins, blinks):
     cls, _ = run_paint({"name": "s", "cache_ttl": 3600, "_ago": mins * 60})
