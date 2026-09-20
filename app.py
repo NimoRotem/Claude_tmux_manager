@@ -4594,24 +4594,15 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
 
 
 def _set_api_key_helper(cfg_dir: Path):
-    """Point Claude Code at the shared API key via settings.json `apiKeyHelper`.
-    Interactive claude does NOT honor a bare ANTHROPIC_API_KEY env var for
-    inference (it falls back to /login), but apiKeyHelper authenticates reliably —
-    and the key stays in a 0600 file rather than the terminal scrollback."""
-    sp = cfg_dir / "settings.json"
-    try:
-        s = json.loads(sp.read_text()) if sp.exists() else {}
-        if not isinstance(s, dict):
-            s = {}
-    except Exception:
-        s = {}
-    s["apiKeyHelper"] = "cat " + shlex.quote(str(ANTHROPIC_API_KEY_FILE))
-    try:
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        _backup_before_dashboard_write(sp)
-        sp.write_text(json.dumps(s, indent=2))
-    except Exception:
-        logger.debug("Failed to set apiKeyHelper in %s", sp, exc_info=True)
+    """Refused: this used to point Claude Code at the metered key via settings.json
+    `apiKeyHelper`, which authenticates whether or not a plan is available.
+
+    A config dir gets the subscription plan and nothing else (owner rule
+    2026-09-20). Left in place as a refusal rather than deleted because the whole
+    point of the failure it caused elsewhere is that it was SILENT: a route that
+    quietly fell back to a metered key billed for hours and nothing looked wrong.
+    `_remove_api_key_helper` still runs, so a dir armed before today gets cleaned."""
+    logger.warning("Refusing to arm apiKeyHelper in %s: plan-only policy", cfg_dir)
 
 
 def _remove_subscription_creds(cfg_dir: Path):
@@ -4626,11 +4617,11 @@ def _remove_subscription_creds(cfg_dir: Path):
 
 
 def _apply_api_key_auth(cfg_dir: Path):
-    """Configure a config dir to authenticate via the shared API key."""
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    _remove_subscription_creds(cfg_dir)
-    _set_api_key_helper(cfg_dir)
-    _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
+    """Refused, and it never reaches the plan credential. This used to UNLINK the
+    subscription token first and then arm the metered key, so a caller that hit it
+    by accident left the dir unable to use the plan at all."""
+    logger.warning("Refusing API-key auth for %s: plan-only policy", cfg_dir)
+    _apply_subscription_auth(cfg_dir)
 
 
 def _subscription_token_valid() -> bool:
@@ -20328,41 +20319,28 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
 
 @app.post("/api/sessions/{session_name}/set-auth-mode")
 async def api_set_auth_mode(session_name: str, body: AuthModeBody):
-    """Toggle between API key and subscription auth for a specific session."""
+    """Put a session on the subscription plan, or clear a stray key out of its pane.
+
+    There used to be an "api" mode here that typed `export ANTHROPIC_API_KEY=...`
+    into the live pane, falling back to scraping an `sk-ant-` literal out of the
+    instruction file when no key was stored. Both halves are gone: a session runs
+    on its plan (owner rule 2026-09-20), and an instruction file is not a place to
+    go looking for a secret. "api" is refused rather than silently downgraded, so
+    anything still asking for it gets told instead of believing it happened."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         if body.mode == "api":
-            key = _stored_anthropic_key
-            if not key:
-                # Fallback: try to extract from ~/CLAUDE.md
-                try:
-                    claude_md = (Path.home() / "CLAUDE.md").read_text()
-                    for line in claude_md.splitlines():
-                        line = line.strip()
-                        if line.startswith("sk-ant-"):
-                            key = line.split()[0].rstrip(",;")
-                            break
-                        elif "sk-ant-" in line:
-                            m = re.search(r'(sk-ant-\S+)', line)
-                            if m:
-                                key = m.group(1).rstrip(",;")
-                                break
-                except Exception:
-                    logger.debug("Failed to scan credentials file for API key", exc_info=True)
-            if not key:
-                return JSONResponse({"error": "No API key found"}, status_code=400)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 f"export ANTHROPIC_API_KEY={key}"],
-                capture_output=True, text=True, timeout=5
+            logger.warning(
+                "Refused API-key auth mode for session %s: plan-only policy", session_name
             )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
+            return JSONResponse(
+                {"error": "A session runs on its subscription plan. API-key auth was removed.",
+                 "mode": _session_auth_mode.get(session_name, "subscription")},
+                status_code=409,
             )
-        elif body.mode == "subscription":
+        if body.mode == "subscription":
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "-l",
                  "unset ANTHROPIC_API_KEY"],
@@ -26859,18 +26837,10 @@ function renderDetail(){
       <div class="tier">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="subscription"
-              onchange="setAuthMode('${s.name}','subscription')"
-              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
-            Subscription
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="api"
-              onchange="setAuthMode('${s.name}','api')"
-              ${s.auth_mode==='api'?'checked':''}>
-            API Key
-          </label>
+          <span style="font-size:.85rem;color:#c9d1d9">Subscription plan</span>
+          <button class="btn" style="font-size:.72rem;padding:2px 8px"
+            title="Types 'unset ANTHROPIC_API_KEY' into this pane"
+            onclick="setAuthMode('${s.name}','subscription')">Clear stray key</button>
           <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
         </div>
       </div>
@@ -29167,7 +29137,7 @@ async function setAuthMode(name,mode){
     if(resp.ok){
       const idx=sessions.findIndex(s=>s.name===name);
       if(idx>=0)sessions[idx].auth_mode=mode;
-      if(statusEl)statusEl.textContent=mode==='api'?'API key exported':'API key unset';
+      if(statusEl)statusEl.textContent='API key unset';
     }else{
       if(statusEl)statusEl.textContent=data.error||'Failed';
     }

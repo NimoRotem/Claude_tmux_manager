@@ -1,4 +1,6 @@
 """A launched session runs on its subscription and is handed no metered API key."""
+import asyncio
+import json
 import os
 import sys
 
@@ -56,3 +58,45 @@ def test_only_the_names_the_dashboard_actually_holds_are_fenced(monkeypatch):
 
 def test_nothing_is_fenced_when_the_dashboard_holds_no_key(monkeypatch):
     assert "-e" not in _launch_argv(monkeypatch, {})
+
+
+def _set_auth_mode(monkeypatch, mode, stored_key="sk-ant-pretend-live-key"):
+    """Call the auth-mode route against a pane nothing may be typed into.
+    -> (status, body dict, list of tmux argv the route tried to run)"""
+    typed = []
+
+    def fake_run(command, **kwargs):
+        typed.append(list(command))
+        return _Created()
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    monkeypatch.setattr(app, "_find_session", lambda name: (None, {"name": name}))
+    monkeypatch.setattr(app, "_stored_anthropic_key", stored_key, raising=False)
+    resp = asyncio.run(app.api_set_auth_mode("probe", app.AuthModeBody(mode=mode)))
+    return resp.status_code, json.loads(bytes(resp.body).decode()), typed
+
+
+def test_api_key_auth_mode_is_refused_and_types_nothing_into_the_pane(monkeypatch):
+    #  THE DEFECT THIS CATCHES: this route used to send-keys `export ANTHROPIC_API_KEY=<key>`
+    #  into the live pane, and when no key was stored it went looking for an sk-ant- literal
+    #  in the instruction file and used that. Either way the session stopped running on the
+    #  plan it was given and started billing, and the control was gated on owning the session,
+    #  not on being an admin. A refusal, not a silent downgrade, so a caller finds out.
+    status, body, typed = _set_auth_mode(monkeypatch, "api")
+    assert status == 409
+    assert not typed, "no tmux command may run for an api-mode request"
+    assert "plan" in body["error"].lower()
+    assert "sk-ant" not in json.dumps(body)
+
+
+def test_subscription_mode_still_clears_a_stray_key_from_the_pane(monkeypatch):
+    status, body, typed = _set_auth_mode(monkeypatch, "subscription")
+    assert status == 200 and body["mode"] == "subscription"
+    assert any("unset ANTHROPIC_API_KEY" in arg for argv in typed for arg in argv)
+
+
+def test_arming_the_api_key_helper_writes_nothing(monkeypatch, tmp_path):
+    #  The settings.json `apiKeyHelper` authenticated whether or not a plan was usable,
+    #  which is exactly how a metered fallback bills for hours without looking wrong.
+    app._set_api_key_helper(tmp_path)
+    assert not (tmp_path / "settings.json").exists()
