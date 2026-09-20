@@ -23,7 +23,8 @@ def _launch_argv(monkeypatch, env):
         return _Created()
 
     monkeypatch.setattr(app.subprocess, "run", fake_run)
-    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+    for name in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                 "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -54,6 +55,15 @@ def test_a_metered_key_in_the_dashboard_env_is_fenced_out_of_the_pane(monkeypatc
 def test_only_the_names_the_dashboard_actually_holds_are_fenced(monkeypatch):
     argv = _launch_argv(monkeypatch, {"CODEX_API_KEY": "sk-pretend"})
     assert _fenced(argv) == ["CODEX_API_KEY="]
+
+
+def test_the_per_job_voice_and_tasks_keys_are_fenced_too(monkeypatch):
+    #  Splitting the box's one key into a voice key and a small-tasks key adds two more
+    #  names a pane must not inherit. Missing them would have quietly re-opened the hole
+    #  the moment the split landed.
+    argv = _launch_argv(monkeypatch, {"OPENAI_VOICE_KEY": "sk-voice-pretend",
+                                      "OPENAI_TASKS_KEY": "sk-tasks-pretend"})
+    assert sorted(_fenced(argv)) == ["OPENAI_TASKS_KEY=", "OPENAI_VOICE_KEY="]
 
 
 def test_nothing_is_fenced_when_the_dashboard_holds_no_key(monkeypatch):

@@ -53,6 +53,14 @@ import httpx
 import websockets
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+#  ONE KEY PER JOB, not one key per box. This dashboard spends metered OpenAI money
+#  on two unrelated things: the voice endpoints (the composer's microphone and the
+#  spoken reply) and small LLM tasks (chat-mode summaries, session titles). Sharing
+#  one key made the daily figure unreadable, which is the whole reason a spend line
+#  naming a box turned out to be naming a KEY. Both fall back to OPENAI_API_KEY, so
+#  a box whose keys have not been split yet behaves exactly as before.
+OPENAI_VOICE_KEY = os.environ.get("OPENAI_VOICE_KEY", "") or OPENAI_API_KEY
+OPENAI_TASKS_KEY = os.environ.get("OPENAI_TASKS_KEY", "") or OPENAI_API_KEY
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
@@ -560,7 +568,7 @@ def _git_identity_for(user, owner_name: str):
             GIT_OWNER_EMAIL or _git_config_value("user.email")
             or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
 
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = openai.AsyncOpenAI(api_key=OPENAI_TASKS_KEY)
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
 # Removed/disabled by default: it issued a continuous stream of gpt-4o-mini calls,
@@ -1444,12 +1452,16 @@ async def lifespan(_app: FastAPI):
     logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
                 PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "configured" if OPENAI_API_KEY else "missing")
+                "tasks=%s voice=%s" % ("set" if OPENAI_TASKS_KEY else "missing",
+                                       "set" if OPENAI_VOICE_KEY else "missing"))
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
+    if not OPENAI_TASKS_KEY:
+        logger.warning("No OPENAI_TASKS_KEY (or OPENAI_API_KEY): LLM summaries will not work.")
+    if not OPENAI_VOICE_KEY:
+        logger.warning("No OPENAI_VOICE_KEY (or OPENAI_API_KEY): the mic and spoken replies "
+                       "will answer 503.")
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
@@ -8526,7 +8538,8 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
     #  on the subscription it was given, and that failure is silent, it just costs money. An agent
     #  runs on its plan and asks the advisor for anything else it needs. tmux has no unset for
     #  new-session, so the names go through EMPTY, which every consumer reads as absent.
-    for fenced in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+    for fenced in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                   "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
         if os.environ.get(fenced):
             command += ["-e", "%s=" % fenced]
     if name:
@@ -12764,7 +12777,7 @@ async def api_stats_processes(request: Request):
 @app.get("/api/health")
 async def api_health():
     """Lightweight health check — verifies tmux is accessible."""
-    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_API_KEY)}
+    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_TASKS_KEY)}
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -17754,7 +17767,7 @@ async def api_session_relogin(session_name: str, request: Request):
 @app.post("/api/transcribe")
 async def api_transcribe(audio: UploadFile = File(...)):
     """Transcribe a recorded voice clip to text (for the composer mic button)."""
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = OPENAI_VOICE_KEY
     if not key:
         return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
     try:
@@ -17824,7 +17837,7 @@ class TTSBody(BaseModel):
 @app.post("/api/tts")
 async def api_tts(body: TTSBody):
     """Speak a reply for live voice mode. Returns MP3 bytes."""
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = OPENAI_VOICE_KEY
     if not key:
         return JSONResponse({"error": "Speech is not configured."}, status_code=503)
     text = _plain_for_speech(body.text)
