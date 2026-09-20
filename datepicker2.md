@@ -1,0 +1,1376 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - generic:
+      - status
+  - generic [ref=e9]:
+    - link "Skip to content":
+      - /url: "#AppFrameMain"
+    - generic [ref=e15]:
+      - generic [ref=e20] [cursor=pointer]:
+        - img "Shopify" [ref=e21]
+        - img "Shopify" [ref=e22]
+      - button "Search CTRL K" [ref=e30] [cursor=pointer]:
+        - generic [ref=e31]:
+          - generic [ref=e32]:
+            - generic:
+              - generic:
+                - generic:
+                  - img
+            - generic "Search" [ref=e33]
+          - generic [ref=e34]:
+            - generic [ref=e35]: CTRL
+            - generic [ref=e36]: K
+      - generic [ref=e37]:
+        - generic [ref=e39]:
+          - button "Sidekick" [ref=e43] [cursor=pointer]:
+            - img [ref=e45]
+          - button "Alerts Feed - 2 unseen alerts" [ref=e60] [cursor=pointer]:
+            - generic [ref=e62]:
+              - img [ref=e63]:
+                - img [ref=e64]
+              - generic [ref=e70]: "2"
+        - button "Nimrod Rotem" [ref=e83] [cursor=pointer]:
+          - generic [ref=e86]:
+            - img "GRIP TECH TOOLS" [ref=e89]
+            - paragraph [ref=e91]: GRIP TECH TOOLS
+    - generic [ref=e93]:
+      - generic "Navigation" [ref=e94]:
+        - navigation [ref=e96]:
+          - generic [ref=e101]:
+            - generic [ref=e102]:
+              - list [ref=e104]:
+                - listitem [ref=e105]:
+                  - link "Home" [ref=e108] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep
+                    - generic [ref=e109]:
+                      - img [ref=e112]
+                      - img [ref=e116]
+                    - generic [ref=e118]: Home
+                - listitem [ref=e119]:
+                  - link "Orders" [ref=e122] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/orders
+                    - generic [ref=e123]:
+                      - img [ref=e126]
+                      - img [ref=e130]
+                    - generic [ref=e132]: Orders
+                - listitem [ref=e133]:
+                  - link "Products" [ref=e136] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/products
+                    - generic [ref=e137]:
+                      - img [ref=e140]
+                      - img [ref=e144]
+                    - generic [ref=e147]: Products
+                - listitem [ref=e148]:
+                  - link "Customers" [ref=e151] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/customers
+                    - generic [ref=e152]:
+                      - img [ref=e155]
+                      - img [ref=e160]
+                    - generic [ref=e163]: Customers
+                - listitem [ref=e164]:
+                  - link "Growth" [ref=e167] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/growth
+                    - generic [ref=e168]:
+                      - img [ref=e171]
+                      - img [ref=e177]
+                    - generic [ref=e181]: Growth
+                - listitem [ref=e182]:
+                  - link "Discounts" [ref=e185] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/discounts
+                    - generic [ref=e186]:
+                      - img [ref=e189]
+                      - img [ref=e193]
+                    - generic [ref=e198]: Discounts
+                - listitem [ref=e199]:
+                  - link "Content" [ref=e202] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/content/metaobjects
+                    - generic [ref=e203]:
+                      - img [ref=e206]
+                      - img [ref=e213]
+                    - generic [ref=e218]: Content
+                - listitem [ref=e219]:
+                  - link "Markets" [ref=e222] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/markets
+                    - generic [ref=e223]:
+                      - img [ref=e226]
+                      - img [ref=e231]
+                    - generic [ref=e234]: Markets
+                - listitem [ref=e235]:
+                  - link "Finance" [ref=e238] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/payments/payouts
+                    - generic [ref=e239]:
+                      - img [ref=e242]
+                      - img [ref=e246]
+                    - generic [ref=e248]: Finance
+                - listitem [ref=e249]:
+                  - link "Analytics" [expanded] [ref=e252] [cursor=pointer]:
+                    - /url: /store/bsiwbd-ep/analytics
+                    - generic [ref=e253]:
+                      - img [ref=e256]
+                      - img [ref=e262]
+                    - generic [ref=e266]: Analytics
+                  - list [ref=e394]:
+                    - listitem [ref=e395]:
+                      - link "Reports" [ref=e398] [cursor=pointer]:
+                        - /url: /store/bsiwbd-ep/analytics/reports
+                        - generic [ref=e399]: Reports
+                    - listitem [ref=e400]:
+                      - link "Live View" [ref=e403] [cursor=pointer]:
+                        - /url: /store/bsiwbd-ep/analytics/live
+                        - generic [ref=e404]: Live View
+              - list [ref=e267]:
+                - listitem [ref=e268]:
+                  - button "Sales channels" [ref=e270] [cursor=pointer]:
+                    - strong [ref=e272]:
+                      - generic: Sales channels
+                  - list [ref=e275]:
+                    - button "Online Store" [ref=e276]:
+                      - list [ref=e277]:
+                        - listitem [ref=e278]:
+                          - link "Online Store" [ref=e281] [cursor=pointer]:
+                            - /url: /store/bsiwbd-ep/themes?appLoadId=10b343c7-c698-48f0-8cb4-1a30b43ce38c
+                            - img [ref=e283]
+                            - generic [ref=e285]: Online Store
+                    - button "Agentic" [ref=e286]:
+                      - list [ref=e287]:
+                        - listitem [ref=e288]:
+                          - link "Agentic" [ref=e291] [cursor=pointer]:
+                            - /url: /store/bsiwbd-ep/apps/agentic?appLoadId=97b1959e-bce1-4d6d-935b-2f0c3ded5983
+                            - img [ref=e293]
+                            - generic [ref=e295]: Agentic
+                    - 'button "Collective: Supplier" [ref=e296]':
+                      - list [ref=e297]:
+                        - listitem [ref=e298]:
+                          - 'link "Collective: Supplier" [ref=e301] [cursor=pointer]':
+                            - /url: /store/bsiwbd-ep/apps/merchant-to-merchant-1?appLoadId=2ad23b70-13cb-4017-b0bc-f3b7bd68480a
+                            - img [ref=e303]
+                            - generic [ref=e305]: "Collective: Supplier"
+                    - listitem
+                    - 'button "Faire: Sell Wholesale Pin to your navigation" [ref=e306]':
+                      - list [ref=e307]:
+                        - listitem [ref=e308]:
+                          - generic [ref=e310]:
+                            - 'link "Faire: Sell Wholesale" [ref=e311] [cursor=pointer]':
+                              - /url: /store/bsiwbd-ep/apps/faire-sell-wholesale?appLoadId=0ec3f34c-208f-4662-983f-6178cfa9c8b7
+                              - img [ref=e313]
+                              - generic [ref=e315]: "Faire: Sell Wholesale"
+                            - button "Pin to your navigation" [ref=e318] [cursor=pointer]:
+                              - text: •
+                              - img [ref=e322]
+                  - status [ref=e324]
+                - listitem [ref=e325]:
+                  - button "Apps" [ref=e327] [cursor=pointer]:
+                    - strong [ref=e329]:
+                      - generic: Apps
+                  - list [ref=e332]:
+                    - button "Collective Pin to your navigation" [disabled] [ref=e333]:
+                      - list [ref=e334]:
+                        - listitem [ref=e335]:
+                          - generic [ref=e337]:
+                            - link "Collective" [disabled] [ref=e338] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/apps/merchant-to-merchant?appLoadId=e17bacc7-7f2f-45c3-b221-787002fa04ae
+                              - img [ref=e340]
+                              - generic [ref=e342]: Collective
+                            - button "Pin to your navigation" [disabled] [ref=e345] [cursor=pointer]:
+                              - text: •
+                              - img [ref=e349]
+                  - status [ref=e351]
+            - list [ref=e353]:
+              - listitem [ref=e354]:
+                - link "Settings" [ref=e357] [cursor=pointer]:
+                  - /url: /store/bsiwbd-ep/settings
+                  - img [ref=e361]
+                  - generic [ref=e363]: Settings
+      - main [ref=e364]:
+        - main [ref=e409]:
+          - generic [ref=e413]:
+            - generic [ref=e420]:
+              - generic:
+                - img [ref=e423]
+                - heading "Analytics" [level=1] [ref=e427]
+            - generic [ref=e428]:
+              - generic [ref=e429]:
+                - button "More actions" [ref=e430] [cursor=pointer]:
+                  - img [ref=e434]
+                - button "Try targets" [ref=e438] [cursor=pointer]:
+                  - generic [ref=e439]:
+                    - generic [ref=e440]:
+                      - generic: Try targets
+                    - img [ref=e444]
+              - link "New exploration" [ref=e447] [cursor=pointer]:
+                - /url: /store/bsiwbd-ep/analytics/reports/explore
+                - generic [ref=e449]:
+                  - generic: New exploration
+          - generic [ref=e452]:
+            - generic:
+              - generic [ref=e453]:
+                - generic [ref=e2953]:
+                  - generic [ref=e2954]:
+                    - 'button "Date control: Jan 1, 2025" [ref=e2956]':
+                      - 'button "Date control: Jan 1, 2025" [ref=e2959] [cursor=pointer]':
+                        - generic [ref=e2960]:
+                          - img [ref=e2963]
+                          - generic [ref=e2965]:
+                            - generic:
+                              - text: Jan 1, 2025
+                              - img [ref=e2969]
+                    - generic: Cancel
+                    - generic: Apply
+                  - 'button "Comparison control: Compare to: Dec 31, 2024" [ref=e2973]':
+                    - 'button "Comparison control: Compare to: Dec 31, 2024" [ref=e2976] [cursor=pointer]':
+                      - generic [ref=e2977]:
+                        - img [ref=e2980]: />
+                        - generic [ref=e2982]:
+                          - generic:
+                            - text: Dec 31, 2024
+                            - img [ref=e2986]
+                - button "USD $" [ref=e493] [cursor=pointer]:
+                  - generic [ref=e494]:
+                    - img [ref=e497]
+                    - generic [ref=e501]:
+                      - generic: USD $
+              - generic [ref=e502]:
+                - generic [ref=e508]:
+                  - region "Gross sales over time metric card" [ref=e511]:
+                    - link "Gross sales" [ref=e518] [cursor=pointer]:
+                      - /url: /store/bsiwbd-ep/analytics/reports/gross_sales_over_time?ql=FROM+sales%0A++SHOW+gross_sales%0A++TIMESERIES+hour+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+gross_sales+TYPE+line
+                      - region "Gross sales" [ref=e520]:
+                        - generic [ref=e521]:
+                          - generic [ref=e523]:
+                            - button "Open definition for Gross sales" [ref=e2989]:
+                              - heading "Gross sales" [level=2] [ref=e2990]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Rough sales revenue, before discounts and returns are factored in over time
+                          - generic [ref=e529]:
+                            - generic [ref=e2992]:
+                              - generic [ref=e2993]:
+                                - generic:
+                                  - generic:
+                                    - button "$0.00":
+                                      - generic:
+                                        - generic: $0.00
+                                  - generic: $0.00
+                              - img "No change" [ref=e2995]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic:
+                                        - list
+                  - region "Returning customer rate over time metric card" [ref=e544]:
+                    - link "Returning customer rate" [ref=e551] [cursor=pointer]:
+                      - /url: /store/bsiwbd-ep/analytics/reports/returning_customer_rate_over_time?ql=FROM+sales%0A++SHOW+returning_customers%2C+customers%2C+returning_customer_rate%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+returning_customer_rate+TYPE+line
+                      - region "Returning customer rate" [ref=e553]:
+                        - generic [ref=e554]:
+                          - generic [ref=e556]:
+                            - button "Open definition for Returning customer rate" [ref=e2998]:
+                              - heading "Returning customer rate" [level=2] [ref=e2999]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Percentage of customers who placed an order that were returning customers
+                          - generic [ref=e562]:
+                            - generic [ref=e3001]:
+                              - generic [ref=e3003]: 0%
+                              - img "No change" [ref=e3005]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic:
+                                        - list
+                  - region "Orders fulfilled over time metric card" [ref=e573]:
+                    - link "Orders fulfilled" [ref=e580] [cursor=pointer]:
+                      - /url: /store/bsiwbd-ep/analytics/reports/orders_fulfilled_over_time?ql=FROM+fulfillments%0A++SHOW+orders_fulfilled%2C+orders_shipped%2C+orders_delivered%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+orders_fulfilled+TYPE+line
+                      - region "Orders fulfilled" [ref=e582]:
+                        - generic [ref=e583]:
+                          - generic [ref=e585]:
+                            - button "Open definition for Orders fulfilled" [ref=e3008]:
+                              - heading "Orders fulfilled" [level=2] [ref=e3009]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total orders that have been marked as fulfilled
+                          - generic [ref=e591]:
+                            - generic [ref=e3011]:
+                              - generic [ref=e3013]: "0"
+                              - img "No change" [ref=e3015]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic:
+                                        - list
+                  - region "Orders over time metric card" [ref=e607]:
+                    - link "Orders" [ref=e614] [cursor=pointer]:
+                      - /url: /store/bsiwbd-ep/analytics/reports/orders_over_time?ql=FROM+sales%0A++SHOW+orders%2C+quantity_ordered_per_order%2C+average_order_value%2C%0A++++reversed_quantity%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+orders+TYPE+line
+                      - region "Orders" [ref=e616]:
+                        - generic [ref=e617]:
+                          - generic [ref=e619]:
+                            - button "Open definition for Orders" [ref=e3018]:
+                              - heading "Orders" [level=2] [ref=e3019]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Number of orders across all sales channels
+                          - generic [ref=e625]:
+                            - generic [ref=e3021]:
+                              - generic [ref=e3023]: "0"
+                              - img "No change" [ref=e3025]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic:
+                                        - list
+                  - region "Total sales over time metric card" [ref=e641]:
+                    - region "Total sales over time" [ref=e647]:
+                      - generic [ref=e648]:
+                        - link "Total sales over time" [ref=e652]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/total_sales_over_time?ql=FROM+sales%0A++SHOW+orders%2C+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C%0A++++shipping_charges%2C+duties%2C+additional_fees%2C+taxes%2C+total_sales%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+line
+                          - generic:
+                            - button "Open definition for Total sales over time" [ref=e3028]:
+                              - heading "Total sales over time" [level=2] [ref=e3029]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Amount spent (subtotal, taxes, shipping, sales reversals, discounts, fees, etc.)
+                        - generic [ref=e658]:
+                          - generic [ref=e3031]:
+                            - generic [ref=e3032]:
+                              - generic:
+                                - generic:
+                                  - button "$0.00":
+                                    - generic:
+                                      - generic: $0.00
+                                - generic: $0.00
+                            - img "No change" [ref=e3034]
+                          - generic [ref=e3040]:
+                            - table [ref=e3041]:
+                              - generic [ref=e3042]:
+                                - generic [ref=e3044]: 12 AM
+                                - generic [ref=e3046]: 2 AM
+                                - generic [ref=e3048]: 4 AM
+                                - generic [ref=e3050]: 6 AM
+                                - generic [ref=e3052]: 8 AM
+                                - generic [ref=e3054]: 10 AM
+                                - generic [ref=e3056]: 12 PM
+                                - generic [ref=e3058]: 2 PM
+                                - generic [ref=e3060]: 4 PM
+                                - generic [ref=e3062]: 6 PM
+                                - generic [ref=e3064]: 8 PM
+                                - generic [ref=e3066]: 10 PM
+                              - generic [ref=e3067]:
+                                - generic [ref=e3070]: $0
+                                - generic [ref=e3073]: $5
+                                - generic [ref=e3076]: $10
+                              - row "12 AM 1 AM 2 AM 3 AM 4 AM 5 AM 6 AM 7 AM 8 AM 9 AM 10 AM 11 AM 12 PM 1 PM 2 PM 3 PM 4 PM 5 PM 6 PM 7 PM 8 PM 9 PM 10 PM 11 PM" [ref=e3077]:
+                                - rowheader
+                                - columnheader "12 AM" [ref=e3078]
+                                - columnheader "1 AM" [ref=e3079]
+                                - columnheader "2 AM" [ref=e3080]
+                                - columnheader "3 AM" [ref=e3081]
+                                - columnheader "4 AM" [ref=e3082]
+                                - columnheader "5 AM" [ref=e3083]
+                                - columnheader "6 AM" [ref=e3084]
+                                - columnheader "7 AM" [ref=e3085]
+                                - columnheader "8 AM" [ref=e3086]
+                                - columnheader "9 AM" [ref=e3087]
+                                - columnheader "10 AM" [ref=e3088]
+                                - columnheader "11 AM" [ref=e3089]
+                                - columnheader "12 PM" [ref=e3090]
+                                - columnheader "1 PM" [ref=e3091]
+                                - columnheader "2 PM" [ref=e3092]
+                                - columnheader "3 PM" [ref=e3093]
+                                - columnheader "4 PM" [ref=e3094]
+                                - columnheader "5 PM" [ref=e3095]
+                                - columnheader "6 PM" [ref=e3096]
+                                - columnheader "7 PM" [ref=e3097]
+                                - columnheader "8 PM" [ref=e3098]
+                                - columnheader "9 PM" [ref=e3099]
+                                - columnheader "10 PM" [ref=e3100]
+                                - columnheader "11 PM" [ref=e3101]
+                              - row "Jan 1, 2025 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0" [ref=e3102]:
+                                - rowheader "Jan 1, 2025" [ref=e3103]
+                                - cell "$0" [ref=e3104]
+                                - cell "$0" [ref=e3105]
+                                - cell "$0" [ref=e3106]
+                                - cell "$0" [ref=e3107]
+                                - cell "$0" [ref=e3108]
+                                - cell "$0" [ref=e3109]
+                                - cell "$0" [ref=e3110]
+                                - cell "$0" [ref=e3111]
+                                - cell "$0" [ref=e3112]
+                                - cell "$0" [ref=e3113]
+                                - cell "$0" [ref=e3114]
+                                - cell "$0" [ref=e3115]
+                                - cell "$0" [ref=e3116]
+                                - cell "$0" [ref=e3117]
+                                - cell "$0" [ref=e3118]
+                                - cell "$0" [ref=e3119]
+                                - cell "$0" [ref=e3120]
+                                - cell "$0" [ref=e3121]
+                                - cell "$0" [ref=e3122]
+                                - cell "$0" [ref=e3123]
+                                - cell "$0" [ref=e3124]
+                                - cell "$0" [ref=e3125]
+                                - cell "$0" [ref=e3126]
+                                - cell "$0" [ref=e3127]
+                              - row "Dec 31, 2024 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0" [ref=e3128]:
+                                - rowheader "Dec 31, 2024" [ref=e3129]
+                                - cell "$0" [ref=e3130]
+                                - cell "$0" [ref=e3131]
+                                - cell "$0" [ref=e3132]
+                                - cell "$0" [ref=e3133]
+                                - cell "$0" [ref=e3134]
+                                - cell "$0" [ref=e3135]
+                                - cell "$0" [ref=e3136]
+                                - cell "$0" [ref=e3137]
+                                - cell "$0" [ref=e3138]
+                                - cell "$0" [ref=e3139]
+                                - cell "$0" [ref=e3140]
+                                - cell "$0" [ref=e3141]
+                                - cell "$0" [ref=e3142]
+                                - cell "$0" [ref=e3143]
+                                - cell "$0" [ref=e3144]
+                                - cell "$0" [ref=e3145]
+                                - cell "$0" [ref=e3146]
+                                - cell "$0" [ref=e3147]
+                                - cell "$0" [ref=e3148]
+                                - cell "$0" [ref=e3149]
+                                - cell "$0" [ref=e3150]
+                                - cell "$0" [ref=e3151]
+                                - cell "$0" [ref=e3152]
+                                - cell "$0" [ref=e3153]
+                            - list [ref=e3155]:
+                              - button "Jan 1, 2025" [ref=e3156]:
+                                - generic [ref=e3160]: Jan 1, 2025
+                              - button "Dec 31, 2024" [ref=e3161]:
+                                - generic [ref=e3165]: Dec 31, 2024
+                  - region "Total sales breakdown metric card" [ref=e797]:
+                    - region "Total sales breakdown" [ref=e803]:
+                      - generic [ref=e804]:
+                        - link "Total sales breakdown" [ref=e808]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/total_sales_breakdown?ql=FROM+sales%0A++SHOW+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C+shipping_charges%2C%0A++++return_fees%2C+taxes%2C+total_sales%0A++TIMESERIES+hour+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C+shipping_charges%2C%0A++return_fees%2C+taxes%2C+total_sales+TYPE+list
+                          - button "Open definition for Total sales breakdown" [ref=e3167]:
+                            - heading "Total sales breakdown" [level=2] [ref=e3168]
+                        - list [ref=e3172]:
+                          - listitem [ref=e3173]:
+                            - link "Gross sales" [ref=e3177] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/gross_sales_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Gross sales
+                            - generic [ref=e3178]:
+                              - strong [ref=e3181]: $0.00
+                              - img "No change" [ref=e3183]
+                          - listitem [ref=e3185]:
+                            - link "Discounts" [ref=e3189] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/discounts_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Discounts
+                            - generic [ref=e3190]:
+                              - strong [ref=e3193]: $0.00
+                              - img "No change" [ref=e3195]
+                          - listitem [ref=e3197]:
+                            - link "Sales reversals" [ref=e3201] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/total_sales_reversals_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Sales reversals
+                            - generic [ref=e3202]:
+                              - strong [ref=e3205]: $0.00
+                              - img "No change" [ref=e3207]
+                          - listitem [ref=e3209]:
+                            - link "Net sales" [ref=e3213] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/net_sales_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Net sales
+                            - generic [ref=e3214]:
+                              - strong [ref=e3217]: $0.00
+                              - img "No change" [ref=e3219]
+                          - listitem [ref=e3221]:
+                            - link "Shipping charges" [ref=e3225] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/shipping_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Shipping charges
+                            - generic [ref=e3226]:
+                              - strong [ref=e3229]: $0.00
+                              - img "No change" [ref=e3231]
+                          - listitem [ref=e3233]:
+                            - link "Return fees" [ref=e3237] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/total_returns_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Return fees
+                            - generic [ref=e3238]:
+                              - strong [ref=e3241]: $0.00
+                              - img "No change" [ref=e3243]
+                          - listitem [ref=e3245]:
+                            - link "Taxes" [ref=e3249] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/taxes?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Taxes
+                            - generic [ref=e3250]:
+                              - strong [ref=e3253]: $0.00
+                              - img "No change" [ref=e3255]
+                          - listitem [ref=e3257]:
+                            - link "Total sales" [ref=e3261] [cursor=pointer]:
+                              - /url: /store/bsiwbd-ep/analytics/reports/total_sales_by_order?ql=SINCE%202025-01-01%20UNTIL%202025-01-01%20COMPARE%20TO%20previous_period
+                              - generic: Total sales
+                            - generic [ref=e3262]:
+                              - strong [ref=e3265]: $0.00
+                              - img "No change" [ref=e3267]
+                  - region "Sessions over time metric card" [ref=e929]:
+                    - region "Sessions over time" [ref=e935]:
+                      - generic [ref=e936]:
+                        - link "Sessions over time" [ref=e940]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_over_time?ql=FROM+sessions%0A++SHOW+online_store_visitors%2C+sessions%0A++WHERE+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+line
+                          - generic:
+                            - button "Open definition for Sessions over time" [ref=e3270]:
+                              - heading "Sessions over time" [level=2] [ref=e3271]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Number of user sessions in your online store
+                        - generic [ref=e946]:
+                          - generic [ref=e3273]:
+                            - generic [ref=e3275]: "0"
+                            - img "No change" [ref=e3277]
+                          - generic [ref=e3283]:
+                            - table [ref=e3284]:
+                              - generic [ref=e3285]:
+                                - generic [ref=e3287]: 12 AM
+                                - generic [ref=e3289]: 3 AM
+                                - generic [ref=e3291]: 6 AM
+                                - generic [ref=e3293]: 9 AM
+                                - generic [ref=e3295]: 12 PM
+                                - generic [ref=e3297]: 3 PM
+                                - generic [ref=e3299]: 6 PM
+                                - generic [ref=e3301]: 9 PM
+                              - generic [ref=e3302]:
+                                - generic [ref=e3305]: "0"
+                                - generic [ref=e3308]: "5"
+                                - generic [ref=e3311]: "10"
+                              - row "12 AM 1 AM 2 AM 3 AM 4 AM 5 AM 6 AM 7 AM 8 AM 9 AM 10 AM 11 AM 12 PM 1 PM 2 PM 3 PM 4 PM 5 PM 6 PM 7 PM 8 PM 9 PM 10 PM 11 PM" [ref=e3312]:
+                                - rowheader
+                                - columnheader "12 AM" [ref=e3313]
+                                - columnheader "1 AM" [ref=e3314]
+                                - columnheader "2 AM" [ref=e3315]
+                                - columnheader "3 AM" [ref=e3316]
+                                - columnheader "4 AM" [ref=e3317]
+                                - columnheader "5 AM" [ref=e3318]
+                                - columnheader "6 AM" [ref=e3319]
+                                - columnheader "7 AM" [ref=e3320]
+                                - columnheader "8 AM" [ref=e3321]
+                                - columnheader "9 AM" [ref=e3322]
+                                - columnheader "10 AM" [ref=e3323]
+                                - columnheader "11 AM" [ref=e3324]
+                                - columnheader "12 PM" [ref=e3325]
+                                - columnheader "1 PM" [ref=e3326]
+                                - columnheader "2 PM" [ref=e3327]
+                                - columnheader "3 PM" [ref=e3328]
+                                - columnheader "4 PM" [ref=e3329]
+                                - columnheader "5 PM" [ref=e3330]
+                                - columnheader "6 PM" [ref=e3331]
+                                - columnheader "7 PM" [ref=e3332]
+                                - columnheader "8 PM" [ref=e3333]
+                                - columnheader "9 PM" [ref=e3334]
+                                - columnheader "10 PM" [ref=e3335]
+                                - columnheader "11 PM" [ref=e3336]
+                              - row "Jan 1, 2025 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0" [ref=e3337]:
+                                - rowheader "Jan 1, 2025" [ref=e3338]
+                                - cell "0" [ref=e3339]
+                                - cell "0" [ref=e3340]
+                                - cell "0" [ref=e3341]
+                                - cell "0" [ref=e3342]
+                                - cell "0" [ref=e3343]
+                                - cell "0" [ref=e3344]
+                                - cell "0" [ref=e3345]
+                                - cell "0" [ref=e3346]
+                                - cell "0" [ref=e3347]
+                                - cell "0" [ref=e3348]
+                                - cell "0" [ref=e3349]
+                                - cell "0" [ref=e3350]
+                                - cell "0" [ref=e3351]
+                                - cell "0" [ref=e3352]
+                                - cell "0" [ref=e3353]
+                                - cell "0" [ref=e3354]
+                                - cell "0" [ref=e3355]
+                                - cell "0" [ref=e3356]
+                                - cell "0" [ref=e3357]
+                                - cell "0" [ref=e3358]
+                                - cell "0" [ref=e3359]
+                                - cell "0" [ref=e3360]
+                                - cell "0" [ref=e3361]
+                                - cell "0" [ref=e3362]
+                              - row "Dec 31, 2024 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0" [ref=e3363]:
+                                - rowheader "Dec 31, 2024" [ref=e3364]
+                                - cell "0" [ref=e3365]
+                                - cell "0" [ref=e3366]
+                                - cell "0" [ref=e3367]
+                                - cell "0" [ref=e3368]
+                                - cell "0" [ref=e3369]
+                                - cell "0" [ref=e3370]
+                                - cell "0" [ref=e3371]
+                                - cell "0" [ref=e3372]
+                                - cell "0" [ref=e3373]
+                                - cell "0" [ref=e3374]
+                                - cell "0" [ref=e3375]
+                                - cell "0" [ref=e3376]
+                                - cell "0" [ref=e3377]
+                                - cell "0" [ref=e3378]
+                                - cell "0" [ref=e3379]
+                                - cell "0" [ref=e3380]
+                                - cell "0" [ref=e3381]
+                                - cell "0" [ref=e3382]
+                                - cell "0" [ref=e3383]
+                                - cell "0" [ref=e3384]
+                                - cell "0" [ref=e3385]
+                                - cell "0" [ref=e3386]
+                                - cell "0" [ref=e3387]
+                                - cell "0" [ref=e3388]
+                            - list [ref=e3390]:
+                              - button "Jan 1, 2025" [ref=e3391]:
+                                - generic [ref=e3395]: Jan 1, 2025
+                              - button "Dec 31, 2024" [ref=e3396]:
+                                - generic [ref=e3400]: Dec 31, 2024
+                  - region "Total sales by sales channel metric card" [ref=e1083]:
+                    - region "Total sales by sales channel" [ref=e1089]:
+                      - generic [ref=e1090]:
+                        - link "Total sales by sales channel" [ref=e1094]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/total_sales_by_sales_channel?ql=FROM+sales%0A++SHOW+orders%2C+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C%0A++++shipping_charges%2C+taxes%2C+total_sales%0A++WHERE+sales_channel+IS+NOT+NULL%0A++GROUP+BY+sales_channel+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+donut
+                          - generic:
+                            - button "Open definition for Total sales by sales channel" [ref=e3402]:
+                              - heading "Total sales by sales channel" [level=2] [ref=e3403]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total sales, broken down by sales channel
+                        - status [ref=e3404]:
+                          - generic [ref=e3407]:
+                            - generic: No data for this date range
+                  - region "Average order value over time metric card" [ref=e1132]:
+                    - region "Average order value over time" [ref=e1138]:
+                      - generic [ref=e1139]:
+                        - link "Average order value over time" [ref=e1143]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/average_order_value_over_time?ql=FROM+sales%0A++SHOW+gross_sales%2C+discounts%2C+orders%2C+average_order_value%0A++WHERE+excludes_post_order_adjustments+%3D+true%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+average_order_value+TYPE+line
+                          - generic:
+                            - button "Open definition for Average order value over time" [ref=e3409]:
+                              - heading "Average order value over time" [level=2] [ref=e3410]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Average order value, factoring in discounts
+                        - generic [ref=e1149]:
+                          - generic [ref=e3412]:
+                            - generic [ref=e3413]:
+                              - generic:
+                                - generic:
+                                  - button "$0.00":
+                                    - generic:
+                                      - generic: $0.00
+                                - generic: $0.00
+                            - img "No change" [ref=e3415]
+                          - generic [ref=e3421]:
+                            - table [ref=e3422]:
+                              - generic [ref=e3423]:
+                                - generic [ref=e3425]: 12 AM
+                                - generic [ref=e3427]: 3 AM
+                                - generic [ref=e3429]: 6 AM
+                                - generic [ref=e3431]: 9 AM
+                                - generic [ref=e3433]: 12 PM
+                                - generic [ref=e3435]: 3 PM
+                                - generic [ref=e3437]: 6 PM
+                                - generic [ref=e3439]: 9 PM
+                              - generic [ref=e3440]:
+                                - generic [ref=e3443]: $0
+                                - generic [ref=e3446]: $5
+                                - generic [ref=e3449]: $10
+                              - row "12 AM 1 AM 2 AM 3 AM 4 AM 5 AM 6 AM 7 AM 8 AM 9 AM 10 AM 11 AM 12 PM 1 PM 2 PM 3 PM 4 PM 5 PM 6 PM 7 PM 8 PM 9 PM 10 PM 11 PM" [ref=e3450]:
+                                - rowheader
+                                - columnheader "12 AM" [ref=e3451]
+                                - columnheader "1 AM" [ref=e3452]
+                                - columnheader "2 AM" [ref=e3453]
+                                - columnheader "3 AM" [ref=e3454]
+                                - columnheader "4 AM" [ref=e3455]
+                                - columnheader "5 AM" [ref=e3456]
+                                - columnheader "6 AM" [ref=e3457]
+                                - columnheader "7 AM" [ref=e3458]
+                                - columnheader "8 AM" [ref=e3459]
+                                - columnheader "9 AM" [ref=e3460]
+                                - columnheader "10 AM" [ref=e3461]
+                                - columnheader "11 AM" [ref=e3462]
+                                - columnheader "12 PM" [ref=e3463]
+                                - columnheader "1 PM" [ref=e3464]
+                                - columnheader "2 PM" [ref=e3465]
+                                - columnheader "3 PM" [ref=e3466]
+                                - columnheader "4 PM" [ref=e3467]
+                                - columnheader "5 PM" [ref=e3468]
+                                - columnheader "6 PM" [ref=e3469]
+                                - columnheader "7 PM" [ref=e3470]
+                                - columnheader "8 PM" [ref=e3471]
+                                - columnheader "9 PM" [ref=e3472]
+                                - columnheader "10 PM" [ref=e3473]
+                                - columnheader "11 PM" [ref=e3474]
+                              - row "Jan 1, 2025 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0" [ref=e3475]:
+                                - rowheader "Jan 1, 2025" [ref=e3476]
+                                - cell "$0" [ref=e3477]
+                                - cell "$0" [ref=e3478]
+                                - cell "$0" [ref=e3479]
+                                - cell "$0" [ref=e3480]
+                                - cell "$0" [ref=e3481]
+                                - cell "$0" [ref=e3482]
+                                - cell "$0" [ref=e3483]
+                                - cell "$0" [ref=e3484]
+                                - cell "$0" [ref=e3485]
+                                - cell "$0" [ref=e3486]
+                                - cell "$0" [ref=e3487]
+                                - cell "$0" [ref=e3488]
+                                - cell "$0" [ref=e3489]
+                                - cell "$0" [ref=e3490]
+                                - cell "$0" [ref=e3491]
+                                - cell "$0" [ref=e3492]
+                                - cell "$0" [ref=e3493]
+                                - cell "$0" [ref=e3494]
+                                - cell "$0" [ref=e3495]
+                                - cell "$0" [ref=e3496]
+                                - cell "$0" [ref=e3497]
+                                - cell "$0" [ref=e3498]
+                                - cell "$0" [ref=e3499]
+                                - cell "$0" [ref=e3500]
+                              - row "Dec 31, 2024 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0 $0" [ref=e3501]:
+                                - rowheader "Dec 31, 2024" [ref=e3502]
+                                - cell "$0" [ref=e3503]
+                                - cell "$0" [ref=e3504]
+                                - cell "$0" [ref=e3505]
+                                - cell "$0" [ref=e3506]
+                                - cell "$0" [ref=e3507]
+                                - cell "$0" [ref=e3508]
+                                - cell "$0" [ref=e3509]
+                                - cell "$0" [ref=e3510]
+                                - cell "$0" [ref=e3511]
+                                - cell "$0" [ref=e3512]
+                                - cell "$0" [ref=e3513]
+                                - cell "$0" [ref=e3514]
+                                - cell "$0" [ref=e3515]
+                                - cell "$0" [ref=e3516]
+                                - cell "$0" [ref=e3517]
+                                - cell "$0" [ref=e3518]
+                                - cell "$0" [ref=e3519]
+                                - cell "$0" [ref=e3520]
+                                - cell "$0" [ref=e3521]
+                                - cell "$0" [ref=e3522]
+                                - cell "$0" [ref=e3523]
+                                - cell "$0" [ref=e3524]
+                                - cell "$0" [ref=e3525]
+                                - cell "$0" [ref=e3526]
+                            - list [ref=e3528]:
+                              - button "Jan 1, 2025" [ref=e3529]:
+                                - generic [ref=e3533]: Jan 1, 2025
+                              - button "Dec 31, 2024" [ref=e3534]:
+                                - generic [ref=e3538]: Dec 31, 2024
+                  - region "Conversion rate over time metric card" [ref=e1269]:
+                    - region "Conversion rate over time" [ref=e1275]:
+                      - generic [ref=e1276]:
+                        - link "Conversion rate over time" [ref=e1280]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/conversion_rate_over_time?ql=FROM+sessions%0A++SHOW+sessions%2C+sessions_with_cart_additions%2C+sessions_that_reached_checkout%2C%0A++++sessions_that_completed_checkout%2C+conversion_rate%0A++WHERE+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+conversion_rate+TYPE+line
+                          - generic:
+                            - button "Open definition for Conversion rate over time" [ref=e3540]:
+                              - heading "Conversion rate over time" [level=2] [ref=e3541]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Percentage of online store sessions that result in a sale
+                        - generic [ref=e1286]:
+                          - generic [ref=e3543]:
+                            - generic [ref=e3545]: 0%
+                            - img "No change" [ref=e3547]
+                          - generic [ref=e3553]:
+                            - table [ref=e3554]:
+                              - generic [ref=e3555]:
+                                - generic [ref=e3557]: 12 AM
+                                - generic [ref=e3559]: 4 AM
+                                - generic [ref=e3561]: 8 AM
+                                - generic [ref=e3563]: 12 PM
+                                - generic [ref=e3565]: 4 PM
+                                - generic [ref=e3567]: 8 PM
+                              - generic [ref=e3568]:
+                                - generic [ref=e3571]: 0%
+                                - generic [ref=e3574]: 50%
+                                - generic [ref=e3577]: 100%
+                              - row "12 AM 1 AM 2 AM 3 AM 4 AM 5 AM 6 AM 7 AM 8 AM 9 AM 10 AM 11 AM 12 PM 1 PM 2 PM 3 PM 4 PM 5 PM 6 PM 7 PM 8 PM 9 PM 10 PM 11 PM" [ref=e3578]:
+                                - rowheader
+                                - columnheader "12 AM" [ref=e3579]
+                                - columnheader "1 AM" [ref=e3580]
+                                - columnheader "2 AM" [ref=e3581]
+                                - columnheader "3 AM" [ref=e3582]
+                                - columnheader "4 AM" [ref=e3583]
+                                - columnheader "5 AM" [ref=e3584]
+                                - columnheader "6 AM" [ref=e3585]
+                                - columnheader "7 AM" [ref=e3586]
+                                - columnheader "8 AM" [ref=e3587]
+                                - columnheader "9 AM" [ref=e3588]
+                                - columnheader "10 AM" [ref=e3589]
+                                - columnheader "11 AM" [ref=e3590]
+                                - columnheader "12 PM" [ref=e3591]
+                                - columnheader "1 PM" [ref=e3592]
+                                - columnheader "2 PM" [ref=e3593]
+                                - columnheader "3 PM" [ref=e3594]
+                                - columnheader "4 PM" [ref=e3595]
+                                - columnheader "5 PM" [ref=e3596]
+                                - columnheader "6 PM" [ref=e3597]
+                                - columnheader "7 PM" [ref=e3598]
+                                - columnheader "8 PM" [ref=e3599]
+                                - columnheader "9 PM" [ref=e3600]
+                                - columnheader "10 PM" [ref=e3601]
+                                - columnheader "11 PM" [ref=e3602]
+                              - row "Jan 1, 2025 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0%" [ref=e3603]:
+                                - rowheader "Jan 1, 2025" [ref=e3604]
+                                - cell "0%" [ref=e3605]
+                                - cell "0%" [ref=e3606]
+                                - cell "0%" [ref=e3607]
+                                - cell "0%" [ref=e3608]
+                                - cell "0%" [ref=e3609]
+                                - cell "0%" [ref=e3610]
+                                - cell "0%" [ref=e3611]
+                                - cell "0%" [ref=e3612]
+                                - cell "0%" [ref=e3613]
+                                - cell "0%" [ref=e3614]
+                                - cell "0%" [ref=e3615]
+                                - cell "0%" [ref=e3616]
+                                - cell "0%" [ref=e3617]
+                                - cell "0%" [ref=e3618]
+                                - cell "0%" [ref=e3619]
+                                - cell "0%" [ref=e3620]
+                                - cell "0%" [ref=e3621]
+                                - cell "0%" [ref=e3622]
+                                - cell "0%" [ref=e3623]
+                                - cell "0%" [ref=e3624]
+                                - cell "0%" [ref=e3625]
+                                - cell "0%" [ref=e3626]
+                                - cell "0%" [ref=e3627]
+                                - cell "0%" [ref=e3628]
+                              - row "Dec 31, 2024 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0% 0%" [ref=e3629]:
+                                - rowheader "Dec 31, 2024" [ref=e3630]
+                                - cell "0%" [ref=e3631]
+                                - cell "0%" [ref=e3632]
+                                - cell "0%" [ref=e3633]
+                                - cell "0%" [ref=e3634]
+                                - cell "0%" [ref=e3635]
+                                - cell "0%" [ref=e3636]
+                                - cell "0%" [ref=e3637]
+                                - cell "0%" [ref=e3638]
+                                - cell "0%" [ref=e3639]
+                                - cell "0%" [ref=e3640]
+                                - cell "0%" [ref=e3641]
+                                - cell "0%" [ref=e3642]
+                                - cell "0%" [ref=e3643]
+                                - cell "0%" [ref=e3644]
+                                - cell "0%" [ref=e3645]
+                                - cell "0%" [ref=e3646]
+                                - cell "0%" [ref=e3647]
+                                - cell "0%" [ref=e3648]
+                                - cell "0%" [ref=e3649]
+                                - cell "0%" [ref=e3650]
+                                - cell "0%" [ref=e3651]
+                                - cell "0%" [ref=e3652]
+                                - cell "0%" [ref=e3653]
+                                - cell "0%" [ref=e3654]
+                            - list [ref=e3656]:
+                              - button "Jan 1, 2025" [ref=e3657]:
+                                - generic [ref=e3661]: Jan 1, 2025
+                              - button "Dec 31, 2024" [ref=e3662]:
+                                - generic [ref=e3666]: Dec 31, 2024
+                  - region "Total sales by product metric card" [ref=e1403]:
+                    - region "Total sales by product" [ref=e1409]:
+                      - generic [ref=e1410]:
+                        - link "Total sales by product" [ref=e1414]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/total_sales_by_product?ql=FROM+sales%0A++SHOW+net_items_sold%2C+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C+taxes%2C%0A++++total_sales%0A++WHERE+product_title+IS+NOT+NULL%0A++GROUP+BY+product_title%2C+product_vendor%2C+product_type+WITH+TOTALS%2C+CURRENCY%0A++++%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Total sales by product" [ref=e3668]:
+                              - heading "Total sales by product" [level=2] [ref=e3669]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total sales, broken down by product
+                        - status [ref=e3670]:
+                          - generic [ref=e3673]:
+                            - generic: No data for this date range
+                  - region "Sessions by device type metric card" [ref=e1441]:
+                    - region "Sessions by device type" [ref=e1447]:
+                      - generic [ref=e1448]:
+                        - link "Sessions by device type" [ref=e1452]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_by_device_type?ql=FROM+sessions%0A++SHOW+online_store_visitors%2C+sessions%0A++WHERE+session_device_type+IS+NOT+NULL%0A++++AND+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++GROUP+BY+session_device_type+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sessions+DESC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+donut
+                          - generic:
+                            - button "Open definition for Sessions by device type" [ref=e3675]:
+                              - heading "Sessions by device type" [level=2] [ref=e3676]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sessions in your online store, broken down by the user's device type
+                        - status [ref=e3677]:
+                          - generic [ref=e3680]:
+                            - generic: No data for this date range
+                  - region "Sessions by location metric card" [ref=e1499]:
+                    - region "Sessions by location" [ref=e1505]:
+                      - generic [ref=e1506]:
+                        - link "Sessions by location" [ref=e1510]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_by_location?ql=FROM+sessions%0A++SHOW+online_store_visitors%2C+sessions%0A++WHERE+session_country+IS+NOT+NULL%0A++++AND+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++GROUP+BY+session_country%2C+session_region%2C+session_city+WITH+TOTALS%2C+CURRENCY%0A++++%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sessions+DESC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Sessions by location" [ref=e3682]:
+                              - heading "Sessions by location" [level=2] [ref=e3683]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sessions in your online store, broken down by geographic location
+                        - status [ref=e3684]:
+                          - generic [ref=e3687]:
+                            - generic: No data for this date range
+                  - region "Total sales by social referrer metric card" [ref=e1573]:
+                    - region "Total sales by social referrer" [ref=e1578]:
+                      - generic [ref=e1579]:
+                        - link "Total sales by social referrer" [ref=e1583]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sales_by_social_source?ql=FROM+sales%0A++SHOW+total_sales%0A++WHERE+order_referrer_source+%3D+%27social%27%0A++GROUP+BY+order_referrer_name+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Total sales by social referrer" [ref=e3689]:
+                              - heading "Total sales by social referrer" [level=2] [ref=e3690]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total sales from social sources, broken down by name
+                        - status [ref=e3691]:
+                          - generic [ref=e3694]:
+                            - generic: No data for this date range
+                  - region "Sessions by social referrer metric card" [ref=e1596]:
+                    - region "Sessions by social referrer" [ref=e1602]:
+                      - generic [ref=e1603]:
+                        - link "Sessions by social referrer" [ref=e1607]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_by_social_source?ql=FROM+sessions%0A++SHOW+sessions%0A++WHERE+referrer_source+%3D+%27social%27%0A++++AND+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++GROUP+BY+referrer_name+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sessions+DESC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Sessions by social referrer" [ref=e3696]:
+                              - heading "Sessions by social referrer" [level=2] [ref=e3697]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sessions in your online store from social sources, broken down by name
+                        - status [ref=e3698]:
+                          - generic [ref=e3701]:
+                            - generic: No data for this date range
+                  - region "Sessions by landing page metric card" [ref=e1634]:
+                    - region "Sessions by landing page" [ref=e1640]:
+                      - generic [ref=e1641]:
+                        - link "Sessions by landing page" [ref=e1645]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_by_landing_page?ql=FROM+sessions%0A++SHOW+online_store_visitors%2C+sessions%2C+sessions_with_cart_additions%2C%0A++++sessions_that_reached_checkout%0A++WHERE+landing_page_path+IS+NOT+NULL%0A++++AND+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++GROUP+BY+landing_page_type%2C+landing_page_path+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C%0A++++PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sessions+DESC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+list_with_dimension_values
+                          - generic:
+                            - button "Open definition for Sessions by landing page" [ref=e3703]:
+                              - heading "Sessions by landing page" [level=2] [ref=e3704]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sessions in your online store, broken down by the page the user first landed on
+                        - status [ref=e3705]:
+                          - generic [ref=e3708]:
+                            - generic: No data for this date range
+                  - region "Performance by referring channel metric card" [ref=e1754]:
+                    - region "Performance by referring channel" [ref=e1760]:
+                      - generic [ref=e1761]:
+                        - link "Performance by referring channel" [ref=e1765]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/performance_by_referring_channel?ql=FROM+sessions%2C+sales%0A++SHOW+sessions%2C+total_sales%2C+orders%2C+%28orders+%2F+sessions%29+AS+conversion_rate%2C%0A++++average_order_value%2C+new_customers%2C+returning_customers%0A++GROUP+BY+referring_channel%2C+traffic_type+WITH%0A++++LAST_NON_DIRECT_CLICK_ATTRIBUTION%2C+TOTALS%2C+GROUP_TOTALS%2C+CURRENCY+%27USD%27%2C%0A++++PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales__last_non_direct_click__referring_channel_totals+DESC%2C%0A++++total_sales__last_non_direct_click+DESC%2C+referring_channel+ASC%2C+traffic_type+ASC%0A++LIMIT+1000%0AVISUALIZE+total_sales__last_non_direct_click+TYPE+stacked_horizontal_bar
+                          - generic:
+                            - button "Open definition for Performance by referring channel" [ref=e3710]:
+                              - heading "Performance by referring channel" [level=2] [ref=e3711]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sales and session metrics from your online store, broken down by referring channel and traffic type
+                        - status [ref=e3712]:
+                          - generic [ref=e3715]:
+                            - generic: No data for this date range
+                  - region "Customer cohort analysis metric card" [ref=e1817]:
+                    - region "Customer cohort analysis" [ref=e1823]:
+                      - generic [ref=e1824]:
+                        - link "Customer cohort analysis" [ref=e1828]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/customer_cohort_analysis?ql=FROM+customer_cohorts_monthly%0A++SHOW+customer_cohorts_monthly_customers%2C%0A++++customer_cohorts_monthly_customers_customer_cohort_period_totals%2C%0A++++customer_cohorts_monthly_customers_periods_since_first_purchase_totals%2C%0A++++customer_cohorts_monthly_customers_totals%2C%0A++++customer_cohorts_monthly_customer_retention_rate%2C%0A++++customer_cohorts_monthly_customer_retention_rate_periods_since_first_purchase_totals%2C%0A++++customer_cohorts_monthly_customer_retention_rate_totals%2C%0A++++customer_cohorts_monthly_customers_in_cohort%2C%0A++++customer_cohorts_monthly_customers_in_cohort_periods_since_first_purchase_totals%2C%0A++++customer_cohorts_monthly_customer_retention_rate_customer_cohort_period_totals%0A++WHERE+customer_cohorts_monthly_periods_since_first_purchase+BETWEEN+-1+AND+11%0A++GROUP+BY+month%2C+customer_cohorts_monthly_periods_since_first_purchase%0A++HAVING+customer_cohorts_monthly_periods_since_first_purchase+%3E%3D+0%0A++SINCE+startOfMonth%28-12m%29+UNTIL+endOfMonth%28-1m%29%0A++ORDER+BY+month+ASC%2C+customer_cohorts_monthly_periods_since_first_purchase+ASC%0AVISUALIZE+customer_cohorts_monthly_customer_retention_rate+TYPE+cohort_grid
+                          - generic:
+                            - button "Open definition for Customer cohort analysis" [ref=e1832]:
+                              - heading "Customer cohort analysis" [level=2] [ref=e1833]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Returning purchase rates, with customers grouped by month of first purchase
+                        - table [ref=e1837]:
+                          - rowgroup [ref=e1838]:
+                            - row "Cohort Customers Months" [ref=e1839]:
+                              - columnheader "Cohort" [ref=e1840]:
+                                - generic [ref=e1841]: Cohort
+                              - columnheader "Customers" [ref=e1842]:
+                                - generic [ref=e1843]: Customers
+                              - columnheader "Months" [ref=e1844]:
+                                - generic [ref=e1845]: Months
+                          - rowgroup [ref=e1846]:
+                            - row "View details for Dec 2025 View details for 1 View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0%" [ref=e1847]:
+                              - cell "View details for Dec 2025" [ref=e1848]:
+                                - button "View details for Dec 2025" [disabled] [ref=e1850]:
+                                  - generic [ref=e1852]: Dec 2025
+                              - cell "View details for 1" [ref=e1853]:
+                                - button "View details for 1" [disabled] [ref=e1855]:
+                                  - generic [ref=e1857]: "1"
+                              - cell "View details for 0%" [ref=e1858]:
+                                - button "View details for 0%" [ref=e1860]:
+                                  - generic [ref=e1862]: 0%
+                              - cell "View details for 0%" [ref=e1863]:
+                                - button "View details for 0%" [ref=e1865]:
+                                  - generic [ref=e1867]: 0%
+                              - cell "View details for 0%" [ref=e1868]:
+                                - button "View details for 0%" [ref=e1870]:
+                                  - generic [ref=e1872]: 0%
+                              - cell "View details for 0%" [ref=e1873]:
+                                - button "View details for 0%" [ref=e1875]:
+                                  - generic [ref=e1877]: 0%
+                              - cell "View details for 0%" [ref=e1878]:
+                                - button "View details for 0%" [ref=e1880]:
+                                  - generic [ref=e1882]: 0%
+                              - cell "View details for 0%" [ref=e1883]:
+                                - button "View details for 0%" [ref=e1885]:
+                                  - generic [ref=e1887]: 0%
+                              - cell "View details for 0%" [ref=e1888]:
+                                - button "View details for 0%" [ref=e1890]:
+                                  - generic [ref=e1892]: 0%
+                              - cell "View details for 0%" [ref=e1893]:
+                                - button "View details for 0%" [ref=e1895]:
+                                  - generic [ref=e1897]: 0%
+                            - row "View details for Jan 2026 View details for 3 View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0%" [ref=e1898]:
+                              - cell "View details for Jan 2026" [ref=e1899]:
+                                - button "View details for Jan 2026" [disabled] [ref=e1901]:
+                                  - generic [ref=e1903]: Jan 2026
+                              - cell "View details for 3" [ref=e1904]:
+                                - button "View details for 3" [disabled] [ref=e1906]:
+                                  - generic [ref=e1908]: "3"
+                              - cell "View details for 0%" [ref=e1909]:
+                                - button "View details for 0%" [ref=e1911]:
+                                  - generic [ref=e1913]: 0%
+                              - cell "View details for 0%" [ref=e1914]:
+                                - button "View details for 0%" [ref=e1916]:
+                                  - generic [ref=e1918]: 0%
+                              - cell "View details for 0%" [ref=e1919]:
+                                - button "View details for 0%" [ref=e1921]:
+                                  - generic [ref=e1923]: 0%
+                              - cell "View details for 0%" [ref=e1924]:
+                                - button "View details for 0%" [ref=e1926]:
+                                  - generic [ref=e1928]: 0%
+                              - cell "View details for 0%" [ref=e1929]:
+                                - button "View details for 0%" [ref=e1931]:
+                                  - generic [ref=e1933]: 0%
+                              - cell "View details for 0%" [ref=e1934]:
+                                - button "View details for 0%" [ref=e1936]:
+                                  - generic [ref=e1938]: 0%
+                              - cell "View details for 0%" [ref=e1939]:
+                                - button "View details for 0%" [ref=e1941]:
+                                  - generic [ref=e1943]: 0%
+                            - row "View details for Feb 2026 View details for 1 View details for 0% View details for 0% View details for 0% View details for 0% View details for 0% View details for 0%" [ref=e1944]:
+                              - cell "View details for Feb 2026" [ref=e1945]:
+                                - button "View details for Feb 2026" [disabled] [ref=e1947]:
+                                  - generic [ref=e1949]: Feb 2026
+                              - cell "View details for 1" [ref=e1950]:
+                                - button "View details for 1" [disabled] [ref=e1952]:
+                                  - generic [ref=e1954]: "1"
+                              - cell "View details for 0%" [ref=e1955]:
+                                - button "View details for 0%" [ref=e1957]:
+                                  - generic [ref=e1959]: 0%
+                              - cell "View details for 0%" [ref=e1960]:
+                                - button "View details for 0%" [ref=e1962]:
+                                  - generic [ref=e1964]: 0%
+                              - cell "View details for 0%" [ref=e1965]:
+                                - button "View details for 0%" [ref=e1967]:
+                                  - generic [ref=e1969]: 0%
+                              - cell "View details for 0%" [ref=e1970]:
+                                - button "View details for 0%" [ref=e1972]:
+                                  - generic [ref=e1974]: 0%
+                              - cell "View details for 0%" [ref=e1975]:
+                                - button "View details for 0%" [ref=e1977]:
+                                  - generic [ref=e1979]: 0%
+                              - cell "View details for 0%" [ref=e1980]:
+                                - button "View details for 0%" [ref=e1982]:
+                                  - generic [ref=e1984]: 0%
+                            - row "View details for Mar 2026 View details for 5 View details for 20% View details for 0% View details for 0% View details for 20% View details for 0%" [ref=e1985]:
+                              - cell "View details for Mar 2026" [ref=e1986]:
+                                - button "View details for Mar 2026" [disabled] [ref=e1988]:
+                                  - generic [ref=e1990]: Mar 2026
+                              - cell "View details for 5" [ref=e1991]:
+                                - button "View details for 5" [disabled] [ref=e1993]:
+                                  - generic [ref=e1995]: "5"
+                              - cell "View details for 20%" [ref=e1996]:
+                                - button "View details for 20%" [ref=e1998]:
+                                  - generic [ref=e2000]: 20%
+                              - cell "View details for 0%" [ref=e2001]:
+                                - button "View details for 0%" [ref=e2003]:
+                                  - generic [ref=e2005]: 0%
+                              - cell "View details for 0%" [ref=e2006]:
+                                - button "View details for 0%" [ref=e2008]:
+                                  - generic [ref=e2010]: 0%
+                              - cell "View details for 20%" [ref=e2011]:
+                                - button "View details for 20%" [ref=e2013]:
+                                  - generic [ref=e2015]: 20%
+                              - cell "View details for 0%" [ref=e2016]:
+                                - button "View details for 0%" [ref=e2018]:
+                                  - generic [ref=e2020]: 0%
+                            - row "View details for Apr 2026 View details for 1 View details for 0% View details for 0% View details for 0% View details for 0%" [ref=e2021]:
+                              - cell "View details for Apr 2026" [ref=e2022]:
+                                - button "View details for Apr 2026" [disabled] [ref=e2024]:
+                                  - generic [ref=e2026]: Apr 2026
+                              - cell "View details for 1" [ref=e2027]:
+                                - button "View details for 1" [disabled] [ref=e2029]:
+                                  - generic [ref=e2031]: "1"
+                              - cell "View details for 0%" [ref=e2032]:
+                                - button "View details for 0%" [ref=e2034]:
+                                  - generic [ref=e2036]: 0%
+                              - cell "View details for 0%" [ref=e2037]:
+                                - button "View details for 0%" [ref=e2039]:
+                                  - generic [ref=e2041]: 0%
+                              - cell "View details for 0%" [ref=e2042]:
+                                - button "View details for 0%" [ref=e2044]:
+                                  - generic [ref=e2046]: 0%
+                              - cell "View details for 0%" [ref=e2047]:
+                                - button "View details for 0%" [ref=e2049]:
+                                  - generic [ref=e2051]: 0%
+                            - row "View details for May 2026 View details for 4 View details for 25% View details for 25% View details for 0%" [ref=e2052]:
+                              - cell "View details for May 2026" [ref=e2053]:
+                                - button "View details for May 2026" [disabled] [ref=e2055]:
+                                  - generic [ref=e2057]: May 2026
+                              - cell "View details for 4" [ref=e2058]:
+                                - button "View details for 4" [disabled] [ref=e2060]:
+                                  - generic [ref=e2062]: "4"
+                              - cell "View details for 25%" [ref=e2063]:
+                                - button "View details for 25%" [ref=e2065]:
+                                  - generic [ref=e2067]: 25%
+                              - cell "View details for 25%" [ref=e2068]:
+                                - button "View details for 25%" [ref=e2070]:
+                                  - generic [ref=e2072]: 25%
+                              - cell "View details for 0%" [ref=e2073]:
+                                - button "View details for 0%" [ref=e2075]:
+                                  - generic [ref=e2077]: 0%
+                            - row "View details for Jun 2026 View details for 1 View details for 0% View details for 0%" [ref=e2078]:
+                              - cell "View details for Jun 2026" [ref=e2079]:
+                                - button "View details for Jun 2026" [disabled] [ref=e2081]:
+                                  - generic [ref=e2083]: Jun 2026
+                              - cell "View details for 1" [ref=e2084]:
+                                - button "View details for 1" [disabled] [ref=e2086]:
+                                  - generic [ref=e2088]: "1"
+                              - cell "View details for 0%" [ref=e2089]:
+                                - button "View details for 0%" [ref=e2091]:
+                                  - generic [ref=e2093]: 0%
+                              - cell "View details for 0%" [ref=e2094]:
+                                - button "View details for 0%" [ref=e2096]:
+                                  - generic [ref=e2098]: 0%
+                            - row "View details for Jul 2026 View details for 3 View details for 33.33%" [ref=e2099]:
+                              - cell "View details for Jul 2026" [ref=e2100]:
+                                - button "View details for Jul 2026" [disabled] [ref=e2102]:
+                                  - generic [ref=e2104]: Jul 2026
+                              - cell "View details for 3" [ref=e2105]:
+                                - button "View details for 3" [disabled] [ref=e2107]:
+                                  - generic [ref=e2109]: "3"
+                              - cell "View details for 33.33%" [ref=e2110]:
+                                - button "View details for 33.33%" [ref=e2112]:
+                                  - generic [ref=e2114]: 33.33%
+                  - region "Sessions by referrer metric card" [ref=e2117]:
+                    - region "Sessions by referrer" [ref=e2123]:
+                      - generic [ref=e2124]:
+                        - link "Sessions by referrer" [ref=e2128]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sessions_by_referrer?ql=FROM+sessions%0A++SHOW+online_store_visitors%2C+sessions%0A++WHERE+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++GROUP+BY+referrer_source%2C+referrer_name%2C+session_city+WITH+TOTALS%2C+CURRENCY%0A++++%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sessions+DESC%0A++LIMIT+1000%0AVISUALIZE+sessions+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Sessions by referrer" [ref=e3717]:
+                              - heading "Sessions by referrer" [level=2] [ref=e3718]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Sessions in your online store, broken down by the name of the site that led to the session
+                        - status [ref=e3719]:
+                          - generic [ref=e3722]:
+                            - generic: No data for this date range
+                  - region "Total sales by referrer metric card" [ref=e2191]:
+                    - region "Total sales by referrer" [ref=e2197]:
+                      - generic [ref=e2198]:
+                        - link "Total sales by referrer" [ref=e2202]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/sales_by_referrer?ql=FROM+sales%0A++SHOW+orders%2C+total_sales%2C+gross_sales%2C+net_sales%0A++GROUP+BY+order_referrer_source%2C+order_referrer_name+WITH+TOTALS%2C+CURRENCY%0A++++%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Total sales by referrer" [ref=e3724]:
+                              - heading "Total sales by referrer" [level=2] [ref=e3725]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total sales, broken down by the name of the site that led to the order
+                        - status [ref=e3726]:
+                          - generic [ref=e3729]:
+                            - generic: No data for this date range
+                  - region "Products by sell-through rate metric card" [ref=e2229]:
+                    - region "Products by sell-through rate" [ref=e2235]:
+                      - generic [ref=e2236]:
+                        - link "Products by sell-through rate" [ref=e2240]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/products_by_sell_through_rate?ql=FROM+inventory%0A++SHOW+starting_inventory_units%2C+ending_inventory_units%2C+inventory_units_sold%2C%0A++++sell_through_rate%0A++WHERE+inventory_is_tracked+%3D+true%0A++GROUP+BY+product_title%2C+product_variant_title%2C+product_variant_sku+WITH+TOTALS%2C%0A++++PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+sell_through_rate+DESC%2C+inventory_units_sold+DESC%0A++LIMIT+1000%0AVISUALIZE+sell_through_rate+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for Products by sell-through rate" [ref=e3731]:
+                              - heading "Products by sell-through rate" [level=2] [ref=e3732]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Products, broken down by sell-through rate (how quickly they're sold)
+                        - status [ref=e3733]:
+                          - generic [ref=e3736]:
+                            - generic: No data for this date range
+                  - region "POS staff sales total metric card" [ref=e2303]:
+                    - region "POS staff sales total" [ref=e2308]:
+                      - generic [ref=e2309]:
+                        - link "POS staff sales total" [ref=e2313]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/pos_staff_sales_total?ql=FROM+sales%0A++SHOW+orders%2C+rate_of_staff_assisted_sales%2C+average_order_value%2C%0A++++quantity_ordered_per_order%2C+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C%0A++++shipping_charges%2C+taxes%2C+total_sales%0A++WHERE+sales_channel+%3D+%27Point+of+Sale%27%0A++++AND+staff_member_name+IS+NOT+NULL%0A++GROUP+BY+staff_member_name%2C+pos_location_name+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C%0A++++PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+horizontal_bar
+                          - generic:
+                            - button "Open definition for POS staff sales total" [ref=e3738]:
+                              - heading "POS staff sales total" [level=2] [ref=e3739]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Number of sales made by the staff member of your retail location
+                        - status [ref=e3740]:
+                          - generic [ref=e3743]:
+                            - generic: No data for this date range
+                  - region "Total sales by POS location metric card" [ref=e2326]:
+                    - region "Total sales by POS location" [ref=e2331]:
+                      - generic [ref=e2332]:
+                        - link "Total sales by POS location" [ref=e2336]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/total_sales_by_pos_location?ql=FROM+sales%0A++SHOW+gross_sales%2C+discounts%2C+sales_reversals%2C+net_sales%2C+shipping_charges%2C%0A++++taxes%2C+total_sales%0A++WHERE+is_pos_sale+%3D+true%0A++GROUP+BY+pos_location_name+WITH+TOTALS%2C+CURRENCY+%27USD%27%2C+PERCENT_CHANGE%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+total_sales+DESC%0A++LIMIT+1000%0AVISUALIZE+total_sales+TYPE+bar
+                          - generic:
+                            - button "Open definition for Total sales by POS location" [ref=e3745]:
+                              - heading "Total sales by POS location" [level=2] [ref=e3746]
+                            - generic:
+                              - generic:
+                                - generic:
+                                  - generic:
+                                    - generic:
+                                      - generic: Total sales, broken down by physical store location
+                        - status [ref=e3747]:
+                          - generic [ref=e3750]:
+                            - generic: No data for this date range
+                  - region "Conversion rate breakdown metric card" [ref=e2349]:
+                    - region "Conversion rate breakdown" [ref=e2355]:
+                      - generic [ref=e2356]:
+                        - link "Conversion rate breakdown" [ref=e2360]:
+                          - /url: /store/bsiwbd-ep/analytics/reports/conversion_rate_breakdown?ql=FROM+sessions%0A++SHOW+sessions%2C+sessions_with_cart_additions%2C+sessions_that_reached_checkout%2C%0A++++sessions_that_completed_checkout%2C+conversion_rate%0A++WHERE+human_or_bot_session+IN+%28%27human%27%2C+%27bot%27%29%0A++TIMESERIES+hour+WITH+TOTALS%2C+PERCENT_CHANGE%2C+CURRENCY+%27USD%27%0A++SINCE+2025-01-01+UNTIL+2025-01-01%0A++COMPARE+TO+previous_period%0A++ORDER+BY+hour+ASC%0A++LIMIT+1000%0AVISUALIZE+conversion_rate%2C+sessions_with_cart_additions%2C%0A++sessions_that_reached_checkout%2C+sessions_that_completed_checkout%2C+sessions+TYPE%0A++funnel
+                          - button "Open definition for Conversion rate breakdown" [ref=e3752]:
+                            - heading "Conversion rate breakdown" [level=2] [ref=e3753]
+                        - generic [ref=e2366]:
+                          - generic [ref=e3755]:
+                            - generic [ref=e3757]: 0%
+                            - img "No change" [ref=e3759]
+                          - list [ref=e3766]:
+                            - generic [ref=e3767]:
+                              - generic [ref=e3769]:
+                                - generic [ref=e3770]:
+                                  - generic [ref=e3771]: Sessions
+                                  - generic [ref=e3772]:
+                                    - generic [ref=e3773]: 0%
+                                    - generic [ref=e3774]:
+                                      - generic [ref=e3775]: "0"
+                                      - img [ref=e3777]:
+                                        - generic [ref=e3778]:
+                                          - img [ref=e3780]
+                                          - generic [ref=e3782]: 0%
+                                - generic [ref=e3783]:
+                                  - generic [ref=e3784]: Added to cart
+                                  - generic [ref=e3785]:
+                                    - generic [ref=e3786]: 0%
+                                    - generic [ref=e3787]:
+                                      - generic [ref=e3788]: "0"
+                                      - img [ref=e3790]:
+                                        - generic [ref=e3791]:
+                                          - img [ref=e3793]
+                                          - generic [ref=e3795]: 0%
+                                - generic [ref=e3796]:
+                                  - generic [ref=e3797]: Reached checkout
+                                  - generic [ref=e3798]:
+                                    - generic [ref=e3799]: 0%
+                                    - generic [ref=e3800]:
+                                      - generic [ref=e3801]: "0"
+                                      - img [ref=e3803]:
+                                        - generic [ref=e3804]:
+                                          - img [ref=e3806]
+                                          - generic [ref=e3808]: 0%
+                                - generic "Completed checkout" [ref=e3809]:
+                                  - generic [ref=e3810]: Completed c…
+                                  - generic [ref=e3811]:
+                                    - generic [ref=e3812]: 0%
+                                    - generic [ref=e3813]:
+                                      - generic [ref=e3814]: "0"
+                                      - img [ref=e3816]:
+                                        - generic [ref=e3817]:
+                                          - img [ref=e3819]
+                                          - generic [ref=e3821]: 0%
+                              - listitem:
+                                - 'generic "Sessions: 0"'
+                              - listitem [ref=e3822]:
+                                - 'generic "Added to cart: 0"'
+                              - listitem [ref=e3824]:
+                                - 'generic "Reached checkout: 0"'
+                              - listitem [ref=e3826]:
+                                - 'generic "Completed checkout: 0"'
+                - paragraph [ref=e2469]:
+                  - text: Learn more about
+                  - link "analytics" [ref=e2470] [cursor=pointer]:
+                    - /url: https://help.shopify.com/manual/reports-and-analytics/shopify-reports/new-analytics
+                    - generic: analytics
+  - generic:
+    - generic:
+      - generic:
+        - generic:
+          - generic:
+            - generic: General shortcuts
+            - generic: Adding items to your store
+            - generic: Navigating your admin panel
+            - generic: Navigating settings
+    - generic [ref=e374]:
+      - separator "Resize sidebar" [ref=e375]
+      - complementary "Sidekick" [ref=e376]
+    - generic:
+      - generic:
+        - generic:
+          - generic:
+            - generic: You'll need to manually recreate this section if you want it back.
+            - generic: Cancel
+            - generic: Delete section

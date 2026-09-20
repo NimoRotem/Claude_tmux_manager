@@ -5304,7 +5304,8 @@ _GROUP_CTX_BEGIN = "<!-- TEAM GROUP CONTEXT (managed — edits below are overwri
 _GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
 # Top-level path segments reserved for the app (never treated as usernames).
 _RESERVED_TOP = {"", "api", "login", "logout", "qa-output", "static", "favicon.ico",
-                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws"}
+                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws",
+                 "console"}
 
 
 def _load_groups() -> dict:
@@ -15331,6 +15332,20 @@ def _proxy_usage() -> dict:
         return {}
 
 
+def _proxy_meters() -> dict:
+    """Bytes that crossed a PAID upstream, per meter bucket.
+
+    Separate from the per-session counters on purpose: those count every byte the
+    relay carried, direct traffic included. Charging direct bytes against a
+    residential budget is what silently pushed every box back onto its datacenter
+    address, which looks exactly like the provider being down.
+    """
+    try:
+        return json.loads(BROWSER_PROXY_USAGE.read_text()).get("meters", {})
+    except Exception:
+        return {}
+
+
 async def _proxy_exit_info(local_port: int, timeout: float = 20) -> dict:
     """What the outside world sees for a browser — fetched THROUGH its own
     loopback port, so it reflects exactly what that browser's traffic does."""
@@ -15382,15 +15397,35 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
             row["exit"] = await _proxy_exit_info(sess["local_port"])
         rows.append(row)
     total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
+    # With a ladder configured the top-level host/port is just one rung's endpoint,
+    # so reporting it as "the provider" names the wrong one. Say what the traffic
+    # actually takes, in order, and keep the paid meters separate from total_bytes:
+    # that total includes direct traffic and is a browsing figure, not a bill.
+    ladder = conf.get("ladder") or []
+    ups = conf.get("upstreams") or {}
+    rungs = [{
+        "name": n,
+        "host": (ups.get(n) or {}).get("host", ""),
+        "port": (ups.get(n) or {}).get("port", 0),
+        "metered": bool((ups.get(n) or {}).get("metered", True)),
+        "meter": (ups.get(n) or {}).get("meter") or n,
+        "budget_mb": (ups.get(n) or {}).get("budget_mb"),
+        "enabled": bool((ups.get(n) or {}).get("enabled", True)),
+    } for n in ladder if n in ups]
+    first = rungs[0] if rungs else None
     return JSONResponse({
         "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
         "enabled": bool(conf.get("enabled")),
-        "provider": conf.get("provider", ""),
-        "host": conf.get("host", ""), "port": conf.get("port", 0),
+        "provider": (first["name"] if first else conf.get("provider", "")),
+        "host": (first["host"] if first else conf.get("host", "")),
+        "port": (first["port"] if first else conf.get("port", 0)),
         "username": conf.get("username", ""), "zone": conf.get("zone", ""),
         "password_set": bool(conf.get("password")),
         "country": conf.get("country", ""),
         "providers": sorted(_proxy_presets().keys()),
+        "ladder": rungs,
+        "fallback_direct": bool(conf.get("fallback_direct", True)),
+        "meters": _proxy_meters(),
         "browsers": rows, "total_bytes": total,
     })
 
@@ -23224,6 +23259,14 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-proxy-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .bs-proxy-title{font-weight:600;color:#e6edf3;font-size:.85rem}
 .bs-proxy-sub{font-size:.7rem;color:#6e7681;margin-left:auto}
+.bs-proxy-ladder{margin-top:10px;border:1px solid #21262d;border-radius:6px;overflow:hidden}
+.bs-proxy-rung{display:flex;align-items:center;gap:8px;padding:5px 9px;border-top:1px solid #21262d;font-size:.75rem}
+.bs-proxy-rung:first-child{border-top:none}
+.bs-proxy-rung.off{opacity:.45}
+.bs-proxy-rung-n{width:16px;height:16px;flex:none;border-radius:50%;background:#21262d;color:#8b949e;font-size:.6rem;display:flex;align-items:center;justify-content:center;font-weight:600}
+.bs-proxy-rung-name{font-weight:600;color:#e6edf3}
+.bs-proxy-rung .bs-proxy-sub{margin-left:0}
+.bs-proxy-rung .bs-badge{margin-left:auto}
 .bs-proxy-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:10px}
 .bs-proxy-form label{font-size:.63rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;display:block;margin-bottom:3px}
 .bs-proxy-form input,.bs-proxy-form select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 8px;font-size:.8rem;outline:none;width:100%;box-sizing:border-box;font-family:inherit}
@@ -30409,6 +30452,18 @@ function renderBrowserTab(data){
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
         'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
         'once nobody is watching. <b>History</b> is the audit trail.</div>'+
+      // Signing in by hand is a different job from watching an agent work, and
+      // VNC is the wrong transport for it. The console browser streams one tab
+      // over CDP instead, goes out DIRECT rather than through the residential
+      // relay, and keeps its profile, so a login done there is still there
+      // tomorrow. Linked from here because this tab is where anyone looking for
+      // a browser looks first.
+      '<div class="pf-banner">Signing in to something yourself? Use the '+
+        '<a href="'+BASE+'/console" target="_blank" rel="noopener">'+
+        '<b>console browser ↗</b></a> instead of View live. It streams the page, '+
+        'not the desktop, so it is far quicker over a phone connection, and it '+
+        'shows you which exit it is on and whether that exit can reach the '+
+        'internet at all.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -30796,14 +30851,40 @@ function renderBrowserProxyPanel(){
       '<span class="bs-proxy-sub">relay not installed (~/.claude-browser/bin/proxy_relay.py)</span></div></div>';
   const on = !!p.enabled;
   const dot = '<span class="bs-dot '+(on?'on':'off')+'"></span>';
+  const rungs = p.ladder||[];
   const who = p.username ? esc(p.provider)+' · '+esc(p.username) : 'no account configured';
   const head = '<div class="bs-proxy-head">'+dot+
     '<span class="bs-proxy-title">Residential proxy</span>'+
     '<span class="bs-badge '+(on?'ok':'warn')+'">'+(on?'ON':'direct')+'</span>'+
-    '<span class="bs-proxy-sub">'+who+' · '+_fmtBytes(p.total_bytes||0)+' used'+
+    '<span class="bs-proxy-sub">'+who+' · '+_fmtBytes(p.total_bytes||0)+' through the relay'+
       (p.country?' · '+esc(p.country.toUpperCase()):'')+'</span></div>';
+  // The ladder, in order, with each rung's PAID spend. Total-through-the-relay
+  // above counts direct traffic too, so it is a browsing figure; these are the
+  // only bytes anybody is billed for, and the only ones a budget may look at.
+  const meters = p.meters||{};
+  const ladder = !rungs.length ? '' :
+    '<div class="bs-proxy-ladder">'+rungs.map(function(r,i){
+      const m = meters[r.meter]||{};
+      const paid = (m.paid_up||0)+(m.paid_down||0);
+      const over = r.budget_mb && (paid/1048576) > r.budget_mb;
+      return '<div class="bs-proxy-rung'+(r.enabled?'':' off')+'">'+
+        '<span class="bs-proxy-rung-n">'+(i+1)+'</span>'+
+        '<span class="bs-proxy-rung-name">'+esc(r.name)+'</span>'+
+        '<span class="bs-proxy-sub">'+esc(r.host||'')+':'+esc(String(r.port||''))+'</span>'+
+        (r.metered
+          ? '<span class="bs-badge '+(over?'warn':'ok')+'">'+_fmtBytes(paid)+
+            (r.budget_mb?(' of '+r.budget_mb+' MB'):'')+(over?' · skipped':'')+'</span>'
+          : '<span class="bs-badge ok">unmetered</span>')+
+        '</div>';
+    }).join('')+
+    (p.fallback_direct
+      ? '<div class="bs-proxy-rung"><span class="bs-proxy-rung-n">'+(rungs.length+1)+'</span>'+
+        '<span class="bs-proxy-rung-name">direct</span>'+
+        '<span class="bs-proxy-sub">this box\'s own address, only if every rung above fails</span></div>'
+      : '')+
+    '</div>';
   if(!_bsProxyEdit){
-    return '<div class="bs-proxy">'+head+
+    return '<div class="bs-proxy">'+head+ladder+
       '<div class="bs-proxy-actions">'+
         '<button class="btn" onclick="toggleBrowserProxy('+(on?'false':'true')+')">'+(on?'Turn off':'Turn on')+'</button> '+
         '<button class="btn btn-ghost" onclick="editBrowserProxy()">Settings</button> '+
@@ -30811,8 +30892,17 @@ function renderBrowserProxyPanel(){
       '</div></div>';
   }
   const opts = (p.providers||[]).map(x=>'<option value="'+esc(x)+'"'+(x===p.provider?' selected':'')+'>'+esc(x)+'</option>').join('');
-  return '<div class="bs-proxy">'+head+
-    '<div class="bs-proxy-form">'+
+  // Say plainly that these fields no longer decide the exit when a ladder is set,
+  // rather than let someone change one and wonder why nothing moved.
+  const ladderNote = rungs.length
+    ? '<div class="bs-proxy-sub" style="grid-column:1/-1">This box egresses through the '+
+      rungs.length+'-rung ladder above, set in ~/.claude-browser/proxy.json under '+
+      '<code>upstreams</code> and <code>ladder</code>. These fields are the older '+
+      'single-provider config and no longer choose the exit; edit the ladder in that '+
+      'file to change it.</div>'
+    : '';
+  return '<div class="bs-proxy">'+head+ladder+
+    '<div class="bs-proxy-form">'+ladderNote+
       '<div><label>Provider</label><select id="bs-px-provider">'+opts+'</select></div>'+
       '<div><label>Username</label><input id="bs-px-user" value="'+esc(p.username||'')+'" placeholder="account user"></div>'+
       '<div><label>Password</label><input id="bs-px-pass" type="password" placeholder="'+(p.password_set?'unchanged':'account password')+'"></div>'+
@@ -33882,6 +33972,19 @@ async def vacuum_tool_sim():
         return HTMLResponse("vacuum_tool_sim.html is missing", status_code=404)
     return FileResponse(str(path), media_type="text/html",
                         headers={"Cache-Control": "no-store"})
+
+
+# The console browser: a headed Chrome a human can sign in to, streamed over CDP
+# instead of VNC. Its own module, mounted here, like the other panels. It has to be
+# registered ABOVE the /{username} catch-all or "console" is read as a member name.
+# The websocket carries a live, signed-in browser, so it re-checks the dashboard
+# cookie itself: HTTP middleware does not run for websockets.
+try:
+    import console_browser
+    console_browser.mount(
+        app, auth_ok=lambda ws: (not AUTH_PASS) or _check_token(ws.cookies.get(AUTH_COOKIE)))
+except Exception:
+    logger.exception("console browser not mounted")
 
 
 @app.get("/{username}", response_class=HTMLResponse)
