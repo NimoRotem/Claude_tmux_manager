@@ -102,6 +102,43 @@ gmail-outbound-search.md
 .claude/
 .playwright-mcp/
 
+#  Third pass, 2026-09-20. The two passes above matched by NAME, and the next `git add -A` simply
+#  brought 9,742 lines the patterns did not name: a whole genomics and ancestry project, Shopify and
+#  Faire exports, an ads form, and an accessibility dump of the Stripe dashboard. Untracked at HEAD,
+#  still in history. Anything here that is not this dashboard's own source is ignored by shape now,
+#  because naming yesterday's leak never catches tomorrow's.
+ANCESTRY*.md
+CellAI_*.md
+OLD_PRS.md
+pgs_*.md
+pgs_*.sh
+pipelinesdocs*/
+genomics_*.md
+gpu-migration-instructions.md
+rotem_cc_v2_genomics_wishlist.md
+ancestry_pipeline_fix_task.md
+analyze.py
+deploy_landing.py
+generate_pgs_stats.py
+rebuild_pgs_registry.py
+incident-response-instructions.md
+hk-keys-full.md
+ads-form.md
+app-dash.md
+ga-picker.md
+datepicker2.md
+shopify_*.md
+faire_*.md
+seed_data_*.json
+hebrew_*.json
+#  Scraps: a browser page saved next to the source, a duplicate download, a scratch dump.
+*.html
+!screenshots/**/*.html
+README\ (*).md
+appscenic_rt.txt
+viewer-framebuffer.txt
+sp.txt
+
 #  Same reasoning, second pass: an expense review, a for-sale report, a sourcing comparison, a
 #  pending trademark list, and a vendor binary distribution that is nobody's source.
 LV_STORAGE_OPTIONS_*.md

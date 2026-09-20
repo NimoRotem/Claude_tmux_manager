@@ -1,4 +1,0 @@
-ERROR: (gcloud.compute.ssh) unrecognized arguments: ,k,- 
-
-To search the help text of gcloud commands, run:
-  gcloud help -- SEARCH_TERMS
