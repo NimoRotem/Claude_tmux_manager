@@ -8486,6 +8486,15 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
         "-F",
         "#{session_id}\t#{session_name}",
     ]
+    #  A SESSION IS NEVER HANDED A METERED KEY (owner rule 2026-09-20). The dashboard keeps its own
+    #  OPENAI_API_KEY for the summaries and the voice endpoints, but a pane must not inherit it: an
+    #  agent that finds a metered key in its environment can end up billing it instead of running
+    #  on the subscription it was given, and that failure is silent, it just costs money. An agent
+    #  runs on its plan and asks the advisor for anything else it needs. tmux has no unset for
+    #  new-session, so the names go through EMPTY, which every consumer reads as absent.
+    for fenced in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+        if os.environ.get(fenced):
+            command += ["-e", "%s=" % fenced]
     if name:
         command += ["-s", name]
     if cwd:
