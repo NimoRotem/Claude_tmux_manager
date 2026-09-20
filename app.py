@@ -6735,10 +6735,12 @@ _activity_state: Dict[str, dict] = {}
 # The transcript is what catches work the pane does not show: a sub-agent writing
 # into the same conversation, or a tool that takes a minute and prints nothing.
 # How long a pane carrying its end-of-turn line has to sit byte-identical before
-# an "esc to interrupt" footer is read as paint nobody refreshed rather than work.
-# Generous on purpose: the cost of being wrong low is a session that looks free
-# while it is compacting, and the cost of being wrong high is the red pill that
-# never goes out.
+# an "esc to interrupt" on the LIVE STATUS ROW is read as paint nobody refreshed
+# rather than work. Only that row reaches here now (see _RE_HINT_BAR), so this is
+# the narrow case of a CLI that died or was suspended mid-frame, not the everyday
+# one it was written for: the everyday one was the key hint bar, which says the
+# same words on a finished pane and could never be waited out, because the timers
+# in a background-agent list keep the bytes moving.
 ESC_STALE_SECONDS = 60
 IDLE_CONFIRM_COUNT = 3
 IDLE_CONFIRM_SECONDS = 10
@@ -6812,11 +6814,49 @@ _RE_WAITING_ON_WORK = re.compile(
     r'waiting\s+(?:for|on)\b[^\n]{0,60}?'
     r'\b(?:agents?|subagents?|tasks?|forks?|workers?|jobs?|tool\s+calls?|completion|results?)\b',
     re.I)
+#  THE KEY HINT BAR IS NOT A STATUS LINE. Claude Code parks a list of what the
+#  keys do under the composer:
+#    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · esc to interrupt ·…"
+#  and it lists "esc to interrupt" there on a FINISHED pane too, under the
+#  end-of-turn line, with the composer empty (captured from a real session,
+#  tests/panes/esc_stale.txt). Reading the phrase off that row is what pinned a
+#  session on a red "Working" pill after its turn was over, and the escape hatch
+#  built for it - the same bytes for ESC_STALE_SECONDS - never fires on a pane
+#  that has a background-agent list at the foot, because those timers tick.
+_RE_HINT_BAR = re.compile(
+    r'^\s*(?:⏵|\?\s*for shortcuts\b|shift\+tab\b|bypass permissions\b|⧉\s*In\b'
+    r'|↑\s*to (?:edit|recall)\b|←\s*for agents\b|\d+%\s+(?:until|context)\b'
+    r'|✔\s*Update installed\b)', re.I)
+#  The live status row carries the same phrase INSIDE its own parentheses:
+#    "✻ Simmering… (42s · ↓ 1.1k tokens · esc to interrupt)"
+#  That one is painted only while the turn is up, so it is the form worth
+#  trusting. Both shapes are anchored, because the moment anyone works on this
+#  file the words are in the pane as ordinary prose and an unanchored search
+#  reads a grep of this very function as a running turn.
+_RE_ESC_LIVE_SPINNER = re.compile(_SPINNER_ICONS + r'\s+\S[^\n]*\besc to interrupt\b', re.I)
+_RE_ESC_LIVE_PAREN = re.compile(r'\(\s*\d+\s*[hms]\b[^)\n]*\besc to interrupt\b', re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
 _RE_TIP_CLAUDE = re.compile(r'Tip:.*claude')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
+
+
+def _esc_to_interrupt_live(lines) -> bool:
+    """True when "esc to interrupt" is on Claude Code's LIVE STATUS row.
+
+    False when the only place it appears is the key hint bar, or the agent's own
+    prose, because neither says a turn is running. See _RE_HINT_BAR above for the
+    pane that proved it.
+    """
+    for line in lines:
+        if "esc to interrupt" not in line.lower():
+            continue
+        if _RE_HINT_BAR.match(line):
+            continue
+        if _RE_ESC_LIVE_SPINNER.search(line) or _RE_ESC_LIVE_PAREN.search(line):
+            return True
+    return False
 
 
 _AUTONOMOUS_KEYWORDS = [
@@ -6992,13 +7032,20 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         while all_lines and not all_lines[-1].strip():
             all_lines.pop()
 
-        # Look at the bottom 6 lines to catch prompt + status bar + separators
-        bottom = all_lines[-6:] if len(all_lines) >= 6 else all_lines
-        bottom_text = "\n".join(bottom)
+        # The prompt, the rules around it and the hint bar. Widened from 6 to 10:
+        # a pane carrying a background-agent list under the hint bar kept the empty
+        # composer just out of reach, so the one row that says "you can type here"
+        # was not being read on exactly the sessions this got wrong.
+        bottom = all_lines[-10:] if len(all_lines) >= 10 else all_lines
 
         # --- Step 1: Check "esc to interrupt" — strongest busy signal ---
-        # This appears in Claude Code's status bar when a task is actively running.
-        has_esc_to_interrupt = "esc to interrupt" in bottom_text
+        # Only where it means something: the live status row, never the key hint
+        # bar under the composer, which lists it on a finished pane too. Read over
+        # the same 25-line window the spinner scan uses, because a pane with a
+        # background-agent list at the foot pushes the status row out of the
+        # bottom six lines this used to look at.
+        has_esc_to_interrupt = _esc_to_interrupt_live(
+            all_lines[-25:] if len(all_lines) >= 25 else all_lines)
 
         # --- Step 1b: compaction, which is its own state ---
         # Reported before anything else because it outranks every other reading:
@@ -7147,18 +7194,14 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             info["turn_done"] = saw_completion
             return info
 
-        # "esc to interrupt" without a spinner = background tasks running.
-        #
-        # It stays the strongest signal, and it has to: a session auto-compacting
-        # after its turn shows the end-of-turn line, no spinner and this footer,
-        # and it IS still working. What separates that from a session nobody can
-        # free is the pane itself. A compacting session repaints (measured: every
-        # few seconds); a finished one whose footer simply never got repainted is
-        # frozen. So the override needs the end-of-turn line AND a pane that has
-        # not changed by a single byte in ESC_STALE_SECONDS, which is minutes
-        # after anything real would have moved. It reports idle rather than
-        # turn_done, so the ordinary debounce and the transcript check still have
-        # to agree before the pill turns green.
+        # "esc to interrupt" on the live status row without a spinner we know =
+        # something is still interruptible. Compaction has its own row and is
+        # already reported above, so what is left here is a turn whose spinner
+        # frame this scan does not recognise. The stale escape hatch stays for the
+        # pane that froze mid-frame: end-of-turn line plus not one byte changed in
+        # ESC_STALE_SECONDS. It reports idle rather than turn_done, so the ordinary
+        # debounce and the transcript check still have to agree before the pill
+        # turns green.
         if has_esc_to_interrupt:
             if saw_completion and stable_seconds >= ESC_STALE_SECONDS:
                 info["status"] = "idle"

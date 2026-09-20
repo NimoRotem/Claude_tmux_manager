@@ -23,6 +23,11 @@ def main() -> int:
         "compacting_in_prose": "idle",  # an agent WRITING the word is not a state
         "subagent_wait":  "busy",   # live `*` spinner frame, a glyph this scan missed
         "running_tool_only": "busy",  # no spinner at all, only "⎿  Running…"
+        # The pill that would not go out. A finished turn, and under it a hint bar
+        # listing "esc to interrupt" and a background-agent list whose timers tick,
+        # so the pane never sits byte-identical and the staleness escape hatch could
+        # never fire. Captured from this box, transcript rows and chrome both.
+        "turn_done_agent_list": "idle",
     }
     # The detail is what the pill paints, so a state is only really reported if
     # this matches too. "Compacting" is the one the UI gives its own bar.
@@ -33,6 +38,7 @@ def main() -> int:
     # done. It must be set on the finished pane and NOT on the one where the same
     # completion line is merely scrollback above a live turn.
     TURN_DONE = {"turn_done": True, "turn_done_then_busy": False,
+                 "turn_done_agent_list": True,
                  "patentdrafting": True, "autoobservation": True,
                  # "● Done. The redraft is in and the checks pass." is the agent's
                  # own prose, not Claude Code's end-of-turn line. It must not count.
@@ -41,7 +47,16 @@ def main() -> int:
     # holds one unchanging string, which is how a stale spinner is tested, so for
     # these the stability entry is dropped before each read: a real animating
     # spinner never looks the same twice and must not be gated off as leftover.
-    LIVE_PANE = {"subagent_wait", "running_tool_only"}
+    #
+    # uspto and live_spinner joined the set when the key hint bar stopped counting
+    # as a busy signal. Their pane text is the same as stale_spinner's apart from
+    # that bar, so after the change the ONLY thing separating a live spinner from a
+    # leftover one is whether the pane repaints, which is the real difference and
+    # the one a snapshot cannot see. turn_done_agent_list is here for the opposite
+    # reason: it is a repainting pane that must still read idle, because what is
+    # moving is a background-agent timer and not the turn.
+    LIVE_PANE = {"subagent_wait", "running_tool_only", "uspto", "live_spinner",
+                 "turn_done_agent_list"}
     fail = 0
     for name, expect in EXPECT.items():
         text = open(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "panes", name + ".txt"), encoding="utf8", errors="replace").read()
@@ -101,19 +116,21 @@ def hysteresis() -> int:
 
 
 def esc_stale() -> int:
-    """The end-of-turn line under a footer that still says "esc to interrupt".
+    """The end-of-turn line under a KEY HINT BAR that says "esc to interrupt".
 
-    Both a session auto-compacting after its turn and a session whose footer
-    simply never got repainted look exactly like this in one snapshot. The pane
-    clock is the only thing that tells them apart, so it is faked here rather
-    than waited out.
+    That bar lists what the keys do and it lists this on a finished pane too, so
+    it is not evidence of work and the pane reads idle at any age. It used to take
+    ESC_STALE_SECONDS of byte-identical pane to escape, which never arrived on a
+    session with a background-agent list ticking at the foot: that is the red pill
+    that would not go out. Compaction, the state the wait was protecting, prints
+    its own row and is caught before any of this (see the compacting fixture).
     """
     import hashlib, os
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panes", "esc_stale.txt")
     text = open(path, encoding="utf8", errors="replace").read()
     digest = hashlib.md5(text.encode()).hexdigest()
     cases = [
-        ("still repainting (compacting)", 5.0, "busy"),
+        ("repainting, one poll old", 5.0, "idle"),
         ("frozen well past the threshold", app.ESC_STALE_SECONDS + 60, "idle"),
     ]
     fail = 0
