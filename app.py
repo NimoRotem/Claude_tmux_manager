@@ -17861,18 +17861,22 @@ class SetApiKey(BaseModel):
 
 @app.post("/api/auth/api-key")
 async def api_set_claude_key(body: SetApiKey):
+    """Clearing the stored key works. Storing one does not (owner rule 2026-09-20).
+
+    A stored key was the switch behind everything metered on this box: it flipped
+    the launch banner to "API key", made the one-time config prime approve the key,
+    put the login watchdog into key mode, and gave the session auth toggle something
+    to export. The plan is the only route, so there is nothing to store."""
     key = body.apiKey.strip()
     if key:
-        if not key.startswith(("sk-ant-", "sk-")):
-            return JSONResponse(
-                {"error": "Invalid API key format. Expected key starting with sk-ant- or sk-."},
-                status_code=400,
-            )
-        _save_anthropic_key(key)
-        return JSONResponse({"ok": True, "message": "API key stored."})
-    else:
-        _clear_anthropic_key()
-        return JSONResponse({"ok": True, "message": "API key cleared."})
+        logger.warning("Refused to store an Anthropic API key: plan-only policy")
+        return JSONResponse(
+            {"error": "This dashboard runs sessions on the subscription plan. "
+                      "A metered API key is not stored here."},
+            status_code=409,
+        )
+    _clear_anthropic_key()
+    return JSONResponse({"ok": True, "message": "API key cleared."})
 
 
 @app.post("/api/auth/logout")
@@ -28981,37 +28985,17 @@ function renderAuthPanel(){
   }else{
     el.innerHTML=`
       <div class="auth-title">Claude Code — Not Connected</div>
-      <p class="auth-hint">Set an Anthropic API key to authenticate Claude Code for new sessions:</p>
-      <input type="password" class="auth-api-input" id="auth-api-key-input"
-        placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false"
-        value="${_authCache.hasApiKey?'••••••••••••••••':''}">
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
-        ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="flex:1" onclick="clearApiKey()">Clear</button>':''}
-      </div>
+      <p class="auth-hint">Sessions here run on the subscription plan. Sign in with
+        <code style="color:#79c0ff">claude auth login</code> in a terminal session. There is no
+        API key to set: a metered key is not stored on this dashboard.</p>
+      ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-top:10px" onclick="clearApiKey()">Clear the stored API key</button>':''}
       ${usageHtml}
-      <hr class="auth-divider">
-      <p class="auth-hint">Or authenticate via OAuth by running <code style="color:#79c0ff">claude auth login</code> in a terminal session.</p>
     `;
   }
 }
 
-async function saveApiKey(){
-  const input=document.getElementById('auth-api-key-input');
-  if(!input)return;
-  const key=input.value.trim();
-  if(!key){alert('Please enter an API key.');return}
-  try{
-    const resp=await fetch(BASE+'/api/auth/api-key',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({apiKey:key})
-    });
-    const data=await resp.json();
-    if(!resp.ok){alert(data.detail||'Failed to save');return}
-    await checkClaudeAuth();
-    renderAuthPanel();
-  }catch(e){alert('Failed to save API key.')}
-}
+// saveApiKey() is gone with the input it read: the plan is the only route, so
+// POST /api/auth/api-key refuses a key and only still accepts the empty clear.
 
 async function clearApiKey(){
   try{

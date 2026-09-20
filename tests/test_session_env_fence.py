@@ -95,6 +95,23 @@ def test_subscription_mode_still_clears_a_stray_key_from_the_pane(monkeypatch):
     assert any("unset ANTHROPIC_API_KEY" in arg for argv in typed for arg in argv)
 
 
+def test_the_dashboard_refuses_to_store_an_anthropic_key(monkeypatch):
+    #  A stored key was the switch behind every metered path here: the launch banner, the
+    #  one-time config prime, the login watchdog's key mode, and the per-session toggle.
+    saved = []
+    monkeypatch.setattr(app, "_save_anthropic_key", lambda key: saved.append(key))
+    resp = asyncio.run(app.api_set_claude_key(app.SetApiKey(apiKey="sk-ant-pretend-live-key")))
+    assert resp.status_code == 409
+    assert not saved, "nothing may reach the key file"
+
+
+def test_clearing_the_stored_key_still_works(monkeypatch):
+    cleared = []
+    monkeypatch.setattr(app, "_clear_anthropic_key", lambda: cleared.append(True))
+    resp = asyncio.run(app.api_set_claude_key(app.SetApiKey(apiKey="  ")))
+    assert resp.status_code == 200 and cleared
+
+
 def test_arming_the_api_key_helper_writes_nothing(monkeypatch, tmp_path):
     #  The settings.json `apiKeyHelper` authenticated whether or not a plan was usable,
     #  which is exactly how a metered fallback bills for hours without looking wrong.
