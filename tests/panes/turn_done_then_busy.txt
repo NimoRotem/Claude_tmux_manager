@@ -1,0 +1,23 @@
+  Check any new box with wc -c ~/AGENTS.md. Around 600 bytes means it never
+  pulled. Your builder5 tenant is fine.
+
+  Left undone: parity reports builder7 has no gh auth, no github ssh key, and
+  zero API keys, skills and infra sidecars against peers. Its advisor token is
+  still builder6's. That session's work completed, so it is safe to dismiss.
+
+✻ Cooked for 10m 38s · done 6:34 PM
+
+> now check the other three boxes as well
+
+● I'll check builder, builder2 and instance-3 the same way.
+
+● Bash(for h in builder builder2 instance-3; do gcloud compute ssh $h --zone
+      us-central1-b --tunnel-through-iap --command="wc -c ~/AGENTS.md"; done)
+  ⎿  Running…
+
+✻ Simmering… (42s · ↓ 1.1k tokens · esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · ← for agents

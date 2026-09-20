@@ -17,7 +17,18 @@ def main() -> int:
         "mk20":           "idle",
         "stale_spinner":  "idle",   # leftover spinner, no esc to interrupt
         "live_spinner":   "busy",   # same spinner, with esc to interrupt
+        "turn_done":      "idle",   # "✻ Cooked for 10m 38s · done 6:34 PM"
+        "turn_done_then_busy": "busy",  # that line scrolled up, a NEW turn running
     }
+    # turn_done is what lets detect_activity settle busy → idle without waiting on
+    # the transcript, which keeps growing for a minute or two after the pane is
+    # done. It must be set on the finished pane and NOT on the one where the same
+    # completion line is merely scrollback above a live turn.
+    TURN_DONE = {"turn_done": True, "turn_done_then_busy": False,
+                 "patentdrafting": True, "autoobservation": True,
+                 # "● Done. The redraft is in and the checks pass." is the agent's
+                 # own prose, not Claude Code's end-of-turn line. It must not count.
+                 "stale_spinner": False, "live_spinner": False, "uspto": False}
     fail = 0
     for name, expect in EXPECT.items():
         text = open(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "panes", name + ".txt"), encoding="utf8", errors="replace").read()
@@ -27,11 +38,51 @@ def main() -> int:
             if i: time.sleep(11)
             got = app._classify_pane(name, text, "bash" if name == "mk20" else "claude")
         ok = got["status"] == expect
+        if name in TURN_DONE:
+            ok = ok and bool(got.get("turn_done")) == TURN_DONE[name]
         fail += 0 if ok else 1
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:16s} expected={expect:5s} got={got['status']:5s} {got['detail']}")
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:20s} expected={expect:5s} got={got['status']:5s}"
+              f" turn_done={bool(got.get('turn_done'))} {got['detail']}")
+    print("  failures:", fail)
+    return 1 if fail else 0
+
+
+def hysteresis() -> int:
+    """detect_activity, with the pane and the transcript clock both faked.
+
+    The case that put a finished session on a pulsing red 'Working' pill: the
+    transcript goes on growing for a minute or two after the turn ends (the Stop
+    hook's result, then the session summary), and the quiet gate read that as
+    'still going'. turn_done is the pane saying otherwise, and it has to win.
+    """
+    cases = [
+        # (label, raw status, turn_done, transcript quiet secs, expected)
+        ("busy → idle, turn_done, transcript still being written", "idle", True,  0.4, "idle"),
+        ("busy → idle, no turn_done, transcript still being written", "idle", False, 0.4, "busy"),
+        ("busy → idle, no turn_done, transcript quiet", "idle", False, 99.0, "busy"),  # needs the count too
+        ("still busy", "busy", False, 0.4, "busy"),
+    ]
+    real_raw, real_quiet = app._detect_activity_raw, app._transcript_quiet_seconds
+    fail = 0
+    try:
+        for label, status, done, quiet, expect in cases:
+            name = "hyst_" + str(abs(hash(label)))
+            app._activity_state[name] = {"status": "busy", "since": time.time() - 60,
+                                         "consecutive_idle": 0, "idle_since": 0,
+                                         "raw": {"status": "busy", "command": "claude", "detail": "Working"}}
+            app._detect_activity_raw = lambda n, s=status, d=done: {
+                "status": s, "command": "claude", "detail": "", "turn_done": d}
+            app._transcript_quiet_seconds = lambda n, q=quiet: q
+            got = app.detect_activity(name)["status"]
+            ok = got == expect
+            fail += 0 if ok else 1
+            print(f"  {'PASS' if ok else 'FAIL'}  expected={expect:5s} got={got:5s}  {label}")
+            app._activity_state.pop(name, None)
+    finally:
+        app._detect_activity_raw, app._transcript_quiet_seconds = real_raw, real_quiet
     print("  failures:", fail)
     return 1 if fail else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main() + hysteresis())

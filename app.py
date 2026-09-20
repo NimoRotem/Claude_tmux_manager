@@ -6752,6 +6752,17 @@ _RE_COMPLETION = re.compile(
     r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
     r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
 )
+# Claude Code's END-OF-TURN status line, and only that:
+#   "✻ Cooked for 10m 38s · done 6:34 PM"
+# It replaces the live spinner the instant the turn ends, so it is proof the
+# composer is live again. Deliberately NARROWER than _RE_COMPLETION above, which
+# also accepts a bare "Done"/"Completed" — that form matches the agent's own prose
+# ("● Done. The redraft is in and the checks pass."), which it can print while a
+# sub-agent is still running. Harmless when all it does is skip a line in the
+# spinner scan; not harmless as a "the turn is over" signal.
+_RE_TURN_DONE = re.compile(
+    r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
+    r'[A-Z][a-zé]+(?:ed|d)\s+for\s+[\dhms\s]+[·⋅]\s*done\b')
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
@@ -7016,6 +7027,13 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         # executing tools / thinking / streaming.
         window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
 
+        # "✻ Cogitated for 41m 2s · done 6:23 PM" is Claude Code SAYING the turn
+        # is over — it replaces the live spinner and only ever appears after the
+        # fact. Worth recording rather than only skipping, because step 5 hands it
+        # to detect_activity as turn_done, which is the one thing allowed to settle
+        # busy → idle without waiting on the transcript.
+        saw_completion = False
+
         # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
         # where possible to avoid false positives from these patterns
         # appearing in conversation output text.
@@ -7024,6 +7042,7 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             stripped = line.strip()
             # Skip completion markers — these look like spinners but mean "finished"
             if _RE_COMPLETION.match(stripped):
+                saw_completion = saw_completion or bool(_RE_TURN_DONE.match(stripped))
                 continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
             if _RE_RUNNING_TASK.match(stripped) and spinner_is_live:
@@ -7071,6 +7090,7 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
             info["detail"] = ""
+            info["turn_done"] = saw_completion
             return info
 
         # "esc to interrupt" without a spinner = background tasks running
@@ -7086,6 +7106,7 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         if content_is_static and cmd.lower() in ("claude", "node"):
             info["status"] = "idle"
             info["detail"] = ""
+            info["turn_done"] = saw_completion
             return info
 
         # --- Step 7: Shell prompt check ---
@@ -7102,6 +7123,7 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             # Claude Code with no spinner + no "esc to interrupt" = idle
             info["status"] = "idle"
             info["detail"] = ""
+            info["turn_done"] = saw_completion
         else:
             info["status"] = "busy"
             info["detail"] = cmd
@@ -7196,9 +7218,20 @@ def detect_activity(session_name: str) -> dict:
             idle_count = prev["consecutive_idle"] + 1
             idle_since = prev.get("idle_since") or now
             quiet = _transcript_quiet_seconds(session_name)
-            settled = (idle_count >= IDLE_CONFIRM_COUNT
-                       and now - idle_since >= IDLE_CONFIRM_SECONDS
-                       and (quiet is None or quiet >= IDLE_TRANSCRIPT_QUIET))
+            if raw.get("turn_done"):
+                # The pane is showing Claude Code's own end-of-turn line
+                # ("✻ Cogitated for 41m 2s · done 6:23 PM"). That is the product
+                # stating the turn is over and the composer is live, so there is
+                # nothing left to debounce. The transcript keeps growing for a
+                # minute or two afterwards — the Stop hook's result and the
+                # session summary both land late — and waiting on it left a
+                # finished session pulsing red with its answer fully on screen,
+                # which is the one thing this pill exists to get right.
+                settled = True
+            else:
+                settled = (idle_count >= IDLE_CONFIRM_COUNT
+                           and now - idle_since >= IDLE_CONFIRM_SECONDS
+                           and (quiet is None or quiet >= IDLE_TRANSCRIPT_QUIET))
             if settled:
                 _activity_state[session_name] = {
                     "status": raw["status"],

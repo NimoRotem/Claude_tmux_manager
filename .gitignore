@@ -10,6 +10,9 @@ build/
 # Virtual environments
 venv/
 .venv/
+# ...and as a symlink, which the pattern above does not match. Each box points it
+# at its own interpreter so the advisor sidecars can find <dashdir>/.venv/bin/python.
+.venv
 env/
 
 # Testing
