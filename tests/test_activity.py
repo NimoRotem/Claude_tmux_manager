@@ -19,7 +19,15 @@ def main() -> int:
         "live_spinner":   "busy",   # same spinner, with esc to interrupt
         "turn_done":      "idle",   # "✻ Cooked for 10m 38s · done 6:34 PM"
         "turn_done_then_busy": "busy",  # that line scrolled up, a NEW turn running
+        "compacting":     "busy",   # its own detail, and its own colour in the UI
+        "compacting_in_prose": "idle",  # an agent WRITING the word is not a state
+        "subagent_wait":  "busy",   # live `*` spinner frame, a glyph this scan missed
+        "running_tool_only": "busy",  # no spinner at all, only "⎿  Running…"
     }
+    # The detail is what the pill paints, so a state is only really reported if
+    # this matches too. "Compacting" is the one the UI gives its own bar.
+    DETAIL = {"compacting": "Compacting", "running_tool_only": "Waiting on a tool",
+              "subagent_wait": "Working", "uspto": "Working", "live_spinner": "Working"}
     # turn_done is what lets detect_activity settle busy → idle without waiting on
     # the transcript, which keeps growing for a minute or two after the pane is
     # done. It must be set on the finished pane and NOT on the one where the same
@@ -29,6 +37,11 @@ def main() -> int:
                  # "● Done. The redraft is in and the checks pass." is the agent's
                  # own prose, not Claude Code's end-of-turn line. It must not count.
                  "stale_spinner": False, "live_spinner": False, "uspto": False}
+    # Fixtures whose point is that the pane is ALIVE. The three-poll loop below
+    # holds one unchanging string, which is how a stale spinner is tested, so for
+    # these the stability entry is dropped before each read: a real animating
+    # spinner never looks the same twice and must not be gated off as leftover.
+    LIVE_PANE = {"subagent_wait", "running_tool_only"}
     fail = 0
     for name, expect in EXPECT.items():
         text = open(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "panes", name + ".txt"), encoding="utf8", errors="replace").read()
@@ -36,10 +49,13 @@ def main() -> int:
         # three polls of an unchanging pane: past the 20s staleness threshold
         for i in range(3):
             if i: time.sleep(11)
+            if name in LIVE_PANE: app._pane_stability.pop(name, None)
             got = app._classify_pane(name, text, "bash" if name == "mk20" else "claude")
         ok = got["status"] == expect
         if name in TURN_DONE:
             ok = ok and bool(got.get("turn_done")) == TURN_DONE[name]
+        if name in DETAIL:
+            ok = ok and got.get("detail") == DETAIL[name]
         fail += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  {name:20s} expected={expect:5s} got={got['status']:5s}"
               f" turn_done={bool(got.get('turn_done'))} {got['detail']}")

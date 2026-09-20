@@ -6748,13 +6748,21 @@ _activity_state: Dict[str, dict] = {}
 # Generous on purpose: the cost of being wrong low is a session that looks free
 # while it is compacting, and the cost of being wrong high is the red pill that
 # never goes out.
-ESC_STALE_SECONDS = 180
+ESC_STALE_SECONDS = 60
 IDLE_CONFIRM_COUNT = 3
 IDLE_CONFIRM_SECONDS = 10
 IDLE_TRANSCRIPT_QUIET = 15
 
 # Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
-_SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
+# Claude Code cycles its spinner through these glyphs frame by frame. `*`, `·`
+# and `•` were missing, and they are ordinary frames: "* Puttering… (8m 21s)" and
+# "· Germinating… (19s)" were both captured from live, working sessions. A session
+# whose footer hint had rotated away from "esc to interrupt" at the moment one of
+# those frames was on screen read as IDLE while it was working, which is how a
+# turn waiting on its sub-agents went grey. Safe to add because every use is
+# gated on spinner_is_live: a prose bullet sits on a pane that has stopped
+# changing, and a real spinner repaints.
+_SPINNER_ICONS = r'[✶✽✻☆◆●*·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
 _RE_COMPLETION = re.compile(
     r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
     r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
@@ -6771,6 +6779,24 @@ _RE_TURN_DONE = re.compile(
     r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
     r'[A-Z][a-zé]+(?:ed|d)\s+for\s+[\dhms\s]+[·⋅]\s*done\b')
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
+# The result slot of a tool call that has not returned yet: "  ⎿  Running…".
+# Claude Code overwrites it with the output the moment the call lands, so unlike
+# "● 2 background agents launched (↓ to manage)" - which is printed once and then
+# sits in the scrollback for ever - this one is only on screen while something
+# really is running. Matching the launch banner instead would pin the session on
+# working permanently, which is the trap the rest of this file keeps hitting.
+_RE_RUNNING_TOOL = re.compile(r'^[⎿│\s]*(?:Running|Waiting)(?:…|\.{2,3})')
+# What Claude Code prints while it is compacting. Worth its own state: the turn
+# is over, the user's work is done, and what is left is housekeeping they should
+# be able to see rather than a red pill that looks like unfinished work.
+# Anchored to the start of a status line, and deliberately NOT matching the
+# "Compacting at auto window (400k tokens)" footer hint, which says how compaction
+# is configured rather than that it is happening. Anchoring matters more than
+# usual here: the words appear in ordinary prose the moment anyone works on this
+# file, and an unanchored search would read that scrollback as a live state.
+_RE_COMPACTING = re.compile(
+    r'^(?:[✶✽✻☆◆●*·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]\s+)?'
+    r'Compacting conversation')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
 # "3 local agents still running", "Waiting for completion of 2 agents": these are
@@ -6983,6 +7009,17 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         # This appears in Claude Code's status bar when a task is actively running.
         has_esc_to_interrupt = "esc to interrupt" in bottom_text
 
+        # --- Step 1b: compaction, which is its own state ---
+        # Reported before anything else because it outranks every other reading:
+        # the prompt is drawn, the spinner may be gone, and the session is neither
+        # free nor working on the user's task. The UI gives it its own colour and
+        # bar, so "it has been red for four minutes" becomes "it is compacting".
+        for line in (all_lines[-25:] if len(all_lines) >= 25 else all_lines):
+            if _RE_COMPACTING.match(line.strip()):
+                info["status"] = "busy"
+                info["detail"] = "Compacting"
+                return info
+
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
         # Lines containing these phrases override idle — session is still working
@@ -7040,6 +7077,7 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         # to detect_activity as turn_done, which is the one thing allowed to settle
         # busy → idle without waiting on the transcript.
         saw_completion = False
+        running_tool = False
 
         # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
         # where possible to avoid false positives from these patterns
@@ -7091,8 +7129,26 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = "Waiting for agents"
                 return info
+            # "⎿  Running…": a tool call, or a sub-agent, that has not returned.
+            # Recorded rather than returned, because it is usually printed ABOVE
+            # the spinner and returning here would relabel every ordinary busy
+            # session. Only consulted once the whole window has failed to produce
+            # a spinner, which is the case that used to read idle: a turn waiting
+            # on its sub-agents, footer rotated off "esc to interrupt", spinner on
+            # a frame this scan did not know.
+            if _RE_RUNNING_TOOL.match(line):
+                running_tool = True
 
         # --- Step 4: (stability was measured above, before the spinner scan) ---
+        # No spinner anywhere, but a tool call is still showing "Running…" on a
+        # pane that is repainting. That is a turn in progress whose spinner frame
+        # this scan does not recognise, and calling it idle is what made a session
+        # waiting on its sub-agents look free.
+        if running_tool and spinner_is_live:
+            info["status"] = "busy"
+            info["detail"] = "Waiting on a tool"
+            return info
+
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
@@ -22802,6 +22858,19 @@ body.member-admin .more-member-only{display:none}
    distinguishable from a session someone actually asked for something. */
 .status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
 .status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
+/* Compacting is housekeeping, not the user's task. Red says "still chewing on
+   your request" and that is the wrong thing to say for four minutes, so it gets
+   its own blue and a bar. The bar is indeterminate on purpose: Claude Code does
+   not report compaction progress, and a fake percentage would be a lie. */
+.status-pill.busy.compacting{background:#388bfd26;color:#79c0ff;border:1px solid #388bfd66;
+  animation:none;font-size:.75rem;padding:3px 12px;gap:7px}
+.status-pill.busy.compacting .status-dot{background:#79c0ff;animation:none}
+.pill-bar{display:inline-block;width:46px;height:3px;border-radius:2px;background:#388bfd33;
+  overflow:hidden;position:relative;flex:none}
+.pill-bar i{position:absolute;top:0;left:0;height:100%;width:45%;border-radius:2px;
+  background:#79c0ff;animation:pill-bar-slide 1.15s ease-in-out infinite}
+@keyframes pill-bar-slide{0%{left:-45%}100%{left:100%}}
+@media (prefers-reduced-motion:reduce){.pill-bar i{animation:none;left:0;width:100%;opacity:.6}}
 .idle-nudge-seg button.in-off.active{background:#484f58}
 .idle-nudge-seg button.in-light.active{background:#1f6feb}
 .idle-nudge-seg button.in-high.active{background:#da3633}
@@ -25371,6 +25440,10 @@ function toggleCleanView(name,checked){
   rerenderAllRaw();
 }
 const lastStatus={};
+// The detail that came with lastStatus. Only one value is load-bearing so far,
+// "Compacting", which the pill paints differently; keeping it here means the
+// 420ms repaint can see it without asking the server again.
+const lastDetail={};
 const _completedUnread={};
 const IDLE_NUDGE_INTERVAL_MS=20000;
 // off: silent, no chime of any kind.
@@ -26072,10 +26145,20 @@ async function setSessionModel(name,model){
     alert('Model switch failed: '+(e&&e.message?e.message:e));
   }
 }
-function statusLabel(s){
+function statusLabel(s,detail){
+  if(_isCompacting(detail))return'Compacting';
   if(s==='busy')return'Working...';
   if(s==='idle')return'Idle';
   return'...';
+}
+// Compaction arrives as busy plus a detail, because to everything that asks "can
+// I type into this session" it is still busy. Only the pill tells them apart.
+function _isCompacting(detail){return (detail||'')==='Compacting'}
+function _pillInner(status,detail){
+  const compacting=_isCompacting(detail);
+  return '<span class="status-dot"></span><span class="status-label">'+statusLabel(status,detail)+'</span>'
+    +(compacting?'<span class="pill-bar"><i></i></span>':'')
+    +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
 }
 
 // How this session authenticates, shown beside the idle/working pill. (S) is a
@@ -26642,10 +26725,8 @@ function renderDetail(){
       </div>
       <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
       <div class="detail-badges">
-        <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
-          <span class="status-dot"></span>
-          <span class="status-label">${statusLabel(s.activity_status)}</span>
-          ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
+        <span class="status-pill ${esc(s.activity_status)}${_isCompacting(s.activity_detail)?' compacting':''}" id="status-${s.name}">
+          ${_pillInner(s.activity_status,s.activity_detail)}
         </span>
         ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
@@ -28084,17 +28165,23 @@ function _paintPillCache(name){
   // would drag the pill back to a status it left minutes ago, once a second.
   const s=sessions.find(x=>x.name===name)||{};
   const status=lastStatus[name]||s.activity_status||'unknown';
-  const want='status-pill '+status+_pillCacheClasses(name,status);
+  // Carry the compacting class through. This runs on the 420ms attention clock
+  // and rebuilds the whole class list, so leaving it out stripped the blue and
+  // the bar within half a second of them being set.
+  const detail=(name in lastDetail)?lastDetail[name]:s.activity_detail;
+  const want='status-pill '+status+_pillCacheClasses(name,status)
+    +(_isCompacting(detail)?' compacting':'');
   if(pill.className!==want)pill.className=want;
 }
 function updateStatusPill(name,status,detail){
+  lastDetail[name]=detail;
   const pill=document.getElementById('status-'+name);
   if(pill){
     // Amber steady = working only to hold the cache. Amber blinking = idle with
     // the cache about to lapse, which is the one that wants you at the keyboard.
-    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status);
-    pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
-      +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
+    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status)
+      +(_isCompacting(detail)?' compacting':'');
+    pill.innerHTML=_pillInner(status,detail);
   }
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
