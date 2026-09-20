@@ -6743,6 +6743,12 @@ _activity_state: Dict[str, dict] = {}
 #   * IDLE_TRANSCRIPT_QUIET seconds since the session's own transcript last grew.
 # The transcript is what catches work the pane does not show: a sub-agent writing
 # into the same conversation, or a tool that takes a minute and prints nothing.
+# How long a pane carrying its end-of-turn line has to sit byte-identical before
+# an "esc to interrupt" footer is read as paint nobody refreshed rather than work.
+# Generous on purpose: the cost of being wrong low is a session that looks free
+# while it is compacting, and the cost of being wrong high is the red pill that
+# never goes out.
+ESC_STALE_SECONDS = 180
 IDLE_CONFIRM_COUNT = 3
 IDLE_CONFIRM_SECONDS = 10
 IDLE_TRANSCRIPT_QUIET = 15
@@ -7094,8 +7100,23 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             info["turn_done"] = saw_completion
             return info
 
-        # "esc to interrupt" without a spinner = background tasks running
+        # "esc to interrupt" without a spinner = background tasks running.
+        #
+        # It stays the strongest signal, and it has to: a session auto-compacting
+        # after its turn shows the end-of-turn line, no spinner and this footer,
+        # and it IS still working. What separates that from a session nobody can
+        # free is the pane itself. A compacting session repaints (measured: every
+        # few seconds); a finished one whose footer simply never got repainted is
+        # frozen. So the override needs the end-of-turn line AND a pane that has
+        # not changed by a single byte in ESC_STALE_SECONDS, which is minutes
+        # after anything real would have moved. It reports idle rather than
+        # turn_done, so the ordinary debounce and the transcript check still have
+        # to agree before the pill turns green.
         if has_esc_to_interrupt:
+            if saw_completion and stable_seconds >= ESC_STALE_SECONDS:
+                info["status"] = "idle"
+                info["detail"] = ""
+                return info
             info["status"] = "busy"
             info["detail"] = "Background tasks"
             return info

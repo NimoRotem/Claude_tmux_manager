@@ -84,5 +84,34 @@ def hysteresis() -> int:
     return 1 if fail else 0
 
 
+def esc_stale() -> int:
+    """The end-of-turn line under a footer that still says "esc to interrupt".
+
+    Both a session auto-compacting after its turn and a session whose footer
+    simply never got repainted look exactly like this in one snapshot. The pane
+    clock is the only thing that tells them apart, so it is faked here rather
+    than waited out.
+    """
+    import hashlib, os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panes", "esc_stale.txt")
+    text = open(path, encoding="utf8", errors="replace").read()
+    digest = hashlib.md5(text.encode()).hexdigest()
+    cases = [
+        ("still repainting (compacting)", 5.0, "busy"),
+        ("frozen well past the threshold", app.ESC_STALE_SECONDS + 60, "idle"),
+    ]
+    fail = 0
+    for label, age, expect in cases:
+        name = "escstale_" + str(int(age))
+        app._pane_stability[name] = (digest, time.time() - age, 9)
+        got = app._classify_pane(name, text, "claude")
+        ok = got["status"] == expect
+        fail += 0 if ok else 1
+        print(f"  {'PASS' if ok else 'FAIL'}  expected={expect:5s} got={got['status']:5s}  {label}")
+        app._pane_stability.pop(name, None)
+    print("  failures:", fail)
+    return 1 if fail else 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main() + hysteresis())
+    raise SystemExit(main() + hysteresis() + esc_stale())
