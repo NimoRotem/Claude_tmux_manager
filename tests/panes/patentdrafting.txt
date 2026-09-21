@@ -1,0 +1,24 @@
+    The loop converges.
+  - Research (Find) returned 60 cards; the 8 attached are a bullseye —
+    CN-210615670-U Magnetic alignment device for butt joint of pipelines,
+    US-3925854-A Alignment clamp, US-6824038-B2 Method and tool for aligning
+    piping components.
+
+  Still running: the redraft turn working that prior art into the draft. It is
+  at 11 agent runs and $22.63 and climbing. That is my one open concern — a
+  single revision turn is expensive, and it is the same turn that earlier hit
+  its 14-run ceiling on the citation bug. I want to see it land before I call
+  anything ready.
+
+  Still to do: filing pack + filing QA on project 27, then clean up the QA
+  projects. I'll report a go/no-go when the turn lands.
+
+✻ Churned for 50s · done 4:25 AM
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · ← for agents
+                                        new task? /clear to save 987.4k tokens
+
+

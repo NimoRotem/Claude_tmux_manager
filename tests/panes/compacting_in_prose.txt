@@ -1,0 +1,11 @@
+● I read the binary and found the strings it prints.
+
+  The literal text is "Compacting conversation", and the footer hint is
+  "Compacting at auto window (400k tokens)". Neither should read as a state.
+
+✻ Cooked for 3m 12s · done 9:04 PM
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · ← for agents

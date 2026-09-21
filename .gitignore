@@ -10,6 +10,9 @@ build/
 # Virtual environments
 venv/
 .venv/
+# ...and as a symlink, which the pattern above does not match. Each box points it
+# at its own interpreter so the advisor sidecars can find <dashdir>/.venv/bin/python.
+.venv
 env/
 
 # Testing
@@ -37,6 +40,9 @@ desktop.ini
 # Backup files
 *.bak-*
 *.orig
+*.away-mode-backup
+*.go-nuts-backup
+*.go-nuts-backup-*
 *.pre-skills-backup
 
 # Pidfiles, archives
@@ -76,13 +82,11 @@ codex-config.tmp.toml
 
 #  THIS REPOSITORY IS PUBLIC. Verified 2026-09-04.
 #  The rules above already keep spreadsheets, archives and images out, which is most of the way
-#  there. The working tree also collects business documents as MARKDOWN and JSON, and those were
-#  not covered: EBITDA and balance-sheet audits, a QuickBooks consolidation, expense data and an
-#  expense review, billing notes, a mailbox search dump, a client handover, a sourcing
-#  comparison, a for-sale report, a pending trademark list.
-#  None of it had ever been committed. But there were 1,283 untracked files in that worktree
-#  against 100 tracked ones, so `git add -A` was one keystroke from publishing the company's
-#  finances. Afterwards: 22, none of them private.
+#  there, but the working tree also collects business documents as MARKDOWN and JSON and those
+#  were unprotected: EBITDA and balance-sheet audits, a QuickBooks consolidation, expense data,
+#  billing notes, a mailbox search dump, a client handover. None of it has ever been committed,
+#  checked across every branch. But 1,283 untracked files sat here against 100 tracked ones, so
+#  `git add -A` in this tree was one keystroke from publishing the company's finances.
 *_AUDIT_*.md
 EBITDA_*.md
 BS_AUDIT_*.md
@@ -90,16 +94,56 @@ QB_*.md
 GRABO_*.md
 HANDOVER-*.md
 billing*.md
-LV_STORAGE_OPTIONS_*.md
-gmail-outbound-search.md
 expenses_data.json
 doba_*.json
-td_pending.json
-tm_list.json
-charts/
-gripster_shots/
+gmail-outbound-search.md
 
-#  Agent working state and a vendor binary distribution. Neither is source.
+#  Agent working state, not source.
 .claude/
 .playwright-mcp/
+
+#  Third pass, 2026-09-20. The two passes above matched by NAME, and the next `git add -A` simply
+#  brought 9,742 lines the patterns did not name: a whole genomics and ancestry project, Shopify and
+#  Faire exports, an ads form, and an accessibility dump of the Stripe dashboard. Untracked at HEAD,
+#  still in history. Anything here that is not this dashboard's own source is ignored by shape now,
+#  because naming yesterday's leak never catches tomorrow's.
+ANCESTRY*.md
+CellAI_*.md
+OLD_PRS.md
+pgs_*.md
+pgs_*.sh
+pipelinesdocs*/
+genomics_*.md
+gpu-migration-instructions.md
+rotem_cc_v2_genomics_wishlist.md
+ancestry_pipeline_fix_task.md
+analyze.py
+deploy_landing.py
+generate_pgs_stats.py
+rebuild_pgs_registry.py
+incident-response-instructions.md
+hk-keys-full.md
+ads-form.md
+app-dash.md
+ga-picker.md
+datepicker2.md
+shopify_*.md
+faire_*.md
+seed_data_*.json
+hebrew_*.json
+#  Scraps: a browser page saved next to the source, a duplicate download, a scratch dump.
+*.html
+!screenshots/**/*.html
+README\ (*).md
+appscenic_rt.txt
+viewer-framebuffer.txt
+sp.txt
+
+#  Same reasoning, second pass: an expense review, a for-sale report, a sourcing comparison, a
+#  pending trademark list, and a vendor binary distribution that is nobody's source.
+LV_STORAGE_OPTIONS_*.md
+charts/
+gripster_shots/
+td_pending.json
+tm_list.json
 ExpansionHunter-*/

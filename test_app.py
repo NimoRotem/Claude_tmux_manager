@@ -24,7 +24,7 @@ from app import (
     _RE_SPINNER_INLINE,
     _RE_SPINNER_START,
     _RE_THOUGHT,
-    _RE_TIP_CODEX,
+    _RE_TIP_CLAUDE,
     AUTH_SECRET,
     IDLE_CONFIRM_COUNT,
     _activity_state,
@@ -178,7 +178,7 @@ class TestAppendAssistantMsg:
         finally:
             app._save_messages = original_save
 
-    def test_updates_different_message_in_same_turn(self):
+    def test_adds_different_message(self):
         import app
         original_save = app._save_messages
         app._save_messages = lambda: None
@@ -187,9 +187,7 @@ class TestAppendAssistantMsg:
                 {"role": "assistant", "text": "hello world", "ts": 1.0}
             ]}
             _append_assistant_msg(entry, "completely different text here", 2.0)
-            assert len(entry["messages"]) == 1
-            assert entry["messages"][0]["text"] == "completely different text here"
-            assert entry["messages"][0]["ts"] == 2.0
+            assert len(entry["messages"]) == 2
         finally:
             app._save_messages = original_save
 
@@ -205,7 +203,7 @@ class TestAppendAssistantMsg:
         finally:
             app._save_messages = original_save
 
-    def test_updates_assistant_message_after_last_user(self):
+    def test_only_checks_last_assistant_message(self):
         import app
         original_save = app._save_messages
         app._save_messages = lambda: None
@@ -215,10 +213,9 @@ class TestAppendAssistantMsg:
                 {"role": "user", "text": "user input", "ts": 2.0},
                 {"role": "assistant", "text": "recent message", "ts": 3.0},
             ]}
-            # Same as an older turn, but the current turn's assistant bubble is updated.
+            # Same as "old message" but different from "recent message" — should add
             _append_assistant_msg(entry, "old message", 4.0)
-            assert len(entry["messages"]) == 3
-            assert entry["messages"][-1]["text"] == "old message"
+            assert len(entry["messages"]) == 4
         finally:
             app._save_messages = original_save
 
@@ -361,35 +358,35 @@ class TestClaudeMdPathValidation:
     def _validate_path(self, path: str) -> bool:
         """Reproduce the validation logic from api_save_claude_md."""
         from pathlib import Path
-        if not path.endswith("AGENTS.md"):
+        if not path.endswith("CLAUDE.md"):
             return False
         real_path = os.path.realpath(path)
         home_dir = str(Path.home())
         if not real_path.startswith(home_dir + "/") and real_path != home_dir:
             return False
-        if not real_path.endswith("/AGENTS.md"):
+        if not real_path.endswith("/CLAUDE.md"):
             return False
         return True
 
     def test_valid_home_claude_md(self):
         from pathlib import Path
-        path = str(Path.home() / "AGENTS.md")
+        path = str(Path.home() / "CLAUDE.md")
         assert self._validate_path(path) is True
 
     def test_valid_project_claude_md(self):
         from pathlib import Path
-        path = str(Path.home() / "some-project" / "AGENTS.md")
+        path = str(Path.home() / "some-project" / "CLAUDE.md")
         assert self._validate_path(path) is True
 
     def test_rejects_etc_claude_md(self):
-        assert self._validate_path("/etc/AGENTS.md") is False
+        assert self._validate_path("/etc/CLAUDE.md") is False
 
     def test_rejects_root_claude_md(self):
-        assert self._validate_path("/root/AGENTS.md") is False
+        assert self._validate_path("/root/CLAUDE.md") is False
 
     def test_rejects_dot_dot_traversal(self):
         from pathlib import Path
-        path = str(Path.home() / ".." / "etc" / "AGENTS.md")
+        path = str(Path.home() / ".." / "etc" / "CLAUDE.md")
         assert self._validate_path(path) is False
 
     def test_rejects_non_claude_md(self):
@@ -398,11 +395,11 @@ class TestClaudeMdPathValidation:
         assert self._validate_path(path) is False
 
     def test_rejects_tricky_suffix(self):
-        # "notAGENTS.md" ends with AGENTS.md but isn't a standalone filename
+        # "notCLAUDE.md" ends with CLAUDE.md but isn't a standalone filename
         from pathlib import Path
-        path = str(Path.home() / "notAGENTS.md")
-        # os.path.realpath resolves to /home/user/notAGENTS.md
-        # endswith("/AGENTS.md") would fail since it's "/notAGENTS.md"
+        path = str(Path.home() / "notCLAUDE.md")
+        # os.path.realpath resolves to /home/user/notCLAUDE.md
+        # endswith("/CLAUDE.md") would fail since it's "/notCLAUDE.md"
         assert self._validate_path(path) is False
 
 
@@ -471,18 +468,6 @@ class TestFindSession:
 
 class TestGetTmuxSessions:
     """Test tmux session list parsing with mocked subprocess."""
-
-    @pytest.fixture(autouse=True)
-    def _show_test_sessions_in_codex_dashboard(self):
-        # `get_tmux_sessions` also re-adds *parked* sessions from the lifecycle
-        # store so a retained session does not vanish from the UI. That store is
-        # real state on the host, so without isolating it these tests fail on any
-        # box that happens to have a parked session.
-        import app as _app
-        empty = {"sessions": {}}
-        with patch("app._session_is_codex", return_value=True), \
-             patch.object(_app._session_lifecycle, "snapshot", return_value=empty):
-            yield
 
     @patch("app.subprocess.run")
     def test_parses_standard_output(self, mock_run):
@@ -682,10 +667,9 @@ class TestDetectActivityHysteresis:
 
 
 class TestBuildSessionResponse:
-    @patch("app._session_real_auth_mode", return_value="api")
     @patch("app.detect_activity")
-    def test_builds_complete_response(self, mock_activity, mock_auth_mode):
-        mock_activity.return_value = {"status": "idle", "command": "codex", "detail": "Waiting"}
+    def test_builds_complete_response(self, mock_activity):
+        mock_activity.return_value = {"status": "idle", "command": "claude", "detail": "Waiting"}
         sess = {"name": "test", "windows": "2", "attached": True}
         data = {
             "title": "My Task",
@@ -706,11 +690,10 @@ class TestBuildSessionResponse:
         assert result["title"] == "My Task"
         assert result["description"] == "Doing stuff"
         assert result["activity_status"] == "idle"
-        assert result["activity_command"] == "codex"
+        assert result["activity_command"] == "claude"
         assert result["activity_detail"] == "Waiting"
-        assert result["auth_mode"] == "api"
-        assert result["autopush_mode"] == "basic"
-        assert result["simple_watchdog"] is False
+        assert result["auth_mode"] == "subscription"  # default
+        assert result["away_mode"] is False  # default
 
     @patch("app.detect_activity")
     def test_missing_data_keys_use_defaults(self, mock_activity):
@@ -783,9 +766,9 @@ class TestActivityRegexPatterns:
         assert _RE_IDLE_PROMPT.match("➜ ")
         assert not _RE_IDLE_PROMPT.match("❯ some command")  # has text after
 
-    def test_tip_codex(self):
-        assert _RE_TIP_CODEX.search("Tip: Use codex --help for more info")
-        assert not _RE_TIP_CODEX.search("Tip: Use git for version control")
+    def test_tip_claude(self):
+        assert _RE_TIP_CLAUDE.search("Tip: Use claude --help for more info")
+        assert not _RE_TIP_CLAUDE.search("Tip: Use git for version control")
 
     def test_completion_msg(self):
         assert _RE_COMPLETION_MSG.search("Completed for 3m")
@@ -972,11 +955,11 @@ class TestLoginRateLimiter:
             app.time.time = original
 
 
-# ─── Shell command safety ───
+# ─── shlex.quote Usage in API Key Injection ───
 
 
 class TestApiKeyShellQuoting:
-    """Shell metadata is quoted and authentication never enters pane history."""
+    """Verify shlex.quote is used when injecting the API key via send-keys."""
 
     def test_shlex_quoted_in_session_create(self):
         import inspect
@@ -985,43 +968,12 @@ class TestApiKeyShellQuoting:
         source = inspect.getsource(app.api_create_session)
         assert "shlex.quote" in source
 
-    def test_set_auth_mode_never_sends_credentials_to_tmux(self):
+    def test_shlex_quoted_in_set_auth_mode(self):
         import inspect
 
         import app
         source = inspect.getsource(app.api_set_auth_mode)
-        assert "OPENAI_API_KEY" not in source
-        assert "subprocess" not in source
-
-
-# ─── Codex detached-session trust ───
-
-
-class TestCodexProjectTrust:
-    def test_adds_native_trust_and_preserves_other_sections(self):
-        from app import _ensure_codex_project_trust, tomllib
-
-        original = (
-            'model = "gpt-5.6-sol"\n\n'
-            '[mcp_servers.google]\ncommand = "uvx"\n'
-        )
-        result = _ensure_codex_project_trust(original, "/srv/grabo")
-        parsed = tomllib.loads(result)
-        assert parsed["projects"]["/srv/grabo"]["trust_level"] == "trusted"
-        assert parsed["mcp_servers"]["google"]["command"] == "uvx"
-
-    def test_replaces_untrusted_marker_idempotently(self):
-        from app import _ensure_codex_project_trust
-
-        original = (
-            '[projects."/srv/grabo"]\n'
-            'trust_level = "untrusted"\n'
-            'trust_level = "untrusted"\n'
-        )
-        result = _ensure_codex_project_trust(original, "/srv/grabo")
-        assert result.count('trust_level = "trusted"') == 1
-        assert "untrusted" not in result
-        assert _ensure_codex_project_trust(result, "/srv/grabo") == result
+        assert "shlex.quote" in source
 
 
 # ─── Atomic JSON Write Tests ───
