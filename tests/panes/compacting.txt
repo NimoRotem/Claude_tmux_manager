@@ -1,0 +1,10 @@
+  Left undone: parity reports builder7 has no gh auth, no github ssh key, and
+  zero API keys, skills and infra sidecars against peers.
+
+✻ Compacting conversation… (48s · ↓ 12.1k tokens)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · esc to interrupt ·…
+                                                         0% until auto-compact
