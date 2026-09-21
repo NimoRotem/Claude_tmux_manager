@@ -1504,8 +1504,6 @@ class Run:
         _activity("escalated to resident browser", sid=str(sess.get("id")), url=self.url,
                   run=self.id, reason=(self.steps[-1].get("why") if self.steps else "asked for"),
                   rung="resident")
-        if self.takeover:
-            self._start_stream(sess)
         out = _run_node(runners["ladder-chromium.mjs"], {
             "url": self.url,
             "cdp": "http://127.0.0.1:%d" % cdp,
@@ -1517,25 +1515,9 @@ class Run:
         }, timeout=timeout + 15)
         step = self._absorb_browser(step, out, RESIDENT, "residential", shot, dom)
         step["browser"] = sess.get("id")
-        step["takeover_url"] = "/browser/%s/vnc.html" % sess.get("id") if self.takeover else ""
+        # The lite view needs nothing started: it attaches when a person opens it.
+        step["takeover_url"] = "/browser/%s/view" % sess.get("id") if self.takeover else ""
         return step
-
-    def _start_stream(self, sess: dict) -> None:
-        """Bring up the noVNC stream so a human can take the page over. Only on
-        request: a stream nobody is watching is ~2% of a core, forever."""
-        with contextlib.suppress(Exception):
-            if _port_alive(int(sess.get("vnc_port") or 0)):
-                return
-            if sess.get("managed"):
-                subprocess.run(["bash", str(CB_ROOT / "bin" / "browser-session.sh"), "vnc-start",
-                                str(sess.get("id")), str(sess.get("display")),
-                                str(sess.get("rfb_port")), str(sess.get("vnc_port"))],
-                               capture_output=True, timeout=60)
-            else:
-                subprocess.run(["sudo", "-n", "systemctl", "start",
-                                os.environ.get("CB_VNC_UNIT", "claude-vnc")],
-                               capture_output=True, timeout=60)
-            _activity("live view started for takeover", sid=str(sess.get("id")), run=self.id)
 
 
 # ---------------------------------------------------------------------------
@@ -1665,7 +1647,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--level", type=int, default=None, help="run exactly this rung, no escalation")
     p.add_argument("--start-level", type=int, default=None, help="start here, still escalates")
     p.add_argument("--no-memory", action="store_true", help="ignore what this host needed before")
-    p.add_argument("--takeover", action="store_true", help="at L4, start the stream for a human")
+    p.add_argument("--takeover", action="store_true", help="at L4, hand back the live view URL for a human")
     p.add_argument("--timeout", type=float, default=None, help="overall deadline, seconds")
     p.add_argument("--json", action="store_true", help="the whole run record")
     p.add_argument("--html", action="store_true", help="print HTML instead of text")

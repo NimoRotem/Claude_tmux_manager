@@ -120,6 +120,15 @@ DEFAULT_EFFORT = os.environ.get("TMUX_DASH_DEFAULT_EFFORT", "xhigh")
 # a redeploy. Persisted to models.json; the backend validation allowlist
 # (ALLOWED_SESSION_MODELS) and the frontend dropdown both derive from it.
 MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
+# Gateway mode (builder2A / LunaRoute and friends): when TMUX_DASH_MODEL_GATEWAY
+# is set, the model dropdown is sourced from an OpenAI/Anthropic-compatible
+# gateway's /v1/models (chat models only) instead of the built-in Anthropic seed
+# catalog, and it re-syncs on the 24h loop so new models the gateway adds show up
+# on their own. Default off, so every other box behaves exactly as before.
+MODEL_GATEWAY = os.environ.get("TMUX_DASH_MODEL_GATEWAY", "").lower() in ("1", "true", "yes")
+_MODEL_GATEWAY_BASE = (os.environ.get("ANTHROPIC_BASE_URL", "") or "").rstrip("/")
+_MODEL_GATEWAY_TOKEN = (os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+                        or os.environ.get("ANTHROPIC_API_KEY", ""))
 _MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
 _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
@@ -229,8 +238,72 @@ def _merge_seed_rows(rows: list) -> list:
     return out
 
 
+def _gateway_model_label(mid: str) -> str:
+    """Readable dropdown label for a gateway model id. deepseek-4.1-flash ->
+    'DeepSeek 4.1 Flash'; glm-5.3-flash-background -> 'GLM 5.3 Flash (background)'."""
+    suffix = ""
+    for tag in ("-background", "-flex"):
+        if mid.endswith(tag):
+            suffix = " (" + tag[1:] + ")"
+            mid = mid[: -len(tag)]
+            break
+    pretty = {"glm": "GLM", "deepseek": "DeepSeek", "qwen": "Qwen", "kimi": "Kimi",
+              "minimax": "MiniMax"}
+    words = [pretty.get(p, p.capitalize() if p[:1].isalpha() else p)
+             for p in mid.split("-") if p]
+    return " ".join(words) + suffix
+
+
+def _fetch_gateway_model_catalog():
+    """Chat-capable models from the gateway's /v1/models as [id, label] rows.
+    Keeps only models that speak the Anthropic Messages API (what Claude Code
+    drives); drops embeddings, rerankers and image models. Returns None on any
+    failure so the caller can fall back to the last cache."""
+    if not (MODEL_GATEWAY and _MODEL_GATEWAY_BASE and _MODEL_GATEWAY_TOKEN):
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            _MODEL_GATEWAY_BASE + "/v1/models",
+            headers={"Authorization": "Bearer " + _MODEL_GATEWAY_TOKEN},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        logger.debug("Gateway model fetch failed", exc_info=True)
+        return None
+    rows = []
+    for m in data.get("data", []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        caps = m.get("capabilities") or {}
+        if not mid or not caps.get("anthropic_messages"):
+            continue
+        rows.append([mid, _gateway_model_label(mid)])
+    rows.sort(key=lambda row: (2 if row[0].endswith("-background")
+                               else 1 if row[0].endswith("-flex") else 0, row[0]))
+    return rows or None
+
+
 def _load_model_catalog() -> list:
     """Load the persisted catalog, or seed it. Always returns a non-empty list."""
+    if MODEL_GATEWAY:
+        gw = _fetch_gateway_model_catalog()
+        if gw:
+            _save_model_catalog(gw, time.time())
+            return gw
+        # Gateway unreachable at boot: reuse the last good cache, but never fold
+        # in the Anthropic seed models — they are not served here.
+        try:
+            if MODELS_FILE.exists():
+                rows = [list(r) for r in (json.loads(MODELS_FILE.read_text()).get("models") or [])
+                        if isinstance(r, (list, tuple)) and len(r) == 2]
+                if rows:
+                    return rows
+        except Exception:
+            logger.debug("Failed to load cached gateway catalog", exc_info=True)
+        return [[DEFAULT_MODEL, _gateway_model_label(DEFAULT_MODEL)]]
     try:
         if MODELS_FILE.exists():
             data = json.loads(MODELS_FILE.read_text())
@@ -331,6 +404,16 @@ async def _refresh_model_catalog(force: bool = False) -> bool:
         now = time.time()
         if not force and now - last < MODEL_CHECK_INTERVAL:
             return False
+        if MODEL_GATEWAY:
+            gw = await asyncio.to_thread(_fetch_gateway_model_catalog)
+            if not gw:
+                logger.info("Gateway model refresh: none returned — will retry")
+                return False
+            changed = [r[0] for r in gw] != [r[0] for r in MODEL_CATALOG]
+            MODEL_CATALOG = gw
+            ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+            _save_model_catalog(gw, now)
+            return changed
         api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
         if not api_ids:
             # Couldn't reach the API — don't stamp last_check, so we retry sooner.
@@ -848,9 +931,10 @@ def _claude_launch_env_prefix() -> str:
     tok = _load_longlived_token()
     if tok and not _plan_credential_is_static():
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
-                + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
-    return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
-            "CLAUDE_CODE_EFFORT_LEVEL; ")
+                + "; export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENAI_VOICE_KEY= OPENAI_TASKS_KEY= CODEX_API_KEY=; "
+                "unset CLAUDE_CODE_EFFORT_LEVEL; ")
+    return ("export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENAI_VOICE_KEY= OPENAI_TASKS_KEY= CODEX_API_KEY=; "
+            "unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_EFFORT_LEVEL; ")
 
 
 # --- Pane launch script ------------------------------------------------------
@@ -1697,6 +1781,63 @@ async def api_dashboard_build():
     reads it is already signed in, so there is nothing to gain by carving it out."""
     return JSONResponse(_dashboard_build())
 
+
+
+# ── Which build of this dashboard is running, and which kind ────────────────
+# There is no single "the dashboard". Nine deployments run five generations of
+# this file, on two different agents (claude and codex), and several of them are
+# not git checkouts at all, so "I'm looking at the dashboard and X is wrong" is a
+# report about nothing until you know WHICH one. The tools menu prints this line
+# so the answer is on screen rather than in an ssh session.
+#
+# The date comes from the running file, not from git: the tree a box serves is
+# routinely ahead of (or behind) its branch, and a mtime cannot lie about which
+# bytes are loaded. The sha is added when there is one, as a courtesy.
+_BUILD_INFO: dict = {}
+
+
+def _dashboard_build() -> dict:
+    """`{version, flavour, host, sha}` for the app.py this process is running."""
+    if _BUILD_INFO:
+        return _BUILD_INFO
+    import socket
+    here = Path(__file__).resolve()
+    try:
+        stamp = time.strftime("%Y.%m.%d", time.localtime(here.stat().st_mtime))
+    except Exception:
+        stamp = "unknown"
+    sha = ""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=str(here.parent), capture_output=True,
+                             text=True, timeout=5)
+        if out.returncode == 0:
+            sha = (out.stdout or "").strip()
+            dirty = subprocess.run(["git", "status", "--porcelain", "--", str(here)],
+                                   cwd=str(here.parent), capture_output=True,
+                                   text=True, timeout=5)
+            if dirty.returncode == 0 and (dirty.stdout or "").strip():
+                sha += "+"
+    except Exception:
+        sha = ""
+    # Which agent a new session spawns is what makes a box "a codex box"; the env
+    # var is the same one supervisor sets, so it cannot drift from reality.
+    cmd = (globals().get("NEW_SESSION_CMD") or "").lower()
+    flavour = "Codex" if "codex" in cmd else "Claude"
+    _BUILD_INFO.update({
+        "version": stamp + ("-" + sha if sha else ""),
+        "flavour": flavour,
+        "host": socket.gethostname(),
+        "sha": sha,
+    })
+    return _BUILD_INFO
+
+
+@app.get("/api/build")
+async def api_dashboard_build():
+    """Open on purpose: it names a build, not a secret, and the login page is one
+    of the places you want to know which box answered."""
+    return JSONResponse(_dashboard_build())
 
 
 # The USPTO filing panel MOVED OUT on 2026-09-01. It is its own service now
@@ -8746,6 +8887,10 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     )
     command = re.sub(r"\s+--effort(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)", "", command)
     command = re.sub(r"\s+--continue\b", "", command)
+    # Resume the conversation only if it was actually written. A session created
+    # with this id but relaunched before its first saved turn has no transcript,
+    # and `--resume` on it exits with "No conversation found", leaving a dead
+    # shell. Start fresh on the same id in that case so the session stays alive.
     command = (command.strip()
                + _model_flag_for_relaunch(session_name)
                + _effort_flag_for_relaunch(session_name)
@@ -13483,6 +13628,16 @@ async def api_auth_setup_submit(body: CodeBody, request: Request):
 BROWSER_SESSIONS_FILE = MESSAGES_DIR / "browser_sessions.json"
 BROWSER_LAUNCHER = str(Path.home() / ".claude-browser" / "bin" / "browser-session.sh")
 BROWSER_MAX_EXTRA = 4  # cap concurrent EXTRA browsers (RAM headroom)
+
+
+def _browser_runtime_coordinates(slot: int) -> tuple[int, int, int, int]:
+    """Map a dashboard-local browser slot into host-global display and ports."""
+    try:
+        offset = int(os.environ.get("CB_BROWSER_SLOT_OFFSET") or 0)
+    except ValueError:
+        offset = 0
+    runtime_slot = max(0, int(slot)) + max(0, offset)
+    return 99 + runtime_slot, 5900 + runtime_slot, 6080 + runtime_slot, 9222 + runtime_slot
 # Streaming caps for a WATCHED browser. defer/wait are x11vnc's frame pacing in
 # ms (80 => ~12 fps, enough to work in, far cheaper than uncapped); compression
 # and quality are noVNC's client-side JPEG knobs.
@@ -13735,20 +13890,12 @@ def _ensure_browser_launcher():
 # CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
 # everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
 # only correct way in.
-#
-# `managed` says who starts the thing. It is False by default because on the
-# hosts this began on, display :99 belongs to a systemd unit (claude-vnc) that
-# owns the browser's whole lifecycle and the dashboard must not fight it. A box
-# built without such a unit has the opposite problem: the default browser is the
-# ADMIN's account browser (_browser_owner_id maps it to "admin"), so with nobody
-# managing it the owner is the one person on the box whose browser can never
-# start, while every other account's does (lisa-claude, 2026-08-27). Set
-# CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
+_DEFAULT_DISPLAY, _DEFAULT_RFB, _DEFAULT_VNC, _DEFAULT_CDP = _browser_runtime_coordinates(0)
 _DEFAULT_BROWSER_SESSION = {
-    "id": "default", "name": "Main browser", "slot": 0, "display": 99,
-    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
-    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222,
+    "id": "default", "name": "Main browser", "slot": 0, "display": _DEFAULT_DISPLAY,
+    "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or _DEFAULT_RFB),
+    "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or _DEFAULT_VNC),
+    "cdp_port": int(os.environ.get("CB_DEFAULT_CDP_PORT") or _DEFAULT_CDP),
     # `managed` says who starts the thing. False by default because on the hosts
     # this began on, display :99 belongs to a systemd unit (claude-vnc) that owns
     # the browser's whole lifecycle and the dashboard must not fight it. A box
@@ -13887,8 +14034,9 @@ def _slot_claims_unlock(fh):
 
 
 def _slot_ports_free(slot: int) -> bool:
+    _display, rfb_port, vnc_port, cdp_port = _browser_runtime_coordinates(slot)
     return not any(_browser_port_alive(p)
-                   for p in (5900 + slot, 6080 + slot, 9222 + slot))
+                   for p in (rfb_port, vnc_port, cdp_port))
 
 
 def _slot_claims_write(claims: dict) -> None:
@@ -13900,10 +14048,11 @@ def _slot_claims_write(claims: dict) -> None:
 
 def _apply_browser_slot(session: dict, slot: int) -> None:
     session["slot"] = slot
-    session["display"] = 99 + slot
-    session["rfb_port"] = 5900 + slot
-    session["vnc_port"] = 6080 + slot
-    session["cdp_port"] = 9222 + slot
+    display, rfb_port, vnc_port, cdp_port = _browser_runtime_coordinates(slot)
+    session["display"] = display
+    session["rfb_port"] = rfb_port
+    session["vnc_port"] = vnc_port
+    session["cdp_port"] = cdp_port
 
 
 def _free_slot(taken: set) -> int:
@@ -14015,6 +14164,13 @@ def _browser_viewer_url(s: dict, prefix: Optional[str] = None) -> str:
             "&autoconnect=true&resize=scale&shared=true"
             f"&compression={VNC_COMPRESSION}&quality={VNC_QUALITY}"
             "&reconnect=true&reconnect_delay=2000")
+
+
+def _browser_view_url(s: dict, prefix: Optional[str] = None) -> str:
+    """The lite live view (browser_view.py): the page over Chrome's own screencast,
+    real X input, the X clipboard. Needs no stream started first, unlike noVNC."""
+    base = ROOT_PATH if prefix is None else prefix
+    return f"{base}/browser/{s.get('id')}/view"
 
 
 # ── Android device viewers ───────────────────────────────────────────────────
@@ -14190,6 +14346,7 @@ async def api_browser_sessions(request: Request):
         row["live_autostop"] = _live_autostop_enabled(s)
         row["live_viewers"] = int(_live_viewers.get(str(s.get("id") or ""), 0))
         row["viewer_url"] = _browser_viewer_url(s, prefix)
+        row["view_url"] = _browser_view_url(s, prefix)
         shot = await asyncio.to_thread(_latest_shot, str(s.get("id") or ""))
         row["shot_at"] = shot.stat().st_mtime if shot else 0
         st = _monitor_state.get(str(s.get("id") or "")) or {}
@@ -14755,14 +14912,15 @@ def _ensure_user_browser_session(
             if not slot:
                 logger.error("No free browser slot for account '%s'", user_id)
                 return {}
+            display, rfb_port, vnc_port, cdp_port = _browser_runtime_coordinates(slot)
             session = {
                 "id": sid,
                 "name": f"{user.get('username') or 'User'} browser"[:80],
                 "slot": slot,
-                "display": 99 + slot,
-                "rfb_port": 5900 + slot,
-                "vnc_port": 6080 + slot,
-                "cdp_port": 9222 + slot,
+                "display": display,
+                "rfb_port": rfb_port,
+                "vnc_port": vnc_port,
+                "cdp_port": cdp_port,
                 "managed": True,
                 "owner_id": user_id,
                 "account_browser": True,
@@ -15177,6 +15335,23 @@ def _visible_page(pages: list) -> dict:
     return pages[0] if pages else {}
 
 
+def _shrink_jpeg(raw: bytes, scale: float, quality: int) -> bytes:
+    """A thumbnail of a full-size capture. Returns the original if Pillow is missing."""
+    if scale >= 1:
+        return raw
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+        img.draft("RGB", size)            # decode at a reduced size where JPEG allows
+        out = io.BytesIO()
+        img.convert("RGB").resize(size, Image.BILINEAR).save(out, "JPEG", quality=int(quality))
+        return out.getvalue()
+    except Exception:
+        return raw
+
+
 async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
                                 page: dict = None) -> dict:
     """Thumbnail the visible tab over CDP and write one audit row for it."""
@@ -15196,18 +15371,15 @@ async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
         return {"ok": False, "error": f"Browser is unreachable: {exc}"[:200]}
     try:
         tab = _CdpTab(ws)
-        try:
-            metrics = await tab.call("Page.getLayoutMetrics", {}, timeout=10)
-            vp = metrics.get("cssVisualViewport") or metrics.get("layoutViewport") or {}
-            w = int(vp.get("clientWidth") or vp.get("width") or 1280)
-            h = int(vp.get("clientHeight") or vp.get("height") or 720)
-            clip = {"x": 0, "y": 0, "width": w, "height": h, "scale": SHOT_SCALE}
-        except Exception:
-            clip = None
-        params = {"format": "jpeg", "quality": SHOT_QUALITY}
-        if clip:
-            params["clip"] = clip
-        shot = await tab.call("Page.captureScreenshot", params, timeout=25)
+        # Full size, shrunk here, never a `clip` with a `scale`. Chrome does a scaled
+        # capture by resizing the PAGE for its duration, and when the connection
+        # closes mid-capture (this call's timeout, a busy page) the resize is never
+        # undone. Measured 2026-09-13: the account browser on builder2 had sat at a
+        # 749x395 viewport, exactly 0.4 of its window, for days; an agent there got
+        # a phone layout. A new session's clearDeviceMetricsOverride does not
+        # restore it; resizing the window does.
+        shot = await tab.call("Page.captureScreenshot",
+                              {"format": "jpeg", "quality": SHOT_QUALITY}, timeout=25)
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
     finally:
@@ -15221,7 +15393,8 @@ async def _capture_browser_shot(session: dict, reason: str, agents: list = None,
     ts = time.time()
     name = f"{int(ts * 1000)}.jpg"
     try:
-        (_shots_dir(sid) / name).write_bytes(base64.b64decode(data))
+        (_shots_dir(sid) / name).write_bytes(
+            await asyncio.to_thread(_shrink_jpeg, base64.b64decode(data), SHOT_SCALE, SHOT_QUALITY))
     except Exception as exc:
         return {"ok": False, "error": f"Could not store screenshot: {exc}"[:200]}
     _prune_shots(sid)
@@ -15422,6 +15595,7 @@ async def _member_browser_status(user: dict, prefix: Optional[str] = None) -> di
             "name": session.get("name", "") or "Browser",
             "running": running,
             "viewer_url": _browser_viewer_url(session, prefix),
+            "view_url": _browser_view_url(session, prefix),
         },
         "connected": connected,
         "signed_in": signed_in,
@@ -15579,7 +15753,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
                       "(here or on the sibling dashboard) and try again."},
             status_code=409)
     sid = "s%d" % slot
-    disp, rfb, vnc, cdp = 99 + slot, 5900 + slot, 6080 + slot, 9222 + slot
+    disp, rfb, vnc, cdp = _browser_runtime_coordinates(slot)
     name = (body.name or "").strip() or f"Browser {slot + 1}"
     _ensure_browser_launcher()
 
@@ -15603,6 +15777,7 @@ async def api_browser_create(body: BrowserCreateBody, request: Request):
     row = dict(entry)
     row["running"] = ok
     row["viewer_url"] = _browser_viewer_url(entry, _req_prefix(request))
+    row["view_url"] = _browser_view_url(entry, _req_prefix(request))
     logger.info("Browser session '%s' created on display :%d (vnc %d, cdp %d), started=%s",
                 sid, disp, vnc, cdp, ok)
     return JSONResponse({"ok": True, "session": row, "started": ok})
@@ -15694,6 +15869,7 @@ async def api_browser_update(sid: str, body: BrowserPatchBody, request: Request)
     row["live_running"] = await asyncio.to_thread(_browser_port_alive, target.get("vnc_port", 0))
     row["live_autostop"] = _live_autostop_enabled(target)
     row["viewer_url"] = _browser_viewer_url(target, _req_prefix(request))
+    row["view_url"] = _browser_view_url(target, _req_prefix(request))
     logger.info("Browser session '%s' updated (name=%r, notes=%d chars)",
                 sid, target.get("name"), len(target.get("notes", "")))
     return JSONResponse({"ok": True, "session": row})
@@ -17967,6 +18143,34 @@ async def browser_proxy_ws(ws: WebSocket, sid: str):
     finally:
         _live_viewers[sid] = max(0, _live_viewers.get(sid, 1) - 1)
         _live_last_seen[sid] = time.time()
+
+
+# The lite live view, /browser/<sid>/view. Registered HERE, above the noVNC asset
+# proxy right below: that route's {path:path} matches /view too, and would hand the
+# request to websockify, which 404s it. Both the page and its websocket check the
+# viewer themselves, because HTTP middleware does not run for websockets.
+def _browser_view_allowed(conn, s: dict) -> bool:
+    if AUTH_PASS and not _check_token(conn.cookies.get(AUTH_COOKIE)):
+        return False
+    user = _current_user(conn)
+    if not user:
+        return False
+    return (not TEAM_MODE) or _is_admin(user) or _browser_owner_id(s) == str(user.get("id", ""))
+
+
+try:
+    import browser_view
+    browser_view.mount(
+        app,
+        session=_browser_session_by_id,
+        can_view=_browser_view_allowed,
+        prefix=_req_prefix,
+        proxy_conf=lambda: _proxy_conf(),
+        extras=lambda s, pre: {"vnc_url": _browser_viewer_url(s, pre),
+                               "live_api": f"{pre}/api/browser/live/{s.get('id')}"},
+    )
+except Exception:
+    logger.exception("lite browser view not mounted")
 
 
 @app.api_route("/browser/{sid}/{path:path}", methods=["GET", "HEAD"])
@@ -20764,7 +20968,8 @@ async def api_set_session_model(session_name: str, body: ModelBody):
         try:
             tail = await asyncio.to_thread(capture_pane_recent, session_name, 8)
             low = tail.lower()
-            if "unknown model" in low or "not a valid model" in low or "invalid model" in low:
+            if ("unknown model" in low or "not a valid model" in low
+                    or "invalid model" in low or "not found" in low):
                 return JSONResponse(
                     {"error": f"Claude rejected the model id '{mid}' — it may not be "
                               "available on this plan or CLI version"},
@@ -22258,7 +22463,11 @@ _seen_claude_running: set = set()       # sessions observed running Claude this 
 # "aborted"/"killed" sitting in prose above the shell.
 _CRASH_SIGNATURE_RE = re.compile(
     r"Aborted|Killed|Segmentation fault|Bus error|"
-    r"Trace/breakpoint trap|Floating point exception|core dumped"
+    r"Trace/breakpoint trap|Floating point exception|core dumped|"
+    # A relaunch whose --resume pointed at a conversation that was never written
+    # exits with this and drops to a bare shell. Treat it as recoverable: the
+    # fixed relaunch path starts fresh on the same id, so it cannot recur.
+    r"No conversation found with session ID"
 )
 # V8 / out-of-memory death throes (case-insensitive).
 _CRASH_OOM_RE = re.compile(
@@ -30986,8 +31195,11 @@ function renderBrowserTab(data){
     const editing = _bsEditId === s.id;
     const openBtns =
       '<button class="btn" onclick="openBrowserSession(\''+id+'\')"'+
-        ' title="Start the VNC stream if it is not up and open it in a new tab. The stream'+
-        ' stops on its own once nobody is watching.">View live&nbsp;↗</button>'+
+        ' title="Watch and use this browser in a new tab. Light: it streams the page only'+
+        ' when it changes, types with a real keyboard, and ctrl-C / ctrl-V work.">View live&nbsp;↗</button>'+
+      ' <button class="btn btn-ghost" onclick="openBrowserVnc(\''+id+'\')"'+
+        ' title="The full noVNC desktop. Heavier; use it only when View live is not enough.'+
+        ' The stream stops on its own once nobody is watching.">VNC</button>'+
       (s.live_running? ' <button class="btn btn-ghost" onclick="stopBrowserLive(\''+id+'\')"'+
         ' title="Stop the VNC stream now. The browser, its tabs and anything driving it'+
         ' carry on untouched.">Stop stream</button>':'')+
@@ -31137,8 +31349,10 @@ function renderBrowserTab(data){
       '<div class="pf-banner">Independent browsers you (or Claude) can drive. Each card shows the '+
         '<b>last screenshot</b>, not a live stream: shots are taken over the browser\'s own control '+
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
-        'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
-        'once nobody is watching. <b>History</b> is the audit trail.</div>'+
+        'nothing to watch. <b>View live ↗</b> opens the browser in a new tab: the page is sent only '+
+        'when it changes, typing and clicks arrive as a real keyboard and mouse, and ctrl-C / ctrl-V '+
+        'copy and paste with your own computer. <b>VNC</b> is the full desktop, heavier, for the '+
+        'rare thing View live cannot show. <b>History</b> is the audit trail.</div>'+
       // Signing in by hand is a different job from watching an agent work, and
       // VNC is the wrong transport for it. The console browser streams one tab
       // over CDP instead, goes out DIRECT rather than through the residential
@@ -31703,14 +31917,21 @@ function _bsHost(url){
   return m ? m[1] : (url||'').slice(0, 40);
 }
 
-// Open the live view: start the stream first (it is normally not running), then
+// Open the lite live view. Nothing to start first: it attaches to the browser's
+// own control port when the tab opens and lets go when it closes.
+function openBrowserSession(id){
+  const s=_bsFind(id);
+  // Not every card is a Chrome. The Android device viewers (builder) proxy an adb
+  // screen over plain HTTP and have no lite view.
+  if(s && (!s.kind || s.kind === 'browser') && s.view_url){ window.open(s.view_url, '_blank'); return; }
+  return openBrowserVnc(id);
+}
+
+// The noVNC desktop: start the stream first (it is normally not running), then
 // open the viewer tab. Opening the tab first would race the bridge coming up.
-async function openBrowserSession(id){
+async function openBrowserVnc(id){
   const s=_bsFind(id);
   if(!s) return;
-  // Not every card is a VNC-backed Chrome. The Android device viewers (builder)
-  // proxy an adb screen over plain HTTP: there is no stream to start, and the
-  // live endpoint would 404 on an id that is not a browser session.
   if(s.kind && s.kind !== 'browser'){ window.open(s.viewer_url, '_blank'); return; }
   if(!s.live_running){
     showToast('Starting the live stream…');
@@ -34730,6 +34951,7 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     return FileResponse(str(target), media_type=mime)
+
 
 
 if __name__ == "__main__":

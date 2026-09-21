@@ -356,6 +356,13 @@ class Screencast:
         self._latest_digest = ""
         self._shown_digest = ""
         self._new_frame = asyncio.Event()
+        # Replies someone is waiting for, by message id. Only call() puts anything
+        # here; the fire-and-forget _send() never does, so the pump stays the only
+        # reader of the socket either way.
+        self._waiters = {}
+        self._pending_ack = None
+        self._was_hidden = False
+        self._last_frame_at = 0.0
 
     async def __aenter__(self):
         self._cdp = await ws_connect(self.ws_url, max_size=None, open_timeout=15)
@@ -391,6 +398,12 @@ class Screencast:
             "format": "jpeg", "quality": self.quality,
             "maxWidth": self.max_width, "maxHeight": self.max_height,
             "everyNthFrame": self.every_nth})
+
+    async def _on_hidden(self):
+        """Gone hidden: without this the stream is simply over."""
+        await self._make_visible()
+        with contextlib.suppress(Exception):
+            await self._start()
 
     async def _renudge(self):
         """After a navigation, provoke a paint if the new page is already static."""
@@ -431,6 +444,36 @@ class Screencast:
                                          "params": params or {}}))
         return self._next_id
 
+    async def call(self, method: str, params: dict = None, timeout: float = 5.0) -> dict:
+        """Send a command and wait for its reply. Needs pump() to be running,
+        because pump() is what reads the socket and hands the reply over."""
+        fut = asyncio.get_running_loop().create_future()
+        self._next_id += 1
+        ident = self._next_id
+        self._waiters[ident] = fut
+        try:
+            await self._cdp.send(json.dumps({"id": ident, "method": method,
+                                             "params": params or {}}))
+            msg = await asyncio.wait_for(fut, timeout)
+        finally:
+            self._waiters.pop(ident, None)
+        if "error" in msg:
+            raise RuntimeError("%s: %s" % (method, (msg["error"] or {}).get("message")))
+        return msg.get("result") or {}
+
+    # Events a subclass wants passed to on_event besides the navigations.
+    EXTRA_EVENTS = ()
+
+    # Ack a frame only when the viewer is ready for the next one, instead of at once.
+    #
+    # Measured 2026-09-13 on builder2, a HEADED Chrome 151 on a page that was not
+    # moving: acked immediately, the screencast produced a frame on every vsync, the
+    # watched Chrome went from 4% of a core to 113%, and the process doing the
+    # acking to 19%. De-duplication hid it on the wire (0.2 KB/s) while the box paid
+    # for 60 JPEG encodes a second. Chrome sends nothing until the last frame is
+    # acked, so holding the ack for the pacing interval is the frame rate limit.
+    PACE_ACKS = False
+
     async def _sender(self, on_frame):
         """At most one frame per interval, and only if the picture changed."""
         while True:
@@ -442,7 +485,18 @@ class Screencast:
                 self._sent += 1
                 self._bytes += len(frame[0])
                 await on_frame(frame[0], frame[1])
-            await asyncio.sleep(self._interval)
+            if not self.PACE_ACKS:
+                await asyncio.sleep(self._interval)
+                continue
+            # Sleep in slices, so an input that shortens the interval takes effect
+            # now rather than after the idle interval already under way.
+            started = time.time()
+            while time.time() - started < self._interval:
+                await asyncio.sleep(min(0.04, self._interval))
+            ack, self._pending_ack = self._pending_ack, None
+            if ack is not None:
+                with contextlib.suppress(Exception):
+                    await self._send("Page.screencastFrameAck", {"sessionId": ack})
 
     async def pump(self, on_frame, on_event=None):
         """Forward frames until the CDP socket closes."""
@@ -463,13 +517,22 @@ class Screencast:
             except Exception:
                 continue
             method = msg.get("method")
+            if method is None and msg.get("id") in self._waiters:
+                fut = self._waiters.pop(msg["id"])
+                if not fut.done():
+                    fut.set_result(msg)
+                continue
             if method == "Page.screencastFrame":
                 params = msg["params"]
                 self._meta = params.get("metadata") or {}
                 self._frames += 1
-                with contextlib.suppress(Exception):
-                    await self._send("Page.screencastFrameAck",
-                                     {"sessionId": params["sessionId"]})
+                self._last_frame_at = time.time()
+                if self.PACE_ACKS:
+                    self._pending_ack = params["sessionId"]
+                else:
+                    with contextlib.suppress(Exception):
+                        await self._send("Page.screencastFrameAck",
+                                         {"sessionId": params["sessionId"]})
                 data = params.get("data", "")
                 self._latest = (data, self._meta)
                 self._latest_digest = hashlib.blake2b(
@@ -477,13 +540,20 @@ class Screencast:
                 self._new_frame.set()
             elif method == "Page.screencastVisibilityChanged":
                 if (msg.get("params") or {}).get("visible"):
-                    with contextlib.suppress(Exception):
-                        await self._start()
+                    # Restart only after a hidden spell. Chrome answers EVERY
+                    # startScreencast with a fresh visible=true, so restarting on
+                    # visible is a loop: measured 2026-09-13 on a headed Chrome 151,
+                    # 200 restarts in under 5 seconds, 26 captures a second of a
+                    # page that was not moving, the browser at 130% of a core.
+                    if self._was_hidden:
+                        self._was_hidden = False
+                        with contextlib.suppress(Exception):
+                            await self._start()
                 else:
-                    # Gone hidden: without this the stream is simply over.
-                    await self._make_visible()
-                    with contextlib.suppress(Exception):
-                        await self._start()
+                    self._was_hidden = True
+                    await self._on_hidden()
+                if on_event and method in self.EXTRA_EVENTS:
+                    await on_event(method, msg.get("params") or {})
             elif method in ("Page.frameNavigated", "Page.loadEventFired"):
                 # A cross-document navigation tears the screencast down with the
                 # old document, and Chrome does not tell you: the socket stays
@@ -502,6 +572,8 @@ class Screencast:
                     asyncio.create_task(self._renudge())
                 if on_event:
                     await on_event(method, msg.get("params") or {})
+            elif method in self.EXTRA_EVENTS and on_event:
+                await on_event(method, msg.get("params") or {})
 
     # ---- input passthrough -------------------------------------------------
     def _to_page(self, nx: float, ny: float):
