@@ -28654,6 +28654,11 @@ const navStatsEl=document.getElementById('nav-server-stats');
 async function refreshNavStats(){
   try{
     const resp=await fetch(BASE+'/api/stats');
+    // The build check used to ride on the status poll alone, so the one tab
+    // that most needed a newer build, the one whose status poll is not getting
+    // through, was also the one tab that could never learn a newer build
+    // existed. Any response carries the header; use this one too.
+    _checkBuild(resp);
     const s=await resp.json();
     const cpuPct=s.cpu_percent!=null?s.cpu_percent:0;
     const threads=s.threads_running!=null?s.threads_running:'?';
