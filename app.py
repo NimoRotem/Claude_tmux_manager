@@ -8799,15 +8799,22 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
         "-F",
         "#{session_id}\t#{session_name}",
     ]
-    held = [name_ for name_ in FENCED_ENV_NAMES if os.environ.get(name_)]
-    if held and _tmux_supports_new_session_e():
-        for fenced in held:
+    #  UNCONDITIONAL, and that is the point. Gating this on the DASHBOARD's own
+    #  environment reads like a fence and is dead code against the case that
+    #  actually happens: measured on the Codex side 2026-09-20, a tmux SERVER's
+    #  global environment carried a 167-character key while the dashboard process
+    #  did not, so `os.environ` said there was nothing to fence and a pane
+    #  inherited it anyway. The server outlives the dashboard and can be started
+    #  by anything. tmux accepts `-e NAME=` for a name nothing has set, so send
+    #  every name every time and both sources are closed.
+    if _tmux_supports_new_session_e():
+        for fenced in FENCED_ENV_NAMES:
             command += ["-e", "%s=" % fenced]
-    elif held:
+    else:
         #  Old tmux: `set-environment -g` reaches the same place, every pane the
         #  server starts from here on, and it has been in tmux since 1.0. Best
         #  effort, because the client below still goes out with the names empty.
-        for fenced in held:
+        for fenced in FENCED_ENV_NAMES:
             try:
                 subprocess.run(["tmux", "set-environment", "-g", fenced, ""],
                                capture_output=True, text=True, timeout=5,
