@@ -622,22 +622,48 @@ def warp_start(wait_s: float = 12.0) -> bool:
     return False
 
 
+def pids_on_port(port: int) -> List[int]:
+    """Whoever is listening on a local port, without assuming which tool is here.
+
+    `lsof` is NOT installed on every box (builder4 has ss and fuser only), and the
+    version of this that shelled straight to lsof raised FileNotFoundError, was
+    swallowed, and reported "could not stop it" for ever: the L3 egress was never
+    reaped on any box without lsof, which is the opposite of what this module
+    promises. Never a name match, always the port: a broad pattern kill has taken
+    out unrelated agent sessions here.
+    """
+    pids: List[int] = []
+    with contextlib.suppress(Exception):
+        out = subprocess.run(["lsof", "-ti", "tcp:%d" % port], capture_output=True,
+                             text=True, timeout=10).stdout.split()
+        pids = [int(p) for p in out if p.strip().isdigit()]
+    if not pids:
+        with contextlib.suppress(Exception):
+            out = subprocess.run(["ss", "-ltnpH", "sport = :%d" % port],
+                                 capture_output=True, text=True, timeout=10).stdout
+            pids = [int(m) for m in re.findall(r"pid=(\d+)", out)]
+    if not pids:
+        with contextlib.suppress(Exception):
+            out = subprocess.run(["fuser", "-n", "tcp", str(port)], capture_output=True,
+                                 text=True, timeout=10).stdout
+            pids = [int(p) for p in out.split() if p.strip().isdigit()]
+    return sorted(set(pids))
+
+
 def warp_stop() -> bool:
     """Kill it by the port it holds. Never `pkill wireproxy`: this box has had
     unrelated agent sessions killed by a broad pattern match before."""
     port = int(config()["warp_port"])
     if not _port_alive(port):
         return False
-    try:
-        out = subprocess.run(["lsof", "-ti", "tcp:%d" % port], capture_output=True,
-                             text=True, timeout=10).stdout.split()
-        for pid in out:
-            with contextlib.suppress(Exception):
-                os.kill(int(pid), 15)
-        _activity("L3 egress down (WARP)", sid="ladder")
-        return True
-    except Exception:
+    pids = pids_on_port(port)
+    if not pids:
         return False
+    for pid in pids:
+        with contextlib.suppress(Exception):
+            os.kill(int(pid), 15)
+    _activity("L3 egress down (WARP)", sid="ladder")
+    return True
 
 
 def warp_reap_if_idle() -> None:
