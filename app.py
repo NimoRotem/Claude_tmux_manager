@@ -90,9 +90,10 @@ AGENT_AGGREGATE_MEMORY_MAX_PERCENT = int(
 def _managed_agent_command(session_name: str, command: str) -> str:
     """Apply builder4-only test and resource controls to one Claude launch."""
     pytest_env = build_pytest_gate_env_prefix(PYTEST_PLUGIN_DIR, account="builder4")
+    # A session runs on its plan and is handed no metered key (owner rule 2026-09-20).
     return scoped_agent_command(
         session_name,
-        f"{pytest_env} {command.strip()}",
+        f"{pytest_env} env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY {command.strip()}",
         memory_high_mb=AGENT_MEMORY_HIGH_MB,
         memory_max_mb=AGENT_MEMORY_MAX_MB,
         slice_name=AGENT_SLICE_NAME,
@@ -564,6 +565,16 @@ def _git_identity_for(user, owner_name: str):
     the owner/admin gets the box's real identity."""
     if TEAM_MODE and user and not _is_admin(user):
         return owner_name, "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN)
+    # A box can have several admins (claude.lisa.my and codex.lisa.my both run
+    # Nimo, Michiel and Monica, all role admin). They share one OS user and one
+    # git config, so without this every one of them commits as the box owner and
+    # `git log` cannot say who did the work. Only the owner account, id "admin",
+    # carries the box's identity; anyone else commits as themselves, preferring
+    # the address they sign in with.
+    if user and str(user.get("id") or "") != "admin":
+        name = str(user.get("username") or "").strip() or owner_name
+        email = str(user.get("google_email") or "").strip()
+        return name, email or "%s@%s" % (name, GIT_EMAIL_DOMAIN)
     return (GIT_OWNER_NAME or _git_config_value("user.name") or owner_name,
             GIT_OWNER_EMAIL or _git_config_value("user.email")
             or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
@@ -1257,18 +1268,39 @@ def _transcript_has_turns(path: str) -> bool:
     return False
 
 
+def _conversation_transcript_candidates(session_name: str, convo_uuid: str) -> list:
+    """This id's transcript file, by the pane's project dir and then by the
+    session's own config dir (which is where a team member's lives)."""
+    target = convo_uuid + ".jsonl"
+    out = []
+    try:
+        out += [f for f in _find_session_jsonl_files(session_name)
+                if os.path.basename(f) == target]
+    except Exception:
+        pass
+    if not out:
+        try:
+            base = _session_config_base(session_name)
+        except Exception:
+            base = Path.home() / ".claude"
+        try:
+            out += [str(p) for p in (base / "projects").glob("*/" + target)]
+        except Exception:
+            pass
+    return out
+
+
 def _conversation_state(session_name: str, convo_uuid: str) -> str:
     """'saved' (resumable), 'stub' (file with no turns), or 'missing'."""
     if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
         return "missing"
-    try:
-        target = convo_uuid + ".jsonl"
-        for f in _find_session_jsonl_files(session_name):
-            if os.path.basename(f) == target:
-                return "saved" if _transcript_has_turns(f) else "stub"
-    except Exception:
-        logger.debug("conversation existence check failed for %s", session_name, exc_info=True)
+    for f in _conversation_transcript_candidates(session_name, convo_uuid):
+        return "saved" if _transcript_has_turns(f) else "stub"
     return "missing"
+
+
+def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
+    return _conversation_state(session_name, convo_uuid) == "saved"
 
 
 def _set_aside_stub_transcript(session_name: str, convo_uuid: str) -> None:
@@ -1277,12 +1309,11 @@ def _set_aside_stub_transcript(session_name: str, convo_uuid: str) -> None:
     Renamed rather than deleted: it holds nothing but two mode lines, but it is
     not ours to destroy, and the suffix says exactly why it moved."""
     try:
-        target = convo_uuid + ".jsonl"
-        for f in _find_session_jsonl_files(session_name):
-            if os.path.basename(f) == target and not _transcript_has_turns(f):
+        for f in _conversation_transcript_candidates(session_name, convo_uuid):
+            if not _transcript_has_turns(f):
                 os.replace(f, f + ".no-turns-%d" % int(time.time()))
                 logger.info("Set aside empty transcript %s for '%s' so it can relaunch",
-                            target, session_name)
+                            os.path.basename(f), session_name)
     except Exception:
         logger.debug("could not set aside stub transcript for %s", session_name, exc_info=True)
 
@@ -1297,12 +1328,28 @@ def _fresh_or_resume_flag(session_name: str, convo_uuid: str) -> str:
     return "--session-id " + convo_uuid
 
 
+def _convo_has_transcript(session_name: str, convo_uuid: str) -> bool:
+    """True when Claude has a transcript on disk for this conversation.
+
+    `--resume <id>` is fatal without one: Claude prints "No conversation found
+    with session ID: <id>" and exits before it draws anything, so the pane drops
+    to bash and the tab reads to the user as a logout (seen on 'smoke',
+    2026-08-27). A conversation we named ourselves with `--session-id` has no
+    file until its first message, so a tab relaunched before anyone typed in it
+    is exactly the case that hits this. Look in the session's OWN config dir
+    only: a member cannot resume a transcript that lives in another one.
+    """
+    return _conversation_state(session_name, convo_uuid) == "saved"
+
+
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """The resume flag for relaunching this pane's Claude, in order of trust.
 
     1. `--resume <uuid>` for the conversation we launched this pane on, or that
        a caller identified. Exact, and the only option that cannot pick up a
-       neighbour's work.
+       neighbour's work. When that conversation has no transcript yet it becomes
+       `--session-id <same uuid>`: same conversation, but Claude has to create it
+       rather than load it, and every record pointing at this pane stays valid.
     2. The scrollback-matching heuristic, for panes that predate (1).
     3. `--continue` — ONLY when no other live session shares this cwd. It means
        "the most recent conversation here", which on a box where every session
@@ -4775,9 +4822,11 @@ def _seed_trust(cfg_dir: Path, cwd: str):
 # client to accept the one-time "Bypass Permissions" warning. A detached session
 # (no client) can't confirm it and claude exits, so members would otherwise hang.
 PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
-#  The script below names its throwaway tmux session `prime_$$`. Durable recovery
-#  reads this prefix to tell scaffolding apart from somebody's tab, so the two
-#  have to agree: see _is_ephemeral_session.
+#  The script below names its throwaway tmux session `prime_$$`. Two things read
+#  this prefix and both have to agree with it: durable recovery, to tell
+#  scaffolding apart from somebody's tab (_is_ephemeral_session), and the
+#  auto-responder, which leaves these sessions alone because the script answers
+#  their menu itself.
 PRIME_SESSION_PREFIX = "prime_"
 _PRIME_SCRIPT = r'''#!/usr/bin/env bash
 # Accept the one-time --dangerously-skip-permissions warning for a config dir.
@@ -4790,7 +4839,7 @@ tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 200 -y 50 -c "$PWD" || exit 1
 # Subscription mode (no key): rely on the config dir's symlinked plan creds.
 if [ -n "$KEY" ]; then PRE="export ANTHROPIC_API_KEY=$KEY; "; else PRE="unset ANTHROPIC_API_KEY; "; fi
-tmux send-keys -t "$S" "${PRE}export CLAUDE_CONFIG_DIR=$CFG; claude --dangerously-skip-permissions" Enter
+tmux send-keys -t "$S" "${PRE}export CLAUDE_CONFIG_DIR=$CFG; env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY claude --dangerously-skip-permissions" Enter
 # Attach a pty client in the background so claude sees an interactive terminal.
 setsid bash -c "script -qfc 'tmux attach -t $S' /dev/null" >/dev/null 2>&1 &
 ok=0
@@ -8671,7 +8720,12 @@ def _exact_tmux_session_id(session_name: str) -> str:
 
 
 def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
-    """Build a managed Claude command bound to one exact conversation."""
+    """Build a managed Claude command bound to one exact conversation.
+
+    `--resume` when Claude has that conversation on disk, `--session-id` when it
+    does not: either way the pane comes back on the id every lifecycle row and
+    tab label already points at. See _convo_has_transcript for why the second
+    case is not hypothetical."""
     if not _UUID_RE.fullmatch(str(resume_uuid or "")):
         raise ValueError("invalid Claude resume UUID")
     # RESUMING A CONVERSATION IS NOT STARTING ONE. The launch defaults belong to a
@@ -8706,12 +8760,20 @@ def _restore_durable_session(candidate: dict) -> dict:
     owner_id = str(candidate.get("owner_id") or "")
     cwd_text = str(candidate.get("cwd") or "")
     resume_uuid = str(candidate.get("resume_uuid") or "")
+    recorded_uuid = resume_uuid          # what the row is bound to, may be empty
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError("invalid durable session name")
     if not generation or not owner_id:
         raise ValueError("durable session binding is incomplete")
     if not _UUID_RE.fullmatch(resume_uuid):
-        raise ValueError("durable session has no exact Claude conversation")
+        # A row reaches here with no conversation when its tab died before Claude
+        # ever wrote one. Refusing to restore made the reconcile loop retry every
+        # 20s forever and the tab never came back ('authsetup', 2026-08-27).
+        # Minting one is safe: a fresh --session-id starts its own conversation
+        # and can never pick up a neighbour's the way --continue can.
+        resume_uuid = str(uuid.uuid4())
+        logger.warning("Durable session '%s' has no conversation on record, "
+                       "restoring it on a fresh one (%s)", name, resume_uuid)
     try:
         cwd = Path(cwd_text).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
@@ -8728,7 +8790,7 @@ def _restore_durable_session(candidate: dict) -> dict:
         generation=generation,
         owner_id=owner_id,
         desired_states={"running"},
-        resume_uuid=resume_uuid,
+        resume_uuid=recorded_uuid,
         restore_on_startup=True,
     ):
         return {"name": name, "status": "stale"}
@@ -8741,7 +8803,7 @@ def _restore_durable_session(candidate: dict) -> dict:
             generation=generation,
             owner_id=owner_id,
             desired_states={"running"},
-            resume_uuid=resume_uuid,
+            resume_uuid=recorded_uuid,
             restore_on_startup=True,
         ):
             raise RuntimeError("session lifecycle changed during recovery")
@@ -9114,11 +9176,17 @@ async def api_create_session(request: Request, body: CreateSession):
                 _boot.append(_profile_export_line(requested_profile))
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
-        # When authenticating via a shared API key, prime the config dir's one-time
-        # bypass-permissions acceptance BEFORE launching, or the detached session's
-        # claude would hit the warning with no attached client and exit. Runs once
-        # per config dir (marker-guarded); first session per user waits ~10-20s.
-        if _stored_anthropic_key:
+        # Prime the config dir's one-time bypass-permissions acceptance BEFORE
+        # launching, or the detached session's claude hits that warning with no
+        # attached client. Its highlighted default is "1. No, exit", so the
+        # auto-responder's Enter kills the pane and durable recovery respawns it
+        # into the same prompt forever: a member's very first session could never
+        # come up (lisa-claude, 2026-08-27). This used to run only when a shared
+        # API key was stored, which left every subscription-auth box exposed even
+        # though _prime_claude_config handles subscription creds perfectly well.
+        # Runs once per config dir (marker-guarded); the first session for an
+        # account waits ~10-20s. The admin's own ~/.claude is primed by daily use.
+        if _stored_anthropic_key or (user and not _is_admin(user)):
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session. Pin the default model
         # unless the chosen profile pins its own via its settings.json.
@@ -13556,24 +13624,102 @@ nice -n 5 dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
 '''
 
+# What the launcher sources. It carries the settings every browser on the box
+# shares, so a flag changed here reaches the default browser and each account's
+# at their next start.
+#
+# This used to be a hand-placed file, present only on the box someone first
+# wrote it on. A rebuilt box got the launcher above (which we write) with
+# nothing to source, so every browser died on "CB_ROOT: unbound variable" while
+# browser_sessions.json still listed a browser per account: configured, and
+# unstartable (lisa-claude, 2026-08-27). It is versioned here now, like the
+# launcher, and written the same way.
+_CHROME_COMMON_SCRIPT = r'''#!/usr/bin/env bash
+# Shared Chrome settings for every browser session on this box.
+# Written by the dashboard (app.py). Local edits are overwritten.
+CB_ROOT="${CB_ROOT:-$HOME/.claude-browser}"
+CB_BIN="${CB_BIN:-$CB_ROOT/bin}"
+CB_SCREEN_W="${CB_SCREEN_W:-1440}"
+CB_SCREEN_H="${CB_SCREEN_H:-900}"
+export CB_ROOT CB_BIN CB_SCREEN_W CB_SCREEN_H
+
+# Per-session runtime dirs. Chrome writes config and cache outside its profile
+# too; without these each browser scribbles into the box's own XDG dirs and two
+# accounts end up sharing state they are supposed to keep apart.
+cb_chrome_env() {   # <id>
+  export CB_SESSION_ID="$1"
+  export XDG_CONFIG_HOME="$CB_ROOT/sessions/$1/xdg"
+  export XDG_CACHE_HOME="$CB_ROOT/sessions/$1/cache"
+  mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+}
+
+cb_proxy_port() {   # <id> -> the relay port for this session, or nothing
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.path.expanduser("~/.claude-browser/proxy.json")))
+except Exception:
+    sys.exit(0)
+s = (d.get("sessions") or {}).get(sys.argv[1]) or {}
+if s.get("enabled") and s.get("local_port"):
+    print(int(s["local_port"]))
+PY
+}
+
+cb_port_open() {    # <port>
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null || return 1
+  exec 3>&-
+  return 0
+}
+
+# One flag per line: the launcher reads this with mapfile.
+cb_chrome_flags() { # <profile> <cdp> <id>
+  local profile="$1" cdp="$2" id="$3" port
+  cat <<FLAGS
+--user-data-dir=$profile
+--remote-debugging-port=$cdp
+--remote-debugging-address=127.0.0.1
+--no-first-run
+--no-default-browser-check
+--disable-session-crashed-bubble
+--disable-features=Translate,MediaRouter,AutofillServerCommunication
+--password-store=basic
+--window-position=0,0
+--window-size=${CB_SCREEN_W},${CB_SCREEN_H}
+--disable-dev-shm-usage
+FLAGS
+  # Sticky per-session exit IP, only when the relay is actually up: pointing
+  # Chrome at a proxy port nothing is listening on fails every page load in
+  # that browser, which is worse than sharing the box's own IP.
+  port="$(cb_proxy_port "$id")"
+  if [ -n "$port" ] && cb_port_open "$port"; then
+    printf -- '--proxy-server=http://127.0.0.1:%s\n' "$port"
+  fi
+}
+'''
+CHROME_COMMON = str(Path.home() / ".claude-browser" / "bin" / "chrome-common.sh")
+
 
 def _ensure_browser_launcher():
-    """Keep the on-disk launcher in sync with the copy above.
+    """Keep the on-disk launcher and the file it sources in sync with the copies
+    above.
 
     It used to be write-if-missing, which meant a launcher written before the
-    anti-fingerprinting work stayed frozen at the old flags forever — new
+    anti-fingerprinting work stayed frozen at the old flags forever: new
     browsers would still start with --no-sandbox/--disable-gpu and no proxy.
-    Rewrite whenever the content differs instead (it's ours; nothing else
-    edits it)."""
-    p = Path(BROWSER_LAUNCHER)
-    try:
-        if not p.exists() or p.read_text() != _BROWSER_LAUNCHER_SCRIPT:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(_BROWSER_LAUNCHER_SCRIPT)
-            p.chmod(0o755)
-            logger.info("Browser launcher script written to %s", p)
-    except Exception:
-        logger.debug("Failed to write browser launcher", exc_info=True)
+    Rewrite whenever the content differs instead (they're ours; nothing else
+    edits them)."""
+    for path, body in ((BROWSER_LAUNCHER, _BROWSER_LAUNCHER_SCRIPT),
+                       (CHROME_COMMON, _CHROME_COMMON_SCRIPT)):
+        p = Path(path)
+        try:
+            if not p.exists() or p.read_text() != body:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body)
+                p.chmod(0o755)
+                logger.info("Browser script written to %s", p)
+        except Exception:
+            logger.debug("Failed to write %s", path, exc_info=True)
 # The default session's ports are host-dependent: 5900/6080 is the convention,
 # but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
 # maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
@@ -13589,6 +13735,15 @@ def _ensure_browser_launcher():
 # CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
 # everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
 # only correct way in.
+#
+# `managed` says who starts the thing. It is False by default because on the
+# hosts this began on, display :99 belongs to a systemd unit (claude-vnc) that
+# owns the browser's whole lifecycle and the dashboard must not fight it. A box
+# built without such a unit has the opposite problem: the default browser is the
+# ADMIN's account browser (_browser_owner_id maps it to "admin"), so with nobody
+# managing it the owner is the one person on the box whose browser can never
+# start, while every other account's does (lisa-claude, 2026-08-27). Set
+# CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
@@ -20918,6 +21073,31 @@ def _parse_menu_options(visible_text: str):
     return options, (selected if selected is not None else 0)
 
 
+# Menu labels, matched on the option text alone, for the LLM-free fallback.
+_MENU_PROCEED_RE = re.compile(
+    r"^(?:yes\b|y\b|accept|proceed|continue|approve|allow|run\b|ok\b|got it)", re.I)
+_MENU_STOP_RE = re.compile(
+    r"^(?:no\b|n\b|exit|quit|cancel|stop|abort|reject|deny|don'?t\b|never)", re.I)
+
+
+def _pick_menu_option_offline(options: list, selected_idx: int):
+    """Choose a menu option without the LLM. Returns an option NUMBER or None.
+
+    Only speaks up when pressing Enter would be actively wrong: the highlighted
+    default stops the agent and exactly one other option clearly proceeds. That
+    is the bypass-permissions warning to the letter, whose default is "1. No,
+    exit" and whose Enter therefore kills a freshly launched session. Anything
+    less clear-cut is left to the LLM or to a human, because guessing at a menu
+    is how an agent ends up answering a question nobody asked it."""
+    if len(options) < 2 or not (0 <= selected_idx < len(options)):
+        return None
+    if not _MENU_STOP_RE.match(options[selected_idx][1].strip()):
+        return None
+    proceeding = [num for i, (num, label) in enumerate(options)
+                  if i != selected_idx and _MENU_PROCEED_RE.match(label.strip())]
+    return proceeding[0] if len(proceeding) == 1 else None
+
+
 async def _llm_pick_menu_option(name: str, visible: str, options: list):
     """Ask the LLM which menu option best continues the work. Returns the chosen
     option NUMBER, or None to fall back to the default (Enter)."""
@@ -20974,6 +21154,38 @@ async def _auto_responder_loop():
                 # Auto-push "off" means never type anything into this terminal.
                 if _get_autopush_mode(name) == "off":
                     continue
+                # The priming sessions drive their own menu (prime_claude.sh
+                # walks to "Yes, I accept" itself). Two actors sending Down and
+                # Enter to one menu land on whichever option the race leaves
+                # highlighted, which is how priming a member's config dir kept
+                # exiting claude and never wrote its marker (2026-08-27).
+                if name.startswith(PRIME_SESSION_PREFIX):
+                    continue
+                    if len(options) >= 2:
+                        # No pick means the highlighted row, which is exactly the
+                        # row that has to pass the same check as any other.
+                        proposed = target if target is not None else options[selected_idx][0]
+                        safe = _safe_menu_choice(options, proposed)
+                        if safe is None:
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': every option exits, logs "
+                                        "out or spends money (%s)", name,
+                                        "; ".join(l[:30] for _, l in options))
+                            continue
+                        if safe != proposed:
+                            log.warning("Auto-responder in '%s' refused option %s (%s) and chose "
+                                        "%s instead", name, proposed,
+                                        next((l[:40] for n, l in options if n == proposed), ""),
+                                        safe)
+                        target = safe
+                    else:
+                        cursor_row = next((ln for ln in result.stdout.splitlines()[::-1]
+                                           if ln.strip().startswith("❯")), "")
+                        if _menu_option_forbidden(cursor_row):
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': the highlighted option "
+                                        "exits, logs out or spends money", name)
+                            continue
                 # Check cooldown
                 last = _auto_respond_cooldown.get(name, 0)
                 if now - last < _AUTO_RESPOND_COOLDOWN:
@@ -21006,6 +21218,14 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
+                    if target is None:
+                        # No LLM (no key, or the call failed): Enter would take the
+                        # highlighted option, and on some menus that is the one that
+                        # stops the agent dead. Pick deliberately instead, then let
+                        # that pick face the same safety check as any other. From
+                        # claude.lisa.my, which had the offline path while main had
+                        # only the check.
+                        target = _pick_menu_option_offline(options, selected_idx)
                     if len(options) >= 2:
                         # No pick means the highlighted row, which is exactly the
                         # row that has to pass the same check as any other.
@@ -22049,9 +22269,20 @@ _CRASH_OOM_RE = re.compile(
 )
 
 
+# Claude refusing to start at all. It exits immediately with one of these lines
+# and no TUI, which looks identical to a logout from the tab. Recovering is the
+# same relaunch, and _resume_flag now picks a flag that cannot repeat the abort.
+_CRASH_LAUNCH_ABORT_RE = re.compile(
+    r"No conversation found with session ID"
+    r"|Session ID [0-9a-fA-F-]{36} is already in use",
+)
+
+
 def _looks_like_crash(text: str) -> bool:
-    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
-    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
+    """True if recent pane output shows Claude dying (OOM/SIGABRT/etc.) or
+    refusing to launch on the conversation it was given."""
+    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text)
+                or _CRASH_LAUNCH_ABORT_RE.search(text))
 
 # A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
 _SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
