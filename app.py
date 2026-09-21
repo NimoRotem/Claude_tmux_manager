@@ -1897,8 +1897,14 @@ def _find_user_by_id(user_id: str) -> Optional[dict]:
 
 
 def _find_user_by_username(username: str) -> Optional[dict]:
+    # Case insensitive, because usernames are ALREADY unique case insensitively:
+    # the create path lowercases before it checks whether a name is taken. Matching
+    # case sensitively here only meant a real account could fail to be found, and
+    # the fleet has this one account written as both "Nimo" and "nimo" depending on
+    # who typed it last. Carried over from builder1, which had the fix first.
+    target = (username or "").lower()
     for u in _load_users():
-        if u.get("username") == username:
+        if (u.get("username") or "").lower() == target:
             return u
     return None
 
@@ -2776,9 +2782,12 @@ async def do_login(request: Request):
     # Legacy env-var path: if the credentials match TMUX_DASH_USER/TMUX_DASH_PASS,
     # accept and treat as the admin user. This keeps the dashboard reachable even
     # if users.json was deleted by hand.
+    # The NAME is compared case insensitively for the same reason as above; the
+    # PASSWORD never is.
     legacy_ok = (
         AUTH_PASS
-        and hmac.compare_digest(username.encode("utf-8"), AUTH_USER.encode("utf-8"))
+        and hmac.compare_digest(username.lower().encode("utf-8"),
+                                AUTH_USER.lower().encode("utf-8"))
         and hmac.compare_digest(password.encode("utf-8"), AUTH_PASS.encode("utf-8"))
     )
     user = _find_user_by_username(username)
