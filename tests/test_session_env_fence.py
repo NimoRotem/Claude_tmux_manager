@@ -62,9 +62,16 @@ def test_a_metered_key_in_the_dashboard_env_is_fenced_out_of_the_pane(monkeypatc
         "a fenced name is passed through EMPTY, which every consumer reads as absent"
 
 
-def test_only_the_names_the_dashboard_actually_holds_are_fenced(monkeypatch):
+def test_every_name_is_fenced_even_the_ones_this_process_does_not_hold(monkeypatch):
+    #  THE DEFECT THIS CATCHES: fencing only the names in the DASHBOARD's own
+    #  environment reads like a fence and is dead code against the case that
+    #  actually happens. Measured on the Codex line 2026-09-20: a tmux SERVER's
+    #  global environment carried a 167-character key while the dashboard process
+    #  did not, so os.environ said there was nothing to fence and the pane
+    #  inherited it. The server outlives the dashboard, so its environment is not
+    #  ours to infer. Send every name every time.
     argv = _launch_argv(monkeypatch, {"CODEX_API_KEY": "sk-pretend"})
-    assert _fenced(argv) == ["CODEX_API_KEY="]
+    assert sorted(_fenced(argv)) == sorted(n + "=" for n in app.FENCED_ENV_NAMES)
 
 
 def test_the_per_job_voice_and_tasks_keys_are_fenced_too(monkeypatch):
@@ -73,11 +80,18 @@ def test_the_per_job_voice_and_tasks_keys_are_fenced_too(monkeypatch):
     #  the moment the split landed.
     argv = _launch_argv(monkeypatch, {"OPENAI_VOICE_KEY": "sk-voice-pretend",
                                       "OPENAI_TASKS_KEY": "sk-tasks-pretend"})
-    assert sorted(_fenced(argv)) == ["OPENAI_TASKS_KEY=", "OPENAI_VOICE_KEY="]
+    fenced = _fenced(argv)
+    assert "OPENAI_VOICE_KEY=" in fenced and "OPENAI_TASKS_KEY=" in fenced
+    assert "OPENAI_VOICE_KEY" in app.FENCED_ENV_NAMES, \
+        "the list itself is the fence: a name missing from it is never sent"
+    assert "OPENAI_TASKS_KEY" in app.FENCED_ENV_NAMES
 
 
-def test_nothing_is_fenced_when_the_dashboard_holds_no_key(monkeypatch):
-    assert "-e" not in _launch_argv(monkeypatch, {})
+def test_the_fence_still_goes_up_when_the_dashboard_holds_no_key_at_all(monkeypatch):
+    #  The old version of this test asserted the opposite, that an empty
+    #  environment means no fence. That is exactly the hole above.
+    assert sorted(_fenced(_launch_argv(monkeypatch, {}))) == \
+        sorted(n + "=" for n in app.FENCED_ENV_NAMES)
 
 
 def test_an_old_tmux_gets_the_fence_without_the_flag_it_does_not_have(monkeypatch):
@@ -91,7 +105,7 @@ def test_an_old_tmux_gets_the_fence_without_the_flag_it_does_not_have(monkeypatc
     }, tmux_has_e=False)
     assert "-e" not in new_session, "3.1c rejects the whole command if -e appears"
     emptied = {argv[3]: argv[4] for argv in runs if argv[1:3] == ["set-environment", "-g"]}
-    assert emptied == {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}
+    assert emptied == {n: "" for n in app.FENCED_ENV_NAMES}
 
 
 def test_the_tmux_client_itself_carries_no_key(monkeypatch):
