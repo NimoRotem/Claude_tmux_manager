@@ -3749,13 +3749,27 @@ def _new_api_id() -> str:
 
 # ── The advisor is the source of truth for every credential ──────────────────
 # No key value is stored on this host any more. The APIs tab reads them from the
-# advisor (hk-proxy, https://advisor.rotem.ai) on demand and writes edits back to
-# it, so all four builder dashboards see the same catalogue. `advisor_cache.json`
-# holds metadata ONLY (never a key) so the tab still renders when the advisor is
-# unreachable.
-ADVISOR_URL = (os.environ.get("ADVISOR_URL") or "https://advisor.rotem.ai").rstrip("/")
+# advisor on demand and writes edits back to it, so every dashboard on the same
+# advisor sees the same catalogue. `advisor_cache.json` holds metadata ONLY
+# (never a key) so the tab still renders when the advisor is unreachable.
+#
+# A BOX MUST SAY WHICH ADVISOR IT IS ON. There is more than one, deliberately:
+# a fleet advisor, and separate ones holding a single product's estate and
+# nothing else. They must not see each other's records, and the separation is
+# only as good as the weakest box's configuration. The fallback below still
+# happens, because nothing should fail to boot over this, but it announces
+# itself: a box on a separate advisor that quietly relies on this default is
+# reading the wrong estate's credentials and would never say so.
+_ADVISOR_URL_ENV = (os.environ.get("ADVISOR_URL") or "").strip()
+ADVISOR_URL = (_ADVISOR_URL_ENV or "https://advisor.rotem.ai").rstrip("/")
 ADVISOR_TOKEN_FILE = Path(os.environ.get("ADVISOR_TOKEN_FILE")
                           or (Path.home() / ".advisor-token"))
+if not _ADVISOR_URL_ENV:
+    logger.warning(
+        "ADVISOR_URL is not set, defaulting to %s. Set it explicitly in this "
+        "box's environment: a box belonging to a different advisor that relies "
+        "on this default talks to the wrong estate and never says so.",
+        ADVISOR_URL)
 ADVISOR_META_CACHE = MESSAGES_DIR / "advisor_cache.json"
 _advisor_state = {"ts": 0.0, "items": [], "error": ""}
 _ADVISOR_TTL = 45.0
