@@ -14,22 +14,32 @@ class _Created:
     stderr = ""
 
 
-def _launch_argv(monkeypatch, env):
-    """Capture the argv `_create_exact_tmux_session` would hand tmux. -> list[str]"""
-    seen = {}
+def _launch(monkeypatch, env, tmux_has_e=True):
+    """Run `_create_exact_tmux_session` against a stubbed tmux.
+
+    -> (new-session argv, every argv it ran, the env each was spawned with)
+    """
+    runs, envs = [], []
 
     def fake_run(command, **kwargs):
-        seen["argv"] = list(command)
+        runs.append(list(command))
+        envs.append(kwargs.get("env"))
         return _Created()
 
     monkeypatch.setattr(app.subprocess, "run", fake_run)
-    for name in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
-                 "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+    monkeypatch.setattr(app, "_tmux_supports_new_session_e", lambda: tmux_has_e)
+    for name in app.FENCED_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     app._create_exact_tmux_session("probe")
-    return seen["argv"]
+    new_session = [argv for argv in runs if argv[1:2] == ["new-session"]][0]
+    return new_session, runs, envs
+
+
+def _launch_argv(monkeypatch, env, tmux_has_e=True):
+    """Capture the argv `_create_exact_tmux_session` would hand tmux. -> list[str]"""
+    return _launch(monkeypatch, env, tmux_has_e)[0]
 
 
 def _fenced(argv):
@@ -68,6 +78,40 @@ def test_the_per_job_voice_and_tasks_keys_are_fenced_too(monkeypatch):
 
 def test_nothing_is_fenced_when_the_dashboard_holds_no_key(monkeypatch):
     assert "-e" not in _launch_argv(monkeypatch, {})
+
+
+def test_an_old_tmux_gets_the_fence_without_the_flag_it_does_not_have(monkeypatch):
+    #  THE DEFECT THIS CATCHES: `new-session -e` arrived in tmux 3.2, and builder1 is
+    #  Debian 11 with 3.1c. Every create there answered "tmux: unknown option -- e",
+    #  so the box could not open a single session. The fence still has to hold on the
+    #  old flag set, or the fix would be to hand the pane a metered key.
+    new_session, runs, _ = _launch(monkeypatch, {
+        "OPENAI_API_KEY": "sk-svcacct-pretend-live-key",
+        "ANTHROPIC_API_KEY": "sk-ant-pretend-live-key",
+    }, tmux_has_e=False)
+    assert "-e" not in new_session, "3.1c rejects the whole command if -e appears"
+    emptied = {argv[3]: argv[4] for argv in runs if argv[1:3] == ["set-environment", "-g"]}
+    assert emptied == {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}
+
+
+def test_the_tmux_client_itself_carries_no_key(monkeypatch):
+    #  If no server is running yet, the client forks one, and the server hands its own
+    #  environment to every pane it ever starts. Emptying the names on the client is
+    #  what stops one badly timed first launch from leaking to everything after it.
+    _, runs, envs = _launch(monkeypatch, {"OPENAI_API_KEY": "sk-svcacct-pretend-live-key"})
+    assert envs and all(env is not None for env in envs), "every tmux call must pass an env"
+    for env in envs:
+        assert env.get("OPENAI_API_KEY") == ""
+
+
+def test_the_tmux_version_gate_reads_the_real_strings(monkeypatch):
+    for version, supported in (("tmux 3.1c\n", False), ("tmux 3.2\n", True),
+                               ("tmux 3.3a\n", True), ("tmux 2.8\n", False),
+                               ("", False)):
+        monkeypatch.setattr(app, "_tmux_new_session_e", {})
+        monkeypatch.setattr(app.subprocess, "run",
+                            lambda *a, **k: type("R", (), {"stdout": version})())
+        assert app._tmux_supports_new_session_e() is supported, version
 
 
 def _set_auth_mode(monkeypatch, mode, stored_key="sk-ant-pretend-live-key"):

@@ -8539,6 +8539,53 @@ async def api_session_history(session_name: str, before: int = -1, limit: int = 
     })
 
 
+#  A SESSION IS NEVER HANDED A METERED KEY (owner rule 2026-09-20). The dashboard keeps its own
+#  OPENAI_API_KEY for the summaries and the voice endpoints, but a pane must not inherit it: an
+#  agent that finds a metered key in its environment can end up billing it instead of running
+#  on the subscription it was given, and that failure is silent, it just costs money. An agent
+#  runs on its plan and asks the advisor for anything else it needs. tmux has no unset, so the
+#  names go through EMPTY, which every consumer reads as absent.
+FENCED_ENV_NAMES = ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                    "ANTHROPIC_API_KEY", "CODEX_API_KEY")
+
+_tmux_new_session_e: dict = {}
+
+
+def _tmux_supports_new_session_e() -> bool:
+    """Does this tmux take `new-session -e`? It arrived in 3.2.
+
+    builder1 is Debian 11 and runs 3.1c, where the flag does not exist: every
+    create there died with `tmux: unknown option -- e` and the dashboard could
+    not open a session at all. Upgrading tmux under a live box is worse than
+    coping with the old one, because a new client cannot talk to the running
+    server and every existing session goes unreachable until it is restarted.
+    """
+    if "ok" not in _tmux_new_session_e:
+        try:
+            out = subprocess.run(["tmux", "-V"], capture_output=True,
+                                 text=True, timeout=5).stdout or ""
+        except Exception:
+            out = ""
+        found = re.search(r"(\d+)\.(\d+)", out)
+        _tmux_new_session_e["ok"] = bool(found) and \
+            (int(found.group(1)), int(found.group(2))) >= (3, 2)
+    return _tmux_new_session_e["ok"]
+
+
+def _fenced_env() -> dict:
+    """This process's environment with every metered key name emptied.
+
+    The tmux CLIENT is spawned with this, so that when there is no server yet
+    and the client forks one, the server cannot inherit a key and hand it to
+    every pane it later starts.
+    """
+    env = dict(os.environ)
+    for name in FENCED_ENV_NAMES:
+        if env.get(name):
+            env[name] = ""
+    return env
+
+
 def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]:
     """Create one tmux session and return the immutable id printed by tmux."""
     command = [
@@ -8549,21 +8596,27 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
         "-F",
         "#{session_id}\t#{session_name}",
     ]
-    #  A SESSION IS NEVER HANDED A METERED KEY (owner rule 2026-09-20). The dashboard keeps its own
-    #  OPENAI_API_KEY for the summaries and the voice endpoints, but a pane must not inherit it: an
-    #  agent that finds a metered key in its environment can end up billing it instead of running
-    #  on the subscription it was given, and that failure is silent, it just costs money. An agent
-    #  runs on its plan and asks the advisor for anything else it needs. tmux has no unset for
-    #  new-session, so the names go through EMPTY, which every consumer reads as absent.
-    for fenced in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
-                   "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
-        if os.environ.get(fenced):
+    held = [name_ for name_ in FENCED_ENV_NAMES if os.environ.get(name_)]
+    if held and _tmux_supports_new_session_e():
+        for fenced in held:
             command += ["-e", "%s=" % fenced]
+    elif held:
+        #  Old tmux: `set-environment -g` reaches the same place, every pane the
+        #  server starts from here on, and it has been in tmux since 1.0. Best
+        #  effort, because the client below still goes out with the names empty.
+        for fenced in held:
+            try:
+                subprocess.run(["tmux", "set-environment", "-g", fenced, ""],
+                               capture_output=True, text=True, timeout=5,
+                               env=_fenced_env())
+            except Exception:
+                pass
     if name:
         command += ["-s", name]
     if cwd:
         command += ["-c", cwd]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=5,
+                            env=_fenced_env())
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Failed to create session")
     created_id, separator, created_name = result.stdout.strip().partition("\t")
