@@ -17963,6 +17963,13 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 _ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
 _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "",
                                  "retry_after": 0, "retry_fp": "", "last_error": ""}
+# How long a fetched payload is served before we go back upstream. This was an
+# HOUR, which is a fifth of the 5-hour window: a box whose 5h limit was fully
+# spent sat on screen at 32% until someone reloaded long enough after the fact,
+# and the bar people use to decide whether to start a session was the one number
+# they could not trust. A minute costs at most 60 upstream calls an hour, and the
+# 429 handler above still backs off hard if Anthropic objects.
+ANTHROPIC_LIMITS_TTL = 60
 
 # --- Dedicated credential for the usage bars -------------------------------
 #
@@ -18406,10 +18413,9 @@ def _sanitize_expired_windows(data: object, now_dt: datetime) -> object:
 async def api_anthropic_usage_limits():
     """Fetch live 5h + 7-day rate-limit utilization from Anthropic OAuth usage API.
 
-    Cached for 1 hour per the user-facing requirement (poll hourly while
-    sessions are active). On upstream failure, returns the last good payload.
-    The cache is keyed on the current token, so a login switch busts it at once
-    instead of showing a previous account's usage for up to an hour.
+    Cached for ANTHROPIC_LIMITS_TTL seconds. On upstream failure, returns the
+    last good payload. The cache is keyed on the current token, so a login switch
+    busts it at once instead of showing a previous account's usage.
     """
     now = time.time()
     now_dt = datetime.now(timezone.utc)
@@ -18421,10 +18427,10 @@ async def api_anthropic_usage_limits():
     # was cached (or persisted across a restart) before this field existed still
     # tells the UI whose numbers it is showing.
     acct = _usage_account(token_source)
-    # Serve cache only if fresh (<1h), same token, AND none of its windows have
-    # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
-    # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
-    if (now - _anthropic_limits_cache["ts"] < 3600
+    # Serve cache only if fresh, same token, AND none of its windows have reset
+    # since — otherwise a rolled-over window (e.g. the 7-day limit) keeps showing
+    # its pre-reset peak (100%) after it has dropped back to ~0.
+    if (now - _anthropic_limits_cache["ts"] < ANTHROPIC_LIMITS_TTL
             and _anthropic_limits_cache["data"]
             and _anthropic_limits_cache.get("fp") == fp
             and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
@@ -22409,8 +22415,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
 .nav-usage-pct{color:#8b949e;font-size:.6rem;font-weight:600;width:26px;text-align:right;font-variant-numeric:tabular-nums}
-/* Time until the window resets, "4D" or "23H", the same small type as the percent. */
-.nav-usage-reset{color:#6e7681;font-size:.6rem;font-weight:600;min-width:22px;text-align:left;font-variant-numeric:tabular-nums}
+/* Time until the window resets, "Reset: 4d". In the header it is its own line
+   ABOVE the 7-day bar; in the account dropdown it trails the 5-hour bar. Hidden
+   while empty, because Anthropic reports no reset time for a window nothing has
+   been spent in yet and a bare "Reset:" reads as a broken widget. */
+.nav-usage-reset{color:#6e7681;font-size:.6rem;font-weight:600;text-align:left;font-variant-numeric:tabular-nums;white-space:nowrap}
 .nav-usage-reset:empty{display:none}
 /* No usable number yet (no account-scoped credential, or upstream down). */
 .nav-usage.no-data{opacity:.6}
@@ -23700,18 +23709,17 @@ body.member-simple .hide-in-simple{display:none!important}
 </nav>
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
+  <!-- The header carries the SEVEN-DAY window only: "Reset: 4d" on the top line,
+       the bar and its percentage under it. That is the number you plan a week
+       around, and it changes slowly enough to be worth permanent eyeline. The
+       5-hour window moved into the account dropdown, under Today's Usage, next to
+       the token counts it belongs with. -->
   <span class="nav-usage no-data" id="nav-usage">
-    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="Anthropic 5-hour limit">
-      <span class="nav-usage-label">5h</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-5h-pct">&mdash;</span>
-      <span class="nav-usage-reset" id="nav-usage-5h-reset"></span>
-    </span>
+    <span class="nav-usage-reset" id="nav-usage-7d-reset" title=""></span>
     <span class="nav-usage-item" id="nav-usage-7d-wrap" title="Anthropic 7-day limit">
       <span class="nav-usage-label">7d</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
       <span class="nav-usage-pct" id="nav-usage-7d-pct">&mdash;</span>
-      <span class="nav-usage-reset" id="nav-usage-7d-reset"></span>
     </span>
   </span>
   <span class="nav-status-text" id="status-info">Watching for changes...</span>
@@ -26290,7 +26298,7 @@ function renderNav(){
     item.innerHTML=`
       <span class="nav-session-id">${esc(sessionLabel(s))}</span>
       <span class="nav-indicators">
-        <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
+        <span class="${esc(_idleNudgeNavDotClass(s.name,lastStatus[s.name]||s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
     // On the tab you are already in, the name is the rename handle. On any
     // other tab the first click still has to select it, or switching sessions
@@ -26718,8 +26726,13 @@ function renderDetail(){
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
+  // The ten-second poll is the freshest reading there is, so the pill, the chat
+  // typing line, the Stop button and the favicon are all built off it. Building
+  // them off s.activity_status alone is what made switching to a tab show a red
+  // "Working" for a session that finished long ago.
+  const liveStatus=lastStatus[s.name]||s.activity_status;
   // Update favicon to match selected session
-  updateFavicon(s.activity_status);
+  updateFavicon(liveStatus);
 
   mainEl.innerHTML=`
     <div class="tab-bar">
@@ -26772,8 +26785,8 @@ function renderDetail(){
       </div>
       <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
       <div class="detail-badges">
-        <span class="status-pill ${esc(s.activity_status)}${_isCompacting(s.activity_detail)?' compacting':''}" id="status-${s.name}">
-          ${_pillInner(s.activity_status,s.activity_detail)}
+        <span class="status-pill ${esc(liveStatus)}${_isCompacting(s.activity_detail)?' compacting':''}" id="status-${s.name}">
+          ${_pillInner(liveStatus,s.activity_detail)}
         </span>
         ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
@@ -26784,7 +26797,7 @@ function renderDetail(){
              between the model chip and the buttons, so it is kept in the DOM (the raw
              view still writes to it) but not shown. -->
         <span class="raw-info" id="raw-info-${s.name}" hidden>Loading terminal...</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}',activeTabs['${s.name}'])" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="btn btn-stop ${liveStatus==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}',activeTabs['${s.name}'])" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="reloadActive('${esc(s.name)}')" title="Re-read this session's terminal from tmux">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
@@ -26794,7 +26807,7 @@ function renderDetail(){
       <div class="chat-wrap">
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
-          ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
+          ${liveStatus==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
         <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
         <!-- Live voice: hands free. Hidden until it is switched on. -->
@@ -28212,6 +28225,24 @@ function _paintPillCache(name){
     +(_isCompacting(detail)?' compacting':'');
   if(pill.className!==want)pill.className=want;
 }
+// The chat view's "Working..." line. Reconciled from whatever status the caller
+// has, because it used to be added and removed only by updateCard — which runs
+// off a full session refresh, not off the ten-second status poll, so a turn that
+// finished left the three bouncing dots on screen indefinitely.
+function _syncChatTyping(name,status){
+  const chatEl=document.getElementById('chat-'+name);
+  if(!chatEl)return;
+  const existing=chatEl.querySelector('.chat-typing');
+  if(status==='busy'&&!existing){
+    const typing=document.createElement('div');
+    typing.className='chat-typing';
+    typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
+    chatEl.appendChild(typing);
+    chatEl.scrollTop=chatEl.scrollHeight;
+  }else if(status!=='busy'&&existing){
+    existing.remove();
+  }
+}
 function updateStatusPill(name,status,detail){
   lastDetail[name]=detail;
   const pill=document.getElementById('status-'+name);
@@ -28225,6 +28256,10 @@ function updateStatusPill(name,status,detail){
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
   if(navDot)navDot.className=_idleNudgeNavDotClass(name,status);
+  _syncChatTyping(name,status);
+  // The live strip under the terminal runs its own clock off busy/idle, so it has
+  // to move on the poll as well, not only on a full refresh.
+  try{if(typeof updateLiveBar==='function')updateLiveBar(name)}catch(e){}
 }
 
 function updateCard(s){
@@ -28243,24 +28278,13 @@ function updateCard(s){
   refreshSavedKeys(s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
-  updateStatusPill(s.name,s.activity_status,s.activity_detail);
-  // Busy/idle drives the live strip's dots and whether its clock is running.
-  updateLiveBar(s.name);
-
-  // Update typing indicator
-  const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl){
-    const existing=chatEl.querySelector('.chat-typing');
-    if(s.activity_status==='busy'&&!existing){
-      const typing=document.createElement('div');
-      typing.className='chat-typing';
-      typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
-      chatEl.appendChild(typing);
-      chatEl.scrollTop=chatEl.scrollHeight;
-    }else if(s.activity_status!=='busy'&&existing){
-      existing.remove();
-    }
-  }
+  // lastStatus is what the ten-second poll writes, so it is never behind this
+  // payload; s.activity_status is only a fallback for a session the poll has not
+  // reached yet. Preferring it stops a slow /refresh reply from dragging the pill
+  // back to a status the session has already left.
+  const fresh=lastStatus[s.name]||s.activity_status;
+  // updateStatusPill also reconciles the chat typing line and the live strip.
+  updateStatusPill(s.name,fresh,s.activity_detail);
 }
 
 // Bring `name` into view even if the project filter currently excludes it.
@@ -28368,6 +28392,17 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// A hidden tab has its timers throttled by the browser to about once a minute,
+// and nothing caught up on return — so coming back to the dashboard showed a
+// status up to a minute stale, which is exactly what "it only updates when I
+// reload the page" looks like. Poll the moment the tab is looked at again, and
+// re-read the usage bars with it.
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState!=='visible')return;
+  try{pollStatus()}catch(e){}
+  try{refreshUsageLimits()}catch(e){}
+});
+
 // The build this tab is RUNNING, learned from the first poll, versus the build
 // the server is serving now. A dashboard left open across a deploy keeps polling
 // fresh data through stale JavaScript, so a change to the UI is invisible and
@@ -28407,7 +28442,18 @@ function _checkBuild(resp){
     document.body.appendChild(pill);
   }catch(e){}
 }
+// /api/status walks every session's tmux pane, so on a box with a dozen sessions
+// it can outlast its own ten-second tick. setInterval does not wait, so the polls
+// used to queue behind each other and the whole page's status fell further and
+// further behind. One in flight at a time; a skipped tick costs ten seconds, a
+// pile-up costs minutes.
+let _pollInFlight=false;
 async function pollStatus(){
+  if(_pollInFlight)return;
+  _pollInFlight=true;
+  try{await _pollStatusOnce()}finally{_pollInFlight=false}
+}
+async function _pollStatusOnce(){
   try{
     const resp=await fetch(BASE+'/api/status');
     _checkBuild(resp);
@@ -28421,10 +28467,21 @@ async function pollStatus(){
         refreshOne(st.name);
       }
       trackSessionStatus(st.name,st.activity_status);
+      // Write the fresh status back onto the session object BEFORE anything
+      // repaints from it. This poll used to update the pill's DOM and nothing
+      // else, leaving `sessions[i].activity_status` frozen at whatever the page
+      // load saw — so every later re-render (switching session or tab, the nav
+      // dots, the favicon, the chat "Working..." line, the Stop button) painted a
+      // status that could be hours old, and a session that had gone idle stayed
+      // red until someone reloaded the page. That was the whole bug.
+      const si=sessions.findIndex(s=>s.name===st.name);
+      if(si>=0){
+        sessions[si].activity_status=st.activity_status;
+        sessions[si].activity_detail=st.activity_detail||'';
+      }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
       // Update model badge in nav
-      const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
         if(st.display_name&&(sessions[si].display_name||'')!==st.display_name){
@@ -28499,26 +28556,29 @@ refreshNavStats();
 
 // --- Anthropic OAuth usage limits (5h + 7d) in nav header ---
 let _usageLimitsTimer=null;
-// "4D", "23H", "40M": whole units left until the window resets, for the header.
+// "4d", "23h", "40m": whole units left until the window resets.
 function _fmtResetShort(iso){
   if(!iso)return'';
   const ms=new Date(iso)-new Date();
   if(!(ms>0))return'';
   const mins=Math.floor(ms/60000);
-  if(mins<60)return Math.max(1,mins)+'M';
+  if(mins<60)return Math.max(1,mins)+'m';
   const hrs=Math.floor(mins/60);
-  if(hrs<24)return hrs+'H';
-  return Math.floor(hrs/24)+'D';
+  if(hrs<24)return hrs+'h';
+  return Math.floor(hrs/24)+'d';
 }
 let _usageResets={fh:'',sd:''};
 function _paintUsageResets(){
-  [['nav-usage-5h-reset',_usageResets.fh,'5-hour'],['nav-usage-7d-reset',_usageResets.sd,'7-day']]
+  // The 5-hour row only exists while the account dropdown is open; getElementById
+  // returning null for it is the normal case, not a failure.
+  [['auth-usage-5h-reset',_usageResets.fh,'5-hour'],['nav-usage-7d-reset',_usageResets.sd,'7-day']]
     .forEach(([id,iso,label])=>{
       const el=document.getElementById(id);
       if(!el)return;
-      const txt=_fmtResetShort(iso);
+      const short=_fmtResetShort(iso);
+      const txt=short?('Reset: '+short):'';
       if(el.textContent!==txt)el.textContent=txt;
-      el.title=txt?('The '+label+' window resets '+_fmtResetTime(iso)):'';
+      el.title=short?('The '+label+' window resets '+_fmtResetTime(iso)):'';
     });
 }
 setInterval(_paintUsageResets,60000);
@@ -28555,62 +28615,46 @@ function _usageErrText(err){
   if(err==='rate_limited') return 'Anthropic is rate-limiting the usage API; backing off and retrying.';
   return 'the Anthropic usage API did not answer (retrying).';
 }
-async function refreshUsageLimits(){
-  if(MEMBER_SIMPLE) return;  // members don't see usage bars
+// Last good payload. Kept because the 5-hour row now lives in the account
+// dropdown, which is rebuilt every time it is opened: without this it would show
+// an empty bar until the next poll came round.
+let _usageLimitsData=null;
+// Every id prefix a bar is painted into. The 5-hour pair exists only while the
+// account dropdown is open and the tools mirror is phone-only, so a null lookup
+// here is the normal case, not a failure.
+const _USAGE_5H_IDS=['auth-usage-5h','tools-usage-5h'];
+const _USAGE_7D_IDS=['nav-usage-7d','tools-usage-7d'];
+// The bars stay on screen either way — only their state changes. `has-data` used
+// to gate `display`, so one bad answer made them vanish entirely and the feature
+// looked deleted.
+function _setUsageHasData(has,why){
   const wrap=document.getElementById('nav-usage');
   const toolsWrap=document.getElementById('nav-tools-usage');
-  if(!wrap)return;
-  // The bars stay on screen either way — only their state changes. `has-data`
-  // used to gate `display`, so one bad answer made them vanish entirely and the
-  // feature looked deleted.
-  const setHasData=(has,why)=>{
-    wrap.classList.toggle('has-data',has);
-    wrap.classList.toggle('no-data',!has);
-    if(toolsWrap){toolsWrap.classList.toggle('has-data',has);toolsWrap.classList.toggle('no-data',!has)}
-    if(!has){
-      _usageResets={fh:'',sd:''};_paintUsageResets();
-      const t='Anthropic usage unavailable — '+(why||'no data yet.');
-      ['nav-usage-5h','nav-usage-7d','tools-usage-5h','tools-usage-7d'].forEach(p=>{
-        const pct=document.getElementById(p+'-pct'); if(pct)pct.textContent='—';
-        const fill=document.getElementById(p+'-fill'); if(fill)fill.style.width='0%';
-      });
-      ['nav-usage-5h-wrap','nav-usage-7d-wrap','tools-usage-5h-wrap','tools-usage-7d-wrap']
-        .forEach(id=>{const el=document.getElementById(id); if(el)el.title=t});
-    }
-  };
-  try{
-    const resp=await fetch(BASE+'/api/usage/limits');
-    // Only blank the bars if we have never had data. Once they are showing,
-    // a transient failure should leave the last known values on screen.
-    if(!resp.ok){
-      let err='', g=null;
-      try{ const j=await resp.json(); err=j.error||''; g=j.grant||null; }catch(e){}
-      let why=_usageErrText(err);
-      if(g && !g.have_credential && g.retry_in_s>0)
-        why += ' The dashboard is re-granting it by itself — next attempt in '+Math.ceil(g.retry_in_s/60)+' min.';
-      if(!wrap.classList.contains('has-data'))setHasData(false,why);
-      _scheduleUsageRetry();return;
-    }
-    const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false,_usageErrText(data&&data.error));_scheduleUsageRetry();return}
-    setHasData(true);
-    wrap.classList.toggle('stale',!!data.stale);
-    if(data.stale)_scheduleUsageRetry();
-    const fh=data.five_hour||{};
-    const sd=data.seven_day||{};
-    _usageResets={fh:fh.resets_at||'',sd:sd.resets_at||''};
-    _paintUsageResets();
-    const fhPct=Math.round(Number(fh.utilization)||0);
-    const sdPct=Math.round(Number(sd.utilization)||0);
-    _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
-    [['nav-usage-5h-pct',fhPct],['nav-usage-7d-pct',sdPct],
-     ['tools-usage-5h-pct',fhPct],['tools-usage-7d-pct',sdPct]].forEach(([id,v])=>{
-      const el=document.getElementById(id); if(el)el.textContent=v+'%';
-    });
-    const staleNote=data.stale?' · last known value (upstream unreachable)':'';
+  if(wrap){wrap.classList.toggle('has-data',has);wrap.classList.toggle('no-data',!has)}
+  if(toolsWrap){toolsWrap.classList.toggle('has-data',has);toolsWrap.classList.toggle('no-data',!has)}
+  if(has)return;
+  _usageResets={fh:'',sd:''};_paintUsageResets();
+  const t='Anthropic usage unavailable — '+(why||'no data yet.');
+  _USAGE_5H_IDS.concat(_USAGE_7D_IDS).forEach(p=>{
+    const pct=document.getElementById(p+'-pct'); if(pct)pct.textContent='—';
+    const fill=document.getElementById(p+'-fill'); if(fill)fill.style.width='0%';
+    const w=document.getElementById(p+'-wrap'); if(w)w.title=t;
+  });
+}
+// Paint a payload onto whichever bars are currently in the DOM. Split out from
+// the fetch so opening the account dropdown repaints its 5-hour row at once.
+function _applyUsageLimits(data){
+  if(!data||(!data.five_hour&&!data.seven_day))return;
+  _setUsageHasData(true);
+  const wrap=document.getElementById('nav-usage');
+  if(wrap)wrap.classList.toggle('stale',!!data.stale);
+  const fh=data.five_hour||{};
+  const sd=data.seven_day||{};
+  _usageResets={fh:fh.resets_at||'',sd:sd.resets_at||''};
+  _paintUsageResets();
+  const fhPct=Math.round(Number(fh.utilization)||0);
+  const sdPct=Math.round(Number(sd.utilization)||0);
+  const staleNote=data.stale?' · last known value (upstream unreachable)':'';
     // Which account, and when it was read. Without these a live 0% is
     // indistinguishable from a dead widget — which is exactly how it reads
     // after a box is signed in to a second, unused account.
@@ -28639,16 +28683,41 @@ async function refreshUsageLimits(){
       if(t)return'resets '+t;
       return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
     };
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
-    const fhWrap=document.getElementById('nav-usage-5h-wrap');
-    const sdWrap=document.getElementById('nav-usage-7d-wrap');
-    if(fhWrap)fhWrap.title=fhTitle;
-    if(sdWrap)sdWrap.title=sdTitle;
-    const tfh=document.getElementById('tools-usage-5h-wrap');
-    const tsd=document.getElementById('tools-usage-7d-wrap');
-    if(tfh)tfh.title=fhTitle;
-    if(tsd)tsd.title=sdTitle;
+  const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
+  const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
+  [[_USAGE_5H_IDS,Number(fh.utilization)||0,fhPct,fhTitle],
+   [_USAGE_7D_IDS,Number(sd.utilization)||0,sdPct,sdTitle]].forEach(([ids,util,pct,title])=>{
+    ids.forEach(p=>{
+      _applyUsageStyle(document.getElementById(p+'-fill'),util);
+      const pe=document.getElementById(p+'-pct'); if(pe)pe.textContent=pct+'%';
+      const w=document.getElementById(p+'-wrap'); if(w)w.title=title;
+    });
+  });
+}
+async function refreshUsageLimits(){
+  if(MEMBER_SIMPLE) return;  // members don't see usage bars
+  const wrap=document.getElementById('nav-usage');
+  if(!wrap)return;
+  try{
+    const resp=await fetch(BASE+'/api/usage/limits');
+    // Only blank the bars if we have never had data. Once they are showing,
+    // a transient failure should leave the last known values on screen.
+    if(!resp.ok){
+      let err='', g=null;
+      try{ const j=await resp.json(); err=j.error||''; g=j.grant||null; }catch(e){}
+      let why=_usageErrText(err);
+      if(g && !g.have_credential && g.retry_in_s>0)
+        why += ' The dashboard is re-granting it by itself — next attempt in '+Math.ceil(g.retry_in_s/60)+' min.';
+      if(!wrap.classList.contains('has-data'))_setUsageHasData(false,why);
+      _scheduleUsageRetry();return;
+    }
+    const data=await resp.json();
+    if(!data||(!data.five_hour&&!data.seven_day)){
+      _setUsageHasData(false,_usageErrText(data&&data.error));_scheduleUsageRetry();return;
+    }
+    if(data.stale)_scheduleUsageRetry();
+    _usageLimitsData=data;
+    _applyUsageLimits(data);
   }catch(e){
     /* keep last known display */
   }
@@ -28664,11 +28733,11 @@ function _scheduleUsageRetry(){
 function startUsageLimitsPolling(){
   if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
   refreshUsageLimits();
-  // Poll every 10 min, not hourly. Upstream is still hit at most once an hour —
-  // the backend cache enforces that — but the cache is keyed on the token, so a
-  // login switch busts it, and an hourly page timer meant the bars kept showing
-  // the PREVIOUS account's numbers for up to an hour after the switch.
-  _usageLimitsTimer=setInterval(refreshUsageLimits,600*1000);
+  // Every minute, matching the backend's own cache window (ANTHROPIC_LIMITS_TTL),
+  // so what is on screen is never more than about two minutes behind the account.
+  // It was ten minutes on top of an hour-long server cache, which is how a box
+  // with its 5-hour window fully spent kept reading 32%.
+  _usageLimitsTimer=setInterval(refreshUsageLimits,60*1000);
 }
 startUsageLimitsPolling();
 
@@ -28990,8 +29059,29 @@ function fmtTokens(n){
   return String(n);
 }
 
+// The plan's 5-hour rolling window, as a bar with its own reset countdown. It
+// lives here rather than in the header: it is the number you check when you are
+// deciding whether there is room to start something now, which is a moment you
+// open this panel anyway. Values are painted by _applyUsageLimits once this
+// markup is in the DOM, so all the HTML has to supply is the shape and the ids.
+function renderFiveHourLimitHtml(){
+  return '<div class="nav-tools-usage-row" id="auth-usage-5h-wrap" title="Anthropic 5-hour limit">'
+    +'<span class="nav-tools-usage-label">5h</span>'
+    +'<span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="auth-usage-5h-fill" style="width:0%"></span></span>'
+    +'<span class="nav-tools-usage-pct" id="auth-usage-5h-pct">&mdash;</span>'
+    +'<span class="nav-usage-reset" id="auth-usage-5h-reset"></span>'
+    +'</div>';
+}
+
 function renderUsageHtml(){
-  if(!_usageCache||!_usageCache.totalTokens)return '';
+  // The 5-hour bar renders whether or not any tokens were recorded today: a box
+  // that has spent nothing still needs to be able to see that, and this block
+  // used to be dropped whole when the count was zero.
+  const head='<hr class="auth-divider">'
+    +'<div class="auth-title" style="margin-bottom:4px">Today\'s Usage</div>'
+    +renderFiveHourLimitHtml();
+  if(!_usageCache||!_usageCache.totalTokens)
+    return head+'<p class="auth-hint" style="margin-top:8px">No tokens recorded yet today.</p>';
   const u=_usageCache;
   const total=u.totalTokens;
   const outPct=total?Math.round(u.outputTokens/total*100):0;
@@ -29005,9 +29095,8 @@ function renderUsageHtml(){
     +'<div style="width:'+inPct+'%;background:#58a6ff" title="Input '+inPct+'%"></div>'
     +'<div style="width:'+rdPct+'%;background:#21262d" title="Cache read '+rdPct+'%"></div>'
     +'</div>';
-  return '<hr class="auth-divider">'
-    +'<div class="auth-title" style="margin-bottom:4px">Today\'s Usage</div>'
-    +'<div class="auth-row"><span class="auth-row-label">Messages</span><span class="auth-row-value">'+u.messages+'</span></div>'
+  return head
+    +'<div class="auth-row" style="margin-top:8px"><span class="auth-row-label">Messages</span><span class="auth-row-value">'+u.messages+'</span></div>'
     +'<div class="auth-row"><span class="auth-row-label">Total tokens</span><span class="auth-row-value">'+fmtTokens(total)+'</span></div>'
     +barH
     +'<div style="display:flex;flex-wrap:wrap;gap:2px 12px;font-size:.7rem;color:#8b949e;margin-bottom:2px">'
@@ -29016,13 +29105,17 @@ function renderUsageHtml(){
     +'<span><span style="color:#d2a8ff">●</span> Cache write '+fmtTokens(u.cacheCreateTokens)+'</span>'
     +'<span style="color:#484f58">Cache read '+fmtTokens(u.cacheReadTokens)+'</span>'
     +'</div>'
-    +'<p class="auth-hint" style="margin-top:6px">Usage resets on a 5-hour rolling window.</p>';
+    +'<p class="auth-hint" style="margin-top:6px">Token counts are for today, UTC. The 5h bar above is the plan\'s own rolling window.</p>';
 }
 
 function renderAuthPanel(){
   const el=document.getElementById('auth-dropdown-content');
   if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
   const usageHtml=renderUsageHtml();
+  // Repaint the 5-hour bar as soon as the markup above lands, and ask for a fresh
+  // read. Without the first call the bar would sit at 0% until the next minute
+  // tick, which is indistinguishable from an unspent window.
+  setTimeout(()=>{_applyUsageLimits(_usageLimitsData);refreshUsageLimits()},0);
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
@@ -33989,12 +34082,12 @@ function closeStats(){
 // ── Phone layout: header status widgets move to the bottom ──────────────────
 // On a phone the header has room for the project switcher and about two session
 // tabs, and the tabs are the thing you actually navigate with. The browser
-// badge, the 5h/7d usage bars and the CPU/RAM readout are all glance-only, so on
-// a narrow screen they move to a strip at the very bottom of the page — below
-// the terminal and the upload area.
+// badge, the 7d usage bar and the CPU/RAM readout are all glance-only, so on a
+// narrow screen they move to a strip at the very bottom of the page — below the
+// terminal and the upload area.
 //
 // The ELEMENTS are moved, not cloned. Every poller writes by id
-// (#nav-usage-5h-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
+// (#nav-usage-7d-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
 // have meant either dead widgets or a second set of updaters to keep in step.
 const _BOTTOM_BAR_IDS=['nav-browser-badge','nav-usage','nav-server-stats'];
 function syncMobileBottomBar(){
