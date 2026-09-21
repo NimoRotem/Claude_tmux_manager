@@ -28,10 +28,11 @@ from typing import Dict, Optional
 import contextlib
 import glob as globmod
 
-import browser_ladder
 import browser_fleet
+import browser_ladder
 import browser_live
 import browser_resource_guard
+from terminal_transcript import ConversationHistory, TranscriptCache
 from runtime_control import (
     LockedJsonStore,
     SessionLifecycleStore,
@@ -61,6 +62,23 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 #  a box whose keys have not been split yet behaves exactly as before.
 OPENAI_VOICE_KEY = os.environ.get("OPENAI_VOICE_KEY", "") or OPENAI_API_KEY
 OPENAI_TASKS_KEY = os.environ.get("OPENAI_TASKS_KEY", "") or OPENAI_API_KEY
+# On a gateway box there is no OpenAI key and no egress to api.openai.com, so the
+# default client below can never answer. Every LLM-backed helper (the watchdog's
+# composer, menu picking) silently returned "" — the failure mode is invisible,
+# because llm_call is documented to return empty rather than raise. The gateway
+# is OpenAI-compatible at /v1/chat/completions (verified), so when we are on one
+# the same helpers run against it instead of doing nothing at all.
+_GATEWAY_LLM_KEY = (os.environ.get("TMUX_DASH_LLM_KEY", "")
+                    or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+                    or os.environ.get("ANTHROPIC_API_KEY", ""))
+_GATEWAY_LLM_MODEL = os.environ.get("TMUX_DASH_LLM_MODEL", "deepseek-4.1-flash")
+# The gateway's models emit a reasoning block that shares ONE token budget with
+# max_tokens, so a small ceiling is spent entirely on deliberation and the reply
+# comes back with content=null and finish_reason="length" — no error, just
+# nothing. Headroom is added on top of the caller's ask, exactly as the
+# researcher project had to do for the same gateway. Raised, not floored: a call
+# that does not deliberate does not pay for this.
+_LLM_REASONING_RESERVE = int(os.environ.get("TMUX_DASH_LLM_REASONING_RESERVE", "2000"))
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
@@ -90,10 +108,9 @@ AGENT_AGGREGATE_MEMORY_MAX_PERCENT = int(
 def _managed_agent_command(session_name: str, command: str) -> str:
     """Apply builder4-only test and resource controls to one Claude launch."""
     pytest_env = build_pytest_gate_env_prefix(PYTEST_PLUGIN_DIR, account="builder4")
-    # A session runs on its plan and is handed no metered key (owner rule 2026-09-20).
     return scoped_agent_command(
         session_name,
-        f"{pytest_env} env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY {command.strip()}",
+        f"{pytest_env} {command.strip()}",
         memory_high_mb=AGENT_MEMORY_HIGH_MB,
         memory_max_mb=AGENT_MEMORY_MAX_MB,
         slice_name=AGENT_SLICE_NAME,
@@ -123,6 +140,24 @@ MODELS_FILE = Path.home() / ".tmux-dashboard" / "models.json"
 _MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
 _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
+# ANTHROPIC_BASE_URL pointed anywhere but Anthropic means this box runs its
+# agents against a gateway (builder2a -> LunaRoute), and the Claude line-up below
+# is not what it can serve. A gateway publishes its own catalogue at /v1/models
+# in the same shape, so on a gateway box the catalogue is REPLACED by what the
+# gateway offers rather than merged into this seed: a Claude id is unroutable
+# there, and choosing one from the dropdown types a /model command that fails.
+_ANTHROPIC_API_HOST = "api.anthropic.com"
+_GATEWAY_MODEL_METADATA: Dict[str, dict] = {}
+
+
+def _model_gateway_base() -> str:
+    """The gateway's base URL, or "" when this box talks to Anthropic itself."""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+    if not base or _ANTHROPIC_API_HOST in base:
+        return ""
+    return base
+
+
 _SEED_MODEL_CATALOG = [
     ["claude-opus-5[1m]", "Opus 5 · 1M"],
     ["claude-opus-5", "Opus 5"],
@@ -234,19 +269,30 @@ def _load_model_catalog() -> list:
     try:
         if MODELS_FILE.exists():
             data = json.loads(MODELS_FILE.read_text())
+            if isinstance(data, dict) and isinstance(data.get("metadata"), dict):
+                _GATEWAY_MODEL_METADATA.update(data["metadata"])
             rows = data.get("models") if isinstance(data, dict) else data
             rows = [list(r) for r in (rows or []) if isinstance(r, (list, tuple)) and len(r) == 2]
             if rows:
-                return _merge_seed_rows(rows)
+                # _merge_seed_rows exists to carry a newly-seeded Claude model
+                # onto a box whose models.json predates it. On a gateway that is
+                # exactly wrong: it would put the Claude line-up back every boot.
+                return rows if _model_gateway_base() else _merge_seed_rows(rows)
     except Exception:
         logger.debug("Failed to load %s; using seed", MODELS_FILE, exc_info=True)
+    if _model_gateway_base():
+        # Nothing persisted yet. Offer only what this box actually launches with
+        # until the first refresh lands, rather than a Claude list the gateway
+        # would refuse. The id is its own label: the gateway names its models.
+        return [[DEFAULT_MODEL, DEFAULT_MODEL]] if DEFAULT_MODEL else []
     return [list(r) for r in _SEED_MODEL_CATALOG]
 
 
 def _save_model_catalog(catalog: list, last_check: float = 0.0):
     try:
         MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MODELS_FILE.write_text(json.dumps({"models": catalog, "last_check": last_check}, indent=2))
+        MODELS_FILE.write_text(json.dumps({"models": catalog, "last_check": last_check,
+                                          "metadata": _GATEWAY_MODEL_METADATA}, indent=2))
     except Exception:
         logger.debug("Failed to save %s", MODELS_FILE, exc_info=True)
 
@@ -274,6 +320,15 @@ for _dm in (DEFAULT_MODEL, _model_base_id(DEFAULT_MODEL)):
 def _anthropic_api_key() -> str:
     """A usable Anthropic API key for the model-catalog check: env first, then
     the API registry, then ~/CLAUDE_API_KEYS.md."""
+    # On a gateway the token is whatever that gateway issued (LunaRoute's is
+    # `lr_…`) and Claude Code is handed it as ANTHROPIC_AUTH_TOKEN, so neither
+    # the `sk-ant-` prefix test nor the Anthropic key stores below apply.
+    if _model_gateway_base():
+        for _var in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            _v = os.environ.get(_var, "").strip()
+            if _v:
+                return _v
+        return ""
     k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if k.startswith("sk-ant-"):
         return k
@@ -314,6 +369,49 @@ def _fetch_anthropic_model_ids() -> list:
     return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
+def _fetch_gateway_model_rows() -> list:
+    """The gateway's own catalogue as [id, label] rows, chat models only.
+
+    A gateway lists more than chat models — LunaRoute publishes embeddings,
+    rerankers and image generators alongside them — and none of those can back a
+    session, so offering them would put a dead entry in the dropdown. They are
+    told apart by `capabilities.messages.supported`; a gateway that publishes no
+    capabilities at all gets everything it lists offered, which is the only
+    honest default when it will not say.
+
+    Both auth headers go out: LunaRoute accepts either, another gateway may want
+    one or the other, and sending both costs nothing."""
+    import urllib.request
+    base = _model_gateway_base()
+    key = _anthropic_api_key()
+    if not base or not key:
+        return []
+    req = urllib.request.Request(
+        base + "/v1/models?limit=1000",
+        headers={"x-api-key": key, "authorization": "Bearer " + key,
+                 "anthropic-version": "2023-06-01"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    items = [m for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+    publishes_caps = any(
+        isinstance((m.get("capabilities") or {}).get("messages"), dict) for m in items)
+    rows = []
+    metadata = {}
+    for m in items:
+        if publishes_caps:
+            msgs = (m.get("capabilities") or {}).get("messages") or {}
+            if not msgs.get("supported"):
+                continue
+        label = (m.get("display_name") or "").strip() or m["id"]
+        rows.append([m["id"], label])
+        metadata[m["id"]] = {key: m[key] for key in ("max_input_tokens", "max_tokens", "capabilities") if key in m}
+    rows.sort(key=lambda row: row[1].lower())
+    _GATEWAY_MODEL_METADATA.clear()
+    _GATEWAY_MODEL_METADATA.update(metadata)
+    return rows
+
+
 MODEL_CHECK_INTERVAL = 24 * 3600  # once per 24h
 
 
@@ -331,6 +429,19 @@ async def _refresh_model_catalog(force: bool = False) -> bool:
         now = time.time()
         if not force and now - last < MODEL_CHECK_INTERVAL:
             return False
+        if _model_gateway_base():
+            # REPLACE: the Claude seed is unroutable through a gateway, so
+            # merging would leave every one of those ids in the dropdown.
+            rows = await asyncio.to_thread(_fetch_gateway_model_rows)
+            if not rows:
+                logger.info("Model auto-detect: gateway listed no chat models "
+                            "(auth/network?) — will retry")
+                return False
+            changed = [r[0] for r in rows] != [r[0] for r in MODEL_CATALOG]
+            MODEL_CATALOG = rows
+            ALLOWED_SESSION_MODELS = [row[0] for row in MODEL_CATALOG]
+            _save_model_catalog(MODEL_CATALOG, now)
+            return changed
         api_ids = await asyncio.to_thread(_fetch_anthropic_model_ids)
         if not api_ids:
             # Couldn't reach the API — don't stamp last_check, so we retry sooner.
@@ -351,10 +462,17 @@ async def _model_refresh_loop():
     """Background: keep the model dropdown current. Re-checks hourly whether a
     24h refresh is due, so a long-lived process still picks up new models daily."""
     await asyncio.sleep(20)  # let startup settle
+    # A gateway box forces the FIRST check: its persisted models.json was very
+    # likely written by the Anthropic path (or by a build with no gateway support
+    # at all), and the 24h timer would hold that wrong list for a day. Cleared
+    # after the call, not inside the `if`, so an unchanged catalogue stops
+    # forcing too and only an outright failure is retried.
+    force_first = bool(_model_gateway_base())
     while True:
         try:
-            if await _refresh_model_catalog():
+            if await _refresh_model_catalog(force=force_first):
                 logger.info("Model catalog updated: %s", [r[0] for r in MODEL_CATALOG])
+            force_first = False
         except Exception:
             logger.debug("model refresh loop iteration failed", exc_info=True)
         await asyncio.sleep(3600)
@@ -545,7 +663,6 @@ GIT_OWNER_NAME = os.environ.get("TMUX_DASH_GIT_NAME", "")
 GIT_OWNER_EMAIL = os.environ.get("TMUX_DASH_GIT_EMAIL", "")
 _git_config_cache: Dict[str, str] = {}
 
-
 def _git_config_value(key: str) -> str:
     """`git config --global --get <key>`, cached (it can't change under us
     without a restart, and this runs on every session create)."""
@@ -565,21 +682,25 @@ def _git_identity_for(user, owner_name: str):
     the owner/admin gets the box's real identity."""
     if TEAM_MODE and user and not _is_admin(user):
         return owner_name, "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN)
-    # A box can have several admins (claude.lisa.my and codex.lisa.my both run
-    # Nimo, Michiel and Monica, all role admin). They share one OS user and one
-    # git config, so without this every one of them commits as the box owner and
-    # `git log` cannot say who did the work. Only the owner account, id "admin",
-    # carries the box's identity; anyone else commits as themselves, preferring
-    # the address they sign in with.
-    if user and str(user.get("id") or "") != "admin":
-        name = str(user.get("username") or "").strip() or owner_name
-        email = str(user.get("google_email") or "").strip()
-        return name, email or "%s@%s" % (name, GIT_EMAIL_DOMAIN)
     return (GIT_OWNER_NAME or _git_config_value("user.name") or owner_name,
             GIT_OWNER_EMAIL or _git_config_value("user.email")
             or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
 
 client = openai.AsyncOpenAI(api_key=OPENAI_TASKS_KEY)
+
+# Lazily-built client for the Claude Code gateway's OpenAI-compatible surface.
+# Separate from `client` above because it carries the gateway's key and base URL
+# rather than an OpenAI one; built on first use so importing the module stays
+# side-effect free when no gateway is configured.
+_gateway_llm_clients: Dict[str, "openai.AsyncOpenAI"] = {}
+
+
+def _gateway_llm_client(base: str) -> "openai.AsyncOpenAI":
+    c = _gateway_llm_clients.get(base)
+    if c is None:
+        c = openai.AsyncOpenAI(api_key=_GATEWAY_LLM_KEY, base_url=base + "/v1")
+        _gateway_llm_clients[base] = c
+    return c
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
 # Removed/disabled by default: it issued a continuous stream of gpt-4o-mini calls,
@@ -848,8 +969,8 @@ def _claude_launch_env_prefix() -> str:
     tok = _load_longlived_token()
     if tok and not _plan_credential_is_static():
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
-                + "; unset ANTHROPIC_API_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
-    return ("unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN "
+                + "; unset ANTHROPIC_API_KEY OPENAI_VOICE_KEY OPENAI_TASKS_KEY CLAUDE_CODE_EFFORT_LEVEL; ")
+    return ("unset ANTHROPIC_API_KEY OPENAI_VOICE_KEY OPENAI_TASKS_KEY CLAUDE_CODE_OAUTH_TOKEN "
             "CLAUDE_CODE_EFFORT_LEVEL; ")
 
 
@@ -871,6 +992,8 @@ def _auth_mode_label() -> str:
     nobody was asking while leaving the one that matters, plan or metered API,
     to be inferred from a line the CLI itself gets wrong. So it names the plan.
     """
+    if _model_gateway_base():
+        return "Model gateway"
     if _stored_anthropic_key:
         return "API key"            # the metered path; the only one that bills
     if _load_longlived_token() and not _plan_credential_is_static():
@@ -1028,19 +1151,17 @@ def _load_simple_watchdog_disabled():
         logger.debug("Failed to load simple-watchdog disabled list", exc_info=True)
 
 
-# --- Auto-push mode (per session): "off" | "basic" | "cache" | "full" ---
+# --- Auto-push mode (per session): "off" | "basic" | "full" ---
 # Governs how much the dashboard is allowed to type into a session's terminal on
 # the user's behalf when Claude stops or waits:
 #   off   — never write anything at all (no option-picking, no Enter on prompts,
 #           no auto /login, no free-form "keep going" messages).
 #   basic — auto-pick from Claude's option menus and confirm permission/plan
-#           prompts (press Enter), and keep the session logged in. Does NOT type
-#           any free-form instructions. It is not blind: a menu option that exits,
-#           logs out or spends money is never picked, whichever mode is on
-#           (_safe_menu_choice), and nothing it types can end the session.
-#   full  — everything in "basic" PLUS the autopilot watchdog that composes and
-#           types a "keep going" message when Claude pauses waiting on the user
-#           before a task is finished. (This was the previous always-on behavior.)
+#           prompts (press Enter), keep the session logged in, AND answer a
+#           question the session is blocked on (see the question gate below).
+#   full  — everything in "basic" PLUS the autopilot watchdog that also composes
+#           and types a "keep going" message when Claude pauses with NOTHING
+#           being asked. (This was the previous always-on behavior.)
 # New sessions default to "basic", and that is deliberate. Do not flip it to
 # "full" to stop sessions handing back half-done: the Stop hook
 # (~/.claude/hooks/keep_going.py) already does that, deterministically, in
@@ -1052,35 +1173,26 @@ def _load_simple_watchdog_disabled():
 # finished report that ended "the decision waiting for you is direction" and
 # typed a new task into that session. Overriding a legitimate hand-back is the
 # reason "full" is opt-in per session rather than the default.
-#   cache : everything in "basic" PLUS a keep-alive shortly before the prompt
-#           cache would expire, so the session is still warm when its owner is
-#           back. Called "Basic +" until 2026-09-17, and stored as "basicplus",
-#           which is still accepted and read as "cache". It used to send one fixed
-#           "continue, re-verify" line, the same words every hour; it now drafts
-#           the next step the owner would most likely ask for, from their own
-#           messages and the agent's replies (_compose_cache_prompt). Held to
-#           safe, in-scope work, and it stops after CACHE_KEEPALIVE_MAX_CHAIN
-#           pushes nobody answered.
-AUTOPUSH_MODES = ("off", "basic", "cache", "full")
-AUTOPUSH_ALIASES = {"basicplus": "cache", "basic+": "cache"}
+#
+# ANSWERING A QUESTION IS NOT THE SAME AS INVENTING A TASK, and that is the line
+# the modes draw. A session that has already asked the user something is stalled
+# in EVERY mode — it is not making progress and it will not until someone
+# replies — so basic, basic+ and full all compose an answer to a question
+# (a session left on a multiple-choice question overnight is exactly the stale
+# session auto-push exists to prevent). What stays exclusive to "full" is
+# pushing work forward when NOTHING is being asked: that is the "invent a next
+# step" behaviour, and it is the one that misfired on 2026-09-01. The question
+# is detected by _looks_like_user_question, which is written to reject a
+# completed hand-back like that incident's ("...is complete... waiting for
+# you is direction") and is pinned by tests.
+#   basic+  : everything in "basic" PLUS a keep-alive that re-reads the prompt
+#           cache shortly before it would expire. See the cache block below.
+#           The KEEP-ALIVE never composes a task: it sends one fixed continue
+#           instruction, which is what makes it safe where "full" is not.
+AUTOPUSH_MODES = ("off", "basic", "basicplus", "full")
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
-
-# When a PERSON last typed into each session through the dashboard (a message,
-# or a key from the key bar). Everything that types on its own reads this first:
-# a login prompt a human opened a minute ago is theirs, not a stranded one, and
-# a keep-alive chain restarts its count the moment somebody is back.
-_human_input_at: Dict[str, float] = {}
-
-
-def _note_human_input(session_name: str) -> None:
-    _human_input_at[session_name] = time.time()
-
-
-def _seconds_since_human_input(session_name: str) -> float:
-    at = _human_input_at.get(session_name)
-    return time.time() - at if at else float("inf")
 
 # ── Prompt cache expiry ─────────────────────────────────────────────────────
 # Anthropic's prompt cache is ephemeral with one of two lifetimes: 5 minutes by
@@ -1104,26 +1216,19 @@ def _seconds_since_human_input(session_name: str) -> float:
 # (usage.cache_read_input_tokens > 0), which is a measurement rather than a
 # prediction: non-zero means the cache was warm at that moment and its timer was
 # refreshed then. That is the honest signal, and it is what the UI reports.
-# Two leads, on purpose in this order:
-#   * CACHE_ALERT_LEAD, 15 minutes out: the page flashes the idle dot (in the
-#     session, its header tab and the favicon, whichever tab you are on) and
-#     beeps once, 4 rapid beeps, 8 on the High idle nudge. That is the call to
-#     come back and send something yourself, whatever the auto-push mode.
-#   * CACHE_PUSH_LEAD, 10 minutes out: a Cache-mode session sends its own next
-#     step. Five minutes after the alert, so a person who heard it gets first go.
-CACHE_ALERT_LEAD = 900
-CACHE_PUSH_LEAD = 600
+CACHE_WARN_LEAD = 600      # start warning 10 minutes before the cache goes cold
+# And make a NOISE five minutes before, once. The blink above is for a screen
+# you are looking at; this is for one you are not. Two thresholds on purpose:
+# seeing it start to blink is a nudge you can ignore, hearing it is the last
+# call, and collapsing them into one number would mean either a chime ten
+# minutes out (too early to act on, so it becomes background noise) or no
+# visible warning until five (too late to notice across a room).
+CACHE_BEEP_LEAD = 300
 CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
                                 # more or less continuous, so leave those alone.
-# The line sent when no better one can be drafted: the model is unreachable, the
-# session has no conversation to read, or the draft failed a safety check.
 CACHE_KEEPALIVE_PROMPT = (
     "Continue. re-verify your own work end to end, then finish whatever is still left."
 )
-# Pushes in a row with nobody answering in between. Each one starts a real turn
-# on the plan's usage limits, so a session left in Cache mode over a weekend
-# must not work all weekend: after this many it stops until a person types.
-CACHE_KEEPALIVE_MAX_CHAIN = 8
 
 
 def _cache_deadline(sess: dict) -> float:
@@ -1140,15 +1245,9 @@ def _cache_deadline(sess: dict) -> float:
     return end + ttl if ttl and end else 0.0
 
 
-def _normalize_autopush_mode(mode) -> str:
-    """A mode id as stored today: lower-case, legacy names mapped, '' if unknown."""
-    m = str(mode or "").strip().lower()
-    m = AUTOPUSH_ALIASES.get(m, m)
-    return m if m in AUTOPUSH_MODES else ""
-
-
 def _get_autopush_mode(session_name: str) -> str:
-    return _normalize_autopush_mode(_autopush_mode.get(session_name)) or AUTOPUSH_DEFAULT
+    m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
+    return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
 
 
 def _save_autopush_mode():
@@ -1166,8 +1265,7 @@ def _load_autopush_mode():
             data = json.loads(AUTOPUSH_MODE_FILE.read_text())
             if isinstance(data, dict):
                 _autopush_mode = {
-                    str(k): _normalize_autopush_mode(v) for k, v in data.items()
-                    if _normalize_autopush_mode(v)
+                    str(k): v for k, v in data.items() if v in AUTOPUSH_MODES
                 }
     except Exception:
         logger.debug("Failed to load autopush-mode map", exc_info=True)
@@ -1233,123 +1331,12 @@ def _neighbours_sharing_cwd(session_name: str) -> list:
     return out
 
 
-def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
-    """True if Claude Code has a saved, RESUMABLE transcript for this id.
-
-    `--resume <id>` on a conversation that was never written makes the CLI exit
-    with "No conversation found", dropping the pane to a bare shell, which then
-    reads as "Claude isn't running" to every action."""
-    return _conversation_state(session_name, convo_uuid) == "saved"
-
-
-# A transcript that holds no turn at all. `/exit` on a session that never got a
-# message still writes `<id>.jsonl` with two bookkeeping lines (mode and
-# permission-mode) and nothing else. Both relaunch flags then fail on it: the CLI
-# answers `--resume` with "No conversation found" and `--session-id` with
-# "Session ID ... is already in use" (it only stats the file). That pair is what
-# left calandar and lisa-solver at a bare shell on 2026-09-17.
-_TRANSCRIPT_TURN_TYPES = ("user", "assistant")
-
-
-def _transcript_has_turns(path: str) -> bool:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if '"type"' not in line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(d, dict) and d.get("type") in _TRANSCRIPT_TURN_TYPES:
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def _conversation_transcript_candidates(session_name: str, convo_uuid: str) -> list:
-    """This id's transcript file, by the pane's project dir and then by the
-    session's own config dir (which is where a team member's lives)."""
-    target = convo_uuid + ".jsonl"
-    out = []
-    try:
-        out += [f for f in _find_session_jsonl_files(session_name)
-                if os.path.basename(f) == target]
-    except Exception:
-        pass
-    if not out:
-        try:
-            base = _session_config_base(session_name)
-        except Exception:
-            base = Path.home() / ".claude"
-        try:
-            out += [str(p) for p in (base / "projects").glob("*/" + target)]
-        except Exception:
-            pass
-    return out
-
-
-def _conversation_state(session_name: str, convo_uuid: str) -> str:
-    """'saved' (resumable), 'stub' (file with no turns), or 'missing'."""
-    if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
-        return "missing"
-    for f in _conversation_transcript_candidates(session_name, convo_uuid):
-        return "saved" if _transcript_has_turns(f) else "stub"
-    return "missing"
-
-
-def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
-    return _conversation_state(session_name, convo_uuid) == "saved"
-
-
-def _set_aside_stub_transcript(session_name: str, convo_uuid: str) -> None:
-    """Rename an empty `<id>.jsonl` so `--session-id <id>` can start on it.
-
-    Renamed rather than deleted: it holds nothing but two mode lines, but it is
-    not ours to destroy, and the suffix says exactly why it moved."""
-    try:
-        for f in _conversation_transcript_candidates(session_name, convo_uuid):
-            if not _transcript_has_turns(f):
-                os.replace(f, f + ".no-turns-%d" % int(time.time()))
-                logger.info("Set aside empty transcript %s for '%s' so it can relaunch",
-                            os.path.basename(f), session_name)
-    except Exception:
-        logger.debug("could not set aside stub transcript for %s", session_name, exc_info=True)
-
-
-def _fresh_or_resume_flag(session_name: str, convo_uuid: str) -> str:
-    """`--resume` on a saved conversation, else `--session-id` on the same id."""
-    state = _conversation_state(session_name, convo_uuid)
-    if state == "saved":
-        return "--resume " + convo_uuid
-    if state == "stub":
-        _set_aside_stub_transcript(session_name, convo_uuid)
-    return "--session-id " + convo_uuid
-
-
-def _convo_has_transcript(session_name: str, convo_uuid: str) -> bool:
-    """True when Claude has a transcript on disk for this conversation.
-
-    `--resume <id>` is fatal without one: Claude prints "No conversation found
-    with session ID: <id>" and exits before it draws anything, so the pane drops
-    to bash and the tab reads to the user as a logout (seen on 'smoke',
-    2026-08-27). A conversation we named ourselves with `--session-id` has no
-    file until its first message, so a tab relaunched before anyone typed in it
-    is exactly the case that hits this. Look in the session's OWN config dir
-    only: a member cannot resume a transcript that lives in another one.
-    """
-    return _conversation_state(session_name, convo_uuid) == "saved"
-
-
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """The resume flag for relaunching this pane's Claude, in order of trust.
 
     1. `--resume <uuid>` for the conversation we launched this pane on, or that
        a caller identified. Exact, and the only option that cannot pick up a
-       neighbour's work. When that conversation has no transcript yet it becomes
-       `--session-id <same uuid>`: same conversation, but Claude has to create it
-       rather than load it, and every record pointing at this pane stays valid.
+       neighbour's work.
     2. The scrollback-matching heuristic, for panes that predate (1).
     3. `--continue` — ONLY when no other live session shares this cwd. It means
        "the most recent conversation here", which on a box where every session
@@ -1359,7 +1346,7 @@ def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """
     uuid_s = resume_uuid or _session_convo(session_name)
     if uuid_s and _UUID_RE.fullmatch(uuid_s):
-        return _fresh_or_resume_flag(session_name, uuid_s)
+        return "--resume " + uuid_s
     guessed = _find_session_transcript_uuid(session_name)
     if guessed:
         _set_session_convo(session_name, guessed)
@@ -1570,8 +1557,8 @@ async def lifespan(_app: FastAPI):
 
     cache_keepalive_task = asyncio.create_task(_cache_keepalive_loop())
     _background_tasks.append(cache_keepalive_task)
-    logger.info("Cache keep-alive started (Cache sessions, %ds before the cache goes cold)",
-                CACHE_PUSH_LEAD)
+    logger.info("Cache keep-alive started (Basic+ sessions, %ds before the cache goes cold)",
+                CACHE_WARN_LEAD)
 
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
@@ -1640,6 +1627,19 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(root_path=ROOT_PATH, lifespan=lifespan)
+
+# ── STEP Studio: a static CAD viewer published at /stepstudio/ ──────────────
+# Routes only; the CSP override is registered much later, once every other
+# middleware exists (see below). Never let the viewer break the dashboard: a
+# failure here is logged and the dashboard boots normally without it.
+try:
+    import stepstudio
+    stepstudio.install(app)
+except Exception:  # pragma: no cover
+    logging.getLogger("tmux-dashboard").exception(
+        "Failed to mount STEP Studio at /stepstudio/ — the dashboard is unaffected"
+    )
+
 # ── Which build of this dashboard is running, and which kind ────────────────
 # There is no single "the dashboard". Nine deployments run five generations of
 # this file, on two different agents (claude and codex), and several of them are
@@ -1696,7 +1696,6 @@ async def api_dashboard_build():
     everything else here: it names a build rather than a secret, but the page that
     reads it is already signed in, so there is nothing to gain by carving it out."""
     return JSONResponse(_dashboard_build())
-
 
 
 # The USPTO filing panel MOVED OUT on 2026-09-01. It is its own service now
@@ -1944,14 +1943,8 @@ def _find_user_by_id(user_id: str) -> Optional[dict]:
 
 
 def _find_user_by_username(username: str) -> Optional[dict]:
-    # Case insensitive, because usernames are ALREADY unique case insensitively:
-    # the create path lowercases before it checks whether a name is taken. Matching
-    # case sensitively here only meant a real account could fail to be found, and
-    # the fleet has this one account written as both "Nimo" and "nimo" depending on
-    # who typed it last. Carried over from builder1, which had the fix first.
-    target = (username or "").lower()
     for u in _load_users():
-        if (u.get("username") or "").lower() == target:
+        if u.get("username") == username:
             return u
     return None
 
@@ -2497,8 +2490,9 @@ def _render_page(kind: str, prefix: str) -> str:
     out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
     # One definition of "approaching cold": the page blinks on the same number of
     # seconds the keep-alive pushes on, so the warning and the action agree.
-    out = out.replace("__CACHE_PUSH_LEAD__", str(CACHE_PUSH_LEAD))
-    out = out.replace("__CACHE_ALERT_LEAD__", str(CACHE_ALERT_LEAD))
+    out = out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
+    out = out.replace("__CACHE_BEEP_LEAD__", str(CACHE_BEEP_LEAD))
+    out = out.replace("__MODEL_GATEWAY__", json.dumps(bool(_model_gateway_base())))
     _page_cache[key] = out
     return out
 
@@ -2651,6 +2645,21 @@ async def auth_middleware(request: Request, call_next):
     rel_path = path[len(rp):] if (rp and path.startswith(rp)) else path
     if _is_public_project_request(rel_path):
         return await call_next(request)
+    # STEP Studio: a static CAD viewer mounted at /stepstudio/ (see stepstudio.py).
+    # It must be exempt from the login gate for the same reason the login page is:
+    # its HTML, JS and 7MB .wasm are all separate requests, and any of them
+    # answered with the login page instead would fail in the browser as a
+    # MIME-type error with no visible 401 to explain it.
+    if rel_path == "/stepstudio" or rel_path.startswith("/stepstudio/"):
+        return await call_next(request)
+    # The sheep demo, published publicly at the short /sheep URL (see
+    # stepstudio.py). Same reason as above: the page and each of its assets are
+    # separate requests, and a login page returned in place of any of them fails
+    # in the browser as a MIME-type error with no visible 401. Serving it under
+    # /sheep rather than /stepstudio/sheep also keeps it on the dashboard's
+    # stricter root CSP, which this page does not need relaxed.
+    if rel_path == "/sheep" or rel_path.startswith("/sheep/"):
+        return await call_next(request)
     token = request.cookies.get(AUTH_COOKIE)
     if not _check_token(token):
         resp = HTMLResponse(_login_page(request))
@@ -2723,6 +2732,22 @@ async def forwarded_prefix_middleware(request: Request, call_next):
     """
     request.scope["root_path"] = _req_prefix(request)
     return await call_next(request)
+
+
+# ── STEP Studio CSP override ────────────────────────────────────────────────
+# Registered HERE, after every other middleware, because Starlette makes the
+# LAST registered middleware the OUTERMOST. This one must be outermost so it can
+# rewrite the Content-Security-Policy that security_headers_middleware sets:
+# OpenCascade is exposed via emscripten's embind, which builds marshalling
+# invokers with new Function(), so the kernel cannot run without 'unsafe-eval'.
+# Scoped to /stepstudio/ only — the dashboard's own pages keep the strict policy.
+try:
+    import stepstudio
+    stepstudio.install_csp(app)
+except Exception:  # pragma: no cover
+    logging.getLogger("tmux-dashboard").exception(
+        "Failed to register the STEP Studio CSP override — the app keeps the strict policy"
+    )
 
 
 @app.get("/api/auth/verify")
@@ -2829,12 +2854,9 @@ async def do_login(request: Request):
     # Legacy env-var path: if the credentials match TMUX_DASH_USER/TMUX_DASH_PASS,
     # accept and treat as the admin user. This keeps the dashboard reachable even
     # if users.json was deleted by hand.
-    # The NAME is compared case insensitively for the same reason as above; the
-    # PASSWORD never is.
     legacy_ok = (
         AUTH_PASS
-        and hmac.compare_digest(username.lower().encode("utf-8"),
-                                AUTH_USER.lower().encode("utf-8"))
+        and hmac.compare_digest(username.encode("utf-8"), AUTH_USER.encode("utf-8"))
         and hmac.compare_digest(password.encode("utf-8"), AUTH_PASS.encode("utf-8"))
     )
     user = _find_user_by_username(username)
@@ -4662,15 +4684,24 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
 
 
 def _set_api_key_helper(cfg_dir: Path):
-    """Refused: this used to point Claude Code at the metered key via settings.json
-    `apiKeyHelper`, which authenticates whether or not a plan is available.
-
-    A config dir gets the subscription plan and nothing else (owner rule
-    2026-09-20). Left in place as a refusal rather than deleted because the whole
-    point of the failure it caused elsewhere is that it was SILENT: a route that
-    quietly fell back to a metered key billed for hours and nothing looked wrong.
-    `_remove_api_key_helper` still runs, so a dir armed before today gets cleaned."""
-    logger.warning("Refusing to arm apiKeyHelper in %s: plan-only policy", cfg_dir)
+    """Point Claude Code at the shared API key via settings.json `apiKeyHelper`.
+    Interactive claude does NOT honor a bare ANTHROPIC_API_KEY env var for
+    inference (it falls back to /login), but apiKeyHelper authenticates reliably —
+    and the key stays in a 0600 file rather than the terminal scrollback."""
+    sp = cfg_dir / "settings.json"
+    try:
+        s = json.loads(sp.read_text()) if sp.exists() else {}
+        if not isinstance(s, dict):
+            s = {}
+    except Exception:
+        s = {}
+    s["apiKeyHelper"] = "cat " + shlex.quote(str(ANTHROPIC_API_KEY_FILE))
+    try:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        _backup_before_dashboard_write(sp)
+        sp.write_text(json.dumps(s, indent=2))
+    except Exception:
+        logger.debug("Failed to set apiKeyHelper in %s", sp, exc_info=True)
 
 
 def _remove_subscription_creds(cfg_dir: Path):
@@ -4685,11 +4716,11 @@ def _remove_subscription_creds(cfg_dir: Path):
 
 
 def _apply_api_key_auth(cfg_dir: Path):
-    """Refused, and it never reaches the plan credential. This used to UNLINK the
-    subscription token first and then arm the metered key, so a caller that hit it
-    by accident left the dir unable to use the plan at all."""
-    logger.warning("Refusing API-key auth for %s: plan-only policy", cfg_dir)
-    _apply_subscription_auth(cfg_dir)
+    """Configure a config dir to authenticate via the shared API key."""
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    _remove_subscription_creds(cfg_dir)
+    _set_api_key_helper(cfg_dir)
+    _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
 
 
 def _subscription_token_valid() -> bool:
@@ -4822,12 +4853,6 @@ def _seed_trust(cfg_dir: Path, cwd: str):
 # client to accept the one-time "Bypass Permissions" warning. A detached session
 # (no client) can't confirm it and claude exits, so members would otherwise hang.
 PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
-#  The script below names its throwaway tmux session `prime_$$`. Two things read
-#  this prefix and both have to agree with it: durable recovery, to tell
-#  scaffolding apart from somebody's tab (_is_ephemeral_session), and the
-#  auto-responder, which leaves these sessions alone because the script answers
-#  their menu itself.
-PRIME_SESSION_PREFIX = "prime_"
 _PRIME_SCRIPT = r'''#!/usr/bin/env bash
 # Accept the one-time --dangerously-skip-permissions warning for a config dir.
 CFG="$1"
@@ -4839,7 +4864,7 @@ tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 200 -y 50 -c "$PWD" || exit 1
 # Subscription mode (no key): rely on the config dir's symlinked plan creds.
 if [ -n "$KEY" ]; then PRE="export ANTHROPIC_API_KEY=$KEY; "; else PRE="unset ANTHROPIC_API_KEY; "; fi
-tmux send-keys -t "$S" "${PRE}export CLAUDE_CONFIG_DIR=$CFG; env -u OPENAI_API_KEY -u OPENAI_VOICE_KEY -u OPENAI_TASKS_KEY claude --dangerously-skip-permissions" Enter
+tmux send-keys -t "$S" "${PRE}export CLAUDE_CONFIG_DIR=$CFG; claude --dangerously-skip-permissions" Enter
 # Attach a pty client in the background so claude sees an interactive terminal.
 setsid bash -c "script -qfc 'tmux attach -t $S' /dev/null" >/dev/null 2>&1 &
 ok=0
@@ -5369,8 +5394,7 @@ _GROUP_CTX_BEGIN = "<!-- TEAM GROUP CONTEXT (managed — edits below are overwri
 _GROUP_CTX_END = "<!-- END TEAM GROUP CONTEXT -->"
 # Top-level path segments reserved for the app (never treated as usernames).
 _RESERVED_TOP = {"", "api", "login", "logout", "qa-output", "static", "favicon.ico",
-                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws",
-                 "console"}
+                 "robots.txt", "sw.js", "health", "_next", "assets", "tmux", "ws"}
 
 
 def _load_groups() -> dict:
@@ -5719,28 +5743,95 @@ def _is_public_project_request(rel: str) -> bool:
     return _find_user_by_username(segs[0]) is not None
 
 
+# Hop-by-hop headers must never be forwarded (RFC 7230 §6.1). Forwarding
+# `content-encoding`/`content-length` while httpx has already decoded the body
+# is the classic double-decode bug: the browser is told "gzip" and handed plain
+# text, and the page dies with ERR_CONTENT_DECODING_FAILED.
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    "content-encoding", "content-length",
+})
+# Request headers we never forward upstream: `host` must be the upstream's own,
+# `cookie` is rebuilt below, `accept-encoding` is dropped so httpx decodes the
+# body itself (we then deliberately do not return `content-encoding`), and the
+# rest are hop-by-hop or useful only to the proxy that received them.
+_REQ_HEADER_DENY = _HOP_BY_HOP | {"host", "cookie", "content-length", "accept-encoding"}
+
+
 async def _proxy_to_port(request: Request, port: int, subpath: str):
+    """Reverse-proxy a project request to its own server on `port`.
+
+    Cookies are forwarded and Set-Cookie is returned to the browser. Without
+    this, any project that authenticates with a session cookie is unusable
+    behind the dashboard: the login POST succeeds, the cookie is dropped on the
+    floor, and the very next request 401s — an infinite login loop.
+
+    The response is streamed rather than buffered, because projects here serve
+    Server-Sent Events (`text/event-stream`) that only deliver their events as
+    they are produced. Buffering would hold the whole stream until the job
+    finished and defeat the live progress view.
+    """
     url = "http://127.0.0.1:%d/%s" % (port, subpath)
     if request.url.query:
         url += "?" + request.url.query
-    body = await request.body()
-    req = urllib.request.Request(url, data=body or None, method=request.method)
-    for h in ("content-type", "accept", "user-agent"):
-        v = request.headers.get(h)
-        if v:
-            req.add_header(h, v)
 
-    def _do():
-        return urllib.request.urlopen(req, timeout=30)
+    fwd = {k: v for k, v in request.headers.items()
+           if k.lower() not in _REQ_HEADER_DENY}
+    # Cookies the browser sent must reach the upstream project verbatim.
+    raw_cookie = request.headers.get("cookie")
+    if raw_cookie:
+        fwd["cookie"] = raw_cookie
+
+    body = await request.body()
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
     try:
-        resp = await asyncio.to_thread(_do)
-        return Response(content=resp.read(), status_code=resp.status,
-                        media_type=resp.headers.get("Content-Type", "application/octet-stream"))
-    except urllib.error.HTTPError as e:
-        return Response(content=e.read(), status_code=e.code,
-                        media_type=e.headers.get("Content-Type", "text/plain"))
+        upstream_req = client.build_request(
+            request.method, url, headers=fwd, content=body or None,
+        )
+        upstream = await client.send(upstream_req, stream=True)
     except Exception:
-        return HTMLResponse("Project server isn't reachable on port %d (is it running?)." % port, status_code=502)
+        await client.aclose()
+        return HTMLResponse(
+            "Project server isn't reachable on port %d (is it running?)." % port,
+            status_code=502,
+        )
+
+    set_cookies = upstream.headers.get_list("set-cookie")
+
+    # Build the response headers explicitly. A plain dict would silently keep
+    # only the last of several legal Set-Cookie headers, so those are collected
+    # separately and appended individually. `content-encoding` was already
+    # dropped by _HOP_BY_HOP, which is correct here: httpx decoded the body, so
+    # telling the browser it is still gzipped would corrupt the response.
+    resp_headers: list[tuple[bytes, bytes]] = [
+        (k.lower().encode(), v.encode())
+        for k, v in upstream.headers.multi_items()
+        if k.lower() not in _HOP_BY_HOP
+        and k.lower() not in ("set-cookie", "cache-control", "x-accel-buffering")
+    ]
+    resp_headers += [(b"set-cookie", c.encode()) for c in set_cookies]
+
+    # SSE holds the connection open; tell any intermediary not to buffer it or
+    # the browser sees nothing until the job ends.
+    if "text/event-stream" in upstream.headers.get("content-type", ""):
+        resp_headers.append((b"cache-control", b"no-cache"))
+        resp_headers.append((b"x-accel-buffering", b"no"))
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    # raw_headers is set after construction so the exact upstream header list
+    # (not a media_type-derived guess) reaches the client.
+    resp = StreamingResponse(_stream(), status_code=upstream.status_code)
+    resp.raw_headers = resp_headers
+    return resp
 
 
 QA_OUTPUT_DIR = Path(__file__).parent / "qa-output"
@@ -6584,6 +6675,47 @@ _SCROLLBACK_WINDOWS = (400, 4000, 50000)
 _SCROLLBACK_MAX_BYTES = 64 * 1024 * 1024
 _scrollback_state: Dict[str, dict] = {}   # {name: {"tail": [str], "lines": int}}
 _scrollback_lock = threading.Lock()
+_clean_transcript_cache = TranscriptCache()
+_clean_conversation_history = ConversationHistory(MESSAGES_DIR / "terminal-conversations.json")
+
+
+def _clean_history_paths(session_name: str, conversation_id: str) -> list:
+    _, session = _find_session(session_name)
+    if not session:
+        return []
+    root = (_session_config_base(session_name) / "projects").resolve()
+    ids = _clean_conversation_history.ids(
+        session_name, _session_owner_id(session_name), session.get("created", ""),
+        conversation_id, _session_convo(session_name),
+    )
+    paths = []
+    for uid in ids:
+        for path in root.glob("*/" + uid + ".jsonl"):
+            try:
+                path.resolve().relative_to(root)
+            except ValueError:
+                continue
+            if path.is_file():
+                paths.append(path)
+                break
+    return paths
+
+
+def _clean_session_transcript(session_name: str) -> Optional[dict]:
+    """Read only a conversation bound to this session, never a neighbor's file."""
+    conversation_id = _session_transcript_uuid(session_name) or _session_convo(session_name)
+    if not conversation_id:
+        return None
+    paths = _clean_history_paths(session_name, conversation_id)
+    if not paths:
+        return None
+    try:
+        snapshot = dict(_clean_transcript_cache.read_many(paths))
+    except (OSError, ValueError):
+        return None
+    snapshot["conversation_id"] = conversation_id
+    snapshot["version"] = conversation_id + ":" + snapshot["version"]
+    return snapshot
 
 
 def _scrollback_path(session_name: str) -> Path:
@@ -6594,6 +6726,14 @@ def _scrollback_path(session_name: str) -> Path:
 def _settled_pane_lines(session_name: str, count: int) -> list:
     """The last `count` lines of a pane's settled scrollback, oldest first."""
     try:
+        history = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{history_size}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # With no history tmux clamps -E -1 to a visible row. That row is
+        # repainted by alternate-screen CLIs and must never enter the archive.
+        if history.returncode != 0 or not history.stdout.strip().isdigit() or int(history.stdout) == 0:
+            return []
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", session_name, "-p", "-J",
              "-S", f"-{max(1, int(count))}", "-E", "-1"],
@@ -6799,71 +6939,17 @@ _pane_stability: Dict[str, tuple] = {}
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
 # Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
 _activity_state: Dict[str, dict] = {}
-# Going busy → idle needs ALL THREE of these, because a session that merely LOOKS
-# finished is the thing that makes the page chime at you for no reason:
-#   * N consecutive idle readings (it was a count alone, and the count was the
-#     bug: several callers poll this, so three readings could land inside a few
-#     seconds of one gap between tool calls),
-#   * IDLE_CONFIRM_SECONDS of wall clock since the first of them, and
-#   * IDLE_TRANSCRIPT_QUIET seconds since the session's own transcript last grew.
-# The transcript is what catches work the pane does not show: a sub-agent writing
-# into the same conversation, or a tool that takes a minute and prints nothing.
-# How long a pane carrying its end-of-turn line has to sit byte-identical before
-# an "esc to interrupt" on the LIVE STATUS ROW is read as paint nobody refreshed
-# rather than work. Only that row reaches here now (see _RE_HINT_BAR), so this is
-# the narrow case of a CLI that died or was suspended mid-frame, not the everyday
-# one it was written for: the everyday one was the key hint bar, which says the
-# same words on a finished pane and could never be waited out, because the timers
-# in a background-agent list keep the bytes moving.
-ESC_STALE_SECONDS = 60
+# Require N consecutive idle readings before switching from busy → idle.
+# At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
 IDLE_CONFIRM_COUNT = 3
-IDLE_CONFIRM_SECONDS = 10
-IDLE_TRANSCRIPT_QUIET = 15
 
 # Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
-# Claude Code cycles its spinner through these glyphs frame by frame. `*`, `·`
-# and `•` were missing, and they are ordinary frames: "* Puttering… (8m 21s)" and
-# "· Germinating… (19s)" were both captured from live, working sessions. A session
-# whose footer hint had rotated away from "esc to interrupt" at the moment one of
-# those frames was on screen read as IDLE while it was working, which is how a
-# turn waiting on its sub-agents went grey. Safe to add because every use is
-# gated on spinner_is_live: a prose bullet sits on a pane that has stopped
-# changing, and a real spinner repaints.
-_SPINNER_ICONS = r'[✶✽✻☆◆●*·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
+_SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
 _RE_COMPLETION = re.compile(
     r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
     r'(?:Done|Completed|[A-Z][a-zé]+(?:ed|d)\s+for\s+\d+[hms])'
 )
-# Claude Code's END-OF-TURN status line, and only that:
-#   "✻ Cooked for 10m 38s · done 6:34 PM"
-# It replaces the live spinner the instant the turn ends, so it is proof the
-# composer is live again. Deliberately NARROWER than _RE_COMPLETION above, which
-# also accepts a bare "Done"/"Completed" — that form matches the agent's own prose
-# ("● Done. The redraft is in and the checks pass."), which it can print while a
-# sub-agent is still running. Harmless when all it does is skip a line in the
-# spinner scan; not harmless as a "the turn is over" signal.
-_RE_TURN_DONE = re.compile(
-    r'^[✶✽✻●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢☆◆]\s+'
-    r'[A-Z][a-zé]+(?:ed|d)\s+for\s+[\dhms\s]+[·⋅]\s*done\b')
 _RE_RUNNING_TASK = re.compile(r'^[⎿\s]*◼')
-# The result slot of a tool call that has not returned yet: "  ⎿  Running…".
-# Claude Code overwrites it with the output the moment the call lands, so unlike
-# "● 2 background agents launched (↓ to manage)" - which is printed once and then
-# sits in the scrollback for ever - this one is only on screen while something
-# really is running. Matching the launch banner instead would pin the session on
-# working permanently, which is the trap the rest of this file keeps hitting.
-_RE_RUNNING_TOOL = re.compile(r'^[⎿│\s]*(?:Running|Waiting)(?:…|\.{2,3})')
-# What Claude Code prints while it is compacting. Worth its own state: the turn
-# is over, the user's work is done, and what is left is housekeeping they should
-# be able to see rather than a red pill that looks like unfinished work.
-# Anchored to the start of a status line, and deliberately NOT matching the
-# "Compacting at auto window (400k tokens)" footer hint, which says how compaction
-# is configured rather than that it is happening. Anchoring matters more than
-# usual here: the words appear in ordinary prose the moment anyone works on this
-# file, and an unanchored search would read that scrollback as a live state.
-_RE_COMPACTING = re.compile(
-    r'^(?:[✶✽✻☆◆●*·•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]\s+)?'
-    r'Compacting conversation')
 _RE_SPINNER_START = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})')
 _RE_SPINNER_INLINE = re.compile(_SPINNER_ICONS + r'\s+\w+(?:…|\.{2,3})(?:\s*\(.*?\))?\s*$')
 # "3 local agents still running", "Waiting for completion of 2 agents": these are
@@ -6875,18 +6961,6 @@ _AGENTS_RUNNING_RE = re.compile(
     r'(?:^|[\s⎿│>])\d+\s+(?:local\s+|background\s+)?(?:agents?|tasks?|tools?)\b[^.]{0,40}?'
     r'\b(?:still\s+running|running|in\s+progress)\b'
     r'|waiting\s+for\s+completion\s+of\s+\d+',
-    re.I)
-# The live status line while the turn is blocked on work of its own:
-#   "✻ Waiting for 4 background agents to finish"
-#   "· Waiting for the remaining tasks"
-# It carries no "…" so the spinner patterns above miss it, and no count in the
-# place _AGENTS_RUNNING_RE looks for one. A leading ● is EXCLUDED on purpose:
-# that is the agent's own prose ("● Waiting for the four search agents to finish
-# scanning…"), which stays on screen long after the work is done.
-_RE_WAITING_ON_WORK = re.compile(
-    r'^\s*(?:[✶✽✻☆◆⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢·•]\s+)?'
-    r'waiting\s+(?:for|on)\b[^\n]{0,60}?'
-    r'\b(?:agents?|subagents?|tasks?|forks?|workers?|jobs?|tool\s+calls?|completion|results?)\b',
     re.I)
 #  THE KEY HINT BAR IS NOT A STATUS LINE. Claude Code parks a list of what the
 #  keys do under the composer:
@@ -7121,17 +7195,6 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         has_esc_to_interrupt = _esc_to_interrupt_live(
             all_lines[-25:] if len(all_lines) >= 25 else all_lines)
 
-        # --- Step 1b: compaction, which is its own state ---
-        # Reported before anything else because it outranks every other reading:
-        # the prompt is drawn, the spinner may be gone, and the session is neither
-        # free nor working on the user's task. The UI gives it its own colour and
-        # bar, so "it has been red for four minutes" becomes "it is compacting".
-        for line in (all_lines[-25:] if len(all_lines) >= 25 else all_lines):
-            if _RE_COMPACTING.match(line.strip()):
-                info["status"] = "busy"
-                info["detail"] = "Compacting"
-                return info
-
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
         # Lines containing these phrases override idle — session is still working
@@ -7183,14 +7246,6 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         # executing tools / thinking / streaming.
         window = all_lines[-25:] if len(all_lines) >= 25 else all_lines
 
-        # "✻ Cogitated for 41m 2s · done 6:23 PM" is Claude Code SAYING the turn
-        # is over — it replaces the live spinner and only ever appears after the
-        # fact. Worth recording rather than only skipping, because step 5 hands it
-        # to detect_activity as turn_done, which is the one thing allowed to settle
-        # busy → idle without waiting on the transcript.
-        saw_completion = False
-        running_tool = False
-
         # All checks are LINE-BY-LINE.  Start-of-line anchoring is used
         # where possible to avoid false positives from these patterns
         # appearing in conversation output text.
@@ -7199,7 +7254,6 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             stripped = line.strip()
             # Skip completion markers — these look like spinners but mean "finished"
             if _RE_COMPLETION.match(stripped):
-                saw_completion = saw_completion or bool(_RE_TURN_DONE.match(stripped))
                 continue
             # ◼ at start of line (with optional ⎿ tree prefix) = running task
             if _RE_RUNNING_TASK.match(stripped) and spinner_is_live:
@@ -7234,53 +7288,19 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = "Agents running"
                 return info
-            # "✻ Waiting for 4 background agents to finish": the turn is not over,
-            # it is blocked on its own sub-agents. Only while the pane is alive —
-            # a waiting spinner animates, so a frozen one is a leftover.
-            if _RE_WAITING_ON_WORK.match(stripped) and spinner_is_live:
-                info["status"] = "busy"
-                info["detail"] = "Waiting for agents"
-                return info
-            # "⎿  Running…": a tool call, or a sub-agent, that has not returned.
-            # Recorded rather than returned, because it is usually printed ABOVE
-            # the spinner and returning here would relabel every ordinary busy
-            # session. Only consulted once the whole window has failed to produce
-            # a spinner, which is the case that used to read idle: a turn waiting
-            # on its sub-agents, footer rotated off "esc to interrupt", spinner on
-            # a frame this scan did not know.
-            if _RE_RUNNING_TOOL.match(line):
-                running_tool = True
 
         # --- Step 4: (stability was measured above, before the spinner scan) ---
-        # No spinner anywhere, but a tool call is still showing "Running…" on a
-        # pane that is repainting. That is a turn in progress whose spinner frame
-        # this scan does not recognise, and calling it idle is what made a session
-        # waiting on its sub-agents look free.
-        if running_tool and spinner_is_live:
-            info["status"] = "busy"
-            info["detail"] = "Waiting on a tool"
-            return info
-
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
         if has_idle_prompt and not has_esc_to_interrupt:
             info["status"] = "idle"
             info["detail"] = ""
-            info["turn_done"] = saw_completion
             return info
 
-        # "esc to interrupt" on the live status row without a spinner we know =
-        # something is still interruptible. Compaction has its own row and is
-        # already reported above, so what is left here is a turn whose spinner
-        # frame this scan does not recognise. The stale escape hatch stays for the
-        # pane that froze mid-frame: end-of-turn line plus not one byte changed in
-        # ESC_STALE_SECONDS. It reports idle rather than turn_done, so the ordinary
-        # debounce and the transcript check still have to agree before the pill
-        # turns green.
+        # "esc to interrupt" on the LIVE STATUS ROW, with no spinner frame this
+        # scan recognises: something is still interruptible. The key hint bar under
+        # the composer says the same words on a finished pane and no longer counts,
+        # which is what pinned a finished session on a red Working pill.
         if has_esc_to_interrupt:
-            if saw_completion and stable_seconds >= ESC_STALE_SECONDS:
-                info["status"] = "idle"
-                info["detail"] = ""
-                return info
             info["status"] = "busy"
             info["detail"] = "Background tasks"
             return info
@@ -7292,7 +7312,6 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         if content_is_static and cmd.lower() in ("claude", "node"):
             info["status"] = "idle"
             info["detail"] = ""
-            info["turn_done"] = saw_completion
             return info
 
         # --- Step 7: Shell prompt check ---
@@ -7309,7 +7328,6 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             # Claude Code with no spinner + no "esc to interrupt" = idle
             info["status"] = "idle"
             info["detail"] = ""
-            info["turn_done"] = saw_completion
         else:
             info["status"] = "busy"
             info["detail"] = cmd
@@ -7318,58 +7336,14 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
     return info
 
 
-_transcript_path_cache: Dict[str, tuple] = {}   # name -> (path, resolved_at)
-
-
-def _own_transcript_path(session_name: str) -> str:
-    """This session's OWN transcript file, by the conversation id it was launched
-    on. '' when the id is unknown or the file is not there yet.
-
-    Deliberately not the heuristic match: a neighbour's transcript in the same
-    working directory would report their work as this session's."""
-    hit = _transcript_path_cache.get(session_name)
-    if hit and time.time() - hit[1] < 60:
-        return hit[0]
-    path = ""
-    try:
-        convo = _session_convo(session_name)
-        if convo and _UUID_RE.fullmatch(convo):
-            target = convo + ".jsonl"
-            for f in _find_session_jsonl_files(session_name):
-                if os.path.basename(f) == target:
-                    path = f
-                    break
-    except Exception:
-        logger.debug("transcript path lookup failed for %s", session_name, exc_info=True)
-    _transcript_path_cache[session_name] = (path, time.time())
-    return path
-
-
-def _transcript_quiet_seconds(session_name: str) -> Optional[float]:
-    """How long since this session's transcript last grew, or None if unknown.
-
-    A sub-agent writes into the conversation it was spawned from, and a long tool
-    call appends its result when it lands, so a growing file means the turn is
-    still going even when the pane has nothing new to show."""
-    path = _own_transcript_path(session_name)
-    if not path:
-        return None
-    try:
-        return max(0.0, time.time() - os.path.getmtime(path))
-    except OSError:
-        _transcript_path_cache.pop(session_name, None)
-        return None
-
-
 def detect_activity(session_name: str) -> dict:
     """Debounced activity detection with asymmetric hysteresis.
 
-    - idle → busy: immediate (one reading).
-    - busy → idle: only once the pane has read idle IDLE_CONFIRM_COUNT times in a
-      row AND for IDLE_CONFIRM_SECONDS, AND this session's transcript has been
-      quiet for IDLE_TRANSCRIPT_QUIET. Anything less calls a gap between tool
-      calls, or a turn waiting on its sub-agents, "finished" — which is what put
-      a completion chime and a cache warning on sessions that were still working.
+    - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
+    - idle → busy: immediate (1 reading)
+
+    This prevents flickering when Claude Code briefly shows no spinner
+    between tool calls or streaming chunks.
     """
     raw = _detect_activity_raw(session_name)
     now = time.time()
@@ -7381,7 +7355,6 @@ def detect_activity(session_name: str) -> dict:
             "status": raw["status"],
             "since": now,
             "consecutive_idle": 1 if raw["status"] == "idle" else 0,
-            "idle_since": now if raw["status"] == "idle" else 0,
             "raw": raw,
         }
         return raw
@@ -7392,61 +7365,38 @@ def detect_activity(session_name: str) -> dict:
             "status": "busy",
             "since": now if prev["status"] != "busy" else prev["since"],
             "consecutive_idle": 0,
-            "idle_since": 0,
             "raw": raw,
         }
         return raw
 
     if raw["status"] in ("idle", "unknown"):
         if prev["status"] == "busy":
-            # Trying to transition busy → idle: hold busy until it has looked
-            # idle for long enough AND nothing is still being written.
+            # Trying to transition busy → idle: increment counter but hold busy
             idle_count = prev["consecutive_idle"] + 1
-            idle_since = prev.get("idle_since") or now
-            quiet = _transcript_quiet_seconds(session_name)
-            if raw.get("turn_done"):
-                # The pane is showing Claude Code's own end-of-turn line
-                # ("✻ Cogitated for 41m 2s · done 6:23 PM"). That is the product
-                # stating the turn is over and the composer is live, so there is
-                # nothing left to debounce. The transcript keeps growing for a
-                # minute or two afterwards — the Stop hook's result and the
-                # session summary both land late — and waiting on it left a
-                # finished session pulsing red with its answer fully on screen,
-                # which is the one thing this pill exists to get right.
-                settled = True
-            else:
-                settled = (idle_count >= IDLE_CONFIRM_COUNT
-                           and now - idle_since >= IDLE_CONFIRM_SECONDS
-                           and (quiet is None or quiet >= IDLE_TRANSCRIPT_QUIET))
-            if settled:
+            if idle_count >= IDLE_CONFIRM_COUNT:
+                # Enough consecutive idle readings — confirm transition
                 _activity_state[session_name] = {
                     "status": raw["status"],
                     "since": now,
                     "consecutive_idle": idle_count,
-                    "idle_since": idle_since,
                     "raw": raw,
                 }
                 return raw
-            # Not settled — stay busy but record the idle reading. A transcript
-            # that grew again means work restarted, so the clock starts over.
-            if quiet is not None and quiet < 2:
-                idle_since = now
-                idle_count = 0
-            _activity_state[session_name] = {
-                "status": "busy",
-                "since": prev["since"],
-                "consecutive_idle": idle_count,
-                "idle_since": idle_since,
-                "raw": prev["raw"],  # keep last busy details
-            }
-            return prev["raw"]
+            else:
+                # Not enough yet — stay busy but record the idle reading
+                _activity_state[session_name] = {
+                    "status": "busy",
+                    "since": prev["since"],
+                    "consecutive_idle": idle_count,
+                    "raw": prev["raw"],  # keep last busy details
+                }
+                return prev["raw"]
         else:
             # Already idle/unknown — stay idle, keep counting
             _activity_state[session_name] = {
                 "status": raw["status"],
                 "since": prev["since"],
                 "consecutive_idle": prev["consecutive_idle"] + 1,
-                "idle_since": prev.get("idle_since") or now,
                 "raw": raw,
             }
             return raw
@@ -7456,7 +7406,6 @@ def detect_activity(session_name: str) -> dict:
         "status": raw["status"],
         "since": now,
         "consecutive_idle": 0,
-        "idle_since": 0,
         "raw": raw,
     }
     return raw
@@ -7470,23 +7419,39 @@ async def async_detect_activity(session_name: str) -> dict:
 async def llm_call(system_prompt: str, user_content: str, max_tokens: int = 200,
                    response_format: dict = None) -> str:
     start = time.time()
+    gateway = _model_gateway_base()
     try:
         kwargs = dict(
-            model="gpt-4o-mini",
+            model=_GATEWAY_LLM_MODEL if gateway else "gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=max_tokens,
+            max_tokens=max_tokens + (_LLM_REASONING_RESERVE if gateway else 0),
             temperature=0.3,
         )
         if response_format:
             kwargs["response_format"] = response_format
-        resp = await client.chat.completions.create(**kwargs)
+        if gateway:
+            if not _GATEWAY_LLM_KEY:
+                logger.error("llm_call: on a gateway box but no gateway key is set "
+                             "(TMUX_DASH_LLM_KEY / ANTHROPIC_AUTH_TOKEN)")
+                return ""
+            resp = await _gateway_llm_client(gateway).chat.completions.create(**kwargs)
+        else:
+            resp = await client.chat.completions.create(**kwargs)
         duration = time.time() - start
         tokens_used = getattr(resp.usage, "total_tokens", 0) if resp.usage else 0
         logger.debug("LLM call completed in %.1fs, %d tokens", duration, tokens_used)
-        return resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content
+        if not content:
+            # A reasoning model that spent its whole budget thinking returns an
+            # empty content with finish_reason "length" rather than an error.
+            logger.warning("llm_call: empty content (finish_reason=%s) — raise "
+                           "TMUX_DASH_LLM_REASONING_RESERVE if this recurs",
+                           getattr(resp.choices[0], "finish_reason", "?"))
+            return ""
+        return content.strip()
     except Exception as e:
         duration = time.time() - start
         logger.error("LLM call failed after %.1fs: %s", duration, e)
@@ -8421,7 +8386,8 @@ async def api_refresh_all_tiers(session_name: str):
     return JSONResponse(build_session_response(sess, entry, activity=activity))
 
 
-async def _activity_payload(request: Request) -> JSONResponse:
+@app.get("/api/status")
+async def api_status(request: Request):
     """Lightweight: return only activity status per session, no LLM calls."""
     user = _current_user(request)
     sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
@@ -8444,24 +8410,6 @@ async def _activity_payload(request: Request) -> JSONResponse:
             **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
-
-
-# Busy -> idle is only ever learned from this poll, so it has TWO paths on
-# purpose. Measured on builder5 2026-09-21: one browser ran ~2,175 poll ticks
-# over six hours and not a single GET /api/status left it, while every other
-# fetch made from the same function body arrived normally. Nothing server-side
-# can drop a request that never reaches the server, so what was being filtered
-# was that one URL on that one client. The twin carries the identical payload
-# under a name nothing has an opinion about, and the page falls back to it after
-# three misses in a row.
-@app.get("/api/status")
-async def api_status(request: Request):
-    return await _activity_payload(request)
-
-
-@app.get("/api/activity")
-async def api_activity(request: Request):
-    return await _activity_payload(request)
 
 
 @app.get("/api/sessions/{session_name}/raw")
@@ -8504,7 +8452,7 @@ def _visible_pane_hash(session_name: str) -> str:
 
 
 @app.get("/api/sessions/{session_name}/raw-tail")
-async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str = ""):
+async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str = "", clean: bool = False):
     """Return delta output since the client's last known line count.
 
     Also detects in-place TUI redraws (Claude Code's alternate screen) by
@@ -8514,6 +8462,22 @@ async def api_raw_tail(session_name: str, known_lines: int = 0, last_hash: str =
     _, found = _find_session(session_name)
     if not found:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    if clean:
+        snapshot = await asyncio.to_thread(_clean_session_transcript, session_name)
+        if snapshot is not None:
+            unchanged = last_hash == snapshot["version"]
+            live_raw = await asyncio.to_thread(capture_pane_recent, session_name, 0)
+            response = {
+                "source": "transcript", "mode": "none" if unchanged else "full",
+                "visible_hash": snapshot["version"], "pane_total": max(1, snapshot["lines"]),
+                "total_lines": snapshot["lines"], "archived_lines": 0,
+                "conversation_id": snapshot["conversation_id"],
+                "message_count": snapshot["message_count"], "live_raw": live_raw,
+            }
+            if not unchanged:
+                response.update(raw=snapshot["raw"], user_lines=snapshot["user_lines"])
+            return JSONResponse(response)
 
     pos = await asyncio.to_thread(get_pane_position, session_name)
     current_total = pos["total_lines"]
@@ -8601,53 +8565,6 @@ async def api_session_history(session_name: str, before: int = -1, limit: int = 
     })
 
 
-#  A SESSION IS NEVER HANDED A METERED KEY (owner rule 2026-09-20). The dashboard keeps its own
-#  OPENAI_API_KEY for the summaries and the voice endpoints, but a pane must not inherit it: an
-#  agent that finds a metered key in its environment can end up billing it instead of running
-#  on the subscription it was given, and that failure is silent, it just costs money. An agent
-#  runs on its plan and asks the advisor for anything else it needs. tmux has no unset, so the
-#  names go through EMPTY, which every consumer reads as absent.
-FENCED_ENV_NAMES = ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
-                    "ANTHROPIC_API_KEY", "CODEX_API_KEY")
-
-_tmux_new_session_e: dict = {}
-
-
-def _tmux_supports_new_session_e() -> bool:
-    """Does this tmux take `new-session -e`? It arrived in 3.2.
-
-    builder1 is Debian 11 and runs 3.1c, where the flag does not exist: every
-    create there died with `tmux: unknown option -- e` and the dashboard could
-    not open a session at all. Upgrading tmux under a live box is worse than
-    coping with the old one, because a new client cannot talk to the running
-    server and every existing session goes unreachable until it is restarted.
-    """
-    if "ok" not in _tmux_new_session_e:
-        try:
-            out = subprocess.run(["tmux", "-V"], capture_output=True,
-                                 text=True, timeout=5).stdout or ""
-        except Exception:
-            out = ""
-        found = re.search(r"(\d+)\.(\d+)", out)
-        _tmux_new_session_e["ok"] = bool(found) and \
-            (int(found.group(1)), int(found.group(2))) >= (3, 2)
-    return _tmux_new_session_e["ok"]
-
-
-def _fenced_env() -> dict:
-    """This process's environment with every metered key name emptied.
-
-    The tmux CLIENT is spawned with this, so that when there is no server yet
-    and the client forks one, the server cannot inherit a key and hand it to
-    every pane it later starts.
-    """
-    env = dict(os.environ)
-    for name in FENCED_ENV_NAMES:
-        if env.get(name):
-            env[name] = ""
-    return env
-
-
 def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]:
     """Create one tmux session and return the immutable id printed by tmux."""
     command = [
@@ -8658,27 +8575,11 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
         "-F",
         "#{session_id}\t#{session_name}",
     ]
-    held = [name_ for name_ in FENCED_ENV_NAMES if os.environ.get(name_)]
-    if held and _tmux_supports_new_session_e():
-        for fenced in held:
-            command += ["-e", "%s=" % fenced]
-    elif held:
-        #  Old tmux: `set-environment -g` reaches the same place, every pane the
-        #  server starts from here on, and it has been in tmux since 1.0. Best
-        #  effort, because the client below still goes out with the names empty.
-        for fenced in held:
-            try:
-                subprocess.run(["tmux", "set-environment", "-g", fenced, ""],
-                               capture_output=True, text=True, timeout=5,
-                               env=_fenced_env())
-            except Exception:
-                pass
     if name:
         command += ["-s", name]
     if cwd:
         command += ["-c", cwd]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=5,
-                            env=_fenced_env())
+    result = subprocess.run(command, capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Failed to create session")
     created_id, separator, created_name = result.stdout.strip().partition("\t")
@@ -8720,12 +8621,7 @@ def _exact_tmux_session_id(session_name: str) -> str:
 
 
 def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
-    """Build a managed Claude command bound to one exact conversation.
-
-    `--resume` when Claude has that conversation on disk, `--session-id` when it
-    does not: either way the pane comes back on the id every lifecycle row and
-    tab label already points at. See _convo_has_transcript for why the second
-    case is not hypothetical."""
+    """Build a managed Claude command bound to one exact conversation."""
     if not _UUID_RE.fullmatch(str(resume_uuid or "")):
         raise ValueError("invalid Claude resume UUID")
     # RESUMING A CONVERSATION IS NOT STARTING ONE. The launch defaults belong to a
@@ -8749,7 +8645,7 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     command = (command.strip()
                + _model_flag_for_relaunch(session_name)
                + _effort_flag_for_relaunch(session_name)
-               + " " + _fresh_or_resume_flag(session_name, resume_uuid))
+               + " --resume " + resume_uuid)
     return _managed_agent_command(session_name, command)
 
 
@@ -8760,20 +8656,12 @@ def _restore_durable_session(candidate: dict) -> dict:
     owner_id = str(candidate.get("owner_id") or "")
     cwd_text = str(candidate.get("cwd") or "")
     resume_uuid = str(candidate.get("resume_uuid") or "")
-    recorded_uuid = resume_uuid          # what the row is bound to, may be empty
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError("invalid durable session name")
     if not generation or not owner_id:
         raise ValueError("durable session binding is incomplete")
     if not _UUID_RE.fullmatch(resume_uuid):
-        # A row reaches here with no conversation when its tab died before Claude
-        # ever wrote one. Refusing to restore made the reconcile loop retry every
-        # 20s forever and the tab never came back ('authsetup', 2026-08-27).
-        # Minting one is safe: a fresh --session-id starts its own conversation
-        # and can never pick up a neighbour's the way --continue can.
-        resume_uuid = str(uuid.uuid4())
-        logger.warning("Durable session '%s' has no conversation on record, "
-                       "restoring it on a fresh one (%s)", name, resume_uuid)
+        raise ValueError("durable session has no exact Claude conversation")
     try:
         cwd = Path(cwd_text).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
@@ -8790,7 +8678,7 @@ def _restore_durable_session(candidate: dict) -> dict:
         generation=generation,
         owner_id=owner_id,
         desired_states={"running"},
-        resume_uuid=recorded_uuid,
+        resume_uuid=resume_uuid,
         restore_on_startup=True,
     ):
         return {"name": name, "status": "stale"}
@@ -8803,7 +8691,7 @@ def _restore_durable_session(candidate: dict) -> dict:
             generation=generation,
             owner_id=owner_id,
             desired_states={"running"},
-            resume_uuid=recorded_uuid,
+            resume_uuid=resume_uuid,
             restore_on_startup=True,
         ):
             raise RuntimeError("session lifecycle changed during recovery")
@@ -8888,49 +8776,15 @@ def _restore_durable_session(candidate: dict) -> dict:
         raise
 
 
-def _is_ephemeral_session(name: str) -> bool:
-    """True for tmux sessions that are scaffolding, not somebody's tab.
-
-    The dashboard drives short-lived sessions of its own: `_authsetup` for the
-    token flow, `prime_<pid>` for accepting the bypass warning in a new config
-    dir. They are created, used and killed in seconds. Durable recovery must not
-    adopt them: it recreates whatever it has a row for, so a checkpointed
-    scaffold session comes back from the dead every 20s after its owner killed
-    it (2026-08-27). The leading underscore is the existing internal-name
-    convention; prime_ is named by the primer script. Carried over from
-    claude.lisa.my, which had this fix while the other boxes did not, and whose
-    absence on builder1 wrote a page of recovery errors into the log every
-    20 seconds for a fortnight.
-    """
-    return name.startswith("_") or name.startswith(PRIME_SESSION_PREFIX)
-
-
 def _checkpoint_live_sessions() -> int:
     """Persist the owner, cwd, and exact Claude conversation for live tabs."""
     checkpointed = 0
     for session in get_tmux_sessions():
         name = str(session.get("name") or "")
-        if not name or _is_ephemeral_session(name):
+        if not name:
             continue
         owner_id = _session_owner_id(name)
         resume_uuid = _session_convo(name)
-        # An id with no transcript is stale as well as unusable: the pane is
-        # running some OTHER conversation (the recorded one was never written,
-        # so Claude cannot be in it). Re-learn rather than checkpoint a pointer
-        # to nothing, but keep the old id if the pane will not name a better one.
-        if resume_uuid and _conversation_state(name, resume_uuid) != "saved":
-            try:
-                _clear_session_convo(name)
-                relearned = _learn_session_convo(name)
-                if relearned:
-                    logger.info("Session '%s': recorded conversation %s has no "
-                                "transcript, corrected to %s", name, resume_uuid, relearned)
-                    resume_uuid = relearned
-                else:
-                    _set_session_convo(name, resume_uuid)
-            except Exception:
-                _set_session_convo(name, resume_uuid)
-                logger.debug("Could not re-learn conversation for '%s'", name, exc_info=True)
         if not resume_uuid:
             try:
                 resume_uuid = _learn_session_convo(name)
@@ -8970,7 +8824,6 @@ def _durable_session_candidates(live_names: set[str]) -> list[dict]:
         row = rows.get(name)
         if (
             name in live_names
-            or _is_ephemeral_session(name)
             or not isinstance(row, dict)
             or not row.get("managed")
             or str(row.get("desired_state") or "") != "running"
@@ -9176,17 +9029,11 @@ async def api_create_session(request: Request, body: CreateSession):
                 _boot.append(_profile_export_line(requested_profile))
             else:
                 logger.warning("Unknown profile_id '%s' on session create", requested_profile)
-        # Prime the config dir's one-time bypass-permissions acceptance BEFORE
-        # launching, or the detached session's claude hits that warning with no
-        # attached client. Its highlighted default is "1. No, exit", so the
-        # auto-responder's Enter kills the pane and durable recovery respawns it
-        # into the same prompt forever: a member's very first session could never
-        # come up (lisa-claude, 2026-08-27). This used to run only when a shared
-        # API key was stored, which left every subscription-auth box exposed even
-        # though _prime_claude_config handles subscription creds perfectly well.
-        # Runs once per config dir (marker-guarded); the first session for an
-        # account waits ~10-20s. The admin's own ~/.claude is primed by daily use.
-        if _stored_anthropic_key or (user and not _is_admin(user)):
+        # When authenticating via a shared API key, prime the config dir's one-time
+        # bypass-permissions acceptance BEFORE launching, or the detached session's
+        # claude would hit the warning with no attached client and exit. Runs once
+        # per config dir (marker-guarded); first session per user waits ~10-20s.
+        if _stored_anthropic_key:
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
         # Optionally launch a command in the new session. Pin the default model
         # unless the chosen profile pins its own via its settings.json.
@@ -9713,6 +9560,23 @@ async def api_get_claude_md(session_name: str):
             except Exception:
                 logger.debug("Failed to read CLAUDE.md at %s", md_path, exc_info=True)
         results.append({"path": md_path, "content": content, "exists": os.path.exists(md_path), "label": "Project"})
+    # Include the selected account/profile and inherited project instructions.
+    # These are loaded by Claude Code too, including when it uses a gateway.
+    extra = [(_session_config_base(session_name) / "CLAUDE.md", "Account / profile")]
+    if cwd:
+        home = Path.home().resolve()
+        directory = Path(cwd).resolve()
+        while directory != home and home in directory.parents:
+            extra.append((directory / ".claude" / "CLAUDE.md", "Project .claude"))
+            directory = directory.parent
+            if directory != home:
+                extra.append((directory / "CLAUDE.md", "Parent project"))
+    for path, label in extra:
+        if path.is_file() and str(path) not in {item["path"] for item in results}:
+            try:
+                results.append({"path": str(path), "content": path.read_text(), "exists": True, "label": label})
+            except OSError:
+                logger.debug("Failed to read instruction file %s", path, exc_info=True)
     # Check home dir
     home_md = os.path.join(str(Path.home()), "CLAUDE.md")
     home_content = ""
@@ -13624,102 +13488,24 @@ nice -n 5 dbus-run-session -- google-chrome-stable "${FLAGS[@]}" \
 echo "started session $ID on display :$DISP rfb $RFB vnc $VNC cdp $CDP"
 '''
 
-# What the launcher sources. It carries the settings every browser on the box
-# shares, so a flag changed here reaches the default browser and each account's
-# at their next start.
-#
-# This used to be a hand-placed file, present only on the box someone first
-# wrote it on. A rebuilt box got the launcher above (which we write) with
-# nothing to source, so every browser died on "CB_ROOT: unbound variable" while
-# browser_sessions.json still listed a browser per account: configured, and
-# unstartable (lisa-claude, 2026-08-27). It is versioned here now, like the
-# launcher, and written the same way.
-_CHROME_COMMON_SCRIPT = r'''#!/usr/bin/env bash
-# Shared Chrome settings for every browser session on this box.
-# Written by the dashboard (app.py). Local edits are overwritten.
-CB_ROOT="${CB_ROOT:-$HOME/.claude-browser}"
-CB_BIN="${CB_BIN:-$CB_ROOT/bin}"
-CB_SCREEN_W="${CB_SCREEN_W:-1440}"
-CB_SCREEN_H="${CB_SCREEN_H:-900}"
-export CB_ROOT CB_BIN CB_SCREEN_W CB_SCREEN_H
-
-# Per-session runtime dirs. Chrome writes config and cache outside its profile
-# too; without these each browser scribbles into the box's own XDG dirs and two
-# accounts end up sharing state they are supposed to keep apart.
-cb_chrome_env() {   # <id>
-  export CB_SESSION_ID="$1"
-  export XDG_CONFIG_HOME="$CB_ROOT/sessions/$1/xdg"
-  export XDG_CACHE_HOME="$CB_ROOT/sessions/$1/cache"
-  mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
-}
-
-cb_proxy_port() {   # <id> -> the relay port for this session, or nothing
-  python3 - "$1" <<'PY' 2>/dev/null
-import json, os, sys
-try:
-    d = json.load(open(os.path.expanduser("~/.claude-browser/proxy.json")))
-except Exception:
-    sys.exit(0)
-s = (d.get("sessions") or {}).get(sys.argv[1]) or {}
-if s.get("enabled") and s.get("local_port"):
-    print(int(s["local_port"]))
-PY
-}
-
-cb_port_open() {    # <port>
-  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null || return 1
-  exec 3>&-
-  return 0
-}
-
-# One flag per line: the launcher reads this with mapfile.
-cb_chrome_flags() { # <profile> <cdp> <id>
-  local profile="$1" cdp="$2" id="$3" port
-  cat <<FLAGS
---user-data-dir=$profile
---remote-debugging-port=$cdp
---remote-debugging-address=127.0.0.1
---no-first-run
---no-default-browser-check
---disable-session-crashed-bubble
---disable-features=Translate,MediaRouter,AutofillServerCommunication
---password-store=basic
---window-position=0,0
---window-size=${CB_SCREEN_W},${CB_SCREEN_H}
---disable-dev-shm-usage
-FLAGS
-  # Sticky per-session exit IP, only when the relay is actually up: pointing
-  # Chrome at a proxy port nothing is listening on fails every page load in
-  # that browser, which is worse than sharing the box's own IP.
-  port="$(cb_proxy_port "$id")"
-  if [ -n "$port" ] && cb_port_open "$port"; then
-    printf -- '--proxy-server=http://127.0.0.1:%s\n' "$port"
-  fi
-}
-'''
-CHROME_COMMON = str(Path.home() / ".claude-browser" / "bin" / "chrome-common.sh")
-
 
 def _ensure_browser_launcher():
-    """Keep the on-disk launcher and the file it sources in sync with the copies
-    above.
+    """Keep the on-disk launcher in sync with the copy above.
 
     It used to be write-if-missing, which meant a launcher written before the
-    anti-fingerprinting work stayed frozen at the old flags forever: new
+    anti-fingerprinting work stayed frozen at the old flags forever — new
     browsers would still start with --no-sandbox/--disable-gpu and no proxy.
-    Rewrite whenever the content differs instead (they're ours; nothing else
-    edits them)."""
-    for path, body in ((BROWSER_LAUNCHER, _BROWSER_LAUNCHER_SCRIPT),
-                       (CHROME_COMMON, _CHROME_COMMON_SCRIPT)):
-        p = Path(path)
-        try:
-            if not p.exists() or p.read_text() != body:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(body)
-                p.chmod(0o755)
-                logger.info("Browser script written to %s", p)
-        except Exception:
-            logger.debug("Failed to write %s", path, exc_info=True)
+    Rewrite whenever the content differs instead (it's ours; nothing else
+    edits it)."""
+    p = Path(BROWSER_LAUNCHER)
+    try:
+        if not p.exists() or p.read_text() != _BROWSER_LAUNCHER_SCRIPT:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_BROWSER_LAUNCHER_SCRIPT)
+            p.chmod(0o755)
+            logger.info("Browser launcher script written to %s", p)
+    except Exception:
+        logger.debug("Failed to write browser launcher", exc_info=True)
 # The default session's ports are host-dependent: 5900/6080 is the convention,
 # but on builder the ups-audit app owns that pair on the SAME display :99 (nginx
 # maps /ups-vnc/ -> 6080) with a password-protected x11vnc, so this dashboard's
@@ -13735,29 +13521,11 @@ def _ensure_browser_launcher():
 # CB_DEFAULT_EXTERNAL_URL only on the host that URL actually points at;
 # everywhere else the dashboard's own /browser/<sid>/vnc.html viewer is the
 # only correct way in.
-#
-# `managed` says who starts the thing. It is False by default because on the
-# hosts this began on, display :99 belongs to a systemd unit (claude-vnc) that
-# owns the browser's whole lifecycle and the dashboard must not fight it. A box
-# built without such a unit has the opposite problem: the default browser is the
-# ADMIN's account browser (_browser_owner_id maps it to "admin"), so with nobody
-# managing it the owner is the one person on the box whose browser can never
-# start, while every other account's does (lisa-claude, 2026-08-27). Set
-# CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
 _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222,
-    # `managed` says who starts the thing. False by default because on the hosts
-    # this began on, display :99 belongs to a systemd unit (claude-vnc) that owns
-    # the browser's whole lifecycle and the dashboard must not fight it. A box
-    # built without such a unit has the opposite problem: the default browser is
-    # the ADMIN's account browser (_browser_owner_id maps it to "admin"), so with
-    # nobody managing it the owner is the one person on the box whose browser can
-    # never start, while every other account's does (lisa-claude, 2026-08-27).
-    # Set CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
-    "managed": os.environ.get("CB_DEFAULT_MANAGED", "") == "1",
+    "cdp_port": 9222, "managed": False,
     "external_url": os.environ.get("CB_DEFAULT_EXTERNAL_URL", ""),
 }
 
@@ -15747,20 +15515,6 @@ def _proxy_usage() -> dict:
         return {}
 
 
-def _proxy_meters() -> dict:
-    """Bytes that crossed a PAID upstream, per meter bucket.
-
-    Separate from the per-session counters on purpose: those count every byte the
-    relay carried, direct traffic included. Charging direct bytes against a
-    residential budget is what silently pushed every box back onto its datacenter
-    address, which looks exactly like the provider being down.
-    """
-    try:
-        return json.loads(BROWSER_PROXY_USAGE.read_text()).get("meters", {})
-    except Exception:
-        return {}
-
-
 async def _proxy_exit_info(local_port: int, timeout: float = 20) -> dict:
     """What the outside world sees for a browser — fetched THROUGH its own
     loopback port, so it reflects exactly what that browser's traffic does."""
@@ -15812,35 +15566,15 @@ async def api_browser_proxy_get(request: Request, check: int = 0):
             row["exit"] = await _proxy_exit_info(sess["local_port"])
         rows.append(row)
     total = sum(int(u.get("bytes_up", 0)) + int(u.get("bytes_down", 0)) for u in usage.values())
-    # With a ladder configured the top-level host/port is just one rung's endpoint,
-    # so reporting it as "the provider" names the wrong one. Say what the traffic
-    # actually takes, in order, and keep the paid meters separate from total_bytes:
-    # that total includes direct traffic and is a browsing figure, not a bill.
-    ladder = conf.get("ladder") or []
-    ups = conf.get("upstreams") or {}
-    rungs = [{
-        "name": n,
-        "host": (ups.get(n) or {}).get("host", ""),
-        "port": (ups.get(n) or {}).get("port", 0),
-        "metered": bool((ups.get(n) or {}).get("metered", True)),
-        "meter": (ups.get(n) or {}).get("meter") or n,
-        "budget_mb": (ups.get(n) or {}).get("budget_mb"),
-        "enabled": bool((ups.get(n) or {}).get("enabled", True)),
-    } for n in ladder if n in ups]
-    first = rungs[0] if rungs else None
     return JSONResponse({
         "installed": BROWSER_PROXY_CONF.parent.exists() and (CB_ROOT / "bin" / "proxy_relay.py").exists(),
         "enabled": bool(conf.get("enabled")),
-        "provider": (first["name"] if first else conf.get("provider", "")),
-        "host": (first["host"] if first else conf.get("host", "")),
-        "port": (first["port"] if first else conf.get("port", 0)),
+        "provider": conf.get("provider", ""),
+        "host": conf.get("host", ""), "port": conf.get("port", 0),
         "username": conf.get("username", ""), "zone": conf.get("zone", ""),
         "password_set": bool(conf.get("password")),
         "country": conf.get("country", ""),
         "providers": sorted(_proxy_presets().keys()),
-        "ladder": rungs,
-        "fallback_direct": bool(conf.get("fallback_direct", True)),
-        "meters": _proxy_meters(),
         "browsers": rows, "total_bytes": total,
     })
 
@@ -17752,7 +17486,7 @@ async def _auto_fix_login(session_name: str) -> dict:
     for _ in range(20):
         await asyncio.sleep(2)
         pane = await asyncio.to_thread(_pane_text, session_name, 25)
-        if _screen_needs_login(pane) or "paste code here" in pane.lower():
+        if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
             continue
         if await _async_is_claude_running(session_name):
             _account_ident_cache.clear()
@@ -17850,7 +17584,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                 if "login successful" in low or "logged in as" in low:
                     ok, why = True, ""
                     break
-                if "paste code here" not in low and not _screen_needs_login(pane):
+                if "paste code here" not in low and not _LOGIN_NEEDED_RE.search(pane):
                     ok, why = True, ""
                     break
             st.update({"running": False, "status": "logged in" if ok else why,
@@ -18077,77 +17811,18 @@ async def api_transcribe(audio: UploadFile = File(...)):
     return JSONResponse({"text": text})
 
 
-# ── Live voice mode: reading a reply out loud ───────────────────────────────
-# The mic button next to the composer has always been one-way: record, whisper,
-# text in the box. Live voice closes the loop on a phone: it listens, sends what
-# you said, and reads the reply back, so a session can be driven with the screen
-# in a pocket. The page handles the listening; this is the other half.
-TTS_MODEL = os.environ.get("TMUX_DASH_TTS_MODEL", "gpt-4o-mini-tts")
-TTS_VOICE = os.environ.get("TMUX_DASH_TTS_VOICE", "alloy")
-_TTS_MAX_CHARS = 2000
-
-_SPEECH_STRIP_RE = [
-    (re.compile(r"```.*?```", re.S), " code block. "),   # never read code aloud
-    (re.compile(r"`([^`]*)`"), r"\1"),
-    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),
-    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),    # a link reads as its words
-    (re.compile(r"^[ \t]*[#>]+[ \t]*", re.M), ""),
-    (re.compile(r"^[ \t]*[-*+][ \t]+", re.M), ""),
-    (re.compile(r"\*\*|__|\*|~~"), ""),
-    (re.compile(r"https?://\S+"), " a link "),
-    (re.compile(r"[ \t]+"), " "),
-    (re.compile(r"\n{2,}"), ". "),
-    (re.compile(r"\n"), ". "),
-]
-
-
-def _plain_for_speech(text: str) -> str:
-    """Markdown as something worth hearing: no backticks, no URLs read letter by
-    letter, no code blocks."""
-    out = str(text or "")
-    for rx, rep in _SPEECH_STRIP_RE:
-        out = rx.sub(rep, out)
-    out = re.sub(r"(?:\.\s*){2,}", ". ", out).strip()
-    return out[:_TTS_MAX_CHARS]
-
-
-class TTSBody(BaseModel):
-    text: str
-    voice: str = ""
-
-
-@app.post("/api/tts")
-async def api_tts(body: TTSBody):
-    """Speak a reply for live voice mode. Returns MP3 bytes."""
-    key = OPENAI_VOICE_KEY
-    if not key:
-        return JSONResponse({"error": "Speech is not configured."}, status_code=503)
-    text = _plain_for_speech(body.text)
-    if not text:
-        return JSONResponse({"error": "Nothing to say."}, status_code=400)
-    voice = body.voice if re.fullmatch(r"[a-z]{3,20}", body.voice or "") else TTS_VOICE
-
-    def _do():
-        c = openai.OpenAI(api_key=key)
-        r = c.audio.speech.create(model=TTS_MODEL, voice=voice, input=text,
-                                  response_format="mp3")
-        return r.read() if hasattr(r, "read") else r.content
-
-    try:
-        audio = await asyncio.to_thread(_do)
-    except Exception as e:
-        logger.warning("tts failed: %s", e)
-        return JSONResponse({"error": "Speech failed."}, status_code=502)
-    return Response(content=audio, media_type="audio/mpeg",
-                    headers={"Cache-Control": "no-store"})
-
-
 # --- Claude Code auth management ---
 
 _claude_auth_cache: dict = {"ts": 0, "data": {}}
 
 @app.get("/api/auth/claude-status")
 async def api_claude_auth_status():
+    gateway = _model_gateway_base()
+    if gateway:
+        from urllib.parse import urlsplit
+        return JSONResponse({"authMethod": "gateway", "gatewayHost": urlsplit(gateway).hostname,
+                             "gatewayConfigured": bool(_anthropic_api_key()), "loggedIn": False,
+                             "hasApiKey": False})
     now = time.time()
     if now - _claude_auth_cache["ts"] < 60 and _claude_auth_cache["data"]:
         cached = dict(_claude_auth_cache["data"])
@@ -18199,22 +17874,18 @@ class SetApiKey(BaseModel):
 
 @app.post("/api/auth/api-key")
 async def api_set_claude_key(body: SetApiKey):
-    """Clearing the stored key works. Storing one does not (owner rule 2026-09-20).
-
-    A stored key was the switch behind everything metered on this box: it flipped
-    the launch banner to "API key", made the one-time config prime approve the key,
-    put the login watchdog into key mode, and gave the session auth toggle something
-    to export. The plan is the only route, so there is nothing to store."""
     key = body.apiKey.strip()
     if key:
-        logger.warning("Refused to store an Anthropic API key: plan-only policy")
-        return JSONResponse(
-            {"error": "This dashboard runs sessions on the subscription plan. "
-                      "A metered API key is not stored here."},
-            status_code=409,
-        )
-    _clear_anthropic_key()
-    return JSONResponse({"ok": True, "message": "API key cleared."})
+        if not key.startswith(("sk-ant-", "sk-")):
+            return JSONResponse(
+                {"error": "Invalid API key format. Expected key starting with sk-ant- or sk-."},
+                status_code=400,
+            )
+        _save_anthropic_key(key)
+        return JSONResponse({"ok": True, "message": "API key stored."})
+    else:
+        _clear_anthropic_key()
+        return JSONResponse({"ok": True, "message": "API key cleared."})
 
 
 @app.post("/api/auth/logout")
@@ -18988,6 +18659,8 @@ def _user_usage_summary(user: dict, *, force: bool = False) -> dict:
 
 def _estimate_cost(inp: int, out: int, cr: int, cc: int, model: str) -> float:
     """Estimate cost in USD from token counts and model name."""
+    if _model_gateway_base():
+        return 0.0  # No gateway prices are published; API responses mark cost unavailable.
     if "opus" in model:
         ci, co, ccr, ccc = 15.0, 75.0, 1.5, 18.75
     elif "haiku" in model:
@@ -19139,6 +18812,9 @@ async def api_stats_usage():
     session_list.sort(key=lambda x: x["lastActive"], reverse=True)
     g5h["estimatedCost"] = round(g5h["estimatedCost"], 2)
     gweek["estimatedCost"] = round(gweek["estimatedCost"], 2)
+    if _model_gateway_base():
+        for window in [g5h, gweek, *[s[key] for s in session_list for key in ("window5h", "thisWeek")]]:
+            window["estimatedCost"] = None
 
     data = {
         "window5h": g5h,
@@ -19282,10 +18958,22 @@ def _session_transcript_uuid(session_name: str) -> str:
         carries the same uuid. Present whatever the session was launched with.
     Neither is a heuristic, so a hit here needs no corroboration."""
     proc = _session_claude_proc(session_name)
+    pid = proc.get("pid") or 0
+    # /clear changes the current UUID without changing the process's original
+    # --session-id argument. Current CLI releases publish the active ID by PID.
+    if pid:
+        try:
+            record = json.loads((_session_config_base(session_name) / "sessions" / f"{pid}.json").read_text())
+            if not isinstance(record, dict):
+                record = {}
+            active = record.get("sessionId", "")
+            if record.get("pid") == pid and re.fullmatch(r"[0-9a-fA-F-]{36}", active):
+                return active.lower()
+        except (OSError, ValueError, TypeError):
+            pass
     sid = _flag_value(proc.get("cmdline", ""), "session-id")
     if re.fullmatch(r"[0-9a-fA-F-]{36}", sid or ""):
         return sid.lower()
-    pid = proc.get("pid") or 0
     if not pid:
         return ""
     try:
@@ -19318,7 +19006,12 @@ def _session_auth_fields(session_name: str) -> dict:
     key = (env.get("ANTHROPIC_API_KEY") or "").strip()
     tok = (env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
     cfg = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
-    if key:
+    from urllib.parse import urlsplit
+    gateway_host = urlsplit(env.get("ANTHROPIC_BASE_URL", "")).hostname
+    if gateway_host and gateway_host != _ANTHROPIC_API_HOST and (env.get("ANTHROPIC_AUTH_TOKEN") or key):
+        data = {"auth_kind": "gateway", "auth_label": "Model gateway",
+                "auth_detail": "Connected through " + gateway_host + ". Claude subscription limits do not apply."}
+    elif key:
         data = {"auth_kind": "api",
                 "auth_label": "API " + (key[:2] + "…" + key[-4:] if len(key) > 8 else "key"),
                 "auth_detail": "Metered ANTHROPIC_API_KEY — billed per token, not on the plan."}
@@ -19428,26 +19121,27 @@ def _pick_session_transcript_file(session_name: str, files: list) -> Optional[st
     files = [f for f in files if not os.path.basename(f).startswith("agent-")]
     if not files:
         return None
-    newest = max(files, key=lambda f: os.path.getmtime(f))
-    if len(files) == 1:
-        return newest
-
     now = time.time()
-    cached = _session_transcript_cache.get(session_name)
-    if cached and now - cached.get("ts", 0) < 90:
-        p = cached.get("path")
-        if p and os.path.exists(p):
-            return p
-
-    # The process knows which file it is writing. Ask it before guessing.
+    # /clear changes the active file while this process and its cached path
+    # remain alive. Check the current binding before any cache or fallback.
     uuid = _session_transcript_uuid(session_name)
     if uuid:
         by_uuid = {os.path.splitext(os.path.basename(f))[0].lower(): f for f in files}
         hit = by_uuid.get(uuid)
         if hit:
-            _session_transcript_cache[session_name] = {"path": hit, "ts": now,
-                                                       "confident": True}
-            return hit
+            _session_transcript_cache[session_name] = {"path": hit, "ts": now, "confident": True}
+        else:
+            _session_transcript_cache.pop(session_name, None)
+        return hit
+    newest = max(files, key=lambda f: os.path.getmtime(f))
+    if len(files) == 1:
+        return newest
+
+    cached = _session_transcript_cache.get(session_name)
+    if cached and now - cached.get("ts", 0) < 90:
+        p = cached.get("path")
+        if p and os.path.exists(p):
+            return p
 
     resolved, confident = newest, False
     try:
@@ -19576,6 +19270,19 @@ def _transcript_match_text(path: str) -> str:
 # measured above the standard window proves the session is on the wide one.
 _CTX_WINDOW_STD = 200_000
 _CTX_WINDOW_1M = 1_000_000
+
+
+def _model_context_limit(model: str, wide: bool = False) -> int:
+    if not model:
+        return 0
+    if _model_gateway_base():
+        metadata = _GATEWAY_MODEL_METADATA.get(_model_base_id(model), {})
+        try:
+            return max(0, int(metadata.get("max_input_tokens", 0)))
+        except (TypeError, ValueError):
+            return 0
+    return _CTX_WINDOW_1M if wide else _CTX_WINDOW_STD
+
 # What a `/effort` or `/model` prints into the pane the moment it takes effect.
 # Anchored on the CLI's own result elbow: an agent that merely PRINTS the phrase
 # (grepping this very file will) must not be read as having switched.
@@ -20151,9 +19858,12 @@ def _detect_session_model_effort(session_name: str) -> dict:
     wide = bool(_MODEL_1M_RE.search(model_line) if model_line
                 else "[1m]" in argv.lower())
     wide = wide or (sure and facts["ctx"] > _CTX_WINDOW_STD)
+    if _model_gateway_base():
+        model = _model_base_id(model)
+        wide = False
     if model and wide and not model.endswith("[1m]"):
         model += "[1m]"
-    limit = (_CTX_WINDOW_1M if wide else _CTX_WINDOW_STD) if model else 0
+    limit = _model_context_limit(model, wide)
 
     # A BORROWED TRANSCRIPT HAS NO FALLBACK, so its numbers must not be shown.
     # Model and effort survive an unproven read because argv carries this
@@ -20383,7 +20093,7 @@ def _parse_session_stats(session_name: str) -> dict:
         "cacheRead": total_cache_read,
         "cacheCreate": total_cache_create,
         "totalTokens": total_input + total_output + total_cache_read + total_cache_create,
-        "estimatedCost": round(estimated_cost, 4),
+        "estimatedCost": None if _model_gateway_base() else round(estimated_cost, 4),
         "peakOutputRate": peak_output_rate,  # tokens/min
         "peakTotalRate": peak_output_rate,
         "recentOutputRate": recent_output_rate,
@@ -20410,66 +20120,6 @@ async def api_session_stats(session_name: str):
     return JSONResponse(stats)
 
 
-_COMPOSER_FRAME_CHARS = set("─━╭╮╰╯│┃┌┐└┘")
-
-
-def _composer_text(session_name: str) -> str:
-    """What is sitting in Claude Code's input box right now.
-
-    The box is the last pair of frame lines on the pane, with the footer
-    ("bypass permissions on ...") below it. Returns "" when the pane is not
-    running the TUI at all, which reads as "nothing is waiting".
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", session_name],
-            capture_output=True, text=True, timeout=5)
-    except Exception:
-        return ""
-    if result.returncode != 0:
-        return ""
-    lines = [line.rstrip() for line in (result.stdout or "").splitlines()]
-    edges = [i for i, line in enumerate(lines)
-             if len(line.strip()) >= 10
-             and set(line.strip()) <= _COMPOSER_FRAME_CHARS]
-    if len(edges) < 2:
-        return ""
-    return " ".join(lines[edges[-2] + 1:edges[-1]])
-
-
-async def _ensure_submitted(session_name: str, cmd_text: str,
-                            attempts: int = 2) -> bool:
-    """Press Enter again while the message is still sitting in the composer.
-
-    One Enter is not always a submit: the TUI eats it to close a paste or an
-    "invisible characters, review and press Enter" gate, and the message then
-    waits in the box until the NEXT message pushes both in together, which
-    reads as the session ignoring what you just sent.
-
-    A retry does not always rescue it (a badly delivered paste can leave the
-    box holding text the TUI no longer treats as input, where Enter does
-    nothing at all), so the answer is also the caller's: False means the
-    session did NOT take the message and the sender has to be told.
-    """
-    tail = re.sub(r"\s+", "", cmd_text)[-40:]
-    if not tail:
-        return True
-    for _ in range(attempts):
-        held = re.sub(r"\s+", "", await asyncio.to_thread(_composer_text, session_name))
-        if tail not in held:
-            return True
-        await asyncio.to_thread(subprocess.run,
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            capture_output=True, text=True, timeout=5)
-        await asyncio.sleep(0.6)
-    held = re.sub(r"\s+", "", await asyncio.to_thread(_composer_text, session_name))
-    if tail in held:
-        logger.warning("Message still sitting in the composer of '%s' after %d "
-                       "Enter presses", session_name, attempts + 1)
-        return False
-    return True
-
-
 class SendCommand(BaseModel):
     command: str
 
@@ -20491,66 +20141,58 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
         # Announce any files uploaded since the last message, so "what did I
         # just upload?" resolves to the exact paths instead of the agent having
         # to guess (or finding another session's files).
-        pending = _take_pending_uploads(_session_upload_key(session_name, sess))
+        is_slash = bool(re.match(r"^/[A-Za-z][\w:-]*(?:\s|$)", cmd_text.lstrip()))
+        pending = [] if is_slash else _take_pending_uploads(_session_upload_key(session_name, sess))
+        if is_slash:
+            cmd_text = cmd_text.lstrip()
         cmd_text = _format_upload_preamble(pending) + cmd_text
         # Multi-line text MUST go via paste-buffer: `send-keys -l` delivers a
         # literal newline, which Claude Code submits on, truncating the message
         # at the first line.
         if len(cmd_text) > 200 or "\n" in cmd_text:
-            # Paste it, BRACKETED. tmux turns the buffer's newlines into
-            # Return as it pastes, and unbracketed those are ordinary Enters:
-            # Claude Code then spends the Enter that follows on closing the
-            # multi-line edit instead of submitting, so the message waits in
-            # the composer until the next one arrives and pushes both in
-            # together. Measured 2026-09-19 on Claude Code 2.1.277, 80x24:
-            # unbracketed stuck 10 times out of 10, `-p` submitted every time.
-            # `-p` only adds the markers if the TUI asked for bracketed paste,
-            # so a plain shell in the pane still gets a plain paste.
-            paste_text = cmd_text.rstrip("\n")
-            buffer_name = "dash-send-%d" % (time.time() * 1000)
-            loaded = await asyncio.to_thread(subprocess.run,
-                ["tmux", "load-buffer", "-b", buffer_name, "-"],
-                input=paste_text, capture_output=True, text=True, timeout=5
-            )
-            if loaded.returncode != 0:
-                # Older tmux without stdin support: go through a file.
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                                 delete=False) as tmp:
-                    tmp.write(paste_text)
-                    tmp_path = tmp.name
-                try:
+            # One named buffer per request prevents cross-session paste races.
+            # Bracketed paste preserves newlines as part of a single prompt.
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+                tmp.write(cmd_text)
+                tmp_path = tmp.name
+            buffer_name = "dash-" + os.path.basename(tmp_path)
+            pasted = False
+            try:
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "load-buffer", "-b", buffer_name, tmp_path],
+                    capture_output=True, text=True, timeout=5, check=True
+                )
+                await asyncio.to_thread(subprocess.run,
+                    ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", session_name],
+                    capture_output=True, text=True, timeout=5, check=True
+                )
+                pasted = True
+            finally:
+                os.unlink(tmp_path)
+                if not pasted:
                     await asyncio.to_thread(subprocess.run,
-                        ["tmux", "load-buffer", "-b", buffer_name, tmp_path],
-                        capture_output=True, text=True, timeout=5
-                    )
-                finally:
-                    os.unlink(tmp_path)
-            await asyncio.to_thread(subprocess.run,
-                ["tmux", "paste-buffer", "-d", "-p", "-b", buffer_name,
-                 "-t", session_name],
-                capture_output=True, text=True, timeout=5
-            )
-            # Let the TUI finish drawing the paste before the Enter lands.
-            await asyncio.sleep(max(0.6, min(3.0, len(paste_text) / 2000)))
+                        ["tmux", "delete-buffer", "-b", buffer_name],
+                        capture_output=True, text=True, timeout=5)
+            # Wait long enough for Claude Code to render the pasted content
+            # before pressing Enter. Scale with length; cap at 5s.
+            wait_secs = max(0.8, min(5.0, len(cmd_text) / 1500))
+            await asyncio.sleep(wait_secs)
+            # Press Enter to submit
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, check=True
             )
         else:
             # Short messages: send-keys -l is fine
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "-l", cmd_text],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, check=True
             )
             # Press Enter as a separate key event
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, check=True
             )
-        # Whichever route it took, prove the box is empty before calling it
-        # sent, and press Enter again if it is not.
-        submitted = await _ensure_submitted(session_name, cmd_text)
-        _note_human_input(session_name)
         # Record user message in chat history
         now = time.time()
         entry = cache.setdefault(session_name, {})
@@ -20582,7 +20224,6 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
             logger.exception(
                 "Failed to append prompt audit for session '%s'", session_name)
         return JSONResponse({"ok": True, "sent": cmd_text,
-                             "submitted": submitted,
                              "attached": [i.get("path") for i in pending]})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -20632,7 +20273,6 @@ async def api_send_keys(session_name: str, body: SendKeys):
                 )
             else:
                 return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
-        _note_human_input(session_name)
         return JSONResponse({"ok": True, "keys_sent": body.keys})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -20667,28 +20307,41 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
 
 @app.post("/api/sessions/{session_name}/set-auth-mode")
 async def api_set_auth_mode(session_name: str, body: AuthModeBody):
-    """Put a session on the subscription plan, or clear a stray key out of its pane.
-
-    There used to be an "api" mode here that typed `export ANTHROPIC_API_KEY=...`
-    into the live pane, falling back to scraping an `sk-ant-` literal out of the
-    instruction file when no key was stored. Both halves are gone: a session runs
-    on its plan (owner rule 2026-09-20), and an instruction file is not a place to
-    go looking for a secret. "api" is refused rather than silently downgraded, so
-    anything still asking for it gets told instead of believing it happened."""
+    """Toggle between API key and subscription auth for a specific session."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         if body.mode == "api":
-            logger.warning(
-                "Refused API-key auth mode for session %s: plan-only policy", session_name
+            key = _stored_anthropic_key
+            if not key:
+                # Fallback: try to extract from ~/CLAUDE.md
+                try:
+                    claude_md = (Path.home() / "CLAUDE.md").read_text()
+                    for line in claude_md.splitlines():
+                        line = line.strip()
+                        if line.startswith("sk-ant-"):
+                            key = line.split()[0].rstrip(",;")
+                            break
+                        elif "sk-ant-" in line:
+                            m = re.search(r'(sk-ant-\S+)', line)
+                            if m:
+                                key = m.group(1).rstrip(",;")
+                                break
+                except Exception:
+                    logger.debug("Failed to scan credentials file for API key", exc_info=True)
+            if not key:
+                return JSONResponse({"error": "No API key found"}, status_code=400)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "-l",
+                 f"export ANTHROPIC_API_KEY={key}"],
+                capture_output=True, text=True, timeout=5
             )
-            return JSONResponse(
-                {"error": "A session runs on its subscription plan. API-key auth was removed.",
-                 "mode": _session_auth_mode.get(session_name, "subscription")},
-                status_code=409,
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                capture_output=True, text=True, timeout=5
             )
-        if body.mode == "subscription":
+        elif body.mode == "subscription":
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "-l",
                  "unset ANTHROPIC_API_KEY"],
@@ -20721,7 +20374,8 @@ async def api_models():
     released models appear without a redeploy. The defaults come with it so the
     New-session dialog can preselect what the box would have launched anyway."""
     return JSONResponse({"models": MODEL_CATALOG, "default": DEFAULT_MODEL,
-                         "efforts": EFFORT_CATALOG, "default_effort": DEFAULT_EFFORT})
+                         "efforts": EFFORT_CATALOG, "default_effort": DEFAULT_EFFORT,
+                         "gateway": bool(_model_gateway_base()), "metadata": _GATEWAY_MODEL_METADATA})
 
 
 @app.post("/api/models/refresh")
@@ -21003,57 +20657,9 @@ _MENU_PICK_SYSTEM_PROMPT = (
     "to the user (e.g. 'no', 'let me decide', 'I'll do it myself', 'ask me later').\n"
     "- If several options proceed, pick the one that makes the MOST progress with the fewest "
     "future interruptions.\n"
-    "- NEVER pick an option that exits or quits Claude Code, logs out or signs out, ends the "
-    "session, or spends money (upgrade, buy, add funds, extra usage). Pick the other option.\n"
-    "- If genuinely unsure, pick the safest option that keeps the session running.\n"
+    "- If genuinely unsure, pick 1.\n"
     "Reply with ONLY the option number, nothing else."
 )
-
-# ── Options the dashboard never picks on a person's behalf ───────────────────
-# The model is told to avoid these, and it is not trusted to: a failed LLM call
-# falls back to Enter on whatever is highlighted, and Claude Code highlights
-# "No, exit" by default on its bypass-permissions warning. So the pick is checked
-# here, deterministically, whoever made it. Ending the session loses the work in
-# the pane; spending money is not a keystroke to make for someone who is away.
-_MENU_ENDS_SESSION_RE = re.compile(
-    r"\b(?:exit|quit|log\s*-?\s*out|sign\s*-?\s*out|end\s+(?:the\s+|this\s+)?session|"
-    r"close\s+(?:claude|the\s+session)|uninstall|abort)\b",
-    re.I,
-)
-_MENU_SPENDS_MONEY_RE = re.compile(
-    r"\b(?:upgrade|purchase|buy|add\s+(?:funds|credits?)|extra\s+usage|overage|pay\b|billing)",
-    re.I,
-)
-_MENU_PROCEED_RE = re.compile(
-    r"\b(?:yes|proceed|continue|accept|allow|approve|resume|retry|try\s+again|keep\s+going|"
-    r"i\s+accept|trust|confirm|ok)\b",
-    re.I,
-)
-
-
-def _menu_option_forbidden(label: str) -> bool:
-    """True for a menu option the auto-responder must never choose."""
-    label = label or ""
-    return bool(_MENU_ENDS_SESSION_RE.search(label) or _MENU_SPENDS_MONEY_RE.search(label))
-
-
-def _safe_menu_choice(options: list, proposed):
-    """The option number to press, or None to leave the menu for a human.
-
-    `proposed` is the model's pick, or None when it had none (the old fallback
-    pressed Enter on the highlighted row). A forbidden or missing pick is
-    replaced by the best allowed option: one that proceeds, else the first one
-    left. When every option would end the session or spend money, nothing is
-    pressed at all."""
-    allowed = [(n, l) for n, l in options if not _menu_option_forbidden(l)]
-    if not allowed:
-        return None
-    if proposed is not None and any(n == proposed for n, _ in allowed):
-        return proposed
-    for n, l in allowed:
-        if _MENU_PROCEED_RE.search(l):
-            return n
-    return allowed[0][0]
 
 
 def _parse_menu_options(visible_text: str):
@@ -21071,31 +20677,6 @@ def _parse_menu_options(visible_text: str):
             selected = len(options)
         options.append((int(m.group(2)), m.group(3).strip()))
     return options, (selected if selected is not None else 0)
-
-
-# Menu labels, matched on the option text alone, for the LLM-free fallback.
-_MENU_PROCEED_RE = re.compile(
-    r"^(?:yes\b|y\b|accept|proceed|continue|approve|allow|run\b|ok\b|got it)", re.I)
-_MENU_STOP_RE = re.compile(
-    r"^(?:no\b|n\b|exit|quit|cancel|stop|abort|reject|deny|don'?t\b|never)", re.I)
-
-
-def _pick_menu_option_offline(options: list, selected_idx: int):
-    """Choose a menu option without the LLM. Returns an option NUMBER or None.
-
-    Only speaks up when pressing Enter would be actively wrong: the highlighted
-    default stops the agent and exactly one other option clearly proceeds. That
-    is the bypass-permissions warning to the letter, whose default is "1. No,
-    exit" and whose Enter therefore kills a freshly launched session. Anything
-    less clear-cut is left to the LLM or to a human, because guessing at a menu
-    is how an agent ends up answering a question nobody asked it."""
-    if len(options) < 2 or not (0 <= selected_idx < len(options)):
-        return None
-    if not _MENU_STOP_RE.match(options[selected_idx][1].strip()):
-        return None
-    proceeding = [num for i, (num, label) in enumerate(options)
-                  if i != selected_idx and _MENU_PROCEED_RE.match(label.strip())]
-    return proceeding[0] if len(proceeding) == 1 else None
 
 
 async def _llm_pick_menu_option(name: str, visible: str, options: list):
@@ -21154,38 +20735,6 @@ async def _auto_responder_loop():
                 # Auto-push "off" means never type anything into this terminal.
                 if _get_autopush_mode(name) == "off":
                     continue
-                # The priming sessions drive their own menu (prime_claude.sh
-                # walks to "Yes, I accept" itself). Two actors sending Down and
-                # Enter to one menu land on whichever option the race leaves
-                # highlighted, which is how priming a member's config dir kept
-                # exiting claude and never wrote its marker (2026-08-27).
-                if name.startswith(PRIME_SESSION_PREFIX):
-                    continue
-                    if len(options) >= 2:
-                        # No pick means the highlighted row, which is exactly the
-                        # row that has to pass the same check as any other.
-                        proposed = target if target is not None else options[selected_idx][0]
-                        safe = _safe_menu_choice(options, proposed)
-                        if safe is None:
-                            _auto_respond_cooldown[name] = now + 50
-                            log.warning("Auto-responder HOLDING '%s': every option exits, logs "
-                                        "out or spends money (%s)", name,
-                                        "; ".join(l[:30] for _, l in options))
-                            continue
-                        if safe != proposed:
-                            log.warning("Auto-responder in '%s' refused option %s (%s) and chose "
-                                        "%s instead", name, proposed,
-                                        next((l[:40] for n, l in options if n == proposed), ""),
-                                        safe)
-                        target = safe
-                    else:
-                        cursor_row = next((ln for ln in result.stdout.splitlines()[::-1]
-                                           if ln.strip().startswith("❯")), "")
-                        if _menu_option_forbidden(cursor_row):
-                            _auto_respond_cooldown[name] = now + 50
-                            log.warning("Auto-responder HOLDING '%s': the highlighted option "
-                                        "exits, logs out or spends money", name)
-                            continue
                 # Check cooldown
                 last = _auto_respond_cooldown.get(name, 0)
                 if now - last < _AUTO_RESPOND_COOLDOWN:
@@ -21218,39 +20767,6 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
-                    if target is None:
-                        # No LLM (no key, or the call failed): Enter would take the
-                        # highlighted option, and on some menus that is the one that
-                        # stops the agent dead. Pick deliberately instead, then let
-                        # that pick face the same safety check as any other. From
-                        # claude.lisa.my, which had the offline path while main had
-                        # only the check.
-                        target = _pick_menu_option_offline(options, selected_idx)
-                    if len(options) >= 2:
-                        # No pick means the highlighted row, which is exactly the
-                        # row that has to pass the same check as any other.
-                        proposed = target if target is not None else options[selected_idx][0]
-                        safe = _safe_menu_choice(options, proposed)
-                        if safe is None:
-                            _auto_respond_cooldown[name] = now + 50
-                            log.warning("Auto-responder HOLDING '%s': every option exits, logs "
-                                        "out or spends money (%s)", name,
-                                        "; ".join(l[:30] for _, l in options))
-                            continue
-                        if safe != proposed:
-                            log.warning("Auto-responder in '%s' refused option %s (%s) and chose "
-                                        "%s instead", name, proposed,
-                                        next((l[:40] for n, l in options if n == proposed), ""),
-                                        safe)
-                        target = safe
-                    else:
-                        cursor_row = next((ln for ln in result.stdout.splitlines()[::-1]
-                                           if ln.strip().startswith("❯")), "")
-                        if _menu_option_forbidden(cursor_row):
-                            _auto_respond_cooldown[name] = now + 50
-                            log.warning("Auto-responder HOLDING '%s': the highlighted option "
-                                        "exits, logs out or spends money", name)
-                            continue
                     if target is not None:
                         chosen = await _select_menu_option(name, options, selected_idx, target)
                     else:
@@ -21293,6 +20809,9 @@ _SIMPLE_WATCHDOG_IDLE_SECS = 45         # stable-idle this long before consideri
 _SIMPLE_WATCHDOG_COOLDOWN = 90          # min seconds between replies per session
 _SIMPLE_WATCHDOG_MAX_LOG = 20
 _SIMPLE_WATCHDOG_MAX_SAME_STALL = 3     # back off after N nudges that don't change the screen
+# The same-stall backoff must EXPIRE. Latched, it meant one unproductive nudge
+# parked a session for good — the `researcher` stall. After this long, try again.
+_SIMPLE_WATCHDOG_BACKOFF_SECS = 600     # 10 minutes
 
 _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "You are an autonomous operator keeping a Claude Code agent moving while THE USER IS AWAY. "
@@ -21303,6 +20822,17 @@ _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "anything — a brand-new or empty session, just the welcome screen, or an idle prompt with no "
     "question and no work above it to act on — choose 'wait'. NEVER invent a task, instruction, or "
     "next step out of nothing; you only push EXISTING work forward, you do not start new work.\n\n"
+    "THE AGENT ASKING YOU SOMETHING IS NOT YOU INVENTING A TASK. When the screen ends in a question "
+    "addressed to the user — 'Which do you want? (a) or (b)', 'Should I proceed?', 'Shall I also "
+    "do X?', 'let me know how you'd like to proceed' — the session is BLOCKED. Choose 'send' and "
+    "ANSWER it with a decision, so the agent resumes on its own. This is the case you most often "
+    "see, and it is the one you must never leave hanging. Answer only what is actually asked: pick "
+    "the option that carries the existing task to completion, make a reasonable default assumption "
+    "where a value is needed, and never widen the question into new work of your own.\n\n"
+    "A COMPLETED hand-back is the one thing you must not push. If the agent has FINISHED and is "
+    "reporting results rather than asking anything — no question, nothing deferred, nothing "
+    "optional left — choose 'wait'. Do not read a closing summary as a question just because it "
+    "addresses the user.\n\n"
     "NEVER ASSERT RESULTS AND NEVER DECLARE THE WORK DONE. You are only reading a terminal — you do "
     "NOT actually know whether any check, test, build, deploy, or fix passed or works. So you must NEVER:\n"
     "- State or imply that checks/tests passed, or that something is verified, confirmed, working, "
@@ -21347,11 +20877,63 @@ _SIMPLE_WATCHDOG_SYSTEM_PROMPT = (
     "or {\"action\":\"wait\"}."
 )
 
+# Appended when the composer's first answer authorised spending. The session has
+# offered the user a choice whose options differ in whether money is committed
+# (e.g. "grant the override --usd 200" vs "fix it for free"), and the composer —
+# told to prefer the option that makes the most progress — picked the paid one.
+# Money is the user's call, so it is re-asked with that option ruled out.
+_NO_SPEND_ADDENDUM = (
+    "\n\nOVERRIDE — THIS SUPERSEDES EVERYTHING ABOVE: your previous answer "
+    "authorised SPENDING MONEY, which is never yours to approve. Commit no spend: "
+    "do not grant, raise, lift, extend or request a spend cap, budget or override; "
+    "do not purchase, subscribe, upgrade or accept a paid tier. The screen offers "
+    "at least one option that costs nothing — choose THAT one and tell the agent "
+    "to proceed with it. If the only way forward genuinely requires spending "
+    "money, choose 'wait' instead and let a human decide."
+)
+
 
 # Deterministic safety backstop. If the recent screen (or the message we're about
 # to send) names a clearly catastrophic / irreversible operation, we NEVER
 # auto-drive it — we leave it for a human, regardless of what the LLM decided.
 # Kept tight so it doesn't block the common "just keep going" cases.
+#
+# The high-cost-spend half of this is split into its own pattern (below) because
+# it is the one alternative that needs a second look: an agent REPORTING its
+# spend ledger mentions large figures next to spend words constantly, and holding
+# on those stalled a real session. `_looks_destructive` re-reads the line for a
+# spend match before treating it as a decision.
+_DESTRUCTIVE_SPEND_RE = re.compile(
+    # a spend verb near a $100+ amount, or any $100+ /month|/year rate
+    # ($100+ = 3+ plain digits or comma-grouped thousands; "$99"/"$5/mo" stay
+    # under). PROSPECTIVE only: "charged"/"spent"/"paid"/"billed"/"cost" describe
+    # money that has ALREADY moved, and an agent reporting its spend ledger — a
+    # table of figures, a cost summary, a reconciliation — names those words next
+    # to large numbers constantly. Matching them made the watchdog declare a
+    # read-only status report an irreversible spend decision and HOLD, which is
+    # exactly how the `researcher` session stalled on 2026-09-20: the agent wrote
+    # "Guard charged | **$102.77** (cap blown)" while ASKING which repair to make,
+    # and the guard saw a purchase. Only a verb that proposes NEW spending counts.
+    r"\b(?:spend|purchas\w*|buy|buying|charg\w*|pay|paying|subscrib\w*|upgrad\w*|order\w*)\b[^\n]{0,40}\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)"
+    r"|\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)(?:\.\d+)?\s*(?:/|per)\s*(?:mo|month|yr|year)\b"
+    # A spend-cap raise authorises money without ever writing a "$": the fleet's
+    # own guard is invoked as `llm-spend override APP --usd 200 --hours 12`. The
+    # `$`-based alternatives above cannot see that, so an agent asking to lift its
+    # own cap read as harmless text — and the composer, biased toward making
+    # progress, picked exactly that option when the `researcher` session offered
+    # "grant a time-boxed override" against a no-spend alternative. Raising a cap
+    # commits money, so it belongs with the other high-cost carve-outs.
+    r"|--usd[\s=]+(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)"
+    r"|\b(?:raise|increase|lift|bump|extend)\w*\b[^\n]{0,30}\b(?:cap|limit|budget|allowance)\b"
+    r"[^\n]{0,30}\b(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)\b"
+    # Authorising a cap override in words, which is how the composer phrased it:
+    # "grant the time-boxed override". No figure and no flag appear, so none of
+    # the alternatives above see it, yet it is the same commitment of money.
+    r"|\b(?:grant|approve|authoris|authoriz|allow|permit|use|apply|accept)\w*\b"
+    r"[^\n]{0,25}\b(?:\w+\s+){0,2}?(?:override|cap|limit|budget|allowance|quota)\b",
+    re.I,
+)
+
 _DESTRUCTIVE_RE = re.compile(
     r"\bDROP\s+(?:TABLE|DATABASE|SCHEMA)\b"
     r"|\bTRUNCATE\s+TABLE\b"
@@ -21360,18 +20942,205 @@ _DESTRUCTIVE_RE = re.compile(
     r"|\b(?:delet|drop|wip|eras|destroy|purg)\w*\s+(?:\w+\s+){0,5}?(?:production|prod\b|all\s+(?:the\s+)?(?:user|customer|account|record|row|data|table))"
     r"|\b(?:irreversibl\w*|cannot be undone|can'?t be undone|permanently\s+(?:delet|remov|eras|destroy)\w*)"
     r"|\boverwrit\w*\s+(?:\w+\s+){0,5}?(?:production|remote\s+history|shared\s+history)"
-    # high-cost spend: a spend verb near a $100+ amount, or any $100+ /month|/year rate
-    # ($100+ = 3+ plain digits or comma-grouped thousands; "$99"/"$5/mo" stay under)
-    r"|\b(?:spend|purchas\w*|buy|buying|charg\w*|pay|paying|subscrib\w*|upgrad\w*|order\w*)\b[^\n]{0,40}\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)"
-    r"|\$\s?(?:[1-9]\d{2,}|[1-9]\d?(?:,\d{3})+)(?:\.\d+)?\s*(?:/|per)\s*(?:mo|month|yr|year)\b",
+    r"|" + _DESTRUCTIVE_SPEND_RE.pattern,
     re.I,
 )
+
+# A spend figure is only a decision if the plan is still OPEN. Money already
+# moved cannot be approved or refused, so text that reports it must not be held.
+# Past-tense and accounting forms only — "spend"/"buy"/"upgrade" are the
+# prospective verbs we DO want to catch, so they are deliberately absent.
+_SPEND_ALREADY_DONE_RE = re.compile(
+    r"\b(?:charged|spent|paid|billed|cost|costs|incurred|accrued|burned|burnt|"
+    r"used|consumed|total|totals|totaled|totalled|sum|summary|overcount\w*|"
+    r"undercount\w*|balance|ledger)\b",
+    re.I,
+)
+
+
+def _spend_match_is_a_report(match, text: str) -> bool:
+    """True if this destructive match is really an accounting of PAST spend.
+
+    Only spend matches are re-read this way. `DROP TABLE`, `rm -rf`, force-push
+    and "cannot be undone" are never softened by the prose around them.
+
+    The line is split at the DOLLAR FIGURE, not at the match start: the verb is
+    often inside the match ("charged $102"), so looking only at what precedes the
+    match would miss the very word that marks it as retrospective.
+    """
+    if not _DESTRUCTIVE_SPEND_RE.search(match.group()):
+        return False
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.end())
+    line = text[line_start: line_end if line_end != -1 else len(text)]
+    dollar = line.find("$")
+    before = line[: dollar if dollar != -1 else len(line)]
+    # "Guard charged $450" / "we spent $300" / "| cost | $450 |" are retrospective.
+    if _SPEND_ALREADY_DONE_RE.search(before):
+        return True
+    # A markdown table row of figures is a ledger, never an authorisation.
+    if line.lstrip().startswith("|") and before.count("|") >= 1:
+        return True
+    return False
+
+
+# Changing or exposing a CREDENTIAL is never the watchdog's decision.
+#
+# On 2026-09-20 the `researcher` agent found its own admin password weak, judged
+# it "a user decision — not mine to change", and left it. This watchdog read that
+# refusal as a stall and pushed the rotation through, writing the new credential
+# to disk. The agent was right and the override was wrong.
+#
+# A credential is different in kind from the work the watchdog exists to keep
+# moving: possession of one is what stands between the internet and everything
+# this box holds, and rotating one can lock a human out of their own account.
+# That puts it alongside DROP TABLE rather than with ordinary task progress, so
+# it is held on the SCREEN as well as on the reply — the answer that authorises
+# a credential change is a bare "yes", which gives the intent away nowhere else.
+#
+# Deliberately narrow: it matches CHANGING or EXPOSING a credential, not talking
+# about one. Describing how a password is hashed, reading a key, or testing that
+# a wrong password 401s are all ordinary work and must not be held.
+#
+# Two word collisions are excluded on purpose. "token" in this codebase usually
+# means an LLM TOKEN (the thing you count and price), and "print"/"dump" near it
+# is measuring, not leaking a secret — so a bare "token" only counts when a
+# credential-qualified form is used. "key" is likewise a dictionary key far more
+# often than a credential. Both are matched here only in their qualified forms.
+_CREDENTIAL_NOUN = (
+    r"(?:password|passwd|passphrase|credentials?|"
+    r"(?:\w+[_\s-])?api[_\s-]?keys?|(?:auth|secret|private|signing|access)[_\s-]?keys?|"
+    r"client[_\s-]?secrets?|secrets?|"
+    r"auth[_\s-]?tokens?|access[_\s-]?tokens?|bearer[_\s-]?tokens?|"
+    r"service[_\s-]?account|oauth)"
+)
+# A bare "token" or "key" is usually an LLM token or a dict key in this codebase,
+# so it only counts when a revoke/replace/regenerate verb makes it a credential
+# operation, or when it is qualified ("LunaRoute key", "API key").
+_BARE_CREDENTIAL_NOUN = r"(?:keys?|tokens?|creds?)"
+_CREDENTIAL_VERB = (
+    r"(?:change|changed|chang\w*|rotat\w*|reset\w*|re-?set|renew\w*|regenerat\w*|"
+    r"revok\w*|replace\w*|reissu\w*|issue|updat\w*|assign\w*|store|storing|"
+    r"write|writing|save|expose|expos\w*|leak\w*|dump\w*)"
+)
+_CREDENTIAL_OP_VERB = (
+    r"(?:rotat\w*|reset\w*|re-?set|renew\w*|regenerat\w*|revok\w*|"
+    r"replace\w*|reissu\w*|issue)"
+)
+_CREDENTIAL_CHANGE_RE = re.compile(
+    # an act on a credential object, allowing up to three words between so a
+    # vendor name does not break adjacency ("regenerate the LunaRoute key").
+    # "token" is EXCLUDED from the bare-noun slot here: "print the token count"
+    # and "set the token limit" are LLM-token bookkeeping, not credential work,
+    # and only a credential OP verb (below) can make a bare token one.
+    r"\b" + _CREDENTIAL_VERB + r"\b(?:\s+\S+){0,3}?\s+"
+    r"(?:" + _CREDENTIAL_NOUN + r"|\bkeys?\b|\bcreds?\b)\b"
+    # a credential OP on a bare key/token — "revoke the existing token",
+    # "regenerate the key" — where the verb itself makes it a credential
+    r"|\b" + _CREDENTIAL_OP_VERB + r"\b(?:\s+\S+){0,3}?\s+"
+    r"(?:" + _BARE_CREDENTIAL_NOUN + r")\b"
+    # ...or the reverse order: the credential named first, then the act
+    r"|\b" + _CREDENTIAL_NOUN + r"\b[^\n]{0,25}?\b"
+    r"(?:rotat\w*|reset\w*|re-?set|chang\w*|renew\w*|revok\w*|regenerat\w*)\b"
+    # a credential file being written or read back for hand-over
+    r"|\b(?:credential|password|secret|token)s?[_\s-]?(?:file|txt|store|vault)\b"
+    r"|\b(?:record|write|save|store)\b[^\n]{0,30}?\b(?:credential|password)\b"
+    r"[^\n]{0,40}?\b(?:retrieve|recover|later|hand|someone|me)\b"
+    # "set a new password" — `set` is too generic to allow before a bare `key`
+    # ("set the API key from the settings page" is documentation, not a change),
+    # but before an unambiguous credential it is a change like any other.
+    r"|\bset\b(?:\s+\S+){0,3}?\s+(?:password|passwd|passphrase|credentials?)\b"
+    # "print/echo the API key so I can copy it" — `print` alone is measurement
+    # ("print the token count"), so it needs an exposure target to count.
+    r"|\b(?:print|echo|emit|show|cat|dump)\b(?:\s+\S+){0,4}?\s+"
+    r"(?:" + _CREDENTIAL_NOUN + r")\b"
+    r"|\b(?:print|echo|emit|show|cat|dump)\b(?:\s+\S+){0,4}?\s+\bkeys?\b"
+    r"[^\n]{0,40}?\b(?:copy|see|read|retrieve|hand|paste|use|it)\b",
+    re.I,
+)
+
+
+# Words that mark a sentence as DISCOURSE about a credential rather than an act
+# on one. Without these the guard cannot tell "rotate the admin password" from
+# "I'm documenting the password rotation procedure", and an agent whose whole
+# task is auth work says the latter constantly. That is not hypothetical: the
+# `watchdog` session was held by its own guard while writing about credential
+# handling, and the `researcher` session spent a day on auth code.
+_CREDENTIAL_DISCOURSE_RE = re.compile(
+    r"\b(?:about|regarding|concerning|re:|document\w*|describ\w*|explain\w*|"
+    r"cover\w*|note|noting|note that|discuss\w*|mention\w*|report\w*|"
+    r"summar\w*|overview|section|paragraph|chapter|guide|how\s+to|"
+    r"procedure|policy|walkthrough|readme|docs?|documentation)\b"
+    # "write up / write out / write down how X is handled" is prose, not a
+    # secret hitting disk, so allow the particle before the discourse noun.
+    r"|\bwrite\s+(?:up|out|down)\b",
+    re.I,
+)
+
+
+def _looks_like_credential_change(text: str) -> bool:
+    """True if the text changes, rotates or exposes a credential.
+
+    Suppressed when the line reads as writing ABOUT credentials rather than
+    acting on one — "writing about credential changes" is a sentence being
+    composed, not a secret being rotated. The discourse marker must appear in
+    the same line as the credential phrase, so a real instruction on a nearby
+    line is still caught.
+    """
+    if not text:
+        return False
+    for line in text.split("\n"):
+        if not _CREDENTIAL_CHANGE_RE.search(line):
+            continue
+        if _CREDENTIAL_DISCOURSE_RE.search(line):
+            continue
+        return True
+    return False
 
 
 def _looks_destructive(text: str) -> bool:
     """True if the text names a clearly destructive/irreversible/high-cost action
     that should never be auto-approved without a human."""
-    return bool(_DESTRUCTIVE_RE.search(text or ""))
+    if not text:
+        return False
+    # A credential change is held outright: it is not a judgement about money or
+    # data we can re-derive, and the authorised form of it is indistinguishable
+    # from ordinary instruction.
+    if _looks_like_credential_change(text):
+        return True
+    # EVERY match is considered, not just the first: a spend report near the top
+    # of a screen must not mask a genuine `DROP TABLE` further down.
+    for m in _DESTRUCTIVE_RE.finditer(text):
+        # A match inside a spend REPORT is a description, not a request: the guard
+        # exists to protect a human decision about money not yet committed.
+        if not _spend_match_is_a_report(m, text):
+            return True
+    return False
+
+
+def _looks_destructive_operation(text: str) -> bool:
+    """Like _looks_destructive but IGNORES the spend alternatives.
+
+    This is the check that still applies to a screen phrased as a question.
+    Answering a question is the watchdog's whole job, and a spend figure being
+    OFFERED ("either (a) grant the override --usd 200, or (b) fix it for free")
+    is a choice to be made, not an act about to happen — holding on it would
+    strand the session forever, which is the stall being fixed. But a genuine
+    destructive OPERATION ("Shall I run DROP TABLE users?") is different: the
+    answer that authorises it is a harmless-looking "yes, go ahead", so the
+    reply cannot be inspected for it. Those are held even when asked as a
+    question, because the screen is the only place the intent is visible.
+    """
+    if not text:
+        return False
+    # A credential change holds on the screen too — see _CREDENTIAL_CHANGE_RE.
+    if _looks_like_credential_change(text):
+        return True
+    for m in _DESTRUCTIVE_RE.finditer(text):
+        if _DESTRUCTIVE_SPEND_RE.search(m.group()):
+            continue
+        return True
+    return False
 
 
 # The watchdog must only push UNFINISHED work forward — it must never assert that
@@ -21446,26 +21215,11 @@ async def _simple_watchdog_send_continue(session_name: str) -> bool:
     return await _simple_watchdog_send_text(session_name, "continue")
 
 
-# Slash commands that end the session, sign it out or throw its context away.
-# Nothing that types on the user's behalf (Full's autopilot, Cache's keep-alive)
-# may send one, whatever composed it.
-_SESSION_ENDING_COMMAND_RE = re.compile(
-    r"^\s*/(?:exit|quit|logout|login|clear|reset|new|resume|rewind|compact|kill)\b", re.I)
-
-
-def _ends_session(text: str) -> bool:
-    return bool(_SESSION_ENDING_COMMAND_RE.search(text or ""))
-
-
 async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
     """Type a composed reply into the session's Claude Code input box and submit.
     Collapses to a single line so Enter submits the whole message at once."""
     text = " ".join((text or "").split())
     if not text:
-        return False
-    if _ends_session(text):
-        logger.warning("Refused to type %r into '%s': it would end or reset the session",
-                       text[:40], session_name)
         return False
     try:
         # -l sends the text literally (so it isn't interpreted as tmux key names);
@@ -21531,10 +21285,15 @@ async def _simple_watchdog_loop():
             now = time.time()
             for sess in sessions_list:
                 name = sess["name"]
-                # Free-form "keep going" nudges only run in FULL auto-push mode.
-                # ("off"/"basic" leave the composing watchdog idle; basic still
-                # gets option-picking + prompt confirms via the auto-responder.)
-                if _get_autopush_mode(name) != "full":
+                # "off" must never type anything into the terminal. Every other
+                # mode reaches here, because a session blocked on a question is
+                # stalled in ALL of them — composing a reply to a question the
+                # agent has already asked is not "inventing a task", and leaving
+                # it unanswered is exactly how a session goes stale. Whether to
+                # push work forward when NOTHING is asked still depends on "full"
+                # (the gate further down, on the no-question path).
+                mode = _get_autopush_mode(name)
+                if not _mode_can_answer_questions(mode):
                     _simple_watchdog_state.pop(name, None)
                     continue
                 # Don't fire if Claude isn't even running
@@ -21592,19 +21351,51 @@ async def _simple_watchdog_loop():
                 idle_for = now - state.get("idle_since", now)
                 if idle_for < _SIMPLE_WATCHDOG_IDLE_SECS:
                     continue
+                # Is the screen actually asking the user something? A question we
+                # have already answered must not be answered again on every pass —
+                # the agent needs time to act on the reply. But the skip EXPIRES:
+                # if the agent ignored the reply the screen never changes, and a
+                # permanent skip would strand the session just as surely as the
+                # old latched backoff did.
+                asking = _looks_like_user_question(visible)
+                if asking and state.get("answered_hash") == content_hash:
+                    if now - state.get("answered_at", 0) < _SIMPLE_WATCHDOG_BACKOFF_SECS:
+                        continue
+                    slog.info("Autopilot re-answering '%s' — no response to the last reply", name)
+                    state["answered_hash"] = None
+                    state["answered_at"] = 0
                 # Back off if we keep hitting the EXACT same stalled screen — a reply
-                # that doesn't move it means poking again won't help; leave it for a human.
+                # that doesn't move it means poking again won't help. The backoff
+                # EXPIRES (below) rather than latching: a session must never be
+                # abandoned for good, or it goes stale, which is the whole failure
+                # this watchdog exists to prevent.
                 if content_hash == state.get("acted_hash"):
                     same = state.get("same_stall", 0) + 1
                     state["same_stall"] = same
                     if same >= _SIMPLE_WATCHDOG_MAX_SAME_STALL:
-                        if not state.get("backed_off"):
-                            slog.info("Autopilot backing off '%s' — unchanged after %d replies", name, same)
-                            state["backed_off"] = True
-                        continue
+                        first = state.get("backed_off_at")
+                        if first is None:
+                            state["backed_off_at"] = now
+                            slog.info("Autopilot backing off '%s' — unchanged after %d replies",
+                                      name, same)
+                            continue
+                        if now - first < _SIMPLE_WATCHDOG_BACKOFF_SECS:
+                            continue
+                        # Backoff has expired: try again, on a fresh count, so a
+                        # long-idle session gets another attempt instead of sitting
+                        # dead until someone notices.
+                        slog.info("Autopilot backoff expired for '%s' — trying again", name)
+                        state["same_stall"] = 0
+                        state["acted_hash"] = None
+                        state["backed_off_at"] = None
                 else:
                     state["same_stall"] = 0
-                    state["backed_off"] = False
+                    state["backed_off_at"] = None
+                # With nothing being asked, only "full" may push work forward —
+                # inventing a next step is the thing basic/basic+ deliberately do
+                # not do.
+                if not asking and mode != "full":
+                    continue
                 # Read the screen and let the LLM compose the reply that keeps it moving.
                 recent = await asyncio.to_thread(capture_pane_recent, name, 80)
                 if not recent.strip():
@@ -21612,7 +21403,18 @@ async def _simple_watchdog_loop():
                 # Safety backstop: never auto-drive a clearly destructive/irreversible
                 # action — the one carve-out from the continue bias. Checked before the
                 # LLM call (cheap) so we don't waste a call either.
-                if _looks_destructive(recent):
+                #
+                # NOT applied to the SPEND half when the screen is a question. A
+                # question is not an action: when the agent writes "Which do you
+                # want? Either (a) grant the override --usd 200, or (b) self-price",
+                # the spend option is being OFFERED, not run. Holding on that stalls
+                # the session permanently — the agent waits for an answer and sits
+                # there until it gets one, which is the exact stall this watchdog
+                # exists to prevent. Money is instead gated on the REPLY, below.
+                # A genuinely destructive OPERATION is still held even when asked
+                # as a question, because the reply that authorises it ("yes, go
+                # ahead") gives the operation away nowhere else.
+                if _looks_destructive_operation(recent):
                     if state.get("held_hash") != content_hash:
                         state["held_hash"] = content_hash
                         slog.info("Autopilot HOLDING '%s' — possible destructive/irreversible "
@@ -21631,8 +21433,39 @@ async def _simple_watchdog_loop():
                 if not decision or decision.get("action") != "send":
                     continue
                 msg = (decision.get("message") or "").strip()
-                if not msg or _looks_destructive(msg):
+                if not msg:
                     continue
+                # The composer is biased toward "make progress", so when a session
+                # offers a spend option against a non-spend one it may well pick
+                # spend — as it did for the `researcher`, choosing "grant the
+                # override --usd 200" over the no-cost repair. Committing money is
+                # the user's decision, so that reply must not be sent. Dropping it
+                # outright would leave the session stalled again, so instead we
+                # ask once more, explicitly forbidden from authorising spend.
+                if _looks_destructive(msg):
+                    slog.info("Autopilot reply to '%s' would authorise spend — "
+                              "re-asking for a non-spend answer: %s",
+                              name, (msg if len(msg) <= 120 else msg[:117] + "..."))
+                    _simple_watchdog_record(name, f"rejected spend-authorising reply: {msg[:80]}")
+                    try:
+                        raw = await llm_call(
+                            system_prompt=_SIMPLE_WATCHDOG_SYSTEM_PROMPT + _NO_SPEND_ADDENDUM,
+                            user_content=f"Session '{name}' terminal (most recent lines):\n\n{recent[-4500:]}",
+                            max_tokens=160,
+                            response_format={"type": "json_object"},
+                        )
+                    except Exception:
+                        continue
+                    decision = _parse_autopilot_decision(raw)
+                    if not decision or decision.get("action") != "send":
+                        continue
+                    msg = (decision.get("message") or "").strip()
+                    # Still authorising spend (or empty)? Then leave it to a human
+                    # rather than sending anything.
+                    if not msg or _looks_destructive(msg):
+                        slog.info("Autopilot leaving '%s' to a human — only spend-"
+                                  "authorising answers offered", name)
+                        continue
                 # Never let the watchdog assert results or rubber-stamp completion. Its
                 # only job is to UNSTICK the session and push unfinished work forward —
                 # not to claim checks passed or tell the agent to mark a task done. If the
@@ -21651,6 +21484,11 @@ async def _simple_watchdog_loop():
                     state["last_action"] = now
                     state["idle_since"] = now
                     state["acted_hash"] = content_hash
+                    # Remember a question we just answered so it is not answered
+                    # again on the next pass — the agent needs the turn to act.
+                    if asking:
+                        state["answered_hash"] = content_hash
+                        state["answered_at"] = now
                     short = msg if len(msg) <= 90 else msg[:87] + "..."
                     _simple_watchdog_record(name, f"replied (idle {int(idle_for)}s): {short}")
                     slog.info("Autopilot replied to '%s' after %ds idle: %s", name, int(idle_for), short)
@@ -21662,30 +21500,6 @@ async def _simple_watchdog_loop():
 
 
 # --- Auto /login watchdog: re-authenticate a session when Claude asks for login ---
-
-# Claude Code prints a SOFT notice days before a login lapses, on every launch:
-#   "⚠ Your login expires in 2 days · run /login to renew"
-# The session is signed in and working. "run /login" in that line matched the
-# regex below, so the watchdog took every freshly launched session for a logged
-# out one, pressed Escape, typed /exit and relaunched it: on 2026-09-17 that
-# killed calandar, phonelinebob and lisa-solver on builder2 inside an hour. The
-# notice is stripped before any login test, so it can never trigger a relaunch.
-_LOGIN_RENEWAL_NOTICE_RE = re.compile(
-    r"^.*(?:login|sign[- ]?in|token|credentials?)\s+(?:expires|will expire)\b.*$"
-    r"|^.*/login\s+to\s+renew\b.*$",
-    re.I | re.M,
-)
-
-
-def _strip_login_renewal_notice(text: str) -> str:
-    """The pane text without Claude Code's advance "login expires" notice."""
-    return _LOGIN_RENEWAL_NOTICE_RE.sub("", text or "")
-
-
-def _screen_needs_login(text: str) -> bool:
-    """True only for a real logged-out message, never for the renewal notice."""
-    return bool(_LOGIN_NEEDED_RE.search(_strip_login_renewal_notice(text)))
-
 
 _LOGIN_NEEDED_RE = re.compile(
     r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
@@ -21706,70 +21520,20 @@ _LOGIN_CODE_PROMPT_RE = re.compile(
     r"(?:paste|enter)\s+(?:the\s+)?(?:(?:authorization|oauth|login)\s+)?code\b",
     re.I,
 )
-# ── Cache: keep the prompt cache warm, and use the turn to move the work on ──
+# ── Basic+ : keep the prompt cache warm ─────────────────────────────────────
 # The cache is what makes a follow-up cheap, and it expires on a timer that
-# restarts on every turn (see CACHE_PUSH_LEAD above). Cache mode spends one turn
-# to restart that timer shortly before it would lapse, so a session left alone
-# over lunch is still warm when its owner comes back.
+# restarts on every turn (see CACHE_WARN_LEAD above). Basic+ spends one cheap
+# turn to restart that timer shortly before it would lapse, so a session left
+# alone over lunch is still warm when its owner comes back.
 #
-# That turn used to carry one fixed line ("Continue. re-verify your own work"),
-# the same words every hour, which bought a redundant verification pass and
-# nothing else. It now carries the step the owner would most likely have asked
-# for next, drafted from the two things the Chat tab already holds: their own
-# messages, and the agent's replies. The draft is held to safe, in-scope work:
-# tests, QA, the clearly missing parts of what was asked for, UI and UX polish,
-# never a new feature nobody asked for, and nothing destructive, costly or
-# outbound. A draft that fails any check below falls back to the fixed line.
-#
-# Still NOT the autopilot ("full"). That one reacts to a screenshot every time
-# the agent pauses, and has typed a new task into a session that was
-# legitimately done. This fires once per cache window, from the conversation
-# rather than the screen, and stops after CACHE_KEEPALIVE_MAX_CHAIN unanswered
-# pushes.
+# Deliberately NOT the autopilot. That one screenshots the pane and lets a model
+# compose an instruction, which is why it stays opt-in and off by default: it
+# cannot tell a finished hand-back from a stall, and it has typed a new task
+# into a session that was legitimately done. This sends ONE fixed sentence and
+# never composes anything, so the worst case is a redundant verification pass on
+# work that was already finished.
 _CACHE_KEEPALIVE_INTERVAL = 30     # seconds between scans
 _cache_keepalive_state: Dict[str, dict] = {}
-CACHE_PROMPT_MODEL = os.environ.get("TMUX_DASH_CACHE_PROMPT_MODEL", "gpt-5.4-mini")
-_CACHE_PROMPT_MAX_CHARS = 1200
-# Said at the end of every drafted step, in the owner's voice, so the agent knows
-# nobody is there to answer and what "safe" means while that is true.
-_CACHE_PROMPT_AWAY_NOTE = (
-    "I'm away for a while, so make the reasonable calls yourself instead of asking, "
-    "and keep it safe: nothing destructive, no spending, no messages to anyone."
-)
-
-_CACHE_PROMPT_SYSTEM = (
-    "You write the next message a busy project owner would send to their AI coding agent "
-    "(Claude Code or Codex, running in a terminal). The owner has stepped away. The agent is "
-    "idle, and one message now keeps its context warm. Use that message to advance the owner's "
-    "project the way the owner most likely would have.\n\n"
-    "You are given the owner's own messages (their words, in full) and recaps of the agent's "
-    "replies, oldest first, then the agent's latest reply in full, then any messages already sent "
-    "on the owner's behalf while they were away.\n\n"
-    "Work out the OVERALL goal from the owner's messages, then write the single most useful next "
-    "step toward it. Good next steps, roughly in this order:\n"
-    "- Anything the owner asked for that the latest reply says is not done, only partly done, "
-    "skipped or left for later.\n"
-    "- Verifying what was built: tests that are missing, QA of the real thing end to end, "
-    "checking the edge cases the work obviously has.\n"
-    "- Fixing problems or risks the agent itself reported.\n"
-    "- Clear gaps a user of this work would hit, UI and UX polish, docs or cleanup of the change.\n"
-    "You may make executive decisions like the owner would: if the agent asked a question, answer "
-    "it with the sensible choice that fits the owner's goals and say so.\n\n"
-    "Do NOT:\n"
-    "- Start a new feature or direction the owner never asked for.\n"
-    "- Ask for anything destructive or hard to undo (deleting data, dropping tables, force "
-    "pushing, rewriting history), anything that spends money, or anything that contacts people "
-    "(email, SMS, calls, posts).\n"
-    "- Ask for a deploy, publish or release unless the owner's messages show that shipping this "
-    "work is already part of the task.\n"
-    "- Claim anything passed, works or is done, or tell the agent to mark the task complete.\n"
-    "- Tell it to stop, wait, or check with the owner. Do not use slash commands.\n"
-    "- Repeat a message already sent while the owner was away; move on to the next thing.\n\n"
-    "Write as the owner, directly to the agent, in 1 to 4 plain sentences, specific to this "
-    "project (name the file, page, feature or test). Do not add a sign-off: a note that the owner "
-    "is away is appended automatically.\n"
-    'Reply with JSON only: {"prompt": "<the message>"}'
-)
 
 
 def _cache_keepalive_active(session_name: str) -> bool:
@@ -21782,174 +21546,8 @@ def _cache_keepalive_active(session_name: str) -> bool:
     return bool((_cache_keepalive_state.get(session_name) or {}).get("fired_for"))
 
 
-def _visible_pane(session_name: str) -> str:
-    """Exactly what is on screen now, no scrollback: what the typing guards read."""
-    try:
-        r = subprocess.run(["tmux", "capture-pane", "-t", session_name, "-p"],
-                           capture_output=True, text=True, timeout=3)
-        return r.stdout if r.returncode == 0 else ""
-    except Exception:
-        return ""
-
-
-def _session_chat_messages(session_name: str) -> list:
-    entry = cache.get(session_name) or {}
-    msgs = entry.get("messages")
-    if msgs is None:
-        try:
-            msgs = _load_session_messages(session_name)
-        except Exception:
-            msgs = []
-    return [m for m in (msgs or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
-
-
-def _human_spoke_since(session_name: str, since: float) -> bool:
-    """Did a person type into this session after `since`?"""
-    if not since:
-        return False
-    if _seconds_since_human_input(session_name) < time.time() - since:
-        return True
-    for m in reversed(_session_chat_messages(session_name)):
-        if m.get("role") == "user" and not m.get("auto"):
-            return float(m.get("ts") or 0) > since
-    return False
-
-
-def _cache_prompt_context(session_name: str, already_sent: list) -> str:
-    """The conversation, as the drafting model reads it. '' when there is none."""
-    msgs = _session_chat_messages(session_name)
-    users = [m for m in msgs if m.get("role") == "user" and not m.get("auto")]
-    if not users:
-        return ""
-    # The first two things the owner asked for usually state the goal; the
-    # recent run says where it stands. Keep both, drop the middle if it is long.
-    first_ids = {id(m) for m in users[:2]}
-    recent = msgs[-14:]
-    keep = [m for m in msgs if id(m) in first_ids and m not in recent] + recent
-    lines = []
-    for m in keep:
-        text = str(m.get("text") or "").strip()
-        if not text:
-            continue
-        if m.get("role") == "user":
-            who = "Sent for the owner while away" if m.get("auto") else "Owner"
-            lines.append("[%s] %s" % (who, text[:3000 if id(m) in first_ids else 1500]))
-        else:
-            lines.append("[Agent, recap] %s" % text[:700])
-    latest = ""
-    newest = msgs[-1] if msgs else {}
-    if newest.get("role") == "assistant" and newest.get("full"):
-        latest = str(newest.get("full"))
-    else:
-        last_user_text = next((str(m.get("text") or "") for m in reversed(msgs)
-                               if m.get("role") == "user"), "")
-        try:
-            latest = _extract_last_assistant_turn(session_name, last_user_text)
-        except Exception:
-            latest = ""
-    cwd = ""
-    try:
-        cwd = get_session_cwd(session_name)
-    except Exception:
-        pass
-    parts = ["Session '%s'%s." % (session_name, (", working in " + cwd) if cwd else "")]
-    parts.append("== Conversation, oldest first ==\n" + "\n\n".join(lines))
-    if latest.strip():
-        parts.append("== The agent's latest reply, in full ==\n" + latest.strip()[-6000:])
-    if already_sent:
-        parts.append("== Already sent for the owner while they were away (do not repeat) ==\n"
-                     + "\n".join("- " + p[:400] for p in already_sent[-5:]))
-    return "\n\n".join(parts)[-24000:]
-
-
-# Stricter than _looks_destructive, which is tuned not to block the autopilot's
-# ordinary "keep going". A drafted step has a harmless fallback (the fixed line),
-# so anything that even names destroying data, rewriting history, spending or
-# contacting people is refused rather than weighed.
-_CACHE_PROMPT_REFUSE_RE = re.compile(
-    r"\b(?:drop|truncate|delete|wipe|erase|purge|destroy|nuke)\b[^.\n]{0,40}?"
-    r"\b(?:tables?|databases?|db|data|records?|rows?|users?|accounts?|buckets?|branch(?:es)?|"
-    r"repo(?:sitory|sitories|s)?|production|prod|backups?|volumes?|disks?|vms?|instances?)\b"
-    r"|\bforce[- ]?push|\bpush\s+(?:--force|-f)\b|\breset\s+--hard\b|\brm\s+-[a-z]*r[a-z]*f"
-    r"|\brebase\b[^.\n]{0,30}\b(?:main|master|shared)\b"
-    r"|\b(?:buy|purchase|pay\s+for|subscribe|upgrade\s+(?:the\s+)?plan|add\s+(?:funds|credits))\b"
-    r"|\b(?:send|email|e-mail|text|sms|call|message|dm|post|tweet)\b[^.\n]{0,30}\b(?:customers?|clients?|"
-    r"users|people|everyone|the\s+team|partners?|vendors?|suppliers?)\b",
-    re.I,
-)
-
-
-def _vet_cache_prompt(draft: str) -> str:
-    """The draft, cleaned, or '' when it must not be sent."""
-    text = " ".join(str(draft or "").split()).strip().strip('"').strip()
-    if len(text) < 12:
-        return ""
-    if text.startswith("/") or _ends_session(text):
-        return ""
-    if _looks_destructive(text) or _asserts_completion(text) or _CACHE_PROMPT_REFUSE_RE.search(text):
-        return ""
-    if len(text) > _CACHE_PROMPT_MAX_CHARS:
-        cut = text[:_CACHE_PROMPT_MAX_CHARS]
-        end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
-        text = cut[:end + 1] if end > _CACHE_PROMPT_MAX_CHARS // 2 else cut
-    return text
-
-
-async def _draft_json(system_prompt: str, user_content: str) -> str:
-    """One JSON reply from the drafting model, falling back to the house model."""
-    try:
-        resp = await client.chat.completions.create(
-            model=CACHE_PROMPT_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_content}],
-            max_completion_tokens=3000,
-            reasoning_effort="low",
-            response_format={"type": "json_object"},
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        if out:
-            return out
-    except Exception as e:
-        logger.warning("Cache prompt draft on %s failed, falling back: %s", CACHE_PROMPT_MODEL, e)
-    return await llm_call(system_prompt, user_content, max_tokens=500,
-                          response_format={"type": "json_object"})
-
-
-async def _compose_cache_prompt(session_name: str, already_sent: list) -> tuple:
-    """(message to send, 'drafted' | 'fixed')."""
-    context = await asyncio.to_thread(_cache_prompt_context, session_name, already_sent)
-    if not context:
-        return CACHE_KEEPALIVE_PROMPT, "fixed"
-    raw = await _draft_json(_CACHE_PROMPT_SYSTEM, context)
-    draft = ""
-    try:
-        m = re.search(r"\{.*\}", raw or "", re.S)
-        draft = (json.loads(m.group()) if m else {}).get("prompt", "")
-    except Exception:
-        draft = ""
-    vetted = _vet_cache_prompt(draft)
-    if not vetted:
-        if draft:
-            logger.warning("Cache prompt draft for '%s' refused, sending the fixed line: %r",
-                           session_name, str(draft)[:200])
-        return CACHE_KEEPALIVE_PROMPT, "fixed"
-    return vetted + " " + _CACHE_PROMPT_AWAY_NOTE, "drafted"
-
-
-def _record_auto_message(session_name: str, text: str, kind: str) -> None:
-    """Show a message the dashboard sent for the owner in the Chat tab, marked as such."""
-    try:
-        entry = cache.setdefault(session_name, {})
-        if "messages" not in entry:
-            entry["messages"] = _load_session_messages(session_name)
-        entry["messages"].append({"role": "user", "text": text, "ts": time.time(), "auto": kind})
-        _save_messages()
-    except Exception:
-        logger.debug("could not record auto message for %s", session_name, exc_info=True)
-
-
 async def _cache_keepalive_loop():
-    """Before an idle Cache session's prompt cache goes cold, send its next step."""
+    """Push one continue into an idle Basic+ session before its cache goes cold."""
     log = logging.getLogger("cache-keepalive")
     await asyncio.sleep(12)  # let startup settle
     while True:
@@ -21959,7 +21557,7 @@ async def _cache_keepalive_loop():
             sessions_list = await asyncio.to_thread(get_tmux_sessions)
             for sess in sessions_list:
                 name = sess["name"]
-                if _get_autopush_mode(name) != "cache":
+                if _get_autopush_mode(name) != "basicplus":
                     _cache_keepalive_state.pop(name, None)
                     continue
                 try:
@@ -21982,29 +21580,13 @@ async def _cache_keepalive_loop():
                 st = _cache_keepalive_state.setdefault(name, {})
                 # A turn landed after our nudge: the cache clock restarted, so
                 # drop the marker (the session stops showing as maintaining) and
-                # let the deadline test below decide afresh. The chain count is
-                # kept: it only restarts when a person types.
+                # let the deadline test below decide afresh.
                 if st.get("fired_for") and turn_end > st["fired_for"] + 1:
-                    st["fired_for"] = 0
-                if st.get("at") and _human_spoke_since(name, st["at"]):
-                    st.update({"chain": 0, "sent": [], "capped": False})
-                if now < deadline - CACHE_PUSH_LEAD:
-                    continue
-                # Already cold: there is nothing left to keep warm, and the next
-                # turn pays full price whoever sends it.
-                if now >= deadline:
+                    st.clear()
+                if now < deadline - CACHE_WARN_LEAD:
                     continue
                 if st.get("fired_for"):
                     continue          # already pushed for this turn
-                if st.get("chain", 0) >= CACHE_KEEPALIVE_MAX_CHAIN:
-                    if not st.get("capped"):
-                        st["capped"] = True
-                        _simple_watchdog_record(
-                            name, "cache keep-alive paused: %d pushes with nobody replying"
-                            % st["chain"])
-                        log.info("Cache keep-alive paused for '%s' after %d unanswered pushes",
-                                 name, st["chain"])
-                    continue
                 if not await _async_is_claude_running(name):
                     continue
                 # Busy is the point of the exercise: a session that is working is
@@ -22015,45 +21597,35 @@ async def _cache_keepalive_loop():
                     continue
                 if activity.get("status") != "idle":
                     continue
-                visible = await asyncio.to_thread(_visible_pane, name)
-                # The same things that make any auto-typing unsafe: a menu the
-                # auto-responder owns, a shell where Claude used to be, and a
+                try:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        ["tmux", "capture-pane", "-t", name, "-p"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if vis.returncode != 0:
+                        continue
+                    visible = vis.stdout
+                except Exception:
+                    continue
+                # The same three things that make any auto-typing unsafe: a menu
+                # the auto-responder owns, a shell where Claude used to be, and a
                 # half-typed message we would clobber. A fresh session has no
                 # conversation to keep warm, so it is skipped too.
-                if (not visible or _detect_interactive_prompt(visible)
+                if (_detect_interactive_prompt(visible)
                         or _looks_like_bare_shell(visible)
                         or _looks_like_fresh_claude_session(visible)
                         or _has_pending_user_input(visible)):
                     continue
-                prompt, source = await _compose_cache_prompt(name, st.get("sent") or [])
-                # Drafting takes seconds. Look again before typing: the owner
-                # may be back, or the agent may have started on its own.
-                now = time.time()
-                try:
-                    activity = await async_detect_activity(name)
-                except Exception:
-                    continue
-                visible = await asyncio.to_thread(_visible_pane, name)
-                if (activity.get("status") != "idle" or not visible
-                        or _has_pending_user_input(visible)
-                        or _detect_interactive_prompt(visible)
-                        or (st.get("at") and _human_spoke_since(name, st["at"]))
-                        or _seconds_since_human_input(name) < 60):
-                    continue
-                ok = await _simple_watchdog_send_text(name, prompt)
+                ok = await _simple_watchdog_send_text(name, CACHE_KEEPALIVE_PROMPT)
                 if ok:
                     st["fired_for"] = turn_end
                     st["at"] = now
-                    st["chain"] = st.get("chain", 0) + 1
-                    st["sent"] = (st.get("sent") or [])[-4:] + [prompt]
-                    _record_auto_message(name, prompt, "cache")
                     left = int(deadline - now)
-                    short = prompt if len(prompt) <= 90 else prompt[:87] + "..."
                     _simple_watchdog_record(
-                        name, "cache keep-alive (%dm before cold, %s): %s"
-                        % (left // 60, source, short))
-                    log.info("Cache keep-alive pushed to '%s' (%ds before cold, %s, %d in a row)",
-                             name, left, source, st["chain"])
+                        name, f"cache keep-alive ({left // 60}m before cold)")
+                    log.info("Cache keep-alive pushed to '%s' (%ds before cold)",
+                             name, left)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -22063,13 +21635,8 @@ async def _cache_keepalive_loop():
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
-# clear it — otherwise we'd interrupt someone typing /login by hand. 45 seconds
-# was far too short for a person: opening the link, signing in and copying the
-# code back leaves the pane byte-for-byte still for minutes, and the watchdog
-# pressed Escape on them ("Login interrupted"). And a login somebody opened from
-# the dashboard is theirs for _LOGIN_FLOW_HUMAN_GRACE, however still it sits.
-_LOGIN_FLOW_STALE_AFTER = 600
-_LOGIN_FLOW_HUMAN_GRACE = 1800
+# clear it — otherwise we'd interrupt someone typing /login by hand.
+_LOGIN_FLOW_STALE_AFTER = 45
 _login_watchdog_state: Dict[str, dict] = {}
 
 
@@ -22098,7 +21665,7 @@ def _classify_login_watchdog_screen(screen: str) -> tuple[bool, bool]:
         or ("select login method" in low)
         or ("press enter to retry" in low and "esc to cancel" in low)
     )
-    needs_login = _screen_needs_login(prompt_tail)
+    needs_login = bool(_LOGIN_NEEDED_RE.search(prompt_tail))
     return needs_login, login_flow_open
 
 
@@ -22177,10 +21744,6 @@ async def _login_watchdog_loop():
                 # /exit'd every few minutes. A live session's pane keeps changing,
                 # so a digest of it tells the two apart — an abandoned prompt is
                 # byte-for-byte static.
-                if login_flow_open and _seconds_since_human_input(name) < _LOGIN_FLOW_HUMAN_GRACE:
-                    state.pop("flow_since", None)
-                    state.pop("flow_sig", None)
-                    continue
                 if login_flow_open:
                     sig = hashlib.sha1((recent or "").encode("utf-8", "replace")).hexdigest()
                     since = state.get("flow_since")
@@ -22269,20 +21832,9 @@ _CRASH_OOM_RE = re.compile(
 )
 
 
-# Claude refusing to start at all. It exits immediately with one of these lines
-# and no TUI, which looks identical to a logout from the tab. Recovering is the
-# same relaunch, and _resume_flag now picks a flag that cannot repeat the abort.
-_CRASH_LAUNCH_ABORT_RE = re.compile(
-    r"No conversation found with session ID"
-    r"|Session ID [0-9a-fA-F-]{36} is already in use",
-)
-
-
 def _looks_like_crash(text: str) -> bool:
-    """True if recent pane output shows Claude dying (OOM/SIGABRT/etc.) or
-    refusing to launch on the conversation it was given."""
-    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text)
-                or _CRASH_LAUNCH_ABORT_RE.search(text))
+    """True if recent pane output shows a process-death signature (OOM/SIGABRT/etc.)."""
+    return bool(_CRASH_SIGNATURE_RE.search(text) or _CRASH_OOM_RE.search(text))
 
 # A user@host:path$ / # / % prompt line. Group 1 = anything typed after it.
 _SHELL_PROMPT_RE = re.compile(r"[\w.\-]+@[\w.\-]+:[^\n]*[$#%>]\s*([^\n]*)$")
@@ -22454,6 +22006,72 @@ async def _crash_recovery_loop():
             logger.debug("Crash recovery iteration failed", exc_info=True)
 
 
+# A question or a hand-back asked in PROSE, not as a numbered menu. Claude Code
+# only renders a selectable menu when it uses its own question tool; a question
+# written as ordinary text ("Which do you want? Either (a) ... or (b) ...") gets
+# no cursor and no numbered options, so _detect_interactive_prompt — which
+# requires "❯ N." — does not see it at all. That is how the `researcher` session
+# sat idle from 05:51 on 2026-09-20 with a real question on screen while Basic
+# auto-push reported nothing to do.
+#
+# Deliberately narrow. This decides only whether the screen is WAITING on a
+# human; what to answer is the composing watchdog's job. A false positive here
+# means the watchdog bothers to look (one cheap LLM call, and it can still
+# choose 'wait'); a false negative means a session goes stale, which is the
+# failure we are fixing. So it leans inclusive — but only on genuine
+# interrogative or hand-back phrasing, never on a statement of progress.
+_USER_QUESTION_RE = re.compile(
+    # a direct question ending in "?"
+    r"(?:\?|？)\s*$"
+    # explicit interrogative openers
+    r"|^\s*(?:would|could|should|shall|can|do|does|did|is|are|was|were|will|"
+    r"which|what|when|where|who|whom|whose|why|how)\b[^\n]{0,120}\?"
+    # imperative hand-backs that still require the user to decide
+    r"|\b(?:let me know|tell me (?:which|what|how|if|whether)|your call|"
+    r"up to you|awaiting your|waiting (?:on|for) your|standing by|"
+    r"say the word|if you(?:'d| would)? (?:like|prefer|want)|"
+    r"please (?:confirm|choose|pick|decide)|need your (?:input|decision|approval)|"
+    r"which do you |which would you |which one do you )\b",
+    re.I | re.M,
+)
+
+# A line asserting work is finished is a statement, not a question — the
+# watchdog must leave a genuinely complete task alone rather than nudge it.
+_USER_QUESTION_NOT_RE = re.compile(
+    r"\b(?:all (?:tests|checks) (?:pass|passed|green)|deployed|is complete|"
+    r"are complete|has been completed|no further action)\b",
+    re.I,
+)
+
+
+def _looks_like_user_question(visible: str) -> bool:
+    """True if the screen shows a question or hand-back addressed to the user.
+
+    Only the tail of the pane is examined — the live prompt area — so a question
+    the agent asked and then ANSWERED itself earlier in the scrollback does not
+    keep the watchdog firing forever.
+    """
+    if not visible:
+        return False
+    tail = "\n".join(visible.strip().split("\n")[-25:])
+    if _USER_QUESTION_NOT_RE.search(tail):
+        return False
+    return bool(_USER_QUESTION_RE.search(tail))
+
+
+def _mode_can_answer_questions(mode: str) -> bool:
+    """Whether this auto-push mode may COMPOSE a reply to a question.
+
+    'off' writes nothing, ever. 'basic', 'basicplus' and 'full' all answer a
+    question the session is blocked on — a session waiting on an absent human is
+    stalled in every one of those modes, so answering is what the mode was
+    chosen for. Only 'full' additionally pushes unfinished work forward when
+    nothing is being asked; that distinction (invent vs. answer) is what the
+    modes are for, and it is preserved.
+    """
+    return mode in ("basic", "basicplus", "full")
+
+
 def _has_pending_user_input(visible: str) -> bool:
     """True if the visible pane shows the ❯ user-input box with text already typed.
 
@@ -22508,7 +22126,7 @@ def _looks_like_fresh_claude_session(visible: str) -> bool:
 
 @app.get("/api/sessions/{session_name}/autopush")
 async def api_autopush_status(session_name: str):
-    """Return the per-session auto-push mode ('off'|'basic'|'cache'|'full') + recent log."""
+    """Return the per-session auto-push mode ('off'|'basic'|'full') + recent log."""
     return JSONResponse({
         "mode": _get_autopush_mode(session_name),
         "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
@@ -22526,13 +22144,11 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
     off   — the dashboard never types into this terminal.
     basic — auto-pick option menus + confirm permission/plan prompts + keep the
             session logged in (no free-form messages).
-    cache — basic, plus the next step drafted and sent before the cache goes
-            cold. "basicplus", its old name, is accepted.
     full  — everything in basic, plus auto-compose a "keep going" nudge when
             Claude pauses waiting on the user before a task is finished.
     """
-    mode = _normalize_autopush_mode(body.mode)
-    if not mode:
+    mode = (body.mode or "").strip().lower()
+    if mode not in AUTOPUSH_MODES:
         return JSONResponse(
             {"error": f"mode must be one of {list(AUTOPUSH_MODES)}"}, status_code=400
         )
@@ -22783,7 +22399,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage.no-data{opacity:.6}
 .nav-usage.no-data .nav-usage-pct{color:#6e7681}
 .nav-usage.stale .nav-usage-pct{font-style:italic;opacity:.75}
-.nav-usage.disabled{display:none}
+.nav-usage.disabled,.nav-tools-usage.disabled{display:none}
 /* Usage bars mirrored into tools dropdown (mobile only) */
 .nav-tools-usage{display:none;padding:8px 14px 4px 14px}
 .nav-tools-usage-title{color:#6e7681;font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
@@ -22792,11 +22408,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-tools-usage-bar{flex:1;height:5px;background:#21262d;border-radius:3px;overflow:hidden;position:relative}
 .nav-tools-usage-pct{color:#8b949e;font-size:.7rem;width:38px;text-align:right;font-variant-numeric:tabular-nums}
 .nav-tools-usage-divider{height:1px;background:#21262d;margin:8px 0 0 0}
-/* Normally mute: "Watching for changes..." is noise once you trust the page.
-   The one thing worth the room is the page admitting it has STOPPED watching:
-   a stale red pill is indistinguishable from a live one, so say it out loud. */
 .nav-status-text{display:none}
-.nav-status-text.poll-stalled{display:inline-flex;align-items:center;gap:6px;background:#3a2d0b;color:#d29922;border:1px solid #5a4510;border-radius:999px;padding:3px 10px;font-size:.7rem;font-weight:600;white-space:nowrap}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -22981,21 +22593,6 @@ body.member-admin .more-member-only{display:none}
 .composer-attachment-remove{flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #30363d;border-radius:50%;background:#21262d;color:#8b949e;cursor:pointer;font-size:.8rem;line-height:1}
 .composer-attachment-remove:hover{background:#da3633;border-color:#da3633;color:#fff}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
-/* Live voice mode: the toggle beside the mic, and the status strip above the
-   composer. The dot says which half of the loop it is in without reading. */
-.cmd-voice{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;background:#21262d;color:#8b949e;cursor:pointer;display:flex;align-items:center;justify-content:center;align-self:flex-end;transition:background .15s,color .15s}
-.cmd-voice:hover{background:#2d333b;color:#c9d1d9}
-.cmd-voice.active{background:#1f6feb;color:#fff}
-.voice-bar{display:none;align-items:center;gap:10px;margin:0 0 8px;padding:8px 12px;border:1px solid #30363d;border-radius:8px;background:#0d1117;font-size:.84rem;color:#c9d1d9}
-.voice-bar.on{display:flex}
-.voice-dot{width:11px;height:11px;border-radius:50%;background:#3fb950;flex-shrink:0}
-.voice-bar.listening .voice-dot{animation:voice-pulse 1.2s ease-in-out infinite}
-.voice-bar.hearing .voice-dot{background:#58a6ff;animation:voice-pulse .45s ease-in-out infinite}
-.voice-bar.sending .voice-dot{background:#58a6ff}
-.voice-bar.speaking .voice-dot{background:#e3b341;animation:voice-pulse .8s ease-in-out infinite}
-@keyframes voice-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.65)}}
-.voice-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.voice-bar .btn{padding:5px 11px;font-size:.78rem}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
 .cmd-send:hover{background:#30363d}
 .cmd-send.is-mic{color:#8b949e}
@@ -23114,14 +22711,6 @@ body.member-admin .more-member-only{display:none}
 .term-live .tl-tok:not(:empty)::before,
 .term-live .tl-since:not(:empty)::before,
 .term-live .tl-ctx:not(:empty)::before{content:'· ';color:#30363d}
-/* Hot or cold, in words, because "idle 47m" only answers the question if you
-   remember the TTL. Orange = still cached, so the next message is cheap.
-   Blue = lapsed, so it pays to write the whole prompt again. */
-.tl-cache{white-space:nowrap;font-weight:600}
-.term-live .tl-cache:not(:empty)::before{content:'· ';color:#30363d;font-weight:400}
-.tl-cache.hot{color:#e3b341}
-.tl-cache.cold{color:#79c0ff}
-.tl-cache.expiring{animation:cache-expiring .36s steps(1,end) infinite}
 .tl-since.warm{color:#3fb950}
 .tl-since.cooling{color:#d29922}
 .tl-since.cold{color:#8b949e}
@@ -23251,47 +22840,26 @@ body.member-admin .more-member-only{display:none}
 .autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
-.autopush-seg button.ap-cache.active{background:#9e6a03}
+.autopush-seg button.ap-basicplus.active{background:#9e6a03}
 .autopush-seg button.ap-full.active{background:#238636}
 /* Approaching cold: the GREEN idle state, blinking fast, so it is caught out of
    the corner of an eye from across the room. Deliberately still green. Amber is
    reserved for the keep-alive below, and one colour meaning two different things
    is exactly the confusion this is supposed to prevent: green blinking means
    "come and type", amber steady means "it is handling it". */
-/* The prompt cache is about to go cold (CACHE_ALERT_LEAD, 15 minutes out): the
-   idle green flashes FAST, in the session, on its header tab and in the favicon.
-   Fast on purpose. A slow pulse already means "finished, not viewed yet". */
-@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.12}}
+@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
 .status-pill.idle.expiring{background:#3fb95033;color:#56d364;border-color:#3fb950aa;
-  animation:cache-expiring .36s steps(1,end) infinite}
+  animation:cache-expiring .7s steps(1,end) infinite}
 .status-pill.idle.expiring .status-dot{background:#56d364;
-  animation:cache-expiring .36s steps(1,end) infinite}
-.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .36s steps(1,end) infinite}
-.nav-dot.idle.expiring,.nav-dot.idle.completed-unread.expiring{width:11px;height:11px;background:#56d364;
-  box-shadow:0 0 9px #3fb950;transform:none;animation:cache-expiring .36s steps(1,end) infinite}
-/* A message the dashboard sent for you (Cache mode), told apart from your own. */
-.chat-msg.user.auto{background:#9e6a031f;border:1px dashed #9e6a03aa}
-.chat-auto-tag{font-size:.68rem;font-weight:600;color:#e3b341;margin-bottom:4px;letter-spacing:.02em}
+  animation:cache-expiring .7s steps(1,end) infinite}
+.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
 /* Working, but only to hold the cache. Amber, and NOT blinking: it wants to be
    distinguishable from a session someone actually asked for something. */
 .status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
 .status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
-/* Compacting is housekeeping, not the user's task. Red says "still chewing on
-   your request" and that is the wrong thing to say for four minutes, so it gets
-   its own blue and a bar. The bar is indeterminate on purpose: Claude Code does
-   not report compaction progress, and a fake percentage would be a lie. */
-.status-pill.busy.compacting{background:#388bfd26;color:#79c0ff;border:1px solid #388bfd66;
-  animation:none;font-size:.75rem;padding:3px 12px;gap:7px}
-.status-pill.busy.compacting .status-dot{background:#79c0ff;animation:none}
-.pill-bar{display:inline-block;width:46px;height:3px;border-radius:2px;background:#388bfd33;
-  overflow:hidden;position:relative;flex:none}
-.pill-bar i{position:absolute;top:0;left:0;height:100%;width:45%;border-radius:2px;
-  background:#79c0ff;animation:pill-bar-slide 1.15s ease-in-out infinite}
-@keyframes pill-bar-slide{0%{left:-45%}100%{left:100%}}
-@media (prefers-reduced-motion:reduce){.pill-bar i{animation:none;left:0;width:100%;opacity:.6}}
 .idle-nudge-seg button.in-off.active{background:#484f58}
 .idle-nudge-seg button.in-light.active{background:#1f6feb}
-.idle-nudge-seg button.in-high.active{background:#da3633}
+.idle-nudge-seg button.in-adhd.active{background:#da3633}
 .tab-more-menu .autopush-seg,.tab-more-menu .idle-nudge-seg{margin:2px 16px 4px}
 .tab-more-menu .autopush-seg button,.tab-more-menu .idle-nudge-seg button{padding:4px 11px;font-size:.72rem}
 
@@ -23374,8 +22942,6 @@ body.member-admin .more-member-only{display:none}
 .nav-tools-wrap{position:relative;flex-shrink:0}
 .nav-tools-menu{display:none;position:absolute;top:100%;right:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:4px 0;z-index:150;box-shadow:0 8px 24px rgba(0,0,0,.4);margin-top:4px}
 .nav-tools-menu.open{display:block}
-.nav-tools-mobile{display:none}
-.nav-tools-sub{margin-left:auto;padding-left:10px;color:#6e7681;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
 .nav-tools-item:hover{background:#1c2128}
 .nav-tools-item .icon{font-size:.9rem}
@@ -23767,21 +23333,11 @@ body.member-simple .hide-in-simple{display:none!important}
 .bs-proxy-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .bs-proxy-title{font-weight:600;color:#e6edf3;font-size:.85rem}
 .bs-proxy-sub{font-size:.7rem;color:#6e7681;margin-left:auto}
-.bs-proxy-ladder{margin-top:10px;border:1px solid #21262d;border-radius:6px;overflow:hidden}
-.bs-proxy-rung{display:flex;align-items:center;gap:8px;padding:5px 9px;border-top:1px solid #21262d;font-size:.75rem}
-.bs-proxy-rung:first-child{border-top:none}
-.bs-proxy-rung.off{opacity:.45}
-.bs-proxy-rung-n{width:16px;height:16px;flex:none;border-radius:50%;background:#21262d;color:#8b949e;font-size:.6rem;display:flex;align-items:center;justify-content:center;font-weight:600}
-.bs-proxy-rung-name{font-weight:600;color:#e6edf3}
-.bs-proxy-rung .bs-proxy-sub{margin-left:0}
-.bs-proxy-rung .bs-badge{margin-left:auto}
 .bs-proxy-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:10px}
 .bs-proxy-form label{font-size:.63rem;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;font-weight:600;display:block;margin-bottom:3px}
 .bs-proxy-form input,.bs-proxy-form select{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 8px;font-size:.8rem;outline:none;width:100%;box-sizing:border-box;font-family:inherit}
 .bs-proxy-form input:focus,.bs-proxy-form select:focus{border-color:#58a6ff}
 .bs-proxy-actions{display:flex;gap:6px;align-items:center;margin-top:10px;flex-wrap:wrap}
-.bs-fp{padding:8px 10px;font-size:.7rem;color:#c9d1d9;border-bottom:1px solid #21262d;background:#0b1017;line-height:1.5}
-.bs-fp .fp-fail{color:#f85149}.bs-fp .fp-warn{color:#d29922}.bs-fp .fp-ok{color:#3fb950}
 .btn-primary{background:#238636;border-color:#238636;color:#fff}
 .btn-primary:hover{background:#2ea043}
 .btn-ghost{background:transparent}
@@ -23973,22 +23529,12 @@ body.member-simple .hide-in-simple{display:none!important}
 
 /* Mobile */
 @media(max-width:768px){
-  /* The header is for session tabs on a phone: the project folder button moves
-     into the gear menu (Projects), and the tab names get bigger to tap and read. */
-  .nav-proj{margin-right:0}
-  .nav-proj-btn{display:none}
-  .nav-tools-mobile{display:flex}
-  .nav-session-id{font-size:.92rem;max-width:150px;padding:2px 8px}
-  .nav-tools-item{padding:11px 16px;font-size:.95rem}
   .top-nav{padding:0 0 0 8px}
   .nav-right{padding-right:8px}
   .nav-brand{padding:10px 8px 10px 0;margin-right:2px;font-size:.75rem}
   .nav-item{padding:8px 10px;gap:5px}
   .nav-attached{display:none}
   .nav-status-text{display:none}
-  /* Even on a phone the stall warning stays: it is the difference between a
-     page that is live and one that only looks it. */
-  .nav-status-text.poll-stalled{display:inline-flex;font-size:.65rem;padding:2px 8px}
   /* The browser badge, the usage bars and the CPU/RAM readout are moved out of
      the header entirely (syncMobileBottomBar) — they are glanceable, not
      interactive, and the tabs need the room more. They now render at the very
@@ -24027,7 +23573,7 @@ body.member-simple .hide-in-simple{display:none!important}
   /* Flow mode is what a phone gets by default (clean view is on), and the whole
      point of it here is that the text fits the screen — so the hanging indent
      shrinks and nothing is allowed to push the line box wider than the column. */
-  .raw-output.flow{font-size:14.5px;line-height:1.55}
+  .raw-output.flow{font-size:12.5px;line-height:1.55}
   .raw-output.flow .tl{padding-left:1.3em;text-indent:-1.3em}
   .term-live{font-size:.66rem;gap:6px;padding:5px 9px}
   .term-live .tl-note{display:none}
@@ -24116,9 +23662,6 @@ body.member-simple .hide-in-simple{display:none!important}
            Claude Login) is reached through the single Settings entry — listing
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
-      <!-- Phones only: the project switcher's folder button left the header for
-           the session tabs, and lives here instead. -->
-      <div class="nav-tools-item nav-tools-mobile nav-tools-admin" id="nav-tools-projects" onclick="openProjectMenuFromTools(event)"><span class="icon">&#128193;</span> Projects <span class="nav-tools-sub" id="nav-tools-proj-name"></span></div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="recoverSessions();closeToolsMenu()"><span class="icon">&#x21BB;</span> Recover sessions</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x2699;</span> Claude Config</div>
@@ -24230,12 +23773,13 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
-// Seconds before the prompt cache goes cold that the session starts flashing and
-// the beeps sound (CACHE_ALERT_LEAD), and that a Cache-mode session sends its own
-// next step (CACHE_PUSH_LEAD). Substituted from the server's constants so the
-// page and the keep-alive can never drift apart.
-const CACHE_ALERT_LEAD=__CACHE_ALERT_LEAD__;
-const CACHE_PUSH_LEAD=__CACHE_PUSH_LEAD__;
+const MODEL_GATEWAY=__MODEL_GATEWAY__;
+// Seconds before the prompt cache goes cold that the session starts
+// blinking, and that Basic+ pushes its keep-alive. Substituted from the
+// server's CACHE_WARN_LEAD so the two can never drift apart.
+const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
+// And the seconds before it goes cold that the double beep sounds, once.
+const CACHE_BEEP_LEAD=__CACHE_BEEP_LEAD__;
 
 // ── Tab-scoped impersonation ────────────────────────────────────────────────
 // The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
@@ -24307,18 +23851,8 @@ function _sessionRoute(){
   try{return{name:decodeURIComponent(match[1]),tab:decodeURIComponent(match[2])}}
   catch(e){return null}
 }
-// A phone opens a session in Chat, a desktop in the Terminal. On a phone the
-// terminal is a narrow column of a wide pane, and Chat is the view written to be
-// read at that size. An explicit tab in the URL still wins either way.
-function _isPhoneLayout(){
-  try{return !!(window.matchMedia&&window.matchMedia('(max-width:768px)').matches);}
-  catch(e){return false}
-}
-function _defaultSessionTab(){
-  return (MEMBER_SIMPLE||_isPhoneLayout())?'chat':'raw';
-}
 function _allowedSessionTab(tab){
-  if(!['raw','chat','skills','info'].includes(tab))return _defaultSessionTab();
+  if(!['raw','chat','skills','info'].includes(tab))return MEMBER_SIMPLE?'chat':'raw';
   if(MEMBER_SIMPLE&&tab==='skills')return'chat';
   return tab;
 }
@@ -24349,10 +23883,11 @@ const rawState={};
 // olderText / olderFrom / archived: history pulled back out of the server's own
 // scrollback archive, which reaches further back than tmux's ring. It is kept
 // separate from fullText because fullText is replaced wholesale on every resync.
-function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',olderText:'',olderFrom:-1,archived:0,loadingOlder:false,paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null};return rawState[n]}
+function getRawState(n){if(!rawState[n])rawState[n]={polling:false,timer:null,knownLines:0,userScrolledUp:false,visibleHash:'',firstLoad:true,fullText:'',olderText:'',olderFrom:-1,archived:0,loadingOlder:false,paneWidth:0,frozen:false,frozenAtLines:0,painted:null,_bodyText:null,_flowMode:null,live:null,source:'terminal',userLines:[],inFlight:false,generation:0,frozenSnapshot:null};return rawState[n]}
 // Everything the terminal should show: the history someone asked for, then the
 // live pane.
 function _rawSource(st){
+  if(st.source==='transcript')return st.fullText||'';
   const older=st.olderText||'';
   const live=st.fullText||'';
   return older?(live?older+'\n'+live:older):live;
@@ -25117,79 +24652,6 @@ function _localWrapLimits(rs,paneWidth){
   }
   return out;
 }
-// ── Links the terminal cut in pieces ────────────────────────────────────────
-// A link longer than a whole row is hard-cut at the TUI's right margin and
-// carried on the next rows, indented like the paragraph. That is the ONLY case:
-// a shorter token that does not fit moves to the next row whole, never cut.
-// Rendering the pieces separately left a link you could not copy in one go, and
-// the paragraph re-flow glued them back with a space ("platform.claude.co m"),
-// because it estimated the margin from the widest row on screen and the divider
-// lines are drawn wider than the text. So cut links are rejoined FIRST, in both
-// views, into one unbroken row. The page wraps that row softly, and selecting it
-// copies the whole link without a break.
-const _LINK_CUT_CH=/^[A-Za-z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+$/;
-const _RULE_ROW_RE=/^[\s─━═┄┅┈┉╌╍│┃║╭╮╯╰┌┐└┘├┤┬┴┼▔▁▂_-]*$/;
-// Like _localWrapLimits, backwards-only for the same reason, but a divider or a
-// box edge does not count: those are drawn to the pane edge, the text is not.
-function _textMargins(rs,paneWidth){
-  const n=rs.length,pw=Math.max(20,paneWidth||80),out=new Array(n);
-  for(let i=0;i<n;i++){
-    let w=0;
-    for(let j=Math.max(0,i-_WRAP_WINDOW);j<=i;j++){
-      const r=rs[j];
-      if(r.length>w&&!_RULE_ROW_RE.test(r))w=r.length;
-    }
-    out[i]=Math.min(w,pw);
-  }
-  return out;
-}
-// The link a row ends in, if it ends in one: a URL, or a path with a slash in it.
-function _cutLinkTail(row){
-  const m=row.match(/(\S+)$/);
-  if(!m)return '';
-  const tok=m[1];
-  const u=tok.search(/https?:\/\//);
-  if(u>=0)return tok.slice(u);
-  const pm=tok.match(/(?:^|[(\[<"'`])(~?\/[A-Za-z0-9_.\-\/]*\/[A-Za-z0-9_.\-]*)$/);
-  return pm?pm[1]:'';
-}
-function _joinCutLinks(rows,paneWidth){
-  const n=rows.length;
-  if(n<2)return rows;
-  const rs=rows.map(r=>r.replace(/\s+$/,''));
-  const margins=_textMargins(rs,paneWidth);
-  const out=[];
-  let i=0;
-  while(i<n){
-    let cur=rs[i],j=i;
-    while(j+1<n){
-      const row=rs[j];
-      // The link so far is the tail of what is already joined; whether it was
-      // cut is a question about the physical row it ended on.
-      const tail=_cutLinkTail(cur);
-      if(!tail)break;
-      if(row.length<margins[j]-1)break;              // stopped short: the link ended here
-      const next=rs[j+1];
-      if(!next.trim()||_BLOCK_START_RE.test(next))break;
-      const body=next.replace(/^\s+/,'');
-      const head=body.split(/\s/)[0];
-      if(!head||/^https?:\/\//.test(head))break;      // the next link, not the rest of this one
-      const isUrl=/^https?:/.test(tail);
-      if(isUrl?!_LINK_CUT_CH.test(head):!/^[A-Za-z0-9_.\-\/~]+$/.test(head.replace(/[),.;:'"`\]>]+$/,'')))break;
-      // Only a token longer than the room on a whole row is ever cut. A URL that
-      // happened to end at the margin, followed by an ordinary word the row had
-      // no space for, fails this and keeps its space.
-      const room=Math.max(20,margins[j]-(next.length-body.length));
-      if(tail.length+head.length<=room)break;
-      cur+=body;
-      j++;
-      if(body.indexOf(' ')>=0)break;                   // the link ended on that row
-    }
-    out.push(cur);
-    i=j+1;
-  }
-  return out;
-}
 function _unwrapRows(lines,paneWidth){
   const n=lines.length,rs=new Array(n);
   for(let i=0;i<n;i++)rs[i]=lines[i].replace(/\s+$/,'');
@@ -25287,10 +24749,6 @@ function _setRawScroll(el,target){
   if(Math.abs(el.scrollTop-target)<1)return;
   el.scrollTop=target;
 }
-// A very long scrollback is bounded, with hysteresis so the window does not
-// crawl forward a line at a time (which would repaint everything, every poll).
-const RAW_MAX_LINES=5000;
-
 // ── Telling your own words apart from the agent's ───────────────────────────
 // Claude Code echoes every message you send straight back into the pane behind a
 // `❯`, with its continuation rows indented two columns, and from there on it
@@ -25341,12 +24799,25 @@ function renderRawText(name,force){
   if(!rawEl)return;
   // The live counter comes off FIRST, in both views. It changes every second,
   // and everything below this line would otherwise re-run every second.
-  const split=splitLiveTail(_rawSource(st).split('\n'));
+  const structured=getCleanViewPref()&&st.source==='transcript';
+  const split=structured?{body:_rawSource(st).split('\n'),live:{seen:false}}:splitLiveTail(_rawSource(st).split('\n'));
   if(split.live.seen){
     split.live.at=_nowMs();
     st.live=split.live;
   }
   updateLiveBar(name);
+  if(st.frozen&&st.frozenSnapshot){
+    const saved=st.frozenSnapshot;
+    if(rawEl._lineMode!==true){
+      rawEl.textContent='';rawEl._lineMode=true;
+      _applyLineDiff(rawEl,{from:0,remove:0,insert:saved.html.length},saved.html);
+      st.painted=saved.html.slice();st.userRows=saved.userRows.slice();
+      rawEl.classList.toggle('flow',saved.flow);rawEl.classList.toggle('exact',!saved.flow);
+      fitTerminalFont(rawEl,st.paneWidth,saved.flow);
+      _setRawScroll(rawEl,saved.scrollTop);
+    }
+    st._pendingRender=true;updateFreezeUi(name);return;
+  }
   // Frozen: keep buffering into st.fullText and leave the screen alone. The
   // agent is untouched — only the paint waits, and unfreezing shows the lot.
   if(!force&&st.frozen){st._pendingRender=true;updateFreezeUi(name);return;}
@@ -25360,11 +24831,10 @@ function renderRawText(name,force){
   const bodyText=split.body.join('\n');
   if(!force&&bodyText===st._bodyText&&flow===st._flowMode&&st.painted){st._pendingRender=false;return;}
 
-  let body=applyRawFilter(bodyText);
+  let body=structured?bodyText:applyRawFilter(bodyText);
   let rows=body?body.split('\n'):[];
-  rows=_joinCutLinks(rows,st.paneWidth);
   if(flow){
-    rows=_unwrapRows(rows,st.paneWidth);
+    if(!structured)rows=_unwrapRows(rows,st.paneWidth);
     while(rows.length&&rows[rows.length-1].trim()==='')rows.pop();
   }else{
     // tmux pads every row out to the pane width. Those trailing spaces are
@@ -25372,12 +24842,8 @@ function renderRawText(name,force){
     // otherwise fits exactly.
     rows=rows.map(l=>l.replace(/\s+$/,''));
   }
-  // The cap trims from the HEAD, so it has to make room for history that was
-  // deliberately loaded — otherwise "load earlier" would delete what it just
-  // fetched. Nothing is trimmed off the front of an explicit request.
-  const olderRows=st.olderText?st.olderText.split('\n').length:0;
-  const cap=RAW_MAX_LINES+olderRows;
-  if(rows.length>cap+400)rows=rows.slice(rows.length-cap);
+  // Keep every loaded row. Capping the DOM here silently hid the beginning even
+  // when the server had returned the complete conversation.
   let htmlLines;
   const prevUserCount=(st.userRows||[]).length;
   st.userRows=[];
@@ -25389,13 +24855,11 @@ function renderRawText(name,force){
     // Linkified as one string so the exact-mode rejoining of URLs and paths
     // split across rows still works; neither renderer ever emits a tag that
     // straddles a newline, so splitting the result back per line is safe.
-    // Cut links are already whole rows (_joinCutLinks), so the linkifier must not
-    // go looking for a continuation on the next row in either view.
-    htmlLines=_linkifyTerminalText(rows.join('\n'),1000000).split('\n');
+    htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
     // Your own words, wrapped so they can be coloured and jumped to. The flags
     // are computed on the FINAL rows, after filtering and unwrapping, so the
     // indices line up with the divs that get painted.
-    const mine=_markUserRows(rows);
+    const mine=structured?(st.userLines||[]):_markUserRows(rows);
     for(let i=0;i<htmlLines.length;i++){
       if(!mine[i])continue;
       if(mine[i]===2)st.userRows.push(i);   // the ❯ row: where a jump lands
@@ -25492,15 +24956,16 @@ let _liveTicker=null;
 function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
-    // The cache warning for every session runs on the attention clock
-    // (startAttentionClock), which keeps ticking in a hidden tab.
+    // Every session, not just the one on screen: a cache lapsing on a tab you
+    // are not looking at is precisely the one worth being told about. Cheap: a
+    // handful of arithmetic comparisons, and it fires at most once per turn.
+    _checkCacheExpiry();
     if(!selectedSession)return;
     // The silence counter has to keep running while the session is IDLE — being
     // idle is the whole point of it — so it is updated on every tick regardless
     // of the busy state. It only rewrites the span when the rendered text
     // actually changes, which past a minute is once a minute.
     _paintIdleSince(selectedSession);
-    _paintCacheChip(selectedSession);
     // The pill's cache state is a function of elapsed time, not of anything the
     // server pushes, so it has to be re-evaluated on the tick as well. Without
     // this a session that is already idle never starts blinking, because the
@@ -25551,9 +25016,9 @@ function _paintIdleSince(name){
     const warm=ago<ttl*0.8, cooling=ago<ttl;
     left=Math.max(0,ttl-ago);
     cls+=warm?' warm':(cooling?' cooling':' cold');
-    // Flash inside the last CACHE_ALERT_LEAD seconds, and only while there is
-    // still something to save: after it is cold there is nothing to hurry for.
-    if(cooling&&left<=CACHE_ALERT_LEAD)cls+=' expiring';
+    // Blink once inside the last CACHE_WARN_LEAD seconds, and only while there
+    // is still something to save: after it is cold there is nothing to hurry for.
+    if(cooling&&left<=CACHE_WARN_LEAD)cls+=' expiring';
     const ttlTxt=ttl>=3600?'1h':Math.round(ttl/60)+'m';
     // What the last turn ACTUALLY did is a measurement; everything after it is a
     // countdown. Report them as the different things they are.
@@ -25569,33 +25034,7 @@ function _paintIdleSince(name){
   }
   if(s.detect_sure===false)cls+=' unsure';
   const txt='idle '+_fmtAgo(ago)+
-    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_ALERT_LEAD?' · cold in '+_fmtAgo(left):'')):'');
-  if(el.textContent!==txt)el.textContent=txt;
-  if(el.className!==cls)el.className=cls;
-  if(el.title!==hint)el.title=hint;
-}
-// Hot or cold, said outright. The row already carried the countdown, but only a
-// reader who remembers this session's TTL could turn "idle 47m" into "the next
-// message is about to cost full price".
-function _paintCacheChip(name){
-  const el=document.getElementById('tl-cache-'+name);
-  if(!el)return;
-  const s=sessions.find(x=>x.name===name)||{};
-  const ttl=s.cache_ttl||0,end=s.last_turn_end||0;
-  if(!ttl||!end){
-    if(el.textContent!==''){el.textContent='';el.className='tl-cache';el.title='';}
-    return;
-  }
-  const busy=_sessionBusy(name);
-  const left=Math.max(0,ttl-(Date.now()/1000-end));
-  const hot=busy||left>0;
-  let cls='tl-cache '+(hot?'hot':'cold');
-  if(hot&&!busy&&left<=CACHE_ALERT_LEAD)cls+=' expiring';
-  const txt=hot?'Cache hot':'Cache cold';
-  const hint=hot
-    ? ('The transcript is still cached, so the next message re-reads it at cache-read price'+
-       (busy?', and every request this turn makes restarts the clock.':'. Cold in '+_fmtAgo(left)+'.'))
-    : 'The cache has lapsed: the next message pays to write the whole prompt again.';
+    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_WARN_LEAD?' · cold in '+_fmtAgo(left):'')):'');
   if(el.textContent!==txt)el.textContent=txt;
   if(el.className!==cls)el.className=cls;
   if(el.title!==hint)el.title=hint;
@@ -25708,18 +25147,26 @@ function updateOlderBar(name){
   // is the tell that tmux has already dropped something. After a load,
   // olderFrom is simply how far back the walk has got.
   const shown=(st.fullText||'').split('\n').length;
-  const more=st.olderFrom<0?(st.archived>shown):(st.olderFrom>0);
+  const more=st.source!=='transcript'&&(st.olderFrom<0?(st.archived>shown):(st.olderFrom>0));
   el.classList.toggle('on',!!more);
   if(!more)return;
   el.textContent=st.loadingOlder
     ? 'Loading earlier history…'
-    : '⤒ Load earlier history'+(st.olderFrom>0?' · '+st.olderFrom+' more lines':'');
+    : 'Scroll up for earlier history'+(st.olderFrom>0?' · '+st.olderFrom+' more lines':'');
+}
+function _maybeLoadEarlierHistory(name){
+  const st=getRawState(name),el=document.getElementById('raw-'+name);
+  if(!el||st.source==='transcript'||st.frozen||st.loadingOlder||!st.userScrolledUp||el.scrollTop>180)return;
+  if(st.olderRetryAt&&Date.now()<st.olderRetryAt)return;
+  const more=st.olderFrom<0?st.archived>(st.fullText||'').split('\n').length:st.olderFrom>0;
+  if(more)loadEarlierHistory(name);
 }
 async function loadEarlierHistory(name){
   const st=getRawState(name);
   if(st.loadingOlder)return;
   const rawEl=document.getElementById('raw-'+name);
   st.loadingOlder=true;updateOlderBar(name);
+  const generation=st.generation||0;
   try{
     const shown=_rawSource(st).split('\n');
     const before=st.olderFrom<0?-1:st.olderFrom;
@@ -25729,7 +25176,8 @@ async function loadEarlierHistory(name){
     const r=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)
       +'/history?before='+before+'&limit='+want);
     const d=await r.json();
-    if(d.error)throw new Error(d.error);
+    if(!r.ok||d.error)throw new Error(d.error||'History request failed.');
+    if(generation!==(st.generation||0))return;
     st.archived=d.total||st.archived;
     let chunk=(d.raw||'').split('\n');
     if(chunk.length===1&&chunk[0]==='')chunk=[];
@@ -25756,9 +25204,11 @@ async function loadEarlierHistory(name){
         : 'Loaded the whole archived history';
     }
   }catch(e){
+    st.olderRetryAt=Date.now()+5000;
     if(statusInfoEl)statusInfoEl.textContent='Could not load earlier history: '+(e&&e.message?e.message:e);
   }finally{
     st.loadingOlder=false;updateOlderBar(name);
+    _maybeLoadEarlierHistory(name);
   }
 }
 
@@ -25785,6 +25235,7 @@ function jumpToLastUserMessage(name){
   const idx=rows[at];
   const el=rawEl.children[idx];
   if(!el)return;
+  st.userScrolledUp=true;
   _setRawScroll(rawEl,Math.max(0,el.offsetTop-10));
   const mark=el.querySelector('.tl-you')||el;
   mark.classList.remove('jumped');
@@ -25801,8 +25252,11 @@ function jumpToLive(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   if(!rawEl)return;
+  st.frozen=false;st.frozenAtLines=0;st.frozenSnapshot=null;
   st._jumpAt=undefined;
   st.userScrolledUp=false;
+  renderRawText(name,true);
+  updateFreezeUi(name);
   _setRawScroll(rawEl,rawEl.scrollHeight);
   if(statusInfoEl)statusInfoEl.textContent='Following the output again';
 }
@@ -25813,12 +25267,15 @@ function jumpToLive(name){
 // renders everything that arrived in between in one go.
 function toggleRawFreeze(name){
   const st=getRawState(name);
+  const rawEl=document.getElementById('raw-'+name);
   st.frozen=!st.frozen;
   st.frozenAtLines=st.frozen?(st.fullText||'').split('\n').length:0;
   if(st.frozen){
+    st.frozenSnapshot={html:(st.painted||[]).slice(),userRows:(st.userRows||[]).slice(),
+      flow:st._flowMode,scrollTop:rawEl?rawEl.scrollTop:0};
     updateFreezeUi(name);
   }else{
-    st.userScrolledUp=false;   // catching up means going to the tail
+    st.frozenSnapshot=null;
     renderRawText(name,true);
   }
 }
@@ -25840,13 +25297,13 @@ function updateFreezeUi(name){
   const pill=document.getElementById('raw-frozen-'+name);
   if(pill){
     pill.classList.toggle('on',!!st.frozen);
-    pill.innerHTML='&#10052; Frozen'+(held?' &middot; '+held+' new line'+(held===1?'':'s'):'')+' &mdash; click to resume';
+    pill.innerHTML='&#10052; Frozen'+(held?' &middot; '+held+' new line'+(held===1?'':'s'):'')+', click to resume';
   }
   const rawEl=document.getElementById('raw-'+name);
   if(rawEl)rawEl.classList.toggle('frozen',!!st.frozen);
 }
-const CLEAN_VIEW_ON='On — only the agent\'s replies';
-const CLEAN_VIEW_OFF='Off — showing the full terminal';
+const CLEAN_VIEW_ON='On: messages and replies';
+const CLEAN_VIEW_OFF='Off: full terminal';
 function toggleCleanView(name,checked){
   setCleanViewPref(checked);
   // Every open session detail panel carries its own copy of this switch, and
@@ -25857,46 +25314,30 @@ function toggleCleanView(name,checked){
   document.querySelectorAll('[id^="cleanview-status-"]').forEach(function(el){
     el.textContent=checked?CLEAN_VIEW_ON:CLEAN_VIEW_OFF;
   });
-  rerenderAllRaw();
+  for(const n in rawState){
+    const st=rawState[n];st.generation=(st.generation||0)+1;
+    st.knownLines=0;st.visibleHash='';st.olderText='';st.olderFrom=-1;
+    st._bodyText=null;pollRawDelta(n);
+  }
 }
 const lastStatus={};
-// The detail that came with lastStatus. Only one value is load-bearing so far,
-// "Compacting", which the pill paints differently; keeping it here means the
-// 420ms repaint can see it without asking the server again.
-const lastDetail={};
 const _completedUnread={};
 const IDLE_NUDGE_INTERVAL_MS=20000;
-// off: silent, no chime of any kind.
-// light (the default): ONE chime when a session YOU SENT SOMETHING TO finishes,
-//   and 4 beeps when a prompt cache is 15 minutes from cold. Nothing repeats and
-//   nothing sounds for the other sessions: on a box running six agents, a chime
-//   per finished turn is what "it keeps beeping at me" was made of. The header
-//   dot still pulses for every finished session, silently.
-// high (called ADHD until 2026-09-17): a chime for EVERY session that finishes,
-//   then again every 20 seconds until each one is given new work, and 8 beeps
-//   instead of 4.
-const IDLE_NUDGE_MODES=['off','light','high'];
-const IDLE_NUDGE_DEFAULT='light';
 const IDLE_NUDGE_TITLES={
-  off:'Off: no sounds at all, not even the prompt-cache warning',
-  light:'Light: one chime when a session you asked something finishes, and 4 quick beeps 15 minutes before a prompt cache goes cold. Nothing repeats.',
-  high:'High: a chime for every session that finishes, then again every 20 seconds until each one is given new work, and 8 beeps instead of 4'
+  off:'Off - only play the normal completion chime once',
+  light:'Light - chime every 20 seconds until every completed tab is viewed',
+  adhd:'ADHD - chime every 20 seconds until every completed tab is given new work'
 };
 const _idleNudgeAdhdPending={};
 let _idleNudgeTimer=null;
 let _idleNudgeModeCache=null;
 
-function _normalizeIdleNudgeMode(mode){
-  if(mode==='adhd')return 'high';
-  return IDLE_NUDGE_MODES.includes(mode)?mode:'';
-}
-
 function getIdleNudgeMode(){
   if(_idleNudgeModeCache)return _idleNudgeModeCache;
   try{
     const saved=localStorage.getItem('idleNudgeMode');
-    _idleNudgeModeCache=_normalizeIdleNudgeMode(saved)||IDLE_NUDGE_DEFAULT;
-  }catch(e){_idleNudgeModeCache=IDLE_NUDGE_DEFAULT}
+    _idleNudgeModeCache=['off','light','adhd'].includes(saved)?saved:'off';
+  }catch(e){_idleNudgeModeCache='off'}
   return _idleNudgeModeCache;
 }
 
@@ -25906,11 +25347,11 @@ function idleNudgeSeg(){
     '" aria-pressed="'+(mode===m?'true':'false')+'" title="'+esc(IDLE_NUDGE_TITLES[m])+
     '" onclick="event.stopPropagation();setIdleNudgeMode(\''+m+'\')">'+label+'</button>';
   return '<div class="idle-nudge-seg" role="group" aria-label="Idle nudge mode">'+
-    b('off','Off')+b('light','Light')+b('high','High')+'</div>';
+    b('off','Off')+b('light','Light')+b('adhd','ADHD')+'</div>';
 }
 
 function syncIdleNudgeUI(mode){
-  mode=_normalizeIdleNudgeMode(mode)||IDLE_NUDGE_DEFAULT;
+  mode=['off','light','adhd'].includes(mode)?mode:'off';
   document.querySelectorAll('.idle-nudge-seg').forEach(seg=>{
     seg.querySelectorAll('button').forEach(btn=>{
       const active=btn.classList.contains('in-'+mode);
@@ -25921,7 +25362,7 @@ function syncIdleNudgeUI(mode){
 }
 
 function _idleNudgeNames(mode){
-  const pending=mode==='high'?_idleNudgeAdhdPending:_completedUnread;
+  const pending=mode==='adhd'?_idleNudgeAdhdPending:_completedUnread;
   const current=new Set(sessions.map(s=>s.name));
   return Object.keys(pending).filter(name=>current.has(name));
 }
@@ -25931,31 +25372,31 @@ function _stopIdleNudgeTimer(){
   _idleNudgeTimer=null;
 }
 
-// ONLY High repeats. Light and Off never schedule this timer at all.
 function _syncIdleNudgeTimer(restart){
   if(restart)_stopIdleNudgeTimer();
-  if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length){
+  const mode=getIdleNudgeMode();
+  if(mode==='off'||!_idleNudgeNames(mode).length){
     _stopIdleNudgeTimer();
     return;
   }
   if(_idleNudgeTimer!==null)return;
   _idleNudgeTimer=setTimeout(function(){
     _idleNudgeTimer=null;
-    if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length)return;
+    const currentMode=getIdleNudgeMode();
+    if(currentMode==='off'||!_idleNudgeNames(currentMode).length)return;
     playCompletionChime();
     _syncIdleNudgeTimer();
   },IDLE_NUDGE_INTERVAL_MS);
 }
 
 function setIdleNudgeMode(mode){
-  mode=_normalizeIdleNudgeMode(mode);
-  if(!mode)return;
+  if(!['off','light','adhd'].includes(mode))return;
   const previous=getIdleNudgeMode();
   _idleNudgeModeCache=mode;
   try{localStorage.setItem('idleNudgeMode',mode)}catch(e){}
-  if(mode==='high'&&previous!=='high'){
+  if(mode==='adhd'&&previous!=='adhd'){
     Object.keys(_completedUnread).forEach(name=>{_idleNudgeAdhdPending[name]=true});
-  }else if(mode!=='high'){
+  }else if(mode!=='adhd'){
     Object.keys(_idleNudgeAdhdPending).forEach(name=>delete _idleNudgeAdhdPending[name]);
   }
   syncIdleNudgeUI(mode);
@@ -25965,29 +25406,7 @@ function setIdleNudgeMode(mode){
 
 function _idleNudgeNavDotClass(name,status){
   const state=status||'unknown';
-  let cls='nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
-  if(state==='idle'&&_inCacheAlert(name))cls+=' expiring';
-  return cls;
-}
-
-// Idle, with its prompt cache inside the last CACHE_ALERT_LEAD seconds and not
-// cold yet. The one state that wants a person at the keyboard now.
-function _inCacheAlert(name){
-  if(typeof sessions==='undefined'||typeof _cacheSecondsLeft!=='function')return false;
-  const left=_cacheSecondsLeft(name);
-  return left!==null&&left>0&&left<=CACHE_ALERT_LEAD;
-}
-
-// Every header tab's dot, re-derived. Cheap, and it has to run on a clock: a
-// session crosses into the alert window with nothing about it changing.
-function _paintAllNavDots(){
-  if(typeof sessions==='undefined')return;
-  for(const s of sessions){
-    const dot=document.getElementById('nav-dot-'+s.name);
-    if(!dot)continue;
-    const want=_idleNudgeNavDotClass(s.name,lastStatus[s.name]||s.activity_status);
-    if(dot.className!==want)dot.className=want;
-  }
+  return 'nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
 }
 
 function _paintIdleNudgeNavDot(name,status){
@@ -26080,35 +25499,27 @@ function playCompletionChime(){
   else play();
 }
 
-// ── The cache-expiry beeps ──────────────────────────────────────────────────
-// One chime means a session finished. A burst of short, flat BEEPS means a
-// session is idle and about to lose its prompt cache: nothing is done, something
-// is about to be thrown away. Deliberately nothing like the completion chime, so
-// the two can be told apart from the next room without looking. 4 on Light, 8
-// on High.
-function playCacheAlertBeeps(count){
+// ── The cache-expiry double beep ────────────────────────────────────────────
+// One chime means a session finished. TWO, lower and falling, mean a session is
+// idle and about to lose its prompt cache: nothing is done, something is about
+// to be thrown away. Deliberately not a louder version of the completion chime,
+// because the two need to be told apart from the next room without looking.
+function playCacheExpiryChime(){
   const ctx=_getCompletionAudioContext();
   if(!ctx)return;
-  const n=Math.max(1,Math.min(12,count|0));
   const play=function(){
     if(ctx.state!=='running')return;
-    const start=ctx.currentTime+0.02, on=0.075, gap=0.065;
+    const now=ctx.currentTime+0.015;
     const master=ctx.createGain();
-    master.gain.setValueAtTime(0.5,start);
+    master.gain.setValueAtTime(0.72,now);
+    master.gain.exponentialRampToValueAtTime(0.0001,now+0.85);
     master.connect(ctx.destination);
-    for(let i=0;i<n;i++){
-      const t=start+i*(on+gap);
-      const osc=ctx.createOscillator(),g=ctx.createGain();
-      osc.type='square';
-      osc.frequency.setValueAtTime(1760,t);
-      g.gain.setValueAtTime(0.0001,t);
-      g.gain.exponentialRampToValueAtTime(0.35,t+0.006);
-      g.gain.setValueAtTime(0.35,t+on-0.012);
-      g.gain.exponentialRampToValueAtTime(0.0001,t+on);
-      osc.connect(g);g.connect(master);osc.start(t);osc.stop(t+on+0.02);
-      osc.onended=function(){try{osc.disconnect();g.disconnect()}catch(e){}};
-    }
-    setTimeout(function(){try{master.disconnect()}catch(e){}},Math.ceil((n*(on+gap)+0.4)*1000));
+    // E5 then B4, 190 ms apart: a falling pair, well below the completion
+    // chime's C6/E6, each with one quiet partial so it rings rather than beeps.
+    [[659.25,0,0.17,0.24],[1318.5,0.003,0.12,0.05],
+     [493.88,0.19,0.26,0.24],[987.77,0.193,0.16,0.05]]
+      .forEach(t=>_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3]));
+    setTimeout(function(){try{master.disconnect()}catch(e){}},1000);
   };
   if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
   else play();
@@ -26121,7 +25532,6 @@ function playCacheAlertBeeps(count){
 const _cacheBeeped={};
 function _checkCacheExpiry(){
   const names=new Set();
-  const nudge=getIdleNudgeMode();
   let fired=false;
   for(let i=0;i<sessions.length;i++){
     const s=sessions[i];
@@ -26136,19 +25546,13 @@ function _checkCacheExpiry(){
     if((lastStatus[s.name]||s.activity_status)!=='idle')continue;
     const left=ttl-(Date.now()/1000-end);
     // Inside the window, and only while there is still something to save. Once
-    // it is cold the money is spent and a beep is just noise.
-    if(left>CACHE_ALERT_LEAD||left<=0)continue;
-    // Marked even when silent, so switching the nudge back on does not replay
-    // a warning for a turn that was already in the window.
+    // it is cold the money is spent and a chime is just noise.
+    if(left>CACHE_BEEP_LEAD||left<=0)continue;
     _cacheBeeped[s.name]=end;
-    if(nudge==='off')continue;
-    if(!fired){                 // one burst even if two sessions lapse together
-      playCacheAlertBeeps(nudge==='high'?8:4);
-      const pushIn=Math.max(0,left-CACHE_PUSH_LEAD);
-      showToast('“'+sessionLabel(s)+'” loses its prompt cache in '+_fmtAgo(left)+
-                '. Send it something now and the next message stays cheap.'+
-                (s.autopush_mode==='cache'
-                  ?' Cache mode sends its next step in '+_fmtAgo(pushIn)+' if you do not.':''),12000);
+    if(!fired){                 // one sound even if two sessions lapse together
+      playCacheExpiryChime();
+      showToast('“'+s.name+'” loses its prompt cache in '+_fmtAgo(left)+
+                '. Send it something now and the next message stays cheap.',12000);
       fired=true;
     }
   }
@@ -26163,22 +25567,16 @@ function trackSessionStatus(name,status,interrupted){
     delete _idleNudgeAdhdPending[name];
     _syncIdleNudgeTimer();
   }
-  const mode=getIdleNudgeMode();
   if(completed&&!interrupted){
     _markCompletionUnread(name);
-    if(mode==='high'){
+    if(getIdleNudgeMode()==='adhd'){
       _idleNudgeAdhdPending[name]=true;
       _syncIdleNudgeTimer();
     }
-    // The status the server reports is a CONFIRMED idle (the pane looked idle
-    // for long enough and the session's transcript stopped growing), so a chime
-    // here is a finished turn, not a gap between tool calls. High chimes for
-    // every session; Light only for one you asked something.
-    if(mode==='high')playCompletionChime();
   }
   if(completed&&_completionWatch[name]&&!interrupted){
     delete _completionWatch[name];
-    if(mode==='light')playCompletionChime();
+    playCompletionChime();
     return true;
   }
   return false;
@@ -26214,75 +25612,12 @@ function restoreDrafts(){
   });
 }
 
-// ── The favicon ─────────────────────────────────────────────────────────────
-// It used to show the SELECTED session's status and nothing else, so the one
-// thing worth seeing from another browser tab, a different session about to
-// lose its prompt cache, was invisible exactly when you were not looking. Now a
-// cache alert on ANY session wins and flashes; otherwise it is the selected
-// session's own status, as before.
-let _faviconStatus='unknown';
-let _faviconFlashOn=false;
-let _faviconShown='';
 function updateFavicon(status){
-  _faviconStatus=status||'unknown';
-  _paintFavicon();
-}
-function _faviconSvg(fill,ring){
-  return "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"+
-    (ring?"<circle cx='8' cy='8' r='7.2' fill='none' stroke='"+ring+"' stroke-width='1.6'/>":"")+
-    "<circle cx='8' cy='8' r='"+(ring?5:7)+"' fill='"+fill+"'/></svg>";
-}
-function _paintFavicon(){
-  const link=document.getElementById('favicon');
-  if(!link)return;
   const colors={busy:'%23f85149',idle:'%233fb950',unknown:'%236e7681'};
-  let svg;
-  if(typeof sessions!=='undefined'&&sessions.some(s=>
-      (lastStatus[s.name]||s.activity_status)==='idle'&&_inCacheAlert(s.name))){
-    _faviconFlashOn=!_faviconFlashOn;
-    svg=_faviconFlashOn?_faviconSvg('%2356d364','%2356d364'):_faviconSvg('%230d1117','%23238636');
-  }else{
-    svg=_faviconSvg(colors[_faviconStatus]||colors.unknown,'');
-  }
-  if(svg===_faviconShown)return;
-  _faviconShown=svg;
-  link.href=svg;
-}
-
-// ── The attention clock ─────────────────────────────────────────────────────
-// Beeps, header dots and the favicon all have to move while you are on another
-// browser tab, which is the whole point of them. A hidden tab's setInterval is
-// throttled to once a MINUTE after a few minutes, which would freeze the favicon
-// mid-flash and hold the beep back. A timer inside a worker is not throttled
-// that way, so the clock ticks there and only posts the tick back.
-let _attentionClock=null;
-let _attentionLastTick=0;
-function _attentionTick(){
-  _attentionLastTick=Date.now();
-  try{
-    _checkCacheExpiry();
-    _paintAllNavDots();
-    _paintFavicon();
-    if(selectedSession){_paintPillCache(selectedSession);_paintIdleSince(selectedSession);_paintCacheChip(selectedSession);}
-  }catch(e){}
-}
-function startAttentionClock(){
-  if(_attentionClock)return;
-  try{
-    const src='setInterval(function(){postMessage(0)},420);';
-    const w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
-    w.onmessage=_attentionTick;
-    _attentionClock=w;
-    // A worker that never reports — blocked by a policy, or a browser that
-    // refuses the blob — must not take the flashing down with it.
-    setTimeout(function(){
-      if(Date.now()-_attentionLastTick<2000)return;
-      try{w.terminate()}catch(e){}
-      _attentionClock=setInterval(_attentionTick,420);
-    },3000);
-  }catch(e){
-    _attentionClock=setInterval(_attentionTick,420);
-  }
+  const c=colors[status]||colors.unknown;
+  const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
+  const link=document.getElementById('favicon');
+  if(link)link.href=svg;
 }
 
 function timeAgo(ts){
@@ -26306,6 +25641,22 @@ function esc(str){
 }
 function formatModelName(model){
   if(!model)return'';
+  // A gateway's ids are not Claude-shaped (deepseek-4.1-flash, glm-5.3-vision),
+  // and the family/version derivation below renders them "deepseek 4.1.flash".
+  // On those boxes the catalogue carries the gateway's own display name, so
+  // prefer it for anything that is not a claude- id. Claude ids fall through to
+  // the derivation and read exactly as they always have.
+  if(!/^claude-/.test(model)){
+    // A session's recorded model can carry the `[1m]` suffix while the
+    // catalogue lists the bare id, so try both and put the suffix back.
+    const gwOneM=/\[1m\]$/.test(model);
+    const gwBase=model.replace(/\[1m\]$/,'');
+    const fromCatalog=MODEL_CHOICES.find(c=>c[0]===model)
+      ||MODEL_CHOICES.find(c=>c[0]===gwBase);
+    if(fromCatalog){
+      return fromCatalog[1]+(gwOneM&&!/·\s*1M$/.test(fromCatalog[1])?' · 1M':'');
+    }
+  }
   const oneM=/\[1m\]$/.test(model);
   // Strip [1m] context suffix, claude- prefix, date suffix like -20251001
   let m=model.replace(/\[1m\]$/,'').replace(/^claude-/,'');
@@ -26565,20 +25916,10 @@ async function setSessionModel(name,model){
     alert('Model switch failed: '+(e&&e.message?e.message:e));
   }
 }
-function statusLabel(s,detail){
-  if(_isCompacting(detail))return'Compacting';
+function statusLabel(s){
   if(s==='busy')return'Working...';
   if(s==='idle')return'Idle';
   return'...';
-}
-// Compaction arrives as busy plus a detail, because to everything that asks "can
-// I type into this session" it is still busy. Only the pill tells them apart.
-function _isCompacting(detail){return (detail||'')==='Compacting'}
-function _pillInner(status,detail){
-  const compacting=_isCompacting(detail);
-  return '<span class="status-dot"></span><span class="status-label">'+statusLabel(status,detail)+'</span>'
-    +(compacting?'<span class="pill-bar"><i></i></span>':'')
-    +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
 }
 
 // How this session authenticates, shown beside the idle/working pill. (S) is a
@@ -26758,7 +26099,6 @@ async function loadProjectsNav(){
     const resp = await fetch(BASE+'/api/project-scope');
     if(!resp.ok){                       // members are not admins; no switcher for them
       const w=document.getElementById('nav-proj-wrap'); if(w) w.style.display='none';
-      const t=document.getElementById('nav-tools-projects'); if(t) t.style.display='none';
       return;
     }
     const data = await resp.json();
@@ -26791,8 +26131,6 @@ function renderProjectNav(){
   const isOther = CURRENT_PROJECT === '__other__';
   nameEl.textContent = isOther ? 'Other sessions'
                      : (CURRENT_PROJECT ? projShort(CURRENT_PROJECT) : 'No project');
-  const toolsName = document.getElementById('nav-tools-proj-name');
-  if(toolsName) toolsName.textContent = nameEl.textContent;
   const btn = document.getElementById('nav-proj-btn');
   if(btn) btn.title = isOther
     ? 'Sessions running outside every registered project.'
@@ -26840,20 +26178,6 @@ function renderProjectNav(){
   listEl.innerHTML = html;
 }
 
-// The phone route to the same menu: opened from the gear, pinned under it.
-function openProjectMenuFromTools(ev){
-  if(ev) ev.stopPropagation();
-  closeToolsMenu();
-  const m = document.getElementById('nav-proj-menu');
-  if(!m) return;
-  m.classList.add('open');
-  const gear = document.querySelector('.nav-tools-wrap');
-  const r = gear ? gear.getBoundingClientRect() : {bottom: 48};
-  m.style.top = Math.round(r.bottom + 6) + 'px';
-  m.style.left = Math.max(8, Math.round(innerWidth - m.offsetWidth - 8)) + 'px';
-  loadProjectsNav();
-  setTimeout(()=>document.addEventListener('click', _closeProjMenuOnce), 0);
-}
 function toggleProjectMenu(ev){
   if(ev) ev.stopPropagation();
   const m = document.getElementById('nav-proj-menu');
@@ -27046,10 +26370,7 @@ function _isRecapWorthShowing(summary,full){
 }
 function chatBubbleInner(m){
   const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
-  if(m.role!=='assistant'){
-    const tag=m.auto?'<div class="chat-auto-tag">Sent by Cache mode while you were away</div>':'';
-    return tag+'<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
-  }
+  if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
   const full=(m.full||'').trim();
   const summary=(m.text||'').trim();
   let html='';
@@ -27064,7 +26385,7 @@ function renderChatBubbles(name){
   if(!msgs.length){
     return '<div class="chat-empty">No messages yet. Type below to talk to Claude — every reply shows up here in full, with links to anything it produced.</div>';
   }
-  return msgs.map(m=>`<div class="chat-msg ${m.role}${m.auto?' auto':''}">${chatBubbleInner(m)}</div>`).join('');
+  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m)}</div>`).join('');
 }
 
 function saveRawCache(){
@@ -27078,6 +26399,7 @@ function saveRawCache(){
       const fullText=st.fullText||rawEl.textContent;
       const lineCount=fullText?fullText.split('\n').length:0;
       rawCache[s.name]={text:fullText,scrollTop:rawEl.scrollTop,scrollHeight:rawEl.scrollHeight,lineCount:lineCount};
+      if(st.frozenSnapshot)st.frozenSnapshot.scrollTop=rawEl.scrollTop;
     }
   });
 }
@@ -27087,7 +26409,7 @@ function renderDetail(){
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
-  const tab=activeTabs[s.name]||_defaultSessionTab();
+  const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
@@ -27150,8 +26472,10 @@ function renderDetail(){
       </div>
       <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
       <div class="detail-badges">
-        <span class="status-pill ${esc(liveStatus)}${_isCompacting(s.activity_detail)?' compacting':''}" id="status-${s.name}">
-          ${_pillInner(liveStatus,s.activity_detail)}
+        <span class="status-pill ${esc(liveStatus)}" id="status-${s.name}">
+          <span class="status-dot"></span>
+          <span class="status-label">${statusLabel(liveStatus)}</span>
+          ${s.activity_detail&&liveStatus!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
@@ -27175,13 +26499,6 @@ function renderDetail(){
           ${liveStatus==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
         <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
-        <!-- Live voice: hands free. Hidden until it is switched on. -->
-        <div class="voice-bar" id="voice-bar-${s.name}">
-          <span class="voice-dot"></span>
-          <span class="voice-text" id="voice-text-${s.name}">Live voice</span>
-          <button class="btn" id="voice-skip-${s.name}" style="display:none" onclick="voiceSkipSpeech()" title="Stop reading this reply out">Skip</button>
-          <button class="btn btn-danger" onclick="stopLiveVoice('Live voice off')">End</button>
-        </div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
@@ -27190,7 +26507,6 @@ function renderDetail(){
             onpaste="handleComposerPaste(event,'${s.name}','chat')"
             oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
-          <button class="btn cmd-voice" id="cmd-voice-${s.name}" onclick="toggleLiveVoice('${s.name}')" title="Live voice: talk to this session hands free. It listens, sends what you say, and reads the reply out loud." aria-label="Live voice mode"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 10v4M8 6v12M12 3v18M16 6v12M20 10v4"/></svg></button>
           <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
@@ -27204,7 +26520,7 @@ function renderDetail(){
            terminal ~34px of height on every screen. -->
       <!-- Only on screen when the server's archive reaches further back than
            tmux's ring still does. Clicking prepends a chunk of it. -->
-      <div class="raw-older" id="raw-older-${s.name}" onclick="loadEarlierHistory('${esc(s.name)}')"></div>
+      <div class="raw-older" id="raw-older-${s.name}" aria-live="polite"></div>
       <div class="raw-output" id="raw-${s.name}" style="${getTerminalHeight()}">Loading Claude Code...</div>
       <!-- The spinner, the seconds counter and the token tally the CLI paints
            into the pane are cut out of the transcript and redrawn here, outside
@@ -27214,7 +26530,6 @@ function renderDetail(){
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
         <span class="tl-since" id="tl-since-${s.name}"></span>
-        <span class="tl-cache" id="tl-cache-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
         <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
@@ -27275,10 +26590,18 @@ function renderDetail(){
       <div class="tier">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <span style="font-size:.85rem;color:#c9d1d9">Subscription plan</span>
-          <button class="btn" style="font-size:.72rem;padding:2px 8px"
-            title="Types 'unset ANTHROPIC_API_KEY' into this pane"
-            onclick="setAuthMode('${s.name}','subscription')">Clear stray key</button>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
+            <input type="radio" name="auth-mode-${s.name}" value="subscription"
+              onchange="setAuthMode('${s.name}','subscription')"
+              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
+            Subscription
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
+            <input type="radio" name="auth-mode-${s.name}" value="api"
+              onchange="setAuthMode('${s.name}','api')"
+              ${s.auth_mode==='api'?'checked':''}>
+            API Key
+          </label>
           <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
         </div>
       </div>
@@ -27355,10 +26678,11 @@ function renderDetail(){
         // freeze pins what is on screen, and there is nothing on screen yet.
         const st=getRawState(s.name);
         st.fullText=cached.text;
-        st.userScrolledUp=false;
+        const holdPosition=st.frozen||st.userScrolledUp;
+        st.userScrolledUp=holdPosition;
         st.painted=null;st._bodyText=null;
-        if(st.frozen)st.frozenAtLines=(st.fullText||'').split('\n').length;
         renderRawText(s.name,true);
+        if(holdPosition)_setRawScroll(rawEl,cached.scrollTop||0);
         if(infoEl&&cached.lineCount)infoEl.textContent=cached.lineCount+' lines';
         startRawPolling(s.name);
       }else{
@@ -27377,7 +26701,6 @@ function renderDetail(){
 }
 
 function selectSession(name,updateRoute=true){
-  if(voiceActive()&&name!==_voice.name)stopLiveVoice('Live voice off');
   stopAllRawPolling();
   selectedSession=name;
   _acknowledgeCompletion(name);
@@ -27385,14 +26708,11 @@ function selectSession(name,updateRoute=true){
   const navItem=document.getElementById('nav-'+name);
   if(navItem)navItem.classList.add('active');
   renderDetail();
-  if(updateRoute)_writeSessionRoute(name,activeTabs[name]||_defaultSessionTab(),false);
+  if(updateRoute)_writeSessionRoute(name,activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'),false);
 }
 
 function switchTab(name,tab,updateRoute=true){
   _acknowledgeCompletion(name);
-  // Live voice belongs to one session's Chat tab: leaving it turns the mic off
-  // rather than leaving it open on a screen that no longer shows it.
-  if(voiceActive()&&(name!==_voice.name||tab!=='chat'))stopLiveVoice('Live voice off');
   tab=_allowedSessionTab(tab);
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
@@ -27696,246 +27016,6 @@ async function toggleRecording(key){
   if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
 }
 
-// ── Live voice mode ─────────────────────────────────────────────────────────
-// The mic button records one clip and puts the text in the box. Live voice is
-// the hands-free version, for a phone in a pocket: it listens, sends what you
-// said when you stop talking, reads the reply out loud, and listens again. It
-// keeps listening while the agent works, so you can add something mid-run.
-//
-// Voice detection is done here rather than by a timer: an analyser on the mic
-// stream, with a noise floor that follows the room, so a silent office and a
-// moving car both work without a setting. Nothing is uploaded until speech has
-// actually been heard, so a long quiet stretch costs nothing.
-const VOICE_SILENCE_MS=1400;        // quiet this long after speech = your turn ended
-const VOICE_MAX_CLIP_MS=90000;      // never record longer than this in one go
-const VOICE_IDLE_RESTART_MS=30000;  // heard nothing: throw the clip away and re-arm
-const VOICE_MIN_RMS=0.012;          // absolute floor, so hiss alone is never speech
-const _voice={name:'',phase:'off',stream:null,ctx:null,srcNode:null,analyser:null,data:null,
-              rec:null,chunks:[],heard:false,startedAt:0,speechAt:0,floor:0.005,dropClip:false,
-              timer:null,replyTimer:null,awaiting:false,sentAt:0,lastSpokenTs:0,pending:null,
-              audio:null,wake:null,lastPull:0};
-function voiceActive(name){return _voice.phase!=='off'&&(!name||_voice.name===name)}
-function _voiceBarEl(){return document.getElementById('voice-bar-'+_voice.name)}
-function _voiceSet(phase,text){
-  if(phase)_voice.phase=phase;
-  const bar=_voiceBarEl();
-  if(bar){
-    bar.className='voice-bar on '+_voice.phase;
-    const t=document.getElementById('voice-text-'+_voice.name);
-    if(t&&text)t.textContent=text;
-    const skip=document.getElementById('voice-skip-'+_voice.name);
-    if(skip)skip.style.display=_voice.phase==='speaking'?'':'none';
-  }
-}
-function renderVoiceBar(){
-  document.querySelectorAll('.voice-bar').forEach(b=>{
-    const on=voiceActive()&&b.id==='voice-bar-'+_voice.name;
-    b.className='voice-bar'+(on?' on '+_voice.phase:'');
-  });
-  document.querySelectorAll('.cmd-voice').forEach(b=>{
-    b.classList.toggle('active',voiceActive()&&b.id==='cmd-voice-'+_voice.name);
-  });
-}
-async function toggleLiveVoice(name){
-  if(voiceActive(name)){stopLiveVoice('Live voice off');return}
-  await startLiveVoice(name);
-}
-async function startLiveVoice(name){
-  if(_voice.phase!=='off')stopLiveVoice('');
-  unlockCompletionAudio();                       // this click is the audio unlock
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
-    showToast('This browser has no microphone access.');return;
-  }
-  let stream;
-  try{
-    stream=await navigator.mediaDevices.getUserMedia(
-      {audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-  }catch(e){showToast('Microphone permission denied or unavailable.');return}
-  _voice.name=name;_voice.stream=stream;_voice.awaiting=false;_voice.pending=null;
-  _voice.floor=0.005;_voice.lastPull=0;
-  // Whatever the agent said BEFORE you started is not read out.
-  const msgs=chatMessages[name]||[];
-  _voice.lastSpokenTs=0;
-  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){_voice.lastSpokenTs=msgs[i].ts||0;break}}
-  const ctx=_getCompletionAudioContext();
-  _voice.ctx=ctx;
-  if(ctx){
-    if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
-    try{
-      _voice.srcNode=ctx.createMediaStreamSource(stream);
-      const an=ctx.createAnalyser();an.fftSize=1024;
-      _voice.srcNode.connect(an);
-      _voice.analyser=an;_voice.data=new Float32Array(an.fftSize);
-    }catch(e){_voice.analyser=null}
-  }
-  try{if(navigator.wakeLock&&navigator.wakeLock.request)_voice.wake=await navigator.wakeLock.request('screen')}catch(e){}
-  _voice.phase='listening';
-  renderVoiceBar();
-  _voiceListen();
-  if(_voice.replyTimer)clearInterval(_voice.replyTimer);
-  _voice.replyTimer=setInterval(_voiceCheckReply,2500);
-}
-function stopLiveVoice(msg){
-  _voice.phase='off';
-  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
-  if(_voice.replyTimer){clearInterval(_voice.replyTimer);_voice.replyTimer=null}
-  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
-  try{if(_voice.stream)_voice.stream.getTracks().forEach(t=>t.stop())}catch(e){}
-  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
-  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
-  try{if(_voice.srcNode)_voice.srcNode.disconnect()}catch(e){}
-  try{if(_voice.wake&&_voice.wake.release)_voice.wake.release()}catch(e){}
-  _voice.rec=null;_voice.stream=null;_voice.analyser=null;_voice.srcNode=null;
-  _voice.wake=null;_voice.awaiting=false;_voice.pending=null;_voice.audio=null;
-  renderVoiceBar();
-  if(msg)showToast(msg);
-}
-function _voiceListen(){
-  if(_voice.phase==='off'||!_voice.stream)return;
-  _voice.phase='listening';_voice.heard=false;_voice.chunks=[];
-  _voice.startedAt=Date.now();_voice.speechAt=0;_voice.dropClip=false;
-  let mr;
-  try{mr=new MediaRecorder(_voice.stream)}catch(e){stopLiveVoice('Recording is not supported in this browser.');return}
-  _voice.rec=mr;
-  mr.ondataavailable=e=>{if(e.data&&e.data.size)_voice.chunks.push(e.data)};
-  mr.onstop=()=>{
-    const drop=_voice.dropClip;_voice.dropClip=false;
-    if(_voice.phase==='off'||_voice.phase==='speaking')return;
-    if(drop){if(_voice.phase==='listening')_voiceListen();return}
-    _voiceSend(new Blob(_voice.chunks,{type:mr.mimeType||'audio/webm'}));
-  };
-  try{mr.start(250)}catch(e){stopLiveVoice('Could not start recording.');return}
-  _voiceSet('listening',_voice.awaiting?'Listening. Claude is still working.':'Listening. Just talk.');
-  if(_voice.timer)clearInterval(_voice.timer);
-  _voice.timer=setInterval(_voiceTick,100);
-}
-function _voiceLevel(){
-  if(!_voice.analyser)return 0;
-  _voice.analyser.getFloatTimeDomainData(_voice.data);
-  let sum=0;
-  for(let i=0;i<_voice.data.length;i++)sum+=_voice.data[i]*_voice.data[i];
-  return Math.sqrt(sum/_voice.data.length);
-}
-function _voiceTick(){
-  if(_voice.phase!=='listening')return;
-  const now=Date.now();
-  const level=_voiceLevel();
-  // The floor drops to the quietest thing heard and creeps back up, so it
-  // follows the room rather than a number someone guessed.
-  _voice.floor=level<_voice.floor?level:(_voice.floor*0.999+level*0.001);
-  const speaking=_voice.analyser?level>Math.max(VOICE_MIN_RMS,_voice.floor*3.5):false;
-  if(speaking){
-    if(!_voice.heard){_voice.heard=true;_voiceSet('hearing','Hearing you.')}
-    _voice.speechAt=now;
-  }
-  if(_voice.heard&&_voice.speechAt&&now-_voice.speechAt>VOICE_SILENCE_MS){_voiceStopClip(false);return}
-  if(_voice.heard&&now-_voice.startedAt>VOICE_MAX_CLIP_MS){_voiceStopClip(false);return}
-  // No analyser (an old browser): fall back to fixed 12-second turns.
-  if(!_voice.analyser&&now-_voice.startedAt>12000){_voiceStopClip(false);return}
-  if(!_voice.heard&&now-_voice.startedAt>VOICE_IDLE_RESTART_MS){_voiceStopClip(true);return}
-}
-function _voiceStopClip(drop){
-  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
-  _voice.dropClip=!!drop;
-  if(!drop)_voiceSet('sending','Sending what you said.');
-  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
-}
-async function _voiceSend(blob){
-  if(_voice.phase==='off')return;
-  if(!blob||!blob.size){_voiceListen();return}
-  const type=blob.type||'';
-  const ext=type.indexOf('mp4')>=0?'m4a':(type.indexOf('ogg')>=0?'ogg':'webm');
-  let text='';
-  try{
-    const fd=new FormData();fd.append('audio',blob,'voice.'+ext);
-    const r=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
-    const j=await r.json().catch(()=>({}));
-    text=(r.ok&&j.text)?String(j.text).trim():'';
-  }catch(e){}
-  if(_voice.phase==='off')return;
-  if(!text||text.replace(/[^A-Za-z0-9]/g,'').length<2){_voiceListen();return}
-  if(/^(stop|end|exit|quit|turn off)\s*(the\s+)?(live\s+)?voice(\s+mode)?\s*[.!]?$/i.test(text)){
-    stopLiveVoice('Live voice off');return;
-  }
-  const name=_voice.name;
-  try{
-    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/send',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({command:text})});
-    if(!resp.ok)throw new Error('send failed');
-    appendChatBubble(name,'user',text,Date.now()/1000);
-    setOptimisticBusy(name);
-    _voice.awaiting=true;_voice.sentAt=Date.now()/1000;_voice.pending=null;
-  }catch(e){showToast('Could not send that message.')}
-  _voiceListen();
-}
-// The reply is the Chat tab's own recap of the turn, which is the short version
-// written to be read out. Speak it only once it has settled: the server updates
-// the same bubble as the turn finishes, and reading a half-written recap aloud
-// is worse than waiting two seconds.
-async function _voiceCheckReply(){
-  if(_voice.phase==='off'||!_voice.awaiting)return;
-  const name=_voice.name;
-  const busy=(lastStatus[name]||'')==='busy';
-  if(!busy&&Date.now()/1000-_voice.sentAt>4&&Date.now()-_voice.lastPull>6000){
-    _voice.lastPull=Date.now();
-    try{await refreshOne(name)}catch(e){}
-  }
-  if(_voice.phase==='off'||busy)return;
-  const msgs=chatMessages[name]||[];
-  let latest=null;
-  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){latest=msgs[i];break}}
-  if(!latest||!(latest.ts>_voice.sentAt)||!(latest.ts>_voice.lastSpokenTs))return;
-  const txt=String(latest.text||latest.full||'').trim();
-  if(!txt)return;
-  if(_voice.pending&&_voice.pending===txt){
-    _voice.pending=null;_voice.awaiting=false;_voice.lastSpokenTs=latest.ts;
-    _voiceSpeak(txt);
-  }else{
-    _voice.pending=txt;
-  }
-}
-function voiceSkipSpeech(){
-  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
-  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
-}
-async function _voiceSpeak(text){
-  if(_voice.phase==='off')return;
-  // Stop listening first: an open mic would hear the reply and answer it.
-  _voice.dropClip=true;
-  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
-  _voiceSet('speaking','Speaking the reply.');
-  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
-  let played=false;
-  try{
-    const r=await fetch(BASE+'/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:text})});
-    if(r.ok&&_voice.ctx){
-      const buf=await r.arrayBuffer();
-      const decoded=await _voice.ctx.decodeAudioData(buf);
-      if(_voice.phase!=='speaking')return;
-      await new Promise(res=>{
-        const src=_voice.ctx.createBufferSource();
-        src.buffer=decoded;src.connect(_voice.ctx.destination);
-        _voice.audio=src;
-        src.onended=()=>{_voice.audio=null;res()};
-        src.start();
-      });
-      played=true;
-    }
-  }catch(e){}
-  if(!played&&window.speechSynthesis&&_voice.phase==='speaking'){
-    // No server voice (offline, no key): the browser's own voice still works.
-    await new Promise(res=>{
-      try{
-        const u=new SpeechSynthesisUtterance(text.slice(0,1500));
-        u.onend=res;u.onerror=res;speechSynthesis.speak(u);
-      }catch(e){res()}
-    });
-  }
-  if(_voice.phase==='speaking')_voiceListen();
-}
-
 async function sendChat(name){
   const input=document.getElementById('cmd-chat-'+name);
   if(!input)return;
@@ -27945,8 +27025,9 @@ async function sendChat(name){
     const key='chat-'+name;
     await _awaitComposerUploads(key);
     const typed=input.value.trim();
-    const attachments=_composerAttachments[key]||[];
-    const cmd=_commandWithComposerAttachments(typed,attachments);
+    const isSlash=/^\/[A-Za-z][\w:-]*(?:\s|$)/.test(typed);
+    const attachments=isSlash?[]:(_composerAttachments[key]||[]);
+    const cmd=isSlash?typed:_commandWithComposerAttachments(typed,attachments);
     if(!cmd){input.disabled=false;input.focus();return;}
     const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
@@ -27955,12 +27036,11 @@ async function sendChat(name){
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
-    if(data.submitted===false)showToast('That went into the terminal but the session did not take it. Open the Terminal tab and press Enter.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
     _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';updateComposerBtn('chat-'+name);
-    _clearComposerAttachments(name,'chat');
+    if(!isSlash)_clearComposerAttachments(name,'chat');
     delete draftText[key];
     refreshUploadedFiles(name);
     sent=true;
@@ -28323,7 +27403,7 @@ function _dropEl(e){
 // and Info have nothing to upload to, so they opt out.
 function _paneDropTarget(){
   if(!selectedSession)return null;
-  const tab=activeTabs[selectedSession]||_defaultSessionTab();
+  const tab=activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw');
   if(tab!=='raw'&&tab!=='chat')return null;
   const el=document.getElementById('tab-'+tab+'-'+selectedSession);
   return el?{name:selectedSession,tab:tab,el:el}:null;
@@ -28386,8 +27466,9 @@ async function sendCmd(name,source){
     const key=source+'-'+name;
     await _awaitComposerUploads(key);
     const typed=input.value.trim();
-    const attachments=_composerAttachments[key]||[];
-    const cmd=_commandWithComposerAttachments(typed,attachments);
+    const isSlash=/^\/[A-Za-z][\w:-]*(?:\s|$)/.test(typed);
+    const attachments=isSlash?[]:(_composerAttachments[key]||[]);
+    const cmd=isSlash?typed:_commandWithComposerAttachments(typed,attachments);
     if(!cmd){input.disabled=false;input.focus();return;}
     const resp=await fetch(BASE+'/api/sessions/'+name+'/send',{
       method:'POST',
@@ -28396,13 +27477,12 @@ async function sendCmd(name,source){
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok)throw new Error(data.error||'Failed to send.');
-    if(data.submitted===false)showToast('That went into the terminal but the session did not take it. Open the Terminal tab and press Enter.');
     appendChatBubble(name,'user',cmd,Date.now()/1000);
     setOptimisticBusy(name);
     _rememberSubmittedDraft(name,typed,attachments);
     input.value='';input.style.height='auto';updateComposerBtn(source+'-'+name);
     delete draftText[key];
-    _clearComposerAttachments(name,source);
+    if(!isSlash)_clearComposerAttachments(name,source);
     // Any pending uploads were just attached to this message — clear the badges.
     refreshUploadedFiles(name);
     if(source==='raw'){
@@ -28445,7 +27525,7 @@ function stopAllRawPolling(){
   for(const n in rawState)stopRawPolling(n);
 }
 
-function _ensureRawScrollTracking(rawEl,st){
+function _ensureRawScrollTracking(rawEl,st,name){
   if(rawEl._scrollTracked)return;
   rawEl._scrollTracked=true;
   // Follow-the-tail is decided by WHERE the pane is, never by who scrolled it.
@@ -28458,6 +27538,8 @@ function _ensureRawScrollTracking(rawEl,st){
   // itself; our own compensation lands away from it and does not.
   rawEl.addEventListener('scroll',()=>{
     st.userScrolledUp=(rawEl.scrollHeight-rawEl.scrollTop-rawEl.clientHeight)>24;
+    if(st.frozenSnapshot)st.frozenSnapshot.scrollTop=rawEl.scrollTop;
+    _maybeLoadEarlierHistory(name);
   },{passive:true});
 }
 
@@ -28465,12 +27547,25 @@ async function pollRawDelta(name){
   const st=getRawState(name);
   const rawEl=document.getElementById('raw-'+name);
   const infoEl=document.getElementById('raw-info-'+name);
-  if(!rawEl)return;
-  _ensureRawScrollTracking(rawEl,st);
+  if(!rawEl||st.inFlight)return;
+  _ensureRawScrollTracking(rawEl,st,name);
+  st.inFlight=true;
+  const generation=st.generation||0,clean=getCleanViewPref();
   try{
-    const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'');
+    const q='?known_lines='+st.knownLines+'&last_hash='+encodeURIComponent(st.visibleHash||'')+'&clean='+(clean?'1':'0');
     const resp=await fetch(BASE+'/api/sessions/'+name+'/raw-tail'+q);
     const data=await resp.json();
+    if(!resp.ok||data.error)throw new Error(data.error||'Terminal request failed.');
+    if(generation!==(st.generation||0)||clean!==getCleanViewPref())return;
+    const source=data.source||'terminal';
+    if(st.source!==source){st.olderText='';st.olderFrom=-1;st._bodyText=null;}
+    st.source=source;
+    if(Array.isArray(data.user_lines))st.userLines=data.user_lines;
+    if(typeof data.live_raw==='string'){
+      const live=splitLiveTail(data.live_raw.split('\n')).live;
+      if(live.seen){live.at=_nowMs();st.live=live;}
+      updateLiveBar(name);
+    }
     if(typeof data.visible_hash==='string')st.visibleHash=data.visible_hash;
     if(typeof data.pane_width==='number'&&data.pane_width>0)st.paneWidth=data.pane_width;
     if(typeof data.archived_lines==='number'){st.archived=data.archived_lines;updateOlderBar(name);}
@@ -28520,11 +27615,18 @@ async function pollRawDelta(name){
         infoEl.textContent=(data.total_lines||lineCount)+' lines';
       }
     }
-  }catch(e){}
+    _maybeLoadEarlierHistory(name);
+  }catch(e){
+    if(infoEl)infoEl.textContent='Could not load terminal. Retrying.';
+  }finally{
+    st.inFlight=false;
+    if(generation!==(st.generation||0))setTimeout(()=>pollRawDelta(name),0);
+  }
 }
 
 async function loadRaw(name){
   const st=getRawState(name);
+  st.generation=(st.generation||0)+1;
   st.knownLines=0;
   st.userScrolledUp=false;
   st.visibleHash='';
@@ -28534,7 +27636,7 @@ async function loadRaw(name){
   st.painted=null;st._bodyText=null;st.live=null;
   // Reload is an explicit "show me the terminal as it is now", which is the
   // opposite of a freeze — so it lifts one.
-  st.frozen=false;st.frozenAtLines=0;
+  st.frozen=false;st.frozenAtLines=0;st.frozenSnapshot=null;
   updateFreezeUi(name);
   const rawEl=document.getElementById('raw-'+name);
   // Wiping to a text node takes the line elements with it — tell the renderer to
@@ -28548,7 +27650,7 @@ async function loadRaw(name){
 // Reload now lives in the header line, which is visible from every tab — so it
 // refreshes whatever that tab is showing rather than only the terminal.
 function reloadActive(name){
-  const tab=activeTabs[name]||_defaultSessionTab();
+  const tab=activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw');
   if(tab==='raw')loadRaw(name);
   else if(tab==='skills')loadProfileSkills(name);
   else refreshOne(name);
@@ -28570,7 +27672,7 @@ function _pillCacheClasses(name,status){
   if(status==='busy'&&s.cache_keepalive)extra+=' keepcache';
   if(status==='idle'){
     const left=_cacheSecondsLeft(name);
-    if(left!==null&&left>0&&left<=CACHE_ALERT_LEAD)extra+=' expiring';
+    if(left!==null&&left>0&&left<=CACHE_WARN_LEAD)extra+=' expiring';
   }
   return extra;
 }
@@ -28582,12 +27684,7 @@ function _paintPillCache(name){
   // would drag the pill back to a status it left minutes ago, once a second.
   const s=sessions.find(x=>x.name===name)||{};
   const status=lastStatus[name]||s.activity_status||'unknown';
-  // Carry the compacting class through. This runs on the 420ms attention clock
-  // and rebuilds the whole class list, so leaving it out stripped the blue and
-  // the bar within half a second of them being set.
-  const detail=(name in lastDetail)?lastDetail[name]:s.activity_detail;
-  const want='status-pill '+status+_pillCacheClasses(name,status)
-    +(_isCompacting(detail)?' compacting':'');
+  const want='status-pill '+status+_pillCacheClasses(name,status);
   if(pill.className!==want)pill.className=want;
 }
 // The chat view's "Working..." line. Reconciled from whatever status the caller
@@ -28609,14 +27706,13 @@ function _syncChatTyping(name,status){
   }
 }
 function updateStatusPill(name,status,detail){
-  lastDetail[name]=detail;
   const pill=document.getElementById('status-'+name);
   if(pill){
     // Amber steady = working only to hold the cache. Amber blinking = idle with
     // the cache about to lapse, which is the one that wants you at the keyboard.
-    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status)
-      +(_isCompacting(detail)?' compacting':'');
-    pill.innerHTML=_pillInner(status,detail);
+    pill.className='status-pill '+(status||'unknown')+_pillCacheClasses(name,status);
+    pill.innerHTML='<span class="status-dot"></span><span class="status-label">'+statusLabel(status)+'</span>'
+      +(detail&&status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(detail)+'</span>':'');
   }
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
@@ -28708,11 +27804,10 @@ async function loadAll(focus){
     // returns you to the session you were reading. Every other path through
     // loadAll is a reload of where you already are: replace, or the stack fills
     // with copies of one entry.
-    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||_defaultSessionTab(),!_focused);
+    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),!_focused);
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
-  startAttentionClock();
   // Phase 2: Background LLM refresh for each session
   lazyRefreshAll();
 }
@@ -28757,24 +27852,6 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
-// The status poll is the ONLY thing that ever moves a session from busy back to
-// idle, and until now nothing watched it. One request that never answered, one
-// throw inside the interval callback, one tab the browser froze and resumed
-// without its timers, and the page sat on its last reading for ever with a red
-// pill that looked live, and the reload was the only cure, which is exactly the
-// symptom that was reported. So a second, cheap clock supervises the first: if
-// no poll has SUCCEEDED for half a minute it re-arms the timer and pokes it.
-// 17s so it cannot fall into step with the 10s poll and double every tick.
-setInterval(function(){
-  if(Date.now()-_lastPollOk<30000)return;
-  if(!pollTimer)startStatusPolling();
-  try{pollStatus()}catch(e){}
-  _paintPollHealth();
-  // A minute with nothing from either poll URL: take the slow road rather than
-  // leave the page frozen. Only ever reached when the page is already broken.
-  if(Date.now()-_lastPollOk>60000)_recoverStatusFromSessions();
-},17000);
-
 // A hidden tab has its timers throttled by the browser to about once a minute,
 // and nothing caught up on return — so coming back to the dashboard showed a
 // status up to a minute stale, which is exactly what "it only updates when I
@@ -28805,7 +27882,6 @@ function _safeToReload(){
     // _recording is a per-session map, not a flag: it is always truthy, so ask
     // whether any session is actually recording.
     if(typeof _recording==='object'&&_recording&&Object.values(_recording).some(Boolean))return false;
-    if(typeof _voice==='object'&&_voice&&_voice.phase!=='off')return false;   // mid-conversation
   }catch(e){return false}
   return true;
 }
@@ -28836,78 +27912,11 @@ async function pollStatus(){
   _pollInFlight=true;
   try{await _pollStatusOnce()}finally{_pollInFlight=false}
 }
-// Two URLs for one payload, and the page swaps between them after three misses
-// in a row. Measured on builder5 2026-09-21: a browser ran ~2,175 poll ticks
-// over six hours and not one GET /api/status left it, while /api/stats and
-// /api/auth/claude-status, issued from the last two lines of this very
-// function, arrived every time. A request that never reaches the server cannot
-// be fixed on the server, so the second name is the way out.
-const _STATUS_URLS=['/api/status','/api/activity'];
-let _statusUrlIdx=0;
-let _pollFails=0;
-let _lastPollOk=Date.now();
-// A poll that never answers used to hold _pollInFlight for ever, and every tick
-// after it returned at the first line: no request, no error, no sign. Eight
-// seconds is comfortably longer than this endpoint takes even while it walks a
-// dozen tmux panes, and an abort at least fails LOUDLY.
-async function _fetchStatus(){
-  const url=BASE+_STATUS_URLS[_statusUrlIdx];
-  if(typeof AbortController!=='function')return fetch(url);
-  const ctl=new AbortController();
-  const t=setTimeout(()=>ctl.abort(),8000);
-  try{return await fetch(url,{signal:ctl.signal})}
-  finally{clearTimeout(t)}
-}
-let _lastRecoveryOk=0;
-// Third and last channel, for the case where BOTH poll URLs are silent.
-// /api/sessions-fast carries the same activity fields down a completely
-// different path, and every page load proves it gets through: it is exactly
-// why reloading "fixed" the frozen pills. Heavier, so it only runs once the
-// poll has been dead for a minute.
-async function _recoverStatusFromSessions(){
-  try{
-    const resp=await fetch(BASE+'/api/sessions-fast');
-    if(!resp.ok)return;
-    const list=await resp.json();
-    for(const s of list){
-      trackSessionStatus(s.name,s.activity_status);
-      const si=sessions.findIndex(x=>x.name===s.name);
-      if(si>=0){
-        sessions[si].activity_status=s.activity_status;
-        sessions[si].activity_detail=s.activity_detail||'';
-      }
-      updateStatusPill(s.name,s.activity_status,s.activity_detail);
-      if(s.name===selectedSession)updateFavicon(s.activity_status);
-    }
-    _lastRecoveryOk=Date.now();
-    _paintPollHealth();
-  }catch(e){}
-}
-// What the header says while the live channel is down. Silence here is what let
-// a frozen page pass for a live one, so name the state and keep the age on it.
-function _paintPollHealth(){
-  if(!statusInfoEl)return;
-  const stalled=_pollFails>0&&Date.now()-_lastPollOk>25000;
-  statusInfoEl.classList.toggle('poll-stalled',stalled);
-  if(!stalled)return;
-  if(Date.now()-_lastRecoveryOk<45000){
-    statusInfoEl.textContent='Live status on the backup path';
-    return;
-  }
-  const secs=Math.round((Date.now()-_lastPollOk)/1000);
-  statusInfoEl.textContent='Live status stalled '+(secs<120?secs+'s':Math.round(secs/60)+'m')+' - retrying';
-}
 async function _pollStatusOnce(){
   try{
-    const resp=await _fetchStatus();
-    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const resp=await fetch(BASE+'/api/status');
     _checkBuild(resp);
     const statuses=await resp.json();
-    _pollFails=0;
-    _lastPollOk=Date.now();
-    // Guarded: this runs BEFORE the statuses are applied, so a missing header
-    // element must not be able to throw the whole poll into the catch arm.
-    if(statusInfoEl)statusInfoEl.classList.remove('poll-stalled');
     let changed=false;
     for(const st of statuses){
       const prev=lastStatus[st.name];
@@ -28971,19 +27980,7 @@ async function _pollStatusOnce(){
       }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
-  }catch(e){
-    _pollFails++;
-    // Three in a row is not a slow box, it is a path that is not working. Swap
-    // URLs every third miss, so each name gets the same three chances and the
-    // page settles on whichever one actually answers.
-    if(_pollFails%3===0)_statusUrlIdx=(_statusUrlIdx+1)%_STATUS_URLS.length;
-    _paintPollHealth();
-    // One off-cycle second chance, and only the first time: a single dropped
-    // request should cost a moment, not a whole tick. Retrying every failure
-    // would turn a blocked URL into a 1.5s loop that also drags the stats and
-    // auth calls at the end of this function along with it.
-    if(_pollFails===1)setTimeout(function(){try{pollStatus()}catch(e2){}},1500);
-  }
+  }catch(e){statusInfoEl.textContent='Status poll failed'}
   _authPollCount++;
   if(_authPollCount%5===0)checkClaudeAuth();
   // Refresh inline server stats every 3rd poll (~30s)
@@ -28995,11 +27992,6 @@ const navStatsEl=document.getElementById('nav-server-stats');
 async function refreshNavStats(){
   try{
     const resp=await fetch(BASE+'/api/stats');
-    // The build check used to ride on the status poll alone, so the one tab
-    // that most needed a newer build, the one whose status poll is not getting
-    // through, was also the one tab that could never learn a newer build
-    // existed. Any response carries the header; use this one too.
-    _checkBuild(resp);
     const s=await resp.json();
     const cpuPct=s.cpu_percent!=null?s.cpu_percent:0;
     const threads=s.threads_running!=null?s.threads_running:'?';
@@ -29082,6 +28074,14 @@ function _usageErrText(err){
   if(err==='rate_limited') return 'Anthropic is rate-limiting the usage API; backing off and retrying.';
   return 'the Anthropic usage API did not answer (retrying).';
 }
+// This box can route sessions through a model gateway instead of the plan, and
+// then the plan's own windows mean nothing, so the bars are hidden rather than
+// shown at zero. Its own function so the fetch below reads like every other box's.
+function _usageBarsDisabled(){
+  if(typeof MODEL_GATEWAY==='undefined'||!MODEL_GATEWAY)return false;
+  ['nav-usage','nav-tools-usage'].forEach(id=>{const el=document.getElementById(id);if(el)el.classList.add('disabled')});
+  return true;
+}
 // Last good payload. Kept because the 5-hour row now lives in the account
 // dropdown, which is rebuilt every time it is opened: without this it would show
 // an empty bar until the next poll came round.
@@ -29162,6 +28162,7 @@ function _applyUsageLimits(data){
   });
 }
 async function refreshUsageLimits(){
+  if(_usageBarsDisabled()) return;  // sessions are on a gateway, not the plan
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
   if(!wrap)return;
@@ -29212,6 +28213,7 @@ startUsageLimitsPolling();
 let _loginHealth={account:null,stale_count:0,sessions:[]};
 let _loginHealthTimer=null;
 async function refreshLoginHealth(){
+  if(MODEL_GATEWAY)return;
   try{
     const resp=await fetch(BASE+'/api/login-health');
     if(!resp.ok)return;
@@ -29250,6 +28252,7 @@ async function reloginSession(name){
   }catch(e){alert('Failed to restart Claude.')}
 }
 function startLoginHealthPolling(){
+  if(MODEL_GATEWAY)return;
   if(_loginHealthTimer)clearInterval(_loginHealthTimer);
   refreshLoginHealth();
   _loginHealthTimer=setInterval(refreshLoginHealth,60000);
@@ -29351,7 +28354,7 @@ async function createSession(){
 function _openNewSession(name){
   if(!name)return;
   selectedSession=name;
-  const tab=_defaultSessionTab();
+  const tab=MEMBER_SIMPLE?'chat':'raw';
   activeTabs[name]=tab;
   location.hash=_sessionRouteHash(name,tab);
 }
@@ -29475,6 +28478,7 @@ async function checkClaudeAuth(){
     // Keep last known good auth state instead of resetting to disconnected
     if(!_authCache)_authCache={loggedIn:false,error:true};
   }
+  if(MODEL_GATEWAY){renderAuthIndicator();return}
   try{
     const usageResp=await fetch(BASE+'/api/auth/usage');
     if(usageResp.ok) _usageCache=await usageResp.json();
@@ -29488,6 +28492,12 @@ function renderAuthIndicator(){
   const dot=document.getElementById('claude-auth-dot');
   const label=document.getElementById('claude-auth-label');
   if(!_authCache){dot.className='status-dot unknown';label.textContent='...';return}
+  if(_authCache.authMethod==='gateway'){
+    dot.className='status-dot';dot.style.background=_authCache.gatewayConfigured?'#d2a8ff':'#f85149';
+    label.textContent=_authCache.gatewayConfigured?'Model gateway':'Gateway not configured';
+    if(label.parentElement)label.parentElement.title=_authCache.gatewayHost||'Model gateway';
+    return;
+  }
   if(_authCache.hasApiKey&&!_authCache.loggedIn){
     dot.className='status-dot';dot.style.background='#d2a8ff';
     label.textContent='API Key';return;
@@ -29578,11 +28588,18 @@ function renderUsageHtml(){
 function renderAuthPanel(){
   const el=document.getElementById('auth-dropdown-content');
   if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
-  const usageHtml=renderUsageHtml();
   // Repaint the 5-hour bar as soon as the markup above lands, and ask for a fresh
   // read. Without the first call the bar would sit at 0% until the next minute
   // tick, which is indistinguishable from an unspent window.
   setTimeout(()=>{_applyUsageLimits(_usageLimitsData);refreshUsageLimits()},0);
+  if(_authCache.authMethod==='gateway'){
+    el.innerHTML='<div class="auth-title">Model gateway</div>'
+      +'<div class="auth-row"><span class="auth-row-label">Provider</span><span class="auth-row-value">'+esc(_authCache.gatewayHost||'Configured gateway')+'</span></div>'
+      +'<p class="auth-hint">'+(_authCache.gatewayConfigured?'Gateway credentials are configured.':'Gateway credentials are missing.')
+      +' Model availability and context sizes come from this provider. Check its account for billing.</p>';
+    return;
+  }
+  const usageHtml=renderUsageHtml();
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
@@ -29601,17 +28618,37 @@ function renderAuthPanel(){
   }else{
     el.innerHTML=`
       <div class="auth-title">Claude Code — Not Connected</div>
-      <p class="auth-hint">Sessions here run on the subscription plan. Sign in with
-        <code style="color:#79c0ff">claude auth login</code> in a terminal session. There is no
-        API key to set: a metered key is not stored on this dashboard.</p>
-      ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-top:10px" onclick="clearApiKey()">Clear the stored API key</button>':''}
+      <p class="auth-hint">Set an Anthropic API key to authenticate Claude Code for new sessions:</p>
+      <input type="password" class="auth-api-input" id="auth-api-key-input"
+        placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false"
+        value="${_authCache.hasApiKey?'••••••••••••••••':''}">
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
+        ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="flex:1" onclick="clearApiKey()">Clear</button>':''}
+      </div>
       ${usageHtml}
+      <hr class="auth-divider">
+      <p class="auth-hint">Or authenticate via OAuth by running <code style="color:#79c0ff">claude auth login</code> in a terminal session.</p>
     `;
   }
 }
 
-// saveApiKey() is gone with the input it read: the plan is the only route, so
-// POST /api/auth/api-key refuses a key and only still accepts the empty clear.
+async function saveApiKey(){
+  const input=document.getElementById('auth-api-key-input');
+  if(!input)return;
+  const key=input.value.trim();
+  if(!key){alert('Please enter an API key.');return}
+  try{
+    const resp=await fetch(BASE+'/api/auth/api-key',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({apiKey:key})
+    });
+    const data=await resp.json();
+    if(!resp.ok){alert(data.detail||'Failed to save');return}
+    await checkClaudeAuth();
+    renderAuthPanel();
+  }catch(e){alert('Failed to save API key.')}
+}
 
 async function clearApiKey(){
   try{
@@ -29737,7 +28774,7 @@ async function setAuthMode(name,mode){
     if(resp.ok){
       const idx=sessions.findIndex(s=>s.name===name);
       if(idx>=0)sessions[idx].auth_mode=mode;
-      if(statusEl)statusEl.textContent='API key unset';
+      if(statusEl)statusEl.textContent=mode==='api'?'API key exported':'API key unset';
     }else{
       if(statusEl)statusEl.textContent=data.error||'Failed';
     }
@@ -29782,7 +28819,7 @@ async function loadSessionStats(name){
         <div class="stat-item"><span class="stat-label">Cache read</span><span class="stat-value">${fmtTokens(st.cacheRead)}</span></div>
         <div class="stat-item"><span class="stat-label">Cache write</span><span class="stat-value">${fmtTokens(st.cacheCreate)}</span></div>
         <div class="stats-divider"></div>
-        <div class="stat-item"><span class="stat-label">API equiv.</span><span class="stat-value cost">$${st.estimatedCost.toFixed(2)}</span></div>
+        <div class="stat-item"><span class="stat-label">${MODEL_GATEWAY?'Cost':'API equiv.'}</span><span class="stat-value cost">${st.estimatedCost==null?'Gateway billing':'$'+st.estimatedCost.toFixed(2)}</span></div>
         <div class="stat-item"><span class="stat-label">Total tokens</span><span class="stat-value">${fmtTokens(st.totalTokens)}</span></div>
         <div class="stat-item"><span class="stat-label">Active time</span><span class="stat-value">${st.activeMinutes}m / ${st.sessionDurationMin}m</span></div>
         <div class="stat-item"><span class="stat-label">Last activity</span><span class="stat-value">${sinceStr}</span></div>
@@ -29816,37 +28853,32 @@ function stopStatsPolling(){
 // ── Auto-push (auto-responder + autopilot watchdog) ──
 let _watchdogTimers={};
 const AUTOPUSH_TITLES={
-  off:'Off: the dashboard never types into this terminal',
-  basic:'Basic: answers option menus and permission prompts so the work keeps going, and keeps '+
-        'the session logged in. Never picks an option that exits, logs out or spends money.',
-  cache:'Cache: Basic, plus '+(CACHE_PUSH_LEAD/60)+' minutes before the prompt cache goes cold it '+
-        'sends the next step you would most likely ask for (tests, QA, the missing parts, polish), '+
-        'drafted from your messages and the replies, so the session stays warm and keeps moving. '+
-        'Never a new feature, nothing destructive. Pauses after 8 pushes nobody answered. The '+
-        'session turns amber while it works on one.',
-  full:'Full: Basic, plus writes a "keep going" reply whenever Claude pauses before finishing'
+  off:'Off — the dashboard never types into this terminal',
+  basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
+  basicplus:'Basic +: Basic, plus one fixed "continue" '+
+            (CACHE_WARN_LEAD/60)+' minutes before the prompt cache goes cold, so the '+
+            'transcript stays warm and your next message is still cheap. Never composes '+
+            'a task; the session turns amber while it is running for this reason.',
+  full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
 };
-function _autopushModeId(mode){
-  return mode==='basicplus'?'cache':(mode||'basic');
-}
 function autopushDesc(mode){
-  return ({off:'Off: no auto-typing',
-           basic:'Basic: answers menus and prompts, never exit or log out',
-           cache:'Cache: Basic, plus sends the likely next step before the cache goes cold',
-           full:'Full: menus, prompts and keep-going replies'})[_autopushModeId(mode)];
+  return ({off:'Off — no auto-typing',
+           basic:'Basic — picks options + confirms prompts',
+           basicplus:'Basic +: Basic, plus keeps the prompt cache warm',
+           full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
 }
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
 function autopushSeg(name,mode,compact){
-  mode=_autopushModeId(mode);
+  mode=mode||'basic';
   const b=(m,label)=>'<button type="button" class="ap-'+m+(mode===m?' active':'')+'" title="'+
     esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
     esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
-    b('off','Off')+b('basic','Basic')+b('cache','Cache')+b('full','Full')+'</div>';
+    b('off','Off')+b('basic','Basic')+b('basicplus','Basic +')+b('full','Full')+'</div>';
 }
 // Reflect a mode across every rendered control for this session (More menu + Info tab).
 function syncAutopushUI(name,mode){
-  mode=_autopushModeId(mode);
+  mode=mode||'basic';
   document.querySelectorAll('.autopush-seg').forEach(seg=>{
     if(seg.dataset.name!==name)return;
     seg.querySelectorAll('button').forEach(btn=>{
@@ -29951,14 +28983,14 @@ function buildKeyBar(name,tab){
     ${tab==='raw'?`<span class="key-bar-sep"></span>
     <button class="key-btn key-freeze" id="freeze-btn-${name}" onclick="toggleRawFreeze('${esc(name)}')" title="Hold the terminal still so you can read and copy. The agent keeps working; new output appears all at once when you unfreeze.">&#10052; Freeze</button>
     <button class="key-btn key-jump" id="jump-btn-${name}" onclick="jumpToLastUserMessage('${esc(name)}')" title="Jump to the last thing YOU wrote. Click again to step back through earlier messages; from the oldest it returns to the newest.">&#8613; My last message</button>
-    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Back to the bottom, and resume following the output.">&#8615; Live</button>`:''}
+    <button class="key-btn key-jump" id="jump-live-${name}" onclick="jumpToLive('${esc(name)}')" title="Unfreeze, show the latest output, and keep following it.">&#8615; Latest output</button>`:''}
     <span class="key-bar-sep"></span>
     <span class="key-bar-label">Cmds:</span>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Wipe conversation">/clear</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/clear')" title="Start a new conversation. Saved messages remain available.">/clear</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/compact')" title="Summarize context">/compact</button>
     <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/context')" title="Context usage">/context</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
-    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>
+    ${MODEL_GATEWAY?'':`<button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/cost')" title="Session cost">/cost</button>
+    <button class="key-btn key-slash" onclick="sendSlashCommand('${name}','/usage')" title="Rate limits">/usage</button>`}
     <span class="key-bar-sep"></span>
     <div class="drop-zone" id="dropzone-${tab}-${name}"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
@@ -30364,16 +29396,18 @@ function toggleKeyBar(barId,toggleEl){
 }
 
 async function sendSlashCommand(name,cmd){
-  appendChatBubble(name,'user',cmd,Date.now()/1000);
-  setOptimisticBusy(name);
   try{
-    await fetch(BASE+'/api/sessions/'+name+'/send',{
+    const response=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command:cmd})
     });
-  }catch(e){alert('Failed to send command.')}
-  scheduleBusyVerification(name);
+    const data=await response.json();
+    if(!response.ok||data.error)throw new Error(data.error||'Failed to send command.');
+    appendChatBubble(name,'user',cmd,Date.now()/1000);
+    setOptimisticBusy(name);
+    scheduleBusyVerification(name);
+  }catch(e){alert(e&&e.message?e.message:'Failed to send command.')}
 }
 
 // ── Skills Tab ──
@@ -30706,12 +29740,12 @@ async function applyRoleVisibility(){
   document.querySelectorAll('.nav-tools-admin').forEach(el => {
     el.style.display = isAdmin ? '' : 'none';
   });
-  renderBuildLine();
   const whoamiEl = document.getElementById('nav-tools-whoami');
   if(whoamiEl && _currentUser){
     const role = _currentUser.role==='admin' ? ' (admin)' : '';
     whoamiEl.textContent = 'Signed in as ' + (_currentUser.username||'?') + role;
   }
+  renderBuildLine();
   renderImpersonationBanner();
   // Re-render session cards so simple-mode toggles (key bar, tabs) take effect now.
   try{ if(sessions && sessions.length){ renderNav(); renderDetail(); } }catch(e){}
@@ -30732,7 +29766,7 @@ async function renderBuildLine(){
   }
   const b = _buildInfo;
   if(!b || !b.version){ el.textContent = ''; return; }
-  el.textContent = [b.host, b.flavour, 'v'+b.version].filter(Boolean).join(' \u00b7 ');
+  el.textContent = [b.host, b.flavour, 'v'+b.version].filter(Boolean).join(' · ');
   el.title = 'This dashboard: ' + (b.host||'?') + ', ' + (b.flavour||'?') +
     ' sessions, build ' + b.version +
     (b.sha && b.sha.endsWith('+') ? ' (working tree has uncommitted changes)' : '');
@@ -30789,7 +29823,7 @@ function renderSettingsTabs(){
   if(isAdmin) tabs.push({id:'users', label:'Users'});
   if(isAdmin) tabs.push({id:'apis', label:'APIs'});
   if(isAdmin) tabs.push({id:'browser', label:'Browser'});
-  if(isAdmin) tabs.push({id:'login', label:'Login'});
+  if(isAdmin&&!MODEL_GATEWAY) tabs.push({id:'login', label:'Login'});
   // Snap to a real tab if the remembered one isn't offered to this role.
   if(!tabs.some(t => t.id === _settingsActiveTab)) _settingsActiveTab = tabs[0].id;
   tabsEl.innerHTML = tabs.map(t =>
@@ -30921,7 +29955,6 @@ let _bsEditId = null;   // session id currently being renamed / annotated
 let _bsData = null;     // last payload, so an edit toggle can re-render without refetching
 let _bsProxy = null;    // /api/browser/proxy payload (config + per-browser exit IP + GB used)
 let _bsProxyEdit = false;
-let _bsFp = {};         // sid -> last fingerprint audit result
 async function loadBrowserTab(){
   let data;
   try{
@@ -30997,6 +30030,12 @@ function renderBrowserTab(data){
         ' title="What this browser has been doing: navigations, tab changes, park/freeze,'+
         ' with the screenshot taken at the time.">History</button>'+
       (s.external_url? ' <button class="btn btn-ghost" onclick="openBrowserDirect(\''+id+'\')">Direct</button>':'');
+    // Freeze, Park, Edit, Fingerprint and New IP were five ghost buttons on
+    // every card, and four of them are things the guards already do on their
+    // own (freeze at BROWSER_FREEZE_IDLE_S, park at BROWSER_AUTOPARK_IDLE_S).
+    // The row is now the three things only a person can decide: watch it, look
+    // at what it did, stop it. Naming a browser has not gone away — the note
+    // under the card opens the editor when you click it.
     const rm = s.managed ? ' <button class="btn btn-danger" onclick="removeBrowserSession(\''+id+'\')">Remove</button>' : '';
     // A still, never a stream. The card used to hold a live noVNC <iframe> per
     // browser, which is a full VNC session rendered for as long as this tab is
@@ -31022,7 +30061,7 @@ function renderBrowserTab(data){
       ? '<div class="bs-notes bs-notes-edit" onclick="startEditBrowser(\''+id+'\')"'+
         ' title="Click to change the name or the note.">'+esc(notes)+'</div>'
       : '<div class="bs-notes empty bs-notes-edit" onclick="startEditBrowser(\''+id+'\')"'+
-        ' title="Click to say what this browser is for.">No note - click to say what this browser is for.</div>';
+        ' title="Click to say what this browser is for.">No note — click to say what this browser is for.</div>';
     // Sign-in state for this browser (from /api/browser/auth-status).
     const a = ((_browserAuth&&_browserAuth.sessions)||[]).find(x=>x.id===s.id) || {};
     let badges = '';
@@ -31093,8 +30132,6 @@ function renderBrowserTab(data){
       badges += '<span class="bs-badge warn">direct, no proxy</span>';
     }
     const badgeRow = badges ? '<div class="bs-badges">'+badges+'</div>' : '';
-    const fp = _bsFp[s.id];
-    const fpBlock = fp ? '<div class="bs-fp">'+fp+'</div>' : '';
     const body = editing
       ? '<div class="bs-edit">'+
           '<label>Name</label>'+
@@ -31108,7 +30145,7 @@ function renderBrowserTab(data){
             '<button class="btn btn-ghost" onclick="cancelBrowserEdit()">Cancel</button>'+
           '</div>'+
         '</div>'
-      : '<div class="bs-preview">'+preview+'</div>'+shotMeta+histBlock+badgeRow+fpBlock+notesBlock;
+      : '<div class="bs-preview">'+preview+'</div>'+shotMeta+histBlock+badgeRow+notesBlock;
     return '<div class="bs-card">'+
       '<div class="bs-head">'+dot+'<span class="bs-name">'+esc(s.name)+'</span>'+
         '<span class="bs-meta">'+status+' · headed, display :'+s.display+' · CDP '+s.cdp_port+
@@ -31139,18 +30176,6 @@ function renderBrowserTab(data){
         'port, at most once a minute and only while the browser is in use, so an idle browser costs '+
         'nothing to watch. <b>View live ↗</b> starts the VNC stream in a new tab and it stops again '+
         'once nobody is watching. <b>History</b> is the audit trail.</div>'+
-      // Signing in by hand is a different job from watching an agent work, and
-      // VNC is the wrong transport for it. The console browser streams one tab
-      // over CDP instead, goes out DIRECT rather than through the residential
-      // relay, and keeps its profile, so a login done there is still there
-      // tomorrow. Linked from here because this tab is where anyone looking for
-      // a browser looks first.
-      '<div class="pf-banner">Signing in to something yourself? Use the '+
-        '<a href="'+BASE+'/console" target="_blank" rel="noopener">'+
-        '<b>console browser ↗</b></a> instead of View live. It streams the page, '+
-        'not the desktop, so it is far quicker over a phone connection, and it '+
-        'shows you which exit it is on and whether that exit can reach the '+
-        'internet at all.</div>'+
       renderBrowserProxyPanel()+
       '<div class="bs-grid">'+(cards||'<div class="history-empty">No browser sessions.</div>')+'</div>'+
       addRow+
@@ -31538,40 +30563,14 @@ function renderBrowserProxyPanel(){
       '<span class="bs-proxy-sub">relay not installed (~/.claude-browser/bin/proxy_relay.py)</span></div></div>';
   const on = !!p.enabled;
   const dot = '<span class="bs-dot '+(on?'on':'off')+'"></span>';
-  const rungs = p.ladder||[];
   const who = p.username ? esc(p.provider)+' · '+esc(p.username) : 'no account configured';
   const head = '<div class="bs-proxy-head">'+dot+
     '<span class="bs-proxy-title">Residential proxy</span>'+
     '<span class="bs-badge '+(on?'ok':'warn')+'">'+(on?'ON':'direct')+'</span>'+
-    '<span class="bs-proxy-sub">'+who+' · '+_fmtBytes(p.total_bytes||0)+' through the relay'+
+    '<span class="bs-proxy-sub">'+who+' · '+_fmtBytes(p.total_bytes||0)+' used'+
       (p.country?' · '+esc(p.country.toUpperCase()):'')+'</span></div>';
-  // The ladder, in order, with each rung's PAID spend. Total-through-the-relay
-  // above counts direct traffic too, so it is a browsing figure; these are the
-  // only bytes anybody is billed for, and the only ones a budget may look at.
-  const meters = p.meters||{};
-  const ladder = !rungs.length ? '' :
-    '<div class="bs-proxy-ladder">'+rungs.map(function(r,i){
-      const m = meters[r.meter]||{};
-      const paid = (m.paid_up||0)+(m.paid_down||0);
-      const over = r.budget_mb && (paid/1048576) > r.budget_mb;
-      return '<div class="bs-proxy-rung'+(r.enabled?'':' off')+'">'+
-        '<span class="bs-proxy-rung-n">'+(i+1)+'</span>'+
-        '<span class="bs-proxy-rung-name">'+esc(r.name)+'</span>'+
-        '<span class="bs-proxy-sub">'+esc(r.host||'')+':'+esc(String(r.port||''))+'</span>'+
-        (r.metered
-          ? '<span class="bs-badge '+(over?'warn':'ok')+'">'+_fmtBytes(paid)+
-            (r.budget_mb?(' of '+r.budget_mb+' MB'):'')+(over?' · skipped':'')+'</span>'
-          : '<span class="bs-badge ok">unmetered</span>')+
-        '</div>';
-    }).join('')+
-    (p.fallback_direct
-      ? '<div class="bs-proxy-rung"><span class="bs-proxy-rung-n">'+(rungs.length+1)+'</span>'+
-        '<span class="bs-proxy-rung-name">direct</span>'+
-        '<span class="bs-proxy-sub">this box\'s own address, only if every rung above fails</span></div>'
-      : '')+
-    '</div>';
   if(!_bsProxyEdit){
-    return '<div class="bs-proxy">'+head+ladder+
+    return '<div class="bs-proxy">'+head+
       '<div class="bs-proxy-actions">'+
         '<button class="btn" onclick="toggleBrowserProxy('+(on?'false':'true')+')">'+(on?'Turn off':'Turn on')+'</button> '+
         '<button class="btn btn-ghost" onclick="editBrowserProxy()">Settings</button> '+
@@ -31579,17 +30578,8 @@ function renderBrowserProxyPanel(){
       '</div></div>';
   }
   const opts = (p.providers||[]).map(x=>'<option value="'+esc(x)+'"'+(x===p.provider?' selected':'')+'>'+esc(x)+'</option>').join('');
-  // Say plainly that these fields no longer decide the exit when a ladder is set,
-  // rather than let someone change one and wonder why nothing moved.
-  const ladderNote = rungs.length
-    ? '<div class="bs-proxy-sub" style="grid-column:1/-1">This box egresses through the '+
-      rungs.length+'-rung ladder above, set in ~/.claude-browser/proxy.json under '+
-      '<code>upstreams</code> and <code>ladder</code>. These fields are the older '+
-      'single-provider config and no longer choose the exit; edit the ladder in that '+
-      'file to change it.</div>'
-    : '';
-  return '<div class="bs-proxy">'+head+ladder+
-    '<div class="bs-proxy-form">'+ladderNote+
+  return '<div class="bs-proxy">'+head+
+    '<div class="bs-proxy-form">'+
       '<div><label>Provider</label><select id="bs-px-provider">'+opts+'</select></div>'+
       '<div><label>Username</label><input id="bs-px-user" value="'+esc(p.username||'')+'" placeholder="account user"></div>'+
       '<div><label>Password</label><input id="bs-px-pass" type="password" placeholder="'+(p.password_set?'unchanged':'account password')+'"></div>'+
@@ -31643,40 +30633,6 @@ async function toggleBrowserProxy(on){
   // route itself, only for the clock to re-match the new exit IP.
   setTimeout(()=>loadBrowserProxy(true), 6000);
   _bsProxy = Object.assign({}, _bsProxy||{}, {enabled:!!on});
-  renderBrowserTab(_bsData||{});
-}
-
-async function rotateBrowserIp(id){
-  const s=_bsFind(id);
-  if(!confirm('Give "'+(s?s.name:id)+'" a new residential IP? Sites it is signed into may ask it to log in again.')) return;
-  try{
-    const r = await fetch(BASE+'/api/browser/proxy/'+encodeURIComponent(id)+'/rotate',{method:'POST'});
-    const d = await r.json();
-    if(!r.ok){ alert(d.error||'Failed'); return; }
-    const ex = d.exit||{};
-    alert(ex.ip ? ('New exit IP: '+ex.ip+' — '+(ex.org||'')+' ('+(ex.city||'')+', '+(ex.country||'')+')')
-                : ('Rotated, but the exit check failed: '+(ex.error||'unknown')));
-  }catch(e){ alert('Failed: '+e.message); return; }
-  loadBrowserProxy(true);
-}
-
-async function checkBrowserFingerprint(id){
-  _bsFp[id] = 'Running fingerprint audit…';
-  renderBrowserTab(_bsData||{});
-  try{
-    const r = await fetch(BASE+'/api/browser/fingerprint/'+encodeURIComponent(id));
-    const d = await r.json();
-    if(!r.ok){ _bsFp[id] = '<span class="fp-fail">Audit failed: '+esc(d.error||'error')+'</span>'; }
-    else{
-      const rows = (d.score||[]);
-      const fails = rows.filter(x=>x.level!=='ok');
-      const n = rows.length - fails.length;
-      _bsFp[id] = '<b>'+n+'/'+rows.length+' checks pass</b>'+
-        (fails.length? '<br>'+fails.map(x=>'<span class="fp-'+(x.level==='fail'?'fail':'warn')+'">'+
-            esc(x.check)+': '+esc(String(x.detail).slice(0,80))+'</span>').join('<br>')
-          : ' <span class="fp-ok">— looks like a normal desktop browser</span>');
-    }
-  }catch(e){ _bsFp[id] = '<span class="fp-fail">Audit failed: '+esc(e.message)+'</span>'; }
   renderBrowserTab(_bsData||{});
 }
 
@@ -31798,31 +30754,6 @@ function renderBrowserHistory(id){
 function openBrowserDirect(id){
   const s=_bsFind(id);
   if(s&&s.external_url) window.open(s.external_url, '_blank');
-}
-
-// Park = close the tabs, keep the browser (and its claude.ai session) alive.
-// The profile lives on disk, so this costs nothing but the open pages.
-async function parkBrowser(id){
-  try{
-    const r = await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/park',{method:'POST'});
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.error||'park failed');
-    showToast('Parked — closed '+(d.closed||0)+' tab(s). Still signed in.');
-  }catch(e){ showToast('Park failed: '+(e.message||e)); }
-  refreshBrowserAuthBadge();
-  loadBrowserTab();
-}
-
-// Freeze = stop the tabs rendering but keep them. Park's gentler sibling.
-async function freezeBrowser(id){
-  try{
-    const r = await fetch(BASE+'/api/browser/'+encodeURIComponent(id)+'/freeze',{method:'POST'});
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.error||'freeze failed');
-    showToast(d.frozen? 'Froze '+d.frozen+' background tab(s) — they resume when shown.'
-                      : 'Nothing to freeze (only the visible tab is loaded).');
-  }catch(e){ showToast('Freeze failed: '+(e.message||e)); }
-  refreshBrowserAuthBadge().then(()=>{ if(_settingsActiveTab==='browser') renderBrowserTab(_bsData||{}); });
 }
 
 async function toggleAutoPark(id, enabled){
@@ -33001,7 +31932,7 @@ const _PROFILE_TABS = [
   {id:'settings', label:'Settings'},
   {id:'login',    label:'Login'},
   {id:'plugins',  label:'Plugins'},
-];
+].filter(tab=>!MODEL_GATEWAY||tab.id!=='login');
 // Element-id suffix the shared skills UI uses when it renders inside this panel
 // rather than inside a session tab.
 const PF_SKILL_KEY = '__profile__';
@@ -34417,7 +33348,7 @@ function renderStats(s,usage){
   // Claude Usage
   if(usage&&(usage.sessions&&usage.sessions.length||usage.thisWeek&&usage.thisWeek.messages)){
     function fmtTok(n){if(!n)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
-    function fmtCost(n){if(!n)return'—';return'$'+n.toFixed(2)}
+    function fmtCost(n){if(n==null)return'Not supplied';return'$'+n.toFixed(2)}
     function modelTag(m){if(!m||m==='unknown')return'';const short=m.replace('claude-','').replace(/-\d{8}$/,'');let bg='#30363d';if(short.includes('opus'))bg='#8b5cf6';else if(short.includes('haiku'))bg='#f59e0b';else if(short.includes('sonnet'))bg='#3b82f6';return'<span class="model-tag" style="background:'+bg+'">'+esc(short)+'</span>'}
     html+='<div class="stats-section"><div class="stats-section-title">Claude Usage</div>';
     html+='<table class="stats-usage-table"><thead><tr><th style="text-align:left">Session</th><th>Model</th><th>5h Tokens</th><th>5h Cost</th><th>Week Tokens</th><th>Week Cost</th></tr></thead><tbody>';
@@ -34661,19 +33592,6 @@ async def vacuum_tool_sim():
                         headers={"Cache-Control": "no-store"})
 
 
-# The console browser: a headed Chrome a human can sign in to, streamed over CDP
-# instead of VNC. Its own module, mounted here, like the other panels. It has to be
-# registered ABOVE the /{username} catch-all or "console" is read as a member name.
-# The websocket carries a live, signed-in browser, so it re-checks the dashboard
-# cookie itself: HTTP middleware does not run for websockets.
-try:
-    import console_browser
-    console_browser.mount(
-        app, auth_ok=lambda ws: (not AUTH_PASS) or _check_token(ws.cookies.get(AUTH_COOKIE)))
-except Exception:
-    logger.exception("console browser not mounted")
-
-
 @app.get("/{username}", response_class=HTMLResponse)
 async def user_projects_page(request: Request, username: str):
     if username in _RESERVED_TOP or "." in username:
@@ -34730,6 +33648,7 @@ async def serve_project(request: Request, username: str, project: str, subpath: 
         return HTMLResponse("Not found", status_code=404)
     mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     return FileResponse(str(target), media_type=mime)
+
 
 
 if __name__ == "__main__":
