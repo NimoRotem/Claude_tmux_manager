@@ -4775,6 +4775,10 @@ def _seed_trust(cfg_dir: Path, cwd: str):
 # client to accept the one-time "Bypass Permissions" warning. A detached session
 # (no client) can't confirm it and claude exits, so members would otherwise hang.
 PRIME_SCRIPT_PATH = MESSAGES_DIR / "hooks" / "prime_claude.sh"
+#  The script below names its throwaway tmux session `prime_$$`. Durable recovery
+#  reads this prefix to tell scaffolding apart from somebody's tab, so the two
+#  have to agree: see _is_ephemeral_session.
+PRIME_SESSION_PREFIX = "prime_"
 _PRIME_SCRIPT = r'''#!/usr/bin/env bash
 # Accept the one-time --dangerously-skip-permissions warning for a config dir.
 CFG="$1"
@@ -8822,15 +8826,49 @@ def _restore_durable_session(candidate: dict) -> dict:
         raise
 
 
+def _is_ephemeral_session(name: str) -> bool:
+    """True for tmux sessions that are scaffolding, not somebody's tab.
+
+    The dashboard drives short-lived sessions of its own: `_authsetup` for the
+    token flow, `prime_<pid>` for accepting the bypass warning in a new config
+    dir. They are created, used and killed in seconds. Durable recovery must not
+    adopt them: it recreates whatever it has a row for, so a checkpointed
+    scaffold session comes back from the dead every 20s after its owner killed
+    it (2026-08-27). The leading underscore is the existing internal-name
+    convention; prime_ is named by the primer script. Carried over from
+    claude.lisa.my, which had this fix while the other boxes did not, and whose
+    absence on builder1 wrote a page of recovery errors into the log every
+    20 seconds for a fortnight.
+    """
+    return name.startswith("_") or name.startswith(PRIME_SESSION_PREFIX)
+
+
 def _checkpoint_live_sessions() -> int:
     """Persist the owner, cwd, and exact Claude conversation for live tabs."""
     checkpointed = 0
     for session in get_tmux_sessions():
         name = str(session.get("name") or "")
-        if not name:
+        if not name or _is_ephemeral_session(name):
             continue
         owner_id = _session_owner_id(name)
         resume_uuid = _session_convo(name)
+        # An id with no transcript is stale as well as unusable: the pane is
+        # running some OTHER conversation (the recorded one was never written,
+        # so Claude cannot be in it). Re-learn rather than checkpoint a pointer
+        # to nothing, but keep the old id if the pane will not name a better one.
+        if resume_uuid and _conversation_state(name, resume_uuid) != "saved":
+            try:
+                _clear_session_convo(name)
+                relearned = _learn_session_convo(name)
+                if relearned:
+                    logger.info("Session '%s': recorded conversation %s has no "
+                                "transcript, corrected to %s", name, resume_uuid, relearned)
+                    resume_uuid = relearned
+                else:
+                    _set_session_convo(name, resume_uuid)
+            except Exception:
+                _set_session_convo(name, resume_uuid)
+                logger.debug("Could not re-learn conversation for '%s'", name, exc_info=True)
         if not resume_uuid:
             try:
                 resume_uuid = _learn_session_convo(name)
@@ -8870,6 +8908,7 @@ def _durable_session_candidates(live_names: set[str]) -> list[dict]:
         row = rows.get(name)
         if (
             name in live_names
+            or _is_ephemeral_session(name)
             or not isinstance(row, dict)
             or not row.get("managed")
             or str(row.get("desired_state") or "") != "running"
@@ -13554,7 +13593,16 @@ _DEFAULT_BROWSER_SESSION = {
     "id": "default", "name": "Main browser", "slot": 0, "display": 99,
     "rfb_port": int(os.environ.get("CB_DEFAULT_RFB_PORT") or 5900),
     "vnc_port": int(os.environ.get("CB_DEFAULT_VNC_PORT") or 6080),
-    "cdp_port": 9222, "managed": False,
+    "cdp_port": 9222,
+    # `managed` says who starts the thing. False by default because on the hosts
+    # this began on, display :99 belongs to a systemd unit (claude-vnc) that owns
+    # the browser's whole lifecycle and the dashboard must not fight it. A box
+    # built without such a unit has the opposite problem: the default browser is
+    # the ADMIN's account browser (_browser_owner_id maps it to "admin"), so with
+    # nobody managing it the owner is the one person on the box whose browser can
+    # never start, while every other account's does (lisa-claude, 2026-08-27).
+    # Set CB_DEFAULT_MANAGED=1 there and the same launcher runs it.
+    "managed": os.environ.get("CB_DEFAULT_MANAGED", "") == "1",
     "external_url": os.environ.get("CB_DEFAULT_EXTERNAL_URL", ""),
 }
 
