@@ -8359,8 +8359,7 @@ async def api_refresh_all_tiers(session_name: str):
     return JSONResponse(build_session_response(sess, entry, activity=activity))
 
 
-@app.get("/api/status")
-async def api_status(request: Request):
+async def _activity_payload(request: Request) -> JSONResponse:
     """Lightweight: return only activity status per session, no LLM calls."""
     user = _current_user(request)
     sessions = _filter_sessions_for_user(get_tmux_sessions(), user)
@@ -8383,6 +8382,24 @@ async def api_status(request: Request):
             **_session_auth_fields(sess["name"]),
         })
     return JSONResponse(out)
+
+
+# Busy -> idle is only ever learned from this poll, so it has TWO paths on
+# purpose. Measured on builder5 2026-09-21: one browser ran ~2,175 poll ticks
+# over six hours and not a single GET /api/status left it, while every other
+# fetch made from the same function body arrived normally. Nothing server-side
+# can drop a request that never reaches the server, so what was being filtered
+# was that one URL on that one client. The twin carries the identical payload
+# under a name nothing has an opinion about, and the page falls back to it after
+# three misses in a row.
+@app.get("/api/status")
+async def api_status(request: Request):
+    return await _activity_payload(request)
+
+
+@app.get("/api/activity")
+async def api_activity(request: Request):
+    return await _activity_payload(request)
 
 
 @app.get("/api/sessions/{session_name}/raw")
@@ -22434,7 +22451,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-tools-usage-bar{flex:1;height:5px;background:#21262d;border-radius:3px;overflow:hidden;position:relative}
 .nav-tools-usage-pct{color:#8b949e;font-size:.7rem;width:38px;text-align:right;font-variant-numeric:tabular-nums}
 .nav-tools-usage-divider{height:1px;background:#21262d;margin:8px 0 0 0}
+/* Normally mute: "Watching for changes..." is noise once you trust the page.
+   The one thing worth the room is the page admitting it has STOPPED watching:
+   a stale red pill is indistinguishable from a live one, so say it out loud. */
 .nav-status-text{display:none}
+.nav-status-text.poll-stalled{display:inline-flex;align-items:center;gap:6px;background:#3a2d0b;color:#d29922;border:1px solid #5a4510;border-radius:999px;padding:3px 10px;font-size:.7rem;font-weight:600;white-space:nowrap}
 .nav-refresh-btn{background:#1f6feb;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;white-space:nowrap;flex-shrink:0}
 .nav-refresh-btn:hover{background:#388bfd}
 .nav-new-btn{background:#238636;color:#fff;border:none;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:1.2rem;font-weight:700;line-height:1;flex-shrink:0;display:flex;align-items:center;justify-content:center;margin-right:8px}
@@ -23624,6 +23645,9 @@ body.member-simple .hide-in-simple{display:none!important}
   .nav-item{padding:8px 10px;gap:5px}
   .nav-attached{display:none}
   .nav-status-text{display:none}
+  /* Even on a phone the stall warning stays: it is the difference between a
+     page that is live and one that only looks it. */
+  .nav-status-text.poll-stalled{display:inline-flex;font-size:.65rem;padding:2px 8px}
   /* The browser badge, the usage bars and the CPU/RAM readout are moved out of
      the header entirely (syncMobileBottomBar) — they are glanceable, not
      interactive, and the tabs need the room more. They now render at the very
@@ -28392,6 +28416,24 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// The status poll is the ONLY thing that ever moves a session from busy back to
+// idle, and until now nothing watched it. One request that never answered, one
+// throw inside the interval callback, one tab the browser froze and resumed
+// without its timers, and the page sat on its last reading for ever with a red
+// pill that looked live, and the reload was the only cure, which is exactly the
+// symptom that was reported. So a second, cheap clock supervises the first: if
+// no poll has SUCCEEDED for half a minute it re-arms the timer and pokes it.
+// 17s so it cannot fall into step with the 10s poll and double every tick.
+setInterval(function(){
+  if(Date.now()-_lastPollOk<30000)return;
+  if(!pollTimer)startStatusPolling();
+  try{pollStatus()}catch(e){}
+  _paintPollHealth();
+  // A minute with nothing from either poll URL: take the slow road rather than
+  // leave the page frozen. Only ever reached when the page is already broken.
+  if(Date.now()-_lastPollOk>60000)_recoverStatusFromSessions();
+},17000);
+
 // A hidden tab has its timers throttled by the browser to about once a minute,
 // and nothing caught up on return — so coming back to the dashboard showed a
 // status up to a minute stale, which is exactly what "it only updates when I
@@ -28453,11 +28495,78 @@ async function pollStatus(){
   _pollInFlight=true;
   try{await _pollStatusOnce()}finally{_pollInFlight=false}
 }
+// Two URLs for one payload, and the page swaps between them after three misses
+// in a row. Measured on builder5 2026-09-21: a browser ran ~2,175 poll ticks
+// over six hours and not one GET /api/status left it, while /api/stats and
+// /api/auth/claude-status, issued from the last two lines of this very
+// function, arrived every time. A request that never reaches the server cannot
+// be fixed on the server, so the second name is the way out.
+const _STATUS_URLS=['/api/status','/api/activity'];
+let _statusUrlIdx=0;
+let _pollFails=0;
+let _lastPollOk=Date.now();
+// A poll that never answers used to hold _pollInFlight for ever, and every tick
+// after it returned at the first line: no request, no error, no sign. Eight
+// seconds is comfortably longer than this endpoint takes even while it walks a
+// dozen tmux panes, and an abort at least fails LOUDLY.
+async function _fetchStatus(){
+  const url=BASE+_STATUS_URLS[_statusUrlIdx];
+  if(typeof AbortController!=='function')return fetch(url);
+  const ctl=new AbortController();
+  const t=setTimeout(()=>ctl.abort(),8000);
+  try{return await fetch(url,{signal:ctl.signal})}
+  finally{clearTimeout(t)}
+}
+let _lastRecoveryOk=0;
+// Third and last channel, for the case where BOTH poll URLs are silent.
+// /api/sessions-fast carries the same activity fields down a completely
+// different path, and every page load proves it gets through: it is exactly
+// why reloading "fixed" the frozen pills. Heavier, so it only runs once the
+// poll has been dead for a minute.
+async function _recoverStatusFromSessions(){
+  try{
+    const resp=await fetch(BASE+'/api/sessions-fast');
+    if(!resp.ok)return;
+    const list=await resp.json();
+    for(const s of list){
+      trackSessionStatus(s.name,s.activity_status);
+      const si=sessions.findIndex(x=>x.name===s.name);
+      if(si>=0){
+        sessions[si].activity_status=s.activity_status;
+        sessions[si].activity_detail=s.activity_detail||'';
+      }
+      updateStatusPill(s.name,s.activity_status,s.activity_detail);
+      if(s.name===selectedSession)updateFavicon(s.activity_status);
+    }
+    _lastRecoveryOk=Date.now();
+    _paintPollHealth();
+  }catch(e){}
+}
+// What the header says while the live channel is down. Silence here is what let
+// a frozen page pass for a live one, so name the state and keep the age on it.
+function _paintPollHealth(){
+  if(!statusInfoEl)return;
+  const stalled=_pollFails>0&&Date.now()-_lastPollOk>25000;
+  statusInfoEl.classList.toggle('poll-stalled',stalled);
+  if(!stalled)return;
+  if(Date.now()-_lastRecoveryOk<45000){
+    statusInfoEl.textContent='Live status on the backup path';
+    return;
+  }
+  const secs=Math.round((Date.now()-_lastPollOk)/1000);
+  statusInfoEl.textContent='Live status stalled '+(secs<120?secs+'s':Math.round(secs/60)+'m')+' - retrying';
+}
 async function _pollStatusOnce(){
   try{
-    const resp=await fetch(BASE+'/api/status');
+    const resp=await _fetchStatus();
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
     _checkBuild(resp);
     const statuses=await resp.json();
+    _pollFails=0;
+    _lastPollOk=Date.now();
+    // Guarded: this runs BEFORE the statuses are applied, so a missing header
+    // element must not be able to throw the whole poll into the catch arm.
+    if(statusInfoEl)statusInfoEl.classList.remove('poll-stalled');
     let changed=false;
     for(const st of statuses){
       const prev=lastStatus[st.name];
@@ -28521,7 +28630,19 @@ async function _pollStatusOnce(){
       }
     }
     if(!changed)statusInfoEl.textContent='Watching for changes...';
-  }catch(e){statusInfoEl.textContent='Status poll failed'}
+  }catch(e){
+    _pollFails++;
+    // Three in a row is not a slow box, it is a path that is not working. Swap
+    // URLs every third miss, so each name gets the same three chances and the
+    // page settles on whichever one actually answers.
+    if(_pollFails%3===0)_statusUrlIdx=(_statusUrlIdx+1)%_STATUS_URLS.length;
+    _paintPollHealth();
+    // One off-cycle second chance, and only the first time: a single dropped
+    // request should cost a moment, not a whole tick. Retrying every failure
+    // would turn a blocked URL into a 1.5s loop that also drags the stats and
+    // auth calls at the end of this function along with it.
+    if(_pollFails===1)setTimeout(function(){try{pollStatus()}catch(e2){}},1500);
+  }
   _authPollCount++;
   if(_authPollCount%5===0)checkClaudeAuth();
   // Refresh inline server stats every 3rd poll (~30s)
@@ -28655,34 +28776,34 @@ function _applyUsageLimits(data){
   const fhPct=Math.round(Number(fh.utilization)||0);
   const sdPct=Math.round(Number(sd.utilization)||0);
   const staleNote=data.stale?' · last known value (upstream unreachable)':'';
-    // Which account, and when it was read. Without these a live 0% is
-    // indistinguishable from a dead widget — which is exactly how it reads
-    // after a box is signed in to a second, unused account.
-    const acct=data.account||{};
-    const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
-    let readNote='';
-    if(data.fetched_at){
-      const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
-      readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
-    }
-    // Where the number came from, and whether spend has moved to overage credits
-    // (the 7-day window being spent is exactly when that starts to cost money).
-    const srcNote=data.source==='ratelimit_headers'
-      ? ' · read from the rate-limit headers on a 1-token probe (the account usage API needs a credential this host does not have)'
-      : '';
-    const ovNote=(data.overage&&data.overage.in_use)
-      ? ' · ⚠ plan window spent — running on overage credits'+
-        (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
-      : '';
-    // Anthropic returns resets_at null for a window nothing has been spent in
-    // yet, so "resets " used to trail off into blank space — which reads as a
-    // broken widget at exactly the moment the honest answer is "this window just
-    // rolled over". Say that instead.
-    const _when=(blk,pct)=>{
-      const t=_fmtResetTime(blk.resets_at);
-      if(t)return'resets '+t;
-      return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
-    };
+  // Which account, and when it was read. Without these a live 0% is
+  // indistinguishable from a dead widget — which is exactly how it reads
+  // after a box is signed in to a second, unused account.
+  const acct=data.account||{};
+  const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
+  let readNote='';
+  if(data.fetched_at){
+    const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
+    readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
+  }
+  // Where the number came from, and whether spend has moved to overage credits
+  // (the 7-day window being spent is exactly when that starts to cost money).
+  const srcNote=data.source==='ratelimit_headers'
+    ? ' · read from the rate-limit headers on a 1-token probe (the account usage API needs a credential this host does not have)'
+    : '';
+  const ovNote=(data.overage&&data.overage.in_use)
+    ? ' · ⚠ plan window spent — running on overage credits'+
+      (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
+    : '';
+  // Anthropic returns resets_at null for a window nothing has been spent in
+  // yet, so "resets " used to trail off into blank space — which reads as a
+  // broken widget at exactly the moment the honest answer is "this window just
+  // rolled over". Say that instead.
+  const _when=(blk,pct)=>{
+    const t=_fmtResetTime(blk.resets_at);
+    if(t)return'resets '+t;
+    return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
+  };
   const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
   const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
   [[_USAGE_5H_IDS,Number(fh.utilization)||0,fhPct,fhTitle],
