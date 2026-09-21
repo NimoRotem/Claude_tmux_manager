@@ -53,6 +53,14 @@ import httpx
 import websockets
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+#  ONE KEY PER JOB, not one key per box. This dashboard spends metered OpenAI money
+#  on two unrelated things: the voice endpoints (the composer's microphone and the
+#  spoken reply) and small LLM tasks (chat-mode summaries, session titles). Sharing
+#  one key made the daily figure unreadable, which is the whole reason a spend line
+#  naming a box turned out to be naming a KEY. Both fall back to OPENAI_API_KEY, so
+#  a box whose keys have not been split yet behaves exactly as before.
+OPENAI_VOICE_KEY = os.environ.get("OPENAI_VOICE_KEY", "") or OPENAI_API_KEY
+OPENAI_TASKS_KEY = os.environ.get("OPENAI_TASKS_KEY", "") or OPENAI_API_KEY
 PORT = int(os.environ.get("TMUX_DASH_PORT", "8501"))
 ROOT_PATH = os.environ.get("TMUX_DASH_ROOT_PATH", "/tmux")
 NEW_SESSION_CMD = os.environ.get("TMUX_DASH_NEW_SESSION_CMD", "")  # e.g. "claude"
@@ -559,7 +567,7 @@ def _git_identity_for(user, owner_name: str):
             GIT_OWNER_EMAIL or _git_config_value("user.email")
             or "%s@%s" % (owner_name, GIT_EMAIL_DOMAIN))
 
-client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = openai.AsyncOpenAI(api_key=OPENAI_TASKS_KEY)
 
 # Auto-summarizer (LLM session title/description/progress/notes + realtime fallback).
 # Removed/disabled by default: it issued a continuous stream of gpt-4o-mini calls,
@@ -1008,14 +1016,16 @@ def _load_simple_watchdog_disabled():
         logger.debug("Failed to load simple-watchdog disabled list", exc_info=True)
 
 
-# --- Auto-push mode (per session): "off" | "basic" | "full" ---
+# --- Auto-push mode (per session): "off" | "basic" | "cache" | "full" ---
 # Governs how much the dashboard is allowed to type into a session's terminal on
 # the user's behalf when Claude stops or waits:
 #   off   — never write anything at all (no option-picking, no Enter on prompts,
 #           no auto /login, no free-form "keep going" messages).
 #   basic — auto-pick from Claude's option menus and confirm permission/plan
 #           prompts (press Enter), and keep the session logged in. Does NOT type
-#           any free-form instructions.
+#           any free-form instructions. It is not blind: a menu option that exits,
+#           logs out or spends money is never picked, whichever mode is on
+#           (_safe_menu_choice), and nothing it types can end the session.
 #   full  — everything in "basic" PLUS the autopilot watchdog that composes and
 #           types a "keep going" message when Claude pauses waiting on the user
 #           before a task is finished. (This was the previous always-on behavior.)
@@ -1030,14 +1040,35 @@ def _load_simple_watchdog_disabled():
 # finished report that ended "the decision waiting for you is direction" and
 # typed a new task into that session. Overriding a legitimate hand-back is the
 # reason "full" is opt-in per session rather than the default.
-#   basic+  : everything in "basic" PLUS a keep-alive that re-reads the prompt
-#           cache shortly before it would expire. See the cache block below.
-#           It never composes a task: it sends one fixed continue instruction,
-#           which is what makes it safe where "full" is not.
-AUTOPUSH_MODES = ("off", "basic", "basicplus", "full")
+#   cache : everything in "basic" PLUS a keep-alive shortly before the prompt
+#           cache would expire, so the session is still warm when its owner is
+#           back. Called "Basic +" until 2026-09-17, and stored as "basicplus",
+#           which is still accepted and read as "cache". It used to send one fixed
+#           "continue, re-verify" line, the same words every hour; it now drafts
+#           the next step the owner would most likely ask for, from their own
+#           messages and the agent's replies (_compose_cache_prompt). Held to
+#           safe, in-scope work, and it stops after CACHE_KEEPALIVE_MAX_CHAIN
+#           pushes nobody answered.
+AUTOPUSH_MODES = ("off", "basic", "cache", "full")
+AUTOPUSH_ALIASES = {"basicplus": "cache", "basic+": "cache"}
 AUTOPUSH_DEFAULT = "basic"
 AUTOPUSH_MODE_FILE = MESSAGES_DIR / "autopush-mode.json"
 _autopush_mode: Dict[str, str] = {}
+
+# When a PERSON last typed into each session through the dashboard (a message,
+# or a key from the key bar). Everything that types on its own reads this first:
+# a login prompt a human opened a minute ago is theirs, not a stranded one, and
+# a keep-alive chain restarts its count the moment somebody is back.
+_human_input_at: Dict[str, float] = {}
+
+
+def _note_human_input(session_name: str) -> None:
+    _human_input_at[session_name] = time.time()
+
+
+def _seconds_since_human_input(session_name: str) -> float:
+    at = _human_input_at.get(session_name)
+    return time.time() - at if at else float("inf")
 
 # ── Prompt cache expiry ─────────────────────────────────────────────────────
 # Anthropic's prompt cache is ephemeral with one of two lifetimes: 5 minutes by
@@ -1061,19 +1092,26 @@ _autopush_mode: Dict[str, str] = {}
 # (usage.cache_read_input_tokens > 0), which is a measurement rather than a
 # prediction: non-zero means the cache was warm at that moment and its timer was
 # refreshed then. That is the honest signal, and it is what the UI reports.
-CACHE_WARN_LEAD = 600      # start warning 10 minutes before the cache goes cold
-# And make a NOISE five minutes before, once. The blink above is for a screen
-# you are looking at; this is for one you are not. Two thresholds on purpose:
-# seeing it start to blink is a nudge you can ignore, hearing it is the last
-# call, and collapsing them into one number would mean either a chime ten
-# minutes out (too early to act on, so it becomes background noise) or no
-# visible warning until five (too late to notice across a room).
-CACHE_BEEP_LEAD = 300
+# Two leads, on purpose in this order:
+#   * CACHE_ALERT_LEAD, 15 minutes out: the page flashes the idle dot (in the
+#     session, its header tab and the favicon, whichever tab you are on) and
+#     beeps once, 4 rapid beeps, 8 on the High idle nudge. That is the call to
+#     come back and send something yourself, whatever the auto-push mode.
+#   * CACHE_PUSH_LEAD, 10 minutes out: a Cache-mode session sends its own next
+#     step. Five minutes after the alert, so a person who heard it gets first go.
+CACHE_ALERT_LEAD = 900
+CACHE_PUSH_LEAD = 600
 CACHE_KEEPALIVE_MIN_TTL = 600   # pointless on a short cache: the nudge would be
                                 # more or less continuous, so leave those alone.
+# The line sent when no better one can be drafted: the model is unreachable, the
+# session has no conversation to read, or the draft failed a safety check.
 CACHE_KEEPALIVE_PROMPT = (
     "Continue. re-verify your own work end to end, then finish whatever is still left."
 )
+# Pushes in a row with nobody answering in between. Each one starts a real turn
+# on the plan's usage limits, so a session left in Cache mode over a weekend
+# must not work all weekend: after this many it stops until a person types.
+CACHE_KEEPALIVE_MAX_CHAIN = 8
 
 
 def _cache_deadline(sess: dict) -> float:
@@ -1090,9 +1128,15 @@ def _cache_deadline(sess: dict) -> float:
     return end + ttl if ttl and end else 0.0
 
 
+def _normalize_autopush_mode(mode) -> str:
+    """A mode id as stored today: lower-case, legacy names mapped, '' if unknown."""
+    m = str(mode or "").strip().lower()
+    m = AUTOPUSH_ALIASES.get(m, m)
+    return m if m in AUTOPUSH_MODES else ""
+
+
 def _get_autopush_mode(session_name: str) -> str:
-    m = _autopush_mode.get(session_name, AUTOPUSH_DEFAULT)
-    return m if m in AUTOPUSH_MODES else AUTOPUSH_DEFAULT
+    return _normalize_autopush_mode(_autopush_mode.get(session_name)) or AUTOPUSH_DEFAULT
 
 
 def _save_autopush_mode():
@@ -1110,7 +1154,8 @@ def _load_autopush_mode():
             data = json.loads(AUTOPUSH_MODE_FILE.read_text())
             if isinstance(data, dict):
                 _autopush_mode = {
-                    str(k): v for k, v in data.items() if v in AUTOPUSH_MODES
+                    str(k): _normalize_autopush_mode(v) for k, v in data.items()
+                    if _normalize_autopush_mode(v)
                 }
     except Exception:
         logger.debug("Failed to load autopush-mode map", exc_info=True)
@@ -1176,6 +1221,81 @@ def _neighbours_sharing_cwd(session_name: str) -> list:
     return out
 
 
+def _conversation_exists(session_name: str, convo_uuid: str) -> bool:
+    """True if Claude Code has a saved, RESUMABLE transcript for this id.
+
+    `--resume <id>` on a conversation that was never written makes the CLI exit
+    with "No conversation found", dropping the pane to a bare shell, which then
+    reads as "Claude isn't running" to every action."""
+    return _conversation_state(session_name, convo_uuid) == "saved"
+
+
+# A transcript that holds no turn at all. `/exit` on a session that never got a
+# message still writes `<id>.jsonl` with two bookkeeping lines (mode and
+# permission-mode) and nothing else. Both relaunch flags then fail on it: the CLI
+# answers `--resume` with "No conversation found" and `--session-id` with
+# "Session ID ... is already in use" (it only stats the file). That pair is what
+# left calandar and lisa-solver at a bare shell on 2026-09-17.
+_TRANSCRIPT_TURN_TYPES = ("user", "assistant")
+
+
+def _transcript_has_turns(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"type"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("type") in _TRANSCRIPT_TURN_TYPES:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _conversation_state(session_name: str, convo_uuid: str) -> str:
+    """'saved' (resumable), 'stub' (file with no turns), or 'missing'."""
+    if not (convo_uuid and _UUID_RE.fullmatch(str(convo_uuid))):
+        return "missing"
+    try:
+        target = convo_uuid + ".jsonl"
+        for f in _find_session_jsonl_files(session_name):
+            if os.path.basename(f) == target:
+                return "saved" if _transcript_has_turns(f) else "stub"
+    except Exception:
+        logger.debug("conversation existence check failed for %s", session_name, exc_info=True)
+    return "missing"
+
+
+def _set_aside_stub_transcript(session_name: str, convo_uuid: str) -> None:
+    """Rename an empty `<id>.jsonl` so `--session-id <id>` can start on it.
+
+    Renamed rather than deleted: it holds nothing but two mode lines, but it is
+    not ours to destroy, and the suffix says exactly why it moved."""
+    try:
+        target = convo_uuid + ".jsonl"
+        for f in _find_session_jsonl_files(session_name):
+            if os.path.basename(f) == target and not _transcript_has_turns(f):
+                os.replace(f, f + ".no-turns-%d" % int(time.time()))
+                logger.info("Set aside empty transcript %s for '%s' so it can relaunch",
+                            target, session_name)
+    except Exception:
+        logger.debug("could not set aside stub transcript for %s", session_name, exc_info=True)
+
+
+def _fresh_or_resume_flag(session_name: str, convo_uuid: str) -> str:
+    """`--resume` on a saved conversation, else `--session-id` on the same id."""
+    state = _conversation_state(session_name, convo_uuid)
+    if state == "saved":
+        return "--resume " + convo_uuid
+    if state == "stub":
+        _set_aside_stub_transcript(session_name, convo_uuid)
+    return "--session-id " + convo_uuid
+
+
 def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """The resume flag for relaunching this pane's Claude, in order of trust.
 
@@ -1191,7 +1311,7 @@ def _resume_flag(session_name: str, resume_uuid: str = None) -> str:
     """
     uuid_s = resume_uuid or _session_convo(session_name)
     if uuid_s and _UUID_RE.fullmatch(uuid_s):
-        return "--resume " + uuid_s
+        return _fresh_or_resume_flag(session_name, uuid_s)
     guessed = _find_session_transcript_uuid(session_name)
     if guessed:
         _set_session_convo(session_name, guessed)
@@ -1331,12 +1451,16 @@ async def lifespan(_app: FastAPI):
     logger.info("tmux Dashboard starting up — port=%s, root_path=%s, auth=%s, openai=%s",
                 PORT, ROOT_PATH,
                 "enabled" if AUTH_PASS else "disabled",
-                "configured" if OPENAI_API_KEY else "missing")
+                "tasks=%s voice=%s" % ("set" if OPENAI_TASKS_KEY else "missing",
+                                       "set" if OPENAI_VOICE_KEY else "missing"))
     if not AUTH_PASS:
         logger.warning("TMUX_DASH_PASS is not set — authentication is DISABLED. "
                        "Set TMUX_DASH_PASS to enable auth.")
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set — LLM summaries will not work.")
+    if not OPENAI_TASKS_KEY:
+        logger.warning("No OPENAI_TASKS_KEY (or OPENAI_API_KEY): LLM summaries will not work.")
+    if not OPENAI_VOICE_KEY:
+        logger.warning("No OPENAI_VOICE_KEY (or OPENAI_API_KEY): the mic and spoken replies "
+                       "will answer 503.")
     if not os.environ.get("TMUX_DASH_SECRET"):
         logger.warning("TMUX_DASH_SECRET is not set — auth tokens will be invalidated on restart. "
                        "Set a persistent secret for stable sessions.")
@@ -1398,8 +1522,8 @@ async def lifespan(_app: FastAPI):
 
     cache_keepalive_task = asyncio.create_task(_cache_keepalive_loop())
     _background_tasks.append(cache_keepalive_task)
-    logger.info("Cache keep-alive started (Basic+ sessions, %ds before the cache goes cold)",
-                CACHE_WARN_LEAD)
+    logger.info("Cache keep-alive started (Cache sessions, %ds before the cache goes cold)",
+                CACHE_PUSH_LEAD)
 
     tmp_watchdog_task = asyncio.create_task(_tmp_watchdog_loop())
     _background_tasks.append(tmp_watchdog_task)
@@ -2319,8 +2443,8 @@ def _render_page(kind: str, prefix: str) -> str:
     out = (HTML_PAGE if kind == "dash" else LOGIN_PAGE).replace("__ROOT_PATH__", prefix)
     # One definition of "approaching cold": the page blinks on the same number of
     # seconds the keep-alive pushes on, so the warning and the action agree.
-    out = out.replace("__CACHE_WARN_LEAD__", str(CACHE_WARN_LEAD))
-    out = out.replace("__CACHE_BEEP_LEAD__", str(CACHE_BEEP_LEAD))
+    out = out.replace("__CACHE_PUSH_LEAD__", str(CACHE_PUSH_LEAD))
+    out = out.replace("__CACHE_ALERT_LEAD__", str(CACHE_ALERT_LEAD))
     _page_cache[key] = out
     return out
 
@@ -4481,24 +4605,15 @@ def _approve_anthropic_key(cfg_dir: Path, key: str):
 
 
 def _set_api_key_helper(cfg_dir: Path):
-    """Point Claude Code at the shared API key via settings.json `apiKeyHelper`.
-    Interactive claude does NOT honor a bare ANTHROPIC_API_KEY env var for
-    inference (it falls back to /login), but apiKeyHelper authenticates reliably —
-    and the key stays in a 0600 file rather than the terminal scrollback."""
-    sp = cfg_dir / "settings.json"
-    try:
-        s = json.loads(sp.read_text()) if sp.exists() else {}
-        if not isinstance(s, dict):
-            s = {}
-    except Exception:
-        s = {}
-    s["apiKeyHelper"] = "cat " + shlex.quote(str(ANTHROPIC_API_KEY_FILE))
-    try:
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        _backup_before_dashboard_write(sp)
-        sp.write_text(json.dumps(s, indent=2))
-    except Exception:
-        logger.debug("Failed to set apiKeyHelper in %s", sp, exc_info=True)
+    """Refused: this used to point Claude Code at the metered key via settings.json
+    `apiKeyHelper`, which authenticates whether or not a plan is available.
+
+    A config dir gets the subscription plan and nothing else (owner rule
+    2026-09-20). Left in place as a refusal rather than deleted because the whole
+    point of the failure it caused elsewhere is that it was SILENT: a route that
+    quietly fell back to a metered key billed for hours and nothing looked wrong.
+    `_remove_api_key_helper` still runs, so a dir armed before today gets cleaned."""
+    logger.warning("Refusing to arm apiKeyHelper in %s: plan-only policy", cfg_dir)
 
 
 def _remove_subscription_creds(cfg_dir: Path):
@@ -4513,11 +4628,11 @@ def _remove_subscription_creds(cfg_dir: Path):
 
 
 def _apply_api_key_auth(cfg_dir: Path):
-    """Configure a config dir to authenticate via the shared API key."""
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    _remove_subscription_creds(cfg_dir)
-    _set_api_key_helper(cfg_dir)
-    _approve_anthropic_key(cfg_dir, _stored_anthropic_key)
+    """Refused, and it never reaches the plan credential. This used to UNLINK the
+    subscription token first and then arm the metered key, so a caller that hit it
+    by accident left the dir unable to use the plan at all."""
+    logger.warning("Refusing API-key auth for %s: plan-only policy", cfg_dir)
+    _apply_subscription_auth(cfg_dir)
 
 
 def _subscription_token_valid() -> bool:
@@ -6620,9 +6735,18 @@ _pane_stability: Dict[str, tuple] = {}
 # Hysteresis for activity detection — prevents rapid busy/idle flickering.
 # Stores per session: {"status": str, "since": float, "consecutive_idle": int, "raw": str}
 _activity_state: Dict[str, dict] = {}
-# Require N consecutive idle readings before switching from busy → idle.
-# At 10s polling interval, 3 readings = ~30 seconds of consistent idle signal.
+# Going busy → idle needs ALL THREE of these, because a session that merely LOOKS
+# finished is the thing that makes the page chime at you for no reason:
+#   * N consecutive idle readings (it was a count alone, and the count was the
+#     bug: several callers poll this, so three readings could land inside a few
+#     seconds of one gap between tool calls),
+#   * IDLE_CONFIRM_SECONDS of wall clock since the first of them, and
+#   * IDLE_TRANSCRIPT_QUIET seconds since the session's own transcript last grew.
+# The transcript is what catches work the pane does not show: a sub-agent writing
+# into the same conversation, or a tool that takes a minute and prints nothing.
 IDLE_CONFIRM_COUNT = 3
+IDLE_CONFIRM_SECONDS = 10
+IDLE_TRANSCRIPT_QUIET = 15
 
 # Pre-compiled regexes for activity detection (hot path — called every ~10s per session)
 _SPINNER_ICONS = r'[✶✽✻☆◆●⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢]'
@@ -6643,11 +6767,61 @@ _AGENTS_RUNNING_RE = re.compile(
     r'\b(?:still\s+running|running|in\s+progress)\b'
     r'|waiting\s+for\s+completion\s+of\s+\d+',
     re.I)
+# The live status line while the turn is blocked on work of its own:
+#   "✻ Waiting for 4 background agents to finish"
+#   "· Waiting for the remaining tasks"
+# It carries no "…" so the spinner patterns above miss it, and no count in the
+# place _AGENTS_RUNNING_RE looks for one. A leading ● is EXCLUDED on purpose:
+# that is the agent's own prose ("● Waiting for the four search agents to finish
+# scanning…"), which stays on screen long after the work is done.
+_RE_WAITING_ON_WORK = re.compile(
+    r'^\s*(?:[✶✽✻☆◆⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✦✧✹✵✴✸❋❊❉✺◇◈⟡⊛⊕⊗▸▹►▻◉◎★♦♢⬡⬢·•]\s+)?'
+    r'waiting\s+(?:for|on)\b[^\n]{0,60}?'
+    r'\b(?:agents?|subagents?|tasks?|forks?|workers?|jobs?|tool\s+calls?|completion|results?)\b',
+    re.I)
+#  THE KEY HINT BAR IS NOT A STATUS LINE. Claude Code parks a list of what the
+#  keys do under the composer:
+#    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · esc to interrupt ·…"
+#  and it lists "esc to interrupt" there on a FINISHED pane too, under the
+#  end-of-turn line, with the composer empty (captured from a real session,
+#  tests/panes/turn_done_agent_list.txt). Reading the phrase off that row is
+#  what pinned a session on a red "Working" pill after its turn was over, and
+#  no staleness escape hatch can save it: a pane with a background-agent list
+#  at the foot never sits byte-identical, because those timers tick.
+_RE_HINT_BAR = re.compile(
+    r'^\s*(?:⏵|\?\s*for shortcuts\b|shift\+tab\b|bypass permissions\b|⧉\s*In\b'
+    r'|↑\s*to (?:edit|recall)\b|←\s*for agents\b|\d+%\s+(?:until|context)\b'
+    r'|✔\s*Update installed\b)', re.I)
+#  The live status row carries the same phrase INSIDE its own parentheses:
+#    "✻ Simmering… (42s · ↓ 1.1k tokens · esc to interrupt)"
+#  That one is painted only while the turn is up, so it is the form worth
+#  trusting. Both shapes are anchored, because the moment anyone works on this
+#  file the words are in the pane as ordinary prose and an unanchored search
+#  reads a grep of this very function as a running turn.
+_RE_ESC_LIVE_SPINNER = re.compile(_SPINNER_ICONS + r'\s+\S[^\n]*\besc to interrupt\b', re.I)
+_RE_ESC_LIVE_PAREN = re.compile(r'\(\s*\d+\s*[hms]\b[^)\n]*\besc to interrupt\b', re.I)
 _RE_THOUGHT = re.compile(r'\(thought for \d+')
 _RE_SHELL_PROMPT = re.compile(r'[\$#%>]\s*$')
 _RE_IDLE_PROMPT = re.compile(r'^[❯➜]\s*$')
 _RE_TIP_CLAUDE = re.compile(r'Tip:.*claude')
 _RE_COMPLETION_MSG = re.compile(r'[A-Z][a-zé]+ for \d+[ms]')
+
+
+def _esc_to_interrupt_live(lines) -> bool:
+    """True when "esc to interrupt" is on Claude Code's LIVE STATUS row.
+
+    False when the only place it appears is the key hint bar, or the agent's own
+    prose, because neither says a turn is running. See _RE_HINT_BAR above for the
+    pane that proved it.
+    """
+    for line in lines:
+        if "esc to interrupt" not in line.lower():
+            continue
+        if _RE_HINT_BAR.match(line):
+            continue
+        if _RE_ESC_LIVE_SPINNER.search(line) or _RE_ESC_LIVE_PAREN.search(line):
+            return True
+    return False
 
 
 _AUTONOMOUS_KEYWORDS = [
@@ -6823,13 +6997,20 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
         while all_lines and not all_lines[-1].strip():
             all_lines.pop()
 
-        # Look at the bottom 6 lines to catch prompt + status bar + separators
-        bottom = all_lines[-6:] if len(all_lines) >= 6 else all_lines
-        bottom_text = "\n".join(bottom)
+        # The prompt, the rules around it and the hint bar. Widened from 6 to 10:
+        # a pane carrying a background-agent list under the hint bar kept the empty
+        # composer just out of reach, so the one row that says "you can type here"
+        # was not being read on exactly the sessions this got wrong.
+        bottom = all_lines[-10:] if len(all_lines) >= 10 else all_lines
 
         # --- Step 1: Check "esc to interrupt" — strongest busy signal ---
-        # This appears in Claude Code's status bar when a task is actively running.
-        has_esc_to_interrupt = "esc to interrupt" in bottom_text
+        # Only where it means something: the live status row, never the key hint
+        # bar under the composer, which lists it on a finished pane too. Read over
+        # the same 25-line window the spinner scan uses, because a pane with a
+        # background-agent list at the foot pushes the status row out of the
+        # bottom six lines this used to look at.
+        has_esc_to_interrupt = _esc_to_interrupt_live(
+            all_lines[-25:] if len(all_lines) >= 25 else all_lines)
 
         # --- Step 2: Check for idle prompt indicators in bottom area ---
         idle_prompt_patterns = [_RE_IDLE_PROMPT, _RE_TIP_CLAUDE, _RE_COMPLETION_MSG]
@@ -6924,6 +7105,13 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
                 info["status"] = "busy"
                 info["detail"] = "Agents running"
                 return info
+            # "✻ Waiting for 4 background agents to finish": the turn is not over,
+            # it is blocked on its own sub-agents. Only while the pane is alive —
+            # a waiting spinner animates, so a frozen one is a leftover.
+            if _RE_WAITING_ON_WORK.match(stripped) and spinner_is_live:
+                info["status"] = "busy"
+                info["detail"] = "Waiting for agents"
+                return info
 
         # --- Step 4: (stability was measured above, before the spinner scan) ---
         # --- Step 5: If idle prompt + no busy signals → truly idle ---
@@ -6932,7 +7120,11 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
             info["detail"] = ""
             return info
 
-        # "esc to interrupt" without a spinner = background tasks running
+        # "esc to interrupt" on the live status row, with no spinner this scan
+        # knows, = something is still interruptible. It is never read off the key
+        # hint bar under the composer: that bar lists the same words on a finished
+        # pane, which is what pinned a finished session on a red "Working" pill
+        # after its turn was over.
         if has_esc_to_interrupt:
             info["status"] = "busy"
             info["detail"] = "Background tasks"
@@ -6969,14 +7161,58 @@ def _classify_pane(session_name: str, visible: str, cmd: str) -> dict:
     return info
 
 
+_transcript_path_cache: Dict[str, tuple] = {}   # name -> (path, resolved_at)
+
+
+def _own_transcript_path(session_name: str) -> str:
+    """This session's OWN transcript file, by the conversation id it was launched
+    on. '' when the id is unknown or the file is not there yet.
+
+    Deliberately not the heuristic match: a neighbour's transcript in the same
+    working directory would report their work as this session's."""
+    hit = _transcript_path_cache.get(session_name)
+    if hit and time.time() - hit[1] < 60:
+        return hit[0]
+    path = ""
+    try:
+        convo = _session_convo(session_name)
+        if convo and _UUID_RE.fullmatch(convo):
+            target = convo + ".jsonl"
+            for f in _find_session_jsonl_files(session_name):
+                if os.path.basename(f) == target:
+                    path = f
+                    break
+    except Exception:
+        logger.debug("transcript path lookup failed for %s", session_name, exc_info=True)
+    _transcript_path_cache[session_name] = (path, time.time())
+    return path
+
+
+def _transcript_quiet_seconds(session_name: str) -> Optional[float]:
+    """How long since this session's transcript last grew, or None if unknown.
+
+    A sub-agent writes into the conversation it was spawned from, and a long tool
+    call appends its result when it lands, so a growing file means the turn is
+    still going even when the pane has nothing new to show."""
+    path = _own_transcript_path(session_name)
+    if not path:
+        return None
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        _transcript_path_cache.pop(session_name, None)
+        return None
+
+
 def detect_activity(session_name: str) -> dict:
     """Debounced activity detection with asymmetric hysteresis.
 
-    - busy → idle: requires IDLE_CONFIRM_COUNT consecutive idle readings (~30s)
-    - idle → busy: immediate (1 reading)
-
-    This prevents flickering when Claude Code briefly shows no spinner
-    between tool calls or streaming chunks.
+    - idle → busy: immediate (one reading).
+    - busy → idle: only once the pane has read idle IDLE_CONFIRM_COUNT times in a
+      row AND for IDLE_CONFIRM_SECONDS, AND this session's transcript has been
+      quiet for IDLE_TRANSCRIPT_QUIET. Anything less calls a gap between tool
+      calls, or a turn waiting on its sub-agents, "finished" — which is what put
+      a completion chime and a cache warning on sessions that were still working.
     """
     raw = _detect_activity_raw(session_name)
     now = time.time()
@@ -6988,6 +7224,7 @@ def detect_activity(session_name: str) -> dict:
             "status": raw["status"],
             "since": now,
             "consecutive_idle": 1 if raw["status"] == "idle" else 0,
+            "idle_since": now if raw["status"] == "idle" else 0,
             "raw": raw,
         }
         return raw
@@ -6998,38 +7235,50 @@ def detect_activity(session_name: str) -> dict:
             "status": "busy",
             "since": now if prev["status"] != "busy" else prev["since"],
             "consecutive_idle": 0,
+            "idle_since": 0,
             "raw": raw,
         }
         return raw
 
     if raw["status"] in ("idle", "unknown"):
         if prev["status"] == "busy":
-            # Trying to transition busy → idle: increment counter but hold busy
+            # Trying to transition busy → idle: hold busy until it has looked
+            # idle for long enough AND nothing is still being written.
             idle_count = prev["consecutive_idle"] + 1
-            if idle_count >= IDLE_CONFIRM_COUNT:
-                # Enough consecutive idle readings — confirm transition
+            idle_since = prev.get("idle_since") or now
+            quiet = _transcript_quiet_seconds(session_name)
+            settled = (idle_count >= IDLE_CONFIRM_COUNT
+                       and now - idle_since >= IDLE_CONFIRM_SECONDS
+                       and (quiet is None or quiet >= IDLE_TRANSCRIPT_QUIET))
+            if settled:
                 _activity_state[session_name] = {
                     "status": raw["status"],
                     "since": now,
                     "consecutive_idle": idle_count,
+                    "idle_since": idle_since,
                     "raw": raw,
                 }
                 return raw
-            else:
-                # Not enough yet — stay busy but record the idle reading
-                _activity_state[session_name] = {
-                    "status": "busy",
-                    "since": prev["since"],
-                    "consecutive_idle": idle_count,
-                    "raw": prev["raw"],  # keep last busy details
-                }
-                return prev["raw"]
+            # Not settled — stay busy but record the idle reading. A transcript
+            # that grew again means work restarted, so the clock starts over.
+            if quiet is not None and quiet < 2:
+                idle_since = now
+                idle_count = 0
+            _activity_state[session_name] = {
+                "status": "busy",
+                "since": prev["since"],
+                "consecutive_idle": idle_count,
+                "idle_since": idle_since,
+                "raw": prev["raw"],  # keep last busy details
+            }
+            return prev["raw"]
         else:
             # Already idle/unknown — stay idle, keep counting
             _activity_state[session_name] = {
                 "status": raw["status"],
                 "since": prev["since"],
                 "consecutive_idle": prev["consecutive_idle"] + 1,
+                "idle_since": prev.get("idle_since") or now,
                 "raw": raw,
             }
             return raw
@@ -7039,6 +7288,7 @@ def detect_activity(session_name: str) -> dict:
         "status": raw["status"],
         "since": now,
         "consecutive_idle": 0,
+        "idle_since": 0,
         "raw": raw,
     }
     return raw
@@ -8176,6 +8426,16 @@ def _create_exact_tmux_session(name: str = "", cwd: str = "") -> tuple[str, str]
         "-F",
         "#{session_id}\t#{session_name}",
     ]
+    #  A SESSION IS NEVER HANDED A METERED KEY (owner rule 2026-09-20). The dashboard keeps its own
+    #  OPENAI_API_KEY for the summaries and the voice endpoints, but a pane must not inherit it: an
+    #  agent that finds a metered key in its environment can end up billing it instead of running
+    #  on the subscription it was given, and that failure is silent, it just costs money. An agent
+    #  runs on its plan and asks the advisor for anything else it needs. tmux has no unset for
+    #  new-session, so the names go through EMPTY, which every consumer reads as absent.
+    for fenced in ("OPENAI_API_KEY", "OPENAI_VOICE_KEY", "OPENAI_TASKS_KEY",
+                   "ANTHROPIC_API_KEY", "CODEX_API_KEY"):
+        if os.environ.get(fenced):
+            command += ["-e", "%s=" % fenced]
     if name:
         command += ["-s", name]
     if cwd:
@@ -8246,7 +8506,7 @@ def _claude_recovery_command(session_name: str, resume_uuid: str) -> str:
     command = (command.strip()
                + _model_flag_for_relaunch(session_name)
                + _effort_flag_for_relaunch(session_name)
-               + " --resume " + resume_uuid)
+               + " " + _fresh_or_resume_flag(session_name, resume_uuid))
     return _managed_agent_command(session_name, command)
 
 
@@ -12411,7 +12671,7 @@ async def api_stats_processes(request: Request):
 @app.get("/api/health")
 async def api_health():
     """Lightweight health check — verifies tmux is accessible."""
-    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_API_KEY)}
+    checks = {"status": "ok", "tmux": False, "openai": bool(OPENAI_TASKS_KEY)}
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -17070,7 +17330,7 @@ async def _auto_fix_login(session_name: str) -> dict:
     for _ in range(20):
         await asyncio.sleep(2)
         pane = await asyncio.to_thread(_pane_text, session_name, 25)
-        if _LOGIN_NEEDED_RE.search(pane) or "paste code here" in pane.lower():
+        if _screen_needs_login(pane) or "paste code here" in pane.lower():
             continue
         if await _async_is_claude_running(session_name):
             _account_ident_cache.clear()
@@ -17168,7 +17428,7 @@ async def _auto_auth_session(session_name: str, reason: str = "") -> dict:
                 if "login successful" in low or "logged in as" in low:
                     ok, why = True, ""
                     break
-                if "paste code here" not in low and not _LOGIN_NEEDED_RE.search(pane):
+                if "paste code here" not in low and not _screen_needs_login(pane):
                     ok, why = True, ""
                     break
             st.update({"running": False, "status": "logged in" if ok else why,
@@ -17367,7 +17627,7 @@ async def api_session_relogin(session_name: str, request: Request):
 @app.post("/api/transcribe")
 async def api_transcribe(audio: UploadFile = File(...)):
     """Transcribe a recorded voice clip to text (for the composer mic button)."""
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = OPENAI_VOICE_KEY
     if not key:
         return JSONResponse({"error": "Transcription is not configured."}, status_code=503)
     try:
@@ -17393,6 +17653,71 @@ async def api_transcribe(audio: UploadFile = File(...)):
         logger.warning("transcribe failed: %s", e)
         return JSONResponse({"error": "Transcription failed."}, status_code=502)
     return JSONResponse({"text": text})
+
+
+# ── Live voice mode: reading a reply out loud ───────────────────────────────
+# The mic button next to the composer has always been one-way: record, whisper,
+# text in the box. Live voice closes the loop on a phone: it listens, sends what
+# you said, and reads the reply back, so a session can be driven with the screen
+# in a pocket. The page handles the listening; this is the other half.
+TTS_MODEL = os.environ.get("TMUX_DASH_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.environ.get("TMUX_DASH_TTS_VOICE", "alloy")
+_TTS_MAX_CHARS = 2000
+
+_SPEECH_STRIP_RE = [
+    (re.compile(r"```.*?```", re.S), " code block. "),   # never read code aloud
+    (re.compile(r"`([^`]*)`"), r"\1"),
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), " "),
+    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),    # a link reads as its words
+    (re.compile(r"^[ \t]*[#>]+[ \t]*", re.M), ""),
+    (re.compile(r"^[ \t]*[-*+][ \t]+", re.M), ""),
+    (re.compile(r"\*\*|__|\*|~~"), ""),
+    (re.compile(r"https?://\S+"), " a link "),
+    (re.compile(r"[ \t]+"), " "),
+    (re.compile(r"\n{2,}"), ". "),
+    (re.compile(r"\n"), ". "),
+]
+
+
+def _plain_for_speech(text: str) -> str:
+    """Markdown as something worth hearing: no backticks, no URLs read letter by
+    letter, no code blocks."""
+    out = str(text or "")
+    for rx, rep in _SPEECH_STRIP_RE:
+        out = rx.sub(rep, out)
+    out = re.sub(r"(?:\.\s*){2,}", ". ", out).strip()
+    return out[:_TTS_MAX_CHARS]
+
+
+class TTSBody(BaseModel):
+    text: str
+    voice: str = ""
+
+
+@app.post("/api/tts")
+async def api_tts(body: TTSBody):
+    """Speak a reply for live voice mode. Returns MP3 bytes."""
+    key = OPENAI_VOICE_KEY
+    if not key:
+        return JSONResponse({"error": "Speech is not configured."}, status_code=503)
+    text = _plain_for_speech(body.text)
+    if not text:
+        return JSONResponse({"error": "Nothing to say."}, status_code=400)
+    voice = body.voice if re.fullmatch(r"[a-z]{3,20}", body.voice or "") else TTS_VOICE
+
+    def _do():
+        c = openai.OpenAI(api_key=key)
+        r = c.audio.speech.create(model=TTS_MODEL, voice=voice, input=text,
+                                  response_format="mp3")
+        return r.read() if hasattr(r, "read") else r.content
+
+    try:
+        audio = await asyncio.to_thread(_do)
+    except Exception as e:
+        logger.warning("tts failed: %s", e)
+        return JSONResponse({"error": "Speech failed."}, status_code=502)
+    return Response(content=audio, media_type="audio/mpeg",
+                    headers={"Cache-Control": "no-store"})
 
 
 # --- Claude Code auth management ---
@@ -17452,18 +17777,22 @@ class SetApiKey(BaseModel):
 
 @app.post("/api/auth/api-key")
 async def api_set_claude_key(body: SetApiKey):
+    """Clearing the stored key works. Storing one does not (owner rule 2026-09-20).
+
+    A stored key was the switch behind everything metered on this box: it flipped
+    the launch banner to "API key", made the one-time config prime approve the key,
+    put the login watchdog into key mode, and gave the session auth toggle something
+    to export. The plan is the only route, so there is nothing to store."""
     key = body.apiKey.strip()
     if key:
-        if not key.startswith(("sk-ant-", "sk-")):
-            return JSONResponse(
-                {"error": "Invalid API key format. Expected key starting with sk-ant- or sk-."},
-                status_code=400,
-            )
-        _save_anthropic_key(key)
-        return JSONResponse({"ok": True, "message": "API key stored."})
-    else:
-        _clear_anthropic_key()
-        return JSONResponse({"ok": True, "message": "API key cleared."})
+        logger.warning("Refused to store an Anthropic API key: plan-only policy")
+        return JSONResponse(
+            {"error": "This dashboard runs sessions on the subscription plan. "
+                      "A metered API key is not stored here."},
+            status_code=409,
+        )
+    _clear_anthropic_key()
+    return JSONResponse({"ok": True, "message": "API key cleared."})
 
 
 @app.post("/api/auth/logout")
@@ -17494,6 +17823,13 @@ _usage_cache: dict = {"ts": 0, "data": {}}
 _ANTHROPIC_LIMITS_CACHE_FILE = MESSAGES_DIR / "usage_limits_cache.json"
 _anthropic_limits_cache: dict = {"ts": 0, "data": None, "fp": "",
                                  "retry_after": 0, "retry_fp": "", "last_error": ""}
+# How long a fetched payload is served before we go back upstream. This was an
+# HOUR, which is a fifth of the 5-hour window: a box whose 5h limit was fully
+# spent sat on screen at 32% until someone reloaded long enough after the fact,
+# and the bar people use to decide whether to start a session was the one number
+# they could not trust. A minute costs at most 60 upstream calls an hour, and the
+# 429 handler above still backs off hard if Anthropic objects.
+ANTHROPIC_LIMITS_TTL = 60
 
 # --- Dedicated credential for the usage bars -------------------------------
 #
@@ -17937,10 +18273,9 @@ def _sanitize_expired_windows(data: object, now_dt: datetime) -> object:
 async def api_anthropic_usage_limits():
     """Fetch live 5h + 7-day rate-limit utilization from Anthropic OAuth usage API.
 
-    Cached for 1 hour per the user-facing requirement (poll hourly while
-    sessions are active). On upstream failure, returns the last good payload.
-    The cache is keyed on the current token, so a login switch busts it at once
-    instead of showing a previous account's usage for up to an hour.
+    Cached for ANTHROPIC_LIMITS_TTL seconds. On upstream failure, returns the
+    last good payload. The cache is keyed on the current token, so a login switch
+    busts it at once instead of showing a previous account's usage.
     """
     now = time.time()
     now_dt = datetime.now(timezone.utc)
@@ -17952,10 +18287,10 @@ async def api_anthropic_usage_limits():
     # was cached (or persisted across a restart) before this field existed still
     # tells the UI whose numbers it is showing.
     acct = _usage_account(token_source)
-    # Serve cache only if fresh (<1h), same token, AND none of its windows have
-    # reset since — otherwise a rolled-over window (e.g. the 7-day limit) keeps
-    # showing its pre-reset peak (100%) for up to an hour after it dropped to ~0.
-    if (now - _anthropic_limits_cache["ts"] < 3600
+    # Serve cache only if fresh, same token, AND none of its windows have reset
+    # since — otherwise a rolled-over window (e.g. the 7-day limit) keeps showing
+    # its pre-reset peak (100%) after it has dropped back to ~0.
+    if (now - _anthropic_limits_cache["ts"] < ANTHROPIC_LIMITS_TTL
             and _anthropic_limits_cache["data"]
             and _anthropic_limits_cache.get("fp") == fp
             and not _usage_windows_expired(_anthropic_limits_cache["data"], now_dt)):
@@ -19742,6 +20077,7 @@ async def api_send_command(session_name: str, body: SendCommand, request: Reques
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
                 capture_output=True, text=True, timeout=5
             )
+        _note_human_input(session_name)
         # Record user message in chat history
         now = time.time()
         entry = cache.setdefault(session_name, {})
@@ -19822,6 +20158,7 @@ async def api_send_keys(session_name: str, body: SendKeys):
                 )
             else:
                 return JSONResponse({"error": f"Key not allowed: {key}"}, status_code=400)
+        _note_human_input(session_name)
         return JSONResponse({"ok": True, "keys_sent": body.keys})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -19856,41 +20193,28 @@ async def api_bracketed_paste_toggle(session_name: str, body: BracketedPasteBody
 
 @app.post("/api/sessions/{session_name}/set-auth-mode")
 async def api_set_auth_mode(session_name: str, body: AuthModeBody):
-    """Toggle between API key and subscription auth for a specific session."""
+    """Put a session on the subscription plan, or clear a stray key out of its pane.
+
+    There used to be an "api" mode here that typed `export ANTHROPIC_API_KEY=...`
+    into the live pane, falling back to scraping an `sk-ant-` literal out of the
+    instruction file when no key was stored. Both halves are gone: a session runs
+    on its plan (owner rule 2026-09-20), and an instruction file is not a place to
+    go looking for a secret. "api" is refused rather than silently downgraded, so
+    anything still asking for it gets told instead of believing it happened."""
     _, sess = _find_session(session_name)
     if not sess:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     try:
         if body.mode == "api":
-            key = _stored_anthropic_key
-            if not key:
-                # Fallback: try to extract from ~/CLAUDE.md
-                try:
-                    claude_md = (Path.home() / "CLAUDE.md").read_text()
-                    for line in claude_md.splitlines():
-                        line = line.strip()
-                        if line.startswith("sk-ant-"):
-                            key = line.split()[0].rstrip(",;")
-                            break
-                        elif "sk-ant-" in line:
-                            m = re.search(r'(sk-ant-\S+)', line)
-                            if m:
-                                key = m.group(1).rstrip(",;")
-                                break
-                except Exception:
-                    logger.debug("Failed to scan credentials file for API key", exc_info=True)
-            if not key:
-                return JSONResponse({"error": "No API key found"}, status_code=400)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "-l",
-                 f"export ANTHROPIC_API_KEY={key}"],
-                capture_output=True, text=True, timeout=5
+            logger.warning(
+                "Refused API-key auth mode for session %s: plan-only policy", session_name
             )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
-                capture_output=True, text=True, timeout=5
+            return JSONResponse(
+                {"error": "A session runs on its subscription plan. API-key auth was removed.",
+                 "mode": _session_auth_mode.get(session_name, "subscription")},
+                status_code=409,
             )
-        elif body.mode == "subscription":
+        if body.mode == "subscription":
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "-l",
                  "unset ANTHROPIC_API_KEY"],
@@ -20205,9 +20529,57 @@ _MENU_PICK_SYSTEM_PROMPT = (
     "to the user (e.g. 'no', 'let me decide', 'I'll do it myself', 'ask me later').\n"
     "- If several options proceed, pick the one that makes the MOST progress with the fewest "
     "future interruptions.\n"
-    "- If genuinely unsure, pick 1.\n"
+    "- NEVER pick an option that exits or quits Claude Code, logs out or signs out, ends the "
+    "session, or spends money (upgrade, buy, add funds, extra usage). Pick the other option.\n"
+    "- If genuinely unsure, pick the safest option that keeps the session running.\n"
     "Reply with ONLY the option number, nothing else."
 )
+
+# ── Options the dashboard never picks on a person's behalf ───────────────────
+# The model is told to avoid these, and it is not trusted to: a failed LLM call
+# falls back to Enter on whatever is highlighted, and Claude Code highlights
+# "No, exit" by default on its bypass-permissions warning. So the pick is checked
+# here, deterministically, whoever made it. Ending the session loses the work in
+# the pane; spending money is not a keystroke to make for someone who is away.
+_MENU_ENDS_SESSION_RE = re.compile(
+    r"\b(?:exit|quit|log\s*-?\s*out|sign\s*-?\s*out|end\s+(?:the\s+|this\s+)?session|"
+    r"close\s+(?:claude|the\s+session)|uninstall|abort)\b",
+    re.I,
+)
+_MENU_SPENDS_MONEY_RE = re.compile(
+    r"\b(?:upgrade|purchase|buy|add\s+(?:funds|credits?)|extra\s+usage|overage|pay\b|billing)",
+    re.I,
+)
+_MENU_PROCEED_RE = re.compile(
+    r"\b(?:yes|proceed|continue|accept|allow|approve|resume|retry|try\s+again|keep\s+going|"
+    r"i\s+accept|trust|confirm|ok)\b",
+    re.I,
+)
+
+
+def _menu_option_forbidden(label: str) -> bool:
+    """True for a menu option the auto-responder must never choose."""
+    label = label or ""
+    return bool(_MENU_ENDS_SESSION_RE.search(label) or _MENU_SPENDS_MONEY_RE.search(label))
+
+
+def _safe_menu_choice(options: list, proposed):
+    """The option number to press, or None to leave the menu for a human.
+
+    `proposed` is the model's pick, or None when it had none (the old fallback
+    pressed Enter on the highlighted row). A forbidden or missing pick is
+    replaced by the best allowed option: one that proceeds, else the first one
+    left. When every option would end the session or spend money, nothing is
+    pressed at all."""
+    allowed = [(n, l) for n, l in options if not _menu_option_forbidden(l)]
+    if not allowed:
+        return None
+    if proposed is not None and any(n == proposed for n, _ in allowed):
+        return proposed
+    for n, l in allowed:
+        if _MENU_PROCEED_RE.search(l):
+            return n
+    return allowed[0][0]
 
 
 def _parse_menu_options(visible_text: str):
@@ -20315,6 +20687,31 @@ async def _auto_responder_loop():
                     options, selected_idx = _parse_menu_options(result.stdout)
                     target = (await _llm_pick_menu_option(name, result.stdout, options)
                               if len(options) >= 2 else None)
+                    if len(options) >= 2:
+                        # No pick means the highlighted row, which is exactly the
+                        # row that has to pass the same check as any other.
+                        proposed = target if target is not None else options[selected_idx][0]
+                        safe = _safe_menu_choice(options, proposed)
+                        if safe is None:
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': every option exits, logs "
+                                        "out or spends money (%s)", name,
+                                        "; ".join(l[:30] for _, l in options))
+                            continue
+                        if safe != proposed:
+                            log.warning("Auto-responder in '%s' refused option %s (%s) and chose "
+                                        "%s instead", name, proposed,
+                                        next((l[:40] for n, l in options if n == proposed), ""),
+                                        safe)
+                        target = safe
+                    else:
+                        cursor_row = next((ln for ln in result.stdout.splitlines()[::-1]
+                                           if ln.strip().startswith("❯")), "")
+                        if _menu_option_forbidden(cursor_row):
+                            _auto_respond_cooldown[name] = now + 50
+                            log.warning("Auto-responder HOLDING '%s': the highlighted option "
+                                        "exits, logs out or spends money", name)
+                            continue
                     if target is not None:
                         chosen = await _select_menu_option(name, options, selected_idx, target)
                     else:
@@ -20510,11 +20907,26 @@ async def _simple_watchdog_send_continue(session_name: str) -> bool:
     return await _simple_watchdog_send_text(session_name, "continue")
 
 
+# Slash commands that end the session, sign it out or throw its context away.
+# Nothing that types on the user's behalf (Full's autopilot, Cache's keep-alive)
+# may send one, whatever composed it.
+_SESSION_ENDING_COMMAND_RE = re.compile(
+    r"^\s*/(?:exit|quit|logout|login|clear|reset|new|resume|rewind|compact|kill)\b", re.I)
+
+
+def _ends_session(text: str) -> bool:
+    return bool(_SESSION_ENDING_COMMAND_RE.search(text or ""))
+
+
 async def _simple_watchdog_send_text(session_name: str, text: str) -> bool:
     """Type a composed reply into the session's Claude Code input box and submit.
     Collapses to a single line so Enter submits the whole message at once."""
     text = " ".join((text or "").split())
     if not text:
+        return False
+    if _ends_session(text):
+        logger.warning("Refused to type %r into '%s': it would end or reset the session",
+                       text[:40], session_name)
         return False
     try:
         # -l sends the text literally (so it isn't interpreted as tmux key names);
@@ -20712,6 +21124,30 @@ async def _simple_watchdog_loop():
 
 # --- Auto /login watchdog: re-authenticate a session when Claude asks for login ---
 
+# Claude Code prints a SOFT notice days before a login lapses, on every launch:
+#   "⚠ Your login expires in 2 days · run /login to renew"
+# The session is signed in and working. "run /login" in that line matched the
+# regex below, so the watchdog took every freshly launched session for a logged
+# out one, pressed Escape, typed /exit and relaunched it: on 2026-09-17 that
+# killed calandar, phonelinebob and lisa-solver on builder2 inside an hour. The
+# notice is stripped before any login test, so it can never trigger a relaunch.
+_LOGIN_RENEWAL_NOTICE_RE = re.compile(
+    r"^.*(?:login|sign[- ]?in|token|credentials?)\s+(?:expires|will expire)\b.*$"
+    r"|^.*/login\s+to\s+renew\b.*$",
+    re.I | re.M,
+)
+
+
+def _strip_login_renewal_notice(text: str) -> str:
+    """The pane text without Claude Code's advance "login expires" notice."""
+    return _LOGIN_RENEWAL_NOTICE_RE.sub("", text or "")
+
+
+def _screen_needs_login(text: str) -> bool:
+    """True only for a real logged-out message, never for the renewal notice."""
+    return bool(_LOGIN_NEEDED_RE.search(_strip_login_renewal_notice(text)))
+
+
 _LOGIN_NEEDED_RE = re.compile(
     r"(?:please run\s+/login|run\s+`?/login`?|type\s+/login|/login\s+to\s+(?:authenticate|continue|log in|sign in)|"
     # "oauth <anything> invalid" matched any line mentioning a third-party OAuth
@@ -20731,20 +21167,70 @@ _LOGIN_CODE_PROMPT_RE = re.compile(
     r"(?:paste|enter)\s+(?:the\s+)?(?:(?:authorization|oauth|login)\s+)?code\b",
     re.I,
 )
-# ── Basic+ : keep the prompt cache warm ─────────────────────────────────────
+# ── Cache: keep the prompt cache warm, and use the turn to move the work on ──
 # The cache is what makes a follow-up cheap, and it expires on a timer that
-# restarts on every turn (see CACHE_WARN_LEAD above). Basic+ spends one cheap
-# turn to restart that timer shortly before it would lapse, so a session left
-# alone over lunch is still warm when its owner comes back.
+# restarts on every turn (see CACHE_PUSH_LEAD above). Cache mode spends one turn
+# to restart that timer shortly before it would lapse, so a session left alone
+# over lunch is still warm when its owner comes back.
 #
-# Deliberately NOT the autopilot. That one screenshots the pane and lets a model
-# compose an instruction, which is why it stays opt-in and off by default: it
-# cannot tell a finished hand-back from a stall, and it has typed a new task
-# into a session that was legitimately done. This sends ONE fixed sentence and
-# never composes anything, so the worst case is a redundant verification pass on
-# work that was already finished.
+# That turn used to carry one fixed line ("Continue. re-verify your own work"),
+# the same words every hour, which bought a redundant verification pass and
+# nothing else. It now carries the step the owner would most likely have asked
+# for next, drafted from the two things the Chat tab already holds: their own
+# messages, and the agent's replies. The draft is held to safe, in-scope work:
+# tests, QA, the clearly missing parts of what was asked for, UI and UX polish,
+# never a new feature nobody asked for, and nothing destructive, costly or
+# outbound. A draft that fails any check below falls back to the fixed line.
+#
+# Still NOT the autopilot ("full"). That one reacts to a screenshot every time
+# the agent pauses, and has typed a new task into a session that was
+# legitimately done. This fires once per cache window, from the conversation
+# rather than the screen, and stops after CACHE_KEEPALIVE_MAX_CHAIN unanswered
+# pushes.
 _CACHE_KEEPALIVE_INTERVAL = 30     # seconds between scans
 _cache_keepalive_state: Dict[str, dict] = {}
+CACHE_PROMPT_MODEL = os.environ.get("TMUX_DASH_CACHE_PROMPT_MODEL", "gpt-5.4-mini")
+_CACHE_PROMPT_MAX_CHARS = 1200
+# Said at the end of every drafted step, in the owner's voice, so the agent knows
+# nobody is there to answer and what "safe" means while that is true.
+_CACHE_PROMPT_AWAY_NOTE = (
+    "I'm away for a while, so make the reasonable calls yourself instead of asking, "
+    "and keep it safe: nothing destructive, no spending, no messages to anyone."
+)
+
+_CACHE_PROMPT_SYSTEM = (
+    "You write the next message a busy project owner would send to their AI coding agent "
+    "(Claude Code or Codex, running in a terminal). The owner has stepped away. The agent is "
+    "idle, and one message now keeps its context warm. Use that message to advance the owner's "
+    "project the way the owner most likely would have.\n\n"
+    "You are given the owner's own messages (their words, in full) and recaps of the agent's "
+    "replies, oldest first, then the agent's latest reply in full, then any messages already sent "
+    "on the owner's behalf while they were away.\n\n"
+    "Work out the OVERALL goal from the owner's messages, then write the single most useful next "
+    "step toward it. Good next steps, roughly in this order:\n"
+    "- Anything the owner asked for that the latest reply says is not done, only partly done, "
+    "skipped or left for later.\n"
+    "- Verifying what was built: tests that are missing, QA of the real thing end to end, "
+    "checking the edge cases the work obviously has.\n"
+    "- Fixing problems or risks the agent itself reported.\n"
+    "- Clear gaps a user of this work would hit, UI and UX polish, docs or cleanup of the change.\n"
+    "You may make executive decisions like the owner would: if the agent asked a question, answer "
+    "it with the sensible choice that fits the owner's goals and say so.\n\n"
+    "Do NOT:\n"
+    "- Start a new feature or direction the owner never asked for.\n"
+    "- Ask for anything destructive or hard to undo (deleting data, dropping tables, force "
+    "pushing, rewriting history), anything that spends money, or anything that contacts people "
+    "(email, SMS, calls, posts).\n"
+    "- Ask for a deploy, publish or release unless the owner's messages show that shipping this "
+    "work is already part of the task.\n"
+    "- Claim anything passed, works or is done, or tell the agent to mark the task complete.\n"
+    "- Tell it to stop, wait, or check with the owner. Do not use slash commands.\n"
+    "- Repeat a message already sent while the owner was away; move on to the next thing.\n\n"
+    "Write as the owner, directly to the agent, in 1 to 4 plain sentences, specific to this "
+    "project (name the file, page, feature or test). Do not add a sign-off: a note that the owner "
+    "is away is appended automatically.\n"
+    'Reply with JSON only: {"prompt": "<the message>"}'
+)
 
 
 def _cache_keepalive_active(session_name: str) -> bool:
@@ -20757,8 +21243,174 @@ def _cache_keepalive_active(session_name: str) -> bool:
     return bool((_cache_keepalive_state.get(session_name) or {}).get("fired_for"))
 
 
+def _visible_pane(session_name: str) -> str:
+    """Exactly what is on screen now, no scrollback: what the typing guards read."""
+    try:
+        r = subprocess.run(["tmux", "capture-pane", "-t", session_name, "-p"],
+                           capture_output=True, text=True, timeout=3)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _session_chat_messages(session_name: str) -> list:
+    entry = cache.get(session_name) or {}
+    msgs = entry.get("messages")
+    if msgs is None:
+        try:
+            msgs = _load_session_messages(session_name)
+        except Exception:
+            msgs = []
+    return [m for m in (msgs or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+
+
+def _human_spoke_since(session_name: str, since: float) -> bool:
+    """Did a person type into this session after `since`?"""
+    if not since:
+        return False
+    if _seconds_since_human_input(session_name) < time.time() - since:
+        return True
+    for m in reversed(_session_chat_messages(session_name)):
+        if m.get("role") == "user" and not m.get("auto"):
+            return float(m.get("ts") or 0) > since
+    return False
+
+
+def _cache_prompt_context(session_name: str, already_sent: list) -> str:
+    """The conversation, as the drafting model reads it. '' when there is none."""
+    msgs = _session_chat_messages(session_name)
+    users = [m for m in msgs if m.get("role") == "user" and not m.get("auto")]
+    if not users:
+        return ""
+    # The first two things the owner asked for usually state the goal; the
+    # recent run says where it stands. Keep both, drop the middle if it is long.
+    first_ids = {id(m) for m in users[:2]}
+    recent = msgs[-14:]
+    keep = [m for m in msgs if id(m) in first_ids and m not in recent] + recent
+    lines = []
+    for m in keep:
+        text = str(m.get("text") or "").strip()
+        if not text:
+            continue
+        if m.get("role") == "user":
+            who = "Sent for the owner while away" if m.get("auto") else "Owner"
+            lines.append("[%s] %s" % (who, text[:3000 if id(m) in first_ids else 1500]))
+        else:
+            lines.append("[Agent, recap] %s" % text[:700])
+    latest = ""
+    newest = msgs[-1] if msgs else {}
+    if newest.get("role") == "assistant" and newest.get("full"):
+        latest = str(newest.get("full"))
+    else:
+        last_user_text = next((str(m.get("text") or "") for m in reversed(msgs)
+                               if m.get("role") == "user"), "")
+        try:
+            latest = _extract_last_assistant_turn(session_name, last_user_text)
+        except Exception:
+            latest = ""
+    cwd = ""
+    try:
+        cwd = get_session_cwd(session_name)
+    except Exception:
+        pass
+    parts = ["Session '%s'%s." % (session_name, (", working in " + cwd) if cwd else "")]
+    parts.append("== Conversation, oldest first ==\n" + "\n\n".join(lines))
+    if latest.strip():
+        parts.append("== The agent's latest reply, in full ==\n" + latest.strip()[-6000:])
+    if already_sent:
+        parts.append("== Already sent for the owner while they were away (do not repeat) ==\n"
+                     + "\n".join("- " + p[:400] for p in already_sent[-5:]))
+    return "\n\n".join(parts)[-24000:]
+
+
+# Stricter than _looks_destructive, which is tuned not to block the autopilot's
+# ordinary "keep going". A drafted step has a harmless fallback (the fixed line),
+# so anything that even names destroying data, rewriting history, spending or
+# contacting people is refused rather than weighed.
+_CACHE_PROMPT_REFUSE_RE = re.compile(
+    r"\b(?:drop|truncate|delete|wipe|erase|purge|destroy|nuke)\b[^.\n]{0,40}?"
+    r"\b(?:tables?|databases?|db|data|records?|rows?|users?|accounts?|buckets?|branch(?:es)?|"
+    r"repo(?:sitory|sitories|s)?|production|prod|backups?|volumes?|disks?|vms?|instances?)\b"
+    r"|\bforce[- ]?push|\bpush\s+(?:--force|-f)\b|\breset\s+--hard\b|\brm\s+-[a-z]*r[a-z]*f"
+    r"|\brebase\b[^.\n]{0,30}\b(?:main|master|shared)\b"
+    r"|\b(?:buy|purchase|pay\s+for|subscribe|upgrade\s+(?:the\s+)?plan|add\s+(?:funds|credits))\b"
+    r"|\b(?:send|email|e-mail|text|sms|call|message|dm|post|tweet)\b[^.\n]{0,30}\b(?:customers?|clients?|"
+    r"users|people|everyone|the\s+team|partners?|vendors?|suppliers?)\b",
+    re.I,
+)
+
+
+def _vet_cache_prompt(draft: str) -> str:
+    """The draft, cleaned, or '' when it must not be sent."""
+    text = " ".join(str(draft or "").split()).strip().strip('"').strip()
+    if len(text) < 12:
+        return ""
+    if text.startswith("/") or _ends_session(text):
+        return ""
+    if _looks_destructive(text) or _asserts_completion(text) or _CACHE_PROMPT_REFUSE_RE.search(text):
+        return ""
+    if len(text) > _CACHE_PROMPT_MAX_CHARS:
+        cut = text[:_CACHE_PROMPT_MAX_CHARS]
+        end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+        text = cut[:end + 1] if end > _CACHE_PROMPT_MAX_CHARS // 2 else cut
+    return text
+
+
+async def _draft_json(system_prompt: str, user_content: str) -> str:
+    """One JSON reply from the drafting model, falling back to the house model."""
+    try:
+        resp = await client.chat.completions.create(
+            model=CACHE_PROMPT_MODEL,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_content}],
+            max_completion_tokens=3000,
+            reasoning_effort="low",
+            response_format={"type": "json_object"},
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        if out:
+            return out
+    except Exception as e:
+        logger.warning("Cache prompt draft on %s failed, falling back: %s", CACHE_PROMPT_MODEL, e)
+    return await llm_call(system_prompt, user_content, max_tokens=500,
+                          response_format={"type": "json_object"})
+
+
+async def _compose_cache_prompt(session_name: str, already_sent: list) -> tuple:
+    """(message to send, 'drafted' | 'fixed')."""
+    context = await asyncio.to_thread(_cache_prompt_context, session_name, already_sent)
+    if not context:
+        return CACHE_KEEPALIVE_PROMPT, "fixed"
+    raw = await _draft_json(_CACHE_PROMPT_SYSTEM, context)
+    draft = ""
+    try:
+        m = re.search(r"\{.*\}", raw or "", re.S)
+        draft = (json.loads(m.group()) if m else {}).get("prompt", "")
+    except Exception:
+        draft = ""
+    vetted = _vet_cache_prompt(draft)
+    if not vetted:
+        if draft:
+            logger.warning("Cache prompt draft for '%s' refused, sending the fixed line: %r",
+                           session_name, str(draft)[:200])
+        return CACHE_KEEPALIVE_PROMPT, "fixed"
+    return vetted + " " + _CACHE_PROMPT_AWAY_NOTE, "drafted"
+
+
+def _record_auto_message(session_name: str, text: str, kind: str) -> None:
+    """Show a message the dashboard sent for the owner in the Chat tab, marked as such."""
+    try:
+        entry = cache.setdefault(session_name, {})
+        if "messages" not in entry:
+            entry["messages"] = _load_session_messages(session_name)
+        entry["messages"].append({"role": "user", "text": text, "ts": time.time(), "auto": kind})
+        _save_messages()
+    except Exception:
+        logger.debug("could not record auto message for %s", session_name, exc_info=True)
+
+
 async def _cache_keepalive_loop():
-    """Push one continue into an idle Basic+ session before its cache goes cold."""
+    """Before an idle Cache session's prompt cache goes cold, send its next step."""
     log = logging.getLogger("cache-keepalive")
     await asyncio.sleep(12)  # let startup settle
     while True:
@@ -20768,7 +21420,7 @@ async def _cache_keepalive_loop():
             sessions_list = await asyncio.to_thread(get_tmux_sessions)
             for sess in sessions_list:
                 name = sess["name"]
-                if _get_autopush_mode(name) != "basicplus":
+                if _get_autopush_mode(name) != "cache":
                     _cache_keepalive_state.pop(name, None)
                     continue
                 try:
@@ -20791,13 +21443,29 @@ async def _cache_keepalive_loop():
                 st = _cache_keepalive_state.setdefault(name, {})
                 # A turn landed after our nudge: the cache clock restarted, so
                 # drop the marker (the session stops showing as maintaining) and
-                # let the deadline test below decide afresh.
+                # let the deadline test below decide afresh. The chain count is
+                # kept: it only restarts when a person types.
                 if st.get("fired_for") and turn_end > st["fired_for"] + 1:
-                    st.clear()
-                if now < deadline - CACHE_WARN_LEAD:
+                    st["fired_for"] = 0
+                if st.get("at") and _human_spoke_since(name, st["at"]):
+                    st.update({"chain": 0, "sent": [], "capped": False})
+                if now < deadline - CACHE_PUSH_LEAD:
+                    continue
+                # Already cold: there is nothing left to keep warm, and the next
+                # turn pays full price whoever sends it.
+                if now >= deadline:
                     continue
                 if st.get("fired_for"):
                     continue          # already pushed for this turn
+                if st.get("chain", 0) >= CACHE_KEEPALIVE_MAX_CHAIN:
+                    if not st.get("capped"):
+                        st["capped"] = True
+                        _simple_watchdog_record(
+                            name, "cache keep-alive paused: %d pushes with nobody replying"
+                            % st["chain"])
+                        log.info("Cache keep-alive paused for '%s' after %d unanswered pushes",
+                                 name, st["chain"])
+                    continue
                 if not await _async_is_claude_running(name):
                     continue
                 # Busy is the point of the exercise: a session that is working is
@@ -20808,35 +21476,45 @@ async def _cache_keepalive_loop():
                     continue
                 if activity.get("status") != "idle":
                     continue
-                try:
-                    vis = await asyncio.to_thread(
-                        subprocess.run,
-                        ["tmux", "capture-pane", "-t", name, "-p"],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    if vis.returncode != 0:
-                        continue
-                    visible = vis.stdout
-                except Exception:
-                    continue
-                # The same three things that make any auto-typing unsafe: a menu
-                # the auto-responder owns, a shell where Claude used to be, and a
+                visible = await asyncio.to_thread(_visible_pane, name)
+                # The same things that make any auto-typing unsafe: a menu the
+                # auto-responder owns, a shell where Claude used to be, and a
                 # half-typed message we would clobber. A fresh session has no
                 # conversation to keep warm, so it is skipped too.
-                if (_detect_interactive_prompt(visible)
+                if (not visible or _detect_interactive_prompt(visible)
                         or _looks_like_bare_shell(visible)
                         or _looks_like_fresh_claude_session(visible)
                         or _has_pending_user_input(visible)):
                     continue
-                ok = await _simple_watchdog_send_text(name, CACHE_KEEPALIVE_PROMPT)
+                prompt, source = await _compose_cache_prompt(name, st.get("sent") or [])
+                # Drafting takes seconds. Look again before typing: the owner
+                # may be back, or the agent may have started on its own.
+                now = time.time()
+                try:
+                    activity = await async_detect_activity(name)
+                except Exception:
+                    continue
+                visible = await asyncio.to_thread(_visible_pane, name)
+                if (activity.get("status") != "idle" or not visible
+                        or _has_pending_user_input(visible)
+                        or _detect_interactive_prompt(visible)
+                        or (st.get("at") and _human_spoke_since(name, st["at"]))
+                        or _seconds_since_human_input(name) < 60):
+                    continue
+                ok = await _simple_watchdog_send_text(name, prompt)
                 if ok:
                     st["fired_for"] = turn_end
                     st["at"] = now
+                    st["chain"] = st.get("chain", 0) + 1
+                    st["sent"] = (st.get("sent") or [])[-4:] + [prompt]
+                    _record_auto_message(name, prompt, "cache")
                     left = int(deadline - now)
+                    short = prompt if len(prompt) <= 90 else prompt[:87] + "..."
                     _simple_watchdog_record(
-                        name, f"cache keep-alive ({left // 60}m before cold)")
-                    log.info("Cache keep-alive pushed to '%s' (%ds before cold)",
-                             name, left)
+                        name, "cache keep-alive (%dm before cold, %s): %s"
+                        % (left // 60, source, short))
+                    log.info("Cache keep-alive pushed to '%s' (%ds before cold, %s, %d in a row)",
+                             name, left, source, st["chain"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -20846,8 +21524,13 @@ async def _cache_keepalive_loop():
 _LOGIN_WATCHDOG_INTERVAL = 15      # seconds between scans
 _LOGIN_WATCHDOG_COOLDOWN = 180     # min seconds between auto /login per session
 # A login prompt must sit unchanged this long before we treat it as abandoned and
-# clear it — otherwise we'd interrupt someone typing /login by hand.
-_LOGIN_FLOW_STALE_AFTER = 45
+# clear it — otherwise we'd interrupt someone typing /login by hand. 45 seconds
+# was far too short for a person: opening the link, signing in and copying the
+# code back leaves the pane byte-for-byte still for minutes, and the watchdog
+# pressed Escape on them ("Login interrupted"). And a login somebody opened from
+# the dashboard is theirs for _LOGIN_FLOW_HUMAN_GRACE, however still it sits.
+_LOGIN_FLOW_STALE_AFTER = 600
+_LOGIN_FLOW_HUMAN_GRACE = 1800
 _login_watchdog_state: Dict[str, dict] = {}
 
 
@@ -20876,7 +21559,7 @@ def _classify_login_watchdog_screen(screen: str) -> tuple[bool, bool]:
         or ("select login method" in low)
         or ("press enter to retry" in low and "esc to cancel" in low)
     )
-    needs_login = bool(_LOGIN_NEEDED_RE.search(prompt_tail))
+    needs_login = _screen_needs_login(prompt_tail)
     return needs_login, login_flow_open
 
 
@@ -20955,6 +21638,10 @@ async def _login_watchdog_loop():
                 # /exit'd every few minutes. A live session's pane keeps changing,
                 # so a digest of it tells the two apart — an abandoned prompt is
                 # byte-for-byte static.
+                if login_flow_open and _seconds_since_human_input(name) < _LOGIN_FLOW_HUMAN_GRACE:
+                    state.pop("flow_since", None)
+                    state.pop("flow_sig", None)
+                    continue
                 if login_flow_open:
                     sig = hashlib.sha1((recent or "").encode("utf-8", "replace")).hexdigest()
                     since = state.get("flow_since")
@@ -21271,7 +21958,7 @@ def _looks_like_fresh_claude_session(visible: str) -> bool:
 
 @app.get("/api/sessions/{session_name}/autopush")
 async def api_autopush_status(session_name: str):
-    """Return the per-session auto-push mode ('off'|'basic'|'full') + recent log."""
+    """Return the per-session auto-push mode ('off'|'basic'|'cache'|'full') + recent log."""
     return JSONResponse({
         "mode": _get_autopush_mode(session_name),
         "log": list(_simple_watchdog_log.get(session_name, []))[-_SIMPLE_WATCHDOG_MAX_LOG:],
@@ -21289,11 +21976,13 @@ async def api_autopush_set(session_name: str, body: AutopushBody):
     off   — the dashboard never types into this terminal.
     basic — auto-pick option menus + confirm permission/plan prompts + keep the
             session logged in (no free-form messages).
+    cache — basic, plus the next step drafted and sent before the cache goes
+            cold. "basicplus", its old name, is accepted.
     full  — everything in basic, plus auto-compose a "keep going" nudge when
             Claude pauses waiting on the user before a task is finished.
     """
-    mode = (body.mode or "").strip().lower()
-    if mode not in AUTOPUSH_MODES:
+    mode = _normalize_autopush_mode(body.mode)
+    if not mode:
         return JSONResponse(
             {"error": f"mode must be one of {list(AUTOPUSH_MODES)}"}, status_code=400
         )
@@ -21534,6 +22223,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .nav-usage-fill.warn{background:#d29922}
 .nav-usage-fill.crit{background:#f85149}
 .nav-usage-pct{color:#8b949e;font-size:.6rem;font-weight:600;width:26px;text-align:right;font-variant-numeric:tabular-nums}
+/* Time until the window resets, "Reset: 4d". In the header it is its own line
+   ABOVE the 7-day bar; in the account dropdown it trails the 5-hour bar. Hidden
+   while empty, because Anthropic reports no reset time for a window nothing has
+   been spent in yet and a bare "Reset:" reads as a broken widget. */
+.nav-usage-reset{color:#6e7681;font-size:.6rem;font-weight:600;text-align:left;font-variant-numeric:tabular-nums;white-space:nowrap}
+.nav-usage-reset:empty{display:none}
 /* No usable number yet (no account-scoped credential, or upstream down). */
 .nav-usage.no-data{opacity:.6}
 .nav-usage.no-data .nav-usage-pct{color:#6e7681}
@@ -21732,6 +22427,21 @@ body.member-admin .more-member-only{display:none}
 .composer-attachment-remove{flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #30363d;border-radius:50%;background:#21262d;color:#8b949e;cursor:pointer;font-size:.8rem;line-height:1}
 .composer-attachment-remove:hover{background:#da3633;border-color:#da3633;color:#fff}
 .cmd-btn-group{display:flex;align-items:flex-end;flex-shrink:0}
+/* Live voice mode: the toggle beside the mic, and the status strip above the
+   composer. The dot says which half of the loop it is in without reading. */
+.cmd-voice{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 14px;background:#21262d;color:#8b949e;cursor:pointer;display:flex;align-items:center;justify-content:center;align-self:flex-end;transition:background .15s,color .15s}
+.cmd-voice:hover{background:#2d333b;color:#c9d1d9}
+.cmd-voice.active{background:#1f6feb;color:#fff}
+.voice-bar{display:none;align-items:center;gap:10px;margin:0 0 8px;padding:8px 12px;border:1px solid #30363d;border-radius:8px;background:#0d1117;font-size:.84rem;color:#c9d1d9}
+.voice-bar.on{display:flex}
+.voice-dot{width:11px;height:11px;border-radius:50%;background:#3fb950;flex-shrink:0}
+.voice-bar.listening .voice-dot{animation:voice-pulse 1.2s ease-in-out infinite}
+.voice-bar.hearing .voice-dot{background:#58a6ff;animation:voice-pulse .45s ease-in-out infinite}
+.voice-bar.sending .voice-dot{background:#58a6ff}
+.voice-bar.speaking .voice-dot{background:#e3b341;animation:voice-pulse .8s ease-in-out infinite}
+@keyframes voice-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.65)}}
+.voice-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.voice-bar .btn{padding:5px 11px;font-size:.78rem}
 .cmd-send{border:none;border-left:1px solid #30363d;border-radius:0;padding:12px 18px;font-size:.95rem;align-self:flex-end;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s,color .15s;display:flex;align-items:center;justify-content:center;min-width:54px}
 .cmd-send:hover{background:#30363d}
 .cmd-send.is-mic{color:#8b949e}
@@ -21850,6 +22560,14 @@ body.member-admin .more-member-only{display:none}
 .term-live .tl-tok:not(:empty)::before,
 .term-live .tl-since:not(:empty)::before,
 .term-live .tl-ctx:not(:empty)::before{content:'· ';color:#30363d}
+/* Hot or cold, in words, because "idle 47m" only answers the question if you
+   remember the TTL. Orange = still cached, so the next message is cheap.
+   Blue = lapsed, so it pays to write the whole prompt again. */
+.tl-cache{white-space:nowrap;font-weight:600}
+.term-live .tl-cache:not(:empty)::before{content:'· ';color:#30363d;font-weight:400}
+.tl-cache.hot{color:#e3b341}
+.tl-cache.cold{color:#79c0ff}
+.tl-cache.expiring{animation:cache-expiring .36s steps(1,end) infinite}
 .tl-since.warm{color:#3fb950}
 .tl-since.cooling{color:#d29922}
 .tl-since.cold{color:#8b949e}
@@ -21979,26 +22697,34 @@ body.member-admin .more-member-only{display:none}
 .autopush-seg button.active,.idle-nudge-seg button.active{color:#fff;font-weight:600}
 .autopush-seg button.ap-off.active{background:#484f58}
 .autopush-seg button.ap-basic.active{background:#1f6feb}
-.autopush-seg button.ap-basicplus.active{background:#9e6a03}
+.autopush-seg button.ap-cache.active{background:#9e6a03}
 .autopush-seg button.ap-full.active{background:#238636}
 /* Approaching cold: the GREEN idle state, blinking fast, so it is caught out of
    the corner of an eye from across the room. Deliberately still green. Amber is
    reserved for the keep-alive below, and one colour meaning two different things
    is exactly the confusion this is supposed to prevent: green blinking means
    "come and type", amber steady means "it is handling it". */
-@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.15}}
+/* The prompt cache is about to go cold (CACHE_ALERT_LEAD, 15 minutes out): the
+   idle green flashes FAST, in the session, on its header tab and in the favicon.
+   Fast on purpose. A slow pulse already means "finished, not viewed yet". */
+@keyframes cache-expiring{0%,100%{opacity:1}50%{opacity:.12}}
 .status-pill.idle.expiring{background:#3fb95033;color:#56d364;border-color:#3fb950aa;
-  animation:cache-expiring .7s steps(1,end) infinite}
+  animation:cache-expiring .36s steps(1,end) infinite}
 .status-pill.idle.expiring .status-dot{background:#56d364;
-  animation:cache-expiring .7s steps(1,end) infinite}
-.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .7s steps(1,end) infinite}
+  animation:cache-expiring .36s steps(1,end) infinite}
+.tl-since.expiring{color:#56d364;font-weight:600;animation:cache-expiring .36s steps(1,end) infinite}
+.nav-dot.idle.expiring,.nav-dot.idle.completed-unread.expiring{width:11px;height:11px;background:#56d364;
+  box-shadow:0 0 9px #3fb950;transform:none;animation:cache-expiring .36s steps(1,end) infinite}
+/* A message the dashboard sent for you (Cache mode), told apart from your own. */
+.chat-msg.user.auto{background:#9e6a031f;border:1px dashed #9e6a03aa}
+.chat-auto-tag{font-size:.68rem;font-weight:600;color:#e3b341;margin-bottom:4px;letter-spacing:.02em}
 /* Working, but only to hold the cache. Amber, and NOT blinking: it wants to be
    distinguishable from a session someone actually asked for something. */
 .status-pill.busy.keepcache{background:#d2992230;color:#e3b341;border-color:#d2992288;animation:none}
 .status-pill.busy.keepcache .status-dot{background:#e3b341;animation:none}
 .idle-nudge-seg button.in-off.active{background:#484f58}
 .idle-nudge-seg button.in-light.active{background:#1f6feb}
-.idle-nudge-seg button.in-adhd.active{background:#da3633}
+.idle-nudge-seg button.in-high.active{background:#da3633}
 .tab-more-menu .autopush-seg,.tab-more-menu .idle-nudge-seg{margin:2px 16px 4px}
 .tab-more-menu .autopush-seg button,.tab-more-menu .idle-nudge-seg button{padding:4px 11px;font-size:.72rem}
 
@@ -22081,6 +22807,8 @@ body.member-admin .more-member-only{display:none}
 .nav-tools-wrap{position:relative;flex-shrink:0}
 .nav-tools-menu{display:none;position:absolute;top:100%;right:0;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:4px 0;z-index:150;box-shadow:0 8px 24px rgba(0,0,0,.4);margin-top:4px}
 .nav-tools-menu.open{display:block}
+.nav-tools-mobile{display:none}
+.nav-tools-sub{margin-left:auto;padding-left:10px;color:#6e7681;font-size:.72rem;font-family:'SF Mono','Fira Code',Consolas,monospace;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nav-tools-item{padding:8px 14px;font-size:.85rem;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .15s}
 .nav-tools-item:hover{background:#1c2128}
 .nav-tools-item .icon{font-size:.9rem}
@@ -22668,6 +23396,13 @@ body.member-simple .hide-in-simple{display:none!important}
 
 /* Mobile */
 @media(max-width:768px){
+  /* The header is for session tabs on a phone: the project folder button moves
+     into the gear menu (Projects), and the tab names get bigger to tap and read. */
+  .nav-proj{margin-right:0}
+  .nav-proj-btn{display:none}
+  .nav-tools-mobile{display:flex}
+  .nav-session-id{font-size:.92rem;max-width:150px;padding:2px 8px}
+  .nav-tools-item{padding:11px 16px;font-size:.95rem}
   .top-nav{padding:0 0 0 8px}
   .nav-right{padding-right:8px}
   .nav-brand{padding:10px 8px 10px 0;margin-right:2px;font-size:.75rem}
@@ -22712,7 +23447,7 @@ body.member-simple .hide-in-simple{display:none!important}
   /* Flow mode is what a phone gets by default (clean view is on), and the whole
      point of it here is that the text fits the screen — so the hanging indent
      shrinks and nothing is allowed to push the line box wider than the column. */
-  .raw-output.flow{font-size:12.5px;line-height:1.55}
+  .raw-output.flow{font-size:14.5px;line-height:1.55}
   .raw-output.flow .tl{padding-left:1.3em;text-indent:-1.3em}
   .term-live{font-size:.66rem;gap:6px;padding:5px 9px}
   .term-live .tl-note{display:none}
@@ -22759,12 +23494,13 @@ body.member-simple .hide-in-simple{display:none!important}
 </nav>
 <div class="nav-right">
   <span class="nav-server-stats" id="nav-server-stats" title="Click for details" onclick="openStats()" style="cursor:pointer"></span>
+  <!-- The header carries the SEVEN-DAY window only: "Reset: 4d" on the top line,
+       the bar and its percentage under it. That is the number you plan a week
+       around, and it changes slowly enough to be worth permanent eyeline. The
+       5-hour window moved into the account dropdown, under Today's Usage, next to
+       the token counts it belongs with. -->
   <span class="nav-usage no-data" id="nav-usage">
-    <span class="nav-usage-item" id="nav-usage-5h-wrap" title="Anthropic 5-hour limit">
-      <span class="nav-usage-label">5h</span>
-      <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-5h-fill" style="width:0%"></span></span>
-      <span class="nav-usage-pct" id="nav-usage-5h-pct">&mdash;</span>
-    </span>
+    <span class="nav-usage-reset" id="nav-usage-7d-reset" title=""></span>
     <span class="nav-usage-item" id="nav-usage-7d-wrap" title="Anthropic 7-day limit">
       <span class="nav-usage-label">7d</span>
       <span class="nav-usage-bar"><span class="nav-usage-fill" id="nav-usage-7d-fill" style="width:0%"></span></span>
@@ -22800,6 +23536,9 @@ body.member-simple .hide-in-simple{display:none!important}
            Claude Login) is reached through the single Settings entry — listing
            those tabs here as well is what made this menu a settings menu
            containing a settings button. -->
+      <!-- Phones only: the project switcher's folder button left the header for
+           the session tabs, and lives here instead. -->
+      <div class="nav-tools-item nav-tools-mobile nav-tools-admin" id="nav-tools-projects" onclick="openProjectMenuFromTools(event)"><span class="icon">&#128193;</span> Projects <span class="nav-tools-sub" id="nav-tools-proj-name"></span></div>
       <div class="nav-tools-item" onclick="openStats();closeToolsMenu()"><span class="icon">&#x1F4CA;</span> System Stats</div>
       <div class="nav-tools-item nav-tools-admin" onclick="recoverSessions();closeToolsMenu()"><span class="icon">&#x21BB;</span> Recover sessions</div>
       <div class="nav-tools-item nav-tools-admin" onclick="openProfiles();closeToolsMenu()"><span class="icon">&#x2699;</span> Claude Config</div>
@@ -22911,12 +23650,12 @@ const navEl=document.getElementById('top-nav');
 const mainEl=document.getElementById('main');
 const statusInfoEl=document.getElementById('status-info');
 const BASE='__ROOT_PATH__';
-// Seconds before the prompt cache goes cold that the session starts
-// blinking, and that Basic+ pushes its keep-alive. Substituted from the
-// server's CACHE_WARN_LEAD so the two can never drift apart.
-const CACHE_WARN_LEAD=__CACHE_WARN_LEAD__;
-// And the seconds before it goes cold that the double beep sounds, once.
-const CACHE_BEEP_LEAD=__CACHE_BEEP_LEAD__;
+// Seconds before the prompt cache goes cold that the session starts flashing and
+// the beeps sound (CACHE_ALERT_LEAD), and that a Cache-mode session sends its own
+// next step (CACHE_PUSH_LEAD). Substituted from the server's constants so the
+// page and the keep-alive can never drift apart.
+const CACHE_ALERT_LEAD=__CACHE_ALERT_LEAD__;
+const CACHE_PUSH_LEAD=__CACHE_PUSH_LEAD__;
 
 // ── Tab-scoped impersonation ────────────────────────────────────────────────
 // The impersonation token lives in sessionStorage, so it is scoped to ONE tab:
@@ -22988,8 +23727,18 @@ function _sessionRoute(){
   try{return{name:decodeURIComponent(match[1]),tab:decodeURIComponent(match[2])}}
   catch(e){return null}
 }
+// A phone opens a session in Chat, a desktop in the Terminal. On a phone the
+// terminal is a narrow column of a wide pane, and Chat is the view written to be
+// read at that size. An explicit tab in the URL still wins either way.
+function _isPhoneLayout(){
+  try{return !!(window.matchMedia&&window.matchMedia('(max-width:768px)').matches);}
+  catch(e){return false}
+}
+function _defaultSessionTab(){
+  return (MEMBER_SIMPLE||_isPhoneLayout())?'chat':'raw';
+}
 function _allowedSessionTab(tab){
-  if(!['raw','chat','skills','info'].includes(tab))return MEMBER_SIMPLE?'chat':'raw';
+  if(!['raw','chat','skills','info'].includes(tab))return _defaultSessionTab();
   if(MEMBER_SIMPLE&&tab==='skills')return'chat';
   return tab;
 }
@@ -23788,6 +24537,79 @@ function _localWrapLimits(rs,paneWidth){
   }
   return out;
 }
+// ── Links the terminal cut in pieces ────────────────────────────────────────
+// A link longer than a whole row is hard-cut at the TUI's right margin and
+// carried on the next rows, indented like the paragraph. That is the ONLY case:
+// a shorter token that does not fit moves to the next row whole, never cut.
+// Rendering the pieces separately left a link you could not copy in one go, and
+// the paragraph re-flow glued them back with a space ("platform.claude.co m"),
+// because it estimated the margin from the widest row on screen and the divider
+// lines are drawn wider than the text. So cut links are rejoined FIRST, in both
+// views, into one unbroken row. The page wraps that row softly, and selecting it
+// copies the whole link without a break.
+const _LINK_CUT_CH=/^[A-Za-z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+$/;
+const _RULE_ROW_RE=/^[\s─━═┄┅┈┉╌╍│┃║╭╮╯╰┌┐└┘├┤┬┴┼▔▁▂_-]*$/;
+// Like _localWrapLimits, backwards-only for the same reason, but a divider or a
+// box edge does not count: those are drawn to the pane edge, the text is not.
+function _textMargins(rs,paneWidth){
+  const n=rs.length,pw=Math.max(20,paneWidth||80),out=new Array(n);
+  for(let i=0;i<n;i++){
+    let w=0;
+    for(let j=Math.max(0,i-_WRAP_WINDOW);j<=i;j++){
+      const r=rs[j];
+      if(r.length>w&&!_RULE_ROW_RE.test(r))w=r.length;
+    }
+    out[i]=Math.min(w,pw);
+  }
+  return out;
+}
+// The link a row ends in, if it ends in one: a URL, or a path with a slash in it.
+function _cutLinkTail(row){
+  const m=row.match(/(\S+)$/);
+  if(!m)return '';
+  const tok=m[1];
+  const u=tok.search(/https?:\/\//);
+  if(u>=0)return tok.slice(u);
+  const pm=tok.match(/(?:^|[(\[<"'`])(~?\/[A-Za-z0-9_.\-\/]*\/[A-Za-z0-9_.\-]*)$/);
+  return pm?pm[1]:'';
+}
+function _joinCutLinks(rows,paneWidth){
+  const n=rows.length;
+  if(n<2)return rows;
+  const rs=rows.map(r=>r.replace(/\s+$/,''));
+  const margins=_textMargins(rs,paneWidth);
+  const out=[];
+  let i=0;
+  while(i<n){
+    let cur=rs[i],j=i;
+    while(j+1<n){
+      const row=rs[j];
+      // The link so far is the tail of what is already joined; whether it was
+      // cut is a question about the physical row it ended on.
+      const tail=_cutLinkTail(cur);
+      if(!tail)break;
+      if(row.length<margins[j]-1)break;              // stopped short: the link ended here
+      const next=rs[j+1];
+      if(!next.trim()||_BLOCK_START_RE.test(next))break;
+      const body=next.replace(/^\s+/,'');
+      const head=body.split(/\s/)[0];
+      if(!head||/^https?:\/\//.test(head))break;      // the next link, not the rest of this one
+      const isUrl=/^https?:/.test(tail);
+      if(isUrl?!_LINK_CUT_CH.test(head):!/^[A-Za-z0-9_.\-\/~]+$/.test(head.replace(/[),.;:'"`\]>]+$/,'')))break;
+      // Only a token longer than the room on a whole row is ever cut. A URL that
+      // happened to end at the margin, followed by an ordinary word the row had
+      // no space for, fails this and keeps its space.
+      const room=Math.max(20,margins[j]-(next.length-body.length));
+      if(tail.length+head.length<=room)break;
+      cur+=body;
+      j++;
+      if(body.indexOf(' ')>=0)break;                   // the link ended on that row
+    }
+    out.push(cur);
+    i=j+1;
+  }
+  return out;
+}
 function _unwrapRows(lines,paneWidth){
   const n=lines.length,rs=new Array(n);
   for(let i=0;i<n;i++)rs[i]=lines[i].replace(/\s+$/,'');
@@ -23960,6 +24782,7 @@ function renderRawText(name,force){
 
   let body=applyRawFilter(bodyText);
   let rows=body?body.split('\n'):[];
+  rows=_joinCutLinks(rows,st.paneWidth);
   if(flow){
     rows=_unwrapRows(rows,st.paneWidth);
     while(rows.length&&rows[rows.length-1].trim()==='')rows.pop();
@@ -23986,7 +24809,9 @@ function renderRawText(name,force){
     // Linkified as one string so the exact-mode rejoining of URLs and paths
     // split across rows still works; neither renderer ever emits a tag that
     // straddles a newline, so splitting the result back per line is safe.
-    htmlLines=_linkifyTerminalText(rows.join('\n'),flow?1000000:st.paneWidth).split('\n');
+    // Cut links are already whole rows (_joinCutLinks), so the linkifier must not
+    // go looking for a continuation on the next row in either view.
+    htmlLines=_linkifyTerminalText(rows.join('\n'),1000000).split('\n');
     // Your own words, wrapped so they can be coloured and jumped to. The flags
     // are computed on the FINAL rows, after filtering and unwrapping, so the
     // indices line up with the divs that get painted.
@@ -24087,16 +24912,15 @@ let _liveTicker=null;
 function startLiveTicker(){
   if(_liveTicker)return;
   _liveTicker=setInterval(function(){
-    // Every session, not just the one on screen: a cache lapsing on a tab you
-    // are not looking at is precisely the one worth being told about. Cheap: a
-    // handful of arithmetic comparisons, and it fires at most once per turn.
-    _checkCacheExpiry();
+    // The cache warning for every session runs on the attention clock
+    // (startAttentionClock), which keeps ticking in a hidden tab.
     if(!selectedSession)return;
     // The silence counter has to keep running while the session is IDLE — being
     // idle is the whole point of it — so it is updated on every tick regardless
     // of the busy state. It only rewrites the span when the rendered text
     // actually changes, which past a minute is once a minute.
     _paintIdleSince(selectedSession);
+    _paintCacheChip(selectedSession);
     // The pill's cache state is a function of elapsed time, not of anything the
     // server pushes, so it has to be re-evaluated on the tick as well. Without
     // this a session that is already idle never starts blinking, because the
@@ -24147,9 +24971,9 @@ function _paintIdleSince(name){
     const warm=ago<ttl*0.8, cooling=ago<ttl;
     left=Math.max(0,ttl-ago);
     cls+=warm?' warm':(cooling?' cooling':' cold');
-    // Blink once inside the last CACHE_WARN_LEAD seconds, and only while there
-    // is still something to save: after it is cold there is nothing to hurry for.
-    if(cooling&&left<=CACHE_WARN_LEAD)cls+=' expiring';
+    // Flash inside the last CACHE_ALERT_LEAD seconds, and only while there is
+    // still something to save: after it is cold there is nothing to hurry for.
+    if(cooling&&left<=CACHE_ALERT_LEAD)cls+=' expiring';
     const ttlTxt=ttl>=3600?'1h':Math.round(ttl/60)+'m';
     // What the last turn ACTUALLY did is a measurement; everything after it is a
     // countdown. Report them as the different things they are.
@@ -24165,7 +24989,33 @@ function _paintIdleSince(name){
   }
   if(s.detect_sure===false)cls+=' unsure';
   const txt='idle '+_fmtAgo(ago)+
-    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_WARN_LEAD?' · cold in '+_fmtAgo(left):'')):'');
+    (ttl?(ago>=ttl?' · cache cold':(left<=CACHE_ALERT_LEAD?' · cold in '+_fmtAgo(left):'')):'');
+  if(el.textContent!==txt)el.textContent=txt;
+  if(el.className!==cls)el.className=cls;
+  if(el.title!==hint)el.title=hint;
+}
+// Hot or cold, said outright. The row already carried the countdown, but only a
+// reader who remembers this session's TTL could turn "idle 47m" into "the next
+// message is about to cost full price".
+function _paintCacheChip(name){
+  const el=document.getElementById('tl-cache-'+name);
+  if(!el)return;
+  const s=sessions.find(x=>x.name===name)||{};
+  const ttl=s.cache_ttl||0,end=s.last_turn_end||0;
+  if(!ttl||!end){
+    if(el.textContent!==''){el.textContent='';el.className='tl-cache';el.title='';}
+    return;
+  }
+  const busy=_sessionBusy(name);
+  const left=Math.max(0,ttl-(Date.now()/1000-end));
+  const hot=busy||left>0;
+  let cls='tl-cache '+(hot?'hot':'cold');
+  if(hot&&!busy&&left<=CACHE_ALERT_LEAD)cls+=' expiring';
+  const txt=hot?'Cache hot':'Cache cold';
+  const hint=hot
+    ? ('The transcript is still cached, so the next message re-reads it at cache-read price'+
+       (busy?', and every request this turn makes restarts the clock.':'. Cold in '+_fmtAgo(left)+'.'))
+    : 'The cache has lapsed: the next message pays to write the whole prompt again.';
   if(el.textContent!==txt)el.textContent=txt;
   if(el.className!==cls)el.className=cls;
   if(el.title!==hint)el.title=hint;
@@ -24432,21 +25282,37 @@ function toggleCleanView(name,checked){
 const lastStatus={};
 const _completedUnread={};
 const IDLE_NUDGE_INTERVAL_MS=20000;
+// off: silent, no chime of any kind.
+// light (the default): ONE chime when a session YOU SENT SOMETHING TO finishes,
+//   and 4 beeps when a prompt cache is 15 minutes from cold. Nothing repeats and
+//   nothing sounds for the other sessions: on a box running six agents, a chime
+//   per finished turn is what "it keeps beeping at me" was made of. The header
+//   dot still pulses for every finished session, silently.
+// high (called ADHD until 2026-09-17): a chime for EVERY session that finishes,
+//   then again every 20 seconds until each one is given new work, and 8 beeps
+//   instead of 4.
+const IDLE_NUDGE_MODES=['off','light','high'];
+const IDLE_NUDGE_DEFAULT='light';
 const IDLE_NUDGE_TITLES={
-  off:'Off - only play the normal completion chime once',
-  light:'Light - chime every 20 seconds until every completed tab is viewed',
-  adhd:'ADHD - chime every 20 seconds until every completed tab is given new work'
+  off:'Off: no sounds at all, not even the prompt-cache warning',
+  light:'Light: one chime when a session you asked something finishes, and 4 quick beeps 15 minutes before a prompt cache goes cold. Nothing repeats.',
+  high:'High: a chime for every session that finishes, then again every 20 seconds until each one is given new work, and 8 beeps instead of 4'
 };
 const _idleNudgeAdhdPending={};
 let _idleNudgeTimer=null;
 let _idleNudgeModeCache=null;
 
+function _normalizeIdleNudgeMode(mode){
+  if(mode==='adhd')return 'high';
+  return IDLE_NUDGE_MODES.includes(mode)?mode:'';
+}
+
 function getIdleNudgeMode(){
   if(_idleNudgeModeCache)return _idleNudgeModeCache;
   try{
     const saved=localStorage.getItem('idleNudgeMode');
-    _idleNudgeModeCache=['off','light','adhd'].includes(saved)?saved:'off';
-  }catch(e){_idleNudgeModeCache='off'}
+    _idleNudgeModeCache=_normalizeIdleNudgeMode(saved)||IDLE_NUDGE_DEFAULT;
+  }catch(e){_idleNudgeModeCache=IDLE_NUDGE_DEFAULT}
   return _idleNudgeModeCache;
 }
 
@@ -24456,11 +25322,11 @@ function idleNudgeSeg(){
     '" aria-pressed="'+(mode===m?'true':'false')+'" title="'+esc(IDLE_NUDGE_TITLES[m])+
     '" onclick="event.stopPropagation();setIdleNudgeMode(\''+m+'\')">'+label+'</button>';
   return '<div class="idle-nudge-seg" role="group" aria-label="Idle nudge mode">'+
-    b('off','Off')+b('light','Light')+b('adhd','ADHD')+'</div>';
+    b('off','Off')+b('light','Light')+b('high','High')+'</div>';
 }
 
 function syncIdleNudgeUI(mode){
-  mode=['off','light','adhd'].includes(mode)?mode:'off';
+  mode=_normalizeIdleNudgeMode(mode)||IDLE_NUDGE_DEFAULT;
   document.querySelectorAll('.idle-nudge-seg').forEach(seg=>{
     seg.querySelectorAll('button').forEach(btn=>{
       const active=btn.classList.contains('in-'+mode);
@@ -24471,7 +25337,7 @@ function syncIdleNudgeUI(mode){
 }
 
 function _idleNudgeNames(mode){
-  const pending=mode==='adhd'?_idleNudgeAdhdPending:_completedUnread;
+  const pending=mode==='high'?_idleNudgeAdhdPending:_completedUnread;
   const current=new Set(sessions.map(s=>s.name));
   return Object.keys(pending).filter(name=>current.has(name));
 }
@@ -24481,31 +25347,31 @@ function _stopIdleNudgeTimer(){
   _idleNudgeTimer=null;
 }
 
+// ONLY High repeats. Light and Off never schedule this timer at all.
 function _syncIdleNudgeTimer(restart){
   if(restart)_stopIdleNudgeTimer();
-  const mode=getIdleNudgeMode();
-  if(mode==='off'||!_idleNudgeNames(mode).length){
+  if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length){
     _stopIdleNudgeTimer();
     return;
   }
   if(_idleNudgeTimer!==null)return;
   _idleNudgeTimer=setTimeout(function(){
     _idleNudgeTimer=null;
-    const currentMode=getIdleNudgeMode();
-    if(currentMode==='off'||!_idleNudgeNames(currentMode).length)return;
+    if(getIdleNudgeMode()!=='high'||!_idleNudgeNames('high').length)return;
     playCompletionChime();
     _syncIdleNudgeTimer();
   },IDLE_NUDGE_INTERVAL_MS);
 }
 
 function setIdleNudgeMode(mode){
-  if(!['off','light','adhd'].includes(mode))return;
+  mode=_normalizeIdleNudgeMode(mode);
+  if(!mode)return;
   const previous=getIdleNudgeMode();
   _idleNudgeModeCache=mode;
   try{localStorage.setItem('idleNudgeMode',mode)}catch(e){}
-  if(mode==='adhd'&&previous!=='adhd'){
+  if(mode==='high'&&previous!=='high'){
     Object.keys(_completedUnread).forEach(name=>{_idleNudgeAdhdPending[name]=true});
-  }else if(mode!=='adhd'){
+  }else if(mode!=='high'){
     Object.keys(_idleNudgeAdhdPending).forEach(name=>delete _idleNudgeAdhdPending[name]);
   }
   syncIdleNudgeUI(mode);
@@ -24515,7 +25381,29 @@ function setIdleNudgeMode(mode){
 
 function _idleNudgeNavDotClass(name,status){
   const state=status||'unknown';
-  return 'nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
+  let cls='nav-dot '+state+(state==='idle'&&_completedUnread[name]?' completed-unread':'');
+  if(state==='idle'&&_inCacheAlert(name))cls+=' expiring';
+  return cls;
+}
+
+// Idle, with its prompt cache inside the last CACHE_ALERT_LEAD seconds and not
+// cold yet. The one state that wants a person at the keyboard now.
+function _inCacheAlert(name){
+  if(typeof sessions==='undefined'||typeof _cacheSecondsLeft!=='function')return false;
+  const left=_cacheSecondsLeft(name);
+  return left!==null&&left>0&&left<=CACHE_ALERT_LEAD;
+}
+
+// Every header tab's dot, re-derived. Cheap, and it has to run on a clock: a
+// session crosses into the alert window with nothing about it changing.
+function _paintAllNavDots(){
+  if(typeof sessions==='undefined')return;
+  for(const s of sessions){
+    const dot=document.getElementById('nav-dot-'+s.name);
+    if(!dot)continue;
+    const want=_idleNudgeNavDotClass(s.name,lastStatus[s.name]||s.activity_status);
+    if(dot.className!==want)dot.className=want;
+  }
 }
 
 function _paintIdleNudgeNavDot(name,status){
@@ -24608,27 +25496,35 @@ function playCompletionChime(){
   else play();
 }
 
-// ── The cache-expiry double beep ────────────────────────────────────────────
-// One chime means a session finished. TWO, lower and falling, mean a session is
-// idle and about to lose its prompt cache: nothing is done, something is about
-// to be thrown away. Deliberately not a louder version of the completion chime,
-// because the two need to be told apart from the next room without looking.
-function playCacheExpiryChime(){
+// ── The cache-expiry beeps ──────────────────────────────────────────────────
+// One chime means a session finished. A burst of short, flat BEEPS means a
+// session is idle and about to lose its prompt cache: nothing is done, something
+// is about to be thrown away. Deliberately nothing like the completion chime, so
+// the two can be told apart from the next room without looking. 4 on Light, 8
+// on High.
+function playCacheAlertBeeps(count){
   const ctx=_getCompletionAudioContext();
   if(!ctx)return;
+  const n=Math.max(1,Math.min(12,count|0));
   const play=function(){
     if(ctx.state!=='running')return;
-    const now=ctx.currentTime+0.015;
+    const start=ctx.currentTime+0.02, on=0.075, gap=0.065;
     const master=ctx.createGain();
-    master.gain.setValueAtTime(0.72,now);
-    master.gain.exponentialRampToValueAtTime(0.0001,now+0.85);
+    master.gain.setValueAtTime(0.5,start);
     master.connect(ctx.destination);
-    // E5 then B4, 190 ms apart: a falling pair, well below the completion
-    // chime's C6/E6, each with one quiet partial so it rings rather than beeps.
-    [[659.25,0,0.17,0.24],[1318.5,0.003,0.12,0.05],
-     [493.88,0.19,0.26,0.24],[987.77,0.193,0.16,0.05]]
-      .forEach(t=>_glassPartial(ctx,master,t[0],now+t[1],t[2],t[3]));
-    setTimeout(function(){try{master.disconnect()}catch(e){}},1000);
+    for(let i=0;i<n;i++){
+      const t=start+i*(on+gap);
+      const osc=ctx.createOscillator(),g=ctx.createGain();
+      osc.type='square';
+      osc.frequency.setValueAtTime(1760,t);
+      g.gain.setValueAtTime(0.0001,t);
+      g.gain.exponentialRampToValueAtTime(0.35,t+0.006);
+      g.gain.setValueAtTime(0.35,t+on-0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001,t+on);
+      osc.connect(g);g.connect(master);osc.start(t);osc.stop(t+on+0.02);
+      osc.onended=function(){try{osc.disconnect();g.disconnect()}catch(e){}};
+    }
+    setTimeout(function(){try{master.disconnect()}catch(e){}},Math.ceil((n*(on+gap)+0.4)*1000));
   };
   if(ctx.state==='suspended')Promise.resolve(ctx.resume()).then(play).catch(()=>{});
   else play();
@@ -24641,6 +25537,7 @@ function playCacheExpiryChime(){
 const _cacheBeeped={};
 function _checkCacheExpiry(){
   const names=new Set();
+  const nudge=getIdleNudgeMode();
   let fired=false;
   for(let i=0;i<sessions.length;i++){
     const s=sessions[i];
@@ -24655,13 +25552,19 @@ function _checkCacheExpiry(){
     if((lastStatus[s.name]||s.activity_status)!=='idle')continue;
     const left=ttl-(Date.now()/1000-end);
     // Inside the window, and only while there is still something to save. Once
-    // it is cold the money is spent and a chime is just noise.
-    if(left>CACHE_BEEP_LEAD||left<=0)continue;
+    // it is cold the money is spent and a beep is just noise.
+    if(left>CACHE_ALERT_LEAD||left<=0)continue;
+    // Marked even when silent, so switching the nudge back on does not replay
+    // a warning for a turn that was already in the window.
     _cacheBeeped[s.name]=end;
-    if(!fired){                 // one sound even if two sessions lapse together
-      playCacheExpiryChime();
-      showToast('“'+s.name+'” loses its prompt cache in '+_fmtAgo(left)+
-                '. Send it something now and the next message stays cheap.',12000);
+    if(nudge==='off')continue;
+    if(!fired){                 // one burst even if two sessions lapse together
+      playCacheAlertBeeps(nudge==='high'?8:4);
+      const pushIn=Math.max(0,left-CACHE_PUSH_LEAD);
+      showToast('“'+sessionLabel(s)+'” loses its prompt cache in '+_fmtAgo(left)+
+                '. Send it something now and the next message stays cheap.'+
+                (s.autopush_mode==='cache'
+                  ?' Cache mode sends its next step in '+_fmtAgo(pushIn)+' if you do not.':''),12000);
       fired=true;
     }
   }
@@ -24676,16 +25579,22 @@ function trackSessionStatus(name,status,interrupted){
     delete _idleNudgeAdhdPending[name];
     _syncIdleNudgeTimer();
   }
+  const mode=getIdleNudgeMode();
   if(completed&&!interrupted){
     _markCompletionUnread(name);
-    if(getIdleNudgeMode()==='adhd'){
+    if(mode==='high'){
       _idleNudgeAdhdPending[name]=true;
       _syncIdleNudgeTimer();
     }
+    // The status the server reports is a CONFIRMED idle (the pane looked idle
+    // for long enough and the session's transcript stopped growing), so a chime
+    // here is a finished turn, not a gap between tool calls. High chimes for
+    // every session; Light only for one you asked something.
+    if(mode==='high')playCompletionChime();
   }
   if(completed&&_completionWatch[name]&&!interrupted){
     delete _completionWatch[name];
-    playCompletionChime();
+    if(mode==='light')playCompletionChime();
     return true;
   }
   return false;
@@ -24721,12 +25630,75 @@ function restoreDrafts(){
   });
 }
 
+// ── The favicon ─────────────────────────────────────────────────────────────
+// It used to show the SELECTED session's status and nothing else, so the one
+// thing worth seeing from another browser tab, a different session about to
+// lose its prompt cache, was invisible exactly when you were not looking. Now a
+// cache alert on ANY session wins and flashes; otherwise it is the selected
+// session's own status, as before.
+let _faviconStatus='unknown';
+let _faviconFlashOn=false;
+let _faviconShown='';
 function updateFavicon(status){
-  const colors={busy:'%23f85149',idle:'%233fb950',unknown:'%236e7681'};
-  const c=colors[status]||colors.unknown;
-  const svg="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='"+c+"'/></svg>";
+  _faviconStatus=status||'unknown';
+  _paintFavicon();
+}
+function _faviconSvg(fill,ring){
+  return "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>"+
+    (ring?"<circle cx='8' cy='8' r='7.2' fill='none' stroke='"+ring+"' stroke-width='1.6'/>":"")+
+    "<circle cx='8' cy='8' r='"+(ring?5:7)+"' fill='"+fill+"'/></svg>";
+}
+function _paintFavicon(){
   const link=document.getElementById('favicon');
-  if(link)link.href=svg;
+  if(!link)return;
+  const colors={busy:'%23f85149',idle:'%233fb950',unknown:'%236e7681'};
+  let svg;
+  if(typeof sessions!=='undefined'&&sessions.some(s=>
+      (lastStatus[s.name]||s.activity_status)==='idle'&&_inCacheAlert(s.name))){
+    _faviconFlashOn=!_faviconFlashOn;
+    svg=_faviconFlashOn?_faviconSvg('%2356d364','%2356d364'):_faviconSvg('%230d1117','%23238636');
+  }else{
+    svg=_faviconSvg(colors[_faviconStatus]||colors.unknown,'');
+  }
+  if(svg===_faviconShown)return;
+  _faviconShown=svg;
+  link.href=svg;
+}
+
+// ── The attention clock ─────────────────────────────────────────────────────
+// Beeps, header dots and the favicon all have to move while you are on another
+// browser tab, which is the whole point of them. A hidden tab's setInterval is
+// throttled to once a MINUTE after a few minutes, which would freeze the favicon
+// mid-flash and hold the beep back. A timer inside a worker is not throttled
+// that way, so the clock ticks there and only posts the tick back.
+let _attentionClock=null;
+let _attentionLastTick=0;
+function _attentionTick(){
+  _attentionLastTick=Date.now();
+  try{
+    _checkCacheExpiry();
+    _paintAllNavDots();
+    _paintFavicon();
+    if(selectedSession){_paintPillCache(selectedSession);_paintIdleSince(selectedSession);_paintCacheChip(selectedSession);}
+  }catch(e){}
+}
+function startAttentionClock(){
+  if(_attentionClock)return;
+  try{
+    const src='setInterval(function(){postMessage(0)},420);';
+    const w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
+    w.onmessage=_attentionTick;
+    _attentionClock=w;
+    // A worker that never reports — blocked by a policy, or a browser that
+    // refuses the blob — must not take the flashing down with it.
+    setTimeout(function(){
+      if(Date.now()-_attentionLastTick<2000)return;
+      try{w.terminate()}catch(e){}
+      _attentionClock=setInterval(_attentionTick,420);
+    },3000);
+  }catch(e){
+    _attentionClock=setInterval(_attentionTick,420);
+  }
 }
 
 function timeAgo(ts){
@@ -25097,7 +26069,7 @@ function renderNav(){
     item.innerHTML=`
       <span class="nav-session-id">${esc(sessionLabel(s))}</span>
       <span class="nav-indicators">
-        <span class="${esc(_idleNudgeNavDotClass(s.name,s.activity_status))}" id="nav-dot-${s.name}"></span>
+        <span class="${esc(_idleNudgeNavDotClass(s.name,lastStatus[s.name]||s.activity_status))}" id="nav-dot-${s.name}"></span>
       </span>`;
     // On the tab you are already in, the name is the rename handle. On any
     // other tab the first click still has to select it, or switching sessions
@@ -25192,6 +26164,7 @@ async function loadProjectsNav(){
     const resp = await fetch(BASE+'/api/project-scope');
     if(!resp.ok){                       // members are not admins; no switcher for them
       const w=document.getElementById('nav-proj-wrap'); if(w) w.style.display='none';
+      const t=document.getElementById('nav-tools-projects'); if(t) t.style.display='none';
       return;
     }
     const data = await resp.json();
@@ -25224,6 +26197,8 @@ function renderProjectNav(){
   const isOther = CURRENT_PROJECT === '__other__';
   nameEl.textContent = isOther ? 'Other sessions'
                      : (CURRENT_PROJECT ? projShort(CURRENT_PROJECT) : 'No project');
+  const toolsName = document.getElementById('nav-tools-proj-name');
+  if(toolsName) toolsName.textContent = nameEl.textContent;
   const btn = document.getElementById('nav-proj-btn');
   if(btn) btn.title = isOther
     ? 'Sessions running outside every registered project.'
@@ -25271,6 +26246,20 @@ function renderProjectNav(){
   listEl.innerHTML = html;
 }
 
+// The phone route to the same menu: opened from the gear, pinned under it.
+function openProjectMenuFromTools(ev){
+  if(ev) ev.stopPropagation();
+  closeToolsMenu();
+  const m = document.getElementById('nav-proj-menu');
+  if(!m) return;
+  m.classList.add('open');
+  const gear = document.querySelector('.nav-tools-wrap');
+  const r = gear ? gear.getBoundingClientRect() : {bottom: 48};
+  m.style.top = Math.round(r.bottom + 6) + 'px';
+  m.style.left = Math.max(8, Math.round(innerWidth - m.offsetWidth - 8)) + 'px';
+  loadProjectsNav();
+  setTimeout(()=>document.addEventListener('click', _closeProjMenuOnce), 0);
+}
 function toggleProjectMenu(ev){
   if(ev) ev.stopPropagation();
   const m = document.getElementById('nav-proj-menu');
@@ -25463,7 +26452,10 @@ function _isRecapWorthShowing(summary,full){
 }
 function chatBubbleInner(m){
   const ts='<div class="chat-meta">'+fmtTime(m.ts)+'</div>';
-  if(m.role!=='assistant')return '<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
+  if(m.role!=='assistant'){
+    const tag=m.auto?'<div class="chat-auto-tag">Sent by Cache mode while you were away</div>':'';
+    return tag+'<div class="chat-body">'+_chatRich(m.text||'')+'</div>'+ts;
+  }
   const full=(m.full||'').trim();
   const summary=(m.text||'').trim();
   let html='';
@@ -25478,7 +26470,7 @@ function renderChatBubbles(name){
   if(!msgs.length){
     return '<div class="chat-empty">No messages yet. Type below to talk to Claude — every reply shows up here in full, with links to anything it produced.</div>';
   }
-  return msgs.map(m=>`<div class="chat-msg ${m.role}">${chatBubbleInner(m)}</div>`).join('');
+  return msgs.map(m=>`<div class="chat-msg ${m.role}${m.auto?' auto':''}">${chatBubbleInner(m)}</div>`).join('');
 }
 
 function saveRawCache(){
@@ -25501,12 +26493,17 @@ function renderDetail(){
   const s=sessions.find(x=>x.name===selectedSession);
   if(!s){mainEl.innerHTML='<div class="empty">No session selected</div>';return}
   // Non-developer (simple) users land on the clean Chat tab; admins on Terminal.
-  const tab=activeTabs[s.name]||(MEMBER_SIMPLE?'chat':'raw');
+  const tab=activeTabs[s.name]||_defaultSessionTab();
   // Sync server messages into local store (merge, don't replace — preserves
   // messages added locally from raw tab that server hasn't echoed back yet)
   if(s.messages && s.messages.length) mergeChatMessages(s.name, s.messages);
+  // The ten-second poll is the freshest reading there is, so the pill, the chat
+  // typing line, the Stop button and the favicon are all built off it. Building
+  // them off s.activity_status alone is what made switching to a tab show a red
+  // "Working" for a session that finished long ago.
+  const liveStatus=lastStatus[s.name]||s.activity_status;
   // Update favicon to match selected session
-  updateFavicon(s.activity_status);
+  updateFavicon(liveStatus);
 
   mainEl.innerHTML=`
     <div class="tab-bar">
@@ -25559,10 +26556,10 @@ function renderDetail(){
       </div>
       <span class="raw-title" id="raw-title-${s.name}" title="What Claude is doing (tmux pane title)">${esc(s.title)||''}</span>
       <div class="detail-badges">
-        <span class="status-pill ${esc(s.activity_status)}" id="status-${s.name}">
+        <span class="status-pill ${esc(liveStatus)}" id="status-${s.name}">
           <span class="status-dot"></span>
-          <span class="status-label">${statusLabel(s.activity_status)}</span>
-          ${s.activity_detail&&s.activity_status!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
+          <span class="status-label">${statusLabel(liveStatus)}</span>
+          ${s.activity_detail&&liveStatus!=='busy'?'<span style="font-weight:400;opacity:.7"> &middot; '+esc(s.activity_detail)+'</span>':''}
         </span>
         ${authBadge(s)}
         <span class="badge model-badge${s.model_pending?' pending':''}${s.detect_sure===false?' unsure':''}${s.fell_back_from?' fellback':''}" id="model-badge-${s.name}" title="${esc(modelTip(s))}" onclick="openModelMenu('${esc(s.name)}',this,event)">${esc(modelBadgeLabel(s))} <span class="caret">&#9662;</span></span>
@@ -25573,7 +26570,7 @@ function renderDetail(){
              between the model chip and the buttons, so it is kept in the DOM (the raw
              view still writes to it) but not shown. -->
         <span class="raw-info" id="raw-info-${s.name}" hidden>Loading terminal...</span>
-        <button class="btn btn-stop ${s.activity_status==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}',activeTabs['${s.name}'])" title="Interrupt Claude (Esc)">Stop</button>
+        <button class="btn btn-stop ${liveStatus==='busy'?'visible':''}" id="interrupt-hdr-${s.name}" onclick="interruptSession('${s.name}',activeTabs['${s.name}'])" title="Interrupt Claude (Esc)">Stop</button>
         <button class="btn" onclick="reloadActive('${esc(s.name)}')" title="Re-read this session's terminal from tmux">Reload</button>
         <button class="btn btn-danger" onclick="showDeleteModal('${esc(s.name)}')" title="Kill session">Delete</button>
       </div>
@@ -25583,9 +26580,16 @@ function renderDetail(){
       <div class="chat-wrap">
         <div class="chat-messages" id="chat-${s.name}">
           ${renderChatBubbles(s.name)}
-          ${s.activity_status==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
+          ${liveStatus==='busy'?'<div class="chat-typing"><span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...</div>':''}
         </div>
         <div class="composer-attachments" id="composer-attachments-chat-${s.name}" aria-live="polite"></div>
+        <!-- Live voice: hands free. Hidden until it is switched on. -->
+        <div class="voice-bar" id="voice-bar-${s.name}">
+          <span class="voice-dot"></span>
+          <span class="voice-text" id="voice-text-${s.name}">Live voice</span>
+          <button class="btn" id="voice-skip-${s.name}" style="display:none" onclick="voiceSkipSpeech()" title="Stop reading this reply out">Skip</button>
+          <button class="btn btn-danger" onclick="stopLiveVoice('Live voice off')">End</button>
+        </div>
         <div class="cmd-bar" style="position:relative">
           <span class="cmd-prompt">&gt;</span>
           <textarea class="cmd-input" id="cmd-chat-${s.name}" rows="1"
@@ -25594,6 +26598,7 @@ function renderDetail(){
             onpaste="handleComposerPaste(event,'${s.name}','chat')"
             oninput="autoGrow(this);updateComposerBtn('chat-${s.name}')"
             autocomplete="off" spellcheck="true" lang="en"></textarea>
+          <button class="btn cmd-voice" id="cmd-voice-${s.name}" onclick="toggleLiveVoice('${s.name}')" title="Live voice: talk to this session hands free. It listens, sends what you say, and reads the reply out loud." aria-label="Live voice mode"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 10v4M8 6v12M12 3v18M16 6v12M20 10v4"/></svg></button>
           <button class="btn cmd-send is-mic" id="cmd-send-chat-${s.name}" onclick="composerAction('chat-${s.name}')" title="Record voice message" aria-label="Send or record voice"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-6 6.92V21h-2v-3.08A7 7 0 0 1 5 11h2a5 5 0 0 0 10 0h2z"/></svg></button>
           <input type="file" id="upload-${s.name}" style="display:none" onchange="uploadFile('${s.name}',this)" multiple>
         </div>
@@ -25617,6 +26622,7 @@ function renderDetail(){
         <span class="tl-verb" id="tl-verb-${s.name}"></span>
         <span class="tl-time" id="tl-time-${s.name}"></span>
         <span class="tl-since" id="tl-since-${s.name}"></span>
+        <span class="tl-cache" id="tl-cache-${s.name}"></span>
         <span class="tl-tok" id="tl-tok-${s.name}"></span>
         <span class="tl-ctx" id="tl-ctx-${s.name}"></span>
         <span class="tl-spacer"></span>
@@ -25677,18 +26683,10 @@ function renderDetail(){
       <div class="tier">
         <div class="tier-label"><span class="dot" style="background:#58a6ff"></span>Auth Mode</div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="subscription"
-              onchange="setAuthMode('${s.name}','subscription')"
-              ${(s.auth_mode||'subscription')==='subscription'?'checked':''}>
-            Subscription
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:#c9d1d9">
-            <input type="radio" name="auth-mode-${s.name}" value="api"
-              onchange="setAuthMode('${s.name}','api')"
-              ${s.auth_mode==='api'?'checked':''}>
-            API Key
-          </label>
+          <span style="font-size:.85rem;color:#c9d1d9">Subscription plan</span>
+          <button class="btn" style="font-size:.72rem;padding:2px 8px"
+            title="Types 'unset ANTHROPIC_API_KEY' into this pane"
+            onclick="setAuthMode('${s.name}','subscription')">Clear stray key</button>
           <span id="auth-mode-status-${s.name}" style="font-size:.72rem;color:#8b949e"></span>
         </div>
       </div>
@@ -25787,6 +26785,7 @@ function renderDetail(){
 }
 
 function selectSession(name,updateRoute=true){
+  if(voiceActive()&&name!==_voice.name)stopLiveVoice('Live voice off');
   stopAllRawPolling();
   selectedSession=name;
   _acknowledgeCompletion(name);
@@ -25794,11 +26793,14 @@ function selectSession(name,updateRoute=true){
   const navItem=document.getElementById('nav-'+name);
   if(navItem)navItem.classList.add('active');
   renderDetail();
-  if(updateRoute)_writeSessionRoute(name,activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw'),false);
+  if(updateRoute)_writeSessionRoute(name,activeTabs[name]||_defaultSessionTab(),false);
 }
 
 function switchTab(name,tab,updateRoute=true){
   _acknowledgeCompletion(name);
+  // Live voice belongs to one session's Chat tab: leaving it turns the mic off
+  // rather than leaving it open on a screen that no longer shows it.
+  if(voiceActive()&&(name!==_voice.name||tab!=='chat'))stopLiveVoice('Live voice off');
   tab=_allowedSessionTab(tab);
   activeTabs[name]=tab;
   const allTabs=mainEl.querySelectorAll('.tab-content');
@@ -26100,6 +27102,246 @@ async function toggleRecording(key){
   _recording[key]=true;
   const btn=document.getElementById('cmd-send-'+key);
   if(btn){btn.classList.remove('is-mic','is-send');btn.classList.add('is-recording');btn.innerHTML=_COMPOSER_STOP_SVG;btn.title='Stop & transcribe';}
+}
+
+// ── Live voice mode ─────────────────────────────────────────────────────────
+// The mic button records one clip and puts the text in the box. Live voice is
+// the hands-free version, for a phone in a pocket: it listens, sends what you
+// said when you stop talking, reads the reply out loud, and listens again. It
+// keeps listening while the agent works, so you can add something mid-run.
+//
+// Voice detection is done here rather than by a timer: an analyser on the mic
+// stream, with a noise floor that follows the room, so a silent office and a
+// moving car both work without a setting. Nothing is uploaded until speech has
+// actually been heard, so a long quiet stretch costs nothing.
+const VOICE_SILENCE_MS=1400;        // quiet this long after speech = your turn ended
+const VOICE_MAX_CLIP_MS=90000;      // never record longer than this in one go
+const VOICE_IDLE_RESTART_MS=30000;  // heard nothing: throw the clip away and re-arm
+const VOICE_MIN_RMS=0.012;          // absolute floor, so hiss alone is never speech
+const _voice={name:'',phase:'off',stream:null,ctx:null,srcNode:null,analyser:null,data:null,
+              rec:null,chunks:[],heard:false,startedAt:0,speechAt:0,floor:0.005,dropClip:false,
+              timer:null,replyTimer:null,awaiting:false,sentAt:0,lastSpokenTs:0,pending:null,
+              audio:null,wake:null,lastPull:0};
+function voiceActive(name){return _voice.phase!=='off'&&(!name||_voice.name===name)}
+function _voiceBarEl(){return document.getElementById('voice-bar-'+_voice.name)}
+function _voiceSet(phase,text){
+  if(phase)_voice.phase=phase;
+  const bar=_voiceBarEl();
+  if(bar){
+    bar.className='voice-bar on '+_voice.phase;
+    const t=document.getElementById('voice-text-'+_voice.name);
+    if(t&&text)t.textContent=text;
+    const skip=document.getElementById('voice-skip-'+_voice.name);
+    if(skip)skip.style.display=_voice.phase==='speaking'?'':'none';
+  }
+}
+function renderVoiceBar(){
+  document.querySelectorAll('.voice-bar').forEach(b=>{
+    const on=voiceActive()&&b.id==='voice-bar-'+_voice.name;
+    b.className='voice-bar'+(on?' on '+_voice.phase:'');
+  });
+  document.querySelectorAll('.cmd-voice').forEach(b=>{
+    b.classList.toggle('active',voiceActive()&&b.id==='cmd-voice-'+_voice.name);
+  });
+}
+async function toggleLiveVoice(name){
+  if(voiceActive(name)){stopLiveVoice('Live voice off');return}
+  await startLiveVoice(name);
+}
+async function startLiveVoice(name){
+  if(_voice.phase!=='off')stopLiveVoice('');
+  unlockCompletionAudio();                       // this click is the audio unlock
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    showToast('This browser has no microphone access.');return;
+  }
+  let stream;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia(
+      {audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  }catch(e){showToast('Microphone permission denied or unavailable.');return}
+  _voice.name=name;_voice.stream=stream;_voice.awaiting=false;_voice.pending=null;
+  _voice.floor=0.005;_voice.lastPull=0;
+  // Whatever the agent said BEFORE you started is not read out.
+  const msgs=chatMessages[name]||[];
+  _voice.lastSpokenTs=0;
+  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){_voice.lastSpokenTs=msgs[i].ts||0;break}}
+  const ctx=_getCompletionAudioContext();
+  _voice.ctx=ctx;
+  if(ctx){
+    if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
+    try{
+      _voice.srcNode=ctx.createMediaStreamSource(stream);
+      const an=ctx.createAnalyser();an.fftSize=1024;
+      _voice.srcNode.connect(an);
+      _voice.analyser=an;_voice.data=new Float32Array(an.fftSize);
+    }catch(e){_voice.analyser=null}
+  }
+  try{if(navigator.wakeLock&&navigator.wakeLock.request)_voice.wake=await navigator.wakeLock.request('screen')}catch(e){}
+  _voice.phase='listening';
+  renderVoiceBar();
+  _voiceListen();
+  if(_voice.replyTimer)clearInterval(_voice.replyTimer);
+  _voice.replyTimer=setInterval(_voiceCheckReply,2500);
+}
+function stopLiveVoice(msg){
+  _voice.phase='off';
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  if(_voice.replyTimer){clearInterval(_voice.replyTimer);_voice.replyTimer=null}
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+  try{if(_voice.stream)_voice.stream.getTracks().forEach(t=>t.stop())}catch(e){}
+  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
+  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
+  try{if(_voice.srcNode)_voice.srcNode.disconnect()}catch(e){}
+  try{if(_voice.wake&&_voice.wake.release)_voice.wake.release()}catch(e){}
+  _voice.rec=null;_voice.stream=null;_voice.analyser=null;_voice.srcNode=null;
+  _voice.wake=null;_voice.awaiting=false;_voice.pending=null;_voice.audio=null;
+  renderVoiceBar();
+  if(msg)showToast(msg);
+}
+function _voiceListen(){
+  if(_voice.phase==='off'||!_voice.stream)return;
+  _voice.phase='listening';_voice.heard=false;_voice.chunks=[];
+  _voice.startedAt=Date.now();_voice.speechAt=0;_voice.dropClip=false;
+  let mr;
+  try{mr=new MediaRecorder(_voice.stream)}catch(e){stopLiveVoice('Recording is not supported in this browser.');return}
+  _voice.rec=mr;
+  mr.ondataavailable=e=>{if(e.data&&e.data.size)_voice.chunks.push(e.data)};
+  mr.onstop=()=>{
+    const drop=_voice.dropClip;_voice.dropClip=false;
+    if(_voice.phase==='off'||_voice.phase==='speaking')return;
+    if(drop){if(_voice.phase==='listening')_voiceListen();return}
+    _voiceSend(new Blob(_voice.chunks,{type:mr.mimeType||'audio/webm'}));
+  };
+  try{mr.start(250)}catch(e){stopLiveVoice('Could not start recording.');return}
+  _voiceSet('listening',_voice.awaiting?'Listening. Claude is still working.':'Listening. Just talk.');
+  if(_voice.timer)clearInterval(_voice.timer);
+  _voice.timer=setInterval(_voiceTick,100);
+}
+function _voiceLevel(){
+  if(!_voice.analyser)return 0;
+  _voice.analyser.getFloatTimeDomainData(_voice.data);
+  let sum=0;
+  for(let i=0;i<_voice.data.length;i++)sum+=_voice.data[i]*_voice.data[i];
+  return Math.sqrt(sum/_voice.data.length);
+}
+function _voiceTick(){
+  if(_voice.phase!=='listening')return;
+  const now=Date.now();
+  const level=_voiceLevel();
+  // The floor drops to the quietest thing heard and creeps back up, so it
+  // follows the room rather than a number someone guessed.
+  _voice.floor=level<_voice.floor?level:(_voice.floor*0.999+level*0.001);
+  const speaking=_voice.analyser?level>Math.max(VOICE_MIN_RMS,_voice.floor*3.5):false;
+  if(speaking){
+    if(!_voice.heard){_voice.heard=true;_voiceSet('hearing','Hearing you.')}
+    _voice.speechAt=now;
+  }
+  if(_voice.heard&&_voice.speechAt&&now-_voice.speechAt>VOICE_SILENCE_MS){_voiceStopClip(false);return}
+  if(_voice.heard&&now-_voice.startedAt>VOICE_MAX_CLIP_MS){_voiceStopClip(false);return}
+  // No analyser (an old browser): fall back to fixed 12-second turns.
+  if(!_voice.analyser&&now-_voice.startedAt>12000){_voiceStopClip(false);return}
+  if(!_voice.heard&&now-_voice.startedAt>VOICE_IDLE_RESTART_MS){_voiceStopClip(true);return}
+}
+function _voiceStopClip(drop){
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  _voice.dropClip=!!drop;
+  if(!drop)_voiceSet('sending','Sending what you said.');
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+}
+async function _voiceSend(blob){
+  if(_voice.phase==='off')return;
+  if(!blob||!blob.size){_voiceListen();return}
+  const type=blob.type||'';
+  const ext=type.indexOf('mp4')>=0?'m4a':(type.indexOf('ogg')>=0?'ogg':'webm');
+  let text='';
+  try{
+    const fd=new FormData();fd.append('audio',blob,'voice.'+ext);
+    const r=await fetch(BASE+'/api/transcribe',{method:'POST',body:fd});
+    const j=await r.json().catch(()=>({}));
+    text=(r.ok&&j.text)?String(j.text).trim():'';
+  }catch(e){}
+  if(_voice.phase==='off')return;
+  if(!text||text.replace(/[^A-Za-z0-9]/g,'').length<2){_voiceListen();return}
+  if(/^(stop|end|exit|quit|turn off)\s*(the\s+)?(live\s+)?voice(\s+mode)?\s*[.!]?$/i.test(text)){
+    stopLiveVoice('Live voice off');return;
+  }
+  const name=_voice.name;
+  try{
+    const resp=await fetch(BASE+'/api/sessions/'+encodeURIComponent(name)+'/send',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command:text})});
+    if(!resp.ok)throw new Error('send failed');
+    appendChatBubble(name,'user',text,Date.now()/1000);
+    setOptimisticBusy(name);
+    _voice.awaiting=true;_voice.sentAt=Date.now()/1000;_voice.pending=null;
+  }catch(e){showToast('Could not send that message.')}
+  _voiceListen();
+}
+// The reply is the Chat tab's own recap of the turn, which is the short version
+// written to be read out. Speak it only once it has settled: the server updates
+// the same bubble as the turn finishes, and reading a half-written recap aloud
+// is worse than waiting two seconds.
+async function _voiceCheckReply(){
+  if(_voice.phase==='off'||!_voice.awaiting)return;
+  const name=_voice.name;
+  const busy=(lastStatus[name]||'')==='busy';
+  if(!busy&&Date.now()/1000-_voice.sentAt>4&&Date.now()-_voice.lastPull>6000){
+    _voice.lastPull=Date.now();
+    try{await refreshOne(name)}catch(e){}
+  }
+  if(_voice.phase==='off'||busy)return;
+  const msgs=chatMessages[name]||[];
+  let latest=null;
+  for(let i=msgs.length-1;i>=0;i--){if(msgs[i].role==='assistant'){latest=msgs[i];break}}
+  if(!latest||!(latest.ts>_voice.sentAt)||!(latest.ts>_voice.lastSpokenTs))return;
+  const txt=String(latest.text||latest.full||'').trim();
+  if(!txt)return;
+  if(_voice.pending&&_voice.pending===txt){
+    _voice.pending=null;_voice.awaiting=false;_voice.lastSpokenTs=latest.ts;
+    _voiceSpeak(txt);
+  }else{
+    _voice.pending=txt;
+  }
+}
+function voiceSkipSpeech(){
+  try{if(_voice.audio)_voice.audio.stop()}catch(e){}
+  try{if(window.speechSynthesis)speechSynthesis.cancel()}catch(e){}
+}
+async function _voiceSpeak(text){
+  if(_voice.phase==='off')return;
+  // Stop listening first: an open mic would hear the reply and answer it.
+  _voice.dropClip=true;
+  if(_voice.timer){clearInterval(_voice.timer);_voice.timer=null}
+  _voiceSet('speaking','Speaking the reply.');
+  try{if(_voice.rec&&_voice.rec.state!=='inactive')_voice.rec.stop()}catch(e){}
+  let played=false;
+  try{
+    const r=await fetch(BASE+'/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:text})});
+    if(r.ok&&_voice.ctx){
+      const buf=await r.arrayBuffer();
+      const decoded=await _voice.ctx.decodeAudioData(buf);
+      if(_voice.phase!=='speaking')return;
+      await new Promise(res=>{
+        const src=_voice.ctx.createBufferSource();
+        src.buffer=decoded;src.connect(_voice.ctx.destination);
+        _voice.audio=src;
+        src.onended=()=>{_voice.audio=null;res()};
+        src.start();
+      });
+      played=true;
+    }
+  }catch(e){}
+  if(!played&&window.speechSynthesis&&_voice.phase==='speaking'){
+    // No server voice (offline, no key): the browser's own voice still works.
+    await new Promise(res=>{
+      try{
+        const u=new SpeechSynthesisUtterance(text.slice(0,1500));
+        u.onend=res;u.onerror=res;speechSynthesis.speak(u);
+      }catch(e){res()}
+    });
+  }
+  if(_voice.phase==='speaking')_voiceListen();
 }
 
 async function sendChat(name){
@@ -26488,7 +27730,7 @@ function _dropEl(e){
 // and Info have nothing to upload to, so they opt out.
 function _paneDropTarget(){
   if(!selectedSession)return null;
-  const tab=activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw');
+  const tab=activeTabs[selectedSession]||_defaultSessionTab();
   if(tab!=='raw'&&tab!=='chat')return null;
   const el=document.getElementById('tab-'+tab+'-'+selectedSession);
   return el?{name:selectedSession,tab:tab,el:el}:null;
@@ -26712,7 +27954,7 @@ async function loadRaw(name){
 // Reload now lives in the header line, which is visible from every tab — so it
 // refreshes whatever that tab is showing rather than only the terminal.
 function reloadActive(name){
-  const tab=activeTabs[name]||(MEMBER_SIMPLE?'chat':'raw');
+  const tab=activeTabs[name]||_defaultSessionTab();
   if(tab==='raw')loadRaw(name);
   else if(tab==='skills')loadProfileSkills(name);
   else refreshOne(name);
@@ -26734,7 +27976,7 @@ function _pillCacheClasses(name,status){
   if(status==='busy'&&s.cache_keepalive)extra+=' keepcache';
   if(status==='idle'){
     const left=_cacheSecondsLeft(name);
-    if(left!==null&&left>0&&left<=CACHE_WARN_LEAD)extra+=' expiring';
+    if(left!==null&&left>0&&left<=CACHE_ALERT_LEAD)extra+=' expiring';
   }
   return extra;
 }
@@ -26749,6 +27991,24 @@ function _paintPillCache(name){
   const want='status-pill '+status+_pillCacheClasses(name,status);
   if(pill.className!==want)pill.className=want;
 }
+// The chat view's "Working..." line. Reconciled from whatever status the caller
+// has, because it used to be added and removed only by updateCard — which runs
+// off a full session refresh, not off the ten-second status poll, so a turn that
+// finished left the three bouncing dots on screen indefinitely.
+function _syncChatTyping(name,status){
+  const chatEl=document.getElementById('chat-'+name);
+  if(!chatEl)return;
+  const existing=chatEl.querySelector('.chat-typing');
+  if(status==='busy'&&!existing){
+    const typing=document.createElement('div');
+    typing.className='chat-typing';
+    typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
+    chatEl.appendChild(typing);
+    chatEl.scrollTop=chatEl.scrollHeight;
+  }else if(status!=='busy'&&existing){
+    existing.remove();
+  }
+}
 function updateStatusPill(name,status,detail){
   const pill=document.getElementById('status-'+name);
   if(pill){
@@ -26761,6 +28021,10 @@ function updateStatusPill(name,status,detail){
   toggleInterruptButtons(name,status==='busy');
   const navDot=document.getElementById('nav-dot-'+name);
   if(navDot)navDot.className=_idleNudgeNavDotClass(name,status);
+  _syncChatTyping(name,status);
+  // The live strip under the terminal runs its own clock off busy/idle, so it has
+  // to move on the poll as well, not only on a full refresh.
+  try{if(typeof updateLiveBar==='function')updateLiveBar(name)}catch(e){}
 }
 
 function updateCard(s){
@@ -26779,24 +28043,13 @@ function updateCard(s){
   refreshSavedKeys(s.name);
   const tsRt=document.getElementById('ts-rt-'+s.name);
   if(tsRt)tsRt.textContent=timeAgo(s.realtime_at);
-  updateStatusPill(s.name,s.activity_status,s.activity_detail);
-  // Busy/idle drives the live strip's dots and whether its clock is running.
-  updateLiveBar(s.name);
-
-  // Update typing indicator
-  const chatEl=document.getElementById('chat-'+s.name);
-  if(chatEl){
-    const existing=chatEl.querySelector('.chat-typing');
-    if(s.activity_status==='busy'&&!existing){
-      const typing=document.createElement('div');
-      typing.className='chat-typing';
-      typing.innerHTML='<span class="typing-dot-group"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></span> Working...';
-      chatEl.appendChild(typing);
-      chatEl.scrollTop=chatEl.scrollHeight;
-    }else if(s.activity_status!=='busy'&&existing){
-      existing.remove();
-    }
-  }
+  // lastStatus is what the ten-second poll writes, so it is never behind this
+  // payload; s.activity_status is only a fallback for a session the poll has not
+  // reached yet. Preferring it stops a slow /refresh reply from dragging the pill
+  // back to a status the session has already left.
+  const fresh=lastStatus[s.name]||s.activity_status;
+  // updateStatusPill also reconciles the chat typing line and the live strip.
+  updateStatusPill(s.name,fresh,s.activity_detail);
 }
 
 // Bring `name` into view even if the project filter currently excludes it.
@@ -26855,10 +28108,11 @@ async function loadAll(focus){
     // returns you to the session you were reading. Every other path through
     // loadAll is a reload of where you already are: replace, or the stack fills
     // with copies of one entry.
-    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||(MEMBER_SIMPLE?'chat':'raw'),!_focused);
+    if(selectedSession)_writeSessionRoute(selectedSession,activeTabs[selectedSession]||_defaultSessionTab(),!_focused);
     loadProjectsNav();          // fills the workspace switcher (admins only)
   }catch(e){mainEl.innerHTML='<div class="empty">Error loading sessions.</div>'}
   startStatusPolling();
+  startAttentionClock();
   // Phase 2: Background LLM refresh for each session
   lazyRefreshAll();
 }
@@ -26903,6 +28157,17 @@ function startStatusPolling(){
   pollTimer=setInterval(pollStatus,10000);
 }
 
+// A hidden tab has its timers throttled by the browser to about once a minute,
+// and nothing caught up on return — so coming back to the dashboard showed a
+// status up to a minute stale, which is exactly what "it only updates when I
+// reload the page" looks like. Poll the moment the tab is looked at again, and
+// re-read the usage bars with it.
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState!=='visible')return;
+  try{pollStatus()}catch(e){}
+  try{refreshUsageLimits()}catch(e){}
+});
+
 // The build this tab is RUNNING, learned from the first poll, versus the build
 // the server is serving now. A dashboard left open across a deploy keeps polling
 // fresh data through stale JavaScript, so a change to the UI is invisible and
@@ -26922,6 +28187,7 @@ function _safeToReload(){
     // _recording is a per-session map, not a flag: it is always truthy, so ask
     // whether any session is actually recording.
     if(typeof _recording==='object'&&_recording&&Object.values(_recording).some(Boolean))return false;
+    if(typeof _voice==='object'&&_voice&&_voice.phase!=='off')return false;   // mid-conversation
   }catch(e){return false}
   return true;
 }
@@ -26941,7 +28207,18 @@ function _checkBuild(resp){
     document.body.appendChild(pill);
   }catch(e){}
 }
+// /api/status walks every session's tmux pane, so on a box with a dozen sessions
+// it can outlast its own ten-second tick. setInterval does not wait, so the polls
+// used to queue behind each other and the whole page's status fell further and
+// further behind. One in flight at a time; a skipped tick costs ten seconds, a
+// pile-up costs minutes.
+let _pollInFlight=false;
 async function pollStatus(){
+  if(_pollInFlight)return;
+  _pollInFlight=true;
+  try{await _pollStatusOnce()}finally{_pollInFlight=false}
+}
+async function _pollStatusOnce(){
   try{
     const resp=await fetch(BASE+'/api/status');
     _checkBuild(resp);
@@ -26955,10 +28232,21 @@ async function pollStatus(){
         refreshOne(st.name);
       }
       trackSessionStatus(st.name,st.activity_status);
+      // Write the fresh status back onto the session object BEFORE anything
+      // repaints from it. This poll used to update the pill's DOM and nothing
+      // else, leaving `sessions[i].activity_status` frozen at whatever the page
+      // load saw — so every later re-render (switching session or tab, the nav
+      // dots, the favicon, the chat "Working..." line, the Stop button) painted a
+      // status that could be hours old, and a session that had gone idle stayed
+      // red until someone reloaded the page. That was the whole bug.
+      const si=sessions.findIndex(s=>s.name===st.name);
+      if(si>=0){
+        sessions[si].activity_status=st.activity_status;
+        sessions[si].activity_detail=st.activity_detail||'';
+      }
       updateStatusPill(st.name,st.activity_status,st.activity_detail);
       if(st.name===selectedSession)updateFavicon(st.activity_status);
       // Update model badge in nav
-      const si=sessions.findIndex(s=>s.name===st.name);
       if(si>=0){
         let navChanged=false;
         if(st.display_name&&(sessions[si].display_name||'')!==st.display_name){
@@ -27033,6 +28321,32 @@ refreshNavStats();
 
 // --- Anthropic OAuth usage limits (5h + 7d) in nav header ---
 let _usageLimitsTimer=null;
+// "4d", "23h", "40m": whole units left until the window resets.
+function _fmtResetShort(iso){
+  if(!iso)return'';
+  const ms=new Date(iso)-new Date();
+  if(!(ms>0))return'';
+  const mins=Math.floor(ms/60000);
+  if(mins<60)return Math.max(1,mins)+'m';
+  const hrs=Math.floor(mins/60);
+  if(hrs<24)return hrs+'h';
+  return Math.floor(hrs/24)+'d';
+}
+let _usageResets={fh:'',sd:''};
+function _paintUsageResets(){
+  // The 5-hour row only exists while the account dropdown is open; getElementById
+  // returning null for it is the normal case, not a failure.
+  [['auth-usage-5h-reset',_usageResets.fh,'5-hour'],['nav-usage-7d-reset',_usageResets.sd,'7-day']]
+    .forEach(([id,iso,label])=>{
+      const el=document.getElementById(id);
+      if(!el)return;
+      const short=_fmtResetShort(iso);
+      const txt=short?('Reset: '+short):'';
+      if(el.textContent!==txt)el.textContent=txt;
+      el.title=short?('The '+label+' window resets '+_fmtResetTime(iso)):'';
+    });
+}
+setInterval(_paintUsageResets,60000);
 function _fmtResetTime(iso){
   if(!iso)return'';
   try{
@@ -27066,28 +28380,89 @@ function _usageErrText(err){
   if(err==='rate_limited') return 'Anthropic is rate-limiting the usage API; backing off and retrying.';
   return 'the Anthropic usage API did not answer (retrying).';
 }
+// Last good payload. Kept because the 5-hour row now lives in the account
+// dropdown, which is rebuilt every time it is opened: without this it would show
+// an empty bar until the next poll came round.
+let _usageLimitsData=null;
+// Every id prefix a bar is painted into. The 5-hour pair exists only while the
+// account dropdown is open and the tools mirror is phone-only, so a null lookup
+// here is the normal case, not a failure.
+const _USAGE_5H_IDS=['auth-usage-5h','tools-usage-5h'];
+const _USAGE_7D_IDS=['nav-usage-7d','tools-usage-7d'];
+// The bars stay on screen either way — only their state changes. `has-data` used
+// to gate `display`, so one bad answer made them vanish entirely and the feature
+// looked deleted.
+function _setUsageHasData(has,why){
+  const wrap=document.getElementById('nav-usage');
+  const toolsWrap=document.getElementById('nav-tools-usage');
+  if(wrap){wrap.classList.toggle('has-data',has);wrap.classList.toggle('no-data',!has)}
+  if(toolsWrap){toolsWrap.classList.toggle('has-data',has);toolsWrap.classList.toggle('no-data',!has)}
+  if(has)return;
+  _usageResets={fh:'',sd:''};_paintUsageResets();
+  const t='Anthropic usage unavailable — '+(why||'no data yet.');
+  _USAGE_5H_IDS.concat(_USAGE_7D_IDS).forEach(p=>{
+    const pct=document.getElementById(p+'-pct'); if(pct)pct.textContent='—';
+    const fill=document.getElementById(p+'-fill'); if(fill)fill.style.width='0%';
+    const w=document.getElementById(p+'-wrap'); if(w)w.title=t;
+  });
+}
+// Paint a payload onto whichever bars are currently in the DOM. Split out from
+// the fetch so opening the account dropdown repaints its 5-hour row at once.
+function _applyUsageLimits(data){
+  if(!data||(!data.five_hour&&!data.seven_day))return;
+  _setUsageHasData(true);
+  const wrap=document.getElementById('nav-usage');
+  if(wrap)wrap.classList.toggle('stale',!!data.stale);
+  const fh=data.five_hour||{};
+  const sd=data.seven_day||{};
+  _usageResets={fh:fh.resets_at||'',sd:sd.resets_at||''};
+  _paintUsageResets();
+  const fhPct=Math.round(Number(fh.utilization)||0);
+  const sdPct=Math.round(Number(sd.utilization)||0);
+  const staleNote=data.stale?' · last known value (upstream unreachable)':'';
+  // Which account, and when it was read. Without these a live 0% is
+  // indistinguishable from a dead widget — which is exactly how it reads
+  // after a box is signed in to a second, unused account.
+  const acct=data.account||{};
+  const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
+  let readNote='';
+  if(data.fetched_at){
+    const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
+    readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
+  }
+  // Where the number came from, and whether spend has moved to overage credits
+  // (the 7-day window being spent is exactly when that starts to cost money).
+  const srcNote=data.source==='ratelimit_headers'
+    ? ' · read from the rate-limit headers on a 1-token probe (the account usage API needs a credential this host does not have)'
+    : '';
+  const ovNote=(data.overage&&data.overage.in_use)
+    ? ' · ⚠ plan window spent — running on overage credits'+
+      (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
+    : '';
+  // Anthropic returns resets_at null for a window nothing has been spent in
+  // yet, so "resets " used to trail off into blank space — which reads as a
+  // broken widget at exactly the moment the honest answer is "this window just
+  // rolled over". Say that instead.
+  const _when=(blk,pct)=>{
+    const t=_fmtResetTime(blk.resets_at);
+    if(t)return'resets '+t;
+    return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
+  };
+  const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
+  const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
+  [[_USAGE_5H_IDS,Number(fh.utilization)||0,fhPct,fhTitle],
+   [_USAGE_7D_IDS,Number(sd.utilization)||0,sdPct,sdTitle]].forEach(([ids,util,pct,title])=>{
+    ids.forEach(p=>{
+      _applyUsageStyle(document.getElementById(p+'-fill'),util);
+      const pe=document.getElementById(p+'-pct'); if(pe)pe.textContent=pct+'%';
+      const w=document.getElementById(p+'-wrap'); if(w)w.title=title;
+    });
+  });
+}
 async function refreshUsageLimits(){
   if(MEMBER_SIMPLE) return;  // members don't see usage bars
   const wrap=document.getElementById('nav-usage');
-  const toolsWrap=document.getElementById('nav-tools-usage');
   if(!wrap)return;
-  // The bars stay on screen either way — only their state changes. `has-data`
-  // used to gate `display`, so one bad answer made them vanish entirely and the
-  // feature looked deleted.
-  const setHasData=(has,why)=>{
-    wrap.classList.toggle('has-data',has);
-    wrap.classList.toggle('no-data',!has);
-    if(toolsWrap){toolsWrap.classList.toggle('has-data',has);toolsWrap.classList.toggle('no-data',!has)}
-    if(!has){
-      const t='Anthropic usage unavailable — '+(why||'no data yet.');
-      ['nav-usage-5h','nav-usage-7d','tools-usage-5h','tools-usage-7d'].forEach(p=>{
-        const pct=document.getElementById(p+'-pct'); if(pct)pct.textContent='—';
-        const fill=document.getElementById(p+'-fill'); if(fill)fill.style.width='0%';
-      });
-      ['nav-usage-5h-wrap','nav-usage-7d-wrap','tools-usage-5h-wrap','tools-usage-7d-wrap']
-        .forEach(id=>{const el=document.getElementById(id); if(el)el.title=t});
-    }
-  };
   try{
     const resp=await fetch(BASE+'/api/usage/limits');
     // Only blank the bars if we have never had data. Once they are showing,
@@ -27098,65 +28473,16 @@ async function refreshUsageLimits(){
       let why=_usageErrText(err);
       if(g && !g.have_credential && g.retry_in_s>0)
         why += ' The dashboard is re-granting it by itself — next attempt in '+Math.ceil(g.retry_in_s/60)+' min.';
-      if(!wrap.classList.contains('has-data'))setHasData(false,why);
+      if(!wrap.classList.contains('has-data'))_setUsageHasData(false,why);
       _scheduleUsageRetry();return;
     }
     const data=await resp.json();
-    if(!data||(!data.five_hour&&!data.seven_day)){setHasData(false,_usageErrText(data&&data.error));_scheduleUsageRetry();return}
-    setHasData(true);
-    wrap.classList.toggle('stale',!!data.stale);
-    if(data.stale)_scheduleUsageRetry();
-    const fh=data.five_hour||{};
-    const sd=data.seven_day||{};
-    const fhPct=Math.round(Number(fh.utilization)||0);
-    const sdPct=Math.round(Number(sd.utilization)||0);
-    _applyUsageStyle(document.getElementById('nav-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('nav-usage-7d-fill'),Number(sd.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-5h-fill'),Number(fh.utilization)||0);
-    _applyUsageStyle(document.getElementById('tools-usage-7d-fill'),Number(sd.utilization)||0);
-    [['nav-usage-5h-pct',fhPct],['nav-usage-7d-pct',sdPct],
-     ['tools-usage-5h-pct',fhPct],['tools-usage-7d-pct',sdPct]].forEach(([id,v])=>{
-      const el=document.getElementById(id); if(el)el.textContent=v+'%';
-    });
-    const staleNote=data.stale?' · last known value (upstream unreachable)':'';
-    // Which account, and when it was read. Without these a live 0% is
-    // indistinguishable from a dead widget — which is exactly how it reads
-    // after a box is signed in to a second, unused account.
-    const acct=data.account||{};
-    const acctNote=acct.email?' · account '+acct.email+(acct.plan?' ('+acct.plan+')':''):'';
-    let readNote='';
-    if(data.fetched_at){
-      const mins=Math.max(0,Math.round((Date.now()/1000-data.fetched_at)/60));
-      readNote=' · read '+(mins<1?'just now':mins<60?mins+'m ago':Math.floor(mins/60)+'h ago');
+    if(!data||(!data.five_hour&&!data.seven_day)){
+      _setUsageHasData(false,_usageErrText(data&&data.error));_scheduleUsageRetry();return;
     }
-    // Where the number came from, and whether spend has moved to overage credits
-    // (the 7-day window being spent is exactly when that starts to cost money).
-    const srcNote=data.source==='ratelimit_headers'
-      ? ' · read from the rate-limit headers on a 1-token probe (the account usage API needs a credential this host does not have)'
-      : '';
-    const ovNote=(data.overage&&data.overage.in_use)
-      ? ' · ⚠ plan window spent — running on overage credits'+
-        (typeof data.overage.utilization==='number'?' ('+Math.round(data.overage.utilization)+'% of those used)':'')
-      : '';
-    // Anthropic returns resets_at null for a window nothing has been spent in
-    // yet, so "resets " used to trail off into blank space — which reads as a
-    // broken widget at exactly the moment the honest answer is "this window just
-    // rolled over". Say that instead.
-    const _when=(blk,pct)=>{
-      const t=_fmtResetTime(blk.resets_at);
-      if(t)return'resets '+t;
-      return pct?'reset time not reported':'window just rolled over, nothing spent in it yet';
-    };
-    const fhTitle='Anthropic 5-hour limit · '+fhPct+'% used · '+_when(fh,fhPct)+acctNote+readNote+staleNote+srcNote+ovNote;
-    const sdTitle='Anthropic 7-day limit · '+sdPct+'% used · '+_when(sd,sdPct)+acctNote+readNote+staleNote+srcNote+ovNote;
-    const fhWrap=document.getElementById('nav-usage-5h-wrap');
-    const sdWrap=document.getElementById('nav-usage-7d-wrap');
-    if(fhWrap)fhWrap.title=fhTitle;
-    if(sdWrap)sdWrap.title=sdTitle;
-    const tfh=document.getElementById('tools-usage-5h-wrap');
-    const tsd=document.getElementById('tools-usage-7d-wrap');
-    if(tfh)tfh.title=fhTitle;
-    if(tsd)tsd.title=sdTitle;
+    if(data.stale)_scheduleUsageRetry();
+    _usageLimitsData=data;
+    _applyUsageLimits(data);
   }catch(e){
     /* keep last known display */
   }
@@ -27172,11 +28498,11 @@ function _scheduleUsageRetry(){
 function startUsageLimitsPolling(){
   if(_usageLimitsTimer)clearInterval(_usageLimitsTimer);
   refreshUsageLimits();
-  // Poll every 10 min, not hourly. Upstream is still hit at most once an hour —
-  // the backend cache enforces that — but the cache is keyed on the token, so a
-  // login switch busts it, and an hourly page timer meant the bars kept showing
-  // the PREVIOUS account's numbers for up to an hour after the switch.
-  _usageLimitsTimer=setInterval(refreshUsageLimits,600*1000);
+  // Every minute, matching the backend's own cache window (ANTHROPIC_LIMITS_TTL),
+  // so what is on screen is never more than about two minutes behind the account.
+  // It was ten minutes on top of an hour-long server cache, which is how a box
+  // with its 5-hour window fully spent kept reading 32%.
+  _usageLimitsTimer=setInterval(refreshUsageLimits,60*1000);
 }
 startUsageLimitsPolling();
 
@@ -27323,7 +28649,7 @@ async function createSession(){
 function _openNewSession(name){
   if(!name)return;
   selectedSession=name;
-  const tab=MEMBER_SIMPLE?'chat':'raw';
+  const tab=_defaultSessionTab();
   activeTabs[name]=tab;
   location.hash=_sessionRouteHash(name,tab);
 }
@@ -27498,8 +28824,29 @@ function fmtTokens(n){
   return String(n);
 }
 
+// The plan's 5-hour rolling window, as a bar with its own reset countdown. It
+// lives here rather than in the header: it is the number you check when you are
+// deciding whether there is room to start something now, which is a moment you
+// open this panel anyway. Values are painted by _applyUsageLimits once this
+// markup is in the DOM, so all the HTML has to supply is the shape and the ids.
+function renderFiveHourLimitHtml(){
+  return '<div class="nav-tools-usage-row" id="auth-usage-5h-wrap" title="Anthropic 5-hour limit">'
+    +'<span class="nav-tools-usage-label">5h</span>'
+    +'<span class="nav-tools-usage-bar"><span class="nav-usage-fill" id="auth-usage-5h-fill" style="width:0%"></span></span>'
+    +'<span class="nav-tools-usage-pct" id="auth-usage-5h-pct">&mdash;</span>'
+    +'<span class="nav-usage-reset" id="auth-usage-5h-reset"></span>'
+    +'</div>';
+}
+
 function renderUsageHtml(){
-  if(!_usageCache||!_usageCache.totalTokens)return '';
+  // The 5-hour bar renders whether or not any tokens were recorded today: a box
+  // that has spent nothing still needs to be able to see that, and this block
+  // used to be dropped whole when the count was zero.
+  const head='<hr class="auth-divider">'
+    +'<div class="auth-title" style="margin-bottom:4px">Today\'s Usage</div>'
+    +renderFiveHourLimitHtml();
+  if(!_usageCache||!_usageCache.totalTokens)
+    return head+'<p class="auth-hint" style="margin-top:8px">No tokens recorded yet today.</p>';
   const u=_usageCache;
   const total=u.totalTokens;
   const outPct=total?Math.round(u.outputTokens/total*100):0;
@@ -27513,9 +28860,8 @@ function renderUsageHtml(){
     +'<div style="width:'+inPct+'%;background:#58a6ff" title="Input '+inPct+'%"></div>'
     +'<div style="width:'+rdPct+'%;background:#21262d" title="Cache read '+rdPct+'%"></div>'
     +'</div>';
-  return '<hr class="auth-divider">'
-    +'<div class="auth-title" style="margin-bottom:4px">Today\'s Usage</div>'
-    +'<div class="auth-row"><span class="auth-row-label">Messages</span><span class="auth-row-value">'+u.messages+'</span></div>'
+  return head
+    +'<div class="auth-row" style="margin-top:8px"><span class="auth-row-label">Messages</span><span class="auth-row-value">'+u.messages+'</span></div>'
     +'<div class="auth-row"><span class="auth-row-label">Total tokens</span><span class="auth-row-value">'+fmtTokens(total)+'</span></div>'
     +barH
     +'<div style="display:flex;flex-wrap:wrap;gap:2px 12px;font-size:.7rem;color:#8b949e;margin-bottom:2px">'
@@ -27524,13 +28870,17 @@ function renderUsageHtml(){
     +'<span><span style="color:#d2a8ff">●</span> Cache write '+fmtTokens(u.cacheCreateTokens)+'</span>'
     +'<span style="color:#484f58">Cache read '+fmtTokens(u.cacheReadTokens)+'</span>'
     +'</div>'
-    +'<p class="auth-hint" style="margin-top:6px">Usage resets on a 5-hour rolling window.</p>';
+    +'<p class="auth-hint" style="margin-top:6px">Token counts are for today, UTC. The 5h bar above is the plan\'s own rolling window.</p>';
 }
 
 function renderAuthPanel(){
   const el=document.getElementById('auth-dropdown-content');
   if(!_authCache){el.innerHTML='<div class="auth-title">Loading...</div>';return}
   const usageHtml=renderUsageHtml();
+  // Repaint the 5-hour bar as soon as the markup above lands, and ask for a fresh
+  // read. Without the first call the bar would sit at 0% until the next minute
+  // tick, which is indistinguishable from an unspent window.
+  setTimeout(()=>{_applyUsageLimits(_usageLimitsData);refreshUsageLimits()},0);
   if(_authCache.loggedIn){
     const plan=(_authCache.subscriptionType||'free').toLowerCase();
     const planClass=plan==='max'?'max':plan==='pro'?'pro':'free';
@@ -27549,37 +28899,17 @@ function renderAuthPanel(){
   }else{
     el.innerHTML=`
       <div class="auth-title">Claude Code — Not Connected</div>
-      <p class="auth-hint">Set an Anthropic API key to authenticate Claude Code for new sessions:</p>
-      <input type="password" class="auth-api-input" id="auth-api-key-input"
-        placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false"
-        value="${_authCache.hasApiKey?'••••••••••••••••':''}">
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="auth-btn auth-btn-primary" style="flex:1" onclick="saveApiKey()">Save key</button>
-        ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="flex:1" onclick="clearApiKey()">Clear</button>':''}
-      </div>
+      <p class="auth-hint">Sessions here run on the subscription plan. Sign in with
+        <code style="color:#79c0ff">claude auth login</code> in a terminal session. There is no
+        API key to set: a metered key is not stored on this dashboard.</p>
+      ${_authCache.hasApiKey?'<button class="auth-btn auth-btn-danger" style="margin-top:10px" onclick="clearApiKey()">Clear the stored API key</button>':''}
       ${usageHtml}
-      <hr class="auth-divider">
-      <p class="auth-hint">Or authenticate via OAuth by running <code style="color:#79c0ff">claude auth login</code> in a terminal session.</p>
     `;
   }
 }
 
-async function saveApiKey(){
-  const input=document.getElementById('auth-api-key-input');
-  if(!input)return;
-  const key=input.value.trim();
-  if(!key){alert('Please enter an API key.');return}
-  try{
-    const resp=await fetch(BASE+'/api/auth/api-key',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({apiKey:key})
-    });
-    const data=await resp.json();
-    if(!resp.ok){alert(data.detail||'Failed to save');return}
-    await checkClaudeAuth();
-    renderAuthPanel();
-  }catch(e){alert('Failed to save API key.')}
-}
+// saveApiKey() is gone with the input it read: the plan is the only route, so
+// POST /api/auth/api-key refuses a key and only still accepts the empty clear.
 
 async function clearApiKey(){
   try{
@@ -27705,7 +29035,7 @@ async function setAuthMode(name,mode){
     if(resp.ok){
       const idx=sessions.findIndex(s=>s.name===name);
       if(idx>=0)sessions[idx].auth_mode=mode;
-      if(statusEl)statusEl.textContent=mode==='api'?'API key exported':'API key unset';
+      if(statusEl)statusEl.textContent='API key unset';
     }else{
       if(statusEl)statusEl.textContent=data.error||'Failed';
     }
@@ -27784,32 +29114,37 @@ function stopStatsPolling(){
 // ── Auto-push (auto-responder + autopilot watchdog) ──
 let _watchdogTimers={};
 const AUTOPUSH_TITLES={
-  off:'Off — the dashboard never types into this terminal',
-  basic:"Basic — auto-pick option menus + confirm permission/plan prompts (Enter), keep logged in",
-  basicplus:'Basic +: Basic, plus one fixed "continue" '+
-            (CACHE_WARN_LEAD/60)+' minutes before the prompt cache goes cold, so the '+
-            'transcript stays warm and your next message is still cheap. Never composes '+
-            'a task; the session turns amber while it is running for this reason.',
-  full:'Full — Basic, plus write a "keep going" instruction when Claude pauses before finishing'
+  off:'Off: the dashboard never types into this terminal',
+  basic:'Basic: answers option menus and permission prompts so the work keeps going, and keeps '+
+        'the session logged in. Never picks an option that exits, logs out or spends money.',
+  cache:'Cache: Basic, plus '+(CACHE_PUSH_LEAD/60)+' minutes before the prompt cache goes cold it '+
+        'sends the next step you would most likely ask for (tests, QA, the missing parts, polish), '+
+        'drafted from your messages and the replies, so the session stays warm and keeps moving. '+
+        'Never a new feature, nothing destructive. Pauses after 8 pushes nobody answered. The '+
+        'session turns amber while it works on one.',
+  full:'Full: Basic, plus writes a "keep going" reply whenever Claude pauses before finishing'
 };
+function _autopushModeId(mode){
+  return mode==='basicplus'?'cache':(mode||'basic');
+}
 function autopushDesc(mode){
-  return ({off:'Off — no auto-typing',
-           basic:'Basic — picks options + confirms prompts',
-           basicplus:'Basic +: Basic, plus keeps the prompt cache warm',
-           full:'Full — options, confirms + keep-going nudges'})[mode||'basic'];
+  return ({off:'Off: no auto-typing',
+           basic:'Basic: answers menus and prompts, never exit or log out',
+           cache:'Cache: Basic, plus sends the likely next step before the cache goes cold',
+           full:'Full: menus, prompts and keep-going replies'})[_autopushModeId(mode)];
 }
 // Build the 3-way segmented control. `compact` shrinks it for the More dropdown.
 function autopushSeg(name,mode,compact){
-  mode=mode||'basic';
+  mode=_autopushModeId(mode);
   const b=(m,label)=>'<button type="button" class="ap-'+m+(mode===m?' active':'')+'" title="'+
     esc(AUTOPUSH_TITLES[m])+'" onclick="event.stopPropagation();setAutopush(\''+
     esc(name).replace(/'/g,"\\'")+'\',\''+m+'\')">'+label+'</button>';
   return '<div class="autopush-seg'+(compact?' compact':'')+'" data-name="'+esc(name)+'">'+
-    b('off','Off')+b('basic','Basic')+b('basicplus','Basic +')+b('full','Full')+'</div>';
+    b('off','Off')+b('basic','Basic')+b('cache','Cache')+b('full','Full')+'</div>';
 }
 // Reflect a mode across every rendered control for this session (More menu + Info tab).
 function syncAutopushUI(name,mode){
-  mode=mode||'basic';
+  mode=_autopushModeId(mode);
   document.querySelectorAll('.autopush-seg').forEach(seg=>{
     if(seg.dataset.name!==name)return;
     seg.querySelectorAll('button').forEach(btn=>{
@@ -32409,12 +33744,12 @@ function closeStats(){
 // ── Phone layout: header status widgets move to the bottom ──────────────────
 // On a phone the header has room for the project switcher and about two session
 // tabs, and the tabs are the thing you actually navigate with. The browser
-// badge, the 5h/7d usage bars and the CPU/RAM readout are all glance-only, so on
-// a narrow screen they move to a strip at the very bottom of the page — below
-// the terminal and the upload area.
+// badge, the 7d usage bar and the CPU/RAM readout are all glance-only, so on a
+// narrow screen they move to a strip at the very bottom of the page — below the
+// terminal and the upload area.
 //
 // The ELEMENTS are moved, not cloned. Every poller writes by id
-// (#nav-usage-5h-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
+// (#nav-usage-7d-fill, #nav-server-stats, #nav-browser-badge…), so a copy would
 // have meant either dead widgets or a second set of updaters to keep in step.
 const _BOTTOM_BAR_IDS=['nav-browser-badge','nav-usage','nav-server-stats'];
 function syncMobileBottomBar(){
