@@ -430,8 +430,17 @@ def stop_browser_workload(
     expected_started: float = 0.0,
     expected_start_ticks: int = 0,
     grace_s: float = 3.0,
+    allow_protected: bool = False,
 ) -> dict:
-    """Stop a freshly revalidated unmanaged browser and its dedicated runner."""
+    """Stop a freshly revalidated unmanaged browser and its dedicated runner.
+
+    `allow_protected` is for one caller: the idle reaper, on a browser whose
+    profile sits in a dashboard slot but which the dashboard no longer lists.
+    The protection exists so CPU containment and the Stop workload button never
+    touch a browser the dashboard is using; a slot it abandoned is not that, and
+    without the override such a browser can never be stopped by anything. One
+    had been running 45 days, 19 of them with nothing attached, for that reason.
+    """
     snapshot = snapshot_processes()
     browser = snapshot.get(int(browser_pid))
     if browser is None:
@@ -459,7 +468,7 @@ def stop_browser_workload(
     item = next((row for row in browser_roots(snapshot) if row.process.pid == browser.pid), None)
     if item is None:
         return {"ok": False, "error": "browser process is gone or changed"}
-    if item.protected:
+    if item.protected and not allow_protected:
         return {"ok": False, "error": "refusing to stop a dashboard-managed browser"}
     workload_root = _workload_root(browser.pid, snapshot)
     root_identity = snapshot.get(workload_root)
