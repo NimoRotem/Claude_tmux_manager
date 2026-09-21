@@ -1,0 +1,20 @@
+  Unrelated find: three iptorch workers read RUNNING in supervisor while dead   
+  five days since a Postgres disconnect. Restarted.                           
+                                                                              
+  Left undone: builder7's dashboard restart, two sessions were mid turn and its
+  live exposure is closed another way. Your call on two things: builder2a runs  
+  on a LunaRoute token with no plan credential at all, and instance-3 carries 12
+  orphan Claude sessions idle up to 13 days, each holding that box's OpenAI     
+  key.                                                                        
+
+✻ Crunched for 1h 25m 47s · done 11:06 PM                                     
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · PR #93 · 1 shell · esc to interrupt · ← for agen…
+                                         ✔ Update installed · Restart to apply
+
+  ● main
+  ◯ general-purpose (+7)  Fetching openai-builder1 a… 5m 54s · ↓ 112.6k tokens
+

@@ -5,3 +5,14 @@ openai==1.58.1            # latest: 2.30.0 (MAJOR — breaking API changes; skip
 python-multipart==0.0.20  # GHSA-wp53-j4wj-2cfg partial mitigation; full fix at 0.0.22 not yet on PyPI
 starlette==0.49.3         # updated 2026-04-03 (was 0.41.3); fixes GHSA-2c2j-9gv5-cj73 + GHSA-7f5h-v6xp-fcq8
 pydantic==2.12.5          # updated 2026-04-03 (was 2.10.3)
+
+# browser_ladder L0 (fetch). curl_cffi is the one that matters: it replays a real
+# Chrome ClientHello, so a site that refuses L0 refuses it for a real reason.
+# requests is the fallback import. With neither installed the whole ladder is
+# dead and /api/ladder 500s on ModuleNotFoundError (lisa-claude, 2026-08-27).
+curl_cffi==0.16.2
+requests==2.34.2
+
+# Test-only, not imported by the app.
+pytest==9.1.1
+pytest-asyncio==1.4.0

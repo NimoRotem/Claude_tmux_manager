@@ -1,0 +1,11 @@
+● 2 background agents launched (↓ to manage)
+   ├ Codex builder box recipe
+   └ Dashboard Google login mechanics
+
+● Agent(Dashboard Google login mechanics)
+  ⎿  Running…
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #93 · ← for agents
