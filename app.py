@@ -24,6 +24,21 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+# Human-facing clock. Storage and logs stay UTC; anything a person reads (file
+# times, "today" boundaries, the browser's time labels) is shown in this zone.
+# Set APP_TZ on the process, never TZ: TZ would leak into every tmux pane.
+DISPLAY_TZ_NAME = os.environ.get("APP_TZ", "America/Los_Angeles")
+DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
+
+
+def _display_day_start():
+    """Midnight today in DISPLAY_TZ: (epoch, UTC ISO prefix 'YYYY-MM-DDTHH:MM:SS', local 'YYYY-MM-DD')."""
+    now_local = datetime.now(DISPLAY_TZ)
+    start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start.astimezone(timezone.utc)
+    return start.timestamp(), start_utc.strftime("%Y-%m-%dT%H:%M:%S"), start.strftime("%Y-%m-%d")
 from typing import Dict, Optional
 import contextlib
 import glob as globmod
@@ -1746,7 +1761,7 @@ def _dashboard_build() -> dict:
     import socket
     here = Path(__file__).resolve()
     try:
-        stamp = time.strftime("%Y.%m.%d", time.localtime(here.stat().st_mtime))
+        stamp = datetime.fromtimestamp(here.stat().st_mtime, DISPLAY_TZ).strftime("%Y.%m.%d")
     except Exception:
         stamp = "unknown"
     sha = ""
@@ -1805,7 +1820,7 @@ def _dashboard_build() -> dict:
     import socket
     here = Path(__file__).resolve()
     try:
-        stamp = time.strftime("%Y.%m.%d", time.localtime(here.stat().st_mtime))
+        stamp = datetime.fromtimestamp(here.stat().st_mtime, DISPLAY_TZ).strftime("%Y.%m.%d")
     except Exception:
         stamp = "unknown"
     sha = ""
@@ -6082,7 +6097,7 @@ def _render_dir_listing(request: Request, dir_path: Path) -> HTMLResponse:
         name = p.name + ("/" if is_dir else "")
         icon = "&#128193;" if is_dir else "&#128196;"
         size = "" if (is_dir or st is None) else _human_size(st.st_size)
-        mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M") if st else ""
+        mtime = datetime.fromtimestamp(st.st_mtime, DISPLAY_TZ).strftime("%Y-%m-%d %H:%M %Z") if st else ""
         rows.append(
             f'<tr><td class="ic">{icon}</td>'
             f'<td><a class="row-link" href="{_attr(_link(p))}">{_html_escape(name)}</a></td>'
@@ -19073,7 +19088,7 @@ async def api_claude_usage():
     if now - _usage_cache["ts"] < 60:
         return JSONResponse(_usage_cache["data"])
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_start_epoch, day_start_utc, today = _display_day_start()
     home = str(Path.home())
     patterns = [
         f"{home}/.claude/projects/*/*.jsonl",
@@ -19093,7 +19108,7 @@ async def api_claude_usage():
     for fpath in files:
         try:
             mtime = os.path.getmtime(fpath)
-            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
+            if mtime < day_start_epoch:
                 continue
             with open(fpath) as f:
                 for line in f:
@@ -19101,7 +19116,7 @@ async def api_claude_usage():
                     if d.get("type") != "assistant":
                         continue
                     ts = d.get("timestamp", "")
-                    if not ts.startswith(today):
+                    if not ts or ts[:19] < day_start_utc:
                         continue
                     msg = d if "usage" in d else d.get("message", {})
                     usage = msg.get("usage")
@@ -20462,7 +20477,7 @@ def _parse_session_stats(session_name: str) -> dict:
     if session_scoped:
         files = [own]
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_start_epoch, day_start_utc, today = _display_day_start()
     now_epoch = now
 
     # Collect all assistant messages with usage from today
@@ -20479,7 +20494,7 @@ def _parse_session_stats(session_name: str) -> dict:
     for fpath in files:
         try:
             mtime = os.path.getmtime(fpath)
-            if datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d") < today:
+            if mtime < day_start_epoch:
                 continue
             with open(fpath) as f:
                 for line in f:
@@ -20487,7 +20502,7 @@ def _parse_session_stats(session_name: str) -> dict:
                     if d.get("type") != "assistant":
                         continue
                     ts_str = d.get("timestamp", "")
-                    if not ts_str.startswith(today):
+                    if not ts_str or ts_str[:19] < day_start_utc:
                         continue
                     msg = d if "usage" in d else d.get("message", {})
                     usage = msg.get("usage")
@@ -26528,7 +26543,7 @@ function timeAgo(ts){
 function fmtTime(ts){
   if(!ts)return'';
   const d=new Date(ts*1000);
-  return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',timeZone:'America/Los_Angeles'});
 }
 function esc(str){
   if(!str)return'';
@@ -29806,7 +29821,7 @@ function renderUsageHtml(){
     +'<span><span style="color:#d2a8ff">●</span> Cache write '+fmtTokens(u.cacheCreateTokens)+'</span>'
     +'<span style="color:#484f58">Cache read '+fmtTokens(u.cacheReadTokens)+'</span>'
     +'</div>'
-    +'<p class="auth-hint" style="margin-top:6px">Token counts are for today, UTC. The 5h bar above is the plan\'s own rolling window.</p>';
+    +'<p class="auth-hint" style="margin-top:6px">Token counts are for today, Pacific time. The 5h bar above is the plan\'s own rolling window.</p>';
 }
 
 function renderAuthPanel(){
@@ -30121,7 +30136,7 @@ function renderWatchdogLog(name,log){
   const logEl=document.getElementById('watchdog-log-'+name);
   if(logEl&&log&&log.length){
     logEl.innerHTML=log.slice(-10).map(e=>
-      '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString()+']</span> '+esc(e.action)+'</div>'
+      '<div class="watchdog-log-entry"><span class="watchdog-ts">['+new Date(e.ts*1000).toLocaleTimeString([],{timeZone:'America/Los_Angeles',timeZoneName:'short'})+']</span> '+esc(e.action)+'</div>'
     ).join('');
     logEl.scrollTop=logEl.scrollHeight;
   }
@@ -32028,7 +32043,7 @@ function renderBrowserHistory(id){
     'The trail fills while this browser is in use.</div></div>';
   const base = BASE+'/api/browser/shot/'+encodeURIComponent(id)+'/';
   return '<div class="bs-hist">'+rows.map(r=>{
-    const when = new Date((r.ts||0)*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const when = new Date((r.ts||0)*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:'America/Los_Angeles'});
     const who = (r.agents||[]).length ? ' · '+esc((r.agents||[]).join(', ')) : '';
     const thumb = r.shot
       ? '<img src="'+esc(base+encodeURIComponent(r.shot))+'" loading="lazy" alt="" '+
@@ -32158,7 +32173,7 @@ async function removeBrowserSession(id){
 
 // --- Login tab (admin) — long-lived never-revoke auth token ---
 let _authStatus = null;
-function _fmtTs(ms){ if(!ms) return '—'; try{ return new Date(ms).toLocaleString(); }catch(e){ return String(ms); } }
+function _fmtTs(ms){ if(!ms) return '—'; try{ return new Date(ms).toLocaleString([],{timeZone:'America/Los_Angeles',timeZoneName:'short'}); }catch(e){ return String(ms); } }
 async function loadLoginTab(){
   let d;
   try{ const r=await fetch(BASE+'/api/auth/status'); d=await r.json(); if(!r.ok) throw new Error(d.error||'Failed'); }
@@ -32704,7 +32719,7 @@ function _browserName(ua){ua=ua||'';if(/Edg\//.test(ua))return'Edge';if(/OPR\//.
 function _groupOpts(sel){return '<option value="">— no group —</option>'+_groupsCache.map(g=>`<option value="${esc(g.id)}" ${g.id===sel?'selected':''}>${esc(g.name)}</option>`).join('');}
 function _fmtUserTokens(value){const n=Number(value||0);if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n);}
 function _fmtUserCost(value){const n=Number(value||0);return n?'$'+n.toFixed(n<1?3:2):'$0';}
-function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString()}catch(e){return'Never'}}
+function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString([],{timeZone:'America/Los_Angeles',timeZoneName:'short'})}catch(e){return'Never'}}
 function _userPresenceName(user){return user.working?'working':(user.online?'online':'offline')}
 function _userStatusRank(user){return user.working?3:(user.online?2:1)}
 function _userSortValue(user,key){
@@ -33054,7 +33069,7 @@ async function _ctxDelete(path){
 // Distinct from session history: chat history is per-session and disappears with
 // the session, this is a permanent record of who typed what, including prompts
 // typed while an admin was impersonating someone.
-function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString()}catch(e){return'Never'}}
+function _fmtUserDate(value){if(!value)return'Never';try{return new Date(Number(value)*1000).toLocaleString([],{timeZone:'America/Los_Angeles',timeZoneName:'short'})}catch(e){return'Never'}}
 let _promptAuditState={userId:'',label:'',items:[],nextBefore:0,nextCursor:''};
 async function openPromptAudit(userId,label,before,append){
   if(!append){
