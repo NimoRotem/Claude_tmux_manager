@@ -106,7 +106,7 @@ def _managed_agent_command(session_name: str, command: str) -> str:
 # flag at launch so the default can't drift when Claude Code persists a /model
 # choice — or a new release's auto-default — into ~/.claude/settings.json (that
 # drift is how default sessions silently became Sonnet 4.6, then Fable 5).
-DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5[1m]")
+DEFAULT_MODEL = os.environ.get("TMUX_DASH_DEFAULT_MODEL", "claude-opus-5-5[1m]")
 # Reasoning effort every new session launches on, exported as
 # CLAUDE_CODE_EFFORT_LEVEL by _claude_launch_env_prefix(). Sessions can still be
 # switched individually from the header dropdown, which runs /effort.
@@ -133,6 +133,8 @@ _MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 # Families offered with a 1M-context "[1m]" variant (haiku doesn't have one).
 _ONE_M_FAMILIES = ("opus", "sonnet", "fable")
 _SEED_MODEL_CATALOG = [
+    ["claude-opus-5-5[1m]", "Opus 5.5 · 1M"],
+    ["claude-opus-5-5", "Opus 5.5"],
     ["claude-opus-5[1m]", "Opus 5 · 1M"],
     ["claude-opus-5", "Opus 5"],
     ["claude-fable-5-1[1m]", "Fable 5.1 · 1M"],
@@ -615,7 +617,7 @@ PUBLIC_BASE_URL = os.environ.get("TMUX_DASH_PUBLIC_URL", "")  # e.g. https://dia
 PUB_URL = (PUBLIC_BASE_URL.rstrip("/") or "https://dianaotech.com") + ROOT_PATH  # external base incl. the ROOT_PATH subpath (e.g. .../build)
 DASH_LOCAL_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 # Team-mode default model + reasoning effort, pinned into every session's config.
-TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-4-8[1m]")
+TEAM_MODEL = os.environ.get("TMUX_DASH_TEAM_MODEL", "claude-opus-5-5[1m]")
 TEAM_EFFORT = os.environ.get("TMUX_DASH_TEAM_EFFORT", DEFAULT_EFFORT)
 # Email domain used for per-user git commit identity (commits are AUTHORED by the
 # member even though everyone shares one OS user).
@@ -10720,7 +10722,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "ux-expert", "name": "UX Expert",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "claude-opus-5-5[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -10896,7 +10898,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "researcher", "name": "Researcher",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "claude-opus-5-5[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -10924,7 +10926,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "security-expert", "name": "Security Expert",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "claude-opus-5-5[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -10954,7 +10956,7 @@ _PROFILE_PRESETS = [
     },
     {
         "id": "optimizer", "name": "Optimizer",
-        "model": "claude-opus-4-8[1m]", "effort": "high",
+        "model": "claude-opus-5-5[1m]", "effort": "high",
         "permissions": dict(_COMMON_PERMISSIONS),
         "env": dict(_COMMON_ENV),
         "claude_md": (
@@ -26553,6 +26555,8 @@ function formatModelName(model){
 // Seed list; refreshed from /api/models on load so newly-released models
 // (added by the 24h auto-detect) appear in the dropdown without a redeploy.
 let MODEL_CHOICES=[
+  ['claude-opus-5-5[1m]','Opus 5.5 · 1M'],
+  ['claude-opus-5-5','Opus 5.5'],
   ['claude-opus-5[1m]','Opus 5 · 1M'],
   ['claude-opus-5','Opus 5'],
   ['claude-fable-5-1[1m]','Fable 5.1 · 1M'],
