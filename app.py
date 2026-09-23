@@ -1725,6 +1725,11 @@ async def lifespan(_app: FastAPI):
 
     usage_cred_task = asyncio.create_task(usage_credential_watchdog())
     _background_tasks.append(usage_cred_task)
+
+    uploads_retention_task = asyncio.create_task(_uploads_retention_loop())
+    _background_tasks.append(uploads_retention_task)
+    logger.info("Uploads retention started (orphaned upload dirs removed after %.0f days)",
+                UPLOADS_RETENTION_DAYS)
     logger.info("Usage-credential watchdog started (credential present=%s)",
                 _usage_credential_ok())
 
@@ -9489,6 +9494,8 @@ async def api_delete_session(request: Request, session_name: str):
         if not sess:
             return JSONResponse({"error": "Session not found"}, status_code=404)
         exact_id = _exact_tmux_session_id(session_name)
+        # The uploads key needs #{session_created}, which is gone after the kill.
+        upload_key = _session_upload_key(session_name, sess)
         lifecycle_owner = _session_owner_id(session_name)
         lifecycle = SESSION_LIFECYCLE.get(session_name)
         if not lifecycle:
@@ -9593,6 +9600,13 @@ async def api_delete_session(request: Request, session_name: str):
             expected_generation=lifecycle_generation,
             owner_id=lifecycle_owner,
         )
+        # Files uploaded into this session die with it.
+        try:
+            gone = await asyncio.to_thread(_remove_session_uploads, session_name, upload_key)
+            if gone:
+                logger.info("Session '%s': removed uploads %s", session_name, gone)
+        except Exception:
+            logger.warning("Session '%s': uploads cleanup failed", session_name, exc_info=True)
         logger.info("Session deleted: '%s'", session_name)
         return JSONResponse({"ok": True, "killed": session_name})
     except Exception as e:
@@ -9678,6 +9692,148 @@ def _session_uploads_dir(session_name: str, sess: Optional[dict] = None,
     if create:
         target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+# Uploads used to outlive their session forever: a deleted session left its files
+# in ~/.tmux-dashboard/uploads/ (287 MB and 111 dirs on builder1, 2026-09-23), and the
+# ticket solvers upload a screenshot into every session they open. A session's own
+# dir now goes when the session is deleted, and a periodic sweep removes a dir that
+# no live session can own once nothing in it has changed for UPLOADS_RETENTION_DAYS.
+UPLOADS_RETENTION_DAYS = float(os.environ.get("TMUX_DASH_UPLOADS_RETENTION_DAYS", "14") or 0)
+UPLOADS_PRUNE_INTERVAL_S = 6 * 3600
+_UPLOAD_KEY_RE = re.compile(r"^(?P<base>.+)-(?P<created>\d+)$")
+
+
+def _upload_dir_inside(path: Path) -> bool:
+    """True only for a real directory directly under UPLOADS_DIR (never a symlink)."""
+    try:
+        return (not path.is_symlink() and path.is_dir()
+                and path.resolve().parent == UPLOADS_DIR.resolve())
+    except OSError:
+        return False
+
+
+def _remove_session_uploads(session_name: str, key: str) -> list:
+    """Delete one deleted session instance's uploads and its pending-upload queue.
+
+    `key` is the instance key captured BEFORE the kill (it needs #{session_created}).
+    The legacy bare-name dir goes too: it can only belong to an instance of this name.
+    """
+    removed = []
+    for name in dict.fromkeys([key, session_name]):
+        if not name:
+            continue
+        target = UPLOADS_DIR / name
+        if _upload_dir_inside(target):
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(name)
+    try:
+        data = _read_json_file(PENDING_UPLOADS_FILE)
+        if key in data:
+            data.pop(key, None)
+            _write_json_file(PENDING_UPLOADS_FILE, data)
+    except Exception:
+        logger.debug("Could not drop pending uploads for %s", key, exc_info=True)
+    return removed
+
+
+def _live_tmux_session_names() -> Optional[set]:
+    """Every session on the default tmux server, Codex and internal ones included,
+    so a sibling dashboard sharing this home never loses a live session's files.
+    None when tmux could not be asked: the caller must then delete nothing."""
+    try:
+        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "no server running" in err or "no sessions" in err:
+            return set()
+        return None
+    return {n.strip() for n in r.stdout.splitlines() if n.strip()}
+
+
+def _upload_dir_owner_is_live(dirname: str, live: set) -> bool:
+    """Match on the NAME part, not the instance key: a durable session restored after a
+    restart comes back with a new #{session_created}, and its resumed conversation may
+    still name files under the old key."""
+    safe_live = {re.sub(r"[^A-Za-z0-9._-]", "_", n).strip("._-") or "session" for n in live}
+    if dirname in live or dirname in safe_live:
+        return True
+    m = _UPLOAD_KEY_RE.match(dirname)
+    return bool(m and (m.group("base") in safe_live or m.group("base") in live))
+
+
+def _newest_mtime(path: Path) -> float:
+    newest = path.lstat().st_mtime
+    for root, dirs, files in os.walk(path):
+        for n in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, n)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def _prune_orphan_uploads(max_age_days: Optional[float] = None,
+                          now: Optional[float] = None) -> dict:
+    """Remove upload dirs that belong to no live session and have not changed for
+    max_age_days. Returns {"removed": [...], "kept_live": n, "kept_recent": n}."""
+    days = UPLOADS_RETENTION_DAYS if max_age_days is None else max_age_days
+    out = {"removed": [], "kept_live": 0, "kept_recent": 0, "freed_bytes": 0}
+    if not days or days <= 0 or not UPLOADS_DIR.is_dir():
+        return out
+    live = _live_tmux_session_names()
+    if live is None:
+        out["skipped"] = "tmux unavailable"
+        return out
+    cutoff = (now or time.time()) - days * 86400
+    for entry in sorted(UPLOADS_DIR.iterdir()):
+        if not _upload_dir_inside(entry):
+            continue
+        if _upload_dir_owner_is_live(entry.name, live):
+            out["kept_live"] += 1
+            continue
+        try:
+            if _newest_mtime(entry) >= cutoff:
+                out["kept_recent"] += 1
+                continue
+            size = sum(f.stat().st_size for f in entry.rglob("*")
+                       if f.is_file() and not f.is_symlink())
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            out["removed"].append(entry.name)
+            out["freed_bytes"] += size
+    if out["removed"]:
+        try:
+            data = _read_json_file(PENDING_UPLOADS_FILE)
+            if any(k in data for k in out["removed"]):
+                for k in out["removed"]:
+                    data.pop(k, None)
+                _write_json_file(PENDING_UPLOADS_FILE, data)
+        except Exception:
+            logger.debug("Could not prune pending uploads", exc_info=True)
+    return out
+
+
+async def _uploads_retention_loop():
+    """Sweep orphaned upload dirs 10 minutes after boot, then every 6 hours."""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            res = await asyncio.to_thread(_prune_orphan_uploads)
+            if res.get("removed"):
+                logger.info("Uploads retention: removed %d orphaned dir(s), %.1f MB (%s)",
+                            len(res["removed"]), res["freed_bytes"] / 1e6,
+                            ", ".join(res["removed"][:20]))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Uploads retention sweep failed")
+        await asyncio.sleep(UPLOADS_PRUNE_INTERVAL_S)
 
 
 def _add_pending_upload(key: str, path: str, size: int):
