@@ -89,6 +89,9 @@ class SessionLifecycleStore:
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     )
 
+    # How long a vanished session's tombstone is kept before it is pruned.
+    TOMBSTONE_TTL_SEC = 14 * 86400
+
     def __init__(self, path: Path):
         self.store = LockedJsonStore(path, lambda: {"version": 2, "sessions": {}})
 
@@ -107,6 +110,7 @@ class SessionLifecycleStore:
         owner_id: str,
         resume_uuid: str = "",
         source: str = "session-create",
+        server_id: str = "",
     ) -> dict[str, Any]:
         owner = str(owner_id or "").strip()
         if not owner:
@@ -125,6 +129,8 @@ class SessionLifecycleStore:
         normalized = self._resume_uuid(resume_uuid)
         if normalized:
             row["resume_uuid"] = normalized
+        if server_id:
+            row["server_id"] = str(server_id)[:128]
 
         def mutate(value: dict[str, Any]) -> dict[str, Any]:
             value["version"] = 2
@@ -143,6 +149,7 @@ class SessionLifecycleStore:
         resume_uuid: str = "",
         source: str = "dashboard",
         expected_generation: str = "",
+        server_id: str = "",
     ) -> dict[str, Any]:
         owner = str(owner_id or "").strip()
         if not owner:
@@ -154,11 +161,19 @@ class SessionLifecycleStore:
             row = value.setdefault("sessions", {}).setdefault(session_name, {})
             if expected_generation and row.get("generation") != expected_generation:
                 raise ValueError("session generation changed during checkpoint")
+            state = str(row.get("desired_state") or "")
             recorded_owner = str(row.get("owner_id") or "")
-            if recorded_owner and recorded_owner != owner:
+            if recorded_owner and recorded_owner != owner and state != "deleted":
                 raise ValueError("session owner changed during checkpoint")
-            if str(row.get("desired_state") or "") in {"deleting", "deleted"}:
+            if state == "deleting":
                 return dict(row)
+            if state == "deleted":
+                # A tombstone from mark_vanished, and a live session under the same name again:
+                # that is a NEW session that reused the name, so it gets a new generation and
+                # none of the dead one's bindings.
+                for stale in ("resume_uuid", "vanished_at", "transition_at", "server_id"):
+                    row.pop(stale, None)
+                row["generation"] = secrets.token_hex(16)
             row.update(
                 {
                     "managed": True,
@@ -173,10 +188,51 @@ class SessionLifecycleStore:
             )
             if normalized:
                 row["resume_uuid"] = normalized
+            if server_id:
+                row["server_id"] = str(server_id)[:128]
             return dict(row)
 
         _value, row = self.store.update(mutate)
         return row
+
+    def mark_vanished(
+        self,
+        session_name: str,
+        *,
+        expected_generation: str = "",
+        server_id: str = "",
+    ) -> bool:
+        """Record that a running session disappeared under a tmux server that is still up.
+
+        That is an external kill (`tmux kill-session`, a shell that exited), not a reboot, so the
+        session must NOT be restored. The row stays as a tombstone (desired_state "deleted") so
+        the log and the registry say what happened; a new session under the same name replaces
+        it at the next checkpoint. Tombstones older than TOMBSTONE_TTL_SEC are dropped here."""
+        generation = str(expected_generation or "").strip()
+        now = time.time()
+
+        def mutate(value: dict[str, Any]) -> bool:
+            sessions = value.setdefault("sessions", {})
+            for name in list(sessions):
+                old = sessions.get(name)
+                if (isinstance(old, dict) and old.get("desired_state") == "deleted"
+                        and now - float(old.get("vanished_at") or now) > self.TOMBSTONE_TTL_SEC):
+                    sessions.pop(name, None)
+            row = sessions.get(session_name)
+            if not isinstance(row, dict):
+                return False
+            if generation and str(row.get("generation") or "") != generation:
+                return False
+            if str(row.get("desired_state") or "") != "running":
+                return False
+            if server_id and str(row.get("server_id") or "") != str(server_id):
+                return False
+            row.update({"desired_state": "deleted", "restore_on_startup": False,
+                        "vanished_at": now})
+            return True
+
+        _value, marked = self.store.update(mutate)
+        return bool(marked)
 
     def begin_transition(
         self,
