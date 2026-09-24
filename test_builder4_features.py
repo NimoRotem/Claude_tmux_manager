@@ -314,6 +314,7 @@ def test_a_launch_that_aborts_on_its_conversation_counts_as_a_crash():
 @pytest.mark.asyncio
 async def test_new_session_launches_claude_inside_the_managed_scope(monkeypatch):
     import app
+    monkeypatch.setattr(app, "_tmux_server_state", lambda: ("7:100", set()))
 
     captured: dict[str, list[str]] = {}
     lifecycle_calls: list[tuple[str, str, dict]] = []
@@ -369,6 +370,7 @@ async def test_new_session_launches_claude_inside_the_managed_scope(monkeypatch)
             "cwd": "/srv/drafting",
             "owner_id": "admin",
             "resume_uuid": "",
+            "server_id": "7:100",
         },
     )
     assert lifecycle_calls[-1][0:2] == ("checkpoint", "drafting")
@@ -631,6 +633,7 @@ def test_live_sessions_are_checkpointed_with_owner_and_conversation(monkeypatch)
                 "owner_id": "admin",
                 "resume_uuid": "12345678-1234-1234-1234-123456789abc",
                 "source": "live-checkpoint",
+                "server_id": "",
             },
         )
     ]

@@ -1635,10 +1635,12 @@ async def lifespan(_app: FastAPI):
     try:
         durable_report = await _reconcile_durable_sessions()
         logger.info(
-            "Durable sessions ready: %d healthy, %d restored, %d failed",
+            "Durable sessions ready: %d healthy, %d restored, %d failed, "
+            "%d ended outside the dashboard (not restored)",
             durable_report.get("healthy", 0),
             len(durable_report.get("restored", [])),
             len(durable_report.get("failed", [])),
+            len(durable_report.get("vanished", [])),
         )
     except Exception:
         logger.exception("Initial durable session reconciliation failed")
@@ -9079,6 +9081,7 @@ def _restore_durable_session(candidate: dict) -> dict:
             resume_uuid=resume_uuid,
             source="durable-recovery",
             expected_generation=generation,
+            server_id=_tmux_server_state()[0],
         )
         return {"name": name, "status": "restored", "tmux_id": created_id}
     except Exception:
@@ -9112,8 +9115,11 @@ def _is_ephemeral_session(name: str) -> bool:
     return name.startswith("_") or name.startswith(PRIME_SESSION_PREFIX)
 
 
-def _checkpoint_live_sessions() -> int:
-    """Persist the owner, cwd, and exact Claude conversation for live tabs."""
+def _checkpoint_live_sessions(server_id: str = "") -> int:
+    """Persist the owner, cwd, and exact Claude conversation for live tabs.
+
+    `server_id` names the tmux server the tab was seen on, so a later reconcile can
+    tell a session killed under a server that is still up from one lost with it."""
     checkpointed = 0
     for session in get_tmux_sessions():
         name = str(session.get("name") or "")
@@ -9154,6 +9160,7 @@ def _checkpoint_live_sessions() -> int:
                     resume_uuid=resume_uuid,
                     source="live-checkpoint",
                     expected_generation=str(row.get("generation") or ""),
+                    server_id=server_id,
                 )
             else:
                 SESSION_LIFECYCLE.register_active(
@@ -9162,6 +9169,7 @@ def _checkpoint_live_sessions() -> int:
                     owner_id=owner_id,
                     resume_uuid=resume_uuid,
                     source="live-checkpoint",
+                    server_id=server_id,
                 )
             checkpointed += 1
         except Exception:
@@ -9188,14 +9196,86 @@ def _durable_session_candidates(live_names: set[str]) -> list[dict]:
     return candidates
 
 
+def _tmux_server_state() -> tuple:
+    """(identity of the default tmux server, every session name on it).
+
+    The identity is the server's pid and start time, so a server that died and was
+    started again (a reboot, an OOM) never matches the one a row was checkpointed
+    on, even if the pid is reused. The names are the RAW list: get_tmux_sessions()
+    hides sessions it judges not to be Claude's, and a session hidden for a moment is
+    not a session that is gone. ("", None) when no server answers."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{pid} #{start_time}\t#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return "", None
+    if result.returncode != 0:
+        return "", None
+    identity, names = "", set()
+    for line in (result.stdout or "").splitlines():
+        head, sep, name = line.partition("\t")
+        if not sep:
+            continue
+        identity = identity or head.strip().replace(" ", ":")
+        names.add(name)
+    return identity, names
+
+
+def _forget_vanished_session(name: str) -> None:
+    """Drop the per-session bindings of a session that was ended outside the
+    dashboard, as DELETE does, so a new session reusing the name starts clean."""
+    for step in (
+        lambda: cache.pop(name, None),
+        lambda: _crash_recovery_state.pop(name, None),
+        lambda: _seen_claude_running.discard(name),
+        lambda: _clear_session_owner(name),
+        lambda: _clear_session_convo(name),
+        lambda: _clear_session_model_choice(name),
+        lambda: _remove_session_display_name(name),
+    ):
+        try:
+            step()
+        except Exception:
+            logger.debug("Cleanup of vanished session '%s' failed", name, exc_info=True)
+
+
 def _reconcile_durable_sessions_locked() -> dict:
-    """Checkpoint live tabs and recreate each missing durable generation once."""
-    checkpointed = _checkpoint_live_sessions()
+    """Checkpoint live tabs and recreate each missing durable generation once.
+
+    ⚠️ A SESSION THAT VANISHED UNDER A LIVE SERVER IS NOT RESTORED. Restore exists
+    for a reboot or a dead tmux server. It used to fire on ANY missing row, so a
+    session somebody ended with a raw `tmux kill-session` came back inside 20
+    seconds with a fresh Claude on its old conversation. That is how the
+    lisa-autofix spawner's hourly reaper and this loop fought for a month on
+    instance-3: 13 finished lisa-fix sessions were killed and resurrected every hour
+    and were still holding ~1.7 GB on 2026-09-24. Each row now carries the server it
+    was last seen on; missing from that same server means somebody ended it, so the
+    row is tombstoned (desired_state "deleted") instead. A row from before this
+    change has no server on record and is restored once, as before."""
+    server_id, all_names = _tmux_server_state()
+    checkpointed = _checkpoint_live_sessions(server_id)
     live_names = {str(row.get("name") or "") for row in get_tmux_sessions()}
     restored = []
     failed = []
+    vanished = []
     for candidate in _durable_session_candidates(live_names):
         name = str(candidate.get("name") or "")
+        if all_names is not None and name in all_names:
+            continue        # alive, only hidden from the Claude list: nothing to restore
+        if server_id and str(candidate.get("server_id") or "") == server_id:
+            if SESSION_LIFECYCLE.mark_vanished(
+                name,
+                expected_generation=str(candidate.get("generation") or ""),
+                server_id=server_id,
+            ):
+                _forget_vanished_session(name)
+                vanished.append(name)
+                logger.warning(
+                    "Session '%s' was ended outside the dashboard while its tmux server "
+                    "(%s) stayed up: marked deleted, not restoring it", name, server_id)
+            continue
         try:
             result = _restore_durable_session(candidate)
             if result.get("status") == "restored":
@@ -9209,6 +9289,7 @@ def _reconcile_durable_sessions_locked() -> dict:
         "healthy": len(live_names),
         "restored": restored,
         "failed": failed,
+        "vanished": vanished,
     }
 
 
@@ -9311,6 +9392,7 @@ async def api_create_session(request: Request, body: CreateSession):
             cwd=start_cwd or _session_cwd(created_id),
             owner_id=owner_id,
             resume_uuid="",
+            server_id=_tmux_server_state()[0],
         )
         lifecycle_generation = str(lifecycle.get("generation") or "")
         # Everything below is COLLECTED, not typed. It used to go into the pane as
@@ -12907,6 +12989,11 @@ def _read_proc_table() -> dict:
     return table
 
 
+def _watched_sockets() -> list:
+    """WATCH_SOCKETS, which is defined further down beside its routes."""
+    return list(globals().get("WATCH_SOCKETS") or [])
+
+
 def _tmux_socket_of(argv: str) -> str:
     m = re.search(r"(?:^|\s)-L\s+(\S+)", argv)
     if m:
@@ -12980,6 +13067,10 @@ def _claude_process_inventory() -> dict:
             # On this dashboard's own tmux socket, in a session that still
             # exists. Anything else is running with nobody watching it.
             "attached": bool(session) and sock == "default",
+            # On a socket this dashboard WATCHES without adopting (the autofix
+            # agents, see /autofix): owned and reaped by their spawner, so they
+            # are not "nobody's".
+            "watched": bool(session) and sock in _watched_sockets(),
             "argv": p["argv"],
         })
     procs.sort(key=lambda x: (x["attached"], -x["rss_mb"]))
@@ -12987,8 +13078,10 @@ def _claude_process_inventory() -> dict:
         "processes": procs,
         "total": len(procs),
         "attached": sum(1 for x in procs if x["attached"]),
-        "orphaned": sum(1 for x in procs if not x["attached"]),
-        "orphan_rss_mb": sum(x["rss_mb"] for x in procs if not x["attached"]),
+        "watched": sum(1 for x in procs if x["watched"]),
+        "orphaned": sum(1 for x in procs if not x["attached"] and not x["watched"]),
+        "orphan_rss_mb": sum(x["rss_mb"] for x in procs
+                             if not x["attached"] and not x["watched"]),
     }
     _CLAUDE_INVENTORY_CACHE.update({"ts": now, "data": data})
     return data
@@ -13067,6 +13160,7 @@ async def api_stats(request: Request):
         inv = await asyncio.to_thread(_claude_process_inventory)
         stats["claude_inventory"] = {
             "total": inv["total"], "attached": inv["attached"],
+            "watched": inv.get("watched", 0),
             "orphaned": inv["orphaned"], "orphan_rss_mb": inv["orphan_rss_mb"],
             "processes": inv["processes"] if is_admin else [],
         }
@@ -34900,6 +34994,8 @@ function renderStats(s,usage){
   if(inv){
     html+='<div class="stats-section"><div class="stats-section-title">Claude Processes ('+inv.total+' running)</div>';
     html+='<div class="stats-row"><span class="stats-row-label">In a session on this dashboard</span><span class="stats-row-value">'+inv.attached+'</span></div>';
+    if(inv.watched)
+      html+='<div class="stats-row"><span class="stats-row-label">Autofix agents, own socket (<a href="'+BASE+'/autofix" target="_blank" style="color:#58a6ff">watch</a>)</span><span class="stats-row-value">'+inv.watched+'</span></div>';
     const orphColor=inv.orphaned?(inv.orphan_rss_mb>=2048?'#f85149':'#d29922'):'#8b949e';
     html+='<div class="stats-row"><span class="stats-row-label">Not attached to any session here</span>'+
       '<span class="stats-row-value" style="color:'+orphColor+'">'+inv.orphaned+
@@ -34913,7 +35009,7 @@ function renderStats(s,usage){
       const who=p.session
         ? (p.attached?esc(p.session):esc(p.socket)+' / '+esc(p.session))
         : 'pid '+p.pid+' (no session)';
-      const dot=p.attached?'#3fb950':'#d29922';
+      const dot=p.attached?'#3fb950':(p.watched?'#58a6ff':'#d29922');
       html+='<div class="stats-row" title="pid '+p.pid+' &middot; '+esc(p.argv||'')+'">'+
         '<span class="stats-row-label"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:'+dot+';margin-right:7px"></span>'+who+'</span>'+
         '<span class="stats-row-value" style="font-size:.72rem">'+fmtMb(p.rss_mb)+' &middot; '+fmtAgeShort(p.age_s)+'</span></div>';
@@ -35155,6 +35251,116 @@ def _projects_page_html(title: str, rows):
             "<div class=card><ul>%s</ul></div>"
             "<p class=muted>%s — projects are served at dianaotech.com/&lt;user&gt;/&lt;project&gt;.</p>"
             "</body></html>") % (title, BRAND_NAME, _PROJECTS_PAGE_CSS, title, items, BRAND_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Agents on their OWN tmux socket, shown read-only.
+#
+# The autofix spawners on this box (lisa-autofix, cron-autofix) keep their Claude
+# sessions on a private socket (agent_socket.SOCKET, "autofix"), per the house
+# rule that an app which spawns agents owns their lifetime. The dashboard must not
+# ADOPT them: it checkpoints every session on the default socket and restores it
+# when it goes missing, which is what kept 13 finished lisa-fix sessions alive for
+# a month. So they are listed here instead, with the pane's tail, and nothing on
+# this page can type into them. `tmux -L <socket> attach -t <name>` takes over.
+# Registered above the /{username} catch-all, behind the dashboard login.
+import agent_socket
+
+WATCH_SOCKETS = [s.strip() for s in os.environ.get(
+    "TMUX_DASH_WATCH_SOCKETS", agent_socket.SOCKET).split(",")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", s.strip() or "") and s.strip() != "default"]
+
+
+@app.get("/api/side-sessions")
+async def api_side_sessions(request: Request):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    out = []
+    for sock in WATCH_SOCKETS:
+        rows = await asyncio.to_thread(agent_socket.describe, sock)
+        out.append({"socket": sock, "sessions": rows})
+    return JSONResponse({"sockets": out, "reap_idle_s": agent_socket.IDLE_REAP_SEC})
+
+
+@app.get("/api/side-sessions/{socket}/{name}/tail")
+async def api_side_session_tail(request: Request, socket: str, name: str, lines: int = 300):
+    if not _is_admin(_current_user(request)):
+        return JSONResponse({"error": "Admin only"}, status_code=403)
+    if socket not in WATCH_SOCKETS or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        return JSONResponse({"error": "Unknown session"}, status_code=404)
+    if not await asyncio.to_thread(agent_socket.has_session, name, socket):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    text = await asyncio.to_thread(agent_socket.capture, name, socket, max(20, min(int(lines), 2000)))
+    return JSONResponse({"socket": socket, "name": name, "text": text})
+
+
+_SIDE_SESSIONS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Autofix sessions</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#0d1117;color:#c9d1d9;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{padding:12px 16px;border-bottom:1px solid #21262d;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+header h1{font-size:16px;margin:0}
+header a{color:#58a6ff;text-decoration:none}
+.note{color:#8b949e;font-size:12px}
+main{display:flex;min-height:calc(100vh - 50px)}
+#list{width:300px;flex:none;border-right:1px solid #21262d;overflow:auto}
+.row{padding:10px 16px;border-bottom:1px solid #161b22;cursor:pointer}
+.row:hover,.row.sel{background:#161b22}
+.row b{display:block;font-weight:600;word-break:break-all}
+.row span{color:#8b949e;font-size:12px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
+#view{flex:1;min-width:0;display:flex;flex-direction:column}
+#meta{padding:10px 16px;border-bottom:1px solid #21262d;color:#8b949e;font-size:12px}
+#meta code{color:#c9d1d9}
+pre{margin:0;padding:12px 16px;flex:1;overflow:auto;font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
+.empty{padding:24px 16px;color:#8b949e}
+@media (max-width:700px){main{flex-direction:column}#list{width:auto;border-right:0;border-bottom:1px solid #21262d;max-height:40vh}}
+</style></head><body>
+<header><h1>Autofix sessions</h1><a href="./">Back to the dashboard</a>
+<span class="note">Read-only. These agents live on their own tmux socket, are never adopted
+or restored by the dashboard, and are ended by their spawner after an hour idle.</span></header>
+<main><div id="list"><div class="empty">Loading...</div></div>
+<div id="view"><div id="meta">Pick a session.</div><pre id="pane"></pre></div></main>
+<script>
+let SEL=null;
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const age=s=>s<90?s+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h';
+async function load(){
+  let d;
+  try{d=await (await fetch('api/side-sessions',{cache:'no-store'})).json();}catch(e){return;}
+  const rows=[];(d.sockets||[]).forEach(s=>(s.sessions||[]).forEach(x=>rows.push(x)));
+  const L=document.getElementById('list');
+  if(!rows.length){L.innerHTML='<div class="empty">No autofix sessions open.</div>';return;}
+  L.innerHTML=rows.map(x=>{
+    const busy=x.idle_s<600, col=busy?'#3fb950':(x.idle_s<(d.reap_idle_s||3600)?'#d29922':'#8b949e');
+    const key=x.socket+'/'+x.name;
+    return '<div class="row'+(SEL===key?' sel':'')+'" data-k="'+esc(key)+'"><b><span class="dot" style="background:'+col+'"></span>'+esc(x.name)+'</b>'+
+      '<span>'+esc(x.cmd||'?')+' &middot; idle '+age(x.idle_s)+(x.attached?' &middot; attached':'')+'</span></div>';
+  }).join('');
+  L.querySelectorAll('.row').forEach(r=>r.onclick=()=>{SEL=r.dataset.k;load();tail();});
+  if(!SEL&&rows.length){SEL=rows[0].socket+'/'+rows[0].name;tail();}
+}
+async function tail(){
+  if(!SEL)return;
+  const [sock,name]=SEL.split('/');
+  const m=document.getElementById('meta'), p=document.getElementById('pane');
+  let d;
+  try{d=await (await fetch('api/side-sessions/'+encodeURIComponent(sock)+'/'+encodeURIComponent(name)+'/tail',{cache:'no-store'})).json();}catch(e){return;}
+  if(d.error){m.textContent=name+': '+d.error;p.textContent='';return;}
+  m.innerHTML='<code>'+esc(name)+'</code> &middot; take over with <code>tmux -L '+esc(sock)+' attach -t '+esc(name)+'</code>';
+  const atBottom=p.scrollTop+p.clientHeight>=p.scrollHeight-40;
+  p.textContent=d.text||'';
+  if(atBottom)p.scrollTop=p.scrollHeight;
+}
+load();setInterval(load,10000);setInterval(tail,4000);
+</script></body></html>"""
+
+
+@app.get("/autofix")
+async def side_sessions_page(request: Request):
+    return HTMLResponse(_SIDE_SESSIONS_PAGE, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/vacuum-sim")
