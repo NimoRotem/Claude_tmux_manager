@@ -99,3 +99,43 @@ def test_credentials_prefer_the_running_dashboard(monkeypatch):
                         lambda: {"TMUX_DASH_USER": "Nimo", "TMUX_DASH_PASS": "live"})
     monkeypatch.setenv("TMUX_DASH_PASS", "stale-inherited")
     assert a._dash_credentials() == ("Nimo", "live")
+
+
+def test_watch_ends_an_idle_session_and_its_server(sock):
+    assert a.new_session("prb-x", "/tmp", socket=sock, command="sleep 300")
+    t0 = time.time()
+    how = a.watch("prb-x", socket=sock, idle_sec=3600, poll=0, log=lambda m: None,
+                  now=lambda: t0 + 7200, sleep=lambda s: None)
+    assert how == "tmux"
+    assert a.list_sessions(sock) == []
+    assert a.tmux(sock, "list-sessions").returncode != 0      # server gone with it
+
+
+def test_watch_honours_max_age_and_waits_while_fresh(sock):
+    assert a.new_session("netagent-y", "/tmp", socket=sock, command="sleep 300")
+    ticks = []
+
+    def fake_sleep(_):
+        ticks.append(1)
+    t0 = time.time()
+    clock = iter([t0, t0 + 3000 + 60])      # first pass fresh, second pass past max age
+    how = a.watch("netagent-y", socket=sock, idle_sec=3600, max_age_sec=3000, poll=0,
+                  log=lambda m: None, now=lambda: next(clock), sleep=fake_sleep)
+    assert how == "tmux" and ticks == [1]
+
+
+def test_watch_returns_when_someone_else_ended_it(sock):
+    assert a.new_session("prb-z", "/tmp", socket=sock, command="sleep 300")
+    a.tmux(sock, "kill-session", "-t", "=prb-z")
+    assert a.watch("prb-z", socket=sock, poll=0, log=lambda m: None) == "gone"
+
+
+def test_spawn_watcher_runs_detached_and_ends_the_session(sock, tmp_path):
+    assert a.new_session("prb-w", "/tmp", socket=sock, command="sleep 300")
+    logf = tmp_path / "w.log"
+    pid = a.spawn_watcher("prb-w", socket=sock, idle_sec=1, poll=1, logfile=str(logf))
+    deadline = time.time() + 20
+    while time.time() < deadline and a.has_session("prb-w", sock):
+        time.sleep(0.5)
+    assert not a.has_session("prb-w", sock)
+    assert "watcher ended 'prb-w'" in logf.read_text()

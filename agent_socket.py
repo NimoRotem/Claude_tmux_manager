@@ -19,6 +19,11 @@ registered, so the registry and tmux agree.
 
 Used by ~/lisa-autofix/spawn_fix_session.py and ~/cron-autofix/cron_autofix.py (they import it
 from this checkout), and by app.py for the watch page. Standard library only.
+
+A launcher with no loop of its own to reap from (a manual script, a cron job that is switched off)
+starts a WATCHER with the session: `spawn_watcher(name, socket)` or from a shell
+`python3 agent_socket.py watch --socket S --name N [--idle SEC] [--max-age SEC] &`. It ends the
+session once it is idle (or older than --max-age) and exits when the session is gone.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -323,3 +329,71 @@ def describe(socket=SOCKET, now=None) -> list[dict]:
         out.append(row)
     out.sort(key=lambda x: -x["created"])
     return out
+
+
+# --------------------------------------------------------------------------- per-session watcher
+
+def watch(name, socket=SOCKET, idle_sec=IDLE_REAP_SEC, max_age_sec=None, poll=60, log=print,
+          now=time.time, sleep=time.sleep) -> str:
+    """Block until `name` is gone. End it once its windows have been quiet for `idle_sec`, or once
+    it is older than `max_age_sec` when that is set; a session somebody is attached to is left
+    alone. Returns how it ended: 'dashboard', 'tmux' or 'gone' (ended by someone else)."""
+    while True:
+        rows = [s for s in list_sessions(socket) if s["name"] == name]
+        if not rows:
+            if not _is_default(socket):
+                kill_server_if_empty(socket)
+            return "gone"
+        s, t = rows[0], now()
+        idle, age = t - s["activity"], t - s["created"]
+        if not s["attached"] and (idle >= idle_sec or (max_age_sec and age >= max_age_sec)):
+            how = end_session(name, socket=socket, log=log)
+            why = f"idle {idle / 60.0:.0f} min" if idle >= idle_sec else f"age {age / 60.0:.0f} min"
+            log(f"watcher ended '{name}' on socket {socket} ({why}) via {how}")
+            return how
+        sleep(poll)
+
+
+def spawn_watcher(name, socket=SOCKET, idle_sec=IDLE_REAP_SEC, max_age_sec=None, poll=60,
+                  logfile=None) -> int:
+    """Start `watch` for one session as a detached process that outlives the launcher.
+    Returns its pid."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "watch", "--socket", str(socket),
+            "--name", name, "--idle", str(int(idle_sec)), "--poll", str(int(poll))]
+    if max_age_sec:
+        argv += ["--max-age", str(int(max_age_sec))]
+    out = open(logfile, "a") if logfile else subprocess.DEVNULL
+    try:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                start_new_session=True, close_fds=True).pid
+    finally:
+        if logfile:
+            out.close()
+
+
+def _main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="End idle agent sessions on a tmux socket.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    w = sub.add_parser("watch", help="watch one session until it ends")
+    w.add_argument("--socket", default=SOCKET)
+    w.add_argument("--name", required=True)
+    w.add_argument("--idle", type=int, default=IDLE_REAP_SEC)
+    w.add_argument("--max-age", type=int, default=0)
+    w.add_argument("--poll", type=int, default=60)
+    r = sub.add_parser("reap", help="end every idle session with one of these prefixes, once")
+    r.add_argument("prefixes", nargs="+")
+    r.add_argument("--socket", default=SOCKET)
+    r.add_argument("--idle", type=int, default=IDLE_REAP_SEC)
+    r.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    stamp = lambda m: print(time.strftime("%Y-%m-%dT%H:%M:%S ") + m, flush=True)  # noqa: E731
+    if a.cmd == "watch":
+        watch(a.name, a.socket, a.idle, a.max_age or None, a.poll, log=stamp)
+    else:
+        reap(a.prefixes, a.idle, sockets=(a.socket, DEFAULT), log=stamp, dry=a.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
