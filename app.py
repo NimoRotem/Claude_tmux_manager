@@ -913,6 +913,19 @@ def _plan_credential_is_static() -> bool:
     return int(o.get("expiresAt") or 0) > int(time.time() * 1000)
 
 
+# Claude Code 2.1.280+ shows its workspace trust dialog as an UNNUMBERED menu
+# whose highlighted default is "No, exit" (2.1.141 showed "1. Yes, I trust this
+# folder" first). A detached pane cannot answer it, and anything that presses
+# Enter into a fresh pane (a dispatcher typing its brief, the old auto-responder)
+# exits claude. The trust record in .claude.json is keyed by the exact cwd, so a
+# copied home, a new tenant or a new folder all fall through to the dialog, and
+# the home directory can never be trusted persistently at all. The CLI skips
+# the check when CLAUDE_CODE_SANDBOXED is set in its PROCESS environment
+# (settings.json `env` is applied only after trust, so it does not work there).
+# It skips the trust dialog only; permissions, hooks and cwd are unchanged.
+_TRUST_ENV_EXPORT = "export CLAUDE_CODE_SANDBOXED=1; "
+
+
 def _claude_launch_env_prefix() -> str:
     """Shell env prefix for launching `claude`. Exports a stored long-lived token
     ONLY when the shared plan credential could otherwise rotate; otherwise unsets
@@ -949,9 +962,9 @@ def _claude_launch_env_prefix() -> str:
     if tok and not _plan_credential_is_static():
         return ("export CLAUDE_CODE_OAUTH_TOKEN=" + shlex.quote(tok)
                 + "; export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENAI_VOICE_KEY= OPENAI_TASKS_KEY= CODEX_API_KEY=; "
-                "unset CLAUDE_CODE_EFFORT_LEVEL; ")
+                + _TRUST_ENV_EXPORT + "unset CLAUDE_CODE_EFFORT_LEVEL; ")
     return ("export ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENAI_VOICE_KEY= OPENAI_TASKS_KEY= CODEX_API_KEY=; "
-            "unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_EFFORT_LEVEL; ")
+            + _TRUST_ENV_EXPORT + "unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_EFFORT_LEVEL; ")
 
 
 # --- Pane launch script ------------------------------------------------------
@@ -4984,6 +4997,8 @@ def _seed_trust(cfg_dir: Path, cwd: str):
         d = {}
     projects = d.get("projects") if isinstance(d.get("projects"), dict) else {}
     proj = projects.get(cwd) if isinstance(projects.get(cwd), dict) else {}
+    if proj.get("hasTrustDialogAccepted") is True and d.get("hasCompletedOnboarding"):
+        return  # already trusted: never rewrite a file live sessions also write
     proj["hasTrustDialogAccepted"] = True
     projects[cwd] = proj
     d["projects"] = projects
@@ -5055,6 +5070,10 @@ def _prime_claude_config(cfg_dir: Path) -> bool:
         return False
     marker = cfg_dir / ".claude_primed"
     if marker.exists():
+        # The marker travels with a copied home (builder2 moved to the tenant
+        # builder2svc with nimrod_rotem's .claude.json, keyed /home/nimrod_rotem),
+        # so re-check the trust record for THIS cwd every time.
+        _seed_trust(cfg_dir, os.getcwd())
         return True
     try:
         cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -9376,6 +9395,16 @@ async def api_create_session(request: Request, body: CreateSession):
         # account waits ~10-20s. The admin's own ~/.claude is primed by daily use.
         if _stored_anthropic_key or (user and not _is_admin(user)):
             await asyncio.to_thread(_prime_claude_config, _user_claude_config_dir(user))
+        else:
+            # The admin's config is never primed, so nothing re-seeded its trust
+            # record when the home moved (builder2 -> builder2svc). The launch
+            # exports CLAUDE_CODE_SANDBOXED as well; this keeps the documented
+            # record right for any CLI that stops honouring that variable.
+            try:
+                _pid = _get_session_profile_id(created) or DEFAULT_PROFILE_ID
+                await asyncio.to_thread(_seed_trust, _profile_dir(_pid), os.getcwd())
+            except Exception:
+                logger.debug("Trust seed for '%s' failed", created, exc_info=True)
         # Optionally launch a command in the new session. Pin the default model
         # unless the chosen profile pins its own via its settings.json.
         _banner = ""
@@ -12699,7 +12728,7 @@ async def api_set_session_profile(session_name: str, body: SetSessionProfileBody
             await asyncio.sleep(0.3)
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "-l",
-                 "claude --dangerously-skip-permissions"],
+                 "CLAUDE_CODE_SANDBOXED=1 claude --dangerously-skip-permissions"],
                 capture_output=True, text=True, timeout=5)
             await asyncio.to_thread(subprocess.run,
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -21332,6 +21361,64 @@ _AUTO_RESPOND_COOLDOWN = 10     # min seconds between auto-responds per session
 _auto_respond_log: list = []    # recent auto-respond events (for debugging)
 
 
+_MENU_FOOTER_RE = re.compile(r"Enter to (?:confirm|select)\b")
+
+
+def _parse_unnumbered_menu(visible_text: str):
+    """Claude Code 2.1.280+ draws some menus without numbers, e.g. its trust
+    dialog:
+
+         ❯ No, exit
+           Yes, I trust this folder
+
+         Enter to confirm · Esc to cancel
+
+    Returns (options, selected_idx) with options numbered 1..n in visual order,
+    or None. Only a block that sits directly above the "Enter to confirm" /
+    "Enter to select" footer counts, so the chat input box ("❯ some text", no
+    footer) is never mistaken for a menu: Enter there would submit the text."""
+    lines = visible_text.rstrip("\n").split("\n")[-25:]
+    footer = next((i for i in range(len(lines) - 1, -1, -1)
+                   if _MENU_FOOTER_RE.search(lines[i])), None)
+    if footer is None:
+        return None
+    cur = next((i for i in range(footer - 1, max(-1, footer - 12), -1)
+                if lines[i].lstrip().startswith("\u276f")), None)
+    if cur is None:
+        return None
+    m = re.match(r"^(\s*)\u276f\s+(\S.*)$", lines[cur])
+    if not m or re.match(r"\d+\.\s", m.group(2)):
+        return None
+    col = lines[cur].index(m.group(2))
+
+    def option_text(line):
+        if len(line) <= col or line[:col].strip() not in ("", "\u276f"):
+            return None
+        if line[col] == " ":
+            return ""          # deeper indent: a description under an option
+        return line[col:].strip()
+
+    start = cur
+    while start - 1 >= 0 and lines[start - 1].strip() and option_text(lines[start - 1]) is not None:
+        start -= 1
+    end = cur
+    while end + 1 < footer and lines[end + 1].strip() and option_text(lines[end + 1]) is not None:
+        end += 1
+    if any(l.strip() for l in lines[end + 1:footer]):
+        return None            # something other than blank rows between block and footer
+    options, selected = [], 0
+    for i in range(start, end + 1):
+        t = option_text(lines[i])
+        if not t:
+            continue
+        if i == cur:
+            selected = len(options)
+        options.append((len(options) + 1, t))
+    if len(options) < 2:
+        return None
+    return options, selected
+
+
 def _detect_interactive_prompt(visible_text: str) -> str | None:
     """Check if visible terminal shows a Claude Code interactive prompt.
 
@@ -21365,6 +21452,11 @@ def _detect_interactive_prompt(visible_text: str) -> str | None:
         # Enter on this would submit that text — never auto-fire here.
         if re.match(r"^[❯\u276f]\s+\S", stripped) and not re.match(r"^[❯\u276f]\s*\d+\.", stripped):
             selector_followed_by_text = True
+
+    # An unnumbered menu (the 2.1.280+ trust dialog) has a footer the input
+    # box never has; check it before the free-text bail below.
+    if not has_selector_on_option and _parse_unnumbered_menu(visible_text):
+        return "selection_prompt"
 
     # Bail if cursor is in the user input box with text waiting.
     if selector_followed_by_text and not has_selector_on_option:
@@ -21469,6 +21561,10 @@ def _parse_menu_options(visible_text: str):
         if m.group(1):
             selected = len(options)
         options.append((int(m.group(2)), m.group(3).strip()))
+    if not options:
+        unnumbered = _parse_unnumbered_menu(visible_text)
+        if unnumbered:
+            return unnumbered
     return options, (selected if selected is not None else 0)
 
 
