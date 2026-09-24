@@ -15,6 +15,11 @@ import agent_socket as a
 from conftest import RUN_SOCKET_PREFIX
 
 
+@pytest.fixture(autouse=True)
+def _state_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(a, "STATE_DIR", tmp_path / "agent-socket-state")
+
+
 @pytest.fixture
 def sock(request):
     name = RUN_SOCKET_PREFIX + request.node.name[:20]
@@ -139,3 +144,38 @@ def test_spawn_watcher_runs_detached_and_ends_the_session(sock, tmp_path):
         time.sleep(0.5)
     assert not a.has_session("prb-w", sock)
     assert "watcher ended 'prb-w'" in logf.read_text()
+
+
+REDRAW_SAME = "sh -c 'while :; do printf \"\\033[H\\033[2Jsame screen\\n\"; sleep 1; done'"
+REDRAW_NEW = "sh -c 'i=0; while :; do i=$((i+1)); printf \"\\033[H\\033[2Jtick %d\\n\" $i; sleep 1; done'"
+
+
+def test_a_redraw_of_the_same_screen_is_still_idle(sock):
+    """An idle Claude TUI redraws every 30 min with identical text: window activity moves, the
+    session is still idle. Measured on instance-3 2026-09-24."""
+    assert a.new_session("prb-same", "/tmp", socket=sock, command=REDRAW_SAME)
+    time.sleep(1.5)
+    log = lambda m: None  # noqa: E731
+    assert a.reap("prb-", 2, sockets=(sock,), log=log) == []      # first sight: activity is fresh
+    time.sleep(3.5)
+    row = a.list_sessions(sock)[0]
+    assert time.time() - row["activity"] < 2                        # activity kept moving
+    done = a.reap("prb-", 2, sockets=(sock,), log=log)
+    assert [d[1] for d in done] == ["prb-same"]
+
+
+def test_a_changing_screen_is_not_idle(sock):
+    assert a.new_session("prb-busy", "/tmp", socket=sock, command=REDRAW_NEW)
+    time.sleep(1.5)
+    log = lambda m: None  # noqa: E731
+    assert a.reap("prb-", 2, sockets=(sock,), log=log) == []
+    time.sleep(3.5)
+    assert a.reap("prb-", 2, sockets=(sock,), log=log) == []
+    assert a.has_session("prb-busy", sock)
+
+
+def test_watch_sees_through_a_same_screen_redraw(sock):
+    assert a.new_session("prb-wsame", "/tmp", socket=sock, command=REDRAW_SAME)
+    time.sleep(1.5)
+    how = a.watch("prb-wsame", socket=sock, idle_sec=2, poll=1, log=lambda m: None)
+    assert how == "tmux"

@@ -3,7 +3,11 @@
 House rule (infra, "An agent you spawn is yours to end"): an app that starts a claude or codex
 session owns its lifetime. Its own socket, a reaper that ends a session idle over an hour, and the
 SERVER killed when its last session goes. Idle is timed from #{window_activity}, because
-#{session_activity} never moves.
+#{session_activity} never moves, AND from the screen hash: an idle Claude Code TUI redraws its pane
+every 30 minutes with IDENTICAL content (measured on instance-3 2026-09-24: a finished
+grabo-bot-fix session showed window activity at exactly +30 and +60 min, same pane hash), so
+window activity alone never reaches an hour and a real agent was never reaped. quiet_since() keeps
+the time the pane's text last CHANGED, in a small state file per socket.
 
 WHY THIS EXISTS. The lisa-autofix spawner and the cron-autofix dispatcher on instance-3 opened
 their fix sessions on the DEFAULT socket. The dashboard checkpoints every live session there into
@@ -27,6 +31,7 @@ session once it is idle (or older than --max-age) and exits when the session is 
 """
 from __future__ import annotations
 
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -55,6 +60,8 @@ DASH_URL = os.environ.get("TMUX_DASH_LOCAL_URL", "http://127.0.0.1:8501")
 LIFECYCLE_FILE = Path(os.environ.get(
     "TMUX_DASH_LIFECYCLE_FILE",
     str(Path.home() / ".tmux-dashboard" / "session-lifecycle.json")))
+STATE_DIR = Path(os.environ.get("AGENT_SOCKET_STATE_DIR",
+                                str(Path.home() / ".cache" / "agent-socket")))
 SUPERVISOR_CONF = os.environ.get("TMUX_DASH_SUPERVISOR_CONF",
                                  "/etc/supervisor/conf.d/tmux-dashboard.conf")
 
@@ -131,6 +138,63 @@ def kill_server_if_empty(socket=SOCKET) -> bool:
     if (r.stdout or "").strip():
         return False
     return tmux(socket, "kill-server").returncode == 0
+
+
+def screen_hash(name, socket=SOCKET) -> str:
+    """Hash of the text on the session's active pane (visible screen), '' when unreadable."""
+    r = tmux(socket, "capture-pane", "-p", "-t", "=" + name + ":", timeout=5)
+    if r.returncode != 0:
+        return ""
+    return hashlib.sha1((r.stdout or "").encode("utf-8", "replace")).hexdigest()
+
+
+def _state_path(socket) -> Path:
+    return STATE_DIR / ("%s.json" % (socket or DEFAULT))
+
+
+def _load_state(socket) -> dict:
+    try:
+        d = json.loads(_state_path(socket).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(socket, updates: dict, live: set) -> None:
+    """Merge `updates` into the socket's state file (another reaper may share the socket) and drop
+    sessions that no longer exist."""
+    path = _state_path(socket)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = _load_state(socket)
+        state.update(updates)
+        state = {k: v for k, v in state.items() if k in live}
+        tmp = path.with_suffix(".%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def quiet_since(rows, socket=SOCKET, state=None, persist=True) -> dict:
+    """{session name: when its pane text last changed}. A redraw that prints the same screen moves
+    #{window_activity} but not this. First sight of a session falls back to window activity."""
+    state = _load_state(socket) if state is None else state
+    out, updates = {}, {}
+    for s in rows:
+        name = s["name"]
+        h = screen_hash(name, socket)
+        prev = state.get(name)
+        if isinstance(prev, dict) and h and prev.get("hash") == h:
+            since = float(prev.get("since") or s["activity"])
+        else:
+            since = s["activity"]
+        out[name] = since
+        updates[name] = {"hash": h, "since": since}
+        state[name] = updates[name]
+    if persist:
+        _save_state(socket, updates, {s["name"] for s in list_sessions(socket)})
+    return out
 
 
 # --------------------------------------------------------------------------- dashboard side
@@ -283,11 +347,13 @@ def reap(prefixes, idle_sec=IDLE_REAP_SEC, sockets=(SOCKET, DEFAULT), keep=(), l
     now = time.time() if now is None else now
     done = []
     for sock in sockets:
-        for s in list_sessions(sock):
+        rows = [s for s in list_sessions(sock) if s["name"].startswith(prefixes)]
+        since = quiet_since(rows, sock) if rows else {}
+        for s in rows:
             name = s["name"]
-            if not name.startswith(prefixes) or name in keep or s["attached"]:
+            if name in keep or s["attached"]:
                 continue
-            idle = now - s["activity"]
+            idle = now - since.get(name, s["activity"])
             if idle < idle_sec:
                 continue
             if dry:
@@ -322,10 +388,12 @@ def describe(socket=SOCKET, now=None) -> list[dict]:
         if len(parts) == 4 and (parts[1] == "1" or parts[0] not in panes):
             panes[parts[0]] = {"cmd": parts[2], "cwd": parts[3]}
     out = []
-    for s in list_sessions(socket):
+    rows = list_sessions(socket)
+    since = quiet_since(rows, socket, state=_load_state(socket), persist=False) if rows else {}
+    for s in rows:
         row = dict(s)
         row.update(panes.get(s["name"], {"cmd": "", "cwd": ""}))
-        row["idle_s"] = max(0, int(now - s["activity"]))
+        row["idle_s"] = max(0, int(now - since.get(s["name"], s["activity"])))
         out.append(row)
     out.sort(key=lambda x: -x["created"])
     return out
@@ -338,6 +406,7 @@ def watch(name, socket=SOCKET, idle_sec=IDLE_REAP_SEC, max_age_sec=None, poll=60
     """Block until `name` is gone. End it once its windows have been quiet for `idle_sec`, or once
     it is older than `max_age_sec` when that is set; a session somebody is attached to is left
     alone. Returns how it ended: 'dashboard', 'tmux' or 'gone' (ended by someone else)."""
+    state: dict = {}
     while True:
         rows = [s for s in list_sessions(socket) if s["name"] == name]
         if not rows:
@@ -345,7 +414,8 @@ def watch(name, socket=SOCKET, idle_sec=IDLE_REAP_SEC, max_age_sec=None, poll=60
                 kill_server_if_empty(socket)
             return "gone"
         s, t = rows[0], now()
-        idle, age = t - s["activity"], t - s["created"]
+        since = quiet_since(rows, socket, state=state, persist=False)[name]
+        idle, age = t - since, t - s["created"]
         if not s["attached"] and (idle >= idle_sec or (max_age_sec and age >= max_age_sec)):
             how = end_session(name, socket=socket, log=log)
             why = f"idle {idle / 60.0:.0f} min" if idle >= idle_sec else f"age {age / 60.0:.0f} min"
