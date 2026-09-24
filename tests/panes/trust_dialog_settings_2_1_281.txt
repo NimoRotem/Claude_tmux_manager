@@ -1,0 +1,27 @@
+builder2svc@builders-owner-us:~/tmux-dashboard-original$ source ~/.tmux-dashboar
+d/launch/lisa-solver-951-98.sh
+[Nimo/lisa-solver-951-98] Max plan · Opus 5.5 1M · Xhigh
+
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /home/builder2svc/tmux-dashboard-original
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ ⚠ This folder pre-approves 3 tool permissions in .claude/settings.local.json:
+   Bash(mkdir -p logs), Bash(python3 enrich.py --stats), and
+ Read(//home/nimrod_rotem/industrialdictionary/**)
+ These will apply without asking. Only proceed if you trust this configuration.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
